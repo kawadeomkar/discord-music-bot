@@ -45,6 +45,13 @@ async def stop(ctx: commands.Context):
         ctx.message.guild.voice_client.stop()
 
 
+
+@bot.command(name='pause', help='pause the current song')
+async def pause(ctx: commands.Context):
+    if ctx.message.guild.voice_client.is_playing():
+        await ctx.message.guild.voice_client.pause()
+
+
 @bot.command(name='join', invoke_without_subcommand=True)
 async def join(ctx: commands.Context):
     if not ctx.message.author.voice:
