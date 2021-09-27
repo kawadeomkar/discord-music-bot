@@ -1,0 +1,17 @@
+FROM python:3.9-slim
+
+RUN adduser --disabled-password --gecos '' omkar
+USER omkar
+WORKDIR /home/omkar
+
+RUN python3 -m pip install --upgrade pip
+
+COPY --chown=omkar:omkar requirements.txt requirements.txt
+RUN pip3 install --user -r requirements.txt
+
+ENV PATH="/home/omkar/.local/bin:${PATH}"
+ENV PYTHONPATH="${PYTHONPATH}:/home/omkar/.local/bin"
+
+COPY --chown=omkar:omkar . .
+
+RUN pip3 install --no-cache-dir ffmpeg-python

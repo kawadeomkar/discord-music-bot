@@ -27,8 +27,10 @@ FFMPEG_OPTS = {
 
 ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
 
+
 class YTDL(discord.PCMVolumeTransformer):
-    def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict, volume: float = 0.5):
+    def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict,
+                 volume: float = 0.5):
         super().__init__(source, volume)
 
         self.requester = ctx.author
@@ -42,7 +44,7 @@ class YTDL(discord.PCMVolumeTransformer):
         self.title = data.get('title')
         self.thumbnail = data.get('thumbnail')
         self.description = data.get('description')
-        #self.duration = self.parse_duration(int(data.get('duration')))
+        # self.duration = self.parse_duration(int(data.get('duration')))
         self.tags = data.get('tags')
         self.url = data.get('webpage_url')
         self.views = data.get('view_count')
@@ -50,11 +52,9 @@ class YTDL(discord.PCMVolumeTransformer):
         self.dislikes = data.get('dislike_count')
         self.stream_url = data.get('url')
 
-
-
     # TODO: search, stream
     @classmethod
-    async def yt_url(cls, url, ctx, *, loop: asyncio.BaseEventLoop=None, stream=False):
+    async def yt_url(cls, url, ctx, *, loop: asyncio.BaseEventLoop = None, stream=False):
         loop = loop or asyncio.get_event_loop()
         process = False
         if "https" not in url:
@@ -66,7 +66,7 @@ class YTDL(discord.PCMVolumeTransformer):
         if data is None:
             # TODO: create exceptions
             raise Exception("Could not find song")
-        #print(data.keys())
+        # print(data.keys())
         if 'entries' in data:
             for entry in data['entries']:
                 if entry and 'formats' in entry and entry.get('_type', None) != 'playlist':
@@ -77,5 +77,6 @@ class YTDL(discord.PCMVolumeTransformer):
         else:
             url = data['formats'][0]['url']
         print(data)
-        ctx.message.guild.voice_client.play(discord.FFmpegPCMAudio(source=url, executable="ffmpeg"))
+        ctx.message.guild.voice_client.play(
+            discord.FFmpegPCMAudio(source=url, **FFMPEG_OPTS, executable="ffmpeg"))
         await ctx.send(f'**Now playing:** {data["title"]}')
