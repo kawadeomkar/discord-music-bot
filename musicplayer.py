@@ -31,8 +31,7 @@ class MusicPlayer:
         self._player.cancel()
 
     async def stop(self):
-        self.queue.clear()
-        self._cog.cleanup(self._guild)
+        await self._cog.cleanup(self._guild)
 
     async def loop(self):
         await self.bot.wait_until_ready()
@@ -52,21 +51,15 @@ class MusicPlayer:
             self.current_song = await YTDL.yt_stream(source, self._ctx, loop=self.bot.loop)
             self.current_song.volume = self.volume
 
-            print("current_song: " + self.current_song.title)
-
-            # embed = discord.Embed(title="**Now playing**",
-            #                      description=f"{self.current_songs.title} - {self.current_song.webpage_url} "
-            #                                  f"[{self.current_song.requester.mention}]",
-            #                      color=discord.Color.blue())
-            #print(embed)
-            #self.play_message = await self._ctx.send(embed=embed)
+            embed = discord.Embed(title="**Now playing**",
+                                  description=f"{self.current_song.title} - {self.current_song.webpage_url} "
+                                              f"[{self.current_song.requester.mention}]",
+                                  color=discord.Color.green())
+            self.play_message = await self._ctx.send(embed=embed)
 
             self._guild.voice_client.play(self.current_song,
                                           after=lambda _: self.bot.loop.call_soon_threadsafe(
                                               self.next_song.set))
             await self.next_song.wait()
-            # self.current_song.cleanup()
+            self.current_song.cleanup()
             self.current_song = None
-
-
-

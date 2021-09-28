@@ -97,11 +97,6 @@ class YTDL(discord.PCMVolumeTransformer):
                     data = entry
                     break
 
-        embed = discord.Embed(title="",
-                              description=f"Queued {data['title']} - ({url}) [{ctx.author.mention}]",
-                              color=discord.Color.blue())
-        await ctx.send(embed=embed)
-
         # ctx.message.guild.voice_client.play(
         # discord.FFmpegPCMAudio(source=url, **FFMPEG_OPTS, executable="ffmpeg"))
 

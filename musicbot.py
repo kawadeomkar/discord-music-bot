@@ -59,6 +59,12 @@ class MusicBot(commands.Cog):
         async with ctx.typing():
             try:
                 source = await YTDL.yt_url(url, ctx, loop=self.bot.loop, ytsearch=ctx.message.content)
+                if mp.queue.qsize() > 0:
+                    embed = discord.Embed(title="Queued song",
+                                          description=f"{source.get('title')} - ({source.get('webpage_url')}) "
+                                                      f"[{ctx.author.mention}]",
+                                          color=discord.Color.blue())
+                    await ctx.send(embed=embed)
                 await mp.queue.put(source)
             except Exception as e:
                 await ctx.send(f"Exception caught: {e}")
