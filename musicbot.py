@@ -1,4 +1,5 @@
 from discord.ext import commands
+from musicplayer import MusicPlayer
 
 # music players
 from youtube import YTDL
@@ -17,17 +18,21 @@ class MusicBot(commands.Cog):
         self.bot = bot
         self.mps = {}
 
-    def get_mp(self, ctx: commands.Context):
+    def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         if ctx.guild.id in self.mps:
             return self.mps[ctx.guild.id]
-        pass
+        self.mps[ctx.guild.id] = MusicPlayer(self.bot, ctx)
+        return self.mps[ctx.guild.id]
 
-    async def cleanup(self, guild: discord.Guild):
+    async def cleanup(self, guild: discord.Guild) -> None:
         if guild.voice_client:
             await guild.voice_client.disconnect()
         self.mps.pop(guild.id, None)
 
-    async def validate_commands(self, ctx: commands.Context):
+    async def cog_before_invoke(self, ctx):
+        self.get_mp(ctx)
+
+    async def validate_commands(self, ctx: commands.Context) -> None:
         if isinstance(ctx.author, discord.User):
             await ctx.send(f'You must be a member of this channel {ctx.author}')
             raise commands.CommandError(f'User {ctx.author} must be a member of this channel.')
@@ -36,27 +41,25 @@ class MusicBot(commands.Cog):
             await ctx.send(f'You are not connected to a voice channel, you silly baka {ctx.author}')
             raise commands.CommandError(f'User {ctx.author} is not connected to a voice channel.')
 
-        # if ctx.voice_client and ctx.voice_client.channel != ctx.author.voice.channel:
-        #    await ctx.send(f'Bot is already being used in channel {ctx.voice_client.channel}')
-        #    raise commands.CommandError('Bot is already in a voice channel.')
+        if not ctx.command == "play" and ctx.voice_client and ctx.voice_client.channel != ctx.author.voice.channel:
+            await ctx.send(f'Bot is already being used in channel {ctx.voice_client.channel}')
+            raise commands.CommandError('Bot is already in a voice channel.')
 
-    @commands.command(name='p', aliases=['pl', 'pla', 'play', 'sing'], help='play a youtube song')
+    @commands.command(name='play', aliases=['p', 'pl', 'pla', 'sing'], help='play a youtube song')
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
+        if not ctx.guild.voice_client:
+            await ctx.invoke(self.join)
 
-        channel, guild = ctx.message.author.voice.channel, ctx.message.guild
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        print(voice_client)
-        print(channel)
+        mp = self.get_mp(ctx)
 
-        if not voice_client:
-            await channel.connect()
-        if not ctx.author.voice.channel == ctx.voice_client.channel:
-            await ctx.voice_client.move_to(channel)
+        print(type(ctx.message.content))
+
         # only support youtube link for now
         async with ctx.typing():
             try:
-                source = await YTDL.yt_url(url, ctx, loop=self.bot.loop)
+                source = await YTDL.yt_url(url, ctx, loop=self.bot.loop, ytsearch=ctx.message.content)
+                await mp.queue.put(source)
             except Exception as e:
                 await ctx.send(f"Exception caught: {e}")
 
@@ -75,11 +78,13 @@ class MusicBot(commands.Cog):
     @commands.command(name='join', aliases=['j'], help='join the channel')
     @commands.before_invoke(validate_commands)
     async def join(self, ctx: commands.Context):
-        if not ctx.message.author.voice:
-            await ctx.send("Must be connected to a voice channel")
-            return
-        else:
-            await ctx.author.voice.channel.connect()
+        channel, guild = ctx.message.author.voice.channel, ctx.message.guild
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+
+        if not voice_client:
+            await channel.connect()
+        if not ctx.author.voice.channel == ctx.voice_client.channel:
+            await ctx.voice_client.move_to(channel)
 
 
 b = commands.Bot(

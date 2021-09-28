@@ -1,13 +1,14 @@
 from discord.ext import commands
 
 import asyncio
+import datetime
 import discord
 import youtube_dl
 
+# TODO: postprocessing ffmpeg, audio format, etc.
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'extractaudio': True,
-    'audioformat': 'mp3',
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
@@ -30,53 +31,84 @@ ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
 
 class YTDL(discord.PCMVolumeTransformer):
     def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict,
-                 volume: float = 0.5):
+                 volume: float = 0.5, requester=None):
+        print(source)
         super().__init__(source, volume)
 
-        self.requester = ctx.author
+        self.requester = requester or ctx.author
         self.channel = ctx.channel
 
         self.data = data
         self.uploader = data.get('uploader')
         self.uploader_url = data.get('uploader_url')
-        date = data.get('upload_date')
-        self.upload_date = date[6:8] + '.' + date[4:6] + '.' + date[0:4]
+        self.date = data.get('upload_date')
+        self.upload_date = self.date[6:8] + '.' + self.date[4:6] + '.' + self.date[0:4]
         self.title = data.get('title')
         self.thumbnail = data.get('thumbnail')
         self.description = data.get('description')
-        # self.duration = self.parse_duration(int(data.get('duration')))
+        self.duration = str(datetime.timedelta(seconds=int(data.get('duration', '0'))))
         self.tags = data.get('tags')
-        self.url = data.get('webpage_url')
+        self.webpage_url = data.get('webpage_url')
         self.views = data.get('view_count')
         self.likes = data.get('like_count')
         self.dislikes = data.get('dislike_count')
         self.stream_url = data.get('url')
 
-    # TODO: search, stream
+    def __getitem__(self, item: str):
+        return self.__getattribute__(item)
+
     @classmethod
-    async def yt_url(cls, url, ctx, *, loop: asyncio.BaseEventLoop = None, stream=False):
+    async def yt_stream(cls, data, ctx, *, loop=None):
+        loop = loop or asyncio.get_event_loop()
+        requester = data['requester']
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(data['webpage_url'],
+                                                                          download=False,
+                                                                          process=True))
+        print("streaming: " + data['url'])
+        print(ctx)
+        return cls(ctx,
+                   discord.FFmpegPCMAudio(data['url'], **FFMPEG_OPTS, executable="ffmpeg"),
+                   data=data,
+                   requester=requester)
+
+    # TODO: handle downloading?
+    @classmethod
+    async def yt_url(cls, url, ctx, *, loop: asyncio.BaseEventLoop = None, download=False,
+                     ytsearch: str = None):
         loop = loop or asyncio.get_event_loop()
         process = False
-        if "https" not in url:
+
+        if "https" not in url and ytsearch:
+            url = " ".join(ytsearch.split(" ")[1:])
             url = f"ytsearch:{url}"
             process = True
-        # process=True to resolve all unresolved references (urls), need for ytsearch
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False, process=process))
 
+        # process=True to resolve all unresolved references (urls), need for ytsearch
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url,
+                                                                          download=download,
+                                                                          process=process))
         if data is None:
-            # TODO: create exceptions
+            # TODO: create custom YTDL exceptions
             raise Exception("Could not find song")
-        # print(data.keys())
-        if 'entries' in data:
+
+        if 'entries' in data:  # TOOD: narrow down to https urls and right bitrate
             for entry in data['entries']:
-                if entry and 'formats' in entry and entry.get('_type', None) != 'playlist':
+                if entry and entry.get('_type', None) != 'playlist':
                     data = entry
-                    print(entry.keys())
-                    url = entry['formats'][0]['url']
                     break
-        else:
-            url = data['formats'][0]['url']
-        print(data)
-        ctx.message.guild.voice_client.play(
-            discord.FFmpegPCMAudio(source=url, **FFMPEG_OPTS, executable="ffmpeg"))
-        await ctx.send(f'**Now playing:** {data["title"]}')
+
+        embed = discord.Embed(title="",
+                              description=f"Queued {data['title']} - ({url}) [{ctx.author.mention}]",
+                              color=discord.Color.blue())
+        await ctx.send(embed=embed)
+
+        # ctx.message.guild.voice_client.play(
+        # discord.FFmpegPCMAudio(source=url, **FFMPEG_OPTS, executable="ffmpeg"))
+
+        return cls(ctx,
+                   discord.FFmpegPCMAudio(ytdl.prepare_filename(data)),
+                   data=data,
+                   requester=ctx.author) \
+            if download else {'webpage_url': data['webpage_url'],
+                              'requester': ctx.author,
+                              'title': data['title']}
