@@ -32,7 +32,6 @@ ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
 class YTDL(discord.PCMVolumeTransformer):
     def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict,
                  volume: float = 0.5, requester=None):
-        print(source)
         super().__init__(source, volume)
 
         self.requester = requester or ctx.author
@@ -52,7 +51,10 @@ class YTDL(discord.PCMVolumeTransformer):
         self.views = data.get('view_count')
         self.likes = data.get('like_count')
         self.dislikes = data.get('dislike_count')
-        self.stream_url = data.get('url')
+        self.url = data.get('url')
+        self.abr = data.get('abr')
+        self.asr = data.get('asr')
+        self.acodec = data.get('acodec')
 
     def __getitem__(self, item: str):
         return self.__getattribute__(item)

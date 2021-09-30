@@ -25,6 +25,7 @@ class MusicBot(commands.Cog):
         return self.mps[ctx.guild.id]
 
     async def cleanup(self, guild: discord.Guild) -> None:
+        print("going to cleanup/disconnect")
         if guild.voice_client:
             await guild.voice_client.disconnect()
         self.mps.pop(guild.id, None)
@@ -48,17 +49,22 @@ class MusicBot(commands.Cog):
     @commands.command(name='play', aliases=['p', 'pl', 'pla', 'sing'], help='play a youtube song')
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
-        if not ctx.guild.voice_client:
-            await ctx.invoke(self.join)
+        if not discord.utils.get(self.bot.voice_clients, guild=ctx.guild):
+            try:
+                print("trying to join voice client")
+                await ctx.invoke(self.join)
+            except Exception as e:
+                print(e)
+                print(f"failed : {str(e)}")
 
         mp = self.get_mp(ctx)
-
-        print(type(ctx.message.content))
 
         # only support youtube link for now
         async with ctx.typing():
             try:
-                source = await YTDL.yt_url(url, ctx, loop=self.bot.loop, ytsearch=ctx.message.content)
+                source = await YTDL.yt_url(url, ctx, loop=self.bot.loop,
+                                           ytsearch=ctx.message.content)
+                print(f"play qsize: {mp.queue.qsize()}")
                 if mp.queue.qsize() > 0:
                     embed = discord.Embed(title="Queued song",
                                           description=f"{source.get('title')} - ({source.get('webpage_url')}) "
@@ -66,20 +72,34 @@ class MusicBot(commands.Cog):
                                           color=discord.Color.blue())
                     await ctx.send(embed=embed)
                 await mp.queue.put(source)
+                await ctx.message.add_reaction('👍')
             except Exception as e:
                 await ctx.send(f"Exception caught: {e}")
 
-    @commands.command(name='stop', aliases=['s'], help='stop current song')
+    @commands.command(name='skip', aliases=['sk'], help='skips current song')
+    @commands.before_invoke(validate_commands)
+    async def skip(self, ctx: commands.Context):
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+        if voice_client and voice_client.is_playing():
+            ctx.message.guild.voice_client.stop()
+            if not ctx.invoked_parents:
+                await ctx.message.add_reaction('⏭')
+
+    @commands.command(name='stop', aliases=['st'], help='stops current song')
     @commands.before_invoke(validate_commands)
     async def stop(self, ctx: commands.Context):
-        if ctx.message.guild.voice_client.is_playing():
-            ctx.message.guild.voice_client.stop()
+        await ctx.invoke(self.skip)
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+        if voice_client:
+            await ctx.message.add_reaction('👋')
+            await ctx.voice_client.disconnect()
 
     @commands.command(name='pause', aliases=['po'], help='pause the current song')
     @commands.before_invoke(validate_commands)
     async def pause(self, ctx: commands.Context):
         if ctx.message.guild.voice_client.is_playing():
             await ctx.message.guild.voice_client.pause()
+            await ctx.message.add_reaction('⏸️')
 
     @commands.command(name='join', aliases=['j'], help='join the channel')
     @commands.before_invoke(validate_commands)
@@ -91,19 +111,64 @@ class MusicBot(commands.Cog):
             await channel.connect()
         if not ctx.author.voice.channel == ctx.voice_client.channel:
             await ctx.voice_client.move_to(channel)
+        await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True)
+        await ctx.message.add_reaction('👋')
+
+    @commands.command(name='clear', aliases=['c'], help='clears the queue, in development')
+    @commands.before_invoke(validate_commands)
+    async def clear(self, ctx: commands.Context):
+        await ctx.send(f"in development")
+
+    @commands.command(name='now', aliases=['np', 'rn', 'nowplaying'], help='display current song')
+    @commands.before_invoke(validate_commands)
+    async def now(self, ctx: commands.Context):
+        mp = self.get_mp(ctx)
+        if ctx.message.guild.voice_client.is_playing() and mp.play_message:
+            await ctx.send(embed=mp.play_message)
+        else:
+            await ctx.send("No songs are currently playing.")
+
+    @commands.command(name='volume', aliases=['v', 'vol', 'sound'], help='volume level between 0 and 100')
+    @commands.before_invoke(validate_commands)
+    async def volume(self, ctx: commands.Context, volume):
+        if isinstance(volume, str):
+            try:
+                volume = int(volume)
+            except ValueError as e:
+                await ctx.send("Volume must be a number between 0 and 100")
+                return
+        if ctx.voice_state.is_playing:
+            if not 0 < volume < 100:
+                return await ctx.send('Volume must be between 0 and 100')
+            if volume > 0:
+                volume = volume / 100
+                mp = self.get_mp(ctx)
+                mp.volume = volume
+                ctx.send(f"Set volume of music player to {volume}")
+        else:
+            await ctx.send("No songs are currently playing.")
+
+    @commands.command(name='ping', aliases=['latency', 'l', 'delay'], help='latency, in development')
+    @commands.before_invoke(validate_commands)
+    async def ping(self, ctx: commands.Context, ping):
+        print(f"ping type: f{ping}")
+        await ctx.send(f"in development")
 
 
-b = commands.Bot(
+bot = commands.Bot(
     command_prefix='-',
     intents=discord.Intents().all(),  # TODO: narrow down
-    description='omkars bad music bot lol')
+    description='omkars bad music bot lol',
+    strip_after_prefix=True)
 
 
-@b.event
+@bot.event
 async def on_ready():
-    print(f'Bot :\n{b.user.name}\n{b.user.id}')
+    activity = discord.Game(name="music", type=3)
+    await bot.change_presence(status=discord.Status.online, activity=activity)
+    print(f'Bot :\n{bot.user.name}\n{bot.user.id}')
 
 
 if __name__ == '__main__':
-    b.add_cog(MusicBot(b))
-    b.run(os.getenv("DISCORD_TOKEN"))
+    bot.add_cog(MusicBot(bot))
+    bot.run(os.getenv("DISCORD_TOKEN"))

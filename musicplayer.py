@@ -31,13 +31,19 @@ class MusicPlayer:
         self._player.cancel()
 
     async def stop(self):
+        print("stopping")
         await self._cog.cleanup(self._guild)
+
+    async def update_activity(self):
+        stream_activity = discord.Streaming()
+        pass
 
     async def loop(self):
         await self.bot.wait_until_ready()
 
         while not self.bot.is_closed():
             self.next_song.clear()
+            print(f"q size: {str(self.queue.qsize())}")
             try:
                 async with async_timeout.timeout(300):
                     source = await self.queue.get()
@@ -45,21 +51,39 @@ class MusicPlayer:
                 # TOOD: send message to leave
                 print("timed out")
                 self.bot.loop.create_task(self.stop())
+                return
 
             print(source)
             # TODO: Exception handle on error processing
             self.current_song = await YTDL.yt_stream(source, self._ctx, loop=self.bot.loop)
             self.current_song.volume = self.volume
 
-            embed = discord.Embed(title="**Now playing**",
-                                  description=f"{self.current_song.title} - {self.current_song.webpage_url} "
-                                              f"[{self.current_song.requester.mention}]",
-                                  color=discord.Color.green())
-            self.play_message = await self._ctx.send(embed=embed)
+            try:
+                embed = discord.Embed(title=f"**Now playing:** {self.current_song.title}",
+                                  description=f"Requester: [{self.current_song.requester.mention}]",
+                                  color=discord.Color.green())\
+                    .add_field(name="Youtube link", value=self.current_song.webpage_url, inline=False)\
+                    .add_field(name="Duration", value=self.current_song.duration)\
+                    .add_field(name="Channel", value=self.current_song.uploader)\
+                    .add_field(name="Views", value=str(self.current_song.views))\
+                    .add_field(name="Likes", value=str(self.current_song.likes))\
+                    .add_field(name="Dislikes", value=str(self.current_song.dislikes))\
+                    .set_thumbnail(url=self.current_song.thumbnail)\
+                    .set_footer(text=f"Avg Bitrate: {self.current_song.abr} | "
+                                     f"Avg Sampling: {self.current_song.asr} | "
+                                     f"Acodec: {self.current_song.acodec}")
+                self.play_message = embed
+
+            except Exception as e:
+                print(f"embed error {str(e)}")
+            await self._ctx.send(embed=embed)
+
+            print(f"guild voice client: {self._guild.voice_client}")
 
             self._guild.voice_client.play(self.current_song,
                                           after=lambda _: self.bot.loop.call_soon_threadsafe(
                                               self.next_song.set))
             await self.next_song.wait()
+            self.queue.task_done()
             self.current_song.cleanup()
             self.current_song = None
