@@ -1,11 +1,13 @@
 from discord.ext import commands
 from musicplayer import MusicPlayer
+from spotify import Spotify
 
 # music players
 from youtube import YTDL
 
 import discord
 import os
+import random
 
 
 class MusicBot(commands.Cog):
@@ -17,6 +19,7 @@ class MusicBot(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.mps = {}
+        self.spotify = Spotify()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         if ctx.guild.id in self.mps:
@@ -57,6 +60,10 @@ class MusicBot(commands.Cog):
                 print(e)
                 print(f"failed : {str(e)}")
 
+        if "spotify" in url or "spotify" in ctx.message.content:
+            title = self.spotify.track()
+            await ctx.send("Spotify not supported yet")
+            return
         mp = self.get_mp(ctx)
 
         # only support youtube link for now
@@ -73,6 +80,9 @@ class MusicBot(commands.Cog):
                     await ctx.send(embed=embed)
                 await mp.queue.put(source)
                 await ctx.message.add_reaction('👍')
+                if ctx.message.author.name == "pineapplecat":
+                    phrases = ["Great choice King! :3"]
+                    await ctx.send(f"{random.choice(phrases)}")
             except Exception as e:
                 await ctx.send(f"Exception caught: {e}")
 
@@ -170,5 +180,8 @@ async def on_ready():
 
 
 if __name__ == '__main__':
+    assert os.getenv("DISCORD_TOKEN") is not None
+    assert os.getenv("SPOTIFY_CLIENT_ID") is not None
+    assert os.getenv("SPOTIFY_CLIENT_SECRET") is not None
     bot.add_cog(MusicBot(bot))
     bot.run(os.getenv("DISCORD_TOKEN"))

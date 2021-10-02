@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from discord.ext import commands
 
 import asyncio
@@ -27,6 +28,14 @@ FFMPEG_OPTS = {
 }
 
 ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
+
+
+@dataclass
+class QueueObject:
+    """Song metadata in a queue before its processed by YTDL"""
+    webpage_url: str
+    title: str
+    requester: str = None
 
 
 class YTDL(discord.PCMVolumeTransformer):

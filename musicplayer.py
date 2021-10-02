@@ -60,15 +60,16 @@ class MusicPlayer:
 
             try:
                 embed = discord.Embed(title=f"**Now playing:** {self.current_song.title}",
-                                  description=f"Requester: [{self.current_song.requester.mention}]",
-                                  color=discord.Color.green())\
-                    .add_field(name="Youtube link", value=self.current_song.webpage_url, inline=False)\
-                    .add_field(name="Duration", value=self.current_song.duration)\
-                    .add_field(name="Channel", value=self.current_song.uploader)\
-                    .add_field(name="Views", value=str(self.current_song.views))\
-                    .add_field(name="Likes", value=str(self.current_song.likes))\
-                    .add_field(name="Dislikes", value=str(self.current_song.dislikes))\
-                    .set_thumbnail(url=self.current_song.thumbnail)\
+                                      description=f"Requester: [{self.current_song.requester.mention}]",
+                                      color=discord.Color.green()) \
+                    .add_field(name="Youtube link", value=self.current_song.webpage_url,
+                               inline=False) \
+                    .add_field(name="Duration", value=self.current_song.duration) \
+                    .add_field(name="Channel", value=self.current_song.uploader) \
+                    .add_field(name="Views", value=str(self.current_song.views)) \
+                    .add_field(name="Likes", value=str(self.current_song.likes)) \
+                    .add_field(name="Dislikes", value=str(self.current_song.dislikes)) \
+                    .set_thumbnail(url=self.current_song.thumbnail) \
                     .set_footer(text=f"Avg Bitrate: {self.current_song.abr} | "
                                      f"Avg Sampling: {self.current_song.asr} | "
                                      f"Acodec: {self.current_song.acodec}")
