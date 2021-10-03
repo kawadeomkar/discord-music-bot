@@ -18,9 +18,8 @@ class Spotify:
     def __init__(self):
         self.client_id = os.getenv('SPOTIFY_CLIENT_ID')
         self.client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+        self.token_expiry = time.time()
         self.auth_token = self.authorize(self.client_id, self.client_secret)
-        self.token_expiry = None
-        pass
 
     def __str__(self):
         return self.auth_token
@@ -37,44 +36,63 @@ class Spotify:
         if headers is None and endpoint_route != self.auth_endpoint:
             headers = {'Authorization': f"Bearer {self.auth_token}"}
 
-        async with aiohttp.ClientSession(json_serialize=ujson).request(http_method,
-                                                                       endpoint_route,
-                                                                       headers=headers,
-                                                                       data=data,
-                                                                       params=params) as resp:
+        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+            resp = await session.request(http_method,
+                                         endpoint_route,
+                                         headers=headers,
+                                         data=data,
+                                         params=params)
             # disable content types for incorrect mime type responses
             if resp.status == 200 or resp.status == 201:
                 data = await resp.json(content_type=None)
                 return data
             else:
-                data = await resp.json(content_type=None)
-                raise Exception(str(data) + "endpoint:  " + endpoint_route + "data: " + str(
-                    data) + "params: " + str(params))
+                raise Exception("endpoint:  " + endpoint_route +
+                                " stat: " + str(resp.status) +
+                                " params: " + str(params))
 
     def authorize(self, client_id: str, client_secret: str):
         # set time before http call for overhead
         self.token_expiry = time.time()
         data = {'grant_type': 'client_credentials',
-                  'client_id': client_id,
-                  'client_secret': client_secret}
+                'client_id': client_id,
+                'client_secret': client_secret}
 
         resp = requests.post(self.auth_endpoint, data=data).json()
         self.token_expiry += resp['expires_in']
         return resp['access_token']
 
     @lru_cache(maxsize=None)
-    async def track(self, id):
+    async def track(self, tid: str) -> str:
         """
         Gets a track information given URL
-        :param id: spotify track id
+        :param tid: spotify track id
         :return: title of the song
         """
-        endpoint_route = self.spotify_endpoint + f"v1/tracks/{id}"
+        endpoint_route = self.spotify_endpoint + f"v1/tracks/{tid}"
         resp = await self.http_call(endpoint_route)
         title = resp['name']
         for artist in resp['artists']:
             title += f" {artist['name']}"
         return title
+
+    @lru_cache(maxsize=None)
+    async def playlist(self, pid: str) -> List[str]:
+        """
+        Gets a playlist information given URL
+        :param pid: spotify track id
+        :return: list of
+        """
+        endpoint_route = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
+        data = {"fields": "items(track(name,artists(name)))"}
+        resp = await self.http_call(endpoint_route, params=data)
+        track_titles = []
+        for item in resp.get("items", []):
+            title = item["track"]["name"]
+            for artist in item["track"]["artists"]:
+                title += f" {artist['name']}"
+            track_titles.append(title)
+        return track_titles
 
     @lru_cache(maxsize=None)
     async def artists(self, ids: Union[List, str]):

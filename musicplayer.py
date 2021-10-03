@@ -7,7 +7,7 @@ import discord
 
 
 class MusicPlayer:
-    __slots__ = ('bot', '_ctx', '_guild', '_channel', '_cog', 'current_song', 'next_song', 'queue',
+    __slots__ = ('bot', '_ctx', '_guild', '_channel', '_cog', 'current_song', 'play_next', 'queue',
                  'play_message', 'volume', '_player')
 
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
@@ -19,8 +19,9 @@ class MusicPlayer:
         self._cog = ctx.cog
 
         self.current_song: YTDL = None
-        self.next_song = asyncio.Event()
-        self.queue = asyncio.Queue()
+        self.play_next: asyncio.Event = asyncio.Event()
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.mutex: asyncio.Lock = asyncio.Lock()
 
         self.play_message = None
         self.volume = 0.5
@@ -42,7 +43,7 @@ class MusicPlayer:
         await self.bot.wait_until_ready()
 
         while not self.bot.is_closed():
-            self.next_song.clear()
+            self.play_next.clear()
             print(f"q size: {str(self.queue.qsize())}")
             try:
                 async with async_timeout.timeout(300):
@@ -53,7 +54,7 @@ class MusicPlayer:
                 self.bot.loop.create_task(self.stop())
                 return
 
-            print(source)
+            print(f"ingested from queue: {source}")
             # TODO: Exception handle on error processing
             self.current_song = await YTDL.yt_stream(source, self._ctx, loop=self.bot.loop)
             self.current_song.volume = self.volume
@@ -83,8 +84,8 @@ class MusicPlayer:
 
             self._guild.voice_client.play(self.current_song,
                                           after=lambda _: self.bot.loop.call_soon_threadsafe(
-                                              self.next_song.set))
-            await self.next_song.wait()
+                                              self.play_next.set))
+            await self.play_next.wait()
             self.queue.task_done()
             self.current_song.cleanup()
             self.current_song = None

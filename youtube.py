@@ -1,10 +1,13 @@
 from dataclasses import dataclass
 from discord.ext import commands
+from typing import Union
 
 import asyncio
 import datetime
 import discord
 import youtube_dl
+import sources
+import spotify
 
 # TODO: postprocessing ffmpeg, audio format, etc.
 YTDL_OPTS = {
@@ -22,11 +25,6 @@ YTDL_OPTS = {
     'source_address': '0.0.0.0',
 }
 
-FFMPEG_OPTS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
-}
-
 ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
 
 
@@ -35,15 +33,21 @@ class QueueObject:
     """Song metadata in a queue before its processed by YTDL"""
     webpage_url: str
     title: str
-    requester: str = None
+    requester: Union[discord.User, discord.Member]
+    ts: int = None
 
 
 class YTDL(discord.PCMVolumeTransformer):
+    FFMPEG_OPTS = {
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        'options': '-vn'
+    }
+
     def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict,
                  volume: float = 0.5, requester=None):
         super().__init__(source, volume)
 
-        self.requester = requester or ctx.author
+        self.requester = requester
         self.channel = ctx.channel
 
         self.data = data
@@ -69,35 +73,56 @@ class YTDL(discord.PCMVolumeTransformer):
         return self.__getattribute__(item)
 
     @classmethod
-    async def yt_stream(cls, data, ctx, *, loop=None):
+    async def yt_stream(cls, qo: QueueObject,
+                        ctx: commands.Context,
+                        *,
+                        loop: asyncio.BaseEventLoop = None):
         loop = loop or asyncio.get_event_loop()
-        requester = data['requester']
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(data['webpage_url'],
+        requester = qo.requester or ctx.author
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(qo.webpage_url,
                                                                           download=False,
                                                                           process=True))
-        print("streaming: " + data['url'])
-        print(ctx)
+        ffmpeg_opts = cls.FFMPEG_OPTS.copy()
+        if qo.ts is not None:
+            ffmpeg_opts["options"] += f" -ss {qo.ts}"
+            await ctx.send(f"Starting song at {qo.ts} seconds")
+
         return cls(ctx,
-                   discord.FFmpegPCMAudio(data['url'], **FFMPEG_OPTS, executable="ffmpeg"),
-                   data=data,
-                   requester=requester)
+                   discord.FFmpegPCMAudio(data['url'], **ffmpeg_opts, executable="ffmpeg"),
+                   data=data, requester=requester)
 
     # TODO: handle downloading?
     @classmethod
-    async def yt_url(cls, url, ctx, *, loop: asyncio.BaseEventLoop = None, download=False,
-                     ytsearch: str = None):
+    async def yt_url(cls, source: Union[sources.SpotifySource,
+                                        sources.YTSource,
+                                        sources.SoundcloudSource],
+                     ctx: commands.Context,
+                     spotify: spotify.Spotify,
+                     *,
+                     loop: asyncio.BaseEventLoop = None,
+                     download=False) -> QueueObject:
         loop = loop or asyncio.get_event_loop()
-        process = False
+        process, ts = False, None
 
-        if "https" not in url and ytsearch:
-            url = " ".join(ytsearch.split(" ")[1:])
-            url = f"ytsearch:{url}"
+        if source.stype == sources.URLSource.SPOTIFY:
+            search = await spotify.track(source.id)
             process = True
+        elif source.stype == sources.URLSource.YOUTUBE:
+            if source.ytsearch:
+                search = source.ytsearch
+                process = True
+            elif source.url:
+                search = source.url
+            ts = source.ts
+        elif source.stype == sources.URLSource.SOUNDCLOUD:
+            search = source.url
 
+        print(search, process)
         # process=True to resolve all unresolved references (urls), need for ytsearch
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url,
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(search,
                                                                           download=download,
                                                                           process=process))
+        print(data)
         if data is None:
             # TODO: create custom YTDL exceptions
             raise Exception("Could not find song")
@@ -107,14 +132,7 @@ class YTDL(discord.PCMVolumeTransformer):
                 if entry and entry.get('_type', None) != 'playlist':
                     data = entry
                     break
-
-        # ctx.message.guild.voice_client.play(
-        # discord.FFmpegPCMAudio(source=url, **FFMPEG_OPTS, executable="ffmpeg"))
-
-        return cls(ctx,
-                   discord.FFmpegPCMAudio(ytdl.prepare_filename(data)),
-                   data=data,
-                   requester=ctx.author) \
-            if download else {'webpage_url': data['webpage_url'],
-                              'requester': ctx.author,
-                              'title': data['title']}
+        if download:
+            # ytdl.prepare_filename(data)
+            pass
+        return QueueObject(data['webpage_url'], data['title'], ctx.author, ts=ts)

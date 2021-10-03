@@ -8,6 +8,7 @@ from youtube import YTDL
 import discord
 import os
 import random
+import sources
 
 
 class MusicBot(commands.Cog):
@@ -52,37 +53,57 @@ class MusicBot(commands.Cog):
     @commands.command(name='play', aliases=['p', 'pl', 'pla', 'sing'], help='play a youtube song')
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
-        if not discord.utils.get(self.bot.voice_clients, guild=ctx.guild):
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+
+        if not voice_client:
             try:
                 print("trying to join voice client")
                 await ctx.invoke(self.join)
             except Exception as e:
-                print(e)
                 print(f"failed : {str(e)}")
+                raise e
 
-        if "spotify" in url or "spotify" in ctx.message.content:
-            title = self.spotify.track()
-            await ctx.send("Spotify not supported yet")
-            return
         mp = self.get_mp(ctx)
 
         # only support youtube link for now
         async with ctx.typing():
             try:
-                source = await YTDL.yt_url(url, ctx, loop=self.bot.loop,
-                                           ytsearch=ctx.message.content)
+                source = sources.parse_url(url, ctx.message.content)
+                if source.stype == sources.URLSource.SPOTIFY and source.type == "playlist":
+                    pl_titles = await self.spotify.playlist(source.id)
+                    srcs = [sources.YTSource(ytsearch=f"ytsearch:{title}") for title in pl_titles]
+                    #await ctx.send("Spotify playlists not yet supported")
+                else:
+                    srcs = [source]
+
+                print(srcs)
+                source_metadata = [await YTDL.yt_url(src,
+                                                     ctx,
+                                                     self.spotify,
+                                                     loop=self.bot.loop)
+                                   for src in srcs]
+
                 print(f"play qsize: {mp.queue.qsize()}")
-                if mp.queue.qsize() > 0:
-                    embed = discord.Embed(title="Queued song",
-                                          description=f"{source.get('title')} - ({source.get('webpage_url')}) "
-                                                      f"[{ctx.author.mention}]",
-                                          color=discord.Color.blue())
-                    await ctx.send(embed=embed)
-                await mp.queue.put(source)
-                await ctx.message.add_reaction('👍')
-                if ctx.message.author.name == "pineapplecat":
-                    phrases = ["Great choice King! :3"]
-                    await ctx.send(f"{random.choice(phrases)}")
+                print(source_metadata)
+                for src_meta in source_metadata:
+                    if mp.queue.qsize() > 0 or (voice_client and voice_client.is_playing()):
+                        embed = discord.Embed(title="Queued song",
+                                              description=f"{src_meta.title} - ({src_meta.webpage_url}) "
+                                                          f"[{ctx.author.mention}]",
+                                              color=discord.Color.blue())
+                        await ctx.send(embed=embed)
+                    await mp.queue.put(src_meta)
+                    await ctx.message.add_reaction('👍')
+                    if ctx.message.author.name == "pineapplecat":
+                        phrases = ["great choice king! :3",
+                                   "my god you gigachad, impressive choice",
+                                   "splendid choice pogdaddy",
+                                   "turbo taste fam",
+                                   "terrific taste turbo chad",
+                                   "vibrations are retrograde daddy"]
+                        await ctx.send(f"{random.choice(phrases)}")
+                    elif ctx.message.author.name == "Bryan":
+                        await ctx.send(f"terrible choice bryan, cringepilled taste beta simp")
             except Exception as e:
                 await ctx.send(f"Exception caught: {e}")
 
@@ -123,11 +144,12 @@ class MusicBot(commands.Cog):
             await ctx.voice_client.move_to(channel)
         await ctx.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=True)
         await ctx.message.add_reaction('👋')
+        await ctx.invoke(self.ping)
 
     @commands.command(name='clear', aliases=['c'], help='clears the queue, in development')
     @commands.before_invoke(validate_commands)
     async def clear(self, ctx: commands.Context):
-        await ctx.send(f"in development")
+        await ctx.send(f"in development, use -stop and -join to clear")
 
     @commands.command(name='now', aliases=['np', 'rn', 'nowplaying'], help='display current song')
     @commands.before_invoke(validate_commands)
@@ -138,7 +160,8 @@ class MusicBot(commands.Cog):
         else:
             await ctx.send("No songs are currently playing.")
 
-    @commands.command(name='volume', aliases=['v', 'vol', 'sound'], help='volume level between 0 and 100')
+    @commands.command(name='volume', aliases=['v', 'vol', 'sound'],
+                      help='volume level between 0 and 100')
     @commands.before_invoke(validate_commands)
     async def volume(self, ctx: commands.Context, volume):
         if isinstance(volume, str):
@@ -158,11 +181,22 @@ class MusicBot(commands.Cog):
         else:
             await ctx.send("No songs are currently playing.")
 
-    @commands.command(name='ping', aliases=['latency', 'l', 'delay'], help='latency, in development')
+    @commands.command(name='ping', aliases=['latency', 'l', 'delay'],
+                      help='latency in milliseconds')
     @commands.before_invoke(validate_commands)
-    async def ping(self, ctx: commands.Context, ping):
-        print(f"ping type: f{ping}")
-        await ctx.send(f"in development")
+    async def ping(self, ctx: commands.Context):
+        ms = self.bot.latency * 1000
+        embed = discord.Embed(title="Ping - latency in ms",
+                              description=f"Ping: **{round(ms)}** milliseconds!")
+        if ms <= 50:
+            embed.color = 0x44ff44
+        elif ms <= 100:
+            embed.color = 0xffd000
+        elif ms <= 200:
+            embed.color = 0xff6600
+        else:
+            embed.color = 0x990000
+        await ctx.send(embed=embed)
 
 
 bot = commands.Bot(
