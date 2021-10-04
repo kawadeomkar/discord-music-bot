@@ -1,14 +1,17 @@
 from discord.ext import commands
-from youtube import YTDL
+from youtube import QueueObject, YTDL
+from typing import List, Union
+from sources import YTSource
 
 import asyncio
 import async_timeout
+import functools
 import discord
 
 
 class MusicPlayer:
     __slots__ = ('bot', '_ctx', '_guild', '_channel', '_cog', 'current_song', 'play_next', 'queue',
-                 'play_message', 'volume', '_player')
+                 'mutex', 'play_message', 'volume', '_player')
 
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
         self.bot = bot
@@ -32,11 +35,21 @@ class MusicPlayer:
         self._player.cancel()
 
     async def stop(self):
-        print("stopping")
         await self._cog.cleanup(self._guild)
 
+    async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
+        if isinstance(obj, list):
+            for o in obj:
+                await self.queue.put(o)
+        else:
+            await self.queue.put(obj)
+
+    async def queue_get(self) -> Union[QueueObject, YTSource]:
+        return await self.queue.get()
+
     async def update_activity(self):
-        stream_activity = discord.Streaming()
+        # TODO
+        # stream_activity = discord.Streaming()
         pass
 
     async def loop(self):
@@ -47,10 +60,13 @@ class MusicPlayer:
             print(f"q size: {str(self.queue.qsize())}")
             try:
                 async with async_timeout.timeout(300):
-                    source = await self.queue.get()
+                    source: Union[QueueObject, YTSource] = await self.queue_get()
+                    if isinstance(source, YTSource):
+                        source = await YTDL.yt_source(self._ctx, source.ytsearch, source.process,
+                                                loop=self.bot.loop)
             except asyncio.TimeoutError as e:
                 # TOOD: send message to leave
-                print("timed out")
+                print("timed out " + str(e))
                 self.bot.loop.create_task(self.stop())
                 return
 

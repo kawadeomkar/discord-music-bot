@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Union
+from typing import List, Union
 
 import re
 
@@ -16,6 +16,7 @@ class SpotifySource:
     type: str
     id: str
     si: str = None
+    process: bool = True
     stype: str = URLSource.SPOTIFY
 
 
@@ -29,14 +30,21 @@ class YTSource:
     url: str = None
     ytsearch: str = None
     ts: int = None
+    process: bool = None
     stype: str = URLSource.YOUTUBE
 
 
 @dataclass(frozen=True)
 class SoundcloudSource:
-    # TODO
+    # TODO timestamp regex
     url: str
+    ts: int = None
+    process: bool = False
     stype: str = URLSource.SOUNDCLOUD
+
+
+def spotify_playlist_to_ytsearch(titles: List[str]) -> List[YTSource]:
+    return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
 
 
 def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
@@ -59,7 +67,7 @@ def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, Soundclo
     if not domain_match:
         ytsearch = " ".join(message.split(" ")[1:])
         ytsearch = f"ytsearch:{ytsearch}"
-        return YTSource(ytsearch=ytsearch)
+        return YTSource(ytsearch=ytsearch, process=True)
 
     domain = domain_match.group(3)
 
@@ -68,15 +76,14 @@ def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, Soundclo
         for _, k, v in args_match:
             if k == 'ts' or k == 't':
                 ts = int(v)
-        return YTSource(url, ts=ts)
+        return YTSource(url, ts=ts, process=False)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
         if path[0] not in ("playlist", "track"):
             raise Exception(f"Unknown Spotify track type: {path}")
         print(path[1])
-        return SpotifySource(path[0], path[1])
+        return SpotifySource(path[0], path[1], process=True)
     elif domain in ("soundcloud.com"):
-        return SoundcloudSource(url)
+        return SoundcloudSource(url, process=True)
     else:
         raise Exception(f"Domain not supported {domain}")
-

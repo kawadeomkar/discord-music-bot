@@ -1,5 +1,8 @@
+from discord.ext import commands
+
 import functools
 import logging
+import random
 import sys
 
 
@@ -22,10 +25,21 @@ def validate_input(*expected_args):
                 if exp not in args or exp not in kwargs:
                     raise Exception(f"Expected argument does not exist {exp}")
             return func(*args, **kwargs)
-
         return validate_wrap
-
     return validate_outer
+
+
+async def send_queue_phrases(ctx: commands.Context):
+    if ctx.message.author.name == "pineapplecat":
+        phrases = ["great choice king! :3",
+                   "my god you gigachad, impressive choice",
+                   "splendid choice pogdaddy",
+                   "turbo taste fam",
+                   "terrific taste turbo chad",
+                   "vibrations are retrograde daddy"]
+        await ctx.send(f"{random.choice(phrases)}")
+    elif ctx.message.author.name == "Bryan":
+        await ctx.send(f"terrible choice bryan, cringepilled taste beta simp")
 
 
 def setLogger(name: str) -> logging:

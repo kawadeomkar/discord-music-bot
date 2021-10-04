@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from discord.ext import commands
+from spotify import Spotify
 from typing import Union
 
 import asyncio
@@ -7,7 +8,6 @@ import datetime
 import discord
 import youtube_dl
 import sources
-import spotify
 
 # TODO: postprocessing ffmpeg, audio format, etc.
 YTDL_OPTS = {
@@ -73,7 +73,8 @@ class YTDL(discord.PCMVolumeTransformer):
         return self.__getattribute__(item)
 
     @classmethod
-    async def yt_stream(cls, qo: QueueObject,
+    async def yt_stream(cls,
+                        qo: QueueObject,
                         ctx: commands.Context,
                         *,
                         loop: asyncio.BaseEventLoop = None):
@@ -91,38 +92,22 @@ class YTDL(discord.PCMVolumeTransformer):
                    discord.FFmpegPCMAudio(data['url'], **ffmpeg_opts, executable="ffmpeg"),
                    data=data, requester=requester)
 
-    # TODO: handle downloading?
     @classmethod
-    async def yt_url(cls, source: Union[sources.SpotifySource,
-                                        sources.YTSource,
-                                        sources.SoundcloudSource],
-                     ctx: commands.Context,
-                     spotify: spotify.Spotify,
-                     *,
-                     loop: asyncio.BaseEventLoop = None,
-                     download=False) -> QueueObject:
+    async def yt_source(cls,
+                        ctx: commands.Context,
+                        search: str,
+                        process: bool,
+                        *,
+                        loop: asyncio.BaseEventLoop = None,
+                        download=False,
+                        ts: int = None) -> QueueObject:
         loop = loop or asyncio.get_event_loop()
-        process, ts = False, None
 
-        if source.stype == sources.URLSource.SPOTIFY:
-            search = await spotify.track(source.id)
-            process = True
-        elif source.stype == sources.URLSource.YOUTUBE:
-            if source.ytsearch:
-                search = source.ytsearch
-                process = True
-            elif source.url:
-                search = source.url
-            ts = source.ts
-        elif source.stype == sources.URLSource.SOUNDCLOUD:
-            search = source.url
-
-        print(search, process)
         # process=True to resolve all unresolved references (urls), need for ytsearch
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(search,
                                                                           download=download,
                                                                           process=process))
-        print(data)
+        # print(data)
         if data is None:
             # TODO: create custom YTDL exceptions
             raise Exception("Could not find song")
@@ -133,6 +118,7 @@ class YTDL(discord.PCMVolumeTransformer):
                     data = entry
                     break
         if download:
+            # TODO: Handle downloading?
             # ytdl.prepare_filename(data)
             pass
         return QueueObject(data['webpage_url'], data['title'], ctx.author, ts=ts)
