@@ -4,7 +4,7 @@ from sources import spotify_playlist_to_ytsearch, parse_url, URLSource, \
     SoundcloudSource, SpotifySource, YTSource
 from spotify import Spotify
 from typing import List, Union
-from util import send_queue_phrases
+from util import queue_message, send_queue_phrases
 
 # music players
 from youtube import QueueObject, YTDL
@@ -36,7 +36,8 @@ class MusicBot(commands.Cog):
         print("going to cleanup/disconnect")
         if guild.voice_client:
             await guild.voice_client.disconnect()
-        self.mps.pop(guild.id, None)
+        if guild.id in self.mps:
+            del self.mps[guild.id]
 
     async def cog_before_invoke(self, ctx: commands.Context):
         self.get_mp(ctx)
@@ -83,12 +84,7 @@ class MusicBot(commands.Cog):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         if not voice_client:
-            try:
-                print("trying to join voice client")
-                await ctx.invoke(self.join)
-            except Exception as e:
-                print(f"failed : {str(e)}")
-                raise e
+            await ctx.invoke(self.join)
 
         mp = self.get_mp(ctx)
 
@@ -101,24 +97,25 @@ class MusicBot(commands.Cog):
                 if isinstance(qobj, list) and source.stype == URLSource.SPOTIFY and source.type == "playlist":
                     qobjs = spotify_playlist_to_ytsearch(qobj)
                     print(f"ytsearch qobjs: {qobjs}")
-                    for i in range(1, len(qobj[:10])):
-                        qobj[i] = f"{i}: {qobj[i-1]}"
 
-                    embed_description = f"Requested by: [{ctx.author.mention}]\n\n" + "\n".join(qobj[:10])
-                    if len(qobj) > 10:
-                        embed_description += "\n..."
+                    description = queue_message(qobj)
+                    embed_description = f"Requested by: [{ctx.author.mention}]\n\n" + description
                     title = f"Queued playlist"
 
                     await ctx.send(embed=discord.Embed(title=title, description=embed_description,
                                                        color=discord.Color.blue()))
                     await mp.queue_put(qobjs)
+                    for title in qobj:
+                        mp.song_queue.append(title)
 
                 else:
                     if mp.queue.qsize() > 0 or (voice_client and voice_client.is_playing()):
-                        title = f"Queued song - [{ctx.author.mention}]"
-                        description = f"{qobj.title} - ({qobj.webpage_url})"
+                        title = f"Queued song"
+                        description = f"Requested by: [{ctx.author.mention}]\n" \
+                                      f"{qobj.title} - ({qobj.webpage_url})"
                         await ctx.send(embed=discord.Embed(title=title, description=description, color=discord.Color.blue()))
                     await mp.queue_put(qobj)
+                    mp.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
                     print(f"play qsize: {mp.queue.qsize()}")
 
                 await ctx.message.add_reaction('👍')
@@ -142,16 +139,27 @@ class MusicBot(commands.Cog):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
         if voice_client:
             await ctx.message.add_reaction('👋')
-            await ctx.voice_client.disconnect()
+            await self.cleanup(ctx.guild)
 
     @commands.command(name='pause', aliases=['po'], help='pause the current song')
     @commands.before_invoke(validate_commands)
     async def pause(self, ctx: commands.Context):
-        if ctx.message.guild.voice_client.is_playing():
-            await ctx.message.guild.voice_client.pause()
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+
+        if voice_client and voice_client.is_playing():
+            await voice_client.pause()
             await ctx.message.add_reaction('⏸️')
 
-    @commands.command(name='join', aliases=['j'], help='join the channel')
+    @commands.command(name='resume', aliases=['r'], help='resume the current song')
+    @commands.before_invoke(validate_commands)
+    async def pause(self, ctx: commands.Context):
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+
+        if voice_client and not voice_client.is_playing() and voice_client.is_paused():
+            await voice_client.resume()
+            await ctx.message.add_reaction('⏭️')
+
+    @commands.command(name='join', aliases=['summon'], help='join the channel')
     @commands.before_invoke(validate_commands)
     async def join(self, ctx: commands.Context):
         channel, guild = ctx.message.author.voice.channel, ctx.message.guild
@@ -178,6 +186,27 @@ class MusicBot(commands.Cog):
             await ctx.send(embed=mp.play_message)
         else:
             await ctx.send("No songs are currently playing.")
+
+    @commands.command(name='history', aliases=['h'], help='display history of songs played')
+    @commands.before_invoke(validate_commands)
+    async def history(self, ctx: commands.Context):
+        mp = self.get_mp(ctx)
+        if mp and mp.history:
+            q_history = queue_message(mp.history[:10])
+            await ctx.send(q_history)
+
+    @commands.command(name='jump', aliases=['j'], help='jumps to a specific position in queue')
+    @commands.before_invoke(validate_commands)
+    async def jump(self, ctx: commands.Context):
+        await ctx.send("currently in development")
+
+    @commands.command(name='queue', aliases=['q'], help='displays current songs in queue')
+    @commands.before_invoke(validate_commands)
+    async def queue(self, ctx: commands.Context):
+        mp = self.get_mp(ctx)
+        if mp and len(mp.song_queue) > 0:
+            q_songs = mp.get_queue()
+            await ctx.send(q_songs)
 
     @commands.command(name='volume', aliases=['v', 'vol', 'sound'],
                       help='volume level between 0 and 100')

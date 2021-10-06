@@ -1,4 +1,5 @@
 from discord.ext import commands
+from typing import List
 
 import functools
 import logging
@@ -14,6 +15,7 @@ def debug(func):
         value = func(*args, **kwargs)
         print(f"{func.__name__!r} returned {value!r}")
         return value
+
     return wrapper_debug
 
 
@@ -25,7 +27,9 @@ def validate_input(*expected_args):
                 if exp not in args or exp not in kwargs:
                     raise Exception(f"Expected argument does not exist {exp}")
             return func(*args, **kwargs)
+
         return validate_wrap
+
     return validate_outer
 
 
@@ -36,13 +40,20 @@ async def send_queue_phrases(ctx: commands.Context):
                    "splendid choice pogdaddy",
                    "turbo taste fam",
                    "terrific taste turbo chad",
-                   "vibrations are retrograde daddy"]
+                   "vibrations are retro daddy"]
         await ctx.send(f"{random.choice(phrases)}")
     elif ctx.message.author.name == "Bryan":
         await ctx.send(f"terrible choice bryan, cringepilled taste beta simp")
 
 
-def setLogger(name: str) -> logging:
+def queue_message(songs: List[str]) -> str:
+    msg = '\n'.join([f"{i}: {songs[i-1]}" for i in range(1, len(songs[:10]))])
+    if len(songs) > 10:
+        msg += '\n...'
+    return msg
+
+
+def set_logger(name: str) -> logging:
     root = logging.getLogger(name)
     root.setLevel(logging.INFO)
 

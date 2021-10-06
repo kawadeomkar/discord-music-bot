@@ -8,7 +8,7 @@ import time
 import ujson
 import util
 
-log = util.setLogger(__name__)
+log = util.set_logger(__name__)
 
 
 class Spotify:
@@ -33,8 +33,9 @@ class Spotify:
         if time.time() > self.token_expiry:
             self.auth_token = self.authorize(self.client_id, self.client_secret)
 
-        if headers is None and endpoint_route != self.auth_endpoint:
-            headers = {'Authorization': f"Bearer {self.auth_token}"}
+        if headers is None:
+            headers = {}
+        headers['Authorization'] = f"Bearer {self.auth_token}"
 
         async with aiohttp.ClientSession(json_serialize=ujson) as session:
             resp = await session.request(http_method,

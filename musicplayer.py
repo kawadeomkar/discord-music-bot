@@ -1,7 +1,9 @@
+from collections import deque
 from discord.ext import commands
 from youtube import QueueObject, YTDL
-from typing import List, Union
 from sources import YTSource
+from typing import List, Union
+from util import queue_message
 
 import asyncio
 import async_timeout
@@ -11,7 +13,7 @@ import discord
 
 class MusicPlayer:
     __slots__ = ('bot', '_ctx', '_guild', '_channel', '_cog', 'current_song', 'play_next', 'queue',
-                 'mutex', 'play_message', 'volume', '_player')
+                 'mutex', 'play_message', 'history', 'song_queue', 'volume', '_player')
 
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
         self.bot = bot
@@ -26,26 +28,43 @@ class MusicPlayer:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.mutex: asyncio.Lock = asyncio.Lock()
 
-        self.play_message = None
+        self.play_message: discord.Embed = None
+        self.history: List[str] = []
+        self.song_queue: deque = deque()
         self.volume = 0.5
 
         self._player = bot.loop.create_task(self.loop())
 
     def __del__(self):
-        self._player.cancel()
+        print("__del__ cancelling task")
+        return self._player.cancel()
+
+    def get_queue(self) -> str:
+        return queue_message(list(self.song_queue)[:10])
 
     async def stop(self):
         await self._cog.cleanup(self._guild)
 
     async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
-        if isinstance(obj, list):
-            for o in obj:
-                await self.queue.put(o)
-        else:
-            await self.queue.put(obj)
+        async with self.mutex:
+            if isinstance(obj, list):
+                for o in obj:
+                    await self.queue.put(o)
+            else:
+                await self.queue.put(obj)
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
+
+    async def queue_clear(self) -> None:
+        async with self.mutex:
+            for _ in range(self.queue.qsize()):
+                try:
+                    self.queue.get_nowait()
+                    self.queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self.song_queue.clear()
 
     async def update_activity(self):
         # TODO
@@ -60,14 +79,15 @@ class MusicPlayer:
             print(f"q size: {str(self.queue.qsize())}")
             try:
                 async with async_timeout.timeout(300):
+                    # mutex lock queue get
                     source: Union[QueueObject, YTSource] = await self.queue_get()
                     if isinstance(source, YTSource):
                         source = await YTDL.yt_source(self._ctx, source.ytsearch, source.process,
-                                                loop=self.bot.loop)
+                                                      loop=self.bot.loop)
             except asyncio.TimeoutError as e:
                 # TOOD: send message to leave
                 print("timed out " + str(e))
-                self.bot.loop.create_task(self.stop())
+                await self.bot.loop.create_task(self.stop())
                 return
 
             print(f"ingested from queue: {source}")
@@ -98,10 +118,12 @@ class MusicPlayer:
 
             print(f"guild voice client: {self._guild.voice_client}")
 
+            self.song_queue.popleft()
             self._guild.voice_client.play(self.current_song,
                                           after=lambda _: self.bot.loop.call_soon_threadsafe(
                                               self.play_next.set))
             await self.play_next.wait()
+            self.history.append(f"{self.current_song.title} - {self.current_song.webpage_url}")
             self.queue.task_done()
             self.current_song.cleanup()
             self.current_song = None
