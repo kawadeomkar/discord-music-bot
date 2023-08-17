@@ -37,7 +37,13 @@ class MusicBot(commands.Cog):
         if guild.voice_client:
             await guild.voice_client.disconnect()
         if guild.id in self.mps:
-            del self.mps[guild.id]
+            try:
+                del self.mps[guild.id]
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(type(e))
+                print(f"caught e")
 
     async def cog_before_invoke(self, ctx: commands.Context):
         self.get_mp(ctx)
@@ -159,10 +165,20 @@ class MusicBot(commands.Cog):
             await voice_client.resume()
             await ctx.message.add_reaction('⏭️')
 
+    @commands.command(name='shuffle', help='shuffles the songs in the queue (3+ songs)')
+    @commands.before_invoke(validate_commands)
+    async def shuffle(self, ctx: commands.Context):
+        mp = self.get_mp(ctx)
+        async with ctx.typing():
+            await ctx.send("Please wait... shuffling")
+            msg = await mp.queue_shuffle()
+            await ctx.message.add_reaction('🔀')
+            await ctx.send(msg)
+
     @commands.command(name='join', aliases=['summon'], help='join the channel')
     @commands.before_invoke(validate_commands)
     async def join(self, ctx: commands.Context):
-        channel, guild = ctx.message.author.voice.channel, ctx.message.guild
+        channel = ctx.message.author.voice.channel
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         if not voice_client:
@@ -218,14 +234,13 @@ class MusicBot(commands.Cog):
             except ValueError as e:
                 await ctx.send("Volume must be a number between 0 and 100")
                 return
-        if ctx.voice_state.is_playing:
-            if not 0 < volume < 100:
+        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+        if voice_client and voice_client.is_playing():
+            if not 0 <= volume <= 100:
                 return await ctx.send('Volume must be between 0 and 100')
-            if volume > 0:
-                volume = volume / 100
-                mp = self.get_mp(ctx)
-                mp.volume = volume
-                ctx.send(f"Set volume of music player to {volume}")
+            volume = volume / 100
+            voice_client.source.volume = volume
+            ctx.send(f"Set volume of music player to {volume}")
         else:
             await ctx.send("No songs are currently playing.")
 

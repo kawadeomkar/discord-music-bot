@@ -1,3 +1,5 @@
+import random
+import time
 from collections import deque
 from discord.ext import commands
 from youtube import QueueObject, YTDL
@@ -37,7 +39,12 @@ class MusicPlayer:
 
     def __del__(self):
         print("__del__ cancelling task")
-        return self._player.cancel()
+        try:
+            self._player.cancel()
+        except Exception as e:
+            print("del caught error")
+            print(str(e))
+        return
 
     def get_queue(self) -> str:
         return queue_message(list(self.song_queue)[:10])
@@ -54,6 +61,9 @@ class MusicPlayer:
                 await self.queue.put(obj)
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
+        while self.mutex.locked():
+            # now this is real hacky but cannot use mutex lock here due to race condition
+            time.sleep(0.25)
         return await self.queue.get()
 
     async def queue_clear(self) -> None:
@@ -61,10 +71,35 @@ class MusicPlayer:
             for _ in range(self.queue.qsize()):
                 try:
                     self.queue.get_nowait()
-                    self.queue.task_done()
+                    self.queue.task_done()  # eventually will use join
                 except asyncio.QueueEmpty:
                     break
             self.song_queue.clear()
+
+    async def queue_shuffle(self) -> str:
+        shuffled = []
+        squeue = []
+
+        if self.queue.qsize() < 4:
+            return "There must be at least 3 songs to shuffle the queue"
+
+        async with self.mutex:
+            for _ in range(self.queue.qsize()):
+                try:
+                    song = self.queue.get_nowait()
+                    self.queue.task_done()
+                    shuffled.append(song)
+                except asyncio.QueueEmpty:
+                    break
+            random.shuffle(shuffled)
+            for song in shuffled:
+                try:
+                    self.queue.put_nowait(song)
+                    squeue.append(f"{song.title} - [{song.webpage_url}]")
+                except asyncio.QueueFull:
+                    break
+            self.song_queue = deque(squeue)
+        return "Shuffled!"
 
     async def update_activity(self):
         # TODO
@@ -87,7 +122,7 @@ class MusicPlayer:
             except asyncio.TimeoutError as e:
                 # TOOD: send message to leave
                 print("timed out " + str(e))
-                await self.bot.loop.create_task(self.stop())
+                self.bot.loop.create_task(self.stop())
                 return
 
             print(f"ingested from queue: {source}")
