@@ -21,7 +21,7 @@ class MusicPlayer:
         self.bot = bot
 
         self._ctx = ctx
-        self._guild = ctx.guild
+        self._guild: discord.Guild = ctx.guild
         self._channel = ctx.channel
         self._cog = ctx.cog
 
@@ -151,12 +151,17 @@ class MusicPlayer:
                 print(f"embed error {str(e)}")
             await self._ctx.send(embed=embed)
 
+            print(f"Current song: {self.current_song}")
             print(f"guild voice client: {self._guild.voice_client}")
+            print(f"guild voice client source: {self._guild.voice_client.source}")
+            print(f"guild voice client user: {self._guild.voice_client.user}")
+            print(f"guild voice client latency: {self._guild.voice_client.latency}")
 
             self.song_queue.popleft()
             self._guild.voice_client.play(self.current_song,
                                           after=lambda _: self.bot.loop.call_soon_threadsafe(
                                               self.play_next.set))
+            print(f"guild voice client source: {self._guild.voice_client.source}") 
             await self.play_next.wait()
             self.history.append(f"{self.current_song.title} - {self.current_song.webpage_url}")
             self.queue.task_done()

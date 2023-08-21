@@ -13,6 +13,7 @@ import sources
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'extractaudio': True,
+    'verbose': True,
     'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
     'restrictfilenames': True,
     'noplaylist': True,
@@ -81,6 +82,9 @@ class YTDL(discord.PCMVolumeTransformer):
                         loop: asyncio.BaseEventLoop = None):
         loop = loop or asyncio.get_event_loop()
         requester = qo.requester or ctx.author
+        print("Streaming...")
+        print(qo)
+        print(ytdl)
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(qo.webpage_url,
                                                                           download=False,
                                                                           process=True))
@@ -89,6 +93,7 @@ class YTDL(discord.PCMVolumeTransformer):
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
             await ctx.send(f"Starting song at {qo.ts} seconds")
 
+        print(f"Usinig {data['url']} as stream URL")
         return cls(ctx,
                    discord.FFmpegPCMAudio(data['url'], **ffmpeg_opts, executable="ffmpeg"),
                    data=data, requester=requester)

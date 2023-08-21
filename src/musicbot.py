@@ -91,8 +91,11 @@ class MusicBot(commands.Cog):
 
         if not voice_client:
             await ctx.invoke(self.join)
+            voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         mp = self.get_mp(ctx)
+        print("Voice client")
+        print(voice_client)
 
         # only support youtube link for now
         async with ctx.typing():
@@ -261,24 +264,5 @@ class MusicBot(commands.Cog):
             embed.color = 0x990000
         await ctx.send(embed=embed)
 
-
-bot = commands.Bot(
-    command_prefix='-',
-    intents=discord.Intents().all(),  # TODO: narrow down
-    description='omkars bad music bot lol',
-    strip_after_prefix=True)
-
-
-@bot.event
-async def on_ready():
-    activity = discord.Game(name="music", type=3)
-    await bot.change_presence(status=discord.Status.online, activity=activity)
-    print(f'Bot :\n{bot.user.name}\n{bot.user.id}')
-
-
-if __name__ == '__main__':
-    assert os.getenv("DISCORD_TOKEN") is not None
-    assert os.getenv("SPOTIFY_CLIENT_ID") is not None
-    assert os.getenv("SPOTIFY_CLIENT_SECRET") is not None
-    bot.add_cog(MusicBot(bot))
-    bot.run(os.getenv("DISCORD_TOKEN"))
+async def setup(bot):
+    await bot.add_cog(MusicBot(bot))

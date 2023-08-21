@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "discord_music_bot"
+version = "0.1.0"
+description = ""
+authors = [
+
+]
+maintainers = [
+
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+youtube-dl = "^2021.12.17"
+discord = "2.3.2"
+requests = "^2.31.0"
+ujson = "^5.8.0"
+pynacl = "1.5.0"
+discord-py = {version = "2.3.2", extras = ["voice"]}
