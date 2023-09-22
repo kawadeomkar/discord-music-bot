@@ -1,8 +1,7 @@
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Union
-
-import re
 
 
 class URLSource(Enum):
@@ -27,6 +26,7 @@ class YTSource:
     :param ytsearch: youtube search
     :param ts: timestamp
     """
+
     url: str = None
     ytsearch: str = None
     ts: int = None
@@ -47,7 +47,9 @@ def spotify_playlist_to_ytsearch(titles: List[str]) -> List[YTSource]:
     return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
 
 
-def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+def parse_url(
+    url: str, message: str
+) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """
     domain regex (4 groups):
         group 1/2: http/www prefix
@@ -58,8 +60,8 @@ def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, Soundclo
     :param message: full message content search
     :return: source
     """
-    domain_re = r'(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)'
-    args_re = r'(\?|\&)([^=]+)\=([^&]+)'
+    domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
+    args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
     domain_match = re.search(domain_re, url)
     args_match = re.findall(args_re, url)
@@ -74,7 +76,7 @@ def parse_url(url: str, message: str) -> Union[SpotifySource, YTSource, Soundclo
     if domain in ("youtube.com", "youtu.be"):
         ts = None
         for _, k, v in args_match:
-            if k == 'ts' or k == 't':
+            if k == "ts" or k == "t":
                 ts = int(v)
         return YTSource(url, ts=ts, process=False)
     elif domain in ("open.spotify.com", "spotify.com"):

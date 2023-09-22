@@ -1,13 +1,18 @@
 import asyncio
-import spotify
+
 import sources
+import spotify
 
 
 async def main():
-    print('Hello ...')
+    print("Hello ...")
     surl = "https://open.spotify.com/track/23gcQr3NRKzLXsP9H5jFQ1?si=8d255931ca894543"
-    surl2 = "https://open.spotify.com/playlist/2jEvNUvrWJZaYGlxVGdbp3?si=3c5a640ca10e4271"
-    surl3 = "https://open.spotify.com/playlist/0ObdckZXsQInIGzdWdcaqu?si=1fa714b3d6f44f15"
+    surl2 = (
+        "https://open.spotify.com/playlist/2jEvNUvrWJZaYGlxVGdbp3?si=3c5a640ca10e4271"
+    )
+    surl3 = (
+        "https://open.spotify.com/playlist/0ObdckZXsQInIGzdWdcaqu?si=1fa714b3d6f44f15"
+    )
     yurl = "https://youtu.be/PNpf1QO7-Hg?t=9&ee=lol"
     yurl2 = "https://youtu.be/YOx3XlQekpA"
 
@@ -22,7 +27,8 @@ async def main():
     titles = await spot.playlist(sp_source.id)
     print(titles)
 
-    #print(yt_source)
+    # print(yt_source)
+
 
 # Python 3.7+
 asyncio.run(main())

@@ -1,0 +1,18 @@
+version: '3.9'
+
+services:
+  discord-music-bot:
+    container_name: discord-music-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: discord-music-bot:${GIT_SHA:-latest}
+    restart: always
+    ports:
+    - "8000:8000"
+    environment:
+    - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+    - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+    - DISCORD_TOKEN=${DISCORD_TOKEN}
+    env_file:
+    - .env

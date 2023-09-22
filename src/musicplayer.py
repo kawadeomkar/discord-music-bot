@@ -1,21 +1,36 @@
+import asyncio
+import functools
 import random
 import time
 from collections import deque
-from discord.ext import commands
-from youtube import QueueObject, YTDL
-from sources import YTSource
 from typing import List, Union
-from util import queue_message
 
-import asyncio
 import async_timeout
-import functools
 import discord
+from discord.ext import commands
+
+from src.sources import YTSource
+from src.util import queue_message
+from src.youtube import YTDL, QueueObject
 
 
 class MusicPlayer:
-    __slots__ = ('bot', '_ctx', '_guild', '_channel', '_cog', 'current_song', 'play_next', 'queue',
-                 'mutex', 'play_message', 'history', 'song_queue', 'volume', '_player')
+    __slots__ = (
+        "bot",
+        "_ctx",
+        "_guild",
+        "_channel",
+        "_cog",
+        "current_song",
+        "play_next",
+        "queue",
+        "mutex",
+        "play_message",
+        "history",
+        "song_queue",
+        "volume",
+        "_player",
+    )
 
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
         self.bot = bot
@@ -117,8 +132,12 @@ class MusicPlayer:
                     # mutex lock queue get
                     source: Union[QueueObject, YTSource] = await self.queue_get()
                     if isinstance(source, YTSource):
-                        source = await YTDL.yt_source(self._ctx, source.ytsearch, source.process,
-                                                      loop=self.bot.loop)
+                        source = await YTDL.yt_source(
+                            self._ctx,
+                            source.ytsearch,
+                            source.process,
+                            loop=self.bot.loop,
+                        )
             except asyncio.TimeoutError as e:
                 # TOOD: send message to leave
                 print("timed out " + str(e))
@@ -127,24 +146,35 @@ class MusicPlayer:
 
             print(f"ingested from queue: {source}")
             # TODO: Exception handle on error processing
-            self.current_song = await YTDL.yt_stream(source, self._ctx, loop=self.bot.loop)
+            self.current_song = await YTDL.yt_stream(
+                source, self._ctx, loop=self.bot.loop
+            )
             self.current_song.volume = self.volume
 
             try:
-                embed = discord.Embed(title=f"**Now playing:** {self.current_song.title}",
-                                      description=f"Requester: [{self.current_song.requester.mention}]",
-                                      color=discord.Color.green()) \
-                    .add_field(name="Youtube link", value=self.current_song.webpage_url,
-                               inline=False) \
-                    .add_field(name="Duration", value=self.current_song.duration) \
-                    .add_field(name="Channel", value=self.current_song.uploader) \
-                    .add_field(name="Views", value=str(self.current_song.views)) \
-                    .add_field(name="Likes", value=str(self.current_song.likes)) \
-                    .add_field(name="Dislikes", value=str(self.current_song.dislikes)) \
-                    .set_thumbnail(url=self.current_song.thumbnail) \
-                    .set_footer(text=f"Avg Bitrate: {self.current_song.abr} | "
-                                     f"Avg Sampling: {self.current_song.asr} | "
-                                     f"Acodec: {self.current_song.acodec}")
+                embed = (
+                    discord.Embed(
+                        title=f"**Now playing:** {self.current_song.title}",
+                        description=f"Requester: [{self.current_song.requester.mention}]",
+                        color=discord.Color.green(),
+                    )
+                    .add_field(
+                        name="Youtube link",
+                        value=self.current_song.webpage_url,
+                        inline=False,
+                    )
+                    .add_field(name="Duration", value=self.current_song.duration)
+                    .add_field(name="Channel", value=self.current_song.uploader)
+                    .add_field(name="Views", value=str(self.current_song.views))
+                    .add_field(name="Likes", value=str(self.current_song.likes))
+                    .add_field(name="Dislikes", value=str(self.current_song.dislikes))
+                    .set_thumbnail(url=self.current_song.thumbnail)
+                    .set_footer(
+                        text=f"Avg Bitrate: {self.current_song.abr} | "
+                        f"Avg Sampling: {self.current_song.asr} | "
+                        f"Acodec: {self.current_song.acodec}"
+                    )
+                )
                 self.play_message = embed
 
             except Exception as e:
@@ -158,12 +188,15 @@ class MusicPlayer:
             print(f"guild voice client latency: {self._guild.voice_client.latency}")
 
             self.song_queue.popleft()
-            self._guild.voice_client.play(self.current_song,
-                                          after=lambda _: self.bot.loop.call_soon_threadsafe(
-                                              self.play_next.set))
-            print(f"guild voice client source: {self._guild.voice_client.source}") 
+            self._guild.voice_client.play(
+                self.current_song,
+                after=lambda _: self.bot.loop.call_soon_threadsafe(self.play_next.set),
+            )
+            print(f"guild voice client source: {self._guild.voice_client.source}")
             await self.play_next.wait()
-            self.history.append(f"{self.current_song.title} - {self.current_song.webpage_url}")
+            self.history.append(
+                f"{self.current_song.title} - {self.current_song.webpage_url}"
+            )
             self.queue.task_done()
             self.current_song.cleanup()
             self.current_song = None
