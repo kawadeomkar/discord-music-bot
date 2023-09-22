@@ -12,7 +12,6 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-youtube-dl = "^2021.12.17"
 discord = "2.3.2"
 requests = "^2.31.0"
 ujson = "^5.8.0"
