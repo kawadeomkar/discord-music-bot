@@ -7,10 +7,17 @@ import discord
 from discord.ext import commands
 
 from src.musicplayer import MusicPlayer
-from src.sources import (SoundcloudSource, SpotifySource, URLSource, YTSource,
-                         parse_url, spotify_playlist_to_ytsearch)
+from src.sources import (
+    SoundcloudSource,
+    SpotifySource,
+    URLSource,
+    YTSource,
+    parse_url,
+    spotify_playlist_to_ytsearch,
+)
 from src.spotify import Spotify
 from src.util import queue_message, send_queue_phrases
+
 # music players
 from src.youtube import YTDL, QueueObject
 

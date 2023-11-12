@@ -8,9 +8,5 @@ services:
       dockerfile: Dockerfile
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
-    environment:
-    - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
-    - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
-    - DISCORD_TOKEN=${DISCORD_TOKEN}
     env_file:
     - .env
