@@ -1,6 +1,6 @@
 import os
 import time
-from functools import lru_cache
+from async_lru import alru_cache
 from typing import Any, Dict, List, Union
 
 import aiohttp
@@ -71,7 +71,7 @@ class Spotify:
         self.token_expiry += resp["expires_in"]
         return resp["access_token"]
 
-    @lru_cache(maxsize=None)
+    @alru_cache(maxsize=None)
     async def track(self, tid: str) -> str:
         """
         Gets a track information given URL
@@ -85,7 +85,7 @@ class Spotify:
             title += f" {artist['name']}"
         return title
 
-    @lru_cache(maxsize=None)
+    @alru_cache(maxsize=None)
     async def playlist(self, pid: str) -> List[str]:
         """
         Gets a playlist information given URL
@@ -103,7 +103,7 @@ class Spotify:
             track_titles.append(title)
         return track_titles
 
-    @lru_cache(maxsize=None)
+    @alru_cache(maxsize=None)
     async def artists(self, ids: Union[List, str]):
         """
         Returns artist(s) information
@@ -117,7 +117,7 @@ class Spotify:
             return resp["artists"]
         return resp
 
-    @lru_cache(maxsize=None)
+    @alru_cache(maxsize=None)
     async def albums(self, ids: Union[List, str]):
         """
         Returns album(s) information
