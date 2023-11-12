@@ -71,7 +71,7 @@ class Spotify:
         self.token_expiry += resp["expires_in"]
         return resp["access_token"]
 
-    @alru_cache(maxsize=None)
+    @alru_cache(maxsize=256, ttl=360)
     async def track(self, tid: str) -> str:
         """
         Gets a track information given URL
@@ -85,7 +85,7 @@ class Spotify:
             title += f" {artist['name']}"
         return title
 
-    @alru_cache(maxsize=None)
+    @alru_cache(maxsize=256, ttl=360)
     async def playlist(self, pid: str) -> List[str]:
         """
         Gets a playlist information given URL
@@ -103,7 +103,7 @@ class Spotify:
             track_titles.append(title)
         return track_titles
 
-    @alru_cache(maxsize=None)
+    @alru_cache(maxsize=256, ttl=360)
     async def artists(self, ids: Union[List, str]):
         """
         Returns artist(s) information
@@ -117,7 +117,7 @@ class Spotify:
             return resp["artists"]
         return resp
 
-    @alru_cache(maxsize=None)
+    @alru_cache(maxsize=256, ttl=360)
     async def albums(self, ids: Union[List, str]):
         """
         Returns album(s) information
