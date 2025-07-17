@@ -1,3 +1,6 @@
+# Ignore
+pyproject.bak.toml
+
 # PyCharm and misc
 .idea
 .idea/
