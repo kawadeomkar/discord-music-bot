@@ -2,6 +2,8 @@
 
 set -aeuxETo pipefail
 
+poetry run python -m black src/
+
 GIT_SHA=$(git rev-parse HEAD)
 export GIT_SHA=$GIT_SHA
 

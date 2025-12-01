@@ -14,6 +14,7 @@ yt-dlp = "2025.11.12"
 async-lru = "^2.0.4"
 async-timeout = "^5.0.1"
 discord-py = {git = "https://github.com/Rapptz/discord.py.git", rev = "master"}
+black = "25.11.0"
 
 [project]
 name = "discord-music-bot"
