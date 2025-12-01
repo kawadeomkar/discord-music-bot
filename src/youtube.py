@@ -9,7 +9,11 @@ from discord.ext import commands
 
 from src.spotify import Spotify
 
+
+# TODO: PO token may be required eventually 
+PO_TOKEN = ''
 # TODO: postprocessing ffmpeg, audio format, etc.
+
 YTDL_OPTS = {
     "format": "bestaudio/best",
     "extractaudio": True,
@@ -24,6 +28,16 @@ YTDL_OPTS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['default', '-tv_simply'],
+            # TODO: at the moment, we aren't being blocked by PO token requirements with `tv_simply`    
+            # This is where the PO token is passed: 'client_name+token_value'
+            #'po_token': f'mweb.player+{PO_TOKEN}'
+            # This specifies which player client to use (mweb is often reliable)
+            #'po_token': f'mweb.gvs+{PO_TOKEN}',
+        }
+    },
 }
 
 
