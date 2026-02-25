@@ -19,6 +19,17 @@ async-timeout = "^5.0.1"
 discord-py = "2.6.4"
 black = "25.11.0"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-asyncio = "^0.24"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
+
 [project]
 name = "discord-music-bot"
 description = ""
