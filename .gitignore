@@ -4,6 +4,8 @@ pyproject.bak.toml
 # PyCharm and misc
 .idea
 .idea/
+.vscode
+.vscode/
 venv
 venv/
 
