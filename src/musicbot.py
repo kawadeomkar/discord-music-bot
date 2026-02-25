@@ -16,7 +16,9 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
-from src.util import queue_message, send_queue_phrases
+from src.util import queue_message, send_queue_phrases, get_logger
+
+log = get_logger(__name__)
 
 # music players
 from src.youtube import YTDL, QueueObject
@@ -41,7 +43,7 @@ class MusicBot(commands.Cog):
         return self.mps[ctx.guild.id]
 
     async def cleanup(self, guild: discord.Guild) -> None:
-        print("going to cleanup/disconnect")
+        log.info("going to cleanup/disconnect")
         if guild.voice_client:
             await guild.voice_client.disconnect()
         if guild.id in self.mps:
@@ -50,8 +52,7 @@ class MusicBot(commands.Cog):
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                print(type(e))
-                print(f"caught e")
+                log.error(f"cleanup error: {type(e).__name__}: {e}")
 
     async def cog_before_invoke(self, ctx: commands.Context):
         self.get_mp(ctx)
@@ -115,8 +116,7 @@ class MusicBot(commands.Cog):
             voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         mp = self.get_mp(ctx)
-        print("Voice client")
-        print(voice_client)
+        log.info(f"Voice client: {voice_client}")
 
         # only support youtube link for now
         async with ctx.typing():
@@ -132,7 +132,7 @@ class MusicBot(commands.Cog):
                     and source.type == "playlist"
                 ):
                     qobjs = spotify_playlist_to_ytsearch(qobj)
-                    print(f"ytsearch qobjs: {qobjs}")
+                    log.info(f"ytsearch qobjs: {qobjs}")
 
                     description = queue_message(qobj)
                     embed_description = (
@@ -169,7 +169,7 @@ class MusicBot(commands.Cog):
                         )
                     await mp.queue_put(qobj)
                     mp.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
-                    print(f"play qsize: {mp.queue.qsize()}")
+                    log.info(f"play qsize: {mp.queue.qsize()}")
 
                 await ctx.message.add_reaction("👍")
                 await send_queue_phrases(ctx)
@@ -229,7 +229,7 @@ class MusicBot(commands.Cog):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         if not voice_client:
-            await channel.connect()
+            await channel.connect(timeout=10.0)
         if not ctx.author.voice.channel == ctx.voice_client.channel:
             await ctx.voice_client.move_to(channel)
         await ctx.guild.change_voice_state(

@@ -13,9 +13,9 @@ def debug(func):
         sig = ", ".join(
             [repr(a) for a in args] + [f"{k}={v!r}" for k, v in kwargs.items()]
         )
-        print(f"Calling {func.__name__}({sig})")
+        log.info(f"Calling {func.__name__}({sig})")
         value = func(*args, **kwargs)
-        print(f"{func.__name__!r} returned {value!r}")
+        log.info(f"{func.__name__!r} returned {value!r}")
         return value
 
     return wrapper_debug
@@ -57,15 +57,19 @@ def queue_message(songs: List[str]) -> str:
     return msg
 
 
-def set_logger(name: str) -> logging:
-    root = logging.getLogger(name)
-    root.setLevel(logging.INFO)
+def get_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    handler.setFormatter(formatter)
-    root.addHandler(handler)
-    return root
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
+
+
+log = get_logger(__name__)

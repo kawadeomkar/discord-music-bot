@@ -7,9 +7,9 @@ import aiohttp
 import requests
 import ujson
 
-from src.util import set_logger
+from src.util import get_logger
 
-log = set_logger(__name__)
+log = get_logger(__name__)
 
 
 class Spotify:

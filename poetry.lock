@@ -577,14 +577,16 @@ files = [
 ]
 
 [[package]]
-name = "discord.py"
-version = "2.7.0a5357+g9be91cb09"
+name = "discord-py"
+version = "2.6.4"
 description = "A Python wrapper for the Discord API"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
-files = []
-develop = false
+files = [
+    {file = "discord_py-2.6.4-py3-none-any.whl", hash = "sha256:2783b7fb7f8affa26847bfc025144652c294e8fe6e0f8877c67ed895749eb227"},
+    {file = "discord_py-2.6.4.tar.gz", hash = "sha256:44384920bae9b7a073df64ae9b14c8cf85f9274b5ad5d1d07bd5a67539de2da9"},
+]
 
 [package.dependencies]
 aiohttp = ">=3.7.4,<4"
@@ -596,12 +598,6 @@ docs = ["imghdr-lts (==1.0.0) ; python_version >= \"3.13\"", "sphinx (==4.4.0)",
 speed = ["Brotli", "aiodns (>=1.1) ; sys_platform != \"win32\"", "cchardet (==2.1.7) ; python_version < \"3.10\"", "orjson (>=3.5.4)", "zstandard (>=0.23.0) ; python_version <= \"3.13\""]
 test = ["coverage[toml]", "pytest", "pytest-asyncio", "pytest-cov", "pytest-mock", "typing-extensions (>=4.3,<5)", "tzdata ; sys_platform == \"win32\""]
 voice = ["PyNaCl (>=1.5.0,<1.6)"]
-
-[package.source]
-type = "git"
-url = "https://github.com/Rapptz/discord.py.git"
-reference = "master"
-resolved_reference = "ef1cb6a089bd84b53bb40f294f5f8b2e3c28c96a"
 
 [[package]]
 name = "frozenlist"
@@ -1514,4 +1510,4 @@ test = ["pytest (>=8.1,<9.0)", "pytest-rerunfailures (>=14.0,<15.0)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "3c2b18f86c066999f21fdb931bbf495db84d2ce17053f45d09d87234ca1fee33"
+content-hash = "d842e8698f6f9c23daf7224cd2220ef4417a3ef4a6d7ca4555a74d86e40551d3"

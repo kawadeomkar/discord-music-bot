@@ -8,5 +8,6 @@ services:
       dockerfile: Dockerfile
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
+    network_mode: host
     env_file:
     - .env

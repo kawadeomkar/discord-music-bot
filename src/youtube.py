@@ -19,13 +19,13 @@ YTDL_OPTS = {
     "extractaudio": True,
     "verbose": True,
     "outtmpl": "%(extractor)s-%(id)s-%(title)s.%(ext)s",
-    "restrictfilenames": True,
+    # "restrictfilenames": True,
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
-    "logtostderr": False,
-    "quiet": True,
-    "no_warnings": True,
+    "logtostderr": True,
+    # "quiet": True,
+    # "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
     "extractor_args": {
@@ -38,6 +38,23 @@ YTDL_OPTS = {
             #'po_token': f'mweb.gvs+{PO_TOKEN}',
         }
     },
+    # Forces ffmpeg to attempt reconnection if the peer drops the connection mid-stream
+    "external_downloader": "ffmpeg",
+    "external_downloader_args": {
+        "ffmpeg_i": [
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "5",
+        ]
+    },
+    # Buffers more data to handle transient network hiccups
+    "socket_timeout": 30,
+    "retries": 10,
+    # Helps bypass server-side termination due to old cache/tokens
+    "rm_cachedir": True,
 }
 
 
@@ -54,7 +71,7 @@ class QueueObject:
     ts: int = None
 
 
-class YTDL(discord.PCMVolumeTransformer):
+class YTDL(discord.FFmpegOpusAudio):
     FFMPEG_OPTS = {
         "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
         "options": "-vn",
@@ -63,13 +80,16 @@ class YTDL(discord.PCMVolumeTransformer):
     def __init__(
         self,
         ctx: commands.Context,
-        source: discord.FFmpegPCMAudio,
+        url: str,
         *,
         data: dict,
-        volume: float = 0.5,
         requester=None,
+        before_options: str = None,
+        options: str = None,
     ):
-        super().__init__(source, volume)
+        super().__init__(
+            url, executable="ffmpeg", before_options=before_options, options=options
+        )
 
         self.requester = requester
         self.channel = ctx.channel
@@ -106,9 +126,6 @@ class YTDL(discord.PCMVolumeTransformer):
     ):
         loop = loop or asyncio.get_event_loop()
         requester = qo.requester or ctx.author
-        print("Streaming...")
-        print(qo)
-        print(ytdl)
         data = await loop.run_in_executor(
             None,
             lambda: ytdl.extract_info(qo.webpage_url, download=False, process=True),
@@ -118,12 +135,13 @@ class YTDL(discord.PCMVolumeTransformer):
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
             await ctx.send(f"Starting song at {qo.ts} seconds")
 
-        print(f"Usinig {data['url']} as stream URL")
         return cls(
             ctx,
-            discord.FFmpegPCMAudio(data["url"], **ffmpeg_opts, executable="ffmpeg"),
+            data["url"],
             data=data,
             requester=requester,
+            before_options=ffmpeg_opts["before_options"],
+            options=ffmpeg_opts["options"],
         )
 
     @classmethod

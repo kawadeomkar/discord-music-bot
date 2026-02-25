@@ -3,6 +3,10 @@ import os
 import discord
 from discord.ext import commands
 
+from src.util import get_logger
+
+log = get_logger(__name__)
+
 
 intents = discord.Intents.all()
 intents.message_content = True
@@ -12,7 +16,7 @@ EXTENSIONS = ("src.musicbot",)
 bot = commands.Bot(
     command_prefix="-",
     intents=discord.Intents().all(),  # TODO: narrow down
-    description="omkars bad music bot lol",
+    description="music bot",
     strip_after_prefix=True,
 )
 
@@ -27,18 +31,19 @@ async def setup_hook() -> None:
 async def on_ready():
     activity = discord.Game(name="music", type=3)
     await bot.change_presence(status=discord.Status.online, activity=activity)
-    print(f"Bot :{bot.user.name} # {bot.user.id}")
-    print(f"Bot cogs: {bot.cogs}")
-    print(f"Bot state: {bot._get_state()}")
-    print(f"Bot commands: {bot.intents.voice_states}")
+    log.info(f"Bot :{bot.user.name} # {bot.user.id}")
+    log.info(f"Bot cogs: {list(bot.cogs.keys())}")
+    log.info(f"Bot guilds: {len(bot.guilds)} | latency: {bot.latency:.2f}s")
+    log.info(f"Bot commands: {bot.intents.voice_states}")
 
 
-if __name__ == "__main__":
+def main():
     assert os.getenv("DISCORD_TOKEN") is not None
     assert os.getenv("SPOTIFY_CLIENT_ID") is not None
     assert os.getenv("SPOTIFY_CLIENT_SECRET") is not None
-    import inspect
-
-    print(inspect.iscoroutinefunction(bot.add_cog))
 
     bot.run(os.getenv("DISCORD_TOKEN"))
+
+
+if __name__ == "__main__":
+    main()

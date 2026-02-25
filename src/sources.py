@@ -3,6 +3,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Union
 
+from src.util import get_logger
+
+log = get_logger(__name__)
+
 
 class URLSource(Enum):
     SPOTIFY: str = "spotify"
@@ -83,7 +87,7 @@ def parse_url(
         path = domain_match.group(4).split("/")
         if path[0] not in ("playlist", "track"):
             raise Exception(f"Unknown Spotify track type: {path}")
-        print(path[1])
+        log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(path[0], path[1], process=True)
     elif domain in ("soundcloud.com"):
         return SoundcloudSource(url, process=True)
