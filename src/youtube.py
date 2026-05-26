@@ -9,7 +9,6 @@ from discord.ext import commands
 
 from src.spotify import Spotify
 
-
 # TODO: PO token may be required eventually
 PO_TOKEN = ""
 # TODO: postprocessing ffmpeg, audio format, etc.

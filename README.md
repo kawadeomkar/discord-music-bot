@@ -74,7 +74,7 @@ SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 **3. Run the bot**
 
 ```bash
-poetry run python -m src.main
+poetry run bot
 ```
 
 ## Docker

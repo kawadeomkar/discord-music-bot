@@ -1,7 +1,5 @@
 import asyncio
-import functools
 import random
-import time
 from collections import deque
 from typing import List, Optional, Union
 
@@ -78,8 +76,7 @@ class MusicPlayer:
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         while self.mutex.locked():
-            # now this is real hacky but cannot use mutex lock here due to race condition
-            time.sleep(0.25)
+            await asyncio.sleep(0.25)
         return await self.queue.get()
 
     async def queue_clear(self) -> None:

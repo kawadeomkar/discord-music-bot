@@ -31,18 +31,20 @@ async def setup_hook() -> None:
 async def on_ready():
     activity = discord.Game(name="music", type=3)
     await bot.change_presence(status=discord.Status.online, activity=activity)
-    log.info(f"Bot :{bot.user.name} # {bot.user.id}")
+    if bot.user:
+        log.info(f"Bot :{bot.user.name} # {bot.user.id}")
     log.info(f"Bot cogs: {list(bot.cogs.keys())}")
     log.info(f"Bot guilds: {len(bot.guilds)} | latency: {bot.latency:.2f}s")
     log.info(f"Bot commands: {bot.intents.voice_states}")
 
 
 def main():
-    assert os.getenv("DISCORD_TOKEN") is not None
+    token = os.getenv("DISCORD_TOKEN")
+    assert token is not None
     assert os.getenv("SPOTIFY_CLIENT_ID") is not None
     assert os.getenv("SPOTIFY_CLIENT_SECRET") is not None
 
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    bot.run(token)
 
 
 if __name__ == "__main__":

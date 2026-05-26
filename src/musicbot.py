@@ -73,7 +73,7 @@ class MusicBot(commands.Cog):
             )
 
         if (
-            not ctx.command == "play"
+            ctx.command.name != "play"
             and ctx.voice_client
             and ctx.voice_client.channel != ctx.author.voice.channel
         ):
@@ -205,7 +205,7 @@ class MusicBot(commands.Cog):
 
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
     @commands.before_invoke(validate_commands)
-    async def pause(self, ctx: commands.Context):
+    async def resume(self, ctx: commands.Context):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         if voice_client and not voice_client.is_playing() and voice_client.is_paused():
@@ -302,7 +302,7 @@ class MusicBot(commands.Cog):
                 return await ctx.send("Volume must be between 0 and 100")
             volume = volume / 100
             voice_client.source.volume = volume
-            ctx.send(f"Set volume of music player to {volume}")
+            await ctx.send(f"Set volume of music player to {volume}")
         else:
             await ctx.send("No songs are currently playing.")
 
