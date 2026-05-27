@@ -1,6 +1,7 @@
 # Ignore
 pyproject.bak.toml
 pyrightconfig.json
+docs/
 
 # PyCharm and misc
 .idea

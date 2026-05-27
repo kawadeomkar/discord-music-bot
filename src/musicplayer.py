@@ -17,9 +17,9 @@ from src.youtube import YTDL, QueueObject
 class MusicPlayer:
     __slots__ = (
         "bot",
-        "_ctx",
         "_guild",
         "_channel",
+        "_last_author",
         "_cog",
         "current_song",
         "play_next",
@@ -30,14 +30,15 @@ class MusicPlayer:
         "song_queue",
         # "volume",
         "_player",
+        "_prefetch_task",
     )
 
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
         self.bot = bot
 
-        self._ctx = ctx
         self._guild: discord.Guild = ctx.guild
-        self._channel = ctx.channel
+        self._channel: discord.TextChannel = ctx.channel
+        self._last_author: Union[discord.User, discord.Member] = ctx.author
         self._cog = ctx.cog
 
         self.current_song: YTDL = None
@@ -50,6 +51,7 @@ class MusicPlayer:
         self.song_queue: deque = deque()
         # self.volume = 0.5
 
+        self._prefetch_task: Optional[asyncio.Task] = None
         self._player = bot.loop.create_task(self.loop())
 
     def __del__(self):
@@ -60,10 +62,16 @@ class MusicPlayer:
             log.error(f"error cancelling player task: {e}")
         return
 
+    def set_context(self, ctx: commands.Context) -> None:
+        self._channel = ctx.channel
+        self._last_author = ctx.author
+
     def get_queue(self) -> str:
         return queue_message(list(self.song_queue)[:10])
 
     async def stop(self):
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
         await self._cog.cleanup(self._guild)
 
     async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
@@ -143,13 +151,13 @@ class MusicPlayer:
     ) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._ctx, source.ytsearch, source.process, loop=self.bot.loop
+                self._last_author, source.ytsearch, source.process, loop=self.bot.loop
             )
         return source
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
         try:
-            return await YTDL.yt_stream(source, self._ctx, loop=self.bot.loop)
+            return await YTDL.yt_stream(source, self._channel, loop=self.bot.loop)
         except Exception as e:
             log.error(f"Error processing song: {e}")
             return None
@@ -158,39 +166,76 @@ class MusicPlayer:
         try:
             embed = self._build_now_playing_embed(song)
             self.play_message = embed
-            await self._ctx.send(embed=embed)
+            await self._channel.send(embed=embed)
         except Exception as e:
             log.error(f"embed error: {e}")
 
+    async def _prefetch_next_song(self) -> Optional[YTDL]:
+        """Pre-resolve and stream the next queued song while the current one plays.
+
+        Only runs if there is already an item in the queue (non-blocking).
+        Calls queue.task_done() itself if dequeue succeeds but streaming fails,
+        so the main loop's task_done() always accounts for exactly one get().
+        """
+        if self.queue.empty() or self.mutex.locked():
+            return None
+        try:
+            source = self.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        try:
+            source = await self._resolve_source(source)
+            return await self._stream_source(source)
+        except asyncio.CancelledError:
+            self.queue.task_done()
+            raise
+        except Exception as e:
+            log.error(f"Prefetch error: {e}")
+            self.queue.task_done()
+            return None
+
     async def loop(self):
         await self.bot.wait_until_ready()
+        prefetched_song: Optional[YTDL] = None
 
         while not self.bot.is_closed():
             self.play_next.clear()
 
-            try:
-                async with async_timeout.timeout(300):
-                    source = await self.queue_get()
-                    source = await self._resolve_source(source)
-            except asyncio.TimeoutError:
-                log.warning("Queue timed out, disconnecting")
-                asyncio.create_task(self.stop())
-                return
+            if prefetched_song is not None:
+                self.current_song = prefetched_song
+                prefetched_song = None
+            else:
+                try:
+                    async with async_timeout.timeout(300):
+                        source = await self.queue_get()
+                        source = await self._resolve_source(source)
+                except asyncio.TimeoutError:
+                    log.warning("Queue timed out, disconnecting")
+                    asyncio.create_task(self.stop())
+                    return
+                self.current_song = await self._stream_source(source)
 
-            self.current_song = await self._stream_source(source)
             if self.current_song is None:
+                prefetched_song = None
                 continue
 
             await self._send_now_playing(self.current_song)
-
             self.song_queue.popleft()
             self._guild.voice_client.play(
                 self.current_song,
                 after=lambda _: self.bot.loop.call_soon_threadsafe(self.play_next.set),
             )
 
-            await asyncio.sleep(10.0)
+            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
+
             await self.play_next.wait()
+
+            try:
+                prefetched_song = await self._prefetch_task
+            except asyncio.CancelledError:
+                prefetched_song = None
+            self._prefetch_task = None
+
             self.history.append(
                 f"{self.current_song.title} - {self.current_song.webpage_url}"
             )
