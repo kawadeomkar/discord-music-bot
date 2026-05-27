@@ -38,7 +38,9 @@ class MusicBot(commands.Cog):
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         if ctx.guild.id in self.mps:
-            return self.mps[ctx.guild.id]
+            mp = self.mps[ctx.guild.id]
+            mp.set_context(ctx)
+            return mp
         self.mps[ctx.guild.id] = MusicPlayer(self.bot, ctx)
         return self.mps[ctx.guild.id]
 
@@ -102,7 +104,9 @@ class MusicBot(commands.Cog):
                 ts = source.ts
             elif source.stype == URLSource.SOUNDCLOUD:
                 search = source.url
-            return await YTDL.yt_source(ctx, search, source.process, loop=loop, ts=ts)
+            return await YTDL.yt_source(
+                ctx.author, search, source.process, loop=loop, ts=ts
+            )
 
     @commands.command(
         name="play", aliases=["p", "pl", "pla", "sing"], help="play a youtube song"

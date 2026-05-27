@@ -84,9 +84,10 @@ class TestYTSource:
             "title": "Extracted Title",
         }
 
-        with patch("src.youtube.ytdl.extract_info", return_value=fake_data):
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
             result = await YTDL.yt_source(
-                mock_ctx, "ytsearch:test song", process=True
+                mock_ctx.author, "ytsearch:test song", process=True
             )
 
         assert isinstance(result, QueueObject)
@@ -95,9 +96,10 @@ class TestYTSource:
         assert result.requester is mock_ctx.author
 
     async def test_yt_source_raises_when_no_data(self, mock_ctx):
-        with patch("src.youtube.ytdl.extract_info", return_value=None):
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
-                await YTDL.yt_source(mock_ctx, "ytsearch:nothing", process=True)
+                await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing", process=True)
 
     async def test_yt_source_picks_first_entry_from_playlist(self, mock_ctx):
         fake_data = {
@@ -114,8 +116,9 @@ class TestYTSource:
                 },
             ]
         }
-        with patch("src.youtube.ytdl.extract_info", return_value=fake_data):
-            result = await YTDL.yt_source(mock_ctx, "ytsearch:test", process=True)
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test", process=True)
 
         assert result.title == "Entry One"
         assert "entry1" in result.webpage_url
@@ -135,8 +138,9 @@ class TestYTSource:
                 },
             ]
         }
-        with patch("src.youtube.ytdl.extract_info", return_value=fake_data):
-            result = await YTDL.yt_source(mock_ctx, "ytsearch:test", process=True)
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test", process=True)
 
         assert result.title == "Real Video"
 
@@ -145,9 +149,10 @@ class TestYTSource:
             "webpage_url": "https://www.youtube.com/watch?v=ts_test",
             "title": "Timestamped Song",
         }
-        with patch("src.youtube.ytdl.extract_info", return_value=fake_data):
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
             result = await YTDL.yt_source(
-                mock_ctx, "https://yt.com/watch?v=ts_test", process=False, ts=45
+                mock_ctx.author, "https://yt.com/watch?v=ts_test", process=False, ts=45
             )
 
         assert result.ts == 45

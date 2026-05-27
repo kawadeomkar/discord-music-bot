@@ -5,7 +5,6 @@ from typing import Union
 
 import discord
 import yt_dlp as youtube_dl
-from discord.ext import commands
 
 from src.spotify import Spotify
 
@@ -57,9 +56,6 @@ YTDL_OPTS = {
 }
 
 
-ytdl = youtube_dl.YoutubeDL(YTDL_OPTS)
-
-
 @dataclass
 class QueueObject:
     """Song metadata in a queue before its processed by YTDL"""
@@ -78,7 +74,7 @@ class YTDL(discord.FFmpegOpusAudio):
 
     def __init__(
         self,
-        ctx: commands.Context,
+        channel: discord.TextChannel,
         url: str,
         *,
         data: dict,
@@ -91,7 +87,7 @@ class YTDL(discord.FFmpegOpusAudio):
         )
 
         self.requester = requester
-        self.channel = ctx.channel
+        self.channel = channel
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -119,26 +115,27 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_stream(
         cls,
         qo: QueueObject,
-        ctx: commands.Context,
+        channel: discord.TextChannel,
         *,
         loop: asyncio.BaseEventLoop = None,
     ):
         loop = loop or asyncio.get_event_loop()
-        requester = qo.requester or ctx.author
         data = await loop.run_in_executor(
             None,
-            lambda: ytdl.extract_info(qo.webpage_url, download=False, process=True),
+            lambda: youtube_dl.YoutubeDL(YTDL_OPTS).extract_info(
+                qo.webpage_url, download=False, process=True
+            ),
         )
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
-            await ctx.send(f"Starting song at {qo.ts} seconds")
+            await channel.send(f"Starting song at {qo.ts} seconds")
 
         return cls(
-            ctx,
+            channel,
             data["url"],
             data=data,
-            requester=requester,
+            requester=qo.requester,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
         )
@@ -146,7 +143,7 @@ class YTDL(discord.FFmpegOpusAudio):
     @classmethod
     async def yt_source(
         cls,
-        ctx: commands.Context,
+        requester: Union[discord.User, discord.Member],
         search: str,
         process: bool,
         *,
@@ -158,9 +155,11 @@ class YTDL(discord.FFmpegOpusAudio):
 
         # process=True to resolve all unresolved references (urls), need for ytsearch
         data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(search, download=download, process=process)
+            None,
+            lambda: youtube_dl.YoutubeDL(YTDL_OPTS).extract_info(
+                search, download=download, process=process
+            ),
         )
-        # print(data)
         if data is None:
             # TODO: create custom YTDL exceptions
             raise Exception("Could not find song")
@@ -174,4 +173,4 @@ class YTDL(discord.FFmpegOpusAudio):
             # TODO: Handle downloading?
             # ytdl.prepare_filename(data)
             pass
-        return QueueObject(data["webpage_url"], data["title"], ctx.author, ts=ts)
+        return QueueObject(data["webpage_url"], data["title"], requester, ts=ts)

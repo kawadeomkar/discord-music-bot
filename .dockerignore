@@ -1,0 +1,19 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local poetry config — Dockerfile sets virtualenvs.create false explicitly
+poetry.toml
+
+# Dev/local files
+.env
+.idea/
+.vscode/
+pyrightconfig.json
+tests/

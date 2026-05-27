@@ -1,5 +1,4 @@
-version: '3.9'
-
+---
 services:
   discord-music-bot:
     container_name: discord-music-bot

@@ -17,6 +17,6 @@ COPY . /app/
 # Installing requirements
 RUN poetry install
 
-ENV PYTHONPATH="${PYTHONPATH}:."
+ENV PYTHONPATH "${PYTHONPATH}:."
 
 CMD ["/usr/local/bin/python", "-m", "src.main"]
