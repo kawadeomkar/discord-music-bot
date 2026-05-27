@@ -28,7 +28,7 @@ class MusicPlayer:
         "play_message",
         "history",
         "song_queue",
-        # "volume",
+        "volume",
         "_player",
         "_prefetch_task",
     )
@@ -47,9 +47,9 @@ class MusicPlayer:
         self.mutex: asyncio.Lock = asyncio.Lock()
 
         self.play_message: discord.Embed = None
-        self.history: List[str] = []
+        self.history: deque = deque(maxlen=50)
         self.song_queue: deque = deque()
-        # self.volume = 0.5
+        self.volume: float = 1.0
 
         self._prefetch_task: Optional[asyncio.Task] = None
         self._player = bot.loop.create_task(self.loop())
@@ -82,7 +82,22 @@ class MusicPlayer:
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
 
+    async def _cancel_prefetch(self) -> None:
+        """Cancel any in-flight prefetch task and wait for it to finish.
+
+        Must be called before any bulk queue mutation (clear, shuffle) so that
+        the item the prefetch already dequeued via get_nowait() is accounted for
+        via its CancelledError handler before we start modifying the queue.
+        """
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+            try:
+                await self._prefetch_task
+            except asyncio.CancelledError:
+                pass
+
     async def queue_clear(self) -> None:
+        await self._cancel_prefetch()
         async with self.mutex:
             for _ in range(self.queue.qsize()):
                 try:
@@ -93,6 +108,8 @@ class MusicPlayer:
             self.song_queue.clear()
 
     async def queue_shuffle(self) -> str:
+        await self._cancel_prefetch()
+
         shuffled = []
         squeue = []
 
@@ -152,7 +169,9 @@ class MusicPlayer:
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
         try:
-            return await YTDL.yt_stream(source, self._channel, loop=self.bot.loop)
+            return await YTDL.yt_stream(
+                source, self._channel, loop=self.bot.loop, volume=self.volume
+            )
         except Exception as e:
             log.error(f"Error processing song: {e}")
             return None
@@ -211,14 +230,24 @@ class MusicPlayer:
                     self.current_song = await self._stream_source(source)
 
                 if self.current_song is None:
-                    prefetched_song = None
+                    try:
+                        self.song_queue.popleft()
+                    except IndexError:
+                        pass
+                    self.queue.task_done()
+                    try:
+                        await self._channel.send("Failed to load the next song, skipping.")
+                    except Exception:
+                        pass
                     continue
 
                 await self._send_now_playing(self.current_song)
                 self.song_queue.popleft()
                 self._guild.voice_client.play(
                     self.current_song,
-                    after=lambda _: self.bot.loop.call_soon_threadsafe(self.play_next.set),
+                    after=lambda _: self.bot.loop.call_soon_threadsafe(
+                        self.play_next.set
+                    ),
                 )
 
                 self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
