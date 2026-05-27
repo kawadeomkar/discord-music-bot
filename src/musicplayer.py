@@ -70,21 +70,16 @@ class MusicPlayer:
         return queue_message(list(self.song_queue)[:10])
 
     async def stop(self):
-        if self._prefetch_task and not self._prefetch_task.done():
-            self._prefetch_task.cancel()
         await self._cog.cleanup(self._guild)
 
     async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
-        async with self.mutex:
-            if isinstance(obj, list):
-                for o in obj:
-                    await self.queue.put(o)
-            else:
-                await self.queue.put(obj)
+        if isinstance(obj, list):
+            for o in obj:
+                await self.queue.put(o)
+        else:
+            await self.queue.put(obj)
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
-        while self.mutex.locked():
-            await asyncio.sleep(0.25)
         return await self.queue.get()
 
     async def queue_clear(self) -> None:
@@ -177,7 +172,7 @@ class MusicPlayer:
         Calls queue.task_done() itself if dequeue succeeds but streaming fails,
         so the main loop's task_done() always accounts for exactly one get().
         """
-        if self.queue.empty() or self.mutex.locked():
+        if self.queue.empty():
             return None
         try:
             source = self.queue.get_nowait()
@@ -200,44 +195,57 @@ class MusicPlayer:
 
         while not self.bot.is_closed():
             self.play_next.clear()
-
-            if prefetched_song is not None:
-                self.current_song = prefetched_song
-                prefetched_song = None
-            else:
-                try:
-                    async with async_timeout.timeout(300):
-                        source = await self.queue_get()
-                        source = await self._resolve_source(source)
-                except asyncio.TimeoutError:
-                    log.warning("Queue timed out, disconnecting")
-                    asyncio.create_task(self.stop())
-                    return
-                self.current_song = await self._stream_source(source)
-
-            if self.current_song is None:
-                prefetched_song = None
-                continue
-
-            await self._send_now_playing(self.current_song)
-            self.song_queue.popleft()
-            self._guild.voice_client.play(
-                self.current_song,
-                after=lambda _: self.bot.loop.call_soon_threadsafe(self.play_next.set),
-            )
-
-            self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
-
-            await self.play_next.wait()
-
             try:
-                prefetched_song = await self._prefetch_task
-            except asyncio.CancelledError:
-                prefetched_song = None
-            self._prefetch_task = None
+                if prefetched_song is not None:
+                    self.current_song = prefetched_song
+                    prefetched_song = None
+                else:
+                    try:
+                        async with async_timeout.timeout(300):
+                            source = await self.queue_get()
+                            source = await self._resolve_source(source)
+                    except asyncio.TimeoutError:
+                        log.warning("Queue timed out, disconnecting")
+                        asyncio.create_task(self.stop())
+                        return
+                    self.current_song = await self._stream_source(source)
 
-            self.history.append(
-                f"{self.current_song.title} - {self.current_song.webpage_url}"
-            )
-            self.queue.task_done()
-            self.current_song = None
+                if self.current_song is None:
+                    prefetched_song = None
+                    continue
+
+                await self._send_now_playing(self.current_song)
+                self.song_queue.popleft()
+                self._guild.voice_client.play(
+                    self.current_song,
+                    after=lambda _: self.bot.loop.call_soon_threadsafe(self.play_next.set),
+                )
+
+                self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
+
+                await self.play_next.wait()
+
+                try:
+                    prefetched_song = await self._prefetch_task
+                except asyncio.CancelledError:
+                    prefetched_song = None
+                self._prefetch_task = None
+
+                self.history.append(
+                    f"{self.current_song.title} - {self.current_song.webpage_url}"
+                )
+                self.queue.task_done()
+                self.current_song = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"Unhandled error in playback loop: {e}", exc_info=True)
+                if self._prefetch_task and not self._prefetch_task.done():
+                    self._prefetch_task.cancel()
+                self._prefetch_task = None
+                prefetched_song = None
+                self.current_song = None
+                try:
+                    await self._channel.send(f"An error occurred in playback: {e}")
+                except Exception:
+                    pass

@@ -50,6 +50,10 @@ class MusicBot(commands.Cog):
             await guild.voice_client.disconnect()
         if guild.id in self.mps:
             try:
+                mp = self.mps[guild.id]
+                if mp._prefetch_task and not mp._prefetch_task.done():
+                    mp._prefetch_task.cancel()
+                mp._player.cancel()
                 del self.mps[guild.id]
             except asyncio.CancelledError:
                 pass
