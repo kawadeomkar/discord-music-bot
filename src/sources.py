@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Union
+from typing import List, Optional, Union
 
 from src.util import get_logger
 
@@ -9,18 +9,18 @@ log = get_logger(__name__)
 
 
 class URLSource(Enum):
-    SPOTIFY: str = "spotify"
-    YOUTUBE: str = "youtube"
-    SOUNDCLOUD: str = "soundcloud"
+    SPOTIFY = "spotify"
+    YOUTUBE = "youtube"
+    SOUNDCLOUD = "soundcloud"
 
 
 @dataclass(frozen=True)
 class SpotifySource:
     type: str
     id: str
-    si: str = None
+    si: Optional[str] = None
     process: bool = True
-    stype: str = URLSource.SPOTIFY
+    stype: URLSource = URLSource.SPOTIFY
 
 
 @dataclass(frozen=True)
@@ -31,20 +31,20 @@ class YTSource:
     :param ts: timestamp
     """
 
-    url: str = None
-    ytsearch: str = None
-    ts: int = None
-    process: bool = None
-    stype: str = URLSource.YOUTUBE
+    url: Optional[str] = None
+    ytsearch: Optional[str] = None
+    ts: Optional[int] = None
+    process: Optional[bool] = None
+    stype: URLSource = URLSource.YOUTUBE
 
 
 @dataclass(frozen=True)
 class SoundcloudSource:
     # TODO timestamp regex
     url: str
-    ts: int = None
+    ts: Optional[int] = None
     process: bool = False
-    stype: str = URLSource.SOUNDCLOUD
+    stype: URLSource = URLSource.SOUNDCLOUD
 
 
 def spotify_playlist_to_ytsearch(titles: List[str]) -> List[YTSource]:
@@ -78,7 +78,7 @@ def parse_url(
     domain = domain_match.group(3)
 
     if domain in ("youtube.com", "youtu.be"):
-        ts = None
+        ts: Optional[int] = None
         for _, k, v in args_match:
             if k == "ts" or k == "t":
                 ts = int(v)

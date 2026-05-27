@@ -1,7 +1,7 @@
 import asyncio
 import os
 import random
-from typing import List, Union
+from typing import List, Optional, Union
 
 import discord
 from discord.ext import commands
@@ -10,7 +10,6 @@ from src.musicplayer import MusicPlayer
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
-    URLSource,
     YTSource,
     parse_url,
     spotify_playlist_to_ytsearch,
@@ -37,6 +36,7 @@ class MusicBot(commands.Cog):
         self.spotify = Spotify()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
+        assert ctx.guild is not None
         if ctx.guild.id in self.mps:
             mp = self.mps[ctx.guild.id]
             mp.set_context(ctx)
@@ -47,7 +47,7 @@ class MusicBot(commands.Cog):
     async def cleanup(self, guild: discord.Guild) -> None:
         log.info("going to cleanup/disconnect")
         if guild.voice_client:
-            await guild.voice_client.disconnect()
+            await guild.voice_client.disconnect(force=False)
         if guild.id in self.mps:
             try:
                 mp = self.mps[guild.id]
@@ -79,7 +79,8 @@ class MusicBot(commands.Cog):
             )
 
         if (
-            ctx.command.name != "play"
+            ctx.command is not None
+            and ctx.command.name != "play"
             and ctx.voice_client
             and ctx.voice_client.channel != ctx.author.voice.channel
         ):
@@ -91,25 +92,24 @@ class MusicBot(commands.Cog):
     async def queue_source(
         self,
         ctx: commands.Context,
-        loop: asyncio.BaseEventLoop,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
     ) -> Union[QueueObject, List[str]]:
-        if source.stype == URLSource.SPOTIFY and source.type == "playlist":
+        if isinstance(source, SpotifySource) and source.type == "playlist":
             return await self.spotify.playlist(source.id)
         else:
-            ts = None
-            if source.stype == URLSource.SPOTIFY:
+            ts: Optional[int] = None
+            search: str
+            if isinstance(source, SpotifySource):
                 search = await self.spotify.track(source.id)
-            elif source.stype == URLSource.YOUTUBE:
-                if source.ytsearch:
-                    search = source.ytsearch
-                elif source.url:
-                    search = source.url
+            elif isinstance(source, YTSource):
+                search = source.ytsearch or source.url or ""
                 ts = source.ts
-            elif source.stype == URLSource.SOUNDCLOUD:
+            elif isinstance(source, SoundcloudSource):
                 search = source.url
+            else:
+                raise ValueError(f"Unknown source type: {type(source)}")
             return await YTDL.yt_source(
-                ctx.author, search, source.process, loop=loop, ts=ts
+                ctx.author, search, source.process or False, ts=ts
             )
 
     @commands.command(
@@ -131,12 +131,12 @@ class MusicBot(commands.Cog):
             try:
                 source = parse_url(url, ctx.message.content)
                 qobj: Union[QueueObject, List[str]] = await self.queue_source(
-                    ctx, self.bot.loop, source
+                    ctx, source
                 )
 
                 if (
                     isinstance(qobj, list)
-                    and source.stype == URLSource.SPOTIFY
+                    and isinstance(source, SpotifySource)
                     and source.type == "playlist"
                 ):
                     qobjs = spotify_playlist_to_ytsearch(qobj)
@@ -160,8 +160,12 @@ class MusicBot(commands.Cog):
                         mp.song_queue.append(title)
 
                 else:
+                    assert isinstance(qobj, QueueObject)
+                    vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
                     if mp.queue.qsize() > 0 or (
-                        voice_client and voice_client.is_playing()
+                        vc is not None
+                        and isinstance(vc, discord.VoiceClient)
+                        and vc.is_playing()
                     ):
                         title = f"Queued song"
                         description = (
@@ -188,8 +192,12 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     async def skip(self, ctx: commands.Context):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if voice_client and voice_client.is_playing():
-            ctx.message.guild.voice_client.stop()
+        if (
+            voice_client is not None
+            and isinstance(voice_client, discord.VoiceClient)
+            and voice_client.is_playing()
+        ):
+            voice_client.stop()
             if not ctx.invoked_parents:
                 await ctx.message.add_reaction("⏭")
 
@@ -198,7 +206,7 @@ class MusicBot(commands.Cog):
     async def stop(self, ctx: commands.Context):
         await ctx.invoke(self.skip)
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if voice_client:
+        if voice_client and ctx.guild is not None:
             await ctx.message.add_reaction("👋")
             await self.cleanup(ctx.guild)
 
@@ -207,8 +215,12 @@ class MusicBot(commands.Cog):
     async def pause(self, ctx: commands.Context):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
-        if voice_client and voice_client.is_playing():
-            await voice_client.pause()
+        if (
+            voice_client is not None
+            and isinstance(voice_client, discord.VoiceClient)
+            and voice_client.is_playing()
+        ):
+            voice_client.pause()
             await ctx.message.add_reaction("⏸️")
 
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
@@ -216,8 +228,13 @@ class MusicBot(commands.Cog):
     async def resume(self, ctx: commands.Context):
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
-        if voice_client and not voice_client.is_playing() and voice_client.is_paused():
-            await voice_client.resume()
+        if (
+            voice_client is not None
+            and isinstance(voice_client, discord.VoiceClient)
+            and not voice_client.is_playing()
+            and voice_client.is_paused()
+        ):
+            voice_client.resume()
             await ctx.message.add_reaction("⏭️")
 
     @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
@@ -233,13 +250,21 @@ class MusicBot(commands.Cog):
     @commands.command(name="join", aliases=["summon"], help="join the channel")
     @commands.before_invoke(validate_commands)
     async def join(self, ctx: commands.Context):
-        channel = ctx.message.author.voice.channel
+        assert isinstance(ctx.author, discord.Member) and ctx.author.voice is not None
+        assert ctx.guild is not None
+        channel = ctx.author.voice.channel
+        assert channel is not None
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
         if not voice_client:
             await channel.connect(timeout=10.0)
-        if not ctx.author.voice.channel == ctx.voice_client.channel:
-            await ctx.voice_client.move_to(channel)
+        vc = ctx.voice_client
+        if (
+            vc is not None
+            and isinstance(vc, discord.VoiceClient)
+            and vc.channel != channel
+        ):
+            await vc.move_to(channel)
         await ctx.guild.change_voice_state(
             channel=channel, self_mute=False, self_deaf=True
         )
@@ -259,7 +284,13 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     async def now(self, ctx: commands.Context):
         mp = self.get_mp(ctx)
-        if ctx.message.guild.voice_client.is_playing() and mp.play_message:
+        vc = ctx.guild.voice_client if ctx.guild else None
+        if (
+            vc is not None
+            and isinstance(vc, discord.VoiceClient)
+            and vc.is_playing()
+            and mp.play_message
+        ):
             await ctx.send(embed=mp.play_message)
         else:
             await ctx.send("No songs are currently playing.")

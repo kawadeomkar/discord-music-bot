@@ -1,7 +1,7 @@
 import asyncio
 import random
 from collections import deque
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import async_timeout
 import discord
@@ -33,25 +33,42 @@ class MusicPlayer:
         "_prefetch_task",
     )
 
+    bot: commands.Bot
+    _guild: discord.Guild
+    _channel: discord.TextChannel
+    _last_author: Union[discord.User, discord.Member]
+    _cog: Any
+    current_song: Optional[YTDL]
+    play_next: asyncio.Event
+    queue: asyncio.Queue
+    mutex: asyncio.Lock
+    play_message: Optional[discord.Embed]
+    history: deque
+    song_queue: deque
+    volume: float
+    _player: asyncio.Task
+    _prefetch_task: Optional[asyncio.Task]
+
     def __init__(self, bot: commands.Bot, ctx: commands.Context):
         self.bot = bot
-
-        self._guild: discord.Guild = ctx.guild
-        self._channel: discord.TextChannel = ctx.channel
-        self._last_author: Union[discord.User, discord.Member] = ctx.author
+        assert ctx.guild is not None
+        assert isinstance(ctx.channel, discord.TextChannel)
+        self._guild = ctx.guild
+        self._channel = ctx.channel
+        self._last_author = ctx.author
         self._cog = ctx.cog
 
-        self.current_song: YTDL = None
-        self.play_next: asyncio.Event = asyncio.Event()
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.mutex: asyncio.Lock = asyncio.Lock()
+        self.current_song = None
+        self.play_next = asyncio.Event()
+        self.queue = asyncio.Queue()
+        self.mutex = asyncio.Lock()
 
-        self.play_message: discord.Embed = None
-        self.history: deque = deque(maxlen=50)
-        self.song_queue: deque = deque()
-        self.volume: float = 1.0
+        self.play_message = None
+        self.history = deque(maxlen=50)
+        self.song_queue = deque()
+        self.volume = 1.0
 
-        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_task = None
         self._player = bot.loop.create_task(self.loop())
 
     def __del__(self):
@@ -63,6 +80,7 @@ class MusicPlayer:
         return
 
     def set_context(self, ctx: commands.Context) -> None:
+        assert isinstance(ctx.channel, discord.TextChannel)
         self._channel = ctx.channel
         self._last_author = ctx.author
 
@@ -135,10 +153,11 @@ class MusicPlayer:
         return "Shuffled!"
 
     def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
+        requester_mention = song.requester.mention if song.requester else "Unknown"
         return (
             discord.Embed(
                 title=f"**Now playing:** {song.title}",
-                description=f"Requester: [{song.requester.mention}]",
+                description=f"Requester: [{requester_mention}]",
                 color=discord.Color.green(),
             )
             .add_field(name="Youtube link", value=song.webpage_url, inline=False)
@@ -163,15 +182,13 @@ class MusicPlayer:
     ) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._last_author, source.ytsearch, source.process, loop=self.bot.loop
+                self._last_author, source.ytsearch or "", source.process or False
             )
         return source
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
         try:
-            return await YTDL.yt_stream(
-                source, self._channel, loop=self.bot.loop, volume=self.volume
-            )
+            return await YTDL.yt_stream(source, self._channel, volume=self.volume)
         except Exception as e:
             log.error(f"Error processing song: {e}")
             return None
@@ -236,14 +253,18 @@ class MusicPlayer:
                         pass
                     self.queue.task_done()
                     try:
-                        await self._channel.send("Failed to load the next song, skipping.")
+                        await self._channel.send(
+                            "Failed to load the next song, skipping."
+                        )
                     except Exception:
                         pass
                     continue
 
                 await self._send_now_playing(self.current_song)
                 self.song_queue.popleft()
-                self._guild.voice_client.play(
+                vc = self._guild.voice_client
+                assert isinstance(vc, discord.VoiceClient)
+                vc.play(
                     self.current_song,
                     after=lambda _: self.bot.loop.call_soon_threadsafe(
                         self.play_next.set

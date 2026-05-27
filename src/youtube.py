@@ -1,12 +1,23 @@
 import asyncio
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Optional, Union
 
 import discord
 import yt_dlp as youtube_dl
 
 from src.spotify import Spotify
+
+_YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
+
+
+def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
+    """Dedicated thread-pool worker for yt-dlp extraction. Top-level so it's named in tracebacks."""
+    return youtube_dl.YoutubeDL(opts).extract_info(
+        url, download=download, process=process
+    )
+
 
 # TODO: PO token may be required eventually
 PO_TOKEN = ""
@@ -63,7 +74,7 @@ class QueueObject:
     webpage_url: str
     title: str
     requester: Union[discord.User, discord.Member]
-    ts: int = None
+    ts: Optional[int] = None
 
 
 class YTDL(discord.FFmpegOpusAudio):
@@ -79,8 +90,8 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         data: dict,
         requester=None,
-        before_options: str = None,
-        options: str = None,
+        before_options: Optional[str] = None,
+        options: Optional[str] = None,
     ):
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -92,7 +103,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.data = data
         self.uploader = data.get("uploader")
         self.uploader_url = data.get("uploader_url")
-        self.date = data.get("upload_date")
+        self.date = data.get("upload_date") or "00000000"
         self.upload_date = self.date[6:8] + "." + self.date[4:6] + "." + self.date[0:4]
         self.title = data.get("title")
         self.thumbnail = data.get("thumbnail")
@@ -117,15 +128,11 @@ class YTDL(discord.FFmpegOpusAudio):
         qo: QueueObject,
         channel: discord.TextChannel,
         *,
-        loop: asyncio.BaseEventLoop = None,
         volume: float = 1.0,
     ):
-        loop = loop or asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(
-            None,
-            lambda: youtube_dl.YoutubeDL(YTDL_OPTS).extract_info(
-                qo.webpage_url, download=False, process=True
-            ),
+            _YTDLP_POOL, _ytdlp_extract, qo.webpage_url, YTDL_OPTS, False, True
         )
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
@@ -150,18 +157,14 @@ class YTDL(discord.FFmpegOpusAudio):
         search: str,
         process: bool,
         *,
-        loop: asyncio.BaseEventLoop = None,
-        download=False,
-        ts: int = None,
+        download: bool = False,
+        ts: Optional[int] = None,
     ) -> QueueObject:
-        loop = loop or asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # process=True to resolve all unresolved references (urls), need for ytsearch
         data = await loop.run_in_executor(
-            None,
-            lambda: youtube_dl.YoutubeDL(YTDL_OPTS).extract_info(
-                search, download=download, process=process
-            ),
+            _YTDLP_POOL, _ytdlp_extract, search, YTDL_OPTS, download, process
         )
         if data is None:
             # TODO: create custom YTDL exceptions

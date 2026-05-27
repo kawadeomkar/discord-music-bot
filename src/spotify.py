@@ -2,7 +2,7 @@ import asyncio
 import os
 import time
 from async_lru import alru_cache
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 import ujson
@@ -33,7 +33,7 @@ class Spotify:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         }
-        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+        async with aiohttp.ClientSession(json_serialize=ujson.dumps) as session:
             resp = await session.post(self.auth_endpoint, data=data)
             resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
@@ -42,11 +42,11 @@ class Spotify:
     async def http_call(
         self,
         endpoint_route: str,
-        params: Dict[str, Union[str, int]] = None,
-        headers=None,
-        data: Dict[str, str] = None,
-        http_method="GET",
-    ):
+        params: Optional[Dict[str, Union[str, int]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+        http_method: str = "GET",
+    ) -> Any:
         if time.time() > self.token_expiry:
             async with self._auth_lock:
                 if time.time() > self.token_expiry:
@@ -56,7 +56,7 @@ class Spotify:
             headers = {}
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+        async with aiohttp.ClientSession(json_serialize=ujson.dumps) as session:
             resp = await session.request(
                 http_method, endpoint_route, headers=headers, data=data, params=params
             )
@@ -96,7 +96,9 @@ class Spotify:
         :return: list of
         """
         endpoint_route = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-        data = {"fields": "items(track(name,artists(name)))"}
+        data: Dict[str, Union[str, int]] = {
+            "fields": "items(track(name,artists(name)))"
+        }
         resp = await self.http_call(endpoint_route, params=data)
         track_titles = []
         for item in resp.get("items", []):
