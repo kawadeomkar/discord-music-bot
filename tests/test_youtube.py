@@ -1,9 +1,35 @@
-"""Tests for src/youtube.py — QueueObject, YTDL config, and yt_source."""
+"""Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import discord
+import orjson
 import pytest
 
-from src.youtube import YTDL, YTDL_OPTS, QueueObject
+from src.youtube import YTDL, YTDL_OPTS, QueueObject, _stream_url_ttl
+
+
+def _fake_ytdl_data(**overrides):
+    base = {
+        "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",
+        "webpage_url": "https://www.youtube.com/watch?v=test",
+        "title": "Test Song",
+        "upload_date": "20240101",
+        "duration": 180,
+        "uploader": "Test Channel",
+        "uploader_url": "",
+        "thumbnail": "https://img.yt.com/test.jpg",
+        "description": "",
+        "tags": [],
+        "view_count": 1000,
+        "like_count": 100,
+        "dislike_count": 5,
+        "abr": 128,
+        "asr": 44100,
+        "acodec": "opus",
+    }
+    base.update(overrides)
+    return base
 
 
 class TestQueueObject:
@@ -156,3 +182,193 @@ class TestYTSource:
             )
 
         assert result.ts == 45
+
+
+class TestYTStream:
+    async def test_yt_stream_returns_ytdl_instance(self, mock_ctx):
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author)
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
+             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+            result = await YTDL.yt_stream(qobj, channel)
+
+        assert isinstance(result, YTDL)
+        assert result.title == "Test Song"
+
+    async def test_yt_stream_appends_volume_filter_when_not_default(self, mock_ctx):
+        """volume != 1.0 must append -filter:a to ffmpeg options."""
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author)
+
+        captured_options = {}
+
+        def capture_init(self, url, *, executable, before_options, options):
+            captured_options["options"] = options
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
+             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init):
+            await YTDL.yt_stream(qobj, channel, volume=0.5)
+
+        assert "volume=0.5" in captured_options["options"]
+
+    async def test_yt_stream_appends_seek_when_ts_set(self, mock_ctx):
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90)
+
+        captured_options = {}
+
+        def capture_init(self, url, *, executable, before_options, options):
+            captured_options["options"] = options
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
+             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init):
+            await YTDL.yt_stream(qobj, channel)
+
+        assert "-ss 90" in captured_options["options"]
+
+
+class TestStreamUrlTtl:
+    def test_returns_seconds_minus_margin(self):
+        future = int(time.time()) + 7200  # 2h from now
+        url = f"https://r2.googlevideo.com/stream?expire={future}&other=x"
+        ttl = _stream_url_ttl(url)
+        assert ttl is not None
+        assert 7200 - 1800 - 5 <= ttl <= 7200 - 1800 + 5
+
+    def test_returns_none_when_no_expire_param(self):
+        ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?other=x")
+        assert ttl is None
+
+    def test_returns_none_when_already_expired(self):
+        past = int(time.time()) - 100
+        url = f"https://r2.googlevideo.com/stream?expire={past}"
+        assert _stream_url_ttl(url) is None
+
+    def test_returns_none_when_ttl_too_short(self):
+        soon = int(time.time()) + 30  # 30s — below 60s threshold
+        url = f"https://r2.googlevideo.com/stream?expire={soon}"
+        assert _stream_url_ttl(url) is None
+
+    def test_returns_none_on_non_numeric_expire(self):
+        ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?expire=notanumber")
+        assert ttl is None
+
+
+class TestStreamCache:
+    async def test_cache_hit_skips_executor(self, mock_ctx, fake_redis):
+        """Second yt_stream call with same URL should use Redis cache."""
+        future = int(time.time()) + 7200
+        cached_data = _fake_ytdl_data(
+            url=f"https://r2.googlevideo.com/stream?expire={future}",
+            webpage_url="https://yt.com/v=cache_hit",
+            title="Cached Song",
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=cache_hit",
+            orjson.dumps(cached_data),
+            ex=3600,
+        )
+        qobj = QueueObject("https://yt.com/v=cache_hit", "Cached Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+
+        with patch("src.youtube._ytdlp_extract") as mock_extract, \
+             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+            await YTDL.yt_stream(qobj, channel, redis=fake_redis)
+        mock_extract.assert_not_called()
+
+    async def test_cache_miss_calls_executor_and_populates_cache(self, mock_ctx, fake_redis):
+        """On cache miss, executor is called and result is written to Redis."""
+        fake_data = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=cache_miss",
+            title="Miss Song",
+        )
+        qobj = QueueObject("https://yt.com/v=cache_miss", "Miss Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract, \
+             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+            await YTDL.yt_stream(qobj, channel, redis=fake_redis)
+
+        mock_extract.assert_called_once()
+        cached = await fake_redis.get("ytdl:stream:https://yt.com/v=cache_miss")
+        assert cached is not None
+
+    async def test_cache_graceful_on_redis_error(self, mock_ctx):
+        """Redis failure during cache check must not crash yt_stream; executor is called."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=err")
+        bad_redis = AsyncMock()
+        bad_redis.get = AsyncMock(side_effect=ConnectionError("Redis down"))
+        qobj = QueueObject("https://yt.com/v=err", "Error Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract, \
+             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+            await YTDL.yt_stream(qobj, channel, redis=bad_redis)
+
+        mock_extract.assert_called_once()
+
+
+class TestPrefetchStream:
+    async def test_populates_cache_on_miss(self, mock_ctx, fake_redis):
+        """prefetch_stream calls yt-dlp and writes to Redis when key is absent."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=pf1", title="Prefetch Song")
+        qobj = QueueObject("https://yt.com/v=pf1", "Prefetch Song", mock_ctx.author)
+
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract:
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+
+        mock_extract.assert_called_once()
+        cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf1")
+        assert cached is not None
+        assert orjson.loads(cached)["title"] == "Prefetch Song"
+
+    async def test_no_op_when_redis_none(self, mock_ctx):
+        """prefetch_stream returns immediately when redis is None — no exception."""
+        qobj = QueueObject("https://yt.com/v=pf2", "No Redis", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await YTDL.prefetch_stream(qobj, redis=None)
+        mock_extract.assert_not_called()
+
+    async def test_no_op_when_already_cached(self, mock_ctx, fake_redis):
+        """prefetch_stream skips yt-dlp extraction when the key is already in Redis."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=pf3")
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=pf3",
+            orjson.dumps(fake_data),
+            ex=3600,
+        )
+        qobj = QueueObject("https://yt.com/v=pf3", "Already Cached", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        mock_extract.assert_not_called()
+
+    async def test_swallows_extraction_errors(self, mock_ctx, fake_redis):
+        """prefetch_stream does not propagate yt-dlp exceptions."""
+        qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", side_effect=Exception("network error")):
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
+        assert cached is None
+
+    async def test_skips_write_when_ttl_too_short(self, mock_ctx, fake_redis):
+        """prefetch_stream does not cache a URL that is already near expiry."""
+        soon = int(time.time()) + 30  # 30s — below the 60s threshold
+        fake_data = _fake_ytdl_data(
+            url=f"https://r2.googlevideo.com/stream?expire={soon}",
+            webpage_url="https://yt.com/v=pf5",
+        )
+        qobj = QueueObject("https://yt.com/v=pf5", "Nearly Expired", mock_ctx.author)
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf5")
+        assert cached is None

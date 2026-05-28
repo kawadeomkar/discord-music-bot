@@ -10,46 +10,46 @@ class TestQueueMessage:
     def test_empty_list_returns_empty_string(self):
         assert queue_message([]) == ""
 
-    def test_two_items_shows_first_item(self):
-        # range(1, len(songs[:10])) with 2 items = range(1, 2) = [1]
-        # Only index 0 is shown; the last song is always omitted (off-by-one)
+    def test_two_items_shows_both(self):
         result = queue_message(["song_a", "song_b"])
         assert "1: song_a" in result
-        assert "song_b" not in result
+        assert "2: song_b" in result
 
-    def test_five_items_shows_four(self):
-        # range(1, 5) = [1, 2, 3, 4] — shows songs[0..3], not songs[4]
+    def test_five_items_shows_all_five(self):
         songs = [f"song{i}" for i in range(5)]
         result = queue_message(songs)
         lines = [line for line in result.split("\n") if line]
-        assert len(lines) == 4
+        assert len(lines) == 5
         assert "1: song0" in result
-        assert "4: song3" in result
-        assert "song4" not in result
+        assert "5: song4" in result
 
     def test_exactly_ten_items_no_ellipsis(self):
         songs = [f"track{i}" for i in range(10)]
         result = queue_message(songs)
         assert "..." not in result
 
+    def test_exactly_ten_items_shows_all_ten(self):
+        songs = [f"track{i}" for i in range(10)]
+        result = queue_message(songs)
+        lines = [line for line in result.split("\n") if line]
+        assert len(lines) == 10
+
     def test_more_than_ten_items_appends_ellipsis(self):
         songs = [f"track{i}" for i in range(15)]
         result = queue_message(songs)
         assert "..." in result
 
-    def test_more_than_ten_items_caps_at_nine_shown(self):
-        # songs[:10] has 10 entries; range(1, 10) = 9 entries shown
+    def test_more_than_ten_items_caps_at_ten_shown(self):
         songs = [f"track{i}" for i in range(20)]
         result = queue_message(songs)
         lines = [line for line in result.split("\n") if line and line != "..."]
-        assert len(lines) == 9
+        assert len(lines) == 10
 
     def test_numbering_starts_at_one(self):
         result = queue_message(["first", "second", "third"])
         assert result.startswith("1:")
 
     def test_songs_sliced_to_ten_before_processing(self):
-        # Ensures songs beyond index 9 are never in the output
         songs = [f"song{i}" for i in range(25)]
         result = queue_message(songs)
         assert "song15" not in result

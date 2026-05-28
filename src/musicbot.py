@@ -1,17 +1,20 @@
 import asyncio
-import os
+import contextlib
 import random
 from typing import List, Optional, Union
 
 import discord
 from discord.ext import commands
 
+import redis.asyncio as aioredis
+
 from src.musicplayer import MusicPlayer
+from src.redis_client import GuildRedisStore
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
     YTSource,
-    parse_url,
+    parse_input,
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
@@ -19,8 +22,36 @@ from src.util import queue_message, send_queue_phrases, get_logger
 
 log = get_logger(__name__)
 
-# music players
 from src.youtube import YTDL, QueueObject
+
+
+def _check_voice_permissions(
+    author: Union[discord.Member, discord.User],
+    voice_client: Optional[discord.VoiceClient],
+    command_name: str,
+) -> Optional[str]:
+    """Returns an error message string if validation fails, None if OK."""
+    if isinstance(author, discord.User):
+        return f"You must be a member of this channel {author}"
+    if not author.voice or not author.voice.channel:
+        return f"You are not connected to a voice channel, you silly baka {author}"
+    if (
+        command_name != "play"
+        and voice_client is not None
+        and voice_client.channel != author.voice.channel
+    ):
+        return f"Bot is already being used in channel {voice_client.channel}"
+    return None
+
+
+def _latency_color(ms: float) -> int:
+    if ms <= 50:
+        return 0x44FF44
+    if ms <= 100:
+        return 0xFFD000
+    if ms <= 200:
+        return 0xFF6600
+    return 0x990000
 
 
 class MusicBot(commands.Cog):
@@ -28,12 +59,13 @@ class MusicBot(commands.Cog):
     class for music bot
     """
 
-    __slots__ = ("bot", "mps")
+    __slots__ = ("bot", "mps", "spotify", "redis")
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
+        self.spotify = Spotify(redis=self.redis)
         self.mps = {}
-        self.spotify = Spotify()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         assert ctx.guild is not None
@@ -41,8 +73,10 @@ class MusicBot(commands.Cog):
             mp = self.mps[ctx.guild.id]
             mp.set_context(ctx)
             return mp
-        self.mps[ctx.guild.id] = MusicPlayer(self.bot, ctx)
-        return self.mps[ctx.guild.id]
+        mp = MusicPlayer.from_context(self.bot, ctx, redis=self.redis)
+        mp.start()
+        self.mps[ctx.guild.id] = mp
+        return mp
 
     async def cleanup(self, guild: discord.Guild) -> None:
         log.info("going to cleanup/disconnect")
@@ -53,7 +87,21 @@ class MusicBot(commands.Cog):
                 mp = self.mps[guild.id]
                 if mp._prefetch_task and not mp._prefetch_task.done():
                     mp._prefetch_task.cancel()
-                mp._player.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mp._prefetch_task
+                if mp._restore_task and not mp._restore_task.done():
+                    mp._restore_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mp._restore_task
+                if mp._player and not mp._player.done():
+                    mp._player.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mp._player
+                if mp._store is not None:
+                    # Intentional stop — clear channel IDs and now-playing state so
+                    # on_ready does not attempt to recover this guild after restart.
+                    await mp._store.clear_connection()
+                    await mp._store.refresh_ttl()
                 del self.mps[guild.id]
             except asyncio.CancelledError:
                 pass
@@ -64,30 +112,13 @@ class MusicBot(commands.Cog):
         self.get_mp(ctx)
 
     async def validate_commands(self, ctx: commands.Context) -> None:
-        if isinstance(ctx.author, discord.User):
-            await ctx.send(f"You must be a member of this channel {ctx.author}")
-            raise commands.CommandError(
-                f"User {ctx.author} must be a member of this channel."
-            )
-
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.send(
-                f"You are not connected to a voice channel, you silly baka {ctx.author}"
-            )
-            raise commands.CommandError(
-                f"User {ctx.author} is not connected to a voice channel."
-            )
-
-        if (
-            ctx.command is not None
-            and ctx.command.name != "play"
-            and ctx.voice_client
-            and ctx.voice_client.channel != ctx.author.voice.channel
-        ):
-            await ctx.send(
-                f"Bot is already being used in channel {ctx.voice_client.channel}"
-            )
-            raise commands.CommandError("Bot is already in a voice channel.")
+        vc = ctx.voice_client
+        voice_client = vc if isinstance(vc, discord.VoiceClient) else None
+        command_name = ctx.command.name if ctx.command is not None else ""
+        msg = _check_voice_permissions(ctx.author, voice_client, command_name)
+        if msg:
+            await ctx.send(msg)
+            raise commands.CommandError(msg)
 
     async def queue_source(
         self,
@@ -126,10 +157,9 @@ class MusicBot(commands.Cog):
         mp = self.get_mp(ctx)
         log.info(f"Voice client: {voice_client}")
 
-        # only support youtube link for now
         async with ctx.typing():
             try:
-                source = parse_url(url, ctx.message.content)
+                source = parse_input(url, ctx.message.content)
                 qobj: Union[QueueObject, List[str]] = await self.queue_source(
                     ctx, source
                 )
@@ -156,8 +186,6 @@ class MusicBot(commands.Cog):
                         )
                     )
                     await mp.queue_put(qobjs)
-                    for title in qobj:
-                        mp.song_queue.append(title)
 
                 else:
                     assert isinstance(qobj, QueueObject)
@@ -180,7 +208,6 @@ class MusicBot(commands.Cog):
                             )
                         )
                     await mp.queue_put(qobj)
-                    mp.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
                     log.info(f"play qsize: {mp.queue.qsize()}")
 
                 await ctx.message.add_reaction("👍")
@@ -268,6 +295,11 @@ class MusicBot(commands.Cog):
         await ctx.guild.change_voice_state(
             channel=channel, self_mute=False, self_deaf=True
         )
+
+        mp = self.get_mp(ctx)
+        if mp._store is not None and isinstance(ctx.channel, discord.TextChannel):
+            await mp._store.set_connection(channel.id, ctx.channel.id)
+
         await ctx.message.add_reaction("👋")
         await ctx.invoke(self.ping)
 
@@ -339,6 +371,7 @@ class MusicBot(commands.Cog):
             return await ctx.send("Volume must be between 0 and 100")
         mp = self.get_mp(ctx)
         mp.volume = volume / 100
+        await mp.redis_set_state("volume", str(mp.volume))
         await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
 
     @commands.command(
@@ -351,15 +384,94 @@ class MusicBot(commands.Cog):
             title="Ping - latency in ms",
             description=f"Ping: **{round(ms)}** milliseconds!",
         )
-        if ms <= 50:
-            embed.color = 0x44FF44
-        elif ms <= 100:
-            embed.color = 0xFFD000
-        elif ms <= 200:
-            embed.color = 0xFF6600
-        else:
-            embed.color = 0x990000
+        embed.color = _latency_color(ms)
         await ctx.send(embed=embed)
+
+    # ── Restart recovery listeners ────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Fires on cold start or session loss (NOT on WebSocket resume).
+        Spawns a recovery task per guild so we don't block the event loop."""
+        if self.redis is None:
+            return
+        for guild in self.bot.guilds:
+            asyncio.create_task(self._restore_guild(guild))
+
+    async def _restore_guild(self, guild: discord.Guild) -> None:
+        """Attempt to rejoin voice and restore queue for one guild after restart."""
+        if self.redis is None:
+            return
+        if guild.id in self.mps:
+            return
+
+        store = GuildRedisStore(self.redis, guild.id)
+
+        # Distributed lock prevents two bot instances from racing on the same guild.
+        if not await store.acquire_recovery_lock():
+            log.info(
+                f"Recovery lock held by another instance for guild {guild.id}, skipping"
+            )
+            return
+
+        try:
+            vc_id, tc_id = await store.get_connection()
+            if vc_id is None or tc_id is None:
+                return
+
+            voice_channel = guild.get_channel(vc_id)
+            text_channel = guild.get_channel(tc_id)
+            if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
+                text_channel, discord.TextChannel
+            ):
+                return
+
+            # Check there is something to restore before connecting.
+            queue_items = await store.get_queue()
+            state = await store.get_state()
+            has_crashed_song = bool(state.get(b"current_song_url", b""))
+            if not queue_items and not has_crashed_song:
+                return
+
+            try:
+                await voice_channel.connect(timeout=30.0, reconnect=True)
+                await guild.change_voice_state(
+                    channel=voice_channel, self_mute=False, self_deaf=True
+                )
+            except Exception as e:
+                log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
+                return
+
+            mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
+            mp.start()
+            self.mps[guild.id] = mp
+
+            log.info(
+                f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
+            )
+        except Exception as e:
+            log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
+        finally:
+            await store.release_recovery_lock()
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Detect when the bot itself is disconnected from a voice channel."""
+        if self.bot.user is None or member.id != self.bot.user.id:
+            return
+        if before.channel is not None and after.channel is None:
+            # Bot was removed from voice — clean up in-memory state.
+            guild = member.guild
+            if guild.id in self.mps:
+                log.info(
+                    f"Bot disconnected from voice in guild {guild.id}, cleaning up"
+                )
+                await self.cleanup(guild)
 
 
 async def setup(bot):

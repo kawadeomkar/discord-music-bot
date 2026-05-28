@@ -6,6 +6,7 @@ from src.sources import (
     SpotifySource,
     URLSource,
     YTSource,
+    parse_input,
     parse_url,
     spotify_playlist_to_ytsearch,
 )
@@ -102,28 +103,11 @@ class TestParseUrlSoundcloud:
         assert result.ts is None
 
 
-class TestParseUrlTextSearch:
-    def test_plain_text_becomes_ytsearch(self):
-        result = parse_url(
-            "never gonna give you up", "-play never gonna give you up"
-        )
-        assert isinstance(result, YTSource)
-        assert result.ytsearch == "ytsearch:never gonna give you up"
-        assert result.process is True
-        assert result.url is None
-
-    def test_multi_word_search(self):
-        result = parse_url("bohemian rhapsody queen", "-play bohemian rhapsody queen")
-        assert isinstance(result, YTSource)
-        assert result.ytsearch == "ytsearch:bohemian rhapsody queen"
-
-    def test_single_word_search(self):
-        result = parse_url("beethoven", "-play beethoven")
-        assert isinstance(result, YTSource)
-        assert result.ytsearch == "ytsearch:beethoven"
-
-
 class TestParseUrlErrors:
+    def test_plain_text_raises_value_error(self):
+        with pytest.raises(ValueError, match="Not a recognised URL"):
+            parse_url("never gonna give you up", "-play never gonna give you up")
+
     def test_unsupported_domain_raises(self):
         url = "https://example.com/video/123"
         with pytest.raises(Exception, match="Domain not supported"):
@@ -133,6 +117,38 @@ class TestParseUrlErrors:
         url = "https://vimeo.com/12345678"
         with pytest.raises(Exception, match="Domain not supported"):
             parse_url(url, f"-play {url}")
+
+
+class TestParseInput:
+    def test_plain_text_becomes_ytsearch(self):
+        result = parse_input(
+            "never gonna give you up", "-play never gonna give you up"
+        )
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:never gonna give you up"
+        assert result.process is True
+        assert result.url is None
+
+    def test_multi_word_search(self):
+        result = parse_input("bohemian rhapsody queen", "-play bohemian rhapsody queen")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:bohemian rhapsody queen"
+
+    def test_single_word_search(self):
+        result = parse_input("beethoven", "-play beethoven")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:beethoven"
+
+    def test_valid_url_is_parsed_directly(self):
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        result = parse_input(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.url == url
+
+    def test_spotify_url_is_parsed_directly(self):
+        url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
+        result = parse_input(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
 
 
 class TestSpotifyPlaylistToYTSearch:

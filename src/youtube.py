@@ -1,13 +1,21 @@
 import asyncio
 import datetime
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, Union
+from urllib.parse import parse_qs, urlparse
 
 import discord
 import yt_dlp as youtube_dl
 
+import redis.asyncio as aioredis
+
+from src.redis_client import cache_get, cache_set
 from src.spotify import Spotify
+from src.util import get_logger
+
+log = get_logger(__name__)
 
 _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
@@ -66,6 +74,45 @@ YTDL_OPTS = {
     "rm_cachedir": True,
 }
 
+# Fields to persist in the stream URL cache — strips ephemeral/large fields.
+_STREAM_CACHE_FIELDS = frozenset(
+    {
+        "url",
+        "webpage_url",
+        "title",
+        "uploader",
+        "uploader_url",
+        "upload_date",
+        "thumbnail",
+        "description",
+        "duration",
+        "tags",
+        "view_count",
+        "like_count",
+        "dislike_count",
+        "abr",
+        "asr",
+        "acodec",
+    }
+)
+
+
+def _stream_url_ttl(stream_url: str) -> Optional[int]:
+    """Returns seconds until stream URL expiry minus 30-min safety margin, or None if too short.
+
+    YouTube CDN URLs carry a 6-hour expiry window (empirically confirmed). The `ip` parameter
+    is included in `sparams` (HMAC-signed) so URLs are cryptographically bound to the IP that
+    extracted them — they cannot be reused from a different host. With a 300s margin, the minimum
+    URL lifetime on a cache hit is only ~5 minutes, which is shorter than many songs. 1800s (30
+    min) ensures cache hits remain valid for songs up to ~30 minutes.
+    """
+    try:
+        expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
+        ttl = expire - int(time.time()) - 1800
+        return ttl if ttl > 60 else None
+    except (ValueError, IndexError):
+        return None
+
 
 @dataclass
 class QueueObject:
@@ -123,17 +170,66 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.__getattribute__(item)
 
     @classmethod
+    async def prefetch_stream(
+        cls,
+        qo: QueueObject,
+        redis: Optional[aioredis.Redis] = None,
+    ) -> None:
+        """Eagerly populate the stream URL cache for a queued song.
+
+        Spawned as a background task at enqueue time so yt_stream() is a cache
+        hit by the time the song is ready to play. No-op when redis is None or
+        the URL is already cached. Errors are logged and swallowed — yt_stream()
+        recovers by extracting fresh at play time.
+        """
+        if redis is None:
+            return
+        cache_key = f"ytdl:stream:{qo.webpage_url}"
+        if await cache_get(redis, cache_key) is not None:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                _YTDLP_POOL, _ytdlp_extract, qo.webpage_url, YTDL_OPTS, False, True
+            )
+        except Exception as e:
+            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
+            return
+        if data is not None:
+            stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+            ttl = _stream_url_ttl(data.get("url", ""))
+            if ttl:
+                await cache_set(redis, cache_key, stripped, ttl)
+
+    @classmethod
     async def yt_stream(
         cls,
         qo: QueueObject,
         channel: discord.TextChannel,
         *,
         volume: float = 1.0,
+        redis: Optional[aioredis.Redis] = None,
     ):
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(
-            _YTDLP_POOL, _ytdlp_extract, qo.webpage_url, YTDL_OPTS, False, True
-        )
+
+        # ── Cache check ───────────────────────────────────────────────────────
+        cache_key = f"ytdl:stream:{qo.webpage_url}"
+        data = await cache_get(redis, cache_key)
+
+        # ── Extract (only if cache miss) ──────────────────────────────────────
+        if data is None:
+            data = await loop.run_in_executor(
+                _YTDLP_POOL, _ytdlp_extract, qo.webpage_url, YTDL_OPTS, False, True
+            )
+            if data is not None:
+                stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+                ttl = _stream_url_ttl(data.get("url", ""))
+                if ttl:
+                    await cache_set(redis, cache_key, stripped, ttl)
+
+        if data is None:
+            raise RuntimeError("Could not extract stream data")
+
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"

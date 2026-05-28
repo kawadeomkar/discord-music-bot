@@ -55,13 +55,15 @@ def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """
+    Parse a URL into a source dataclass. Raises ValueError if no domain is matched.
+
     domain regex (4 groups):
         group 1/2: http/www prefix
         group 3: domain
         group 4: path
 
     :param url: URL to be parsed
-    :param message: full message content search
+    :param message: full message content (used for Spotify si param extraction)
     :return: source
     """
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
@@ -71,9 +73,7 @@ def parse_url(
     args_match = re.findall(args_re, url)
 
     if not domain_match:
-        ytsearch = " ".join(message.split(" ")[1:])
-        ytsearch = f"ytsearch:{ytsearch}"
-        return YTSource(ytsearch=ytsearch, process=True)
+        raise ValueError(f"Not a recognised URL: {url!r}")
 
     domain = domain_match.group(3)
 
@@ -89,7 +89,24 @@ def parse_url(
             raise Exception(f"Unknown Spotify track type: {path}")
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(path[0], path[1], process=True)
-    elif domain in ("soundcloud.com"):
+    elif domain in ("soundcloud.com",):
         return SoundcloudSource(url, process=True)
     else:
         raise Exception(f"Domain not supported {domain}")
+
+
+def parse_input(
+    user_input: str, message: str
+) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+    """
+    Top-level entry point for command input. Tries parse_url; falls back to ytsearch.
+
+    :param user_input: the URL or search term from the command argument
+    :param message: full message content (used to extract the search query)
+    :return: source
+    """
+    try:
+        return parse_url(user_input, message)
+    except ValueError:
+        ytsearch = " ".join(message.split(" ")[1:])
+        return YTSource(ytsearch=f"ytsearch:{ytsearch}", process=True)

@@ -5,13 +5,44 @@ from typing import Any, List, Optional, Union
 
 import async_timeout
 import discord
+import orjson
 from discord.ext import commands
 
+from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.util import queue_message, get_logger
 
 log = get_logger(__name__)
 from src.youtube import YTDL, QueueObject
+
+
+def _queue_display_str(title: str, url: str) -> str:
+    return f"{title} - {url}"
+
+
+def _serialize_queue_item(qobj: QueueObject) -> bytes:
+    return orjson.dumps(
+        {
+            "webpage_url": qobj.webpage_url,
+            "title": qobj.title,
+            "requester_id": qobj.requester.id,
+            "ts": qobj.ts,
+        }
+    )
+
+
+def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[QueueObject]:
+    try:
+        d = orjson.loads(data)
+        member: Union[discord.Member, discord.User, None] = (
+            guild.get_member(d["requester_id"]) or guild.owner
+        )
+        if member is None:
+            return None
+        return QueueObject(d["webpage_url"], d["title"], member, ts=d.get("ts"))
+    except Exception as e:
+        log.warning(f"Failed to deserialize queue item: {e}")
+        return None
 
 
 class MusicPlayer:
@@ -31,6 +62,8 @@ class MusicPlayer:
         "volume",
         "_player",
         "_prefetch_task",
+        "_store",
+        "_restore_task",
     )
 
     bot: commands.Bot
@@ -46,17 +79,25 @@ class MusicPlayer:
     history: deque
     song_queue: deque
     volume: float
-    _player: asyncio.Task
+    _player: Optional[asyncio.Task]
     _prefetch_task: Optional[asyncio.Task]
+    _store: Optional[GuildRedisStore]
+    _restore_task: Optional[asyncio.Task]
 
-    def __init__(self, bot: commands.Bot, ctx: commands.Context):
+    def __init__(
+        self,
+        bot: commands.Bot,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        cog: Any,
+        redis=None,
+    ):
         self.bot = bot
-        assert ctx.guild is not None
-        assert isinstance(ctx.channel, discord.TextChannel)
-        self._guild = ctx.guild
-        self._channel = ctx.channel
-        self._last_author = ctx.author
-        self._cog = ctx.cog
+        self._guild = guild
+        self._channel = channel
+        _fallback: Union[discord.Member, discord.User, None] = guild.me or guild.owner
+        self._last_author = _fallback  # type: ignore[assignment]
+        self._cog = cog
 
         self.current_song = None
         self.play_next = asyncio.Event()
@@ -68,16 +109,32 @@ class MusicPlayer:
         self.song_queue = deque()
         self.volume = 1.0
 
-        self._prefetch_task = None
-        self._player = bot.loop.create_task(self.loop())
+        self._store = (
+            GuildRedisStore(redis, self._guild.id) if redis is not None else None
+        )
+        self._player: Optional[asyncio.Task] = None
+        self._prefetch_task: Optional[asyncio.Task] = None
+        self._restore_task: Optional[asyncio.Task] = None
 
-    def __del__(self):
-        log.info("cancelling player task")
-        try:
-            self._player.cancel()
-        except Exception as e:
-            log.error(f"error cancelling player task: {e}")
-        return
+    @classmethod
+    def from_context(
+        cls,
+        bot: commands.Bot,
+        ctx: commands.Context,
+        redis=None,
+    ) -> "MusicPlayer":
+        assert ctx.guild is not None
+        assert isinstance(ctx.channel, discord.TextChannel)
+        assert ctx.cog is not None
+        mp = cls(bot, ctx.guild, ctx.channel, ctx.cog, redis=redis)
+        mp._last_author = ctx.author
+        return mp
+
+    def start(self) -> None:
+        """Start the playback loop and (if Redis is configured) the state restore task."""
+        self._player = self.bot.loop.create_task(self.loop())
+        if self._store is not None:
+            self._restore_task = self.bot.loop.create_task(self._restore_state())
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -90,12 +147,99 @@ class MusicPlayer:
     async def stop(self):
         await self._cog.cleanup(self._guild)
 
+    async def redis_set_state(self, field: str, value: str) -> None:
+        """Update a field in the guild state hash."""
+        if self._store is not None:
+            await self._store.set_state(field, value)
+
+    # ── State restore ─────────────────────────────────────────────────────────
+
+    async def _restore_state(self) -> None:
+        """
+        Restore queue, history, and volume from Redis after a bot restart.
+        Runs as a background task; waits for bot ready so guild members are cached.
+        """
+        if self._store is None:
+            return
+        await self.bot.wait_until_ready()
+        try:
+            # Restore volume
+            state = await self._store.get_state()
+            if state and b"volume" in state:
+                self.volume = float(state[b"volume"])
+
+            # Re-queue song that was playing when the bot crashed (at-most-once delivery).
+            # current_song_url is written to state when playback starts and cleared when
+            # it finishes normally. A non-empty value means the bot died mid-song.
+            crashed_url_raw = state.get(b"current_song_url", b"")
+            if crashed_url_raw:
+                crashed_url = crashed_url_raw.decode()
+                crashed_title = state.get(b"current_song_title", b"").decode()
+                requester: Union[discord.Member, discord.User, None] = (
+                    self._guild.me or self._guild.owner
+                )
+                if requester is not None:
+                    crashed = QueueObject(crashed_url, crashed_title, requester)
+                    await self.queue.put(crashed)
+                    self.song_queue.append(
+                        _queue_display_str(crashed_title, crashed_url)
+                    )
+                    await self._store.set_state("current_song_url", "")
+                    await self._store.set_state("current_song_title", "")
+                    log.info(
+                        f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
+                    )
+
+            # Restore queue (Redis list → asyncio.Queue + song_queue deque)
+            items = await self._store.get_queue()
+            count = 0
+            for item in items:
+                qobj = _deserialize_queue_item(item, self._guild)
+                if qobj is not None:
+                    await self.queue.put(qobj)
+                    self.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
+                    count += 1
+            if count:
+                log.info(f"Restored {count} queued songs for guild {self._guild.id}")
+
+            # Restore history (Redis list is newest-first; deque appends oldest-first)
+            hist_items = await self._store.get_history()
+            for item in reversed(hist_items):
+                try:
+                    self.history.append(orjson.loads(item))
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.error(f"State restore failed for guild {self._guild.id}: {e}")
+            return
+
+        # Refresh TTL on all guild keys after successful restore.
+        await self._store.refresh_ttl()
+
+    # ── Queue operations ──────────────────────────────────────────────────────
+
     async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
-        if isinstance(obj, list):
-            for o in obj:
-                await self.queue.put(o)
-        else:
-            await self.queue.put(obj)
+        items: list[Union[QueueObject, YTSource]] = (
+            list(obj) if isinstance(obj, list) else [obj]
+        )
+        for item in items:
+            await self.queue.put(item)
+
+            if isinstance(item, QueueObject):
+                self.song_queue.append(_queue_display_str(item.title, item.webpage_url))
+            else:
+                self.song_queue.append(
+                    _queue_display_str(item.ytsearch or item.url or "?", "")
+                )
+
+            # Mirror to Redis and kick off stream pre-fetch (QueueObject only —
+            # YTSource items have no stable webpage_url to key the cache on).
+            if isinstance(item, QueueObject) and self._store is not None:
+                await self._store.push_queue(_serialize_queue_item(item))
+                asyncio.create_task(
+                    YTDL.prefetch_stream(item, redis=self._store.redis)
+                )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
@@ -120,16 +264,17 @@ class MusicPlayer:
             for _ in range(self.queue.qsize()):
                 try:
                     self.queue.get_nowait()
-                    self.queue.task_done()  # eventually will use join
+                    self.queue.task_done()
                 except asyncio.QueueEmpty:
                     break
             self.song_queue.clear()
+        if self._store is not None:
+            await self._store.delete_queue()
 
     async def queue_shuffle(self) -> str:
         await self._cancel_prefetch()
 
-        shuffled = []
-        squeue = []
+        shuffled: List[Union[QueueObject, YTSource]] = []
 
         if self.queue.qsize() < 4:
             return "There must be at least 3 songs to shuffle the queue"
@@ -143,14 +288,33 @@ class MusicPlayer:
                 except asyncio.QueueEmpty:
                     break
             random.shuffle(shuffled)
+            squeue = []
             for song in shuffled:
                 try:
                     self.queue.put_nowait(song)
-                    squeue.append(f"{song.title} - [{song.webpage_url}]")
+                    if isinstance(song, QueueObject):
+                        squeue.append(_queue_display_str(song.title, song.webpage_url))
+                    else:
+                        squeue.append(
+                            _queue_display_str(song.ytsearch or song.url or "?", "")
+                        )
                 except asyncio.QueueFull:
                     break
             self.song_queue = deque(squeue)
+
+        # Rebuild Redis mirror atomically: DELETE + RPUSH must be MULTI/EXEC,
+        # not plain pipeline — a plain pipeline() leaves a window where the key
+        # is empty and a concurrent LPOP sees an empty queue.
+        if self._store is not None and shuffled:
+            serialized = [
+                _serialize_queue_item(s) for s in shuffled if isinstance(s, QueueObject)
+            ]
+            if serialized:
+                await self._store.rebuild_queue(serialized)
+
         return "Shuffled!"
+
+    # ── Embed building ────────────────────────────────────────────────────────
 
     def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
         requester_mention = song.requester.mention if song.requester else "Unknown"
@@ -174,8 +338,9 @@ class MusicPlayer:
 
     async def update_activity(self):
         # TODO
-        # stream_activity = discord.Streaming()
         pass
+
+    # ── Playback pipeline helpers ─────────────────────────────────────────────
 
     async def _resolve_source(
         self, source: Union[QueueObject, YTSource]
@@ -188,7 +353,12 @@ class MusicPlayer:
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
         try:
-            return await YTDL.yt_stream(source, self._channel, volume=self.volume)
+            return await YTDL.yt_stream(
+                source,
+                self._channel,
+                volume=self.volume,
+                redis=self._store.redis if self._store is not None else None,
+            )
         except Exception as e:
             log.error(f"Error processing song: {e}")
             return None
@@ -225,6 +395,8 @@ class MusicPlayer:
             self.queue.task_done()
             return None
 
+    # ── Main playback loop ────────────────────────────────────────────────────
+
     async def loop(self):
         await self.bot.wait_until_ready()
         prefetched_song: Optional[YTDL] = None
@@ -251,6 +423,8 @@ class MusicPlayer:
                         self.song_queue.popleft()
                     except IndexError:
                         pass
+                    if self._store is not None:
+                        await self._store.pop_queue()
                     self.queue.task_done()
                     try:
                         await self._channel.send(
@@ -260,8 +434,10 @@ class MusicPlayer:
                         pass
                     continue
 
-                await self._send_now_playing(self.current_song)
                 self.song_queue.popleft()
+                if self._store is not None:
+                    await self._store.pop_queue()
+
                 vc = self._guild.voice_client
                 assert isinstance(vc, discord.VoiceClient)
                 vc.play(
@@ -270,6 +446,16 @@ class MusicPlayer:
                         self.play_next.set
                     ),
                 )
+                await self._send_now_playing(self.current_song)
+
+                # Mirror now-playing song to Redis state
+                if self._store is not None and self.current_song is not None:
+                    await self._store.set_state(
+                        "current_song_title", self.current_song.title or ""
+                    )
+                    await self._store.set_state(
+                        "current_song_url", self.current_song.webpage_url or ""
+                    )
 
                 self._prefetch_task = asyncio.create_task(self._prefetch_next_song())
 
@@ -281,9 +467,19 @@ class MusicPlayer:
                     prefetched_song = None
                 self._prefetch_task = None
 
-                self.history.append(
-                    f"{self.current_song.title} - {self.current_song.webpage_url}"
-                )
+                if self.current_song is not None:
+                    history_entry = (
+                        f"{self.current_song.title} - {self.current_song.webpage_url}"
+                    )
+                    self.history.append(history_entry)
+                    if self._store is not None:
+                        await self._store.push_history(orjson.dumps(history_entry))
+
+                # Clear now-playing state
+                if self._store is not None:
+                    await self._store.set_state("current_song_title", "")
+                    await self._store.set_state("current_song_url", "")
+
                 self.queue.task_done()
                 self.current_song = None
             except asyncio.CancelledError:
