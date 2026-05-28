@@ -1,4 +1,5 @@
 """Shared fixtures for the discord-music-bot test suite."""
+
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -90,13 +91,16 @@ async def fake_redis():
 @pytest.fixture
 def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
     """Construct MusicPlayer with fake Redis. start() is NOT called — tests operate on state directly."""
-    return MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
+    return MusicPlayer(
+        mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+    )
 
 
 @pytest.fixture
 def spotify(fake_redis):
     """Spotify instance with fake Redis cache and no blocking auth call at construction."""
     from unittest.mock import patch
+
     with patch.dict(
         "os.environ",
         {"SPOTIFY_CLIENT_ID": "test_id", "SPOTIFY_CLIENT_SECRET": "test_secret"},
@@ -133,6 +137,11 @@ def ytdl_instance(mock_channel, mock_author):
         if data:
             default_data.update(data)
         with patch.object(d.FFmpegOpusAudio, "__init__", return_value=None):
-            return YTDL(mock_channel, default_data["url"], data=default_data, requester=mock_author)
+            return YTDL(
+                mock_channel,
+                default_data["url"],
+                data=default_data,
+                requester=mock_author,
+            )
 
     return _make

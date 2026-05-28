@@ -1,4 +1,5 @@
 """Tests for src/sources.py — URL parsing and source type detection."""
+
 import pytest
 
 from src.sources import (
@@ -121,9 +122,7 @@ class TestParseUrlErrors:
 
 class TestParseInput:
     def test_plain_text_becomes_ytsearch(self):
-        result = parse_input(
-            "never gonna give you up", "-play never gonna give you up"
-        )
+        result = parse_input("never gonna give you up", "-play never gonna give you up")
         assert isinstance(result, YTSource)
         assert result.ytsearch == "ytsearch:never gonna give you up"
         assert result.process is True

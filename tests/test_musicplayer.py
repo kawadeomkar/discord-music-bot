@@ -1,4 +1,5 @@
 """Tests for src/musicplayer.py — queue operations, embed building, and Redis integration."""
+
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock
 
@@ -41,7 +42,10 @@ def queue_obj(mock_author):
 
 class TestQueueDisplayStr:
     def test_formats_title_and_url(self):
-        assert _queue_display_str("My Song", "https://yt.com") == "My Song - https://yt.com"
+        assert (
+            _queue_display_str("My Song", "https://yt.com")
+            == "My Song - https://yt.com"
+        )
 
     def test_empty_url_leaves_trailing_dash(self):
         result = _queue_display_str("Search Query", "")
@@ -82,14 +86,18 @@ class TestQueuePut:
         assert music_player.queue.qsize() == 3
         assert len(music_player.song_queue) == 3
 
-    async def test_put_multiple_singles_increments_size(self, music_player, mock_author):
+    async def test_put_multiple_singles_increments_size(
+        self, music_player, mock_author
+    ):
         for i in range(4):
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
             await music_player.queue_put(qobj)
         assert music_player.queue.qsize() == 4
         assert len(music_player.song_queue) == 4
 
-    async def test_put_mirrors_queue_object_to_redis(self, music_player, queue_obj, fake_redis):
+    async def test_put_mirrors_queue_object_to_redis(
+        self, music_player, queue_obj, fake_redis
+    ):
         await music_player.queue_put(queue_obj)
         items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert len(items) == 1
@@ -109,21 +117,27 @@ class TestQueuePut:
         import asyncio
         from unittest.mock import patch, AsyncMock
 
-        with patch("src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock) as mock_pf:
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
             await music_player.queue_put(queue_obj)
             await asyncio.sleep(0)  # yield to let the spawned task run
         mock_pf.assert_awaited_once()
         call_kwargs = mock_pf.call_args
         assert call_kwargs[0][0] == queue_obj  # first positional arg is the QueueObject
 
-    async def test_put_does_not_spawn_prefetch_for_yt_source(self, music_player, mock_author):
+    async def test_put_does_not_spawn_prefetch_for_yt_source(
+        self, music_player, mock_author
+    ):
         """queue_put does not spawn prefetch_stream for YTSource items (no webpage_url)."""
         import asyncio
         from unittest.mock import patch, AsyncMock
         from src.sources import YTSource
 
         source = YTSource(ytsearch="ytsearch:test song", process=True)
-        with patch("src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock) as mock_pf:
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
             await music_player.queue_put(source)
             await asyncio.sleep(0)
         mock_pf.assert_not_awaited()
@@ -172,7 +186,9 @@ class TestQueueShuffle:
         result = await music_player.queue_shuffle()
         assert result == "There must be at least 3 songs to shuffle the queue"
 
-    async def test_shuffle_sufficient_songs_returns_shuffled(self, music_player, mock_author):
+    async def test_shuffle_sufficient_songs_returns_shuffled(
+        self, music_player, mock_author
+    ):
         for i in range(5):
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
             await music_player.queue_put(qobj)
@@ -218,7 +234,9 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert mock_song.title in embed.title
 
-    def test_embed_description_contains_requester_mention(self, music_player, mock_song):
+    def test_embed_description_contains_requester_mention(
+        self, music_player, mock_song
+    ):
         embed = music_player._build_now_playing_embed(mock_song)
         assert mock_song.requester.mention in embed.description
 
@@ -272,9 +290,7 @@ class TestMusicPlayerInitialState:
 class TestRedisHelpers:
     async def test_redis_push_history_capped_at_50(self, music_player, fake_redis):
         for i in range(55):
-            await music_player._store.push_history(
-                orjson.dumps(f"Song {i} - url{i}")
-            )
+            await music_player._store.push_history(orjson.dumps(f"Song {i} - url{i}"))
         items = await fake_redis.lrange(music_player._store.history_key(), 0, -1)
         assert len(items) == 50
 
@@ -291,19 +307,23 @@ class TestRedisHelpers:
         assert len(remaining) == 1
         assert remaining[0] == b"item2"
 
-    def test_store_is_none_when_no_redis(self, mock_bot, mock_guild, mock_channel, mock_ctx):
+    def test_store_is_none_when_no_redis(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
         assert mp._store is None
 
 
 class TestStateRestore:
     async def test_restore_populates_queue(self, music_player, fake_redis, mock_author):
-        item = orjson.dumps({
-            "webpage_url": "https://yt.com/v=abc",
-            "title": "Restored Song",
-            "requester_id": mock_author.id,
-            "ts": None,
-        })
+        item = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=abc",
+                "title": "Restored Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
         await fake_redis.rpush(music_player._store.queue_key(), item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
@@ -316,28 +336,36 @@ class TestStateRestore:
         await music_player._restore_state()
         assert music_player.volume == 0.5
 
-    async def test_restore_noop_when_no_redis(self, mock_bot, mock_guild, mock_channel, mock_ctx):
+    async def test_restore_noop_when_no_redis(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
         await mp._restore_state()
         assert mp.queue.qsize() == 0
 
 
 class TestRestoreCrashedSong:
-    async def test_crashed_song_requeued_at_front(self, music_player, fake_redis, mock_author):
+    async def test_crashed_song_requeued_at_front(
+        self, music_player, fake_redis, mock_author
+    ):
         """If current_song_url is set in state at restore time, it goes to queue position 0."""
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_url", b"https://yt.com/v=crash"
+            music_player._store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
             music_player._store.state_key(), b"current_song_title", b"Crashed Song"
         )
         # Also seed a normal queued item so we can confirm ordering.
-        normal_item = orjson.dumps({
-            "webpage_url": "https://yt.com/v=normal",
-            "title": "Normal Song",
-            "requester_id": mock_author.id,
-            "ts": None,
-        })
+        normal_item = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=normal",
+                "title": "Normal Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
         await fake_redis.rpush(music_player._store.queue_key(), normal_item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
@@ -348,10 +376,14 @@ class TestRestoreCrashedSong:
         assert first.webpage_url == "https://yt.com/v=crash"
         assert first.title == "Crashed Song"
 
-    async def test_crashed_song_state_cleared_after_restore(self, music_player, fake_redis):
+    async def test_crashed_song_state_cleared_after_restore(
+        self, music_player, fake_redis
+    ):
         """State fields are wiped so a second restart does not re-queue the same song."""
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_url", b"https://yt.com/v=crash"
+            music_player._store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
             music_player._store.state_key(), b"current_song_title", b"Crashed Song"
@@ -364,14 +396,18 @@ class TestRestoreCrashedSong:
         assert state.get(b"current_song_url", b"") == b""
         assert state.get(b"current_song_title", b"") == b""
 
-    async def test_no_crash_song_when_state_empty(self, music_player, fake_redis, mock_author):
+    async def test_no_crash_song_when_state_empty(
+        self, music_player, fake_redis, mock_author
+    ):
         """No crashed song entry means only queued items are restored."""
-        normal_item = orjson.dumps({
-            "webpage_url": "https://yt.com/v=abc",
-            "title": "Normal",
-            "requester_id": mock_author.id,
-            "ts": None,
-        })
+        normal_item = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=abc",
+                "title": "Normal",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
         await fake_redis.rpush(music_player._store.queue_key(), normal_item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
@@ -392,7 +428,9 @@ class TestResolveSource:
         from src.sources import YTSource
 
         fake_qobj = QueueObject("https://yt.com/v=1", "Resolved", mock_author)
-        with patch("src.musicplayer.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)):
+        with patch(
+            "src.musicplayer.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
             result = await music_player._resolve_source(
                 YTSource(ytsearch="ytsearch:test", process=True)
             )
@@ -404,7 +442,10 @@ class TestStreamSource:
     async def test_returns_none_on_exception(self, music_player, queue_obj):
         from unittest.mock import patch, AsyncMock
 
-        with patch("src.musicplayer.YTDL.yt_stream", new=AsyncMock(side_effect=Exception("boom"))):
+        with patch(
+            "src.musicplayer.YTDL.yt_stream",
+            new=AsyncMock(side_effect=Exception("boom")),
+        ):
             result = await music_player._stream_source(queue_obj)
         assert result is None
 
@@ -412,6 +453,8 @@ class TestStreamSource:
         from unittest.mock import patch, AsyncMock
 
         mock_ytdl = MagicMock()
-        with patch("src.musicplayer.YTDL.yt_stream", new=AsyncMock(return_value=mock_ytdl)):
+        with patch(
+            "src.musicplayer.YTDL.yt_stream", new=AsyncMock(return_value=mock_ytdl)
+        ):
             result = await music_player._stream_source(queue_obj)
         assert result is mock_ytdl

@@ -237,9 +237,7 @@ class MusicPlayer:
             # YTSource items have no stable webpage_url to key the cache on).
             if isinstance(item, QueueObject) and self._store is not None:
                 await self._store.push_queue(_serialize_queue_item(item))
-                asyncio.create_task(
-                    YTDL.prefetch_stream(item, redis=self._store.redis)
-                )
+                asyncio.create_task(YTDL.prefetch_stream(item, redis=self._store.redis))
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()

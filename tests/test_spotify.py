@@ -1,4 +1,5 @@
 """Tests for src/spotify.py — Spotify API auth, response parsing, and Redis cache."""
+
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,7 +39,9 @@ class TestSpotifyRefreshToken:
         await spotify._refresh_token()
         assert spotify.auth_token == "test_access_token_xyz"
 
-    async def test_refresh_token_sends_client_credentials_grant(self, spotify, mock_auth_response):
+    async def test_refresh_token_sends_client_credentials_grant(
+        self, spotify, mock_auth_response
+    ):
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
         mock_session = _make_mock_session(mock_resp)
@@ -51,7 +54,9 @@ class TestSpotifyRefreshToken:
         assert call_kwargs["data"]["client_id"] == "test_id"
         assert call_kwargs["data"]["client_secret"] == "test_secret"
 
-    async def test_refresh_token_sets_token_expiry_in_future(self, spotify, mock_auth_response):
+    async def test_refresh_token_sets_token_expiry_in_future(
+        self, spotify, mock_auth_response
+    ):
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
         mock_session = _make_mock_session(mock_resp)
@@ -72,7 +77,9 @@ class TestSpotifyTrack:
             "name": "Bohemian Rhapsody",
             "artists": [{"name": "Queen"}],
         }
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ):
             result = await spotify.track("some_track_id")
 
         assert result == "Bohemian Rhapsody Queen"
@@ -82,14 +89,18 @@ class TestSpotifyTrack:
             "name": "Collaboration Track",
             "artists": [{"name": "Artist A"}, {"name": "Artist B"}],
         }
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ):
             result = await spotify.track("multi_artist_id")
 
         assert result == "Collaboration Track Artist A Artist B"
 
     async def test_track_calls_correct_endpoint(self, spotify):
         mock_response = {"name": "Song", "artists": [{"name": "Artist"}]}
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)) as mock_call:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ) as mock_call:
             await spotify.track("abc123")
 
         called_endpoint = mock_call.call_args[0][0]
@@ -115,7 +126,9 @@ class TestSpotifyPlaylist:
                 },
             ]
         }
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ):
             result = await spotify.playlist("playlist_id_123")
 
         assert len(result) == 2
@@ -124,14 +137,18 @@ class TestSpotifyPlaylist:
 
     async def test_playlist_empty_items_returns_empty_list(self, spotify):
         mock_response = {"items": []}
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ):
             result = await spotify.playlist("empty_playlist_id")
 
         assert result == []
 
     async def test_playlist_calls_correct_endpoint(self, spotify):
         mock_response = {"items": []}
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)) as mock_call:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ) as mock_call:
             await spotify.playlist("pl_abc")
 
         called_endpoint = mock_call.call_args[0][0]
@@ -148,7 +165,9 @@ class TestSpotifyPlaylist:
                 }
             ]
         }
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_response)
+        ):
             result = await spotify.playlist("pid")
 
         assert result[0] == "Collab A B C"
@@ -200,32 +219,40 @@ class TestSpotifyRedisCache:
 
     async def test_track_cache_hit_skips_http(self, spotify):
         """Second call returns cached value without hitting http_call."""
-        with patch.object(spotify, "http_call", new=AsyncMock(
-            return_value={"name": "Song", "artists": [{"name": "Artist"}]}
-        )) as mock_call:
+        with patch.object(
+            spotify,
+            "http_call",
+            new=AsyncMock(
+                return_value={"name": "Song", "artists": [{"name": "Artist"}]}
+            ),
+        ) as mock_call:
             await spotify.track("tid_cache1")
             await spotify.track("tid_cache1")  # second call — cache hit
         mock_call.assert_called_once()
 
     async def test_playlist_cache_hit_skips_http(self, spotify):
         mock_resp = {"items": [{"track": {"name": "T", "artists": [{"name": "A"}]}}]}
-        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)) as m:
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_resp)
+        ) as m:
             await spotify.playlist("pid_cache1")
             await spotify.playlist("pid_cache1")
         m.assert_called_once()
 
     async def test_track_ttl_is_24h(self, spotify, fake_redis):
-        with patch.object(spotify, "http_call", new=AsyncMock(
-            return_value={"name": "S", "artists": [{"name": "A"}]}
-        )):
+        with patch.object(
+            spotify,
+            "http_call",
+            new=AsyncMock(return_value={"name": "S", "artists": [{"name": "A"}]}),
+        ):
             await spotify.track("ttl_test_track")
         ttl = await fake_redis.ttl("spotify:track:ttl_test_track")
         assert 86390 <= ttl <= 86400
 
     async def test_playlist_ttl_is_1h(self, spotify, fake_redis):
-        with patch.object(spotify, "http_call", new=AsyncMock(
-            return_value={"items": []}
-        )):
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value={"items": []})
+        ):
             await spotify.playlist("ttl_test_playlist")
         ttl = await fake_redis.ttl("spotify:playlist:ttl_test_playlist")
         assert 3590 <= ttl <= 3600
@@ -233,10 +260,15 @@ class TestSpotifyRedisCache:
     async def test_cache_graceful_when_no_redis(self, fake_redis):
         """Spotify without Redis still works via network."""
         from unittest.mock import patch as p
-        with p.dict("os.environ", {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"}):
+
+        with p.dict(
+            "os.environ", {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"}
+        ):
             s = Spotify(redis=None)
-        with patch.object(s, "http_call", new=AsyncMock(
-            return_value={"name": "S", "artists": [{"name": "A"}]}
-        )):
+        with patch.object(
+            s,
+            "http_call",
+            new=AsyncMock(return_value={"name": "S", "artists": [{"name": "A"}]}),
+        ):
             result = await s.track("no_redis")
         assert result == "S A"

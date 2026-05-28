@@ -1,4 +1,5 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
+
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -144,7 +145,9 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test", process=True)
+            result = await YTDL.yt_source(
+                mock_ctx.author, "ytsearch:test", process=True
+            )
 
         assert result.title == "Entry One"
         assert "entry1" in result.webpage_url
@@ -166,7 +169,9 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test", process=True)
+            result = await YTDL.yt_source(
+                mock_ctx.author, "ytsearch:test", process=True
+            )
 
         assert result.title == "Real Video"
 
@@ -189,10 +194,14 @@ class TestYTStream:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
-        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+        )
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
-             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+        ):
             result = await YTDL.yt_stream(qobj, channel)
 
         assert isinstance(result, YTDL)
@@ -203,15 +212,19 @@ class TestYTStream:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
-        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author)
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+        )
 
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
             captured_options["options"] = options
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
-             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init):
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
             await YTDL.yt_stream(qobj, channel, volume=0.5)
 
         assert "volume=0.5" in captured_options["options"]
@@ -220,15 +233,19 @@ class TestYTStream:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
-        qobj = QueueObject("https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90)
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
+        )
 
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
             captured_options["options"] = options
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data), \
-             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init):
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
             await YTDL.yt_stream(qobj, channel)
 
         assert "-ss 90" in captured_options["options"]
@@ -279,12 +296,16 @@ class TestStreamCache:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
-        with patch("src.youtube._ytdlp_extract") as mock_extract, \
-             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+        with (
+            patch("src.youtube._ytdlp_extract") as mock_extract,
+            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+        ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
         mock_extract.assert_not_called()
 
-    async def test_cache_miss_calls_executor_and_populates_cache(self, mock_ctx, fake_redis):
+    async def test_cache_miss_calls_executor_and_populates_cache(
+        self, mock_ctx, fake_redis
+    ):
         """On cache miss, executor is called and result is written to Redis."""
         fake_data = _fake_ytdl_data(
             webpage_url="https://yt.com/v=cache_miss",
@@ -294,8 +315,10 @@ class TestStreamCache:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract, \
-             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
+            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+        ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
 
         mock_extract.assert_called_once()
@@ -311,8 +334,10 @@ class TestStreamCache:
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract, \
-             patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None):
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
+            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+        ):
             await YTDL.yt_stream(qobj, channel, redis=bad_redis)
 
         mock_extract.assert_called_once()
@@ -321,10 +346,14 @@ class TestStreamCache:
 class TestPrefetchStream:
     async def test_populates_cache_on_miss(self, mock_ctx, fake_redis):
         """prefetch_stream calls yt-dlp and writes to Redis when key is absent."""
-        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=pf1", title="Prefetch Song")
+        fake_data = _fake_ytdl_data(
+            webpage_url="https://yt.com/v=pf1", title="Prefetch Song"
+        )
         qobj = QueueObject("https://yt.com/v=pf1", "Prefetch Song", mock_ctx.author)
 
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract:
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
 
         mock_extract.assert_called_once()
@@ -355,7 +384,9 @@ class TestPrefetchStream:
     async def test_swallows_extraction_errors(self, mock_ctx, fake_redis):
         """prefetch_stream does not propagate yt-dlp exceptions."""
         qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
-        with patch("src.youtube._ytdlp_extract", side_effect=Exception("network error")):
+        with patch(
+            "src.youtube._ytdlp_extract", side_effect=Exception("network error")
+        ):
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
         assert cached is None

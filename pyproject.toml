@@ -25,6 +25,11 @@ orjson = ">=3.9.0"
 pytest = "^8.0"
 pytest-asyncio = "^0.24"
 fakeredis = ">=2.26.0"
+pyright = "^1.1.409"
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

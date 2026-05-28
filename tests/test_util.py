@@ -1,4 +1,5 @@
 """Tests for src/util.py — queue formatting and logging utilities."""
+
 import logging
 
 import pytest

@@ -1,4 +1,5 @@
 """Tests for src/musicbot.py — voice permission validation, queue source dispatch, and latency color."""
+
 import orjson
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -101,21 +102,29 @@ class TestQueueSource:
         source = SpotifySource(type="track", id="tid123")
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
-        with patch("src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)):
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
 
     async def test_youtube_url_calls_yt_source(self, music_bot, mock_ctx):
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
-        fake_qobj = QueueObject("https://yt.com/watch?v=abc", "YT Song", mock_ctx.author)
-        with patch("src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)):
+        fake_qobj = QueueObject(
+            "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
+        )
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
 
     async def test_youtube_search_uses_ytsearch(self, music_bot, mock_ctx):
         source = YTSource(ytsearch="ytsearch:test song", process=True)
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
-        with patch("src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)) as mock_yt:
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ) as mock_yt:
             await music_bot.queue_source(mock_ctx, source)
         call_args = mock_yt.call_args
         assert call_args[0][1] == "ytsearch:test song"
@@ -196,6 +205,7 @@ class TestEagerRestore:
     ):
         """No queue items + no crashed song → skip restore even if channel IDs exist."""
         from src.redis_client import GuildRedisStore
+
         store = GuildRedisStore(fake_redis_bot, mock_guild.id)
         await store.set_connection(888000000000000001, 888000000000000002)
         # No queue items, no current_song_url in state
@@ -229,11 +239,15 @@ class TestVoiceStateConsistency:
         after.channel = None  # now disconnected
 
         mock_guild.voice_client = None
-        with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()) as mock_cleanup:
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
             await music_bot_with_redis.on_voice_state_update(member, before, after)
         mock_cleanup.assert_awaited_once_with(mock_guild)
 
-    async def test_other_member_disconnect_ignored(self, music_bot_with_redis, mock_guild):
+    async def test_other_member_disconnect_ignored(
+        self, music_bot_with_redis, mock_guild
+    ):
         """on_voice_state_update does nothing when a non-bot member disconnects."""
         mock_bot_user = MagicMock()
         mock_bot_user.id = 999999999999999999
@@ -247,6 +261,8 @@ class TestVoiceStateConsistency:
         after = MagicMock(spec=discord.VoiceState)
         after.channel = None
 
-        with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()) as mock_cleanup:
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
             await music_bot_with_redis.on_voice_state_update(member, before, after)
         mock_cleanup.assert_not_called()
