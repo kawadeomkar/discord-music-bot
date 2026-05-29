@@ -197,7 +197,7 @@ class TestMusicPlayerInitialState:
         assert len(music_player.song_queue) == 0
 
     def test_history_starts_empty(self, music_player):
-        assert music_player.history == []
+        assert len(music_player.history) == 0
 
     def test_current_song_is_none(self, music_player):
         assert music_player.current_song is None

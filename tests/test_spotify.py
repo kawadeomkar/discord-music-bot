@@ -16,50 +16,69 @@ def mock_auth_response():
 
 
 @pytest.fixture
-def spotify(mock_auth_response):
-    """Spotify instance with mocked auth and env vars."""
-    with patch("src.spotify.requests.post") as mock_post, patch.dict(
+def spotify():
+    """Spotify instance — no blocking auth call at construction time."""
+    with patch.dict(
         "os.environ",
         {"SPOTIFY_CLIENT_ID": "test_id", "SPOTIFY_CLIENT_SECRET": "test_secret"},
     ):
-        mock_post.return_value.json.return_value = mock_auth_response
-        instance = Spotify()
-    return instance
+        return Spotify()
 
 
-class TestSpotifyAuthorize:
-    def test_authorize_sets_auth_token(self, mock_auth_response):
-        with patch("src.spotify.requests.post") as mock_post, patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "csecret"},
-        ):
-            mock_post.return_value.json.return_value = mock_auth_response
-            sp = Spotify()
+def _make_mock_session(resp):
+    """Return an aiohttp.ClientSession mock wired to return resp from .post() and .request()."""
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.post = AsyncMock(return_value=resp)
+    session.request = AsyncMock(return_value=resp)
+    return session
 
-        assert sp.auth_token == "test_access_token_xyz"
 
-    def test_authorize_sends_client_credentials_grant(self, mock_auth_response):
-        with patch("src.spotify.requests.post") as mock_post, patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "cid", "SPOTIFY_CLIENT_SECRET": "csecret"},
-        ):
-            mock_post.return_value.json.return_value = mock_auth_response
-            Spotify()
+class TestSpotifyRefreshToken:
 
-        call_data = mock_post.call_args[1]["data"]
-        assert call_data["grant_type"] == "client_credentials"
-        assert call_data["client_id"] == "cid"
-        assert call_data["client_secret"] == "csecret"
+    @pytest.mark.asyncio
+    async def test_refresh_token_sets_auth_token(self, spotify, mock_auth_response):
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
 
-    def test_authorize_sets_token_expiry_in_future(self, spotify):
+        with patch("src.spotify.aiohttp.ClientSession", return_value=_make_mock_session(mock_resp)):
+            await spotify._refresh_token()
+
+        assert spotify.auth_token == "test_access_token_xyz"
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_sends_client_credentials_grant(self, spotify, mock_auth_response):
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        mock_session = _make_mock_session(mock_resp)
+
+        with patch("src.spotify.aiohttp.ClientSession", return_value=mock_session):
+            await spotify._refresh_token()
+
+        call_kwargs = mock_session.post.call_args[1]
+        assert call_kwargs["data"]["grant_type"] == "client_credentials"
+        assert call_kwargs["data"]["client_id"] == "test_id"
+        assert call_kwargs["data"]["client_secret"] == "test_secret"
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_sets_token_expiry_in_future(self, spotify, mock_auth_response):
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+
+        with patch("src.spotify.aiohttp.ClientSession", return_value=_make_mock_session(mock_resp)):
+            await spotify._refresh_token()
+
         assert spotify.token_expiry > time.time()
 
     def test_str_returns_auth_token(self, spotify):
-        assert str(spotify) == spotify.auth_token
+        spotify.auth_token = "my_token"
+        assert str(spotify) == "my_token"
 
 
 class TestSpotifyTrack:
     pytestmark = pytest.mark.asyncio(loop_scope="session")
+
     async def test_track_combines_name_and_artists(self, spotify):
         mock_response = {
             "name": "Bohemian Rhapsody",
@@ -91,6 +110,7 @@ class TestSpotifyTrack:
 
 class TestSpotifyPlaylist:
     pytestmark = pytest.mark.asyncio(loop_scope="session")
+
     async def test_playlist_returns_list_of_titles(self, spotify):
         mock_response = {
             "items": [
@@ -149,52 +169,42 @@ class TestSpotifyPlaylist:
 
 class TestSpotifyHttpCall:
     pytestmark = pytest.mark.asyncio(loop_scope="session")
+
     async def test_http_call_raises_on_non_200(self, spotify):
         mock_response = AsyncMock()
         mock_response.status = 404
-
-        mock_session = MagicMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=None)
-        mock_session.request = AsyncMock(return_value=mock_response)
+        mock_session = _make_mock_session(mock_response)
 
         with patch("src.spotify.aiohttp.ClientSession", return_value=mock_session):
             with pytest.raises(Exception, match="stat: 404"):
                 await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
 
     async def test_http_call_sets_authorization_header(self, spotify):
+        spotify.auth_token = "valid_token"
+        spotify.token_expiry = time.time() + 3600
+
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"data": "ok"})
-
-        mock_session = MagicMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=None)
-        mock_session.request = AsyncMock(return_value=mock_response)
+        mock_session = _make_mock_session(mock_response)
 
         with patch("src.spotify.aiohttp.ClientSession", return_value=mock_session):
             await spotify.http_call("https://api.spotify.com/v1/tracks/xyz")
 
         call_kwargs = mock_session.request.call_args[1]
         assert "Authorization" in call_kwargs["headers"]
-        assert call_kwargs["headers"]["Authorization"] == f"Bearer {spotify.auth_token}"
+        assert call_kwargs["headers"]["Authorization"] == "Bearer valid_token"
 
-    async def test_http_call_refreshes_expired_token(self, spotify, mock_auth_response):
+    async def test_http_call_refreshes_expired_token(self, spotify):
         spotify.token_expiry = time.time() - 1  # force expiry
 
         mock_response = AsyncMock()
         mock_response.status = 200
         mock_response.json = AsyncMock(return_value={"data": "ok"})
+        mock_session = _make_mock_session(mock_response)
 
-        mock_session = MagicMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=None)
-        mock_session.request = AsyncMock(return_value=mock_response)
-
-        with patch("src.spotify.aiohttp.ClientSession", return_value=mock_session), patch(
-            "src.spotify.requests.post"
-        ) as mock_post:
-            mock_post.return_value.json.return_value = mock_auth_response
+        with patch("src.spotify.aiohttp.ClientSession", return_value=mock_session), \
+             patch.object(spotify, "_refresh_token", new=AsyncMock()) as mock_refresh:
             await spotify.http_call("https://api.spotify.com/v1/tracks/xyz")
 
-        mock_post.assert_called_once()
+        mock_refresh.assert_called_once()

@@ -50,6 +50,10 @@ class MusicBot(commands.Cog):
             await guild.voice_client.disconnect()
         if guild.id in self.mps:
             try:
+                mp = self.mps[guild.id]
+                if mp._prefetch_task and not mp._prefetch_task.done():
+                    mp._prefetch_task.cancel()
+                mp._player.cancel()
                 del self.mps[guild.id]
             except asyncio.CancelledError:
                 pass
@@ -267,7 +271,7 @@ class MusicBot(commands.Cog):
     async def history(self, ctx: commands.Context):
         mp = self.get_mp(ctx)
         if mp and mp.history:
-            q_history = queue_message(mp.history[:10])
+            q_history = queue_message(list(mp.history)[:10])
             await ctx.send(q_history)
 
     @commands.command(
@@ -297,18 +301,14 @@ class MusicBot(commands.Cog):
         if isinstance(volume, str):
             try:
                 volume = int(volume)
-            except ValueError as e:
+            except ValueError:
                 await ctx.send("Volume must be a number between 0 and 100")
                 return
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if voice_client and voice_client.is_playing():
-            if not 0 <= volume <= 100:
-                return await ctx.send("Volume must be between 0 and 100")
-            volume = volume / 100
-            voice_client.source.volume = volume
-            await ctx.send(f"Set volume of music player to {volume}")
-        else:
-            await ctx.send("No songs are currently playing.")
+        if not 0 <= volume <= 100:
+            return await ctx.send("Volume must be between 0 and 100")
+        mp = self.get_mp(ctx)
+        mp.volume = volume / 100
+        await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
 
     @commands.command(
         name="ping", aliases=["latency", "l", "delay"], help="latency in milliseconds"

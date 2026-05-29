@@ -118,6 +118,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         *,
         loop: asyncio.BaseEventLoop = None,
+        volume: float = 1.0,
     ):
         loop = loop or asyncio.get_event_loop()
         data = await loop.run_in_executor(
@@ -130,6 +131,8 @@ class YTDL(discord.FFmpegOpusAudio):
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
             await channel.send(f"Starting song at {qo.ts} seconds")
+        if volume != 1.0:
+            ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
         return cls(
             channel,

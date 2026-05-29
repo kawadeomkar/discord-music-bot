@@ -1,10 +1,10 @@
+import asyncio
 import os
 import time
 from async_lru import alru_cache
 from typing import Any, Dict, List, Union
 
 import aiohttp
-import requests
 import ujson
 
 from src.util import get_logger
@@ -19,11 +19,25 @@ class Spotify:
     def __init__(self):
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-        self.token_expiry = time.time()
-        self.auth_token = self.authorize(self.client_id, self.client_secret)
+        self.token_expiry = 0.0
+        self.auth_token: str = ""
+        self._auth_lock = asyncio.Lock()
 
     def __str__(self):
         return self.auth_token
+
+    async def _refresh_token(self) -> None:
+        self.token_expiry = time.time()
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        }
+        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+            resp = await session.post(self.auth_endpoint, data=data)
+            resp_data = await resp.json(content_type=None)
+        self.auth_token = resp_data["access_token"]
+        self.token_expiry += resp_data["expires_in"]
 
     async def http_call(
         self,
@@ -34,7 +48,9 @@ class Spotify:
         http_method="GET",
     ):
         if time.time() > self.token_expiry:
-            self.auth_token = self.authorize(self.client_id, self.client_secret)
+            async with self._auth_lock:
+                if time.time() > self.token_expiry:
+                    await self._refresh_token()
 
         if headers is None:
             headers = {}
@@ -57,19 +73,6 @@ class Spotify:
                     + " params: "
                     + str(params)
                 )
-
-    def authorize(self, client_id: str, client_secret: str):
-        # set time before http call for overhead
-        self.token_expiry = time.time()
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        }
-
-        resp = requests.post(self.auth_endpoint, data=data).json()
-        self.token_expiry += resp["expires_in"]
-        return resp["access_token"]
 
     @alru_cache(maxsize=256, ttl=360)
     async def track(self, tid: str) -> str:
