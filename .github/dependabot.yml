@@ -1,0 +1,30 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    ignore:
+      # yt-dlp uses date-based versioning and YouTube extraction breaks between
+      # versions. Update manually after integration testing.
+      - dependency-name: yt-dlp
+        update-types:
+          - version-update:semver-patch
+          - version-update:semver-minor
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies

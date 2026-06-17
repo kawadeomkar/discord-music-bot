@@ -15,14 +15,22 @@ ujson = "^5.8.0"
 pynacl = "1.6.2"
 davey = "^0.1.5"
 yt-dlp = "2026.3.17"
-async-lru = "^2.0.4"
 async-timeout = "^5.0.1"
 discord-py = "2.7.1"
 black = "^26.5.1"
+redis = ">=5.0.0"
+orjson = ">=3.9.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
 pytest-asyncio = "^0.24"
+fakeredis = ">=2.26.0"
+pyright = "^1.1.409"
+pytest-cov = "^7.1.0"
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

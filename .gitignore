@@ -3,6 +3,9 @@ pyproject.bak.toml
 pyrightconfig.json
 docs/
 
+# Claude Code
+.claude/
+
 # PyCharm and misc
 .idea
 .idea/

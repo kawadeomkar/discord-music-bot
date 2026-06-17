@@ -1,30 +1,45 @@
 import asyncio
 import os
 import time
-from async_lru import alru_cache
-from typing import Any, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import aiohttp
 import ujson
 
+import redis.asyncio as aioredis
+
+from src.redis_client import cache_get, cache_set
 from src.util import get_logger
 
 log = get_logger(__name__)
+
+_TRACK_TTL = 86400  # 24h — track titles/artists don't change
+_PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
+_ARTIST_TTL = 86400  # 24h
+_ALBUM_TTL = 86400  # 24h
 
 
 class Spotify:
     spotify_endpoint = "https://api.spotify.com/"
     auth_endpoint = "https://accounts.spotify.com/api/token"
 
-    def __init__(self):
+    def __init__(
+        self,
+        redis: Optional[aioredis.Redis] = None,
+        session_factory: Optional[Callable[..., Any]] = None,
+    ):
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self.token_expiry = 0.0
         self.auth_token: str = ""
         self._auth_lock = asyncio.Lock()
+        self._redis = redis
+        self._session_factory = session_factory or aiohttp.ClientSession
 
     def __str__(self):
         return self.auth_token
+
+    # ── Auth ─────────────────────────────────────────────────────────────────
 
     async def _refresh_token(self) -> None:
         self.token_expiry = time.time()
@@ -33,7 +48,7 @@ class Spotify:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         }
-        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+        async with self._session_factory(json_serialize=ujson.dumps) as session:
             resp = await session.post(self.auth_endpoint, data=data)
             resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
@@ -42,11 +57,11 @@ class Spotify:
     async def http_call(
         self,
         endpoint_route: str,
-        params: Dict[str, Union[str, int]] = None,
-        headers=None,
-        data: Dict[str, str] = None,
-        http_method="GET",
-    ):
+        params: Optional[Dict[str, Union[str, int]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+        http_method: str = "GET",
+    ) -> Any:
         if time.time() > self.token_expiry:
             async with self._auth_lock:
                 if time.time() > self.token_expiry:
@@ -56,81 +71,72 @@ class Spotify:
             headers = {}
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        async with aiohttp.ClientSession(json_serialize=ujson) as session:
+        async with self._session_factory(json_serialize=ujson.dumps) as session:
             resp = await session.request(
                 http_method, endpoint_route, headers=headers, data=data, params=params
             )
-            # disable content types for incorrect mime type responses
-            if resp.status == 200 or resp.status == 201:
-                data = await resp.json(content_type=None)
-                return data
-            else:
-                raise Exception(
-                    "endpoint:  "
-                    + endpoint_route
-                    + " stat: "
-                    + str(resp.status)
-                    + " params: "
-                    + str(params)
-                )
+            if resp.status in (200, 201):
+                return await resp.json(content_type=None)
+            raise Exception(
+                f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+            )
 
-    @alru_cache(maxsize=256, ttl=360)
+    # ── Cached API methods ────────────────────────────────────────────────────
+
     async def track(self, tid: str) -> str:
-        """
-        Gets a track information given URL
-        :param tid: spotify track id
-        :return: title of the song
-        """
-        endpoint_route = self.spotify_endpoint + f"v1/tracks/{tid}"
-        resp = await self.http_call(endpoint_route)
-        title = resp["name"]
-        for artist in resp["artists"]:
-            title += f" {artist['name']}"
-        return title
+        key = f"spotify:track:{tid}"
+        cached = await cache_get(self._redis, key)
+        if cached is not None:
+            return cached
+        endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
+        resp = await self.http_call(endpoint)
+        result = resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+        await cache_set(self._redis, key, result, _TRACK_TTL)
+        return result
 
-    @alru_cache(maxsize=256, ttl=360)
     async def playlist(self, pid: str) -> List[str]:
-        """
-        Gets a playlist information given URL
-        :param pid: spotify track id
-        :return: list of
-        """
-        endpoint_route = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-        data = {"fields": "items(track(name,artists(name)))"}
-        resp = await self.http_call(endpoint_route, params=data)
-        track_titles = []
-        for item in resp.get("items", []):
-            title = item["track"]["name"]
-            for artist in item["track"]["artists"]:
-                title += f" {artist['name']}"
-            track_titles.append(title)
+        key = f"spotify:playlist:{pid}"
+        cached = await cache_get(self._redis, key)
+        if cached is not None:
+            return cached
+        endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
+        data: Dict[str, Union[str, int]] = {
+            "fields": "items(track(name,artists(name)))"
+        }
+        resp = await self.http_call(endpoint, params=data)
+        track_titles = [
+            item["track"]["name"]
+            + "".join(f" {a['name']}" for a in item["track"]["artists"])
+            for item in resp.get("items", [])
+        ]
+        await cache_set(self._redis, key, track_titles, _PLAYLIST_TTL)
         return track_titles
 
-    @alru_cache(maxsize=256, ttl=360)
-    async def artists(self, ids: Union[List, str]):
-        """
-        Returns artist(s) information
-        ids: List of artist IDs or single artist ID
-        """
-        endpoint_route = self.spotify_endpoint + "v1/artists"
+    async def artists(self, ids: Union[List[str], str]) -> Any:
         if isinstance(ids, str):
             ids = [ids]
-        resp = await self.http_call(endpoint_route, params={"ids": ",".join(ids)})
-        if "artists" in resp:
-            return resp["artists"]
-        return resp
+        key = f"spotify:artist:{','.join(sorted(ids))}"
+        cached = await cache_get(self._redis, key)
+        if cached is not None:
+            return cached
+        resp = await self.http_call(
+            self.spotify_endpoint + "v1/artists", params={"ids": ",".join(ids)}
+        )
+        result = resp.get("artists", resp)
+        await cache_set(self._redis, key, result, _ARTIST_TTL)
+        return result
 
-    @alru_cache(maxsize=256, ttl=360)
-    async def albums(self, ids: Union[List, str]):
-        """
-        Returns album(s) information
-        ids: List of album IDs or single album ID
-        """
-        endpoint_route = self.spotify_endpoint + "v1/albums"
+    async def albums(self, ids: Union[List[str], str]) -> Any:
         if isinstance(ids, str):
             ids = [ids]
-        resp = await self.http_call(endpoint_route, params={"ids": ",".join(ids)})
-        if "albums" in resp:
-            return resp["albums"]
+        key = f"spotify:album:{','.join(sorted(ids))}"
+        cached = await cache_get(self._redis, key)
+        if cached is not None:
+            return cached
+        resp = await self.http_call(
+            self.spotify_endpoint + "v1/albums", params={"ids": ",".join(ids)}
+        )
+        result = resp.get("albums", resp)
         log.debug(resp)
-        return resp
+        await cache_set(self._redis, key, result, _ALBUM_TTL)
+        return result
