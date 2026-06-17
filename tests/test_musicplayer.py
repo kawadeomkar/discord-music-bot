@@ -1,13 +1,19 @@
 """Tests for src/musicplayer.py — queue operations, embed building, and Redis integration."""
 
+import asyncio
 from collections import deque
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import orjson
 import pytest
 
-from src.musicplayer import MusicPlayer, _queue_display_str
+from src.musicplayer import (
+    MusicPlayer,
+    _deserialize_queue_item,
+    _queue_display_str,
+    _serialize_queue_item,
+)
 from src.youtube import QueueObject
 
 
@@ -440,8 +446,6 @@ class TestResolveSource:
 
 class TestStreamSource:
     async def test_returns_none_on_exception(self, music_player, queue_obj):
-        from unittest.mock import patch, AsyncMock
-
         with patch(
             "src.musicplayer.YTDL.yt_stream",
             new=AsyncMock(side_effect=Exception("boom")),
@@ -450,11 +454,416 @@ class TestStreamSource:
         assert result is None
 
     async def test_returns_ytdl_on_success(self, music_player, queue_obj):
-        from unittest.mock import patch, AsyncMock
-
         mock_ytdl = MagicMock()
         with patch(
             "src.musicplayer.YTDL.yt_stream", new=AsyncMock(return_value=mock_ytdl)
         ):
             result = await music_player._stream_source(queue_obj)
         assert result is mock_ytdl
+
+
+# ── New coverage: from_context, start, set_context, stop ─────────────────────
+
+
+class TestFromContext:
+    def test_creates_music_player(self, mock_bot, mock_ctx, fake_redis):
+        mp = MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
+        assert isinstance(mp, MusicPlayer)
+
+    def test_sets_last_author_to_ctx_author(self, mock_bot, mock_ctx, fake_redis):
+        mp = MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
+        assert mp._last_author is mock_ctx.author
+
+    def test_raises_if_guild_is_none(self, mock_bot, mock_ctx, fake_redis):
+        mock_ctx.guild = None
+        with pytest.raises(AssertionError):
+            MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
+
+    def test_attaches_store_when_redis_provided(self, mock_bot, mock_ctx, fake_redis):
+        mp = MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
+        assert mp._store is not None
+
+
+class TestStart:
+    def test_creates_player_task(self, music_player):
+        mock_task = MagicMock()
+        music_player.bot.loop = MagicMock()
+        music_player.bot.loop.create_task = MagicMock(return_value=mock_task)
+        music_player.start()
+        assert music_player._player is mock_task
+
+    def test_creates_restore_task_when_store_present(self, music_player):
+        mock_task = MagicMock()
+        music_player.bot.loop = MagicMock()
+        music_player.bot.loop.create_task = MagicMock(return_value=mock_task)
+        assert music_player._store is not None
+        music_player.start()
+        assert music_player._restore_task is not None
+
+    def test_no_restore_task_when_store_absent(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        mock_bot.loop = MagicMock()
+        mock_bot.loop.create_task = MagicMock(return_value=MagicMock())
+        mp.start()
+        assert mp._restore_task is None
+
+
+class TestSetContext:
+    def test_updates_channel(self, music_player, mock_ctx):
+        new_channel = MagicMock(spec=discord.TextChannel)
+        mock_ctx.channel = new_channel
+        music_player.set_context(mock_ctx)
+        assert music_player._channel is new_channel
+
+    def test_updates_last_author(self, music_player, mock_ctx):
+        new_author = MagicMock(spec=discord.Member)
+        mock_ctx.author = new_author
+        music_player.set_context(mock_ctx)
+        assert music_player._last_author is new_author
+
+
+class TestStop:
+    async def test_delegates_to_cog_cleanup(self, music_player):
+        music_player._cog.cleanup = AsyncMock()
+        await music_player.stop()
+        music_player._cog.cleanup.assert_awaited_once_with(music_player._guild)
+
+
+# ── _cancel_prefetch ──────────────────────────────────────────────────────────
+
+
+class TestCancelPrefetch:
+    async def test_noop_when_no_prefetch_task(self, music_player):
+        music_player._prefetch_task = None
+        await music_player._cancel_prefetch()  # must not raise
+
+    async def test_noop_when_prefetch_task_already_done(self, music_player):
+        task = MagicMock(spec=asyncio.Task)
+        task.done.return_value = True
+        music_player._prefetch_task = task
+        await music_player._cancel_prefetch()
+        task.cancel.assert_not_called()
+
+    async def test_cancels_in_flight_prefetch_task(self, music_player):
+        async def _long():
+            await asyncio.sleep(100)
+
+        task = asyncio.create_task(_long())
+        music_player._prefetch_task = task
+        await music_player._cancel_prefetch()
+        assert task.cancelled()
+
+
+# ── _send_now_playing ─────────────────────────────────────────────────────────
+
+
+class TestSendNowPlaying:
+    async def test_sends_embed_to_channel(self, music_player, mock_song):
+        await music_player._send_now_playing(mock_song)
+        music_player._channel.send.assert_awaited_once()
+        call_kwargs = music_player._channel.send.call_args[1]
+        assert "embed" in call_kwargs
+
+    async def test_stores_embed_as_play_message(self, music_player, mock_song):
+        await music_player._send_now_playing(mock_song)
+        assert music_player.play_message is not None
+        assert isinstance(music_player.play_message, discord.Embed)
+
+    async def test_swallows_channel_send_exception(self, music_player, mock_song):
+        music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
+        await music_player._send_now_playing(mock_song)  # must not raise
+
+
+# ── _prefetch_next_song ───────────────────────────────────────────────────────
+
+
+class TestPrefetchNextSong:
+    @pytest.fixture(autouse=True)
+    def _stub_prefetch_stream(self, monkeypatch):
+        from src import youtube
+
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
+    async def test_returns_none_when_queue_empty(self, music_player):
+        result = await music_player._prefetch_next_song()
+        assert result is None
+
+    async def test_returns_ytdl_on_success(self, music_player, queue_obj):
+        await music_player.queue.put(queue_obj)
+        mock_song = MagicMock()
+        with (
+            patch(
+                "src.musicplayer.YTDL.yt_source",
+                new=AsyncMock(return_value=queue_obj),
+            ),
+            patch(
+                "src.musicplayer.YTDL.yt_stream",
+                new=AsyncMock(return_value=mock_song),
+            ),
+        ):
+            result = await music_player._prefetch_next_song()
+        assert result is mock_song
+
+    async def test_returns_none_and_calls_task_done_on_stream_error(
+        self, music_player, queue_obj
+    ):
+        await music_player.queue.put(queue_obj)
+        with patch(
+            "src.musicplayer.YTDL.yt_stream",
+            new=AsyncMock(side_effect=Exception("network")),
+        ):
+            result = await music_player._prefetch_next_song()
+        assert result is None
+
+    async def test_reraises_cancelled_error_and_calls_task_done(
+        self, music_player, queue_obj
+    ):
+        # MusicPlayer uses __slots__ so instance attributes can't be set directly;
+        # patch at the class level instead.
+        await music_player.queue.put(queue_obj)
+        with patch.object(
+            MusicPlayer,
+            "_resolve_source",
+            new=AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._prefetch_next_song()
+
+
+# ── queue_get ─────────────────────────────────────────────────────────────────
+
+
+class TestQueueGet:
+    async def test_returns_item_from_queue(self, music_player, queue_obj):
+        await music_player.queue.put(queue_obj)
+        result = await music_player.queue_get()
+        assert result is queue_obj
+
+
+# ── _deserialize_queue_item edge cases ────────────────────────────────────────
+
+
+class TestDeserializeQueueItem:
+    def test_falls_back_to_guild_owner_when_member_not_found(self, mock_guild):
+        owner = MagicMock(spec=discord.Member)
+        mock_guild.get_member = MagicMock(return_value=None)
+        mock_guild.owner = owner
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=1",
+                "title": "Song",
+                "requester_id": 99999,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert result is not None
+        assert result.requester is owner
+
+    def test_returns_none_when_member_and_owner_both_none(self, mock_guild):
+        mock_guild.get_member = MagicMock(return_value=None)
+        mock_guild.owner = None
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=1",
+                "title": "Song",
+                "requester_id": 99999,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert result is None
+
+    def test_returns_none_on_invalid_json(self, mock_guild):
+        result = _deserialize_queue_item(b"not valid json{{{{", mock_guild)
+        assert result is None
+
+    def test_preserves_ts_field(self, mock_guild, mock_author):
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=1",
+                "title": "Song",
+                "requester_id": mock_author.id,
+                "ts": 42,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert result is not None
+        assert result.ts == 42
+
+
+class TestSerializeQueueItem:
+    def test_round_trip(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author, ts=30)
+        data = _serialize_queue_item(qobj)
+        d = orjson.loads(data)
+        assert d["webpage_url"] == "https://yt.com/v=1"
+        assert d["title"] == "Test Song"
+        assert d["requester_id"] == mock_author.id
+        assert d["ts"] == 30
+
+
+# ── _restore_state additional paths ──────────────────────────────────────────
+
+
+class TestRestoreStateTtlRefresh:
+    async def test_ttl_refreshed_after_successful_restore(
+        self, music_player, fake_redis
+    ):
+        """TTL on all guild keys is refreshed at the end of a successful restore."""
+        await fake_redis.hset(music_player._store.state_key(), b"volume", b"0.8")
+        # Set a short TTL initially
+        await fake_redis.expire(music_player._store.state_key(), 10)
+
+        await music_player._restore_state()
+
+        ttl = await fake_redis.ttl(music_player._store.state_key())
+        assert ttl > 1000  # refreshed to GUILD_TTL
+
+    async def test_restore_continues_after_bad_queue_item(
+        self, music_player, fake_redis, mock_author
+    ):
+        """Malformed queue items are skipped; valid ones are still restored."""
+        valid = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=ok",
+                "title": "Good Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
+        await fake_redis.rpush(music_player._store.queue_key(), b"!!!bad json!!!", valid)
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        await music_player._restore_state()
+
+        assert music_player.queue.qsize() == 1
+        item = await music_player.queue.get()
+        assert item.title == "Good Song"
+
+
+# ── loop() ────────────────────────────────────────────────────────────────────
+
+
+class TestLoop:
+    @pytest.fixture
+    def mock_song(self):
+        song = MagicMock()
+        song.title = "Loop Test Song"
+        song.webpage_url = "https://yt.com/v=loop1"
+        return song
+
+    async def test_exits_immediately_when_bot_closed(self, music_player):
+        music_player.bot.is_closed.return_value = True
+        music_player.bot.wait_until_ready = AsyncMock()
+        await music_player.loop()  # should return without hanging
+
+    async def test_timeout_triggers_stop(self, music_player):
+        # MusicPlayer uses __slots__; patch methods at the class level.
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.return_value = False
+
+        stop_called = asyncio.Event()
+
+        async def _mock_stop(self_inner):
+            stop_called.set()
+
+        with patch.object(
+            MusicPlayer,
+            "queue_get",
+            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+        ):
+            with patch.object(MusicPlayer, "stop", new=_mock_stop):
+                await music_player.loop()
+        await asyncio.sleep(0)
+        assert stop_called.is_set()
+
+    async def test_skips_song_when_stream_returns_none(self, music_player, queue_obj):
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        music_player._channel.send.assert_awaited_with(
+            "Failed to load the next song, skipping."
+        )
+
+    async def test_plays_song_and_updates_history(
+        self, music_player, queue_obj, mock_song
+    ):
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+
+        # vc.play is a mock so it never calls the after callback that sets play_next;
+        # mock wait() so it returns immediately instead of blocking.
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        assert len(music_player.history) == 1
+        assert mock_song.title in music_player.history[0]
+
+    async def test_unhandled_exception_sends_error_message(
+        self, music_player, queue_obj
+    ):
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        vc = object.__new__(discord.VoiceClient)
+
+        def _bad_play(*a, **kw):
+            raise RuntimeError("ffmpeg gone")
+
+        vc.play = _bad_play
+        music_player._guild.voice_client = vc
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=MagicMock())
+            ),
+        ):
+            await music_player.loop()
+
+        music_player._channel.send.assert_awaited()

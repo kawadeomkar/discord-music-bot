@@ -272,3 +272,70 @@ class TestSpotifyRedisCache:
         ):
             result = await s.track("no_redis")
         assert result == "S A"
+
+
+class TestSpotifyArtists:
+    async def test_single_artist_id_as_string(self, spotify):
+        mock_resp = {"artists": [{"name": "Test Artist", "id": "1"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            result = await spotify.artists("artist_id_1")
+        assert result == mock_resp["artists"]
+
+    async def test_multiple_artist_ids_as_list(self, spotify):
+        mock_resp = {"artists": [{"name": "A"}, {"name": "B"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            result = await spotify.artists(["id1", "id2"])
+        assert len(result) == 2
+
+    async def test_cache_hit_skips_http(self, spotify):
+        mock_resp = {"artists": [{"name": "A"}]}
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_resp)
+        ) as m:
+            await spotify.artists("aid1")
+            await spotify.artists("aid1")
+        m.assert_called_once()
+
+    async def test_ttl_is_24h(self, spotify, fake_redis):
+        mock_resp = {"artists": [{"name": "A"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            await spotify.artists("ttl_aid")
+        ttl = await fake_redis.ttl("spotify:artist:ttl_aid")
+        assert 86390 <= ttl <= 86400
+
+
+class TestSpotifyAlbums:
+    async def test_single_album_id(self, spotify):
+        mock_resp = {"albums": [{"name": "Test Album"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            result = await spotify.albums("album_id_1")
+        assert result == mock_resp["albums"]
+
+    async def test_multiple_album_ids(self, spotify):
+        mock_resp = {"albums": [{"name": "A"}, {"name": "B"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            result = await spotify.albums(["alb1", "alb2"])
+        assert len(result) == 2
+
+    async def test_cache_hit_skips_http(self, spotify):
+        mock_resp = {"albums": [{"name": "Album A"}]}
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=mock_resp)
+        ) as m:
+            await spotify.albums("alb_cache")
+            await spotify.albums("alb_cache")
+        m.assert_called_once()
+
+    async def test_ttl_is_24h(self, spotify, fake_redis):
+        mock_resp = {"albums": [{"name": "A"}]}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            await spotify.albums("ttl_alb")
+        ttl = await fake_redis.ttl("spotify:album:ttl_alb")
+        assert 86390 <= ttl <= 86400
+
+    async def test_sorted_cache_key_for_multiple_ids(self, spotify, fake_redis):
+        mock_resp = {"albums": []}
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=mock_resp)):
+            await spotify.albums(["zid", "aid"])
+        cached = await fake_redis.get("spotify:album:aid,zid")
+        assert cached is not None

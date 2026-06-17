@@ -33,6 +33,17 @@ def _fake_ytdl_data(**overrides):
     return base
 
 
+class TestYTDLGetItem:
+    def test_getitem_returns_attribute(self, ytdl_instance):
+        song = ytdl_instance()
+        assert song["title"] == "Test Song"
+        assert song["webpage_url"] == "https://www.youtube.com/watch?v=test"
+
+    def test_getitem_returns_uploader(self, ytdl_instance):
+        song = ytdl_instance()
+        assert song["uploader"] == "Test Channel"
+
+
 class TestQueueObject:
     def test_required_fields(self, mock_author):
         qobj = QueueObject(
@@ -187,6 +198,30 @@ class TestYTSource:
             )
 
         assert result.ts == 45
+
+    async def test_yt_source_passes_download_flag(self, mock_ctx):
+        fake_data = {
+            "webpage_url": "https://yt.com/v=dl",
+            "title": "Download Song",
+        }
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract:
+            result = await YTDL.yt_source(
+                mock_ctx.author, "https://yt.com/v=dl", process=True, download=True
+            )
+        # download=True is passed as the 3rd positional arg to _ytdlp_extract
+        call_args = mock_extract.call_args[0]
+        assert call_args[2] is True
+        assert result.title == "Download Song"
+
+
+class TestYTStreamRuntimeError:
+    async def test_raises_when_extract_returns_none(self, mock_ctx):
+        qobj = QueueObject("https://yt.com/v=none", "None Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        with patch("src.youtube._ytdlp_extract", return_value=None):
+            with pytest.raises(RuntimeError, match="Could not extract stream data"):
+                await YTDL.yt_stream(qobj, channel)
 
 
 class TestYTStream:

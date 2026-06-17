@@ -1,10 +1,11 @@
 """Tests for src/util.py — queue formatting and logging utilities."""
 
 import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.util import get_logger, queue_message
+from src.util import get_logger, queue_message, send_queue_phrases
 
 
 class TestQueueMessage:
@@ -97,3 +98,28 @@ class TestGetLogger:
         logger_b = get_logger("module.b")
         assert logger_a is not logger_b
         assert logger_a.name != logger_b.name
+
+
+class TestSendQueuePhrases:
+    async def test_pineapplecat_receives_special_phrase(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.message.author.name = "pineapplecat"
+        await send_queue_phrases(ctx)
+        ctx.send.assert_awaited_once()
+
+    async def test_bryan_receives_insult(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.message.author.name = "Bryan"
+        await send_queue_phrases(ctx)
+        ctx.send.assert_awaited_once()
+        sent_msg = ctx.send.call_args[0][0]
+        assert "bryan" in sent_msg.lower()
+
+    async def test_other_user_receives_nothing(self):
+        ctx = MagicMock()
+        ctx.send = AsyncMock()
+        ctx.message.author.name = "regularuser"
+        await send_queue_phrases(ctx)
+        ctx.send.assert_not_awaited()
