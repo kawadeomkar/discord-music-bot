@@ -735,7 +735,9 @@ class TestRestoreStateTtlRefresh:
                 "ts": None,
             }
         )
-        await fake_redis.rpush(music_player._store.queue_key(), b"!!!bad json!!!", valid)
+        await fake_redis.rpush(
+            music_player._store.queue_key(), b"!!!bad json!!!", valid
+        )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()

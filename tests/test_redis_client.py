@@ -16,7 +16,6 @@ from src.redis_client import (
     get_redis,
 )
 
-
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 

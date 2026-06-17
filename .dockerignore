@@ -16,4 +16,3 @@ poetry.toml
 .idea/
 .vscode/
 pyrightconfig.json
-tests/
