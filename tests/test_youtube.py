@@ -204,7 +204,9 @@ class TestYTSource:
             "webpage_url": "https://yt.com/v=dl",
             "title": "Download Song",
         }
-        with patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract:
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
             result = await YTDL.yt_source(
                 mock_ctx.author, "https://yt.com/v=dl", process=True, download=True
             )

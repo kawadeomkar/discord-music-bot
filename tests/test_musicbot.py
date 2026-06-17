@@ -499,7 +499,9 @@ class TestNowCommand:
         await MusicBot.now.callback(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_once()
 
-    async def test_sends_not_playing_when_no_song(self, music_bot, mock_ctx, mock_guild):
+    async def test_sends_not_playing_when_no_song(
+        self, music_bot, mock_ctx, mock_guild
+    ):
         mock_guild.voice_client = None
         mock_ctx.guild = mock_guild
         mp = MagicMock()
