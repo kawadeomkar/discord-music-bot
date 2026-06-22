@@ -2,7 +2,7 @@
 
 set -aeuxETo pipefail
 
-poetry run python -m black src/ --target-version py313
+poetry run python -m black src/ tests/ --target-version py313
 
 GIT_SHA=$(git rev-parse HEAD)
 export GIT_SHA=$GIT_SHA

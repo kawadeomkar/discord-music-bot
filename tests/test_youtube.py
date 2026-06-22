@@ -7,7 +7,14 @@ import discord
 import orjson
 import pytest
 
-from src.youtube import YTDL, YTDL_OPTS, QueueObject, _YTDL_SOURCE_OPTS, _YTDL_STREAM_OPTS, _stream_url_ttl
+from src.youtube import (
+    YTDL,
+    YTDL_OPTS,
+    QueueObject,
+    _YTDL_SOURCE_OPTS,
+    _YTDL_STREAM_OPTS,
+    _stream_url_ttl,
+)
 
 
 def _fake_ytdl_data(**overrides):
