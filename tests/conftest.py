@@ -1,13 +1,51 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import os
+
+# Disable OTel SDK before any src.* import — telemetry.py reads this at module level.
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import fakeredis
 import pytest
+import structlog
 
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
+
+
+@pytest.fixture(autouse=True, scope="session")
+def configure_structlog_for_tests():
+    """Configure structlog with minimal output for tests.
+
+    Replaces the JSON renderer with a plain renderer so test output is readable,
+    and drops the OTel context processor (no TracerProvider in tests).
+    """
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def reset_structlog_contextvars():
+    """Clear structlog context variables between every test.
+
+    Without this, a test that calls bind_contextvars(guild_id=...) would
+    leak that context into subsequent tests via the ContextVar storage.
+    """
+    structlog.contextvars.clear_contextvars()
+    yield
+    structlog.contextvars.clear_contextvars()
 
 
 @pytest.fixture

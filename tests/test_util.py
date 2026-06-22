@@ -4,6 +4,7 @@ import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import structlog
 
 from src.util import get_logger, queue_message, send_queue_phrases
 
@@ -59,39 +60,29 @@ class TestQueueMessage:
 
 
 class TestGetLogger:
-    def test_returns_logger_instance(self):
+    def test_returns_structlog_logger(self):
         logger = get_logger("test.module")
-        assert isinstance(logger, logging.Logger)
+        # structlog returns a lazy proxy — not a stdlib Logger
+        assert not isinstance(logger, logging.Logger)
+        assert hasattr(logger, "info") and hasattr(logger, "warning")
 
-    def test_logger_has_correct_name(self):
-        logger = get_logger("my.custom.module")
-        assert logger.name == "my.custom.module"
+    def test_logging_methods_are_callable(self):
+        logger = get_logger("test.callable")
+        assert callable(logger.info)
+        assert callable(logger.warning)
+        assert callable(logger.error)
+        assert callable(logger.debug)
 
-    def test_logger_level_is_info(self):
-        logger = get_logger("test.level_check")
-        assert logger.level == logging.INFO
+    def test_logging_does_not_raise(self):
+        logger = get_logger("test.no_raise")
+        logger.info("test message", key="value")
 
-    def test_logger_has_exactly_one_handler(self):
-        logger = get_logger("test.single_handler")
-        assert len(logger.handlers) == 1
-
-    def test_calling_twice_does_not_add_duplicate_handlers(self):
+    def test_calling_twice_returns_functional_loggers(self):
         logger_a = get_logger("test.no_dup")
         logger_b = get_logger("test.no_dup")
-        assert logger_a is logger_b
-        assert len(logger_b.handlers) == 1
-
-    def test_handler_is_stream_handler(self):
-        logger = get_logger("test.stream_handler")
-        assert isinstance(logger.handlers[0], logging.StreamHandler)
-
-    def test_handler_formatter_includes_name_and_level(self):
-        logger = get_logger("test.formatter_check")
-        formatter = logger.handlers[0].formatter
-        fmt = formatter._fmt
-        assert "%(name)s" in fmt
-        assert "%(levelname)s" in fmt
-        assert "%(message)s" in fmt
+        # Both proxies are usable; no errors on repeated calls
+        logger_a.info("from a")
+        logger_b.info("from b")
 
     def test_different_names_return_different_loggers(self):
         logger_a = get_logger("module.a")

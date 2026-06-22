@@ -10,9 +10,16 @@ services:
     network_mode: host
     env_file:
     - .env
+    environment:
+      - OTEL_SERVICE_NAME=discord-music-bot
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+      # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
     depends_on:
       redis:
         condition: service_healthy
+      # otel-lgtm is intentionally NOT in depends_on.
+      # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
+      # so a hard dependency would break `docker compose up discord-music-bot redis`.
 
   redis:
     image: redis:7-alpine
@@ -34,5 +41,29 @@ services:
       timeout: 3s
       retries: 5
 
+  otel-lgtm:
+    image: grafana/otel-lgtm:latest
+    container_name: discord-otel-lgtm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"    # Grafana UI (localhost only)
+      - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
+      - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+    volumes:
+      - otel-grafana:/var/lib/grafana
+      - otel-tempo:/tmp/tempo
+      - otel-loki:/tmp/loki
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   redis-data:
+  otel-grafana:
+  otel-tempo:
+  otel-loki:

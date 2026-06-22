@@ -1,11 +1,12 @@
-import logging
 import os
 from typing import Any, Optional
 
 import orjson
 import redis.asyncio as aioredis
 
-log = logging.getLogger(__name__)
+from src.util import get_logger
+
+log = get_logger(__name__)
 
 GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"

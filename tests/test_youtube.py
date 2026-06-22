@@ -7,7 +7,14 @@ import discord
 import orjson
 import pytest
 
-from src.youtube import YTDL, YTDL_OPTS, QueueObject, _stream_url_ttl
+from src.youtube import (
+    YTDL,
+    YTDL_OPTS,
+    QueueObject,
+    _YTDL_SOURCE_OPTS,
+    _YTDL_STREAM_OPTS,
+    _stream_url_ttl,
+)
 
 
 def _fake_ytdl_data(**overrides):
@@ -90,7 +97,8 @@ class TestYTDLOpts:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
     def test_default_search_is_auto(self):
-        assert YTDL_OPTS["default_search"] == "auto"
+        # default_search belongs to the source (search) opts, not the stream opts
+        assert _YTDL_SOURCE_OPTS["default_search"] == "auto"
 
     def test_retries_is_set(self):
         assert YTDL_OPTS["retries"] > 0
@@ -101,10 +109,17 @@ class TestYTDLOpts:
     def test_extractor_args_include_youtube(self):
         assert "youtube" in YTDL_OPTS["extractor_args"]
 
-    def test_ffmpeg_reconnect_args_present(self):
-        ffmpeg_args = YTDL_OPTS["external_downloader_args"]["ffmpeg_i"]
-        assert "-reconnect" in ffmpeg_args
-        assert "-reconnect_streamed" in ffmpeg_args
+    def test_stream_opts_have_format(self):
+        assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best"
+
+    def test_source_opts_no_format(self):
+        # yt_source only needs metadata; format resolution is deferred to yt_stream
+        assert "format" not in _YTDL_SOURCE_OPTS
+
+    def test_no_verbose_or_rm_cachedir(self):
+        for opts in (_YTDL_SOURCE_OPTS, _YTDL_STREAM_OPTS):
+            assert not opts.get("verbose")
+            assert not opts.get("rm_cachedir")
 
 
 class TestYTDLFfmpegOpts:
