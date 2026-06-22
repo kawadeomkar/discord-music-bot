@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import discord
@@ -49,12 +50,22 @@ class MusicBotApp(commands.AutoShardedBot):
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()
+        # shutdown_telemetry() calls force_flush() which blocks for up to 30s.
+        # Run it in an executor to avoid blocking the event loop on shutdown.
+        from src.telemetry import shutdown_telemetry
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, shutdown_telemetry)
 
 
 bot = MusicBotApp()
 
 
 def main():
+    from src.telemetry import setup_telemetry
+
+    setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves
+
     token = os.getenv("DISCORD_TOKEN")
     assert token is not None
     assert os.getenv("SPOTIFY_CLIENT_ID") is not None

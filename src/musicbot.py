@@ -18,9 +18,15 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import StatusCode
+
+from src.telemetry import get_tracer
 from src.util import queue_message, send_queue_phrases, get_logger
 
 log = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 from src.youtube import YTDL, QueueObject
 
@@ -59,13 +65,14 @@ class MusicBot(commands.Cog):
     class for music bot
     """
 
-    __slots__ = ("bot", "mps", "spotify", "redis")
+    __slots__ = ("bot", "mps", "spotify", "redis", "_active_spans")
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
         self.spotify = Spotify(redis=self.redis)
         self.mps = {}
+        self._active_spans: dict = {}  # id(ctx) → (Span, context_token)
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         assert ctx.guild is not None
@@ -79,12 +86,21 @@ class MusicBot(commands.Cog):
         return mp
 
     async def cleanup(self, guild: discord.Guild) -> None:
-        log.info("going to cleanup/disconnect")
-        if guild.voice_client:
-            await guild.voice_client.disconnect(force=False)
-        if guild.id in self.mps:
+        # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
+        # on_voice_state_update firing while stop's disconnect is in-flight) gets None
+        # and returns immediately, preventing the KeyError TOCTOU race.
+        mp = self.mps.pop(guild.id, None)
+        if mp is None:
+            return
+
+        with _tracer.start_as_current_span(
+            "bot.cleanup",
+            attributes={"discord.guild_id": str(guild.id)},
+        ):
+            log.info("going to cleanup/disconnect")
+            if guild.voice_client:
+                await guild.voice_client.disconnect(force=False)
             try:
-                mp = self.mps[guild.id]
                 if mp._prefetch_task and not mp._prefetch_task.done():
                     mp._prefetch_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -102,14 +118,70 @@ class MusicBot(commands.Cog):
                     # on_ready does not attempt to recover this guild after restart.
                     await mp._store.clear_connection()
                     await mp._store.refresh_ttl()
-                del self.mps[guild.id]
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log.error(f"cleanup error: {type(e).__name__}: {e}")
 
     async def cog_before_invoke(self, ctx: commands.Context):
-        self.get_mp(ctx)
+        from structlog.contextvars import bind_contextvars
+
+        bind_contextvars(
+            guild_id=str(ctx.guild.id) if ctx.guild else "none",
+            user_id=str(ctx.author.id),
+            command=ctx.command.name if ctx.command else "unknown",
+        )
+
+        cmd_name = ctx.command.name if ctx.command else "unknown"
+        span = _tracer.start_span(
+            f"command.{cmd_name}",
+            attributes={
+                "discord.guild_id": str(ctx.guild.id) if ctx.guild else "",
+                "discord.user_id": str(ctx.author.id),
+            },
+        )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        self._active_spans[id(ctx)] = (span, token)
+
+        try:
+            self.get_mp(ctx)
+        except Exception as e:
+            # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
+            self._active_spans.pop(id(ctx))
+            span.record_exception(e)
+            span.set_status(StatusCode.ERROR, "before_invoke failed")
+            span.end()
+            otel_context.detach(token)
+            raise
+
+    async def cog_after_invoke(self, ctx: commands.Context):
+        from structlog.contextvars import clear_contextvars
+
+        clear_contextvars()
+        pair = self._active_spans.pop(id(ctx), None)
+        if pair:
+            span, token = pair
+            span.end()
+            otel_context.detach(token)
+
+    async def cog_command_error(self, ctx: commands.Context, error: Exception):
+        # Peek (don't pop) — cog_after_invoke runs in the finally block after this
+        # and is responsible for ending the span.
+        pair = self._active_spans.get(id(ctx))
+        if pair:
+            span, _ = pair
+            span.record_exception(error)
+            span.set_status(StatusCode.ERROR, str(error))
+
+        # validate_commands already sends its own message before raising CommandError,
+        # so only handle errors that produce no user-visible output.
+        if isinstance(error, commands.MissingRequiredArgument):
+            cmd = ctx.command
+            usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
+            await ctx.send(
+                f"Missing argument: `{error.param.name}`."
+                + (f" Usage: {usage}" if usage else "")
+            )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         vc = ctx.voice_client
@@ -140,7 +212,7 @@ class MusicBot(commands.Cog):
             else:
                 raise ValueError(f"Unknown source type: {type(source)}")
             return await YTDL.yt_source(
-                ctx.author, search, source.process or False, ts=ts
+                ctx.author, search, source.process or False, ts=ts, redis=self.redis
             )
 
     @commands.command(
@@ -213,7 +285,16 @@ class MusicBot(commands.Cog):
                 await ctx.message.add_reaction("👍")
                 await send_queue_phrases(ctx)
             except Exception as e:
-                await ctx.send(f"Exception caught: {e}")
+                log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
+                span_ctx = trace.get_current_span().get_span_context()
+                embed = discord.Embed(
+                    title="Failed to queue song",
+                    description=f"**{type(e).__name__}:** {e}",
+                    color=discord.Color.red(),
+                )
+                if span_ctx.is_valid:
+                    embed.set_footer(text=f"trace: {format(span_ctx.trace_id, '032x')}")
+                await ctx.send(embed=embed)
 
     @commands.command(name="skip", aliases=["sk"], help="skips current song")
     @commands.before_invoke(validate_commands)
@@ -407,52 +488,62 @@ class MusicBot(commands.Cog):
 
         store = GuildRedisStore(self.redis, guild.id)
 
-        # Distributed lock prevents two bot instances from racing on the same guild.
-        if not await store.acquire_recovery_lock():
-            log.info(
-                f"Recovery lock held by another instance for guild {guild.id}, skipping"
-            )
-            return
-
-        try:
-            vc_id, tc_id = await store.get_connection()
-            if vc_id is None or tc_id is None:
+        with _tracer.start_as_current_span(
+            "guild.restore",
+            attributes={"discord.guild_id": str(guild.id)},
+        ) as span:
+            # Distributed lock prevents two bot instances from racing on the same guild.
+            # Acquired inside the span so the SET NX EX Redis call is a child span.
+            if not await store.acquire_recovery_lock():
+                span.set_attribute("restore.skipped_lock", True)
+                log.info(
+                    f"Recovery lock held by another instance for guild {guild.id}, skipping"
+                )
                 return
-
-            voice_channel = guild.get_channel(vc_id)
-            text_channel = guild.get_channel(tc_id)
-            if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
-                text_channel, discord.TextChannel
-            ):
-                return
-
-            # Check there is something to restore before connecting.
-            queue_items = await store.get_queue()
-            state = await store.get_state()
-            has_crashed_song = bool(state.get(b"current_song_url", b""))
-            if not queue_items and not has_crashed_song:
-                return
-
             try:
-                await voice_channel.connect(timeout=30.0, reconnect=True)
-                await guild.change_voice_state(
-                    channel=voice_channel, self_mute=False, self_deaf=True
+                vc_id, tc_id = await store.get_connection()
+                if vc_id is None or tc_id is None:
+                    return
+
+                voice_channel = guild.get_channel(vc_id)
+                text_channel = guild.get_channel(tc_id)
+                if not isinstance(
+                    voice_channel, discord.VoiceChannel
+                ) or not isinstance(text_channel, discord.TextChannel):
+                    return
+
+                # Check there is something to restore before connecting.
+                queue_items = await store.get_queue()
+                state = await store.get_state()
+                has_crashed_song = bool(state.get(b"current_song_url", b""))
+                if not queue_items and not has_crashed_song:
+                    return
+
+                span.set_attribute("restore.queue_count", len(queue_items))
+                span.set_attribute("restore.crashed_song", has_crashed_song)
+
+                try:
+                    await voice_channel.connect(timeout=30.0, reconnect=True)
+                    await guild.change_voice_state(
+                        channel=voice_channel, self_mute=False, self_deaf=True
+                    )
+                except Exception as e:
+                    log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
+                    return
+
+                mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
+                mp.start()
+                self.mps[guild.id] = mp
+
+                log.info(
+                    f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
                 )
             except Exception as e:
-                log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
-                return
-
-            mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
-            mp.start()
-            self.mps[guild.id] = mp
-
-            log.info(
-                f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
-            )
-        except Exception as e:
-            log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
-        finally:
-            await store.release_recovery_lock()
+                log.error(
+                    f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True
+                )
+            finally:
+                await store.release_recovery_lock()
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -468,10 +559,14 @@ class MusicBot(commands.Cog):
             # Bot was removed from voice — clean up in-memory state.
             guild = member.guild
             if guild.id in self.mps:
-                log.info(
-                    f"Bot disconnected from voice in guild {guild.id}, cleaning up"
-                )
-                await self.cleanup(guild)
+                with _tracer.start_as_current_span(
+                    "bot.voice_state_update",
+                    attributes={"discord.guild_id": str(guild.id)},
+                ):
+                    log.info(
+                        f"Bot disconnected from voice in guild {guild.id}, cleaning up"
+                    )
+                    await self.cleanup(guild)
 
 
 async def setup(bot):

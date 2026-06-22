@@ -1,8 +1,7 @@
-import logging
 import random
-import sys
 from typing import List
 
+import structlog
 from discord.ext import commands
 
 
@@ -29,19 +28,8 @@ def queue_message(songs: List[str]) -> str:
     return msg
 
 
-def get_logger(name: str) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-
-    return logger
+def get_logger(name: str) -> structlog.stdlib.BoundLogger:
+    return structlog.get_logger(name)
 
 
 log = get_logger(__name__)

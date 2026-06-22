@@ -22,6 +22,7 @@ def music_bot(mock_bot):
     cog.mps = {}
     cog.spotify = MagicMock()
     cog.redis = None
+    cog._active_spans = {}
     return cog
 
 
@@ -147,6 +148,7 @@ def music_bot_with_redis(mock_bot, fake_redis_bot):
     cog.mps = {}
     cog.spotify = MagicMock()
     cog.redis = fake_redis_bot
+    cog._active_spans = {}
     return cog
 
 
@@ -326,6 +328,12 @@ class TestGetMp:
 
 class TestCleanup:
     async def test_disconnects_voice_client(self, music_bot, mock_guild):
+        mp = MagicMock()
+        mp._prefetch_task = None
+        mp._restore_task = None
+        mp._player = None
+        mp._store = None
+        music_bot.mps[mock_guild.id] = mp
         mock_guild.voice_client.disconnect = AsyncMock()
         await music_bot.cleanup(mock_guild)
         mock_guild.voice_client.disconnect.assert_awaited_once()
