@@ -528,7 +528,14 @@ class TestOnReady:
         self, music_bot_with_redis, mock_guild
     ):
         created = []
-        with patch("asyncio.create_task", side_effect=lambda c: created.append(c)):
+
+        def _capture(coro):
+            assert coro.__name__ == "_restore_guild"
+            created.append(coro)
+            coro.close()
+            return MagicMock()
+
+        with patch("asyncio.create_task", side_effect=_capture):
             await music_bot_with_redis.on_ready()
         assert len(created) == len(music_bot_with_redis.bot.guilds)
 

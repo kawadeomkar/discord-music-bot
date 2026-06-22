@@ -15,6 +15,7 @@ from src.musicplayer import (
     _serialize_queue_item,
 )
 from src.youtube import QueueObject
+from tests.helpers import stub_create_task
 
 
 @pytest.fixture
@@ -150,6 +151,12 @@ class TestQueuePut:
 
 
 class TestQueueClear:
+    @pytest.fixture(autouse=True)
+    def _stub_prefetch(self, monkeypatch):
+        from src import youtube
+
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
     async def test_clear_empties_queue(self, music_player, mock_author):
         for i in range(3):
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
@@ -180,6 +187,12 @@ class TestQueueClear:
 
 
 class TestQueueShuffle:
+    @pytest.fixture(autouse=True)
+    def _stub_prefetch(self, monkeypatch):
+        from src import youtube
+
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
     async def test_shuffle_requires_minimum_four_items(self, music_player, mock_author):
         for i in range(3):
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
@@ -488,14 +501,14 @@ class TestStart:
     def test_creates_player_task(self, music_player):
         mock_task = MagicMock()
         music_player.bot.loop = MagicMock()
-        music_player.bot.loop.create_task = MagicMock(return_value=mock_task)
+        music_player.bot.loop.create_task = stub_create_task(mock_task)
         music_player.start()
         assert music_player._player is mock_task
 
     def test_creates_restore_task_when_store_present(self, music_player):
         mock_task = MagicMock()
         music_player.bot.loop = MagicMock()
-        music_player.bot.loop.create_task = MagicMock(return_value=mock_task)
+        music_player.bot.loop.create_task = stub_create_task(mock_task)
         assert music_player._store is not None
         music_player.start()
         assert music_player._restore_task is not None
@@ -505,7 +518,7 @@ class TestStart:
     ):
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
         mock_bot.loop = MagicMock()
-        mock_bot.loop.create_task = MagicMock(return_value=MagicMock())
+        mock_bot.loop.create_task = stub_create_task()
         mp.start()
         assert mp._restore_task is None
 
