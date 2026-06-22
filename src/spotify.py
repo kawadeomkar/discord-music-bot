@@ -98,7 +98,9 @@ class Spotify:
             try:
                 endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
                 resp = await self.http_call(endpoint)
-                result = resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+                result = resp["name"] + "".join(
+                    f" {a['name']}" for a in resp["artists"]
+                )
                 await cache_set(self._redis, key, result, _TRACK_TTL)
                 return result
             except Exception as e:
@@ -139,7 +141,10 @@ class Spotify:
             ids = [ids]
         with _tracer.start_as_current_span(
             "spotify.artists",
-            attributes={"spotify.artist_ids": ",".join(ids), "spotify.artist_count": len(ids)},
+            attributes={
+                "spotify.artist_ids": ",".join(ids),
+                "spotify.artist_count": len(ids),
+            },
         ) as span:
             key = f"spotify:artist:{','.join(sorted(ids))}"
             cached = await cache_get(self._redis, key)
@@ -163,7 +168,10 @@ class Spotify:
             ids = [ids]
         with _tracer.start_as_current_span(
             "spotify.albums",
-            attributes={"spotify.album_ids": ",".join(ids), "spotify.album_count": len(ids)},
+            attributes={
+                "spotify.album_ids": ",".join(ids),
+                "spotify.album_count": len(ids),
+            },
         ) as span:
             key = f"spotify:album:{','.join(sorted(ids))}"
             cached = await cache_get(self._redis, key)

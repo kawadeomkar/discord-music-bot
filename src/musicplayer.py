@@ -226,7 +226,10 @@ class MusicPlayer:
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(f"State restore failed for guild {self._guild.id}: {e}", exc_info=True)
+                log.error(
+                    f"State restore failed for guild {self._guild.id}: {e}",
+                    exc_info=True,
+                )
                 return
 
             # Refresh TTL on all guild keys after successful restore.
