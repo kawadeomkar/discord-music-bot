@@ -129,6 +129,7 @@ class QueueObject:
     title: str
     requester: Union[discord.User, discord.Member]
     ts: Optional[int] = None
+    user_input: Optional[str] = None
 
 
 class YTDL(discord.FFmpegOpusAudio):

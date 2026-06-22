@@ -263,6 +263,7 @@ class MusicBot(commands.Cog):
 
                 else:
                     assert isinstance(qobj, QueueObject)
+                    qobj.user_input = url
                     vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
                     if mp.queue.qsize() > 0 or (
                         vc is not None
@@ -392,6 +393,45 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     async def clear(self, ctx: commands.Context):
         await ctx.send(f"in development, use -stop and -join to clear")
+
+    @commands.command(
+        name="remove",
+        aliases=["rm"],
+        help="remove all queued songs matching a YouTube URL",
+    )
+    @commands.before_invoke(validate_commands)
+    async def remove(self, ctx: commands.Context, url: Optional[str] = None):
+        if url is None:
+            await ctx.send(
+                "`-remove <url>` — removes all songs matching the given URL from the queue. "
+                "The URL must match the YouTube link shown in the **Now Playing** embed."
+            )
+            return
+        mp = self.get_mp(ctx)
+        positions = await mp.queue_remove(url)
+        if not positions:
+            await ctx.send(f"No queued songs found matching: <{url}>")
+            return
+        count = len(positions)
+        noun = "song" if count == 1 else "songs"
+        pos_label = "Position" if count == 1 else "Positions"
+        pos_str = ", ".join(str(p) for p in positions)
+        updated_queue = mp.get_queue()
+        embed = (
+            discord.Embed(
+                title=f"Removed {count} {noun} from the queue",
+                color=discord.Color.orange(),
+            )
+            .add_field(name="URL", value=f"<{url}>", inline=False)
+            .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
+            .add_field(
+                name="Updated queue",
+                value=updated_queue if updated_queue else "Queue is now empty.",
+                inline=False,
+            )
+        )
+        await ctx.send(embed=embed)
+        await ctx.message.add_reaction("🗑️")
 
     @commands.command(
         name="now", aliases=["np", "rn", "nowplaying"], help="display current song"

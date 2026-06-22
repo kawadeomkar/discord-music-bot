@@ -31,6 +31,7 @@ def _serialize_queue_item(qobj: QueueObject) -> bytes:
             "title": qobj.title,
             "requester_id": qobj.requester.id,
             "ts": qobj.ts,
+            "user_input": qobj.user_input,
         }
     )
 
@@ -43,7 +44,13 @@ def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[Queue
         )
         if member is None:
             return None
-        return QueueObject(d["webpage_url"], d["title"], member, ts=d.get("ts"))
+        return QueueObject(
+            d["webpage_url"],
+            d["title"],
+            member,
+            ts=d.get("ts"),
+            user_input=d.get("user_input"),
+        )
     except Exception as e:
         log.warning(f"Failed to deserialize queue item: {e}")
         return None
@@ -329,6 +336,58 @@ class MusicPlayer:
                 await self._store.rebuild_queue(serialized)
 
         return "Shuffled!"
+
+    async def queue_remove(self, url: str) -> list[int]:
+        """Remove all queued items whose webpage_url matches url.
+
+        Returns a list of 1-indexed queue positions that were removed.
+        """
+        await self._cancel_prefetch()
+        removed_positions: list[int] = []
+        kept: List[Union[QueueObject, YTSource]] = []
+
+        async with self.mutex:
+            # Drain everything first so positions are numbered before partitioning.
+            drained: List[Union[QueueObject, YTSource]] = []
+            for _ in range(self.queue.qsize()):
+                try:
+                    item = self.queue.get_nowait()
+                    self.queue.task_done()
+                    drained.append(item)
+                except asyncio.QueueEmpty:
+                    break
+
+            for pos, item in enumerate(drained, start=1):
+                if isinstance(item, QueueObject):
+                    match = item.webpage_url == url or item.user_input == url
+                else:
+                    match = (item.url or "") == url
+                if match:
+                    removed_positions.append(pos)
+                else:
+                    kept.append(item)
+
+            squeue = []
+            for item in kept:
+                self.queue.put_nowait(item)
+                if isinstance(item, QueueObject):
+                    squeue.append(_queue_display_str(item.title, item.webpage_url))
+                else:
+                    squeue.append(
+                        _queue_display_str(item.ytsearch or item.url or "?", "")
+                    )
+            self.song_queue = deque(squeue)
+
+        if removed_positions and self._store is not None:
+            serialized = [
+                _serialize_queue_item(s) for s in kept if isinstance(s, QueueObject)
+            ]
+            if serialized:
+                await self._store.rebuild_queue(serialized)
+            else:
+                await self._store.delete_queue()
+
+        return removed_positions
 
     # ── Embed building ────────────────────────────────────────────────────────
 
