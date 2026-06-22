@@ -96,7 +96,7 @@ class MusicBot(commands.Cog):
         with _tracer.start_as_current_span(
             "bot.cleanup",
             attributes={"discord.guild_id": str(guild.id)},
-        ):
+        ) as span:
             log.info("going to cleanup/disconnect")
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
@@ -121,7 +121,9 @@ class MusicBot(commands.Cog):
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                log.error(f"cleanup error: {type(e).__name__}: {e}")
+                span.record_exception(e)
+                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
 
     async def cog_before_invoke(self, ctx: commands.Context):
         from structlog.contextvars import bind_contextvars
@@ -528,6 +530,7 @@ class MusicBot(commands.Cog):
                         channel=voice_channel, self_mute=False, self_deaf=True
                     )
                 except Exception as e:
+                    span.set_attribute("restore.voice_connect_failed", True)
                     log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
                     return
 
@@ -539,6 +542,8 @@ class MusicBot(commands.Cog):
                     f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
                 )
             except Exception as e:
+                span.record_exception(e)
+                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
                 log.error(
                     f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True
                 )

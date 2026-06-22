@@ -54,7 +54,7 @@ class MusicBotApp(commands.AutoShardedBot):
         # Run it in an executor to avoid blocking the event loop on shutdown.
         from src.telemetry import shutdown_telemetry
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, shutdown_telemetry)
 
 

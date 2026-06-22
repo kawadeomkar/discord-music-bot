@@ -8,6 +8,8 @@ import discord
 import orjson
 from discord.ext import commands
 
+from opentelemetry.trace import StatusCode
+
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -222,7 +224,9 @@ class MusicPlayer:
                 span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
 
             except Exception as e:
-                log.error(f"State restore failed for guild {self._guild.id}: {e}")
+                span.record_exception(e)
+                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                log.error(f"State restore failed for guild {self._guild.id}: {e}", exc_info=True)
                 return
 
             # Refresh TTL on all guild keys after successful restore.
@@ -399,7 +403,7 @@ class MusicPlayer:
         with _tracer.start_as_current_span(
             "player.prefetch",
             attributes={"discord.guild_id": str(self._guild.id)},
-        ):
+        ) as span:
             try:
                 source = await self._resolve_source(source)
                 return await self._stream_source(source)
@@ -407,7 +411,9 @@ class MusicPlayer:
                 self.queue.task_done()
                 raise
             except Exception as e:
-                log.error(f"Prefetch error: {e}")
+                span.record_exception(e)
+                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
                 self.queue.task_done()
                 return None
 
@@ -512,6 +518,8 @@ class MusicPlayer:
                     span.set_attribute("loop.cancelled", True)
                     raise
                 except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
                     log.error(
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,
