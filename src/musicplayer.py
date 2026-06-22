@@ -238,10 +238,17 @@ class MusicPlayer:
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
-    async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
-        items: list[Union[QueueObject, YTSource]] = (
-            list(obj) if isinstance(obj, list) else [obj]
-        )
+    async def queue_put(
+        self,
+        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        *,
+        prefetch: bool = True,
+    ):
+        items: list[Union[QueueObject, YTSource]]
+        if isinstance(obj, list):
+            items = list(obj)  # type: ignore[arg-type]
+        else:
+            items = [obj]
         for item in items:
             await self.queue.put(item)
 
@@ -252,11 +259,17 @@ class MusicPlayer:
                     _queue_display_str(item.ytsearch or item.url or "?", "")
                 )
 
-            # Mirror to Redis and kick off stream pre-fetch (QueueObject only —
-            # YTSource items have no stable webpage_url to key the cache on).
+            # Mirror to Redis and (optionally) kick off stream pre-fetch.
+            # prefetch=False for bulk playlist enqueues — spawning N concurrent
+            # prefetch tasks saturates the thread pool and produces stream URLs that
+            # expire before the song reaches playback position. _prefetch_next_song
+            # handles one-ahead prefetch naturally as songs play.
             if isinstance(item, QueueObject) and self._store is not None:
                 await self._store.push_queue(_serialize_queue_item(item))
-                asyncio.create_task(YTDL.prefetch_stream(item, redis=self._store.redis))
+                if prefetch:
+                    asyncio.create_task(
+                        YTDL.prefetch_stream(item, redis=self._store.redis)
+                    )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
@@ -275,7 +288,7 @@ class MusicPlayer:
             except asyncio.CancelledError:
                 pass
 
-    async def queue_clear(self) -> None:
+    async def queue_clear(self) -> List[str]:
         await self._cancel_prefetch()
         async with self.mutex:
             for _ in range(self.queue.qsize()):
@@ -284,9 +297,11 @@ class MusicPlayer:
                     self.queue.task_done()
                 except asyncio.QueueEmpty:
                     break
+            cleared = list(self.song_queue)
             self.song_queue.clear()
         if self._store is not None:
             await self._store.delete_queue()
+        return cleared
 
     async def queue_shuffle(self) -> str:
         await self._cancel_prefetch()
@@ -477,6 +492,12 @@ class MusicPlayer:
                 try:
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
+                    if prefetched_song is not None and not self.song_queue:
+                        # The queue was cleared while _prefetch_next_song was running.
+                        # The prefetch task completed and consumed a get_nowait() — balance
+                        # it with task_done() and discard the result so the song isn't played.
+                        self.queue.task_done()
+                        prefetched_song = None
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
@@ -509,7 +530,15 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    self.song_queue.popleft()
+                    try:
+                        self.song_queue.popleft()
+                    except IndexError:
+                        # song_queue was cleared while this song was being resolved
+                        # (e.g. during the async yt_stream call). Discard without
+                        # playing; task_done() balances the queue.get() above.
+                        self.queue.task_done()
+                        self.current_song = None
+                        continue
                     if self._store is not None:
                         await self._store.pop_queue()
 

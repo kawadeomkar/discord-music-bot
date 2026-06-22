@@ -3,7 +3,7 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import discord
@@ -71,6 +71,15 @@ _YTDL_STREAM_OPTS = {
     "format": "bestaudio/best",
     "check_formats": False,
     "retries": 10,
+}
+
+# Used by yt_playlist: fetches entry metadata for all videos in a playlist without
+# individually extracting each video's stream URL. noplaylist=False overrides the
+# base option so yt-dlp processes the full playlist rather than just the first video.
+_YTDL_PLAYLIST_OPTS = {
+    **_YTDL_BASE_OPTS,
+    "noplaylist": False,
+    "extract_flat": True,
 }
 
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
@@ -351,3 +360,38 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
 
             return QueueObject(webpage_url, title, requester, ts=ts)
+
+    @classmethod
+    async def yt_playlist(
+        cls,
+        url: str,
+        requester: Union[discord.User, discord.Member],
+    ) -> List[QueueObject]:
+        with _tracer.start_as_current_span(
+            "ytdl.yt_playlist",
+            attributes={"ytdl.url": url},
+        ) as span:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(
+                _YTDLP_POOL,
+                _ytdlp_extract,
+                url,
+                _YTDL_PLAYLIST_OPTS,
+                False,
+                True,
+            )
+            if data is None:
+                raise Exception(f"Could not fetch YouTube playlist: {url}")
+            entries = data.get("entries") or []
+            span.set_attribute("ytdl.playlist_size", len(entries))
+            qobjs: List[QueueObject] = []
+            for entry in entries:
+                if not entry:
+                    continue
+                video_id = entry.get("id")
+                if not video_id:
+                    continue
+                title = entry.get("title") or video_id
+                url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+                qobjs.append(QueueObject(url, title, requester))
+            return qobjs

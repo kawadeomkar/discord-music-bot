@@ -10,7 +10,7 @@ import pytest
 from discord.ext import commands
 
 from src.musicbot import MusicBot, _check_voice_permissions, _latency_color
-from src.sources import SpotifySource, YTSource
+from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
 from tests.helpers import stub_create_task
 
@@ -97,13 +97,13 @@ class TestLatencyColor:
 class TestQueueSource:
 
     async def test_spotify_playlist_returns_list(self, music_bot, mock_ctx):
-        source = SpotifySource(type="playlist", id="pid123")
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(mock_ctx, source)
         assert result == ["Song A", "Song B"]
 
     async def test_spotify_track_calls_yt_source(self, music_bot, mock_ctx):
-        source = SpotifySource(type="track", id="tid123")
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         with patch(
@@ -132,6 +132,43 @@ class TestQueueSource:
             await music_bot.queue_source(mock_ctx, source)
         call_args = mock_yt.call_args
         assert call_args[0][1] == "ytsearch:test song"
+
+    async def test_youtube_playlist_calls_yt_playlist(self, music_bot, mock_ctx):
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest123",
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id="PLtest123",
+        )
+        fake_qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
+            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+        ]
+        with patch(
+            "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+        ) as mock_playlist:
+            result = await music_bot.queue_source(mock_ctx, source)
+        mock_playlist.assert_awaited_once_with(
+            "https://www.youtube.com/playlist?list=PLtest123", mock_ctx.author
+        )
+        assert result == fake_qobjs
+
+    async def test_youtube_playlist_preserves_full_url(self, music_bot, mock_ctx):
+        full_url = "https://www.youtube.com/watch?v=XfHbPIx42uo&list=RDXfHbPIx42uo&start_radio=1"
+        source = YTSource(
+            url=full_url,
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id="RDXfHbPIx42uo",
+        )
+        fake_qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)
+        ]
+        with patch(
+            "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+        ) as mock_playlist:
+            await music_bot.queue_source(mock_ctx, source)
+        mock_playlist.assert_awaited_once_with(full_url, mock_ctx.author)
 
 
 @pytest.fixture
@@ -487,11 +524,29 @@ class TestPingCommand:
 
 
 class TestClearCommand:
-    async def test_sends_in_development_message(self, music_bot, mock_ctx):
+    async def test_sends_empty_message_when_queue_already_empty(
+        self, music_bot, mock_ctx
+    ):
+        mp = MagicMock()
+        mp.queue_clear = AsyncMock(return_value=[])
+        music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.clear.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        msg = mock_ctx.send.call_args[0][0]
-        assert "development" in msg.lower()
+        mp.queue_clear.assert_awaited_once()
+        mock_ctx.send.assert_awaited_once_with("The queue is already empty.")
+
+    async def test_sends_embed_with_cleared_songs(self, music_bot, mock_ctx):
+        cleared = ["Song A - https://yt.com/1", "Song B - https://yt.com/2"]
+        mp = MagicMock()
+        mp.queue_clear = AsyncMock(return_value=cleared)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+        await MusicBot.clear.callback(music_bot, mock_ctx)
+        mp.queue_clear.assert_awaited_once()
+        mock_ctx.message.add_reaction.assert_awaited_once_with("🗑️")
+        call_kwargs = mock_ctx.send.call_args[1]
+        embed = call_kwargs["embed"]
+        assert "2 songs removed" in embed.title
+        assert "Song A" in embed.description
 
 
 class TestNowCommand:
