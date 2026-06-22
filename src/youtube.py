@@ -130,6 +130,24 @@ class QueueObject:
     requester: Union[discord.User, discord.Member]
     ts: Optional[int] = None
     user_input: Optional[str] = None
+    duration: Optional[int] = None  # seconds, from yt-dlp at enqueue time
+    uploader: Optional[str] = None  # YouTube channel name
+
+
+def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
+    """Back-fill QueueObject fields that yt_source() couldn't populate.
+
+    yt_source() uses _YTDL_SOURCE_OPTS (no format selection), which often
+    returns None for duration/uploader on search-term queries because
+    YouTube's search results page doesn't include all metadata fields.
+    prefetch_stream() uses _YTDL_STREAM_OPTS (full extraction) and has
+    the complete data — this helper writes it back onto the same QueueObject
+    instance so get_queue() sees the enriched values.
+    """
+    if qo.duration is None and data.get("duration") is not None:
+        qo.duration = int(data["duration"])
+    if qo.uploader is None:
+        qo.uploader = data.get("uploader")
 
 
 class YTDL(discord.FFmpegOpusAudio):
@@ -198,9 +216,11 @@ class YTDL(discord.FFmpegOpusAudio):
                 span.set_attribute("ytdl.skipped", True)
                 return
             cache_key = f"ytdl:stream:{qo.webpage_url}"
-            already_cached = await cache_get(redis, cache_key) is not None
+            cached = await cache_get(redis, cache_key)
+            already_cached = cached is not None
             span.set_attribute("ytdl.already_cached", already_cached)
             if already_cached:
+                _enrich_queueobject(qo, cached)
                 return
             loop = asyncio.get_running_loop()
             try:
@@ -223,6 +243,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 ttl = _stream_url_ttl(data.get("url", ""))
                 if ttl:
                     await cache_set(redis, cache_key, stripped, ttl)
+                _enrich_queueobject(qo, data)
 
     @classmethod
     async def yt_stream(
@@ -309,7 +330,13 @@ class YTDL(discord.FFmpegOpusAudio):
                     span.set_attribute("ytdl.source_cache_hit", True)
                     span.set_attribute("ytdl.result_title", cached.get("title", ""))
                     return QueueObject(
-                        cached["webpage_url"], cached["title"], requester, ts=ts
+                        cached["webpage_url"],
+                        cached["title"],
+                        requester,
+                        ts=ts,
+                        user_input=search,
+                        duration=cached.get("duration"),
+                        uploader=cached.get("uploader"),
                     )
 
             span.set_attribute("ytdl.source_cache_hit", False)
@@ -340,14 +367,30 @@ class YTDL(discord.FFmpegOpusAudio):
 
             webpage_url = data["webpage_url"]
             title = data.get("title", "")
+            raw_duration = data.get("duration")
+            duration = int(raw_duration) if raw_duration is not None else None
+            uploader = data.get("uploader")
             span.set_attribute("ytdl.result_title", title)
 
             if redis is not None:
                 await cache_set(
                     redis,
                     cache_key,
-                    {"webpage_url": webpage_url, "title": title},
+                    {
+                        "webpage_url": webpage_url,
+                        "title": title,
+                        "duration": duration,
+                        "uploader": uploader,
+                    },
                     _YT_SOURCE_TTL,
                 )
 
-            return QueueObject(webpage_url, title, requester, ts=ts)
+            return QueueObject(
+                webpage_url,
+                title,
+                requester,
+                ts=ts,
+                user_input=search,
+                duration=duration,
+                uploader=uploader,
+            )

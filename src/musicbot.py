@@ -98,21 +98,25 @@ class MusicBot(commands.Cog):
             attributes={"discord.guild_id": str(guild.id)},
         ) as span:
             log.info("going to cleanup/disconnect")
-            if guild.voice_client:
-                await guild.voice_client.disconnect(force=False)
             try:
+                # Cancel tasks before disconnecting so the playback loop cannot
+                # wake up and start the next song between voice_client.stop() and
+                # the task cancellation. VoiceClient.disconnect() calls stop()
+                # internally, so audio is silenced when we disconnect below.
                 if mp._prefetch_task and not mp._prefetch_task.done():
                     mp._prefetch_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await mp._prefetch_task
-                if mp._restore_task and not mp._restore_task.done():
-                    mp._restore_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await mp._restore_task
                 if mp._player and not mp._player.done():
                     mp._player.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await mp._player
+                if mp._restore_task and not mp._restore_task.done():
+                    mp._restore_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await mp._restore_task
+                if guild.voice_client:
+                    await guild.voice_client.disconnect(force=False)
                 if mp._store is not None:
                     # Intentional stop — clear channel IDs and now-playing state so
                     # on_ready does not attempt to recover this guild after restart.
@@ -315,7 +319,11 @@ class MusicBot(commands.Cog):
     @commands.command(name="stop", aliases=["st"], help="stops current song")
     @commands.before_invoke(validate_commands)
     async def stop(self, ctx: commands.Context):
-        await ctx.invoke(self.skip)
+        # Do not call skip before cleanup: skip fires voice_client.stop() which
+        # triggers the after callback (play_next.set), giving the playback loop a
+        # window to start the next song before the loop task is cancelled.
+        # cleanup() cancels _player first, then disconnects — disconnect()
+        # internally stops the audio subprocess, so no explicit skip is needed.
         voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
         if voice_client and ctx.guild is not None:
             await ctx.message.add_reaction("👋")
@@ -416,21 +424,16 @@ class MusicBot(commands.Cog):
         noun = "song" if count == 1 else "songs"
         pos_label = "Position" if count == 1 else "Positions"
         pos_str = ", ".join(str(p) for p in positions)
-        updated_queue = mp.get_queue()
-        embed = (
+        removal_embed = (
             discord.Embed(
                 title=f"Removed {count} {noun} from the queue",
                 color=discord.Color.orange(),
             )
             .add_field(name="URL", value=f"<{url}>", inline=False)
             .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
-            .add_field(
-                name="Updated queue",
-                value=updated_queue if updated_queue else "Queue is now empty.",
-                inline=False,
-            )
         )
-        await ctx.send(embed=embed)
+        await ctx.send(embed=removal_embed)
+        await ctx.send(embed=mp.get_queue())
         await ctx.message.add_reaction("🗑️")
 
     @commands.command(
@@ -473,9 +476,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     async def queue(self, ctx: commands.Context):
         mp = self.get_mp(ctx)
-        if mp and len(mp.song_queue) > 0:
-            q_songs = mp.get_queue()
-            await ctx.send(q_songs)
+        await ctx.send(embed=mp.get_queue())
 
     @commands.command(
         name="volume",

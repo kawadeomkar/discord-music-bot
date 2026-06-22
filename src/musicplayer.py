@@ -1,7 +1,9 @@
 import asyncio
+import datetime
 import random
 from collections import deque
 from typing import Any, List, Optional, Union
+from zoneinfo import ZoneInfo
 
 import async_timeout
 import discord
@@ -13,15 +15,32 @@ from opentelemetry.trace import StatusCode
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
-from src.util import queue_message, get_logger
+from src.util import get_logger
+from src.youtube import YTDL, QueueObject
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
-from src.youtube import YTDL, QueueObject
+
+_PST = ZoneInfo("America/Los_Angeles")
 
 
-def _queue_display_str(title: str, url: str) -> str:
-    return f"{title} - {url}"
+def _fmt_duration(secs: int) -> str:
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_total_duration(secs: int) -> str:
+    h, r = divmod(secs, 3600)
+    m, s = divmod(r, 60)
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h}h")
+    if m:
+        parts.append(f"{m}m")
+    if s:
+        parts.append(f"{s}s")
+    return " ".join(parts) or "0s"
 
 
 def _serialize_queue_item(qobj: QueueObject) -> bytes:
@@ -32,6 +51,8 @@ def _serialize_queue_item(qobj: QueueObject) -> bytes:
             "requester_id": qobj.requester.id,
             "ts": qobj.ts,
             "user_input": qobj.user_input,
+            "duration": qobj.duration,
+            "uploader": qobj.uploader,
         }
     )
 
@@ -50,6 +71,8 @@ def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[Queue
             member,
             ts=d.get("ts"),
             user_input=d.get("user_input"),
+            duration=d.get("duration"),
+            uploader=d.get("uploader"),
         )
     except Exception as e:
         log.warning(f"Failed to deserialize queue item: {e}")
@@ -152,8 +175,82 @@ class MusicPlayer:
         self._channel = ctx.channel
         self._last_author = ctx.author
 
-    def get_queue(self) -> str:
-        return queue_message(list(self.song_queue)[:10])
+    def get_queue(self) -> discord.Embed:
+        items = list(self.song_queue)
+        total = len(items)
+
+        total_secs = sum(
+            item.duration
+            for item in items
+            if isinstance(item, QueueObject) and item.duration is not None
+        )
+        duration_partial = any(
+            not isinstance(item, QueueObject) or item.duration is None for item in items
+        )
+
+        # Track whether any preceding song had an unknown duration so we can
+        # flag downstream estimates as uncertain.
+        uncertain = False
+
+        # Seed cumulative seconds with the current song's total duration as a proxy
+        # for its remaining time (we don't track elapsed; this overestimates but
+        # keeps the math simple and avoids showing "now" for everything).
+        cumulative_secs = 0
+        if self.current_song is not None:
+            try:
+                h, m, s = self.current_song.duration.split(":")
+                cumulative_secs = int(h) * 3600 + int(m) * 60 + int(s)
+            except (AttributeError, ValueError):
+                uncertain = True
+        now_pst = datetime.datetime.now(tz=_PST)
+
+        lines = []
+        for i, item in enumerate(items[:10], start=1):
+            est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
+            hour = est_dt.hour % 12 or 12
+            ampm = "AM" if est_dt.hour < 12 else "PM"
+            prefix = "~" if uncertain else ""
+            est_str = f"{prefix}**{hour}:{est_dt.strftime('%M')} {ampm}** PST"
+
+            if isinstance(item, QueueObject):
+                title = item.title or "Unknown"
+                requester = item.requester.mention if item.requester else "Unknown"
+                dur = (
+                    _fmt_duration(item.duration)
+                    if item.duration is not None
+                    else "?:??"
+                )
+                channel = item.uploader or "Unknown channel"
+                ts_note = f"  ·  starts at `{item.ts}s`" if item.ts else ""
+                lines.append(
+                    f"`{i}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
+                    f"{channel} · {requester}"
+                )
+                if item.duration is not None:
+                    cumulative_secs += item.duration
+                else:
+                    uncertain = True
+            else:
+                search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+                lines.append(f"`{i}` {search} · *resolving...*")
+                uncertain = True
+
+        header = f"Songs: **{total}**"
+        if total_secs > 0:
+            dur_prefix = "~" if duration_partial else ""
+            header += (
+                f"\nTotal Duration: **{dur_prefix}{_fmt_total_duration(total_secs)}**"
+            )
+
+        songs_text = "\n\n".join(lines) if lines else "*The queue is empty.*"
+        if total > 10:
+            songs_text += f"\n\n*... and {total - 10} more*"
+
+        return discord.Embed(
+            title="Queue",
+            description=header + "\n\n" + songs_text,
+            color=discord.Color.blue(),
+        )
 
     async def stop(self):
         await self._cog.cleanup(self._guild)
@@ -196,9 +293,7 @@ class MusicPlayer:
                     if requester is not None:
                         crashed = QueueObject(crashed_url, crashed_title, requester)
                         await self.queue.put(crashed)
-                        self.song_queue.append(
-                            _queue_display_str(crashed_title, crashed_url)
-                        )
+                        self.song_queue.append(crashed)
                         await self._store.set_state("current_song_url", "")
                         await self._store.set_state("current_song_title", "")
                         log.info(
@@ -212,7 +307,7 @@ class MusicPlayer:
                     qobj = _deserialize_queue_item(item, self._guild)
                     if qobj is not None:
                         await self.queue.put(qobj)
-                        self.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
+                        self.song_queue.append(qobj)
                         count += 1
                 if count:
                     log.info(
@@ -251,12 +346,7 @@ class MusicPlayer:
         for item in items:
             await self.queue.put(item)
 
-            if isinstance(item, QueueObject):
-                self.song_queue.append(_queue_display_str(item.title, item.webpage_url))
-            else:
-                self.song_queue.append(
-                    _queue_display_str(item.ytsearch or item.url or "?", "")
-                )
+            self.song_queue.append(item)
 
             # Mirror to Redis and kick off stream pre-fetch (QueueObject only —
             # YTSource items have no stable webpage_url to key the cache on).
@@ -311,26 +401,23 @@ class MusicPlayer:
                 except asyncio.QueueEmpty:
                     break
             random.shuffle(shuffled)
-            squeue = []
+            kept_after_shuffle = []
             for song in shuffled:
                 try:
                     self.queue.put_nowait(song)
-                    if isinstance(song, QueueObject):
-                        squeue.append(_queue_display_str(song.title, song.webpage_url))
-                    else:
-                        squeue.append(
-                            _queue_display_str(song.ytsearch or song.url or "?", "")
-                        )
+                    kept_after_shuffle.append(song)
                 except asyncio.QueueFull:
                     break
-            self.song_queue = deque(squeue)
+            self.song_queue = deque(kept_after_shuffle)
 
         # Rebuild Redis mirror atomically: DELETE + RPUSH must be MULTI/EXEC,
         # not plain pipeline — a plain pipeline() leaves a window where the key
         # is empty and a concurrent LPOP sees an empty queue.
-        if self._store is not None and shuffled:
+        if self._store is not None and kept_after_shuffle:
             serialized = [
-                _serialize_queue_item(s) for s in shuffled if isinstance(s, QueueObject)
+                _serialize_queue_item(s)
+                for s in kept_after_shuffle
+                if isinstance(s, QueueObject)
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -367,16 +454,9 @@ class MusicPlayer:
                 else:
                     kept.append(item)
 
-            squeue = []
             for item in kept:
                 self.queue.put_nowait(item)
-                if isinstance(item, QueueObject):
-                    squeue.append(_queue_display_str(item.title, item.webpage_url))
-                else:
-                    squeue.append(
-                        _queue_display_str(item.ytsearch or item.url or "?", "")
-                    )
-            self.song_queue = deque(squeue)
+            self.song_queue = deque(kept)
 
         if removed_positions and self._store is not None:
             serialized = [
