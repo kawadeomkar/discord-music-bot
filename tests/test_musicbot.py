@@ -12,6 +12,7 @@ from discord.ext import commands
 from src.musicbot import MusicBot, _check_voice_permissions, _latency_color
 from src.sources import SpotifySource, YTSource
 from src.youtube import QueueObject
+from tests.helpers import stub_create_task
 
 
 @pytest.fixture
@@ -527,17 +528,13 @@ class TestOnReady:
     async def test_creates_restore_task_per_guild(
         self, music_bot_with_redis, mock_guild
     ):
-        created = []
-
-        def _capture(coro):
-            assert coro.__name__ == "_restore_guild"
-            created.append(coro)
-            coro.close()
-            return MagicMock()
-
-        with patch("asyncio.create_task", side_effect=_capture):
+        stub = stub_create_task()
+        with patch("asyncio.create_task", stub):
             await music_bot_with_redis.on_ready()
-        assert len(created) == len(music_bot_with_redis.bot.guilds)
+
+        assert stub.call_count == len(music_bot_with_redis.bot.guilds)
+        for (coro,), _ in stub.call_args_list:
+            assert coro.__name__ == "_restore_guild"
 
 
 class TestRestoreGuildLock:

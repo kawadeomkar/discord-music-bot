@@ -47,6 +47,12 @@ def queue_obj(mock_author):
     )
 
 
+@pytest.fixture()
+def _stub_queue_put_tasks(monkeypatch):
+    """Prevent asyncio.create_task in queue_put from scheduling real prefetch Tasks."""
+    monkeypatch.setattr("asyncio.create_task", stub_create_task())
+
+
 class TestQueueDisplayStr:
     def test_formats_title_and_url(self):
         assert (
@@ -152,10 +158,8 @@ class TestQueuePut:
 
 class TestQueueClear:
     @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch):
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    def _setup(self, _stub_queue_put_tasks):
+        pass
 
     async def test_clear_empties_queue(self, music_player, mock_author):
         for i in range(3):
@@ -188,10 +192,8 @@ class TestQueueClear:
 
 class TestQueueShuffle:
     @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch):
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+    def _setup(self, _stub_queue_put_tasks):
+        pass
 
     async def test_shuffle_requires_minimum_four_items(self, music_player, mock_author):
         for i in range(3):
@@ -498,20 +500,22 @@ class TestFromContext:
 
 
 class TestStart:
-    def test_creates_player_task(self, music_player):
-        mock_task = MagicMock()
-        music_player.bot.loop = MagicMock()
-        music_player.bot.loop.create_task = stub_create_task(mock_task)
-        music_player.start()
-        assert music_player._player is mock_task
+    def test_start_creates_player_and_restore_tasks(self, music_player):
+        player_task = MagicMock(name="player_task")
+        restore_task = MagicMock(name="restore_task")
+        returns = [player_task, restore_task]
 
-    def test_creates_restore_task_when_store_present(self, music_player):
-        mock_task = MagicMock()
+        def _create(coro):
+            coro.close()
+            return returns.pop(0)
+
         music_player.bot.loop = MagicMock()
-        music_player.bot.loop.create_task = stub_create_task(mock_task)
+        music_player.bot.loop.create_task = MagicMock(side_effect=_create)
         assert music_player._store is not None
         music_player.start()
-        assert music_player._restore_task is not None
+
+        assert music_player._player is player_task
+        assert music_player._restore_task is restore_task
 
     def test_no_restore_task_when_store_absent(
         self, mock_bot, mock_guild, mock_channel, mock_ctx
@@ -520,6 +524,7 @@ class TestStart:
         mock_bot.loop = MagicMock()
         mock_bot.loop.create_task = stub_create_task()
         mp.start()
+        assert mp._player is not None
         assert mp._restore_task is None
 
 
