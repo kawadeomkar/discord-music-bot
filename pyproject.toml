@@ -30,7 +30,7 @@ structlog = ">=24.4.0"
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"
 pytest-asyncio = "^0.24"
-fakeredis = ">=2.26.0"
+fakeredis = ">=2.36.2"
 pyright = "^1.1.409"
 pytest-cov = "^7.1.0"
 black = "^26.5.1"
