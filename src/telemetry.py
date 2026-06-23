@@ -1,3 +1,5 @@
+import functools
+import inspect
 import logging
 import os
 import sys
@@ -5,6 +7,7 @@ from typing import Optional
 
 import structlog
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
@@ -89,6 +92,64 @@ def shutdown_telemetry() -> None:
 
 def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
+
+
+def traced(
+    func=None,
+    *,
+    name=None,
+    attributes=None,
+    record_exceptions=True,
+    set_status_on_exception=True,
+):
+    """Wrap a sync or async function in an OTel span.
+
+    For functions that swallow exceptions (catch without re-raising), call
+    trace.get_current_span().record_exception() / .set_status() manually inside
+    the except block — the decorator only records exceptions that propagate out.
+    """
+
+    def decorator(fn):
+        span_name = name or f"{fn.__module__}.{fn.__qualname__}"
+        static_attrs = attributes or {}
+        tracer = get_tracer(fn.__module__)
+
+        if inspect.iscoroutinefunction(fn):
+
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                with tracer.start_as_current_span(span_name, attributes=static_attrs):
+                    try:
+                        return await fn(*args, **kwargs)
+                    except Exception as e:
+                        if record_exceptions:
+                            trace.get_current_span().record_exception(e)
+                        if set_status_on_exception:
+                            trace.get_current_span().set_status(
+                                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+                            )
+                        raise
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(fn)
+            def sync_wrapper(*args, **kwargs):
+                with tracer.start_as_current_span(span_name, attributes=static_attrs):
+                    try:
+                        return fn(*args, **kwargs)
+                    except Exception as e:
+                        if record_exceptions:
+                            trace.get_current_span().record_exception(e)
+                        if set_status_on_exception:
+                            trace.get_current_span().set_status(
+                                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+                            )
+                        raise
+
+            return sync_wrapper
+
+    return decorator(func) if func is not None else decorator
 
 
 # ── Internal setup ────────────────────────────────────────────────────────────

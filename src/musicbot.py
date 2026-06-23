@@ -25,7 +25,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
-from src.telemetry import get_tracer
+from src.telemetry import get_tracer, traced
 from src.util import queue_message, send_queue_phrases, get_logger
 
 log = get_logger(__name__)
@@ -88,6 +88,7 @@ class MusicBot(commands.Cog):
         self.mps[ctx.guild.id] = mp
         return mp
 
+    @traced(name="bot.cleanup")
     async def cleanup(self, guild: discord.Guild) -> None:
         # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
         # on_voice_state_update firing while stop's disconnect is in-flight) gets None
@@ -96,37 +97,36 @@ class MusicBot(commands.Cog):
         if mp is None:
             return
 
-        with _tracer.start_as_current_span(
-            "bot.cleanup",
-            attributes={"discord.guild_id": str(guild.id)},
-        ) as span:
-            log.info("going to cleanup/disconnect")
-            if guild.voice_client:
-                await guild.voice_client.disconnect(force=False)
-            try:
-                if mp._prefetch_task and not mp._prefetch_task.done():
-                    mp._prefetch_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await mp._prefetch_task
-                if mp._restore_task and not mp._restore_task.done():
-                    mp._restore_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await mp._restore_task
-                if mp._player and not mp._player.done():
-                    mp._player.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await mp._player
-                if mp._store is not None:
-                    # Intentional stop — clear channel IDs and now-playing state so
-                    # on_ready does not attempt to recover this guild after restart.
-                    await mp._store.clear_connection()
-                    await mp._store.refresh_ttl()
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
+        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
+        log.info("going to cleanup/disconnect")
+        if guild.voice_client:
+            await guild.voice_client.disconnect(force=False)
+        try:
+            if mp._prefetch_task and not mp._prefetch_task.done():
+                mp._prefetch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._prefetch_task
+            if mp._restore_task and not mp._restore_task.done():
+                mp._restore_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._restore_task
+            if mp._player and not mp._player.done():
+                mp._player.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._player
+            if mp._store is not None:
+                # Intentional stop — clear channel IDs and now-playing state so
+                # on_ready does not attempt to recover this guild after restart.
+                await mp._store.clear_connection()
+                await mp._store.refresh_ttl()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+            )
+            log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
 
     async def cog_before_invoke(self, ctx: commands.Context):
         from structlog.contextvars import bind_contextvars
@@ -197,6 +197,7 @@ class MusicBot(commands.Cog):
             await ctx.send(msg)
             raise commands.CommandError(msg)
 
+    @traced(name="bot.queue_source")
     async def queue_source(
         self,
         ctx: commands.Context,
@@ -536,6 +537,7 @@ class MusicBot(commands.Cog):
         for guild in self.bot.guilds:
             asyncio.create_task(self._restore_guild(guild))
 
+    @traced(name="guild.restore")
     async def _restore_guild(self, guild: discord.Guild) -> None:
         """Attempt to rejoin voice and restore queue for one guild after restart."""
         if self.redis is None:
@@ -545,65 +547,68 @@ class MusicBot(commands.Cog):
 
         store = GuildRedisStore(self.redis, guild.id)
 
-        with _tracer.start_as_current_span(
-            "guild.restore",
-            attributes={"discord.guild_id": str(guild.id)},
-        ) as span:
-            # Distributed lock prevents two bot instances from racing on the same guild.
-            # Acquired inside the span so the SET NX EX Redis call is a child span.
-            if not await store.acquire_recovery_lock():
-                span.set_attribute("restore.skipped_lock", True)
-                log.info(
-                    f"Recovery lock held by another instance for guild {guild.id}, skipping"
-                )
+        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
+        # Distributed lock prevents two bot instances from racing on the same guild.
+        # Acquired inside the span so the SET NX EX Redis call is a child span.
+        if not await store.acquire_recovery_lock():
+            trace.get_current_span().set_attribute("restore.skipped_lock", True)
+            log.info(
+                f"Recovery lock held by another instance for guild {guild.id}, skipping"
+            )
+            return
+        try:
+            vc_id, tc_id = await store.get_connection()
+            if vc_id is None or tc_id is None:
                 return
+
+            voice_channel = guild.get_channel(vc_id)
+            text_channel = guild.get_channel(tc_id)
+            if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
+                text_channel, discord.TextChannel
+            ):
+                return
+
+            # Check there is something to restore before connecting.
+            queue_items = await store.get_queue()
+            state = await store.get_state()
+            has_crashed_song = bool(state.get(b"current_song_url", b""))
+            if not queue_items and not has_crashed_song:
+                return
+
+            trace.get_current_span().set_attribute(
+                "restore.queue_count", len(queue_items)
+            )
+            trace.get_current_span().set_attribute(
+                "restore.crashed_song", has_crashed_song
+            )
+
             try:
-                vc_id, tc_id = await store.get_connection()
-                if vc_id is None or tc_id is None:
-                    return
-
-                voice_channel = guild.get_channel(vc_id)
-                text_channel = guild.get_channel(tc_id)
-                if not isinstance(
-                    voice_channel, discord.VoiceChannel
-                ) or not isinstance(text_channel, discord.TextChannel):
-                    return
-
-                # Check there is something to restore before connecting.
-                queue_items = await store.get_queue()
-                state = await store.get_state()
-                has_crashed_song = bool(state.get(b"current_song_url", b""))
-                if not queue_items and not has_crashed_song:
-                    return
-
-                span.set_attribute("restore.queue_count", len(queue_items))
-                span.set_attribute("restore.crashed_song", has_crashed_song)
-
-                try:
-                    await voice_channel.connect(timeout=30.0, reconnect=True)
-                    await guild.change_voice_state(
-                        channel=voice_channel, self_mute=False, self_deaf=True
-                    )
-                except Exception as e:
-                    span.set_attribute("restore.voice_connect_failed", True)
-                    log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
-                    return
-
-                mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
-                mp.start()
-                self.mps[guild.id] = mp
-
-                log.info(
-                    f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
+                await voice_channel.connect(timeout=30.0, reconnect=True)
+                await guild.change_voice_state(
+                    channel=voice_channel, self_mute=False, self_deaf=True
                 )
             except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(
-                    f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True
+                trace.get_current_span().set_attribute(
+                    "restore.voice_connect_failed", True
                 )
-            finally:
-                await store.release_recovery_lock()
+                log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
+                return
+
+            mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
+            mp.start()
+            self.mps[guild.id] = mp
+
+            log.info(
+                f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
+            )
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+            )
+            log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
+        finally:
+            await store.release_recovery_lock()
 
     @commands.Cog.listener()
     async def on_voice_state_update(

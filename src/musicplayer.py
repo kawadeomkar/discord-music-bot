@@ -9,11 +9,12 @@ import discord
 import orjson
 from discord.ext import commands
 
+from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
-from src.telemetry import get_tracer
+from src.telemetry import get_tracer, traced
 from src.util import queue_message, get_logger
 
 log = get_logger(__name__)
@@ -493,6 +494,7 @@ class MusicPlayer:
         except Exception as e:
             log.error(f"embed error: {e}")
 
+    @traced(name="player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
         """Pre-resolve and stream the next queued song while the current one plays.
 
@@ -506,22 +508,21 @@ class MusicPlayer:
             source = self.queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
-        with _tracer.start_as_current_span(
-            "player.prefetch",
-            attributes={"discord.guild_id": str(self._guild.id)},
-        ) as span:
-            try:
-                source = await self._resolve_source(source)
-                return await self._stream_source(source)
-            except asyncio.CancelledError:
-                self.queue.task_done()
-                raise
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
-                self.queue.task_done()
-                return None
+        trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
+        try:
+            source = await self._resolve_source(source)
+            return await self._stream_source(source)
+        except asyncio.CancelledError:
+            self.queue.task_done()
+            raise
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+            )
+            log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
+            self.queue.task_done()
+            return None
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
