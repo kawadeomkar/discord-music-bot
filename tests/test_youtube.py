@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import orjson
 import pytest
+from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.youtube import (
     YTDL,
@@ -15,6 +16,7 @@ from src.youtube import (
     _YTDL_STREAM_OPTS,
     _stream_url_ttl,
 )
+from tests.helpers import _noop_ffmpeg_init
 
 
 def _fake_ytdl_data(**overrides):
@@ -252,7 +254,7 @@ class TestYTStream:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=_noop_ffmpeg_init),
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
@@ -271,6 +273,7 @@ class TestYTStream:
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
+            self._process = _DISCORD_MISSING
             captured_options["options"] = options
 
         with (
@@ -292,6 +295,7 @@ class TestYTStream:
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
+            self._process = _DISCORD_MISSING
             captured_options["options"] = options
 
         with (
@@ -350,7 +354,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract") as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=_noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
         mock_extract.assert_not_called()
@@ -369,7 +373,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=_noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
 
@@ -388,7 +392,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=_noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=bad_redis)
 
