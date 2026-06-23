@@ -269,6 +269,16 @@ class TestBuildNowPlayingEmbed:
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
 
+    def test_embed_does_not_have_dislikes_field(self, music_player, mock_song):
+        embed = music_player._build_now_playing_embed(mock_song)
+        field_names = [f.name for f in embed.fields]
+        assert "Dislikes" not in field_names
+
+    def test_embed_thumbnail_not_set_when_none(self, music_player, mock_song):
+        mock_song.thumbnail = None
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert not embed.thumbnail.url
+
 
 class TestMusicPlayerInitialState:
     def test_queue_starts_empty(self, music_player):
@@ -423,6 +433,76 @@ class TestRestoreCrashedSong:
         first = await music_player.queue.get()
         assert first.title == "Normal"
 
+    async def test_crashed_song_uses_last_author_id_for_requester(
+        self, music_player, fake_redis, mock_author
+    ):
+        """If last_author_id is in state, the crashed song's requester is that member."""
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_url", b"https://yt.com/v=crash"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(),
+            b"last_author_id",
+            str(mock_author.id).encode(),
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.requester is mock_author
+
+    async def test_crashed_song_computes_position_from_play_epoch(
+        self, music_player, fake_redis, mock_author
+    ):
+        """play_start_epoch and total_pause_seconds are combined into a seek offset."""
+        import time
+
+        start = time.time() - 90  # started 90 seconds ago, 10s of pauses
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_url", b"https://yt.com/v=crash"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"play_start_epoch", str(start).encode()
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"total_pause_seconds", b"10"
+        )
+        music_player._guild.get_member = MagicMock(return_value=None)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        # expected position ≈ 90 - 10 = 80s; allow ±10s tolerance for test latency
+        assert first.ts is not None
+        assert 70 <= first.ts <= 90
+
+    async def test_crashed_song_position_none_when_no_epoch(
+        self, music_player, fake_redis, mock_author
+    ):
+        """When play_start_epoch is absent, ts on the restored QueueObject is None."""
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_url", b"https://yt.com/v=crash"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed"
+        )
+        music_player._guild.get_member = MagicMock(return_value=None)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.ts is None
+
 
 class TestResolveSource:
     async def test_returns_queue_object_unchanged(self, music_player, queue_obj):
@@ -509,6 +589,23 @@ class TestStart:
         mp.start()
         assert mp._restore_task is None
 
+    def test_restore_complete_set_immediately_when_store_absent(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        """When there is no Redis store, start() must signal _restore_complete immediately
+        so loop()'s prefetch gate never blocks."""
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        mock_bot.loop = MagicMock()
+        mock_bot.loop.create_task = MagicMock(return_value=MagicMock())
+        mp.start()
+        assert mp._restore_complete.is_set()
+
+    def test_restore_complete_not_set_before_start_when_store_present(
+        self, music_player
+    ):
+        """Before start() or _restore_state() runs, the event must be clear."""
+        assert not music_player._restore_complete.is_set()
+
 
 class TestSetContext:
     def test_updates_channel(self, music_player, mock_ctx):
@@ -574,6 +671,27 @@ class TestSendNowPlaying:
     async def test_swallows_channel_send_exception(self, music_player, mock_song):
         music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
         await music_player._send_now_playing(mock_song)  # must not raise
+
+    async def test_persists_embed_fields_to_redis(
+        self, music_player, mock_song, fake_redis
+    ):
+        """_send_now_playing writes the embed fields into the Redis now-playing hash."""
+        mock_song.requester.id = 999
+        mock_song.requester.mention = "<@999>"
+        await music_player._send_now_playing(mock_song)
+        data = await fake_redis.hgetall(music_player._store.now_playing_key())
+        assert data[b"title"] == mock_song.title.encode()
+        assert data[b"uploader"] == mock_song.uploader.encode()
+        assert data[b"requester_mention"] == mock_song.requester.mention.encode()
+
+    async def test_send_now_playing_no_redis_write_when_store_absent(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx, mock_song
+    ):
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        mp._channel = mock_channel
+        await mp._send_now_playing(mock_song)
+        # No store means no Redis write; embed still set locally
+        assert mp.play_message is not None
 
 
 # ── _prefetch_next_song ───────────────────────────────────────────────────────
@@ -808,6 +926,10 @@ class TestLoop:
     async def test_plays_song_and_updates_history(
         self, music_player, queue_obj, mock_song
     ):
+        # _restore_complete is never set unless start() is called or _restore_state() runs.
+        # Set it here so the restore gate in loop() does not block for 10s.
+        music_player._restore_complete.set()
+
         music_player.bot.wait_until_ready = AsyncMock()
         music_player.bot.is_closed.side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
@@ -869,3 +991,124 @@ class TestLoop:
             await music_player.loop()
 
         music_player._channel.send.assert_awaited()
+
+
+# ── _restore_complete event ───────────────────────────────────────────────────
+
+
+class TestRestoreCompleteEvent:
+    async def test_set_after_successful_restore(self, music_player):
+        music_player.bot.wait_until_ready = AsyncMock()
+        await music_player._restore_state()
+        assert music_player._restore_complete.is_set()
+
+    async def test_set_even_when_restore_raises(self, music_player):
+        music_player.bot.wait_until_ready = AsyncMock()
+        with patch.object(
+            music_player._store,
+            "get_state",
+            new=AsyncMock(side_effect=Exception("redis down")),
+        ):
+            await music_player._restore_state()
+        assert music_player._restore_complete.is_set()
+
+    async def test_set_even_when_queue_restore_fails(self, music_player):
+        music_player.bot.wait_until_ready = AsyncMock()
+        with patch.object(
+            music_player._store,
+            "get_queue",
+            new=AsyncMock(side_effect=Exception("redis down")),
+        ):
+            await music_player._restore_state()
+        assert music_player._restore_complete.is_set()
+
+
+# ── _build_now_playing_embed_from_data ────────────────────────────────────────
+
+_NP_DATA: dict[bytes, bytes] = {
+    b"title": b"Test Song",
+    b"webpage_url": b"https://yt.com/v=1",
+    b"uploader": b"Test Channel",
+    b"duration": b"3:30",
+    b"thumbnail": b"https://img.yt.com/thumb.jpg",
+    b"view_count": b"1000",
+    b"like_count": b"50",
+    b"abr": b"128",
+    b"asr": b"44100",
+    b"acodec": b"opus",
+    b"requester_id": b"123",
+    b"requester_mention": b"<@123>",
+}
+
+
+class TestBuildNowPlayingEmbedFromData:
+    def test_returns_discord_embed(self, music_player):
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert isinstance(embed, discord.Embed)
+
+    def test_title_from_data(self, music_player):
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert "Test Song" in embed.title
+
+    def test_requester_mention_in_description(self, music_player):
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert "<@123>" in embed.description
+
+    def test_thumbnail_set_from_data(self, music_player):
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert embed.thumbnail.url == "https://img.yt.com/thumb.jpg"
+
+    def test_thumbnail_not_set_when_empty(self, music_player):
+        data = dict(_NP_DATA)
+        data[b"thumbnail"] = b""
+        embed = music_player._build_now_playing_embed_from_data(data)
+        assert not embed.thumbnail.url
+
+    def test_footer_contains_bitrate(self, music_player):
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert "128" in embed.footer.text
+
+    def test_missing_field_defaults_to_empty_string(self, music_player):
+        data = {b"title": b"Minimal"}  # all other fields absent
+        embed = music_player._build_now_playing_embed_from_data(data)
+        assert "Minimal" in embed.title
+
+
+# ── _restore_state: now-playing embed restoration ────────────────────────────
+
+
+class TestRestoreStateNowPlaying:
+    async def test_restores_play_message_from_redis(self, music_player, fake_redis):
+        """If now_playing hash exists in Redis, play_message is populated on restore."""
+        await fake_redis.hset(
+            music_player._store.now_playing_key(),
+            mapping={
+                "title": "Restored Song",
+                "webpage_url": "https://yt.com/v=1",
+                "uploader": "Channel",
+                "duration": "3:00",
+                "thumbnail": "",
+                "view_count": "100",
+                "like_count": "10",
+                "abr": "128",
+                "asr": "44100",
+                "acodec": "opus",
+                "requester_id": "123",
+                "requester_mention": "<@123>",
+            },
+        )
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        assert music_player.play_message is not None
+        assert isinstance(music_player.play_message, discord.Embed)
+        assert "Restored Song" in music_player.play_message.title
+
+    async def test_play_message_none_when_no_now_playing_in_redis(
+        self, music_player
+    ):
+        """No now_playing hash → play_message stays None after restore."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        await music_player._restore_state()
+        assert music_player.play_message is None

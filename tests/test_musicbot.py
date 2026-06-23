@@ -1,6 +1,7 @@
 """Tests for src/musicbot.py — voice permission validation, queue source dispatch, and latency color."""
 
 import asyncio
+import time
 import orjson
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -384,9 +385,26 @@ class TestCleanup:
 
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot, mock_ctx):
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        mock_mp = MagicMock()
+        mock_mp._store = None  # skip the redis_set_state branch
+        music_bot.get_mp = MagicMock(return_value=mock_mp)
         await music_bot.cog_before_invoke(mock_ctx)
         music_bot.get_mp.assert_called_once_with(mock_ctx)
+
+    async def test_writes_last_author_id_when_store_present(
+        self, music_bot, mock_ctx
+    ):
+        """When the player has a Redis store, cog_before_invoke persists the author ID."""
+        mock_mp = MagicMock()
+        mock_mp._store = MagicMock()  # non-None
+        mock_mp.redis_set_state = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mock_mp)
+
+        await music_bot.cog_before_invoke(mock_ctx)
+
+        mock_mp.redis_set_state.assert_awaited_once_with(
+            "last_author_id", str(mock_ctx.author.id)
+        )
 
 
 class TestValidateCommands:
@@ -446,6 +464,28 @@ class TestPauseCommand:
             await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_not_called()
 
+    async def test_pause_calls_on_pause_on_store(self, music_bot, mock_ctx):
+        """pause command forwards the wall-clock epoch to the player's store."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.pause = MagicMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        mock_store = MagicMock()
+        mock_store.on_pause = AsyncMock()
+        mock_mp = MagicMock()
+        mock_mp._store = mock_store
+        music_bot.get_mp = MagicMock(return_value=mock_mp)
+
+        before = time.time()
+        with patch("discord.utils.get", return_value=vc):
+            await MusicBot.pause.callback(music_bot, mock_ctx)
+        after = time.time()
+
+        mock_store.on_pause.assert_awaited_once()
+        call_epoch = mock_store.on_pause.call_args[0][0]
+        assert before <= call_epoch <= after
+
 
 class TestResumeCommand:
     async def test_resumes_when_paused(self, music_bot, mock_ctx):
@@ -457,6 +497,29 @@ class TestResumeCommand:
         with patch("discord.utils.get", return_value=vc):
             await MusicBot.resume.callback(music_bot, mock_ctx)
         vc.resume.assert_called_once()
+
+    async def test_resume_calls_on_resume_on_store(self, music_bot, mock_ctx):
+        """resume command forwards the wall-clock epoch to the player's store."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=True)
+        vc.resume = MagicMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        mock_store = MagicMock()
+        mock_store.on_resume = AsyncMock()
+        mock_mp = MagicMock()
+        mock_mp._store = mock_store
+        music_bot.get_mp = MagicMock(return_value=mock_mp)
+
+        before = time.time()
+        with patch("discord.utils.get", return_value=vc):
+            await MusicBot.resume.callback(music_bot, mock_ctx)
+        after = time.time()
+
+        mock_store.on_resume.assert_awaited_once()
+        call_epoch = mock_store.on_resume.call_args[0][0]
+        assert before <= call_epoch <= after
 
 
 class TestVolumeCommand:
@@ -601,3 +664,90 @@ class TestSetup:
         ):
             await setup(mock_bot)
         mock_bot.add_cog.assert_awaited_once()
+
+
+# ── _restore_guild Gap 3: channel-deleted notification ────────────────────────
+
+
+class TestRestoreGuildChannelDeleted:
+    async def test_clears_connection_when_both_channels_deleted(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When both stored channels are gone, Redis state is cleared so the
+        guild is not retried on the next on_ready."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None  # both resolved to None
+        mock_guild.system_channel.send = AsyncMock()
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        vc_id, tc_id = await store.get_connection()
+        assert vc_id is None
+        assert tc_id is None
+
+    async def test_sends_notification_via_system_channel(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """Notification is sent when both channels are deleted."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.send = AsyncMock()
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        mock_guild.system_channel.send.assert_awaited_once()
+        msg = mock_guild.system_channel.send.call_args[0][0]
+        assert "⚠️" in msg
+        assert "voice channel" in msg
+        assert "text channel" in msg
+        assert "were deleted" in msg
+
+    async def test_notifies_via_text_channel_when_only_voice_deleted(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When only the voice channel is gone, notify via the still-valid text channel."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        text_channel = MagicMock(spec=discord.TextChannel)
+        text_channel.send = AsyncMock()
+
+        def _get_channel(ch_id):
+            if ch_id == 888000000000000001:
+                return None  # voice deleted
+            return text_channel  # text still exists
+
+        mock_guild.get_channel.side_effect = _get_channel
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        text_channel.send.assert_awaited_once()
+        msg = text_channel.send.call_args[0][0]
+        assert "voice channel" in msg
+        assert "was deleted" in msg
+
+    async def test_swallows_notify_send_failure(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """A failure sending the notification must not propagate out of _restore_guild."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.send = AsyncMock(
+            side_effect=Exception("channel gone")
+        )
+
+        await music_bot_with_redis._restore_guild(mock_guild)  # must not raise

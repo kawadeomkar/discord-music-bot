@@ -9,7 +9,7 @@ import ujson
 import redis.asyncio as aioredis
 from opentelemetry.trace import StatusCode
 
-from src.redis_client import cache_get, cache_set
+from src.redis_client import cache_get, cache_set, spotify_token_get, spotify_token_set
 from src.telemetry import get_tracer
 from src.util import get_logger
 
@@ -45,6 +45,17 @@ class Spotify:
     # ── Auth ─────────────────────────────────────────────────────────────────
 
     async def _refresh_token(self) -> None:
+        if self._redis is not None:
+            cached_token = await spotify_token_get(self._redis)
+            if cached_token:
+                self.auth_token = cached_token
+                # Set token_expiry well into the future. The Redis TTL is the real
+                # expiry guard; this local value prevents http_call()'s
+                # time.time() > token_expiry check from re-entering _refresh_token()
+                # during the lifetime of this process.
+                self.token_expiry = time.time() + 3540  # 59 min
+                return
+
         self.token_expiry = time.time()
         data = {
             "grant_type": "client_credentials",
@@ -55,7 +66,9 @@ class Spotify:
             resp = await session.post(self.auth_endpoint, data=data)
             resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
-        self.token_expiry += resp_data["expires_in"]
+        expires_in: int = resp_data["expires_in"]
+        self.token_expiry += expires_in
+        await spotify_token_set(self._redis, self.auth_token, expires_in)
 
     async def http_call(
         self,

@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 from collections import deque
 from typing import Any, List, Optional, Union
 
@@ -10,7 +11,7 @@ from discord.ext import commands
 
 from opentelemetry.trace import StatusCode
 
-from src.redis_client import GuildRedisStore
+from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import queue_message, get_logger
@@ -68,6 +69,7 @@ class MusicPlayer:
         "_prefetch_task",
         "_store",
         "_restore_task",
+        "_restore_complete",
     )
 
     bot: commands.Bot
@@ -87,6 +89,7 @@ class MusicPlayer:
     _prefetch_task: Optional[asyncio.Task]
     _store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
+    _restore_complete: asyncio.Event
 
     def __init__(
         self,
@@ -119,6 +122,7 @@ class MusicPlayer:
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
+        self._restore_complete = asyncio.Event()
 
     @classmethod
     def from_context(
@@ -139,6 +143,10 @@ class MusicPlayer:
         self._player = self.bot.loop.create_task(self.loop())
         if self._store is not None:
             self._restore_task = self.bot.loop.create_task(self._restore_state())
+        else:
+            # No Redis — no restore will run; signal immediately so the prefetch
+            # gate in loop() never waits.
+            self._restore_complete.set()
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -171,23 +179,69 @@ class MusicPlayer:
             attributes={"discord.guild_id": str(self._guild.id)},
         ) as span:
             try:
-                # Restore volume
                 state = await self._store.get_state()
+
+                # Restore volume
                 if state and b"volume" in state:
                     self.volume = float(state[b"volume"])
 
+                # Restore now-playing embed so -now works if a song is playing on recovery.
+                np_data = await self._store.get_now_playing()
+                if np_data:
+                    self.play_message = self._build_now_playing_embed_from_data(np_data)
+
                 # Re-queue song that was playing when the bot crashed (at-most-once delivery).
-                # current_song_url is written to state when playback starts and cleared when
-                # it finishes normally. A non-empty value means the bot died mid-song.
+                # current_song_url is set atomically with the LPOP; a non-empty value means
+                # the bot died after the transaction committed but before the song finished.
                 crashed_url_raw = state.get(b"current_song_url", b"")
+                count = 0
                 if crashed_url_raw:
                     crashed_url = crashed_url_raw.decode()
                     crashed_title = state.get(b"current_song_title", b"").decode()
-                    requester: Union[discord.Member, discord.User, None] = (
-                        self._guild.me or self._guild.owner
-                    )
+
+                    # Resolve the actual requester who last triggered a command.
+                    last_author_id_raw = state.get(b"last_author_id", b"")
+                    requester: Union[discord.Member, discord.User, None] = None
+                    if last_author_id_raw:
+                        try:
+                            requester = self._guild.get_member(int(last_author_id_raw))
+                        except (ValueError, Exception):
+                            pass
+                    if requester is None:
+                        requester = self._guild.me or self._guild.owner
+
+                    # Compute approximate playback position at time of crash.
+                    position: Optional[int] = None
+                    play_start_raw = state.get(b"play_start_epoch", b"")
+                    if play_start_raw:
+                        try:
+                            now = time.time()
+                            elapsed = now - float(play_start_raw)
+                            total_pause = int(float(state.get(b"total_pause_seconds", b"0")))
+                            pause_start_raw_pos = state.get(b"pause_start_epoch", b"")
+                            if pause_start_raw_pos:
+                                total_pause += int(now - float(pause_start_raw_pos))
+                            position = max(0, int(elapsed - total_pause))
+
+                            # Cap at duration − 10s to prevent FFmpeg seeking past EOF.
+                            stream_data = await cache_get(
+                                self._store.redis, f"ytdl:stream:{crashed_url}"
+                            )
+                            if stream_data is not None:
+                                raw_duration = stream_data.get("duration")
+                                if raw_duration is not None:
+                                    position = min(position, max(0, int(raw_duration) - 10))
+
+                            log.info(
+                                f"Computed recovery position {position}s for '{crashed_title}' "
+                                f"(elapsed={int(elapsed)}s, paused={total_pause}s)"
+                            )
+                        except Exception as pos_err:
+                            log.warning(f"Failed to compute recovery position: {pos_err}")
+                            position = None
+
                     if requester is not None:
-                        crashed = QueueObject(crashed_url, crashed_title, requester)
+                        crashed = QueueObject(crashed_url, crashed_title, requester, ts=position)
                         await self.queue.put(crashed)
                         self.song_queue.append(
                             _queue_display_str(crashed_title, crashed_url)
@@ -200,7 +254,6 @@ class MusicPlayer:
 
                 # Restore queue (Redis list → asyncio.Queue + song_queue deque)
                 items = await self._store.get_queue()
-                count = 0
                 for item in items:
                     qobj = _deserialize_queue_item(item, self._guild)
                     if qobj is not None:
@@ -223,6 +276,9 @@ class MusicPlayer:
                 span.set_attribute("restore.queue_count", count)
                 span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
 
+                # Refresh TTL on all guild keys after successful restore.
+                await self._store.refresh_ttl()
+
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
@@ -230,10 +286,10 @@ class MusicPlayer:
                     f"State restore failed for guild {self._guild.id}: {e}",
                     exc_info=True,
                 )
-                return
-
-            # Refresh TTL on all guild keys after successful restore.
-            await self._store.refresh_ttl()
+            finally:
+                # Always signal loop() that restore has finished or failed so the
+                # prefetch gate never blocks indefinitely.
+                self._restore_complete.set()
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
@@ -334,7 +390,7 @@ class MusicPlayer:
 
     def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
         requester_mention = song.requester.mention if song.requester else "Unknown"
-        return (
+        embed = (
             discord.Embed(
                 title=f"**Now playing:** {song.title}",
                 description=f"Requester: [{requester_mention}]",
@@ -345,12 +401,38 @@ class MusicPlayer:
             .add_field(name="Channel", value=song.uploader)
             .add_field(name="Views", value=str(song.views))
             .add_field(name="Likes", value=str(song.likes))
-            .add_field(name="Dislikes", value=str(song.dislikes))
-            .set_thumbnail(url=song.thumbnail)
             .set_footer(
                 text=f"Avg Bitrate: {song.abr} | Avg Sampling: {song.asr} | Acodec: {song.acodec}"
             )
         )
+        if song.thumbnail:
+            embed.set_thumbnail(url=song.thumbnail)
+        return embed
+
+    def _build_now_playing_embed_from_data(self, data: dict[bytes, bytes]) -> discord.Embed:
+        """Reconstruct a now-playing embed from the Redis HASH data (bytes keys/values)."""
+        def field(key: str) -> str:
+            return data.get(key.encode(), b"").decode()
+
+        thumbnail = field("thumbnail")
+        embed = (
+            discord.Embed(
+                title=f"**Now playing:** {field('title')}",
+                description=f"Requester: [{field('requester_mention')}]",
+                color=discord.Color.green(),
+            )
+            .add_field(name="Youtube link", value=field("webpage_url"), inline=False)
+            .add_field(name="Duration", value=field("duration"))
+            .add_field(name="Channel", value=field("uploader"))
+            .add_field(name="Views", value=field("view_count"))
+            .add_field(name="Likes", value=field("like_count"))
+            .set_footer(
+                text=f"Avg Bitrate: {field('abr')} | Avg Sampling: {field('asr')} | Acodec: {field('acodec')}"
+            )
+        )
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
+        return embed
 
     async def update_activity(self):
         # TODO
@@ -387,6 +469,22 @@ class MusicPlayer:
             embed = self._build_now_playing_embed(song)
             self.play_message = embed
             await self._channel.send(embed=embed)
+
+            if self._store is not None:
+                await self._store.set_now_playing({
+                    "title": song.title or "",
+                    "webpage_url": song.webpage_url or "",
+                    "uploader": song.uploader or "",
+                    "duration": song.duration or "",
+                    "thumbnail": song.thumbnail or "",
+                    "view_count": str(song.views or ""),
+                    "like_count": str(song.likes or ""),
+                    "abr": str(song.abr or ""),
+                    "asr": str(song.asr or ""),
+                    "acodec": song.acodec or "",
+                    "requester_id": str(song.requester.id) if song.requester else "",
+                    "requester_mention": song.requester.mention if song.requester else "Unknown",
+                })
         except Exception as e:
             log.error(f"embed error: {e}")
 
@@ -470,8 +568,6 @@ class MusicPlayer:
                     span.set_attribute("song.title", self.current_song.title or "")
 
                     self.song_queue.popleft()
-                    if self._store is not None:
-                        await self._store.pop_queue()
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
@@ -481,16 +577,31 @@ class MusicPlayer:
                             self.play_next.set
                         ),
                     )
+                    play_start = time.time()  # capture immediately before any awaits
+
+                    # Atomically LPOP the Redis queue and write all now-playing state
+                    # fields in a single MULTI/EXEC, eliminating the at-most-once window.
+                    if self._store is not None and self.current_song is not None:
+                        await self._store.pop_queue_and_start_song(
+                            url=self.current_song.webpage_url or "",
+                            title=self.current_song.title or "",
+                            play_start_epoch=play_start,
+                        )
+
+                    assert self.current_song is not None  # guarded by `if is None: continue` above
                     await self._send_now_playing(self.current_song)
 
-                    # Mirror now-playing song to Redis state
-                    if self._store is not None and self.current_song is not None:
-                        await self._store.set_state(
-                            "current_song_title", self.current_song.title or ""
-                        )
-                        await self._store.set_state(
-                            "current_song_url", self.current_song.webpage_url or ""
-                        )
+                    # Gate prefetch on restore completion so _restore_state() has had a
+                    # chance to populate the asyncio.Queue before get_nowait() is called.
+                    if not self._restore_complete.is_set():
+                        try:
+                            async with async_timeout.timeout(10.0):
+                                await self._restore_complete.wait()
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                f"[guild:{self._guild.id}] Timed out waiting for "
+                                f"_restore_complete; proceeding with prefetch"
+                            )
 
                     self._prefetch_task = asyncio.create_task(
                         self._prefetch_next_song()
@@ -510,10 +621,11 @@ class MusicPlayer:
                         if self._store is not None:
                             await self._store.push_history(orjson.dumps(history_entry))
 
-                    # Clear now-playing state
                     if self._store is not None:
                         await self._store.set_state("current_song_title", "")
                         await self._store.set_state("current_song_url", "")
+                        await self._store.clear_now_playing()
+                        await self._store.clear_playback_position()
 
                     self.queue.task_done()
                     self.current_song = None
@@ -532,6 +644,9 @@ class MusicPlayer:
                     self._prefetch_task = None
                     prefetched_song = None
                     self.current_song = None
+                    if self._store is not None:
+                        await self._store.clear_now_playing()
+                        await self._store.clear_playback_position()
                     try:
                         span_ctx = span.get_span_context()
                         embed = discord.Embed(

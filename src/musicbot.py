@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import random
+import time
 from typing import List, Optional, Union
 
 import discord
@@ -146,7 +147,10 @@ class MusicBot(commands.Cog):
         self._active_spans[id(ctx)] = (span, token)
 
         try:
-            self.get_mp(ctx)
+            mp = self.get_mp(ctx)
+            # Persist the invoking user ID for crash recovery requester attribution.
+            if mp._store is not None:
+                await mp.redis_set_state("last_author_id", str(ctx.author.id))
         except Exception as e:
             # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
             self._active_spans.pop(id(ctx))
@@ -331,6 +335,9 @@ class MusicBot(commands.Cog):
             and voice_client.is_playing()
         ):
             voice_client.pause()
+            mp = self.get_mp(ctx)
+            if mp._store is not None:
+                await mp._store.on_pause(time.time())
             await ctx.message.add_reaction("⏸️")
 
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
@@ -345,6 +352,9 @@ class MusicBot(commands.Cog):
             and voice_client.is_paused()
         ):
             voice_client.resume()
+            mp = self.get_mp(ctx)
+            if mp._store is not None:
+                await mp._store.on_resume(time.time())
             await ctx.message.add_reaction("⏭️")
 
     @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
@@ -509,9 +519,56 @@ class MusicBot(commands.Cog):
 
                 voice_channel = guild.get_channel(vc_id)
                 text_channel = guild.get_channel(tc_id)
-                if not isinstance(
-                    voice_channel, discord.VoiceChannel
-                ) or not isinstance(text_channel, discord.TextChannel):
+                voice_ok = isinstance(voice_channel, discord.VoiceChannel)
+                text_ok = isinstance(text_channel, discord.TextChannel)
+
+                if not voice_ok or not text_ok:
+                    # Clear stale channel IDs so this guild is not re-attempted on every reconnect.
+                    await store.clear_connection()
+                    span.set_attribute("restore.channel_missing", True)
+                    log.warning(
+                        f"Recovery skipped for guild {guild.id}: "
+                        f"voice_channel_id={vc_id} (resolved={voice_ok}) "
+                        f"text_channel_id={tc_id} (resolved={text_ok})"
+                    )
+
+                    # Attempt to notify users via the best available text channel.
+                    notify_channel: Optional[discord.TextChannel] = None
+                    if text_ok:
+                        notify_channel = text_channel  # type: ignore[assignment]
+                    elif guild.me is not None:
+                        if (
+                            guild.system_channel is not None
+                            and guild.system_channel.permissions_for(guild.me).send_messages
+                        ):
+                            notify_channel = guild.system_channel
+                        else:
+                            notify_channel = next(
+                                (
+                                    ch for ch in guild.text_channels
+                                    if ch.permissions_for(guild.me).send_messages
+                                ),
+                                None,
+                            )
+
+                    if notify_channel is not None:
+                        deleted: List[str] = []
+                        if not voice_ok:
+                            deleted.append("voice channel")
+                        if not text_ok:
+                            deleted.append("text channel")
+                        what = " and ".join(deleted)
+                        verb = "was" if len(deleted) == 1 else "were"
+                        try:
+                            await notify_channel.send(
+                                f"⚠️ I came back online but the {what} I was playing in "
+                                f"{verb} deleted. Use `-play` in a voice channel to start fresh."
+                            )
+                        except Exception as notify_err:
+                            log.warning(
+                                f"Failed to send channel-deleted notification for "
+                                f"guild {guild.id}: {notify_err}"
+                            )
                     return
 
                 # Check there is something to restore before connecting.
