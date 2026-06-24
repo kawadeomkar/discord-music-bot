@@ -9,17 +9,21 @@ from unittest.mock import MagicMock
 from discord.utils import MISSING as _DISCORD_MISSING
 
 
-def _noop_ffmpeg_init(self, *args, **kwargs):
-    """Replacement for FFmpegOpusAudio.__init__ that sets _process = MISSING.
+def noop_ffmpeg_init(self, *args, **kwargs):
+    """Replacement for FFmpegOpusAudio.__init__ that stubs all pre-spawn attributes.
 
     When a test patches FFmpegOpusAudio.__init__, the instance is created without
-    running the real __init__, so _process is never assigned.  GC then calls
-    __del__ → cleanup() → _kill_process() → _check_process_returncode(), each of
-    which reads self._process and raises AttributeError.  Setting _process to MISSING
-    replicates the sentinel that discord.py itself writes before spawning the
-    subprocess, which causes all three guard methods to return early.
+    running the real __init__, so the pre-spawn sentinels are never assigned.  GC
+    then calls __del__ → cleanup() → _kill_process() / _check_process_returncode(),
+    each of which reads these attributes and raises AttributeError.  Setting them
+    here mirrors the pre-spawn state discord.py itself establishes before the
+    subprocess is started, causing all guard methods to return early.
     """
     self._process = _DISCORD_MISSING
+    self._stopped = False
+    self._stdout = None
+    self._stdin = None
+    self._stderr = None
 
 
 def stub_create_task(return_value=None):
@@ -31,10 +35,8 @@ def stub_create_task(return_value=None):
     This stub closes each coroutine immediately and returns a configurable mock
     Task so callers' return-value assertions still pass.
     """
-    rv = return_value if return_value is not None else MagicMock()
-
     def _impl(coro):
         coro.close()
-        return rv
+        return return_value if return_value is not None else MagicMock()
 
     return MagicMock(side_effect=_impl)
