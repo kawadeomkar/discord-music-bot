@@ -528,13 +528,28 @@ class TestOnReady:
     async def test_creates_restore_task_per_guild(
         self, music_bot_with_redis, mock_guild
     ):
+        guilds = list(music_bot_with_redis.bot.guilds)
         stub = stub_create_task()
-        with patch("asyncio.create_task", stub):
+        passed_guilds = []
+
+        async def _noop():
+            pass
+
+        # MusicBot uses __slots__, so we must patch at the class level.
+        # Capture happens synchronously in the spy (before stub_create_task
+        # closes the coroutine, which would prevent the body from running).
+        def _spy(self_inner, guild):
+            passed_guilds.append(guild)
+            return _noop()
+
+        with (
+            patch("asyncio.create_task", stub),
+            patch.object(type(music_bot_with_redis), "_restore_guild", _spy),
+        ):
             await music_bot_with_redis.on_ready()
 
-        assert stub.call_count == len(music_bot_with_redis.bot.guilds)
-        for (coro,), _ in stub.call_args_list:
-            assert coro.__name__ == "_restore_guild"
+        assert stub.call_count == len(guilds)
+        assert passed_guilds == guilds
 
 
 class TestRestoreGuildLock:

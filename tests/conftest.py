@@ -14,7 +14,7 @@ import structlog
 
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import _noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -175,7 +175,7 @@ def ytdl_instance(mock_channel, mock_author):
         }
         if data:
             default_data.update(data)
-        with patch.object(d.FFmpegOpusAudio, "__init__", new=_noop_ffmpeg_init):
+        with patch.object(d.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
             return YTDL(
                 mock_channel,
                 default_data["url"],

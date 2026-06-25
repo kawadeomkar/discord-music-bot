@@ -163,6 +163,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.thumbnail = data.get("thumbnail")
         self.description = data.get("description")
         self.duration = str(datetime.timedelta(seconds=int(data.get("duration", "0"))))
+        self.duration_secs: int = int(data.get("duration") or 0)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")

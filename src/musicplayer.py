@@ -1,5 +1,6 @@
 import asyncio
 import random
+import time
 from collections import deque
 from typing import Any, List, Optional, Union
 
@@ -352,9 +353,48 @@ class MusicPlayer:
             )
         )
 
-    async def update_activity(self):
-        # TODO
-        pass
+    async def update_activity(self, song: Optional[YTDL] = None) -> None:
+        if song is not None:
+            now_ms = int(time.time() * 1000)
+            timestamps: dict = {"start": now_ms}
+            if song.duration_secs > 0:
+                timestamps["end"] = now_ms + song.duration_secs * 1000
+
+            # Bot opcode-3 activities only render `name` reliably in Discord's
+            # client. Rich Presence (details, assets) requires the Discord RPC/SDK
+            # which connects to a local desktop client — incompatible with server
+            # bots. Pack the uploader into `name` as a suffix so it's visible.
+            # `details` is kept as a forward-compat fallback; `timestamps` works
+            # in the hover tooltip regardless.
+            title = song.title or "a song"
+            uploader = song.uploader
+            raw_name = f"{title} · {uploader}" if uploader else title
+            name = raw_name if len(raw_name) <= 128 else raw_name[:127] + "…"
+
+            # state renders in both hover and click card for bot activities.
+            # state_url kept for forward-compat (state renders, URL may become
+            # clickable). details/details_url confirmed non-rendering for bots.
+            activity = discord.Activity(
+                type=discord.ActivityType.listening,
+                name=name,
+                state=song.duration,
+                state_url=song.webpage_url,  # discord.py >= 2.6; silent no-op if downgraded
+                timestamps=timestamps,
+            )
+        else:
+            # Only reset when no other guild is still playing.
+            active = any(
+                vc.is_playing()
+                for vc in self.bot.voice_clients
+                if isinstance(vc, discord.VoiceClient)
+            )
+            if active:
+                return
+            activity = discord.Game(name="music")
+        try:
+            await self.bot.change_presence(activity=activity)
+        except Exception as e:
+            log.warning(f"Failed to update bot activity: {e}", exc_info=True)
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
@@ -481,6 +521,7 @@ class MusicPlayer:
                             self.play_next.set
                         ),
                     )
+                    await self.update_activity(self.current_song)
                     await self._send_now_playing(self.current_song)
 
                     # Mirror now-playing song to Redis state
@@ -517,8 +558,10 @@ class MusicPlayer:
 
                     self.queue.task_done()
                     self.current_song = None
+                    await self.update_activity(None)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
+                    await self.update_activity(None)
                     raise
                 except Exception as e:
                     span.record_exception(e)

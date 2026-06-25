@@ -1,6 +1,7 @@
 """Tests for src/musicplayer.py — queue operations, embed building, and Redis integration."""
 
 import asyncio
+import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,6 +33,7 @@ def mock_song():
     song.likes = 50_000
     song.dislikes = 500
     song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
+    song.duration_secs = 210
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
@@ -49,8 +51,10 @@ def queue_obj(mock_author):
 
 @pytest.fixture()
 def _stub_queue_put_tasks(monkeypatch):
-    """Prevent asyncio.create_task in queue_put from scheduling real prefetch Tasks."""
-    monkeypatch.setattr("asyncio.create_task", stub_create_task())
+    """Prevent prefetch_stream tasks in queue_put from doing real yt-dlp work."""
+    from src import youtube
+
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
 
 class TestQueueDisplayStr:
@@ -283,6 +287,97 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
+
+
+class TestUpdateActivity:
+    async def test_sets_playing_activity_when_song_playing(
+        self, music_player, mock_song
+    ):
+        music_player.bot.change_presence = AsyncMock()
+        await music_player.update_activity(mock_song)
+        music_player.bot.change_presence.assert_awaited_once()
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert isinstance(activity, discord.Activity)
+        assert activity.type == discord.ActivityType.listening
+        # name encodes uploader as suffix since bot activities only render name
+        assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
+        assert activity.state == mock_song.duration
+        assert activity.state_url == mock_song.webpage_url
+        assert "start" in activity.timestamps
+        now_ms = int(time.time() * 1000)
+        assert activity.timestamps["start"] <= now_ms
+        assert activity.timestamps["start"] >= now_ms - 2000
+        assert "end" in activity.timestamps
+        assert (
+            abs(
+                activity.timestamps["end"]
+                - (activity.timestamps["start"] + mock_song.duration_secs * 1000)
+            )
+            < 1000
+        )
+
+    async def test_omits_end_timestamp_when_duration_unknown(
+        self, music_player, mock_song
+    ):
+        music_player.bot.change_presence = AsyncMock()
+        mock_song.duration_secs = 0
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert "start" in activity.timestamps
+        assert "end" not in activity.timestamps
+
+    async def test_truncates_name_to_128_chars(self, music_player, mock_song):
+        music_player.bot.change_presence = AsyncMock()
+        mock_song.title = "A" * 125
+        mock_song.uploader = "B"
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert len(activity.name) == 128
+        assert activity.name.endswith("…")
+
+    async def test_resets_to_game_activity_when_idle(self, music_player):
+        music_player.bot.change_presence = AsyncMock()
+        music_player.bot.voice_clients = []
+        await music_player.update_activity(None)
+        music_player.bot.change_presence.assert_awaited_once()
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert isinstance(activity, discord.Game)
+        assert activity.name == "music"
+
+    async def test_skips_reset_when_another_guild_is_playing(self, music_player):
+        music_player.bot.change_presence = AsyncMock()
+        active_vc = MagicMock(spec=discord.VoiceClient)
+        active_vc.is_playing.return_value = True
+        music_player.bot.voice_clients = [active_vc]
+        await music_player.update_activity(None)
+        music_player.bot.change_presence.assert_not_awaited()
+
+    async def test_resets_when_voice_clients_present_but_not_playing(
+        self, music_player
+    ):
+        music_player.bot.change_presence = AsyncMock()
+        idle_vc = MagicMock(spec=discord.VoiceClient)
+        idle_vc.is_playing.return_value = False
+        music_player.bot.voice_clients = [idle_vc]
+        await music_player.update_activity(None)
+        music_player.bot.change_presence.assert_awaited_once()
+
+    async def test_falls_back_to_a_song_when_title_is_none(
+        self, music_player, mock_song
+    ):
+        music_player.bot.change_presence = AsyncMock()
+        mock_song.title = None
+        mock_song.uploader = None
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert activity.name == "a song"
+
+    async def test_swallows_change_presence_exception(self, music_player, mock_song):
+        music_player.bot.change_presence = AsyncMock(
+            side_effect=Exception("rate limited")
+        )
+        # Must not raise — playback loop must not be interrupted by a presence failure
+        await music_player.update_activity(mock_song)
 
 
 class TestMusicPlayerInitialState:
@@ -852,6 +947,7 @@ class TestLoop:
             patch.object(
                 MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
             ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
         ):
             await music_player.loop()
 
@@ -887,3 +983,39 @@ class TestLoop:
             await music_player.loop()
 
         music_player._channel.send.assert_awaited()
+
+    async def test_update_activity_called_at_song_start_and_end(
+        self, music_player, queue_obj, mock_song
+    ):
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        activity_mock = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", activity_mock),
+        ):
+            await music_player.loop()
+
+        assert activity_mock.await_count == 2
+        assert activity_mock.call_args_list[0].args[0] is mock_song
+        assert activity_mock.call_args_list[1].args[0] is None
