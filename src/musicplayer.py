@@ -603,6 +603,7 @@ class MusicPlayer:
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
+                    assert self.current_song is not None
                     vc.play(
                         self.current_song,
                         after=lambda _: self.bot.loop.call_soon_threadsafe(
