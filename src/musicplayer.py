@@ -69,6 +69,8 @@ class MusicPlayer:
         "_prefetch_task",
         "_store",
         "_restore_task",
+        "_queue_cleared",
+        "_background_tasks",
     )
 
     bot: commands.Bot
@@ -88,6 +90,8 @@ class MusicPlayer:
     _prefetch_task: Optional[asyncio.Task]
     _store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
+    _queue_cleared: bool
+    _background_tasks: set
 
     def __init__(
         self,
@@ -120,6 +124,8 @@ class MusicPlayer:
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
+        self._queue_cleared: bool = False
+        self._background_tasks: set = set()
 
     @classmethod
     def from_context(
@@ -251,7 +257,6 @@ class MusicPlayer:
             items = [obj]
         for item in items:
             await self.queue.put(item)
-
             if isinstance(item, QueueObject):
                 self.song_queue.append(_queue_display_str(item.title, item.webpage_url))
             else:
@@ -259,17 +264,29 @@ class MusicPlayer:
                     _queue_display_str(item.ytsearch or item.url or "?", "")
                 )
 
-            # Mirror to Redis and (optionally) kick off stream pre-fetch.
-            # prefetch=False for bulk playlist enqueues — spawning N concurrent
-            # prefetch tasks saturates the thread pool and produces stream URLs that
-            # expire before the song reaches playback position. _prefetch_next_song
-            # handles one-ahead prefetch naturally as songs play.
-            if isinstance(item, QueueObject) and self._store is not None:
-                await self._store.push_queue(_serialize_queue_item(item))
-                if prefetch:
-                    asyncio.create_task(
-                        YTDL.prefetch_stream(item, redis=self._store.redis)
-                    )
+        # Mirror to Redis and (optionally) kick off stream pre-fetch.
+        # prefetch=False for bulk playlist enqueues — spawning N concurrent
+        # prefetch tasks saturates the thread pool and produces stream URLs that
+        # expire before the song reaches playback position. _prefetch_next_song
+        # handles one-ahead prefetch naturally as songs play.
+        if self._store is not None:
+            if prefetch:
+                for item in items:
+                    if isinstance(item, QueueObject):
+                        await self._store.push_queue(_serialize_queue_item(item))
+                        task = asyncio.create_task(
+                            YTDL.prefetch_stream(item, redis=self._store.redis)
+                        )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
+            else:
+                serialized = [
+                    _serialize_queue_item(item)
+                    for item in items
+                    if isinstance(item, QueueObject)
+                ]
+                if serialized:
+                    await self._store.push_queue_batch(serialized)
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
@@ -291,6 +308,7 @@ class MusicPlayer:
     async def queue_clear(self) -> List[str]:
         await self._cancel_prefetch()
         async with self.mutex:
+            self._queue_cleared = True
             for _ in range(self.queue.qsize()):
                 try:
                     self.queue.get_nowait()
@@ -299,8 +317,8 @@ class MusicPlayer:
                     break
             cleared = list(self.song_queue)
             self.song_queue.clear()
-        if self._store is not None:
-            await self._store.delete_queue()
+            if self._store is not None:
+                await self._store.delete_queue()
         return cleared
 
     async def queue_shuffle(self) -> str:
@@ -490,13 +508,16 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
+                    queue_was_cleared = self._queue_cleared
+                    self._queue_cleared = False
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
-                    if prefetched_song is not None and not self.song_queue:
+                    if prefetched_song is not None and queue_was_cleared:
                         # The queue was cleared while _prefetch_next_song was running.
                         # The prefetch task completed and consumed a get_nowait() — balance
                         # it with task_done() and discard the result so the song isn't played.
                         self.queue.task_done()
+                        prefetched_song.cleanup()
                         prefetched_song = None
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
@@ -536,7 +557,10 @@ class MusicPlayer:
                         # song_queue was cleared while this song was being resolved
                         # (e.g. during the async yt_stream call). Discard without
                         # playing; task_done() balances the queue.get() above.
+                        # cleanup() terminates the FFmpeg subprocess that yt_stream
+                        # already spawned — omitting it would leak the process.
                         self.queue.task_done()
+                        self.current_song.cleanup()
                         self.current_song = None
                         continue
                     if self._store is not None:

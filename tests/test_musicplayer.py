@@ -159,6 +159,19 @@ class TestQueuePut:
             await asyncio.sleep(0)
         mock_pf.assert_not_awaited()
 
+    async def test_put_with_prefetch_false_skips_prefetch_task(
+        self, music_player, queue_obj
+    ):
+        """queue_put(prefetch=False) never spawns a background prefetch_stream task."""
+        from unittest.mock import patch, AsyncMock
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put(queue_obj, prefetch=False)
+            await asyncio.sleep(0)
+        mock_pf.assert_not_awaited()
+
 
 class TestQueueClear:
     @pytest.fixture(autouse=True)
@@ -192,6 +205,24 @@ class TestQueueClear:
         await music_player.queue_clear()
         items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert items == []
+
+    async def test_clear_returns_list_of_cleared_display_strings(
+        self, music_player, mock_author
+    ):
+        """queue_clear() returns the song_queue display strings for the cleared songs."""
+        qobjs = [
+            QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            for i in range(3)
+        ]
+        for q in qobjs:
+            await music_player.queue_put(q)
+        cleared = await music_player.queue_clear()
+        assert len(cleared) == 3
+        assert all("Song" in s for s in cleared)
+
+    async def test_clear_returns_empty_list_when_queue_was_empty(self, music_player):
+        cleared = await music_player.queue_clear()
+        assert cleared == []
 
 
 class TestQueueShuffle:
@@ -1019,3 +1050,41 @@ class TestLoop:
         assert activity_mock.await_count == 2
         assert activity_mock.call_args_list[0].args[0] is mock_song
         assert activity_mock.call_args_list[1].args[0] is None
+
+    async def test_discards_song_and_calls_cleanup_when_song_queue_cleared_mid_stream(
+        self, music_player, queue_obj, mock_song
+    ):
+        """If song_queue is cleared while _stream_source runs, the YTDL object is
+        discarded without playing and its FFmpeg subprocess is terminated via cleanup().
+        """
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+
+        mock_song.cleanup = MagicMock()
+
+        async def _stream_and_clear(_self, source):
+            # Simulate queue_clear() racing with stream resolution
+            music_player.song_queue.clear()
+            return mock_song
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(MusicPlayer, "_stream_source", new=_stream_and_clear),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        vc.play.assert_not_called()
+        mock_song.cleanup.assert_called_once()

@@ -392,6 +392,8 @@ class YTDL(discord.FFmpegOpusAudio):
                 if not video_id:
                     continue
                 title = entry.get("title") or video_id
-                url = entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
-                qobjs.append(QueueObject(url, title, requester))
+                video_url = (
+                    entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+                )
+                qobjs.append(QueueObject(video_url, title, requester))
             return qobjs

@@ -203,7 +203,7 @@ class MusicBot(commands.Cog):
     ) -> Union[QueueObject, List[str], List[QueueObject]]:
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             return await self.spotify.playlist(source.id)
-        if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
+        elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             assert source.list_id is not None
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
@@ -245,15 +245,23 @@ class MusicBot(commands.Cog):
         )
 
     async def _enqueue_yt_playlist(
-        self, ctx: commands.Context, qobjs: List[QueueObject], mp: MusicPlayer
+        self,
+        ctx: commands.Context,
+        qobjs: List[QueueObject],
+        mp: MusicPlayer,
+        playlist_url: str,
     ) -> None:
-        log.info(f"yt playlist track count: {len(qobjs)}")
+        count = len(qobjs)
+        log.info(f"yt playlist track count: {count}")
         description = queue_message([q.title for q in qobjs])
         await asyncio.gather(
             ctx.send(
                 embed=discord.Embed(
-                    title="Queued playlist",
-                    description=f"Requested by: [{ctx.author.mention}]\n\n{description}",
+                    title=f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                    description=(
+                        f"Requested by: [{ctx.author.mention}]\n"
+                        f"{playlist_url}\n\n{description}"
+                    ),
                     color=discord.Color.blue(),
                 )
             ),
@@ -321,7 +329,11 @@ class MusicBot(commands.Cog):
                     and isinstance(source, YTSource)
                     and source.type == YTType.PLAYLIST
                 ):
-                    await self._enqueue_yt_playlist(ctx, qobj, mp)  # type: ignore[arg-type]
+                    playlist_url = (
+                        source.url
+                        or f"https://www.youtube.com/playlist?list={source.list_id}"
+                    )
+                    await self._enqueue_yt_playlist(ctx, qobj, mp, playlist_url)  # type: ignore[arg-type]
                 else:
                     assert isinstance(qobj, QueueObject)
                     await self._enqueue_single(ctx, qobj, mp)

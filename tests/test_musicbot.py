@@ -171,6 +171,57 @@ class TestQueueSource:
         mock_playlist.assert_awaited_once_with(full_url, mock_ctx.author)
 
 
+class TestEnqueueYtPlaylist:
+
+    async def test_sends_embed_with_song_count_and_playlist_url(
+        self, music_bot, mock_ctx
+    ):
+        qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
+            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+        ]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+        playlist_url = "https://www.youtube.com/playlist?list=PLtest"
+
+        await music_bot._enqueue_yt_playlist(mock_ctx, qobjs, mp, playlist_url)
+
+        call_kwargs = mock_ctx.send.call_args[1]
+        embed = call_kwargs["embed"]
+        assert "2 songs" in embed.title
+        assert playlist_url in embed.description
+        assert "Track 1" in embed.description
+
+    async def test_singular_song_count_in_title(self, music_bot, mock_ctx):
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Only Track", mock_ctx.author)]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_yt_playlist(
+            mock_ctx, qobjs, mp, "https://www.youtube.com/playlist?list=PLtest"
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "1 song" in embed.title
+        assert "1 songs" not in embed.title
+
+    async def test_calls_queue_put_with_prefetch_false(self, music_bot, mock_ctx):
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_yt_playlist(
+            mock_ctx, qobjs, mp, "https://www.youtube.com/playlist?list=PLtest"
+        )
+
+        mp.queue_put.assert_awaited_once()
+        _, call_kwargs = mp.queue_put.call_args
+        assert call_kwargs.get("prefetch") is False
+
+
 @pytest.fixture
 async def fake_redis_bot():
     server = fakeredis.FakeServer()
