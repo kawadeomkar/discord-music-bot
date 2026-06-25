@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import random
+from itertools import islice
 from typing import Any, Coroutine, List, Optional, Union
 
 import discord
@@ -204,7 +205,8 @@ class MusicBot(commands.Cog):
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             return await self.spotify.playlist(source.id)
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-            assert source.list_id is not None
+            if source.list_id is None:
+                raise ValueError("YTSource with type=PLAYLIST must have list_id set")
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
             )
@@ -253,7 +255,7 @@ class MusicBot(commands.Cog):
     ) -> None:
         count = len(qobjs)
         log.info(f"yt playlist track count: {count}")
-        description = queue_message([q.title for q in qobjs])
+        description = queue_message([q.title for q in islice(qobjs, 10)])
         await asyncio.gather(
             ctx.send(
                 embed=discord.Embed(
@@ -273,9 +275,9 @@ class MusicBot(commands.Cog):
     async def _enqueue_single(
         self, ctx: commands.Context, qobj: QueueObject, mp: MusicPlayer
     ) -> None:
-        vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+        vc = ctx.voice_client
         should_show_queued = mp.queue.qsize() > 0 or (
-            vc is not None and isinstance(vc, discord.VoiceClient) and vc.is_playing()
+            isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
         coros: list[Coroutine[Any, Any, Any]] = [
             mp.queue_put(qobj),
@@ -303,20 +305,18 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-
         async with ctx.typing():
             try:
                 source = parse_input(url, ctx.message.content)
 
-                if not voice_client:
+                if not ctx.voice_client:
                     await ctx.invoke(self.join)
 
                 qobj: Union[QueueObject, List[str], List[QueueObject]] = (
                     await self.queue_source(ctx, source)
                 )
                 mp = self.get_mp(ctx)
-                log.info(f"Voice client: {voice_client}")
+                log.info(f"Voice client: {ctx.voice_client}")
 
                 if (
                     isinstance(qobj, list)
@@ -353,13 +353,9 @@ class MusicBot(commands.Cog):
     @commands.command(name="skip", aliases=["sk"], help="skips current song")
     @commands.before_invoke(validate_commands)
     async def skip(self, ctx: commands.Context):
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if (
-            voice_client is not None
-            and isinstance(voice_client, discord.VoiceClient)
-            and voice_client.is_playing()
-        ):
-            voice_client.stop()
+        vc = ctx.voice_client
+        if isinstance(vc, discord.VoiceClient) and vc.is_playing():
+            vc.stop()
             if not ctx.invoked_parents:
                 await ctx.message.add_reaction("⏭")
 
@@ -367,36 +363,28 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     async def stop(self, ctx: commands.Context):
         await ctx.invoke(self.skip)
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-        if voice_client and ctx.guild is not None:
+        if ctx.voice_client and ctx.guild is not None:
             await ctx.message.add_reaction("👋")
             await self.cleanup(ctx.guild)
 
     @commands.command(name="pause", aliases=["po"], help="pause the current song")
     @commands.before_invoke(validate_commands)
     async def pause(self, ctx: commands.Context):
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-
-        if (
-            voice_client is not None
-            and isinstance(voice_client, discord.VoiceClient)
-            and voice_client.is_playing()
-        ):
-            voice_client.pause()
+        vc = ctx.voice_client
+        if isinstance(vc, discord.VoiceClient) and vc.is_playing():
+            vc.pause()
             await ctx.message.add_reaction("⏸️")
 
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
     @commands.before_invoke(validate_commands)
     async def resume(self, ctx: commands.Context):
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-
+        vc = ctx.voice_client
         if (
-            voice_client is not None
-            and isinstance(voice_client, discord.VoiceClient)
-            and not voice_client.is_playing()
-            and voice_client.is_paused()
+            isinstance(vc, discord.VoiceClient)
+            and not vc.is_playing()
+            and vc.is_paused()
         ):
-            voice_client.resume()
+            vc.resume()
             await ctx.message.add_reaction("⏭️")
 
     @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
@@ -416,16 +404,11 @@ class MusicBot(commands.Cog):
         assert ctx.guild is not None
         channel = ctx.author.voice.channel
         assert channel is not None
-        voice_client = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
 
-        if not voice_client:
+        if not ctx.voice_client:
             await channel.connect(timeout=10.0)
         vc = ctx.voice_client
-        if (
-            vc is not None
-            and isinstance(vc, discord.VoiceClient)
-            and vc.channel != channel
-        ):
+        if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
             await vc.move_to(channel)
         await ctx.guild.change_voice_state(
             channel=channel, self_mute=False, self_deaf=True

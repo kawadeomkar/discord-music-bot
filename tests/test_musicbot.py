@@ -153,6 +153,19 @@ class TestQueueSource:
         )
         assert result == fake_qobjs
 
+    async def test_youtube_playlist_raises_if_list_id_missing(
+        self, music_bot, mock_ctx
+    ):
+        """queue_source raises ValueError (not AssertionError) when list_id is None."""
+        source = YTSource(
+            url="https://www.youtube.com/watch?v=abc",
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id=None,
+        )
+        with pytest.raises(ValueError, match="list_id"):
+            await music_bot.queue_source(mock_ctx, source)
+
     async def test_youtube_playlist_preserves_full_url(self, music_bot, mock_ctx):
         full_url = "https://www.youtube.com/watch?v=XfHbPIx42uo&list=RDXfHbPIx42uo&start_radio=1"
         source = YTSource(
@@ -263,8 +276,8 @@ class TestJoinChannelPersistence:
         music_bot_with_redis.mps[mock_guild.id] = mp
 
         # join is a @commands.command — call the underlying callback directly.
+        mock_ctx.voice_client = None  # bot not yet in channel
         with (
-            patch("discord.utils.get", return_value=None),
             patch.object(discord.VoiceChannel, "connect", new=AsyncMock()),
             patch.object(mock_ctx, "invoke", new=AsyncMock()),
         ):
@@ -503,17 +516,17 @@ class TestSkipCommand:
         vc.is_playing = MagicMock(return_value=True)
         vc.stop = MagicMock()
         mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.skip.callback(music_bot, mock_ctx)
+        await MusicBot.skip.callback(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.stop = MagicMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.skip.callback(music_bot, mock_ctx)
+        mock_ctx.voice_client = vc
+        await MusicBot.skip.callback(music_bot, mock_ctx)
         vc.stop.assert_not_called()
 
 
@@ -522,17 +535,17 @@ class TestPauseCommand:
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
         vc.pause = MagicMock()
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.pause.callback(music_bot, mock_ctx)
+        await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.pause = MagicMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.pause.callback(music_bot, mock_ctx)
+        mock_ctx.voice_client = vc
+        await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_not_called()
 
 
@@ -542,9 +555,9 @@ class TestResumeCommand:
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
         vc.resume = MagicMock()
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.resume.callback(music_bot, mock_ctx)
+        await MusicBot.resume.callback(music_bot, mock_ctx)
         vc.resume.assert_called_once()
 
 

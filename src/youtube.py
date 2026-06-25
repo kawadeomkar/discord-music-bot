@@ -361,9 +361,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
             return QueueObject(webpage_url, title, requester, ts=ts)
 
-    @classmethod
+    @staticmethod
     async def yt_playlist(
-        cls,
         url: str,
         requester: Union[discord.User, discord.Member],
     ) -> List[QueueObject]:

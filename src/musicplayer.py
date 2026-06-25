@@ -269,24 +269,23 @@ class MusicPlayer:
         # prefetch tasks saturates the thread pool and produces stream URLs that
         # expire before the song reaches playback position. _prefetch_next_song
         # handles one-ahead prefetch naturally as songs play.
-        if self._store is not None:
-            if prefetch:
-                for item in items:
-                    if isinstance(item, QueueObject):
-                        await self._store.push_queue(_serialize_queue_item(item))
-                        task = asyncio.create_task(
-                            YTDL.prefetch_stream(item, redis=self._store.redis)
-                        )
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
-            else:
-                serialized = [
-                    _serialize_queue_item(item)
-                    for item in items
-                    if isinstance(item, QueueObject)
-                ]
-                if serialized:
-                    await self._store.push_queue_batch(serialized)
+        if self._store is None:
+            return
+        queue_objects = [i for i in items if isinstance(i, QueueObject)]
+        if not queue_objects:
+            return
+        if prefetch:
+            for item in queue_objects:
+                await self._store.push_queue(_serialize_queue_item(item))
+                task = asyncio.create_task(
+                    YTDL.prefetch_stream(item, redis=self._store.redis)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+        else:
+            await self._store.push_queue_batch(
+                [_serialize_queue_item(item) for item in queue_objects]
+            )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
@@ -515,7 +514,8 @@ class MusicPlayer:
                     if prefetched_song is not None and queue_was_cleared:
                         # The queue was cleared while _prefetch_next_song was running.
                         # The prefetch task completed and consumed a get_nowait() — balance
-                        # it with task_done() and discard the result so the song isn't played.
+                        # it with task_done() and release the FFmpeg subprocess via cleanup()
+                        # so it doesn't leak when we discard the result.
                         self.queue.task_done()
                         prefetched_song.cleanup()
                         prefetched_song = None
@@ -551,20 +551,21 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    try:
-                        self.song_queue.popleft()
-                    except IndexError:
-                        # song_queue was cleared while this song was being resolved
-                        # (e.g. during the async yt_stream call). Discard without
-                        # playing; task_done() balances the queue.get() above.
-                        # cleanup() terminates the FFmpeg subprocess that yt_stream
-                        # already spawned — omitting it would leak the process.
-                        self.queue.task_done()
-                        self.current_song.cleanup()
-                        self.current_song = None
-                        continue
-                    if self._store is not None:
-                        await self._store.pop_queue()
+                    async with self.mutex:
+                        try:
+                            self.song_queue.popleft()
+                        except IndexError:
+                            # song_queue was cleared while this song was being resolved
+                            # (e.g. during the async yt_stream call). Discard without
+                            # playing; task_done() balances the queue.get() above.
+                            # cleanup() terminates the FFmpeg subprocess that yt_stream
+                            # already spawned — omitting it would leak the process.
+                            self.queue.task_done()
+                            self.current_song.cleanup()
+                            self.current_song = None
+                            continue
+                        if self._store is not None:
+                            await self._store.pop_queue()
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)

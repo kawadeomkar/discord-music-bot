@@ -1051,6 +1051,70 @@ class TestLoop:
         assert activity_mock.call_args_list[0].args[0] is mock_song
         assert activity_mock.call_args_list[1].args[0] is None
 
+    async def test_prefetched_song_cleaned_up_when_queue_was_cleared(
+        self, music_player, queue_obj, mock_song
+    ):
+        """When _queue_cleared is set while a prefetch is in-flight, the loop
+        discards the prefetched song and calls cleanup() so the FFmpeg subprocess
+        is not leaked.
+
+        Flow:
+          Iteration 1 — song 1 plays normally; prefetch dequeues song 2, sets
+          _queue_cleared = True, and returns a YTDL mock.
+          Iteration 2 — guard fires: task_done() + cleanup() + discard; then
+          queue_get() raises TimeoutError so the loop exits cleanly.
+        """
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        queue_obj2 = QueueObject(
+            "https://yt.com/watch?v=2", "Song 2", queue_obj.requester
+        )
+        await music_player.queue.put(queue_obj)
+        await music_player.queue.put(queue_obj2)
+        music_player.song_queue.append("Song 1 - url")
+        music_player.song_queue.append("Song 2 - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        prefetched = MagicMock()
+        prefetched.cleanup = MagicMock()
+
+        async def _prefetch_with_clear(_self):
+            try:
+                music_player.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            music_player._queue_cleared = True
+            return prefetched
+
+        async def _stop_noop(_self):
+            pass
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "_prefetch_next_song", new=_prefetch_with_clear),
+            patch.object(
+                MusicPlayer,
+                "queue_get",
+                new=AsyncMock(side_effect=[queue_obj, asyncio.TimeoutError()]),
+            ),
+            patch.object(MusicPlayer, "stop", new=_stop_noop),
+        ):
+            await music_player.loop()
+
+        prefetched.cleanup.assert_called_once()
+
     async def test_discards_song_and_calls_cleanup_when_song_queue_cleared_mid_stream(
         self, music_player, queue_obj, mock_song
     ):
