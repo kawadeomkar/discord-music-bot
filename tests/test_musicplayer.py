@@ -53,6 +53,7 @@ def queue_obj(mock_author):
 def _stub_queue_put_tasks(monkeypatch):
     """Prevent prefetch_stream tasks in queue_put from doing real yt-dlp work."""
     from src import youtube
+
     monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
 
@@ -307,10 +308,13 @@ class TestUpdateActivity:
         assert activity.timestamps["start"] <= now_ms
         assert activity.timestamps["start"] >= now_ms - 2000
         assert "end" in activity.timestamps
-        assert abs(
-            activity.timestamps["end"]
-            - (activity.timestamps["start"] + mock_song.duration_secs * 1000)
-        ) < 1000
+        assert (
+            abs(
+                activity.timestamps["end"]
+                - (activity.timestamps["start"] + mock_song.duration_secs * 1000)
+            )
+            < 1000
+        )
 
     async def test_omits_end_timestamp_when_duration_unknown(
         self, music_player, mock_song

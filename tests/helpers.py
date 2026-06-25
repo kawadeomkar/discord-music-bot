@@ -35,6 +35,7 @@ def stub_create_task(return_value=None):
     This stub closes each coroutine immediately and returns a configurable mock
     Task so callers' return-value assertions still pass.
     """
+
     def _impl(coro):
         coro.close()
         return return_value if return_value is not None else MagicMock()
