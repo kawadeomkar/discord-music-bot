@@ -228,49 +228,49 @@ class MusicBot(commands.Cog):
             )
 
     async def _enqueue_playlist(
-        self, ctx: commands.Context, qobj: List[str], mp: MusicPlayer
-    ) -> None:
-        qobjs = spotify_playlist_to_ytsearch(qobj)
-        log.info(f"ytsearch qobjs: {qobjs}")
-        description = queue_message(qobj)
-        await asyncio.gather(
-            ctx.send(
-                embed=discord.Embed(
-                    title="Queued playlist",
-                    description=f"Requested by: [{ctx.author.mention}]\n\n{description}",
-                    color=discord.Color.blue(),
-                )
-            ),
-            mp.queue_put(qobjs, prefetch=False),
-            ctx.message.add_reaction("👍"),
-            send_queue_phrases(ctx),
-        )
-
-    async def _enqueue_yt_playlist(
         self,
         ctx: commands.Context,
-        qobjs: List[QueueObject],
+        source: Union[SpotifySource, YTSource, SoundcloudSource],
+        qobj: Union[List[str], List[QueueObject]],
         mp: MusicPlayer,
-        playlist_url: str,
     ) -> None:
-        count = len(qobjs)
-        log.info(f"yt playlist track count: {count}")
-        description = queue_message([q.title for q in islice(qobjs, 10)])
-        await asyncio.gather(
-            ctx.send(
-                embed=discord.Embed(
-                    title=f"Queued playlist — {count} song{'s' if count != 1 else ''}",
-                    description=(
-                        f"Requested by: [{ctx.author.mention}]\n"
-                        f"{playlist_url}\n\n{description}"
-                    ),
-                    color=discord.Color.blue(),
-                )
-            ),
-            mp.queue_put(qobjs, prefetch=False),  # type: ignore[arg-type]
-            ctx.message.add_reaction("👍"),
-            send_queue_phrases(ctx),
-        )
+        if isinstance(source, SpotifySource):
+            titles: List[str] = qobj  # type: ignore[assignment]
+            qobjs_yt = spotify_playlist_to_ytsearch(titles)
+            log.info(f"ytsearch qobjs: {qobjs_yt}")
+            embed = discord.Embed(
+                title="Queued playlist",
+                description=f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                color=discord.Color.blue(),
+            )
+            await asyncio.gather(
+                ctx.send(embed=embed),
+                mp.queue_put(qobjs_yt, prefetch=False),
+                ctx.message.add_reaction("👍"),
+                send_queue_phrases(ctx),
+            )
+        else:
+            assert isinstance(source, YTSource)
+            playlist_url = (
+                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
+            )
+            tracks: List[QueueObject] = qobj  # type: ignore[assignment]
+            count = len(tracks)
+            log.info(f"yt playlist track count: {count}")
+            embed = discord.Embed(
+                title=f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                description=(
+                    f"Requested by: [{ctx.author.mention}]\n"
+                    f"{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}"
+                ),
+                color=discord.Color.blue(),
+            )
+            await asyncio.gather(
+                ctx.send(embed=embed),
+                mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
+                ctx.message.add_reaction("👍"),
+                send_queue_phrases(ctx),
+            )
 
     async def _enqueue_single(
         self, ctx: commands.Context, qobj: QueueObject, mp: MusicPlayer
@@ -301,7 +301,7 @@ class MusicBot(commands.Cog):
         log.info(f"play qsize: {mp.queue.qsize()}")
 
     @commands.command(
-        name="play", aliases=["p", "pl", "pla", "sing"], help="play a youtube song"
+        name="play", aliases=["p", "sing"], help="play a youtube song"
     )
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
@@ -324,12 +324,14 @@ class MusicBot(commands.Cog):
                             join_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError, Exception):
                                 await join_task
-                        # Disconnect any voice connection that join established
-                        # (covers both: join in-flight but partially connected, and
-                        # join completed before queue_source failed — ghost connection).
-                        if ctx.guild and ctx.guild.voice_client:
+                        # Full cleanup (not just disconnect) — cog_before_invoke already
+                        # created a MusicPlayer and started its loop() task. Without
+                        # cleanup() that task runs as a zombie for up to 300s waiting on
+                        # queue.get(), and store.clear_connection() is never called,
+                        # which would trigger spurious crash recovery on restart.
+                        if ctx.guild is not None:
                             with contextlib.suppress(Exception):
-                                await ctx.guild.voice_client.disconnect(force=True)
+                                await self.cleanup(ctx.guild)
                         raise
                 else:
                     qobj = await self.queue_source(ctx, source)
@@ -337,22 +339,8 @@ class MusicBot(commands.Cog):
                 mp = self.get_mp(ctx)
                 log.info(f"Voice client: {ctx.voice_client}")
 
-                if (
-                    isinstance(qobj, list)
-                    and isinstance(source, SpotifySource)
-                    and source.type == SpotifyType.PLAYLIST
-                ):
-                    await self._enqueue_playlist(ctx, qobj, mp)  # type: ignore[arg-type]
-                elif (
-                    isinstance(qobj, list)
-                    and isinstance(source, YTSource)
-                    and source.type == YTType.PLAYLIST
-                ):
-                    playlist_url = (
-                        source.url
-                        or f"https://www.youtube.com/playlist?list={source.list_id}"
-                    )
-                    await self._enqueue_yt_playlist(ctx, qobj, mp, playlist_url)  # type: ignore[arg-type]
+                if isinstance(qobj, list):
+                    await self._enqueue_playlist(ctx, source, qobj, mp)
                 else:
                     assert isinstance(qobj, QueueObject)
                     await self._enqueue_single(ctx, qobj, mp)
