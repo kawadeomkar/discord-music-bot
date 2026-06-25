@@ -19,6 +19,21 @@ from src.youtube import QueueObject
 from tests.helpers import stub_create_task
 
 
+@pytest.fixture(autouse=True)
+def _stub_prefetch(monkeypatch):
+    """Stub YTDL.prefetch_stream for every test in this module.
+
+    queue_put() spawns asyncio.create_task(YTDL.prefetch_stream(...)) for every
+    QueueObject. Without this stub, any test that calls queue_put with a yt.com
+    test URL would trigger a real yt-dlp network request in a background task.
+    Tests that specifically assert on prefetch behaviour override this via their
+    own patch() context manager, which takes precedence.
+    """
+    from src import youtube
+
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
+
 @pytest.fixture
 def mock_song():
     """A mock YTDL-like song object with all metadata attributes."""
@@ -70,18 +85,6 @@ class TestQueueDisplayStr:
 
 
 class TestQueuePut:
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch):
-        """Silence background prefetch_stream tasks in tests that don't test them.
-
-        Tests that explicitly assert on prefetch behaviour patch the method
-        themselves via `with patch(...)`, which takes precedence over this stub.
-        """
-        from unittest.mock import AsyncMock
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
     async def test_put_single_queue_object(self, music_player, queue_obj):
         await music_player.queue_put(queue_obj)
         assert music_player.queue.qsize() == 1
@@ -724,12 +727,6 @@ class TestSendNowPlaying:
 
 
 class TestPrefetchNextSong:
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch_stream(self, monkeypatch):
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
     async def test_returns_none_when_queue_empty(self, music_player):
         result = await music_player._prefetch_next_song()
         assert result is None
