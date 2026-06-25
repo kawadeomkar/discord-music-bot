@@ -241,7 +241,7 @@ class MusicBot(commands.Cog):
                     color=discord.Color.blue(),
                 )
             ),
-            mp.queue_put(qobjs),
+            mp.queue_put(qobjs, prefetch=False),
             ctx.message.add_reaction("👍"),
             send_queue_phrases(ctx),
         )

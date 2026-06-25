@@ -25,20 +25,41 @@ def _queue_display_str(title: str, url: str) -> str:
     return f"{title} - {url}"
 
 
-def _serialize_queue_item(qobj: QueueObject) -> bytes:
+def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
+    if isinstance(item, QueueObject):
+        return orjson.dumps(
+            {
+                "type": "qobj",
+                "webpage_url": item.webpage_url,
+                "title": item.title,
+                "requester_id": item.requester.id,
+                "ts": item.ts,
+            }
+        )
     return orjson.dumps(
         {
-            "webpage_url": qobj.webpage_url,
-            "title": qobj.title,
-            "requester_id": qobj.requester.id,
-            "ts": qobj.ts,
+            "type": "ytsource",
+            "ytsearch": item.ytsearch,
+            "url": item.url,
+            "process": item.process,
+            "ts": item.ts,
         }
     )
 
 
-def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[QueueObject]:
+def _deserialize_queue_item(
+    data: bytes, guild: discord.Guild
+) -> Optional[Union[QueueObject, YTSource]]:
     try:
         d = orjson.loads(data)
+        if d.get("type") == "ytsource":
+            return YTSource(
+                ytsearch=d.get("ytsearch"),
+                url=d.get("url"),
+                process=d.get("process"),
+                ts=d.get("ts"),
+            )
+        # "qobj" type or legacy entries written before the type field was added
         member: Union[discord.Member, discord.User, None] = (
             guild.get_member(d["requester_id"]) or guild.owner
         )
@@ -209,10 +230,19 @@ class MusicPlayer:
                 items = await self._store.get_queue()
                 count = 0
                 for item in items:
-                    qobj = _deserialize_queue_item(item, self._guild)
-                    if qobj is not None:
-                        await self.queue.put(qobj)
-                        self.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
+                    restored = _deserialize_queue_item(item, self._guild)
+                    if restored is not None:
+                        await self.queue.put(restored)
+                        if isinstance(restored, QueueObject):
+                            self.song_queue.append(
+                                _queue_display_str(restored.title, restored.webpage_url)
+                            )
+                        else:
+                            self.song_queue.append(
+                                _queue_display_str(
+                                    restored.ytsearch or restored.url or "?", ""
+                                )
+                            )
                         count += 1
                 if count:
                     log.info(
@@ -271,20 +301,21 @@ class MusicPlayer:
         # handles one-ahead prefetch naturally as songs play.
         if self._store is None:
             return
-        queue_objects = [i for i in items if isinstance(i, QueueObject)]
-        if not queue_objects:
+        serializable = [i for i in items if isinstance(i, (QueueObject, YTSource))]
+        if not serializable:
             return
         if prefetch:
-            for item in queue_objects:
+            for item in serializable:
                 await self._store.push_queue(_serialize_queue_item(item))
-                task = asyncio.create_task(
-                    YTDL.prefetch_stream(item, redis=self._store.redis)
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+                if isinstance(item, QueueObject):
+                    task = asyncio.create_task(
+                        YTDL.prefetch_stream(item, redis=self._store.redis)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
         else:
             await self._store.push_queue_batch(
-                [_serialize_queue_item(item) for item in queue_objects]
+                [_serialize_queue_item(item) for item in serializable]
             )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
@@ -316,8 +347,8 @@ class MusicPlayer:
                     break
             cleared = list(self.song_queue)
             self.song_queue.clear()
-            if self._store is not None:
-                await self._store.delete_queue()
+        if self._store is not None:
+            await self._store.delete_queue()
         return cleared
 
     async def queue_shuffle(self) -> str:
@@ -551,6 +582,7 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
+                    discard = False
                     async with self.mutex:
                         try:
                             self.song_queue.popleft()
@@ -563,9 +595,11 @@ class MusicPlayer:
                             self.queue.task_done()
                             self.current_song.cleanup()
                             self.current_song = None
-                            continue
-                        if self._store is not None:
-                            await self._store.pop_queue()
+                            discard = True
+                    if discard:
+                        continue
+                    if self._store is not None:
+                        await self._store.pop_queue()
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)

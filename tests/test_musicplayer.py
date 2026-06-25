@@ -15,6 +15,7 @@ from src.musicplayer import (
     _queue_display_str,
     _serialize_queue_item,
 )
+from src.sources import YTSource
 from src.youtube import QueueObject
 from tests.helpers import stub_create_task
 
@@ -122,8 +123,33 @@ class TestQueuePut:
         items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
+        assert data["type"] == "qobj"
         assert data["title"] == queue_obj.title
         assert data["webpage_url"] == queue_obj.webpage_url
+
+    async def test_put_mirrors_yt_source_to_redis(self, music_player, fake_redis):
+        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True)
+        await music_player.queue_put(src)
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(items) == 1
+        data = orjson.loads(items[0])
+        assert data["type"] == "ytsource"
+        assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
+
+    async def test_put_yt_source_does_not_spawn_prefetch(
+        self, music_player, fake_redis, mock_author
+    ):
+        from unittest.mock import patch, AsyncMock
+
+        src = YTSource(ytsearch="ytsearch:test", process=True)
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put(src)
+            await asyncio.sleep(0)
+        mock_pf.assert_not_awaited()
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(items) == 1
 
     async def test_put_sets_ttl_on_redis_key(self, music_player, queue_obj, fake_redis):
         await music_player.queue_put(queue_obj)
@@ -841,10 +867,76 @@ class TestSerializeQueueItem:
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author, ts=30)
         data = _serialize_queue_item(qobj)
         d = orjson.loads(data)
+        assert d["type"] == "qobj"
         assert d["webpage_url"] == "https://yt.com/v=1"
         assert d["title"] == "Test Song"
         assert d["requester_id"] == mock_author.id
         assert d["ts"] == 30
+
+    def test_ytsource_round_trip(self):
+        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True, ts=10)
+        data = _serialize_queue_item(src)
+        d = orjson.loads(data)
+        assert d["type"] == "ytsource"
+        assert d["ytsearch"] == "ytsearch:Never Gonna Give You Up"
+        assert d["process"] is True
+        assert d["ts"] == 10
+        assert "requester_id" not in d
+
+    def test_ytsource_url_preserved(self):
+        src = YTSource(url="https://www.youtube.com/watch?v=abc", process=False)
+        data = _serialize_queue_item(src)
+        d = orjson.loads(data)
+        assert d["type"] == "ytsource"
+        assert d["url"] == "https://www.youtube.com/watch?v=abc"
+
+
+class TestDeserializeQueueItemYTSource:
+    def test_ytsource_deserialized_correctly(self, mock_guild):
+        data = orjson.dumps(
+            {
+                "type": "ytsource",
+                "ytsearch": "ytsearch:Bohemian Rhapsody Queen",
+                "url": None,
+                "process": True,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:Bohemian Rhapsody Queen"
+        assert result.process is True
+
+    def test_ytsource_with_url(self, mock_guild):
+        data = orjson.dumps(
+            {
+                "type": "ytsource",
+                "ytsearch": None,
+                "url": "https://www.youtube.com/watch?v=abc",
+                "process": False,
+                "ts": 15,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, YTSource)
+        assert result.url == "https://www.youtube.com/watch?v=abc"
+        assert result.ts == 15
+
+    def test_legacy_entry_without_type_field_deserializes_as_qobj(
+        self, mock_guild, mock_author
+    ):
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=legacy",
+                "title": "Legacy Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, QueueObject)
+        assert result.webpage_url == "https://yt.com/v=legacy"
 
 
 # ── _restore_state additional paths ──────────────────────────────────────────
