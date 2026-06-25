@@ -309,12 +309,31 @@ class MusicBot(commands.Cog):
             try:
                 source = parse_input(url, ctx.message.content)
 
+                qobj: Union[QueueObject, List[str], List[QueueObject]]
                 if not ctx.voice_client:
-                    await ctx.invoke(self.join)
+                    # Launch join concurrently with queue_source — both are pure I/O
+                    # (Discord WebSocket handshake vs yt-dlp extraction) with no data
+                    # dependency between them. await join_task after queue_source
+                    # guarantees the voice client is ready before queue_put fires.
+                    join_task = asyncio.create_task(ctx.invoke(self.join))
+                    try:
+                        qobj = await self.queue_source(ctx, source)
+                        await join_task
+                    except BaseException:
+                        if not join_task.done():
+                            join_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await join_task
+                        # Disconnect any voice connection that join established
+                        # (covers both: join in-flight but partially connected, and
+                        # join completed before queue_source failed — ghost connection).
+                        if ctx.guild and ctx.guild.voice_client:
+                            with contextlib.suppress(Exception):
+                                await ctx.guild.voice_client.disconnect(force=True)
+                        raise
+                else:
+                    qobj = await self.queue_source(ctx, source)
 
-                qobj: Union[QueueObject, List[str], List[QueueObject]] = (
-                    await self.queue_source(ctx, source)
-                )
                 mp = self.get_mp(ctx)
                 log.info(f"Voice client: {ctx.voice_client}")
 

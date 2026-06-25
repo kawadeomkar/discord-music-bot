@@ -613,6 +613,143 @@ class TestClearCommand:
         assert "Song A" in embed.description
 
 
+class TestPlayCommand:
+    """Tests for the play() cold-join parallelism (Change A).
+
+    asyncio.Future is used as the join_task stand-in: unlike AsyncMock,
+    a Future is directly awaitable via __await__, matching how the real
+    asyncio.Task behaves when the code does `await join_task`.
+    """
+
+    async def test_cold_join_creates_task_and_awaits_after_queue_source(
+        self, music_bot, mock_ctx
+    ):
+        """join is launched as a task; join_task is awaited after queue_source."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        # Resolved Future: done() is True, await returns immediately.
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task) as mock_create:
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        mock_create.assert_called_once()
+        music_bot.queue_source.assert_awaited_once()
+        music_bot._enqueue_single.assert_awaited_once()
+
+    async def test_warm_path_skips_join_task(self, music_bot, mock_ctx):
+        """When already in voice, no join task is created and queue_source runs directly."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        with patch("asyncio.create_task") as mock_create:
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        mock_create.assert_not_called()
+        music_bot.queue_source.assert_awaited_once()
+
+    async def test_cold_join_cancels_inflight_join_when_queue_source_fails(
+        self, music_bot, mock_ctx
+    ):
+        """queue_source fails while join is still running → join task is cancelled."""
+        mock_ctx.voice_client = None
+        mock_ctx.guild.voice_client = None
+
+        # Pending Future: done() is False; cancel() marks it cancelled so the
+        # subsequent `await join_task` in the guard raises CancelledError (suppressed).
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_called_once()
+        mock_ctx.send.assert_awaited()  # error embed shown
+
+    async def test_cold_join_disconnects_when_join_done_before_queue_source_fails(
+        self, music_bot, mock_ctx
+    ):
+        """join completes first, then queue_source fails → voice disconnected (no ghost connection)."""
+        mock_ctx.voice_client = None
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.disconnect = AsyncMock()
+        mock_ctx.guild.voice_client = vc  # join already established voice
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)  # done() is True
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_not_called()  # already done, nothing to cancel
+        vc.disconnect.assert_awaited_once_with(force=True)
+        mock_ctx.send.assert_awaited()
+
+    async def test_cold_join_cancels_and_disconnects_partial_connection(
+        self, music_bot, mock_ctx
+    ):
+        """join in-flight but voice partially established → cancel and disconnect."""
+        mock_ctx.voice_client = None
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.disconnect = AsyncMock()
+        mock_ctx.guild.voice_client = vc
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()  # pending, done() is False
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_called_once()
+        vc.disconnect.assert_awaited_once_with(force=True)
+        mock_ctx.send.assert_awaited()
+
+
 class TestNowCommand:
     async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
         vc = object.__new__(discord.VoiceClient)
