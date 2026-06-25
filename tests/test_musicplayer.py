@@ -897,6 +897,7 @@ class TestLoop:
         song = MagicMock()
         song.title = "Loop Test Song"
         song.webpage_url = "https://yt.com/v=loop1"
+        song.duration_secs = 210
         return song
 
     async def test_exits_immediately_when_bot_closed(self, music_player):
