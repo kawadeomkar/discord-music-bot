@@ -24,10 +24,10 @@ jobs:
       - name: Install dependencies
         run: |
           poetry config virtualenvs.in-project true
-          poetry install --with dev --no-root
+          poetry install --only=main,test,lint --no-root
 
       - name: Export requirements for pip-audit
-        run: poetry export --without-hashes -f requirements.txt -o requirements-audit.txt
+        run: poetry export --without-hashes --with=test,lint -f requirements.txt -o requirements-audit.txt
 
       - name: Run pip-audit
         uses: pypa/gh-action-pip-audit@v1.1.0
