@@ -384,11 +384,18 @@ class YTDL(discord.FFmpegOpusAudio):
             entries = data.get("entries") or []
             span.set_attribute("ytdl.playlist_size", len(entries))
             qobjs: List[QueueObject] = []
-            for entry in entries:
+            for i, entry in enumerate(entries):
                 if not entry:
+                    log.warning("Skipping null entry at playlist index %d for %s", i, url)
                     continue
                 video_id = entry.get("id")
                 if not video_id:
+                    log.warning(
+                        "Skipping entry at playlist index %d (title=%r) — missing video ID for %s",
+                        i,
+                        entry.get("title"),
+                        url,
+                    )
                     continue
                 title = entry.get("title") or video_id
                 video_url = (
