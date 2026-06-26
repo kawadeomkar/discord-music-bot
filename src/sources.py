@@ -14,9 +14,19 @@ class URLSource(Enum):
     SOUNDCLOUD = "soundcloud"
 
 
+class SpotifyType(Enum):
+    TRACK = "track"
+    PLAYLIST = "playlist"
+
+
+class YTType(Enum):
+    TRACK = "track"
+    PLAYLIST = "playlist"
+
+
 @dataclass(frozen=True)
 class SpotifySource:
-    type: str
+    type: SpotifyType
     id: str
     si: Optional[str] = None
     process: bool = True
@@ -29,6 +39,7 @@ class YTSource:
     :param url: YT URL
     :param ytsearch: youtube search
     :param ts: timestamp
+    :param list_id: YouTube playlist ID (present when type == YTType.PLAYLIST)
     """
 
     url: Optional[str] = None
@@ -36,6 +47,8 @@ class YTSource:
     ts: Optional[int] = None
     process: Optional[bool] = None
     stype: URLSource = URLSource.YOUTUBE
+    type: YTType = YTType.TRACK
+    list_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -79,16 +92,25 @@ def parse_url(
 
     if domain in ("youtube.com", "youtu.be"):
         ts: Optional[int] = None
+        list_id: Optional[str] = None
         for _, k, v in args_match:
             if k == "ts" or k == "t":
                 ts = int(v)
+            elif k == "list":
+                list_id = v
+        if list_id is not None:
+            return YTSource(
+                url, ts=ts, process=False, type=YTType.PLAYLIST, list_id=list_id
+            )
         return YTSource(url, ts=ts, process=False)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
-        if path[0] not in ("playlist", "track"):
+        try:
+            spotify_type = SpotifyType(path[0])
+        except ValueError:
             raise Exception(f"Unknown Spotify track type: {path}")
         log.info(f"Spotify source ID: {path[1]}")
-        return SpotifySource(path[0], path[1], process=True)
+        return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):
         return SoundcloudSource(url, process=True)
     else:

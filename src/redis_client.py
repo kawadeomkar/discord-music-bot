@@ -106,6 +106,20 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
 
+    async def push_queue_batch(self, items: list[bytes]) -> None:
+        """RPUSH all items in one pipeline round-trip and refresh TTL on all guild keys."""
+        if not items:
+            return
+        try:
+            pipe = self.redis.pipeline()
+            pipe.rpush(self.queue_key(), *items)
+            pipe.expire(self.queue_key(), GUILD_TTL)
+            pipe.expire(self.state_key(), GUILD_TTL)
+            pipe.expire(self.history_key(), GUILD_TTL)
+            await pipe.execute()  # type: ignore[misc]
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
+
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes the item immediately with no ack.
         # If the bot crashes after this call, the song is lost from Redis.

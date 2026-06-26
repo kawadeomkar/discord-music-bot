@@ -3,13 +3,14 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import discord
 import yt_dlp as youtube_dl
 
 import redis.asyncio as aioredis
+from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_get, cache_set
@@ -71,6 +72,15 @@ _YTDL_STREAM_OPTS = {
     "format": "bestaudio/best",
     "check_formats": False,
     "retries": 10,
+}
+
+# Used by yt_playlist: fetches entry metadata for all videos in a playlist without
+# individually extracting each video's stream URL. noplaylist=False overrides the
+# base option so yt-dlp processes the full playlist rather than just the first video.
+_YTDL_PLAYLIST_OPTS = {
+    **_YTDL_BASE_OPTS,
+    "noplaylist": False,
+    "extract_flat": True,
 }
 
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
@@ -163,6 +173,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.thumbnail = data.get("thumbnail")
         self.description = data.get("description")
         self.duration = str(datetime.timedelta(seconds=int(data.get("duration", "0"))))
+        self.duration_secs: int = int(data.get("duration") or 0)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")
@@ -177,6 +188,7 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.__getattribute__(item)
 
     @classmethod
+    @_tracer.start_as_current_span("ytdl.prefetch_stream")
     async def prefetch_stream(
         cls,
         qo: QueueObject,
@@ -189,41 +201,43 @@ class YTDL(discord.FFmpegOpusAudio):
         the URL is already cached. Errors are logged and swallowed — yt_stream()
         recovers by extracting fresh at play time.
         """
-        with _tracer.start_as_current_span(
-            "ytdl.prefetch_stream",
-            attributes={"ytdl.url": qo.webpage_url},
-        ) as span:
-            if redis is None:
-                span.set_attribute("ytdl.skipped", True)
-                return
-            cache_key = f"ytdl:stream:{qo.webpage_url}"
-            already_cached = await cache_get(redis, cache_key) is not None
-            span.set_attribute("ytdl.already_cached", already_cached)
-            if already_cached:
-                return
-            loop = asyncio.get_running_loop()
-            try:
-                data = await loop.run_in_executor(
-                    _YTDLP_POOL,
-                    _ytdlp_extract,
-                    qo.webpage_url,
-                    _YTDL_STREAM_OPTS,
-                    False,
-                    True,
-                )
-                span.set_attribute("ytdl.extract_success", data is not None)
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR)
-                log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
-                return
-            if data is not None:
-                stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
-                ttl = _stream_url_ttl(data.get("url", ""))
-                if ttl:
-                    await cache_set(redis, cache_key, stripped, ttl)
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        if redis is None:
+            trace.get_current_span().set_attribute("ytdl.skipped", True)
+            return
+        cache_key = f"ytdl:stream:{qo.webpage_url}"
+        already_cached = await cache_get(redis, cache_key) is not None
+        trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
+        if already_cached:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                _YTDLP_POOL,
+                _ytdlp_extract,
+                qo.webpage_url,
+                _YTDL_STREAM_OPTS,
+                False,
+                True,
+            )
+            trace.get_current_span().set_attribute(
+                "ytdl.extract_success", data is not None
+            )
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"prefetch_stream failed: {e}"
+            )
+            log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
+            return
+        if data is not None:
+            stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+            ttl = _stream_url_ttl(data.get("url", ""))
+            if ttl:
+                await cache_set(redis, cache_key, stripped, ttl)
 
     @classmethod
+    @_tracer.start_as_current_span("ytdl.yt_stream")
     async def yt_stream(
         cls,
         qo: QueueObject,
@@ -232,54 +246,52 @@ class YTDL(discord.FFmpegOpusAudio):
         volume: float = 1.0,
         redis: Optional[aioredis.Redis] = None,
     ):
-        with _tracer.start_as_current_span(
-            "ytdl.yt_stream",
-            attributes={"ytdl.url": qo.webpage_url},
-        ) as span:
-            loop = asyncio.get_running_loop()
+        trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
+        loop = asyncio.get_running_loop()
 
-            # ── Cache check ───────────────────────────────────────────────────────
-            cache_key = f"ytdl:stream:{qo.webpage_url}"
-            data = await cache_get(redis, cache_key)
-            span.set_attribute("ytdl.cache_hit", data is not None)
+        # ── Cache check ───────────────────────────────────────────────────────
+        cache_key = f"ytdl:stream:{qo.webpage_url}"
+        data = await cache_get(redis, cache_key)
+        trace.get_current_span().set_attribute("ytdl.cache_hit", data is not None)
 
-            # ── Extract (only if cache miss) ──────────────────────────────────────
-            if data is None:
-                data = await loop.run_in_executor(
-                    _YTDLP_POOL,
-                    _ytdlp_extract,
-                    qo.webpage_url,
-                    _YTDL_STREAM_OPTS,
-                    False,
-                    True,
-                )
-                span.set_attribute("ytdl.extracted_fresh", True)
-                if data is not None:
-                    stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
-                    ttl = _stream_url_ttl(data.get("url", ""))
-                    if ttl:
-                        await cache_set(redis, cache_key, stripped, ttl)
-
-            if data is None:
-                raise RuntimeError("Could not extract stream data")
-
-            ffmpeg_opts = cls.FFMPEG_OPTS.copy()
-            if qo.ts is not None:
-                ffmpeg_opts["options"] += f" -ss {qo.ts}"
-                await channel.send(f"Starting song at {qo.ts} seconds")
-            if volume != 1.0:
-                ffmpeg_opts["options"] += f" -filter:a volume={volume}"
-
-            return cls(
-                channel,
-                data["url"],
-                data=data,
-                requester=qo.requester,
-                before_options=ffmpeg_opts["before_options"],
-                options=ffmpeg_opts["options"],
+        # ── Extract (only if cache miss) ──────────────────────────────────────
+        if data is None:
+            data = await loop.run_in_executor(
+                _YTDLP_POOL,
+                _ytdlp_extract,
+                qo.webpage_url,
+                _YTDL_STREAM_OPTS,
+                False,
+                True,
             )
+            trace.get_current_span().set_attribute("ytdl.extracted_fresh", True)
+            if data is not None:
+                stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+                ttl = _stream_url_ttl(data.get("url", ""))
+                if ttl:
+                    await cache_set(redis, cache_key, stripped, ttl)
+
+        if data is None:
+            raise RuntimeError("Could not extract stream data")
+
+        ffmpeg_opts = cls.FFMPEG_OPTS.copy()
+        if qo.ts is not None:
+            ffmpeg_opts["options"] += f" -ss {qo.ts}"
+            await channel.send(f"Starting song at {qo.ts} seconds")
+        if volume != 1.0:
+            ffmpeg_opts["options"] += f" -filter:a volume={volume}"
+
+        return cls(
+            channel,
+            data["url"],
+            data=data,
+            requester=qo.requester,
+            before_options=ffmpeg_opts["before_options"],
+            options=ffmpeg_opts["options"],
+        )
 
     @classmethod
+    @_tracer.start_as_current_span("ytdl.yt_source")
     async def yt_source(
         cls,
         requester: Union[discord.User, discord.Member],
@@ -290,63 +302,101 @@ class YTDL(discord.FFmpegOpusAudio):
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
-        with _tracer.start_as_current_span(
-            "ytdl.yt_source",
-            attributes={
-                "ytdl.search": search,
-                "ytdl.process": process,
-            },
-        ) as span:
-            # Cache key: normalise search so "Destiny" and "destiny " both hit.
-            # ts is intentionally excluded — it is a per-request playback offset,
-            # not part of the video identity.
-            cache_key = f"ytdl:source:{search.strip().lower()}"
+        trace.get_current_span().set_attribute("ytdl.search", search)
+        trace.get_current_span().set_attribute("ytdl.process", process)
+        # Cache key: normalise search so "Destiny" and "destiny " both hit.
+        # ts is intentionally excluded — it is a per-request playback offset,
+        # not part of the video identity.
+        cache_key = f"ytdl:source:{search.strip().lower()}"
 
-            if redis is not None:
-                cached = await cache_get(redis, cache_key)
-                if cached is not None:
-                    span.set_attribute("ytdl.source_cache_hit", True)
-                    span.set_attribute("ytdl.result_title", cached.get("title", ""))
-                    return QueueObject(
-                        cached["webpage_url"], cached["title"], requester, ts=ts
-                    )
-
-            span.set_attribute("ytdl.source_cache_hit", False)
-            loop = asyncio.get_running_loop()
-
-            # process=True to resolve all unresolved references (urls), need for ytsearch
-            data = await loop.run_in_executor(
-                _YTDLP_POOL,
-                _ytdlp_extract,
-                search,
-                _YTDL_SOURCE_OPTS,
-                download,
-                process,
-            )
-            if data is None:
-                # TODO: create custom YTDL exceptions
-                raise Exception("Could not find song")
-
-            if "entries" in data:  # TOOD: narrow down to https urls and right bitrate
-                for entry in data["entries"]:
-                    if entry and entry.get("_type", None) != "playlist":
-                        data = entry
-                        break
-            if download:
-                # TODO: Handle downloading?
-                # ytdl.prepare_filename(data)
-                pass
-
-            webpage_url = data["webpage_url"]
-            title = data.get("title", "")
-            span.set_attribute("ytdl.result_title", title)
-
-            if redis is not None:
-                await cache_set(
-                    redis,
-                    cache_key,
-                    {"webpage_url": webpage_url, "title": title},
-                    _YT_SOURCE_TTL,
+        if redis is not None:
+            cached = await cache_get(redis, cache_key)
+            if cached is not None:
+                trace.get_current_span().set_attribute("ytdl.source_cache_hit", True)
+                trace.get_current_span().set_attribute(
+                    "ytdl.result_title", cached.get("title", "")
+                )
+                return QueueObject(
+                    cached["webpage_url"], cached["title"], requester, ts=ts
                 )
 
-            return QueueObject(webpage_url, title, requester, ts=ts)
+        trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
+        loop = asyncio.get_running_loop()
+
+        # process=True to resolve all unresolved references (urls), need for ytsearch
+        data = await loop.run_in_executor(
+            _YTDLP_POOL,
+            _ytdlp_extract,
+            search,
+            _YTDL_SOURCE_OPTS,
+            download,
+            process,
+        )
+        if data is None:
+            # TODO: create custom YTDL exceptions
+            raise Exception("Could not find song")
+
+        if "entries" in data:  # TOOD: narrow down to https urls and right bitrate
+            for entry in data["entries"]:
+                if entry and entry.get("_type", None) != "playlist":
+                    data = entry
+                    break
+        if download:
+            # TODO: Handle downloading?
+            # ytdl.prepare_filename(data)
+            pass
+
+        webpage_url = data["webpage_url"]
+        title = data.get("title", "")
+        trace.get_current_span().set_attribute("ytdl.result_title", title)
+
+        if redis is not None:
+            await cache_set(
+                redis,
+                cache_key,
+                {"webpage_url": webpage_url, "title": title},
+                _YT_SOURCE_TTL,
+            )
+
+        return QueueObject(webpage_url, title, requester, ts=ts)
+
+    @staticmethod
+    @_tracer.start_as_current_span("ytdl.yt_playlist")
+    async def yt_playlist(
+        url: str,
+        requester: Union[discord.User, discord.Member],
+    ) -> List[QueueObject]:
+        trace.get_current_span().set_attribute("ytdl.url", url)
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(
+            _YTDLP_POOL,
+            _ytdlp_extract,
+            url,
+            _YTDL_PLAYLIST_OPTS,
+            False,
+            True,
+        )
+        if data is None:
+            raise Exception(f"Could not fetch YouTube playlist: {url}")
+        entries = data.get("entries") or []
+        trace.get_current_span().set_attribute("ytdl.playlist_size", len(entries))
+        qobjs: List[QueueObject] = []
+        for i, entry in enumerate(entries):
+            if not entry:
+                log.warning("Skipping null entry at playlist index %d for %s", i, url)
+                continue
+            video_id = entry.get("id")
+            if not video_id:
+                log.warning(
+                    "Skipping entry at playlist index %d (title=%r) — missing video ID for %s",
+                    i,
+                    entry.get("title"),
+                    url,
+                )
+                continue
+            title = entry.get("title") or video_id
+            video_url = (
+                entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
+            )
+            qobjs.append(QueueObject(video_url, title, requester))
+        return qobjs
