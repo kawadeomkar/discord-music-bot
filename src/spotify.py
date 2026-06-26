@@ -95,14 +95,11 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
-        try:
-            endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
-            resp = await self.http_call(endpoint)
-            result = resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
-            await cache_set(self._redis, key, result, _TRACK_TTL)
-            return result
-        except Exception:
-            raise
+        endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
+        resp = await self.http_call(endpoint)
+        result = resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+        await cache_set(self._redis, key, result, _TRACK_TTL)
+        return result
 
     @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(self, pid: str) -> List[str]:
@@ -112,24 +109,21 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
-        try:
-            endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-            data: Dict[str, Union[str, int]] = {
-                "fields": "items(track(name,artists(name)))"
-            }
-            resp = await self.http_call(endpoint, params=data)
-            track_titles = [
-                item["track"]["name"]
-                + "".join(f" {a['name']}" for a in item["track"]["artists"])
-                for item in resp.get("items", [])
-            ]
-            trace.get_current_span().set_attribute(
-                "spotify.track_count", len(track_titles)
-            )
-            await cache_set(self._redis, key, track_titles, _PLAYLIST_TTL)
-            return track_titles
-        except Exception:
-            raise
+        endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
+        data: Dict[str, Union[str, int]] = {
+            "fields": "items(track(name,artists(name)))"
+        }
+        resp = await self.http_call(endpoint, params=data)
+        track_titles = [
+            item["track"]["name"]
+            + "".join(f" {a['name']}" for a in item["track"]["artists"])
+            for item in resp.get("items", [])
+        ]
+        trace.get_current_span().set_attribute(
+            "spotify.track_count", len(track_titles)
+        )
+        await cache_set(self._redis, key, track_titles, _PLAYLIST_TTL)
+        return track_titles
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[List[str], str]) -> Any:
@@ -142,15 +136,12 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
-        try:
-            resp = await self.http_call(
-                self.spotify_endpoint + "v1/artists", params={"ids": ",".join(ids)}
-            )
-            result = resp.get("artists", resp)
-            await cache_set(self._redis, key, result, _ARTIST_TTL)
-            return result
-        except Exception:
-            raise
+        resp = await self.http_call(
+            self.spotify_endpoint + "v1/artists", params={"ids": ",".join(ids)}
+        )
+        result = resp.get("artists", resp)
+        await cache_set(self._redis, key, result, _ARTIST_TTL)
+        return result
 
     @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[List[str], str]) -> Any:
@@ -163,13 +154,10 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
-        try:
-            resp = await self.http_call(
-                self.spotify_endpoint + "v1/albums", params={"ids": ",".join(ids)}
-            )
-            result = resp.get("albums", resp)
-            log.debug(resp)
-            await cache_set(self._redis, key, result, _ALBUM_TTL)
-            return result
-        except Exception:
-            raise
+        resp = await self.http_call(
+            self.spotify_endpoint + "v1/albums", params={"ids": ",".join(ids)}
+        )
+        result = resp.get("albums", resp)
+        log.debug(resp)
+        await cache_set(self._redis, key, result, _ALBUM_TTL)
+        return result

@@ -93,10 +93,9 @@ class MusicBot(commands.Cog):
         # on_voice_state_update firing while stop's disconnect is in-flight) gets None
         # and returns immediately, preventing the KeyError TOCTOU race.
         mp = self.mps.pop(guild.id, None)
+        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         if mp is None:
             return
-
-        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         log.info("going to cleanup/disconnect")
         if guild.voice_client:
             await guild.voice_client.disconnect(force=False)
@@ -196,14 +195,18 @@ class MusicBot(commands.Cog):
             await ctx.send(msg)
             raise commands.CommandError(msg)
 
-    async def _command_error(self, ctx: commands.Context, e: Exception) -> None:
-        trace.get_current_span().record_exception(e)
-        trace.get_current_span().set_status(
-            StatusCode.ERROR, f"{type(e).__name__}: {e}"
-        )
-        span_ctx = trace.get_current_span().get_span_context()
+    async def _command_error(
+        self,
+        ctx: commands.Context,
+        e: Exception,
+        title: str = "Command failed",
+    ) -> None:
+        span = trace.get_current_span()
+        span.record_exception(e)
+        span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+        span_ctx = span.get_span_context()
         embed = discord.Embed(
-            title="Command failed",
+            title=title,
             description=f"**{type(e).__name__}:** {e}",
             color=discord.Color.red(),
         )
@@ -363,19 +366,7 @@ class MusicBot(commands.Cog):
 
             except Exception as e:
                 log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
-                trace.get_current_span().record_exception(e)
-                trace.get_current_span().set_status(
-                    StatusCode.ERROR, f"{type(e).__name__}: {e}"
-                )
-                span_ctx = trace.get_current_span().get_span_context()
-                embed = discord.Embed(
-                    title="Failed to queue song",
-                    description=f"**{type(e).__name__}:** {e}",
-                    color=discord.Color.red(),
-                )
-                if span_ctx.is_valid:
-                    embed.set_footer(text=f"trace: {format(span_ctx.trace_id, '032x')}")
-                await ctx.send(embed=embed)
+                await self._command_error(ctx, e, title="Failed to queue song")
 
     @commands.command(name="skip", aliases=["sk"], help="skips current song")
     @commands.before_invoke(validate_commands)
@@ -676,8 +667,10 @@ class MusicBot(commands.Cog):
                     channel=voice_channel, self_mute=False, self_deaf=True
                 )
             except Exception as e:
-                trace.get_current_span().set_attribute(
-                    "restore.voice_connect_failed", True
+                trace.get_current_span().set_attribute("restore.voice_connect_failed", True)
+                trace.get_current_span().record_exception(e)
+                trace.get_current_span().set_status(
+                    StatusCode.ERROR, f"voice connect failed: {e}"
                 )
                 log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
                 return
