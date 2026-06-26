@@ -1,6 +1,7 @@
 import random
-from typing import List
+from typing import List, Optional
 
+import discord
 import structlog
 from discord.ext import commands
 
@@ -26,6 +27,29 @@ def queue_message(songs: List[str]) -> str:
     if len(songs) > 10:
         msg += "\n..."
     return msg
+
+
+def latency_color(ms: float) -> discord.Color:
+    if ms <= 50:
+        return discord.Color(0x44FF44)
+    if ms <= 100:
+        return discord.Color(0xFFD000)
+    if ms <= 200:
+        return discord.Color(0xFF6600)
+    return discord.Color(0x990000)
+
+
+async def send_embed(
+    destination: discord.abc.Messageable,
+    title: str,
+    description: str,
+    color: Optional[discord.Color] = None,
+    footer: Optional[str] = None,
+) -> None:
+    embed = discord.Embed(title=title, description=description, color=color)
+    if footer:
+        embed.set_footer(text=footer)
+    await destination.send(embed=embed)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

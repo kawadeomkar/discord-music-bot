@@ -15,7 +15,7 @@ from opentelemetry.trace import StatusCode
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
-from src.util import queue_message, get_logger
+from src.util import queue_message, send_embed, get_logger
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -667,15 +667,17 @@ class MusicPlayer:
                     self.current_song = None
                     try:
                         span_ctx = span.get_span_context()
-                        embed = discord.Embed(
-                            title="Playback error — skipping song",
-                            description=f"**{type(e).__name__}:** {e}",
-                            color=discord.Color.red(),
+                        footer = (
+                            f"trace: {format(span_ctx.trace_id, '032x')}"
+                            if span_ctx.is_valid
+                            else None
                         )
-                        if span_ctx.is_valid:
-                            embed.set_footer(
-                                text=f"trace: {format(span_ctx.trace_id, '032x')}"
-                            )
-                        await self._channel.send(embed=embed)
+                        await send_embed(
+                            self._channel,
+                            "Playback error — skipping song",
+                            f"**{type(e).__name__}:** {e}",
+                            discord.Color.red(),
+                            footer=footer,
+                        )
                     except Exception:
                         pass

@@ -25,7 +25,13 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.telemetry import get_tracer
-from src.util import queue_message, send_queue_phrases, get_logger
+from src.util import (
+    latency_color,
+    queue_message,
+    send_embed,
+    send_queue_phrases,
+    get_logger,
+)
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -50,16 +56,6 @@ def _check_voice_permissions(
     ):
         return f"Bot is already being used in channel {voice_client.channel}"
     return None
-
-
-def _latency_color(ms: float) -> int:
-    if ms <= 50:
-        return 0x44FF44
-    if ms <= 100:
-        return 0xFFD000
-    if ms <= 200:
-        return 0xFF6600
-    return 0x990000
 
 
 class MusicBot(commands.Cog):
@@ -205,14 +201,16 @@ class MusicBot(commands.Cog):
         span.record_exception(e)
         span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
         span_ctx = span.get_span_context()
-        embed = discord.Embed(
-            title=title,
-            description=f"**{type(e).__name__}:** {e}",
-            color=discord.Color.red(),
+        footer = (
+            f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
         )
-        if span_ctx.is_valid:
-            embed.set_footer(text=f"trace: {format(span_ctx.trace_id, '032x')}")
-        await ctx.send(embed=embed)
+        await send_embed(
+            ctx,
+            title,
+            f"**{type(e).__name__}:** {e}",
+            discord.Color.red(),
+            footer=footer,
+        )
 
     @_tracer.start_as_current_span("bot.queue_source")
     async def queue_source(
@@ -257,13 +255,13 @@ class MusicBot(commands.Cog):
             titles: List[str] = qobj  # type: ignore[assignment]
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
-            embed = discord.Embed(
-                title="Queued playlist",
-                description=f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
-                color=discord.Color.blue(),
-            )
             await asyncio.gather(
-                ctx.send(embed=embed),
+                send_embed(
+                    ctx,
+                    "Queued playlist",
+                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    discord.Color.blue(),
+                ),
                 mp.queue_put(qobjs_yt, prefetch=False),
                 ctx.message.add_reaction("👍"),
                 send_queue_phrases(ctx),
@@ -276,16 +274,13 @@ class MusicBot(commands.Cog):
             tracks: List[QueueObject] = qobj  # type: ignore[assignment]
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
-            embed = discord.Embed(
-                title=f"Queued playlist — {count} song{'s' if count != 1 else ''}",
-                description=(
-                    f"Requested by: [{ctx.author.mention}]\n"
-                    f"{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}"
-                ),
-                color=discord.Color.blue(),
-            )
             await asyncio.gather(
-                ctx.send(embed=embed),
+                send_embed(
+                    ctx,
+                    f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    discord.Color.blue(),
+                ),
                 mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
                 ctx.message.add_reaction("👍"),
                 send_queue_phrases(ctx),
@@ -306,15 +301,11 @@ class MusicBot(commands.Cog):
         ]
         if should_show_queued:
             coros.append(
-                ctx.send(
-                    embed=discord.Embed(
-                        title="Queued song",
-                        description=(
-                            f"Requested by: [{ctx.author.mention}]\n"
-                            f"{qobj.title} - ({qobj.webpage_url})"
-                        ),
-                        color=discord.Color.blue(),
-                    )
+                send_embed(
+                    ctx,
+                    "Queued song",
+                    f"Requested by: [{ctx.author.mention}]\n{qobj.title} - ({qobj.webpage_url})",
+                    discord.Color.blue(),
                 )
             )
         await asyncio.gather(*coros)
@@ -486,12 +477,11 @@ class MusicBot(commands.Cog):
             description = queue_message(cleared)
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
-                ctx.send(
-                    embed=discord.Embed(
-                        title=f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
-                        description=description,
-                        color=discord.Color.red(),
-                    )
+                send_embed(
+                    ctx,
+                    f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
+                    description,
+                    discord.Color.red(),
                 ),
             )
         except Exception as e:
@@ -595,12 +585,12 @@ class MusicBot(commands.Cog):
     async def ping(self, ctx: commands.Context):
         try:
             ms = self.bot.latency * 1000
-            embed = discord.Embed(
-                title="Ping - latency in ms",
-                description=f"Ping: **{round(ms)}** milliseconds!",
+            await send_embed(
+                ctx,
+                "Ping - latency in ms",
+                f"Ping: **{round(ms)}** milliseconds!",
+                latency_color(ms),
             )
-            embed.color = _latency_color(ms)
-            await ctx.send(embed=embed)
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
