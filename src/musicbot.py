@@ -667,7 +667,9 @@ class MusicBot(commands.Cog):
                     channel=voice_channel, self_mute=False, self_deaf=True
                 )
             except Exception as e:
-                trace.get_current_span().set_attribute("restore.voice_connect_failed", True)
+                trace.get_current_span().set_attribute(
+                    "restore.voice_connect_failed", True
+                )
                 trace.get_current_span().record_exception(e)
                 trace.get_current_span().set_status(
                     StatusCode.ERROR, f"voice connect failed: {e}"

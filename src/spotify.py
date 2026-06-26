@@ -119,9 +119,7 @@ class Spotify:
             + "".join(f" {a['name']}" for a in item["track"]["artists"])
             for item in resp.get("items", [])
         ]
-        trace.get_current_span().set_attribute(
-            "spotify.track_count", len(track_titles)
-        )
+        trace.get_current_span().set_attribute("spotify.track_count", len(track_titles))
         await cache_set(self._redis, key, track_titles, _PLAYLIST_TTL)
         return track_titles
 

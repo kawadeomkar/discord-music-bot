@@ -225,7 +225,9 @@ class YTDL(discord.FFmpegOpusAudio):
             )
         except Exception as e:
             trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(StatusCode.ERROR, f"prefetch_stream failed: {e}")
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"prefetch_stream failed: {e}"
+            )
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return
         if data is not None:
