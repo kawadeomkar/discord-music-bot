@@ -10,7 +10,7 @@ import pytest
 from discord.ext import commands
 
 from src.musicbot import MusicBot, _check_voice_permissions, _latency_color
-from src.sources import SpotifySource, YTSource
+from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
 from tests.helpers import stub_create_task
 
@@ -97,13 +97,13 @@ class TestLatencyColor:
 class TestQueueSource:
 
     async def test_spotify_playlist_returns_list(self, music_bot, mock_ctx):
-        source = SpotifySource(type="playlist", id="pid123")
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(mock_ctx, source)
         assert result == ["Song A", "Song B"]
 
     async def test_spotify_track_calls_yt_source(self, music_bot, mock_ctx):
-        source = SpotifySource(type="track", id="tid123")
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         with patch(
@@ -132,6 +132,148 @@ class TestQueueSource:
             await music_bot.queue_source(mock_ctx, source)
         call_args = mock_yt.call_args
         assert call_args[0][1] == "ytsearch:test song"
+
+    async def test_youtube_playlist_calls_yt_playlist(self, music_bot, mock_ctx):
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest123",
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id="PLtest123",
+        )
+        fake_qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
+            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+        ]
+        with patch(
+            "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+        ) as mock_playlist:
+            result = await music_bot.queue_source(mock_ctx, source)
+        mock_playlist.assert_awaited_once_with(
+            "https://www.youtube.com/playlist?list=PLtest123", mock_ctx.author
+        )
+        assert result == fake_qobjs
+
+    async def test_youtube_playlist_raises_if_list_id_missing(
+        self, music_bot, mock_ctx
+    ):
+        """queue_source raises ValueError (not AssertionError) when list_id is None."""
+        source = YTSource(
+            url="https://www.youtube.com/watch?v=abc",
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id=None,
+        )
+        with pytest.raises(ValueError, match="list_id"):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_youtube_playlist_preserves_full_url(self, music_bot, mock_ctx):
+        full_url = "https://www.youtube.com/watch?v=XfHbPIx42uo&list=RDXfHbPIx42uo&start_radio=1"
+        source = YTSource(
+            url=full_url,
+            process=False,
+            type=YTType.PLAYLIST,
+            list_id="RDXfHbPIx42uo",
+        )
+        fake_qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)
+        ]
+        with patch(
+            "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
+        ) as mock_playlist:
+            await music_bot.queue_source(mock_ctx, source)
+        mock_playlist.assert_awaited_once_with(full_url, mock_ctx.author)
+
+
+class TestEnqueuePlaylist:
+
+    # ── YouTube playlist path ─────────────────────────────────────────────────
+
+    async def test_yt_sends_embed_with_song_count_and_playlist_url(
+        self, music_bot, mock_ctx
+    ):
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        qobjs = [
+            QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
+            QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
+        ]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "2 songs" in embed.title
+        assert source.url in embed.description
+        assert "Track 1" in embed.description
+
+    async def test_yt_singular_song_count_in_title(self, music_bot, mock_ctx):
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Only Track", mock_ctx.author)]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "1 song" in embed.title
+        assert "1 songs" not in embed.title
+
+    async def test_yt_calls_queue_put_with_prefetch_false(self, music_bot, mock_ctx):
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+
+        mp.queue_put.assert_awaited_once()
+        _, call_kwargs = mp.queue_put.call_args
+        assert call_kwargs.get("prefetch") is False
+
+    # ── Spotify playlist path ─────────────────────────────────────────────────
+
+    async def test_spotify_sends_queued_playlist_embed(self, music_bot, mock_ctx):
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        titles = ["Song A", "Song B", "Song C"]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, titles, mp)
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Queued playlist" in embed.title
+        assert "Song A" in embed.description
+
+    async def test_spotify_calls_queue_put_with_prefetch_false(
+        self, music_bot, mock_ctx
+    ):
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        titles = ["Song A", "Song B"]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, titles, mp)
+
+        mp.queue_put.assert_awaited_once()
+        _, call_kwargs = mp.queue_put.call_args
+        assert call_kwargs.get("prefetch") is False
 
 
 @pytest.fixture
@@ -175,8 +317,8 @@ class TestJoinChannelPersistence:
         music_bot_with_redis.mps[mock_guild.id] = mp
 
         # join is a @commands.command — call the underlying callback directly.
+        mock_ctx.voice_client = None  # bot not yet in channel
         with (
-            patch("discord.utils.get", return_value=None),
             patch.object(discord.VoiceChannel, "connect", new=AsyncMock()),
             patch.object(mock_ctx, "invoke", new=AsyncMock()),
         ):
@@ -415,17 +557,17 @@ class TestSkipCommand:
         vc.is_playing = MagicMock(return_value=True)
         vc.stop = MagicMock()
         mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.skip.callback(music_bot, mock_ctx)
+        await MusicBot.skip.callback(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.stop = MagicMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.skip.callback(music_bot, mock_ctx)
+        mock_ctx.voice_client = vc
+        await MusicBot.skip.callback(music_bot, mock_ctx)
         vc.stop.assert_not_called()
 
 
@@ -434,17 +576,17 @@ class TestPauseCommand:
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
         vc.pause = MagicMock()
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.pause.callback(music_bot, mock_ctx)
+        await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.pause = MagicMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.pause.callback(music_bot, mock_ctx)
+        mock_ctx.voice_client = vc
+        await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_not_called()
 
 
@@ -454,9 +596,9 @@ class TestResumeCommand:
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
         vc.resume = MagicMock()
+        mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        with patch("discord.utils.get", return_value=vc):
-            await MusicBot.resume.callback(music_bot, mock_ctx)
+        await MusicBot.resume.callback(music_bot, mock_ctx)
         vc.resume.assert_called_once()
 
 
@@ -487,11 +629,166 @@ class TestPingCommand:
 
 
 class TestClearCommand:
-    async def test_sends_in_development_message(self, music_bot, mock_ctx):
+    async def test_sends_empty_message_when_queue_already_empty(
+        self, music_bot, mock_ctx
+    ):
+        mp = MagicMock()
+        mp.queue_clear = AsyncMock(return_value=[])
+        music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.clear.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        msg = mock_ctx.send.call_args[0][0]
-        assert "development" in msg.lower()
+        mp.queue_clear.assert_awaited_once()
+        mock_ctx.send.assert_awaited_once_with("The queue is already empty.")
+
+    async def test_sends_embed_with_cleared_songs(self, music_bot, mock_ctx):
+        cleared = ["Song A - https://yt.com/1", "Song B - https://yt.com/2"]
+        mp = MagicMock()
+        mp.queue_clear = AsyncMock(return_value=cleared)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+        await MusicBot.clear.callback(music_bot, mock_ctx)
+        mp.queue_clear.assert_awaited_once()
+        mock_ctx.message.add_reaction.assert_awaited_once_with("🗑️")
+        call_kwargs = mock_ctx.send.call_args[1]
+        embed = call_kwargs["embed"]
+        assert "2 songs removed" in embed.title
+        assert "Song A" in embed.description
+
+
+class TestPlayCommand:
+    """Tests for the play() cold-join parallelism (Change A).
+
+    asyncio.Future is used as the join_task stand-in: unlike AsyncMock,
+    a Future is directly awaitable via __await__, matching how the real
+    asyncio.Task behaves when the code does `await join_task`.
+    """
+
+    async def test_cold_join_creates_task_and_awaits_after_queue_source(
+        self, music_bot, mock_ctx
+    ):
+        """join is launched as a task; join_task is awaited after queue_source."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        # Resolved Future: done() is True, await returns immediately.
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task) as mock_create:
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        mock_create.assert_called_once()
+        music_bot.queue_source.assert_awaited_once()
+        music_bot._enqueue_single.assert_awaited_once()
+
+    async def test_warm_path_skips_join_task(self, music_bot, mock_ctx):
+        """When already in voice, no join task is created and queue_source runs directly."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+
+        with patch("asyncio.create_task") as mock_create:
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        mock_create.assert_not_called()
+        music_bot.queue_source.assert_awaited_once()
+
+    async def test_cold_join_cancels_inflight_join_when_queue_source_fails(
+        self, music_bot, mock_ctx
+    ):
+        """queue_source fails while join is still running → join task cancelled, then cleanup()."""
+        mock_ctx.voice_client = None
+        mock_ctx.guild.voice_client = None
+
+        # Pending Future: done() is False; cancel() marks it cancelled so the
+        # subsequent `await join_task` in the guard raises CancelledError (suppressed).
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.cleanup = AsyncMock()
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_called_once()
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mock_ctx.send.assert_awaited()  # error embed shown
+
+    async def test_cold_join_cleans_up_when_join_done_before_queue_source_fails(
+        self, music_bot, mock_ctx
+    ):
+        """join completes first, then queue_source fails → cleanup() called (handles ghost connection)."""
+        mock_ctx.voice_client = None
+        mock_ctx.guild.voice_client = MagicMock(
+            spec=discord.VoiceClient
+        )  # join already established voice
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)  # done() is True
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.cleanup = AsyncMock()
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_not_called()  # already done, nothing to cancel
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mock_ctx.send.assert_awaited()
+
+    async def test_cold_join_cancels_and_cleans_up_partial_connection(
+        self, music_bot, mock_ctx
+    ):
+        """join in-flight but voice partially established → cancel join task, then cleanup()."""
+        mock_ctx.voice_client = None
+        mock_ctx.guild.voice_client = MagicMock(spec=discord.VoiceClient)
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()  # pending, done() is False
+        cancel_spy = MagicMock(side_effect=join_task.cancel)
+        join_task.cancel = cancel_spy
+
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.cleanup = AsyncMock()
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        cancel_spy.assert_called_once()
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mock_ctx.send.assert_awaited()
 
 
 class TestNowCommand:
