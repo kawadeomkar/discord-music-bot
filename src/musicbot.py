@@ -228,6 +228,7 @@ class MusicBot(commands.Cog):
                 ctx.author, search, source.process or False, ts=ts, redis=self.redis
             )
 
+    @traced(name="bot.enqueue_playlist")
     async def _enqueue_playlist(
         self,
         ctx: commands.Context,
@@ -273,6 +274,7 @@ class MusicBot(commands.Cog):
                 send_queue_phrases(ctx),
             )
 
+    @traced(name="bot.enqueue_single")
     async def _enqueue_single(
         self, ctx: commands.Context, qobj: QueueObject, mp: MusicPlayer
     ) -> None:
