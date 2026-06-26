@@ -628,49 +628,47 @@ class MusicBot(commands.Cog):
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 
+    @_tracer.start_as_current_span("bot.alone_countdown")
     async def _alone_countdown(self, guild: discord.Guild) -> None:
-        with _tracer.start_as_current_span(
-            "bot.alone_countdown",
-            attributes={"discord.guild_id": str(guild.id)},
-        ) as span:
-            try:
-                mp = self.mps.get(guild.id)
-                text_channel = mp._channel if mp is not None else None
+        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
+        try:
+            mp = self.mps.get(guild.id)
+            text_channel = mp._channel if mp is not None else None
 
-                if text_channel is not None:
-                    try:
-                        await text_channel.send(
-                            embed=discord.Embed(
-                                title="No users remaining in voice channel",
-                                description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                                color=discord.Color.orange(),
-                            )
+            if text_channel is not None:
+                try:
+                    await text_channel.send(
+                        embed=discord.Embed(
+                            title="No users remaining in voice channel",
+                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                            color=discord.Color.orange(),
                         )
-                    except Exception:
-                        pass  # channel deleted or no permission — countdown continues regardless
-
-                await asyncio.sleep(10)
-
-                vc = guild.voice_client
-                if (
-                    isinstance(vc, discord.VoiceClient)
-                    and vc.channel is not None
-                    and not any(not m.bot for m in vc.channel.members)
-                ):
-                    log.info(
-                        f"Bot still alone in guild {guild.id} after 10s — disconnecting"
                     )
-                    await self.cleanup(guild)
-            except asyncio.CancelledError:
-                pass  # user rejoined or explicit stop; timer was cancelled
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(
-                    f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True
+                except Exception:
+                    pass  # channel deleted or no permission — countdown continues regardless
+
+            await asyncio.sleep(10)
+
+            vc = guild.voice_client
+            if (
+                isinstance(vc, discord.VoiceClient)
+                and vc.channel is not None
+                and not any(not m.bot for m in vc.channel.members)
+            ):
+                log.info(
+                    f"Bot still alone in guild {guild.id} after 10s — disconnecting"
                 )
-            finally:
-                self._alone_timers.pop(guild.id, None)
+                await self.cleanup(guild)
+        except asyncio.CancelledError:
+            pass  # user rejoined or explicit stop; timer was cancelled
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+            log.error(
+                f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True
+            )
+        finally:
+            self._alone_timers.pop(guild.id, None)
 
     # ── Restart recovery listeners ────────────────────────────────────────────
 
