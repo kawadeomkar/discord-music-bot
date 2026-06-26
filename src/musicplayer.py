@@ -357,7 +357,7 @@ class MusicPlayer:
 
         shuffled: List[Union[QueueObject, YTSource]] = []
 
-        if self.queue.qsize() < 4:
+        if self.queue.qsize() < 3:
             return "There must be at least 3 songs to shuffle the queue"
 
         async with self.mutex:
