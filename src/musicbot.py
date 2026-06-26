@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import random
 from itertools import islice
-from typing import Any, Coroutine, List, Optional, Union
+from typing import Any, Coroutine, List, Optional, Union, assert_never
 
 import discord
 from discord.ext import commands
@@ -222,7 +222,7 @@ class MusicBot(commands.Cog):
             elif isinstance(source, SoundcloudSource):
                 search = source.url
             else:
-                raise ValueError(f"Unknown source type: {type(source)}")
+                assert_never(source)
             return await YTDL.yt_source(
                 ctx.author, search, source.process or False, ts=ts, redis=self.redis
             )
@@ -300,9 +300,7 @@ class MusicBot(commands.Cog):
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
-    @commands.command(
-        name="play", aliases=["p", "sing"], help="play a youtube song"
-    )
+    @commands.command(name="play", aliases=["p", "sing"], help="play a youtube song")
     @commands.before_invoke(validate_commands)
     async def play(self, ctx: commands.Context, url):
         async with ctx.typing():
