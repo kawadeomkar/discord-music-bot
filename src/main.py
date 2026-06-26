@@ -4,6 +4,7 @@ import os
 import discord
 from discord.ext import commands
 
+from src.config import ENVIRONMENT
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
 
@@ -42,6 +43,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
+        log.info(f"Environment: {ENVIRONMENT.value}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         log.info(f"Bot commands: {self.intents.voice_states}")
@@ -67,9 +69,12 @@ def main():
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves
 
     token = os.getenv("DISCORD_TOKEN")
-    assert token is not None
-    assert os.getenv("SPOTIFY_CLIENT_ID") is not None
-    assert os.getenv("SPOTIFY_CLIENT_SECRET") is not None
+    if not token:
+        raise ValueError("DISCORD_TOKEN environment variable is not set")
+    if not os.getenv("SPOTIFY_CLIENT_ID"):
+        raise ValueError("SPOTIFY_CLIENT_ID environment variable is not set")
+    if not os.getenv("SPOTIFY_CLIENT_SECRET"):
+        raise ValueError("SPOTIFY_CLIENT_SECRET environment variable is not set")
     bot.run(token)
 
 

@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+ENVIRONMENT="${ENVIRONMENT:-production}"
+export ENVIRONMENT
+
 poetry install --only=main,lint --no-root
 poetry run python -m black src/ tests/ --target-version py313
 

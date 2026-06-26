@@ -41,7 +41,8 @@ COPY tests/ ./tests/
 COPY pyproject.toml ./
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONPATH="."
+    PYTHONPATH="." \
+    ENVIRONMENT="test"
 
 CMD ["python", "-m", "pytest", "--tb=short", "-q"]
 
@@ -62,6 +63,7 @@ COPY src/ ./src/
 COPY pyproject.toml ./
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONPATH="."
+    PYTHONPATH="." \
+    ENVIRONMENT="production"
 
 CMD ["python", "-m", "src.main"]
