@@ -11,10 +11,11 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 
 from src.redis_client import cache_get, cache_set
-from src.telemetry import traced
+from src.telemetry import get_tracer
 from src.util import get_logger
 
 log = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 _TRACK_TTL = 86400  # 24h — track titles/artists don't change
 _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
@@ -86,7 +87,7 @@ class Spotify:
 
     # ── Cached API methods ────────────────────────────────────────────────────
 
-    @traced(name="spotify.track")
+    @_tracer.start_as_current_span("spotify.track")
     async def track(self, tid: str) -> str:
         trace.get_current_span().set_attribute("spotify.track_id", tid)
         key = f"spotify:track:{tid}"
@@ -103,7 +104,7 @@ class Spotify:
         except Exception:
             raise
 
-    @traced(name="spotify.playlist")
+    @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(self, pid: str) -> List[str]:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
         key = f"spotify:playlist:{pid}"
@@ -130,7 +131,7 @@ class Spotify:
         except Exception:
             raise
 
-    @traced(name="spotify.artists")
+    @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[List[str], str]) -> Any:
         if isinstance(ids, str):
             ids = [ids]
@@ -151,7 +152,7 @@ class Spotify:
         except Exception:
             raise
 
-    @traced(name="spotify.albums")
+    @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[List[str], str]) -> Any:
         if isinstance(ids, str):
             ids = [ids]

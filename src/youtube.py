@@ -15,10 +15,11 @@ from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_get, cache_set
 from src.spotify import Spotify
-from src.telemetry import traced
+from src.telemetry import get_tracer
 from src.util import get_logger
 
 log = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
@@ -187,7 +188,7 @@ class YTDL(discord.FFmpegOpusAudio):
         return self.__getattribute__(item)
 
     @classmethod
-    @traced(name="ytdl.prefetch_stream")
+    @_tracer.start_as_current_span("ytdl.prefetch_stream")
     async def prefetch_stream(
         cls,
         qo: QueueObject,
@@ -234,7 +235,7 @@ class YTDL(discord.FFmpegOpusAudio):
                 await cache_set(redis, cache_key, stripped, ttl)
 
     @classmethod
-    @traced(name="ytdl.yt_stream")
+    @_tracer.start_as_current_span("ytdl.yt_stream")
     async def yt_stream(
         cls,
         qo: QueueObject,
@@ -288,7 +289,7 @@ class YTDL(discord.FFmpegOpusAudio):
         )
 
     @classmethod
-    @traced(name="ytdl.yt_source")
+    @_tracer.start_as_current_span("ytdl.yt_source")
     async def yt_source(
         cls,
         requester: Union[discord.User, discord.Member],
@@ -358,7 +359,7 @@ class YTDL(discord.FFmpegOpusAudio):
         return QueueObject(webpage_url, title, requester, ts=ts)
 
     @staticmethod
-    @traced(name="ytdl.yt_playlist")
+    @_tracer.start_as_current_span("ytdl.yt_playlist")
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
@@ -380,9 +381,7 @@ class YTDL(discord.FFmpegOpusAudio):
         qobjs: List[QueueObject] = []
         for i, entry in enumerate(entries):
             if not entry:
-                log.warning(
-                    "Skipping null entry at playlist index %d for %s", i, url
-                )
+                log.warning("Skipping null entry at playlist index %d for %s", i, url)
                 continue
             video_id = entry.get("id")
             if not video_id:

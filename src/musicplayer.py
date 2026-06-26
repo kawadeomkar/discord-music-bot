@@ -14,7 +14,7 @@ from opentelemetry.trace import StatusCode
 
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
-from src.telemetry import get_tracer, traced
+from src.telemetry import get_tracer
 from src.util import queue_message, get_logger
 
 log = get_logger(__name__)
@@ -494,7 +494,7 @@ class MusicPlayer:
         except Exception as e:
             log.error(f"embed error: {e}")
 
-    @traced(name="player.prefetch")
+    @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
         """Pre-resolve and stream the next queued song while the current one plays.
 

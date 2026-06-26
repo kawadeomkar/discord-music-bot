@@ -25,7 +25,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
-from src.telemetry import get_tracer, traced
+from src.telemetry import get_tracer
 from src.util import queue_message, send_queue_phrases, get_logger
 
 log = get_logger(__name__)
@@ -88,7 +88,7 @@ class MusicBot(commands.Cog):
         self.mps[ctx.guild.id] = mp
         return mp
 
-    @traced(name="bot.cleanup")
+    @_tracer.start_as_current_span("bot.cleanup")
     async def cleanup(self, guild: discord.Guild) -> None:
         # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
         # on_voice_state_update firing while stop's disconnect is in-flight) gets None
@@ -197,7 +197,7 @@ class MusicBot(commands.Cog):
             await ctx.send(msg)
             raise commands.CommandError(msg)
 
-    @traced(name="bot.queue_source")
+    @_tracer.start_as_current_span("bot.queue_source")
     async def queue_source(
         self,
         ctx: commands.Context,
@@ -228,7 +228,7 @@ class MusicBot(commands.Cog):
                 ctx.author, search, source.process or False, ts=ts, redis=self.redis
             )
 
-    @traced(name="bot.enqueue_playlist")
+    @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
         self,
         ctx: commands.Context,
@@ -274,7 +274,7 @@ class MusicBot(commands.Cog):
                 send_queue_phrases(ctx),
             )
 
-    @traced(name="bot.enqueue_single")
+    @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
         self, ctx: commands.Context, qobj: QueueObject, mp: MusicPlayer
     ) -> None:
@@ -539,7 +539,7 @@ class MusicBot(commands.Cog):
         for guild in self.bot.guilds:
             asyncio.create_task(self._restore_guild(guild))
 
-    @traced(name="guild.restore")
+    @_tracer.start_as_current_span("guild.restore")
     async def _restore_guild(self, guild: discord.Guild) -> None:
         """Attempt to rejoin voice and restore queue for one guild after restart."""
         if self.redis is None:
