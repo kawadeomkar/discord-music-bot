@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import random
 from itertools import islice
 from typing import Any, Coroutine, List, Optional, Union, assert_never
 
@@ -197,6 +196,21 @@ class MusicBot(commands.Cog):
             await ctx.send(msg)
             raise commands.CommandError(msg)
 
+    async def _command_error(self, ctx: commands.Context, e: Exception) -> None:
+        trace.get_current_span().record_exception(e)
+        trace.get_current_span().set_status(
+            StatusCode.ERROR, f"{type(e).__name__}: {e}"
+        )
+        span_ctx = trace.get_current_span().get_span_context()
+        embed = discord.Embed(
+            title="Command failed",
+            description=f"**{type(e).__name__}:** {e}",
+            color=discord.Color.red(),
+        )
+        if span_ctx.is_valid:
+            embed.set_footer(text=f"trace: {format(span_ctx.trace_id, '032x')}")
+        await ctx.send(embed=embed)
+
     @_tracer.start_as_current_span("bot.queue_source")
     async def queue_source(
         self,
@@ -305,6 +319,7 @@ class MusicBot(commands.Cog):
 
     @commands.command(name="play", aliases=["p", "sing"], help="play a youtube song")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url):
         async with ctx.typing():
             try:
@@ -348,6 +363,10 @@ class MusicBot(commands.Cog):
 
             except Exception as e:
                 log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
+                trace.get_current_span().record_exception(e)
+                trace.get_current_span().set_status(
+                    StatusCode.ERROR, f"{type(e).__name__}: {e}"
+                )
                 span_ctx = trace.get_current_span().get_span_context()
                 embed = discord.Embed(
                     title="Failed to queue song",
@@ -360,140 +379,197 @@ class MusicBot(commands.Cog):
 
     @commands.command(name="skip", aliases=["sk"], help="skips current song")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.skip")
     async def skip(self, ctx: commands.Context):
-        vc = ctx.voice_client
-        if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-            vc.stop()
-            if not ctx.invoked_parents:
-                await ctx.message.add_reaction("⏭")
+        try:
+            vc = ctx.voice_client
+            if isinstance(vc, discord.VoiceClient) and vc.is_playing():
+                vc.stop()
+                if not ctx.invoked_parents:
+                    await ctx.message.add_reaction("⏭")
+        except Exception as e:
+            log.error(f"skip failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="stop", aliases=["st"], help="stops current song")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context):
-        await ctx.invoke(self.skip)
-        if ctx.voice_client and ctx.guild is not None:
-            await ctx.message.add_reaction("👋")
-            await self.cleanup(ctx.guild)
+        try:
+            await ctx.invoke(self.skip)
+            if ctx.voice_client and ctx.guild is not None:
+                await ctx.message.add_reaction("👋")
+                await self.cleanup(ctx.guild)
+        except Exception as e:
+            log.error(f"stop failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="pause", aliases=["po"], help="pause the current song")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.pause")
     async def pause(self, ctx: commands.Context):
-        vc = ctx.voice_client
-        if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-            vc.pause()
-            await ctx.message.add_reaction("⏸️")
+        try:
+            vc = ctx.voice_client
+            if isinstance(vc, discord.VoiceClient) and vc.is_playing():
+                vc.pause()
+                await ctx.message.add_reaction("⏸️")
+        except Exception as e:
+            log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.resume")
     async def resume(self, ctx: commands.Context):
-        vc = ctx.voice_client
-        if (
-            isinstance(vc, discord.VoiceClient)
-            and not vc.is_playing()
-            and vc.is_paused()
-        ):
-            vc.resume()
-            await ctx.message.add_reaction("⏭️")
+        try:
+            vc = ctx.voice_client
+            if (
+                isinstance(vc, discord.VoiceClient)
+                and not vc.is_playing()
+                and vc.is_paused()
+            ):
+                vc.resume()
+                await ctx.message.add_reaction("⏭️")
+        except Exception as e:
+            log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.shuffle")
     async def shuffle(self, ctx: commands.Context):
-        mp = self.get_mp(ctx)
-        async with ctx.typing():
-            await ctx.send("Please wait... shuffling")
-            msg = await mp.queue_shuffle()
-            await ctx.message.add_reaction("🔀")
-            await ctx.send(msg)
+        try:
+            mp = self.get_mp(ctx)
+            async with ctx.typing():
+                await ctx.send("Please wait... shuffling")
+                msg = await mp.queue_shuffle()
+                await ctx.message.add_reaction("🔀")
+                await ctx.send(msg)
+        except Exception as e:
+            log.error(f"shuffle failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="join", aliases=["summon"], help="join the channel")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.join")
     async def join(self, ctx: commands.Context):
-        assert isinstance(ctx.author, discord.Member) and ctx.author.voice is not None
-        assert ctx.guild is not None
-        channel = ctx.author.voice.channel
-        assert channel is not None
+        try:
+            assert (
+                isinstance(ctx.author, discord.Member) and ctx.author.voice is not None
+            )
+            assert ctx.guild is not None
+            channel = ctx.author.voice.channel
+            assert channel is not None
 
-        if not ctx.voice_client:
-            await channel.connect(timeout=10.0)
-        vc = ctx.voice_client
-        if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
-            await vc.move_to(channel)
-        await ctx.guild.change_voice_state(
-            channel=channel, self_mute=False, self_deaf=True
-        )
+            if not ctx.voice_client:
+                await channel.connect(timeout=10.0)
+            vc = ctx.voice_client
+            if isinstance(vc, discord.VoiceClient) and vc.channel != channel:
+                await vc.move_to(channel)
+            await ctx.guild.change_voice_state(
+                channel=channel, self_mute=False, self_deaf=True
+            )
 
-        mp = self.get_mp(ctx)
-        if mp._store is not None and isinstance(ctx.channel, discord.TextChannel):
-            await mp._store.set_connection(channel.id, ctx.channel.id)
+            mp = self.get_mp(ctx)
+            if mp._store is not None and isinstance(ctx.channel, discord.TextChannel):
+                await mp._store.set_connection(channel.id, ctx.channel.id)
 
-        await asyncio.gather(
-            ctx.message.add_reaction("👋"),
-            ctx.invoke(self.ping),
-        )
+            await asyncio.gather(
+                ctx.message.add_reaction("👋"),
+                ctx.invoke(self.ping),
+            )
+        except Exception as e:
+            log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(name="clear", aliases=["c"], help="clears the queue")
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context):
-        mp = self.get_mp(ctx)
-        cleared = await mp.queue_clear()
-        if not cleared:
-            await ctx.send("The queue is already empty.")
-            return
-        description = queue_message(cleared)
-        await asyncio.gather(
-            ctx.message.add_reaction("🗑️"),
-            ctx.send(
-                embed=discord.Embed(
-                    title=f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
-                    description=description,
-                    color=discord.Color.red(),
-                )
-            ),
-        )
+        try:
+            mp = self.get_mp(ctx)
+            cleared = await mp.queue_clear()
+            if not cleared:
+                await ctx.send("The queue is already empty.")
+                return
+            description = queue_message(cleared)
+            await asyncio.gather(
+                ctx.message.add_reaction("🗑️"),
+                ctx.send(
+                    embed=discord.Embed(
+                        title=f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
+                        description=description,
+                        color=discord.Color.red(),
+                    )
+                ),
+            )
+        except Exception as e:
+            log.error(f"clear failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="now", aliases=["np", "rn", "nowplaying"], help="display current song"
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.now")
     async def now(self, ctx: commands.Context):
-        mp = self.get_mp(ctx)
-        vc = ctx.guild.voice_client if ctx.guild else None
-        if (
-            vc is not None
-            and isinstance(vc, discord.VoiceClient)
-            and vc.is_playing()
-            and mp.play_message
-        ):
-            await ctx.send(embed=mp.play_message)
-        else:
-            await ctx.send("No songs are currently playing.")
+        try:
+            mp = self.get_mp(ctx)
+            vc = ctx.guild.voice_client if ctx.guild else None
+            if (
+                vc is not None
+                and isinstance(vc, discord.VoiceClient)
+                and vc.is_playing()
+                and mp.play_message
+            ):
+                await ctx.send(embed=mp.play_message)
+            else:
+                await ctx.send("No songs are currently playing.")
+        except Exception as e:
+            log.error(f"now failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="history", aliases=["h"], help="display history of songs played"
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.history")
     async def history(self, ctx: commands.Context):
-        mp = self.get_mp(ctx)
-        if mp and mp.history:
-            q_history = queue_message(list(mp.history)[:10])
-            await ctx.send(q_history)
+        try:
+            mp = self.get_mp(ctx)
+            if mp and mp.history:
+                q_history = queue_message(list(mp.history)[:10])
+                await ctx.send(q_history)
+        except Exception as e:
+            log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="jump", aliases=["j"], help="jumps to a specific position in queue"
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.jump")
     async def jump(self, ctx: commands.Context):
-        await ctx.send("currently in development")
+        try:
+            await ctx.send("currently in development")
+        except Exception as e:
+            log.error(f"jump failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="queue", aliases=["q"], help="displays current songs in queue"
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.queue")
     async def queue(self, ctx: commands.Context):
-        mp = self.get_mp(ctx)
-        if mp and len(mp.song_queue) > 0:
-            q_songs = mp.get_queue()
-            await ctx.send(q_songs)
+        try:
+            mp = self.get_mp(ctx)
+            if mp and len(mp.song_queue) > 0:
+                q_songs = mp.get_queue()
+                await ctx.send(q_songs)
+        except Exception as e:
+            log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="volume",
@@ -501,32 +577,42 @@ class MusicBot(commands.Cog):
         help="volume level between 0 and 100",
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.volume")
     async def volume(self, ctx: commands.Context, volume):
-        if isinstance(volume, str):
-            try:
-                volume = int(volume)
-            except ValueError:
-                await ctx.send("Volume must be a number between 0 and 100")
-                return
-        if not 0 <= volume <= 100:
-            return await ctx.send("Volume must be between 0 and 100")
-        mp = self.get_mp(ctx)
-        mp.volume = volume / 100
-        await mp.redis_set_state("volume", str(mp.volume))
-        await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
+        try:
+            if isinstance(volume, str):
+                try:
+                    volume = int(volume)
+                except ValueError:
+                    await ctx.send("Volume must be a number between 0 and 100")
+                    return
+            if not 0 <= volume <= 100:
+                return await ctx.send("Volume must be between 0 and 100")
+            mp = self.get_mp(ctx)
+            mp.volume = volume / 100
+            await mp.redis_set_state("volume", str(mp.volume))
+            await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
+        except Exception as e:
+            log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="ping", aliases=["latency", "l", "delay"], help="latency in milliseconds"
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context):
-        ms = self.bot.latency * 1000
-        embed = discord.Embed(
-            title="Ping - latency in ms",
-            description=f"Ping: **{round(ms)}** milliseconds!",
-        )
-        embed.color = _latency_color(ms)
-        await ctx.send(embed=embed)
+        try:
+            ms = self.bot.latency * 1000
+            embed = discord.Embed(
+                title="Ping - latency in ms",
+                description=f"Ping: **{round(ms)}** milliseconds!",
+            )
+            embed.color = _latency_color(ms)
+            await ctx.send(embed=embed)
+        except Exception as e:
+            log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
 
     # ── Restart recovery listeners ────────────────────────────────────────────
 
