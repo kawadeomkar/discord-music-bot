@@ -67,7 +67,15 @@ class MusicBot(commands.Cog):
     class for music bot
     """
 
-    __slots__ = ("bot", "mps", "spotify", "redis", "_active_spans", "_alone_timers")
+    __slots__ = (
+        "bot",
+        "mps",
+        "spotify",
+        "redis",
+        "_active_spans",
+        "_alone_timers",
+        "_restore_tasks",
+    )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -76,6 +84,7 @@ class MusicBot(commands.Cog):
         self.mps = {}
         self._active_spans: dict = {}  # id(ctx) → (Span, context_token)
         self._alone_timers: dict[int, asyncio.Task] = {}
+        self._restore_tasks: set[asyncio.Task] = set()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         assert ctx.guild is not None
@@ -93,7 +102,7 @@ class MusicBot(commands.Cog):
         # Cancel any pending alone-disconnect timer before the atomic gate so it
         # cannot fire after cleanup completes and attempt a second cleanup.
         existing = self._alone_timers.pop(guild.id, None)
-        if existing and not existing.done():
+        if existing and not existing.done() and existing is not asyncio.current_task():
             existing.cancel()
 
         # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
@@ -154,10 +163,10 @@ class MusicBot(commands.Cog):
         self._active_spans[id(ctx)] = (span, token)
 
         try:
+            if ctx.guild is None:
+                return
             old_channel = (
-                self.mps[ctx.guild.id]._channel
-                if ctx.guild and ctx.guild.id in self.mps
-                else None
+                self.mps[ctx.guild.id]._channel if ctx.guild.id in self.mps else None
             )
             mp = self.get_mp(ctx)
             if (
@@ -628,9 +637,7 @@ class MusicBot(commands.Cog):
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 
-    @_tracer.start_as_current_span("bot.alone_countdown")
     async def _alone_countdown(self, guild: discord.Guild) -> None:
-        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         try:
             mp = self.mps.get(guild.id)
             text_channel = mp._channel if mp is not None else None
@@ -649,24 +656,26 @@ class MusicBot(commands.Cog):
 
             await asyncio.sleep(10)
 
-            vc = guild.voice_client
-            if (
-                isinstance(vc, discord.VoiceClient)
-                and vc.channel is not None
-                and not any(not m.bot for m in vc.channel.members)
+            # Span covers only the post-sleep decision so it doesn't stay open for
+            # the full 10 seconds (which confuses OTLP exporters and leaks OTel context).
+            with _tracer.start_as_current_span(
+                "bot.alone_countdown",
+                attributes={"discord.guild_id": str(guild.id)},
             ):
-                log.info(
-                    f"Bot still alone in guild {guild.id} after 10s — disconnecting"
-                )
-                await self.cleanup(guild)
+                vc = guild.voice_client
+                if (
+                    isinstance(vc, discord.VoiceClient)
+                    and vc.channel is not None
+                    and not any(not m.bot for m in vc.channel.members)
+                ):
+                    log.info(
+                        f"Bot still alone in guild {guild.id} after 10s — disconnecting"
+                    )
+                    await self.cleanup(guild)
         except asyncio.CancelledError:
             pass  # user rejoined or explicit stop; timer was cancelled
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-            log.error(
-                f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True
-            )
+            log.error(f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True)
         finally:
             self._alone_timers.pop(guild.id, None)
 
@@ -679,7 +688,9 @@ class MusicBot(commands.Cog):
         if self.redis is None:
             return
         for guild in self.bot.guilds:
-            asyncio.create_task(self._restore_guild(guild))
+            task = asyncio.create_task(self._restore_guild(guild))
+            self._restore_tasks.add(task)
+            task.add_done_callback(self._restore_tasks.discard)
 
     @_tracer.start_as_current_span("guild.restore")
     async def _restore_guild(self, guild: discord.Guild) -> None:
@@ -794,6 +805,10 @@ class MusicBot(commands.Cog):
 
         vc = guild.voice_client
         if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
+            return
+
+        # Skip mute/deafen/server-deafen events — channel is unchanged.
+        if before.channel == after.channel:
             return
 
         # Only care about events that affect the bot's current channel.

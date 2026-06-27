@@ -25,6 +25,7 @@ def music_bot(mock_bot):
     cog.redis = None
     cog._active_spans = {}
     cog._alone_timers = {}
+    cog._restore_tasks = set()
     return cog
 
 
@@ -294,6 +295,7 @@ def music_bot_with_redis(mock_bot, fake_redis_bot):
     cog.redis = fake_redis_bot
     cog._active_spans = {}
     cog._alone_timers = {}
+    cog._restore_tasks = set()
     return cog
 
 
@@ -519,6 +521,59 @@ class TestVoiceStateConsistency:
         timer.cancel.assert_called_once()
         assert mock_guild.id not in music_bot_with_redis._alone_timers
 
+    async def test_two_rapid_leaves_produce_one_timer(
+        self, music_bot_with_redis, mock_guild
+    ):
+        """Two members leaving in quick succession cancels the first timer and starts one new one."""
+        mock_bot_user = MagicMock()
+        mock_bot_user.id = 999999999999999999
+        music_bot_with_redis.bot.user = mock_bot_user
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+
+        tasks_created = []
+        first_task = MagicMock(spec=asyncio.Task)
+        first_task.done.return_value = False
+        first_task.cancel = MagicMock()
+
+        def _capture_and_close(coro):
+            coro.close()
+            task = MagicMock(spec=asyncio.Task)
+            task.done.return_value = False
+            task.cancel = MagicMock()
+            tasks_created.append(task)
+            return task
+
+        def _make_member():
+            m = MagicMock(spec=discord.Member)
+            m.id = 123456789
+            m.bot = False
+            m.guild = mock_guild
+            before = MagicMock(spec=discord.VoiceState)
+            before.channel = vc.channel
+            after = MagicMock(spec=discord.VoiceState)
+            after.channel = None
+            return m, before, after
+
+        with patch("asyncio.create_task", side_effect=_capture_and_close):
+            m1, b1, a1 = _make_member()
+            await music_bot_with_redis.on_voice_state_update(m1, b1, a1)
+            m2, b2, a2 = _make_member()
+            await music_bot_with_redis.on_voice_state_update(m2, b2, a2)
+
+        assert len(tasks_created) == 2
+        tasks_created[
+            0
+        ].cancel.assert_called_once()  # first timer cancelled by second event
+        assert music_bot_with_redis._alone_timers[mock_guild.id] is tasks_created[1]
+
     async def test_member_change_in_unrelated_channel_ignored(
         self, music_bot_with_redis, mock_guild
     ):
@@ -615,6 +670,29 @@ class TestGetMp:
 
 
 class TestCleanup:
+    async def test_does_not_cancel_current_task(self, music_bot, mock_guild):
+        """cleanup() skips cancellation when the alone-timer IS the running task (self-cancel guard)."""
+        current = asyncio.current_task()
+        assert current is not None, "test must run inside an asyncio.Task"
+        music_bot._alone_timers[mock_guild.id] = (
+            current  # simulate countdown calling cleanup on itself
+        )
+
+        mp = MagicMock()
+        mp._prefetch_task = None
+        mp._restore_task = None
+        mp._player = None
+        mp._store = None
+        music_bot.mps[mock_guild.id] = mp
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        # If the guard were missing, current_task().cancel() would have been called
+        # and this coroutine would receive CancelledError at the next await.
+        assert not current.cancelled()
+        assert mock_guild.id not in music_bot._alone_timers
+
     async def test_disconnects_voice_client(self, music_bot, mock_guild):
         mp = MagicMock()
         mp._prefetch_task = None
@@ -772,6 +850,13 @@ class TestCogBeforeInvoke:
         await music_bot.cog_before_invoke(mock_ctx)
 
         store.set_connection.assert_not_awaited()
+
+    async def test_returns_early_when_guild_is_none(self, music_bot, mock_ctx):
+        """cog_before_invoke must not call get_mp (which asserts guild is not None) in a DM."""
+        mock_ctx.guild = None
+        music_bot.get_mp = MagicMock()
+        await music_bot.cog_before_invoke(mock_ctx)
+        music_bot.get_mp.assert_not_called()
 
 
 class TestValidateCommands:
@@ -1228,6 +1313,23 @@ class TestAloneCountdown:
                 await music_bot._alone_countdown(mock_guild)
 
         mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_skips_cleanup_when_voice_client_gone(self, music_bot, mock_guild):
+        """If the voice client is None when the countdown wakes, cleanup is not called."""
+        text_channel = MagicMock(spec=discord.TextChannel)
+        text_channel.send = AsyncMock()
+
+        mp = MagicMock()
+        mp._channel = text_channel
+        music_bot.mps[mock_guild.id] = mp
+
+        mock_guild.voice_client = None  # bot already disconnected mid-sleep
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot._alone_countdown(mock_guild)
+
+        mock_cleanup.assert_not_awaited()
 
     async def test_timer_removed_from_dict_on_completion(self, music_bot, mock_guild):
         """_alone_timers entry is removed in the finally block regardless of outcome."""
