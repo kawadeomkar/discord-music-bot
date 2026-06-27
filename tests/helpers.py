@@ -4,6 +4,7 @@ Plain module-level functions (not fixtures) so they can be imported directly
 from any test file or conftest without routing through pytest's plugin machinery.
 """
 
+import asyncio
 from unittest.mock import MagicMock
 
 from discord.utils import MISSING as _DISCORD_MISSING
@@ -41,3 +42,15 @@ def stub_create_task(return_value=None):
         return return_value if return_value is not None else MagicMock()
 
     return MagicMock(side_effect=_impl)
+
+
+def make_mock_task() -> MagicMock:
+    """Return a MagicMock resembling a running asyncio.Task.
+
+    Shorthand for the three-line boilerplate used wherever a test needs to
+    verify that a running timer or background task is cancelled.
+    """
+    task = MagicMock(spec=asyncio.Task)
+    task.done.return_value = False
+    task.cancel = MagicMock()
+    return task

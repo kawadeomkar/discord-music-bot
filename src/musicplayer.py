@@ -255,8 +255,10 @@ class MusicPlayer:
                 for item in reversed(hist_items):
                     try:
                         self.history.append(orjson.loads(item))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to deserialize history item in guild {self._guild.id}: {e}"
+                        )
 
                 span.set_attribute("restore.queue_count", count)
                 span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
@@ -569,7 +571,9 @@ class MusicPlayer:
                         try:
                             self.song_queue.popleft()
                         except IndexError:
-                            pass
+                            log.warning(
+                                f"song_queue was empty on failed-song pop in guild {self._guild.id}"
+                            )
                         if self._store is not None:
                             await self._store.pop_queue()
                         self.queue.task_done()
@@ -577,8 +581,10 @@ class MusicPlayer:
                             await self._channel.send(
                                 "Failed to load the next song, skipping."
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.warning(
+                                f"Failed to send skip-notification in guild {self._guild.id}: {e}"
+                            )
                         continue
 
                     span.set_attribute("song.title", self.current_song.title or "")
@@ -677,5 +683,7 @@ class MusicPlayer:
                                 text=f"trace: {format(span_ctx.trace_id, '032x')}"
                             )
                         await self._channel.send(embed=embed)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to send playback-error embed in guild {self._guild.id}: {e}"
+                        )
