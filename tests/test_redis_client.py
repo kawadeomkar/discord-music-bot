@@ -132,7 +132,12 @@ class TestKeyHelpers:
         assert "123456789" in store.now_playing_key()
 
     def test_keys_are_distinct(self, store):
-        keys = [store.queue_key(), store.state_key(), store.history_key(), store.now_playing_key()]
+        keys = [
+            store.queue_key(),
+            store.state_key(),
+            store.history_key(),
+            store.now_playing_key(),
+        ]
         assert len(set(keys)) == len(keys)
 
 
@@ -487,8 +492,24 @@ class TestPopQueueAndStartSong:
         ttl = await fake_redis.ttl(store.state_key())
         assert ttl > 0
 
+    async def test_empty_queue_lpop_is_noop_state_still_written(
+        self, store, fake_redis
+    ):
+        """LPOP on an empty list returns nil, but the HSET still runs atomically."""
+        await store.pop_queue_and_start_song(
+            "https://yt.com/v=1", "No Queue Song", 500.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_url"] == b"https://yt.com/v=1"
+        assert state[b"current_song_title"] == b"No Queue Song"
+        assert state[b"play_start_epoch"] == b"500.0"
+        remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert remaining == []
+
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.pop_queue_and_start_song("url", "title", 1000.0)  # must not raise
+        await broken_store.pop_queue_and_start_song(
+            "url", "title", 1000.0
+        )  # must not raise
 
 
 # ── Now-playing operations ────────────────────────────────────────────────────
@@ -591,3 +612,41 @@ class TestPlaybackPosition:
 
     async def test_clear_playback_position_swallows_error(self, broken_store):
         await broken_store.clear_playback_position()  # must not raise
+
+
+class TestClearSongEndState:
+    async def test_clears_current_song_fields(self, store, fake_redis):
+        await fake_redis.hset(
+            store.state_key(),
+            mapping={
+                b"current_song_url": b"https://yt.com/v=1",
+                b"current_song_title": b"Song",
+            },
+        )
+        await store.clear_song_end_state()
+        state = await fake_redis.hgetall(store.state_key())
+        assert state.get(b"current_song_url") == b""
+        assert state.get(b"current_song_title") == b""
+
+    async def test_deletes_now_playing_hash(self, store, fake_redis):
+        await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
+        await store.clear_song_end_state()
+        assert await fake_redis.exists(store.now_playing_key()) == 0
+
+    async def test_removes_playback_position_fields(self, store, fake_redis):
+        await fake_redis.hset(
+            store.state_key(),
+            mapping={
+                b"play_start_epoch": b"1000.0",
+                b"total_pause_seconds": b"5",
+                b"pause_start_epoch": b"995.0",
+            },
+        )
+        await store.clear_song_end_state()
+        state = await fake_redis.hgetall(store.state_key())
+        assert b"play_start_epoch" not in state
+        assert b"total_pause_seconds" not in state
+        assert b"pause_start_epoch" not in state
+
+    async def test_swallows_redis_error(self, broken_store):
+        await broken_store.clear_song_end_state()  # must not raise

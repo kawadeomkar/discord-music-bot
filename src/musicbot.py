@@ -756,7 +756,8 @@ class MusicBot(commands.Cog):
                     else:
                         notify_channel = next(
                             (
-                                ch for ch in guild.text_channels
+                                ch
+                                for ch in guild.text_channels
                                 if ch.permissions_for(guild.me).send_messages
                             ),
                             None,

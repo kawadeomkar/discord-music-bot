@@ -1,5 +1,5 @@
 import os
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
@@ -181,19 +181,20 @@ class GuildRedisStore:
         try:
             pipe = self.redis.pipeline(transaction=True)
             pipe.lpop(self.queue_key())
-            pipe.hset(self.state_key(), mapping={
-                "current_song_url": url,
-                "current_song_title": title,
-                "play_start_epoch": str(play_start_epoch),
-                "total_pause_seconds": "0",
-            })
+            pipe.hset(
+                self.state_key(),
+                mapping={
+                    "current_song_url": url,
+                    "current_song_title": title,
+                    "play_start_epoch": str(play_start_epoch),
+                    "total_pause_seconds": "0",
+                },
+            )
             pipe.hdel(self.state_key(), "pause_start_epoch")
             pipe.expire(self.state_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
-            log.warning(
-                f"[guild:{self.guild_id}] pop_queue_and_start_song failed: {e}"
-            )
+            log.warning(f"[guild:{self.guild_id}] pop_queue_and_start_song failed: {e}")
 
     async def get_queue(self) -> list[bytes]:
         """Return all queued items oldest-first."""
@@ -261,10 +262,12 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] clear_now_playing failed: {e}")
 
-    async def get_now_playing(self) -> dict:
+    async def get_now_playing(self) -> dict[bytes, bytes]:
         """HGETALL the now_playing hash. Returns empty dict on key miss or error."""
         try:
-            return await self.redis.hgetall(self.now_playing_key())
+            return cast(
+                dict[bytes, bytes], await self.redis.hgetall(self.now_playing_key())
+            )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] get_now_playing failed: {e}")
             return {}
@@ -300,11 +303,13 @@ class GuildRedisStore:
     async def on_resume(self, resume_epoch: float) -> None:
         """Accumulate elapsed pause time into total_pause_seconds and clear pause_start_epoch."""
         try:
-            state = await self.redis.hgetall(self.state_key())
-            pause_start_raw = state.get(b"pause_start_epoch", b"")
+            vals = await self.redis.hmget(
+                self.state_key(), "pause_start_epoch", "total_pause_seconds"
+            )
+            pause_start_raw = vals[0] or b""
             if not pause_start_raw:
                 return
-            total_raw = state.get(b"total_pause_seconds", b"0")
+            total_raw = vals[1] if vals[1] is not None else b"0"
             elapsed_pause = resume_epoch - float(pause_start_raw)
             new_total = int(float(total_raw)) + int(elapsed_pause)
             pipe = self.redis.pipeline()
@@ -326,6 +331,30 @@ class GuildRedisStore:
             )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] clear_playback_position failed: {e}")
+
+    async def clear_song_end_state(self) -> None:
+        """Pipeline that clears all transient song state in one round-trip.
+
+        Combines: current_song_url/title ← "", DELETE now_playing hash,
+        HDEL all position tracking fields.  Called on both normal song end
+        and the error-path skip in loop().
+        """
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hset(
+                self.state_key(),
+                mapping={"current_song_url": "", "current_song_title": ""},
+            )
+            pipe.delete(self.now_playing_key())
+            pipe.hdel(
+                self.state_key(),
+                "play_start_epoch",
+                "total_pause_seconds",
+                "pause_start_epoch",
+            )
+            await pipe.execute()
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] clear_song_end_state failed: {e}")
 
     # State operations
 

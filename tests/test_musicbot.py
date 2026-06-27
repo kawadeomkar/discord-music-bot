@@ -743,14 +743,14 @@ class TestCleanup:
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot, mock_ctx):
         mock_mp = MagicMock()
-        mock_mp._store = None  # skip both redis_set_state and channel-persistence branches
+        mock_mp._store = (
+            None  # skip both redis_set_state and channel-persistence branches
+        )
         music_bot.get_mp = MagicMock(return_value=mock_mp)
         await music_bot.cog_before_invoke(mock_ctx)
         music_bot.get_mp.assert_called_once_with(mock_ctx)
 
-    async def test_writes_last_author_id_when_store_present(
-        self, music_bot, mock_ctx
-    ):
+    async def test_writes_last_author_id_when_store_present(self, music_bot, mock_ctx):
         """When the player has a Redis store, cog_before_invoke persists the author ID."""
         mock_mp = MagicMock()
         mock_mp._store = MagicMock()  # non-None
@@ -1390,6 +1390,9 @@ class TestRestoreGuildChannelDeleted:
 
         mock_guild.get_channel.return_value = None  # both resolved to None
         mock_guild.system_channel.send = AsyncMock()
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
 
         await music_bot_with_redis._restore_guild(mock_guild)
 
@@ -1400,7 +1403,7 @@ class TestRestoreGuildChannelDeleted:
     async def test_sends_notification_via_system_channel(
         self, music_bot_with_redis, mock_guild, fake_redis_bot
     ):
-        """Notification is sent when both channels are deleted."""
+        """Notification is sent via system_channel when both stored channels are deleted."""
         from src.redis_client import GuildRedisStore
 
         store = GuildRedisStore(fake_redis_bot, mock_guild.id)
@@ -1408,6 +1411,9 @@ class TestRestoreGuildChannelDeleted:
 
         mock_guild.get_channel.return_value = None
         mock_guild.system_channel.send = AsyncMock()
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
 
         await music_bot_with_redis._restore_guild(mock_guild)
 
@@ -1417,6 +1423,32 @@ class TestRestoreGuildChannelDeleted:
         assert "voice channel" in msg
         assert "text channel" in msg
         assert "were deleted" in msg
+
+    async def test_falls_back_to_text_channels_when_system_channel_no_perms(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When system_channel denies send_messages, falls back to guild.text_channels."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=False
+        )
+
+        fallback = MagicMock(spec=discord.TextChannel)
+        fallback.send = AsyncMock()
+        fallback.permissions_for = MagicMock(
+            return_value=discord.Permissions(send_messages=True)
+        )
+        mock_guild.text_channels = [fallback]
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        fallback.send.assert_awaited_once()
+        mock_guild.system_channel.send.assert_not_called()
 
     async def test_notifies_via_text_channel_when_only_voice_deleted(
         self, music_bot_with_redis, mock_guild, fake_redis_bot
@@ -1456,6 +1488,9 @@ class TestRestoreGuildChannelDeleted:
         mock_guild.get_channel.return_value = None
         mock_guild.system_channel.send = AsyncMock(
             side_effect=Exception("channel gone")
+        )
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
         )
 
         await music_bot_with_redis._restore_guild(mock_guild)  # must not raise
