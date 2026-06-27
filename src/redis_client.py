@@ -40,8 +40,8 @@ async def close_redis_pool(pool: aioredis.ConnectionPool) -> None:
     """Gracefully close the connection pool. Call once at shutdown."""
     try:
         await pool.aclose()
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Failed to close Redis connection pool: {e}")
 
 
 # ── Generic cache helpers ─────────────────────────────────────────────────────

@@ -651,8 +651,10 @@ class MusicBot(commands.Cog):
                             color=discord.Color.orange(),
                         )
                     )
-                except Exception:
-                    pass  # channel deleted or no permission — countdown continues regardless
+                except Exception as e:
+                    log.warning(
+                        f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
+                    )
 
             await asyncio.sleep(10)
 
