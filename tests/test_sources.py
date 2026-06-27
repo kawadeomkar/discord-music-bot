@@ -5,8 +5,10 @@ import pytest
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
+    SpotifyType,
     URLSource,
     YTSource,
+    YTType,
     parse_input,
     parse_url,
     spotify_playlist_to_ytsearch,
@@ -57,13 +59,43 @@ class TestParseUrlYouTube:
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.YOUTUBE
 
+    def test_youtube_watch_url_is_track_by_default(self):
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.TRACK
+        assert result.list_id is None
+
+    def test_youtube_url_with_list_param_is_playlist(self):
+        url = "https://www.youtube.com/watch?v=jOLT6ukrQSg&list=RDEMfxur2p8gn1zGJ2gwGBdjQg"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.list_id == "RDEMfxur2p8gn1zGJ2gwGBdjQg"
+        assert result.url == url
+
+    def test_youtube_playlist_url_is_playlist(self):
+        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.list_id == "PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+
+    def test_youtube_playlist_preserves_timestamp(self):
+        url = "https://www.youtube.com/watch?v=abc&list=PLtest&t=30"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.list_id == "PLtest"
+        assert result.ts == 30
+
 
 class TestParseUrlSpotify:
     def test_spotify_track(self):
         url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
         result = parse_url(url, f"-play {url}")
         assert isinstance(result, SpotifySource)
-        assert result.type == "track"
+        assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
         assert result.stype == URLSource.SPOTIFY
         assert result.process is True
@@ -72,7 +104,7 @@ class TestParseUrlSpotify:
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         result = parse_url(url, f"-play {url}")
         assert isinstance(result, SpotifySource)
-        assert result.type == "playlist"
+        assert result.type == SpotifyType.PLAYLIST
         assert result.id == "37i9dQZF1DXcBWIGoYBM5M"
         assert result.stype == URLSource.SPOTIFY
 
@@ -80,7 +112,7 @@ class TestParseUrlSpotify:
         url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=abc123"
         result = parse_url(url, f"-play {url}")
         assert isinstance(result, SpotifySource)
-        assert result.type == "track"
+        assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
 
     def test_unknown_spotify_type_raises(self):

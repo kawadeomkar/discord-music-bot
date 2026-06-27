@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 import orjson
 import pytest
-
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -15,6 +14,21 @@ from src.youtube import (
     _YTDL_STREAM_OPTS,
     _stream_url_ttl,
 )
+from tests.helpers import noop_ffmpeg_init
+
+
+@pytest.fixture(autouse=True)
+def _suppress_ytdl_del(monkeypatch):
+    """Patch discord.AudioSource.__del__ to a no-op for every test in this module.
+
+    YTDL tests patch discord.FFmpegOpusAudio.__init__ to return_value=None so that
+    no real FFmpeg process is spawned. This leaves _process unset on the instance.
+    When Python GC collects the object, AudioSource.__del__ → FFmpegAudio.cleanup()
+    → _kill_process() → _check_process_returncode() accesses self._process and raises
+    AttributeError. Suppressing __del__ here avoids that crash without touching
+    production code.
+    """
+    monkeypatch.setattr(discord.AudioSource, "__del__", lambda self: None)
 
 
 def _fake_ytdl_data(**overrides):
@@ -252,7 +266,7 @@ class TestYTStream:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
@@ -271,6 +285,7 @@ class TestYTStream:
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
+            noop_ffmpeg_init(self)
             captured_options["options"] = options
 
         with (
@@ -292,6 +307,7 @@ class TestYTStream:
         captured_options = {}
 
         def capture_init(self, url, *, executable, before_options, options):
+            noop_ffmpeg_init(self)
             captured_options["options"] = options
 
         with (
@@ -350,7 +366,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract") as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
         mock_extract.assert_not_called()
@@ -369,7 +385,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=fake_redis)
 
@@ -388,7 +404,7 @@ class TestStreamCache:
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data) as mock_extract,
-            patch.object(discord.FFmpegOpusAudio, "__init__", return_value=None),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
         ):
             await YTDL.yt_stream(qobj, channel, redis=bad_redis)
 

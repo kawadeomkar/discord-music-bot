@@ -9,6 +9,7 @@ import discord
 import orjson
 from discord.ext import commands
 
+from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import GuildRedisStore, cache_get
@@ -25,20 +26,41 @@ def _queue_display_str(title: str, url: str) -> str:
     return f"{title} - {url}"
 
 
-def _serialize_queue_item(qobj: QueueObject) -> bytes:
+def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
+    if isinstance(item, QueueObject):
+        return orjson.dumps(
+            {
+                "type": "qobj",
+                "webpage_url": item.webpage_url,
+                "title": item.title,
+                "requester_id": item.requester.id,
+                "ts": item.ts,
+            }
+        )
     return orjson.dumps(
         {
-            "webpage_url": qobj.webpage_url,
-            "title": qobj.title,
-            "requester_id": qobj.requester.id,
-            "ts": qobj.ts,
+            "type": "ytsource",
+            "ytsearch": item.ytsearch,
+            "url": item.url,
+            "process": item.process,
+            "ts": item.ts,
         }
     )
 
 
-def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[QueueObject]:
+def _deserialize_queue_item(
+    data: bytes, guild: discord.Guild
+) -> Optional[Union[QueueObject, YTSource]]:
     try:
         d = orjson.loads(data)
+        if d.get("type") == "ytsource":
+            return YTSource(
+                ytsearch=d.get("ytsearch"),
+                url=d.get("url"),
+                process=d.get("process"),
+                ts=d.get("ts"),
+            )
+        # "qobj" type or legacy entries written before the type field was added
         member: Union[discord.Member, discord.User, None] = (
             guild.get_member(d["requester_id"]) or guild.owner
         )
@@ -70,6 +92,8 @@ class MusicPlayer:
         "_store",
         "_restore_task",
         "_restore_complete",
+        "_queue_cleared",
+        "_background_tasks",
     )
 
     bot: commands.Bot
@@ -90,6 +114,8 @@ class MusicPlayer:
     _store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
+    _queue_cleared: bool
+    _background_tasks: set
 
     def __init__(
         self,
@@ -123,6 +149,8 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
+        self._queue_cleared: bool = False
+        self._background_tasks: set = set()
 
     @classmethod
     def from_context(
@@ -255,10 +283,19 @@ class MusicPlayer:
                 # Restore queue (Redis list → asyncio.Queue + song_queue deque)
                 items = await self._store.get_queue()
                 for item in items:
-                    qobj = _deserialize_queue_item(item, self._guild)
-                    if qobj is not None:
-                        await self.queue.put(qobj)
-                        self.song_queue.append(f"{qobj.title} - {qobj.webpage_url}")
+                    restored = _deserialize_queue_item(item, self._guild)
+                    if restored is not None:
+                        await self.queue.put(restored)
+                        if isinstance(restored, QueueObject):
+                            self.song_queue.append(
+                                _queue_display_str(restored.title, restored.webpage_url)
+                            )
+                        else:
+                            self.song_queue.append(
+                                _queue_display_str(
+                                    restored.ytsearch or restored.url or "?", ""
+                                )
+                            )
                         count += 1
                 if count:
                     log.info(
@@ -270,8 +307,10 @@ class MusicPlayer:
                 for item in reversed(hist_items):
                     try:
                         self.history.append(orjson.loads(item))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to deserialize history item in guild {self._guild.id}: {e}"
+                        )
 
                 span.set_attribute("restore.queue_count", count)
                 span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
@@ -293,13 +332,19 @@ class MusicPlayer:
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
-    async def queue_put(self, obj: Union[QueueObject, YTSource, List[YTSource]]):
-        items: list[Union[QueueObject, YTSource]] = (
-            list(obj) if isinstance(obj, list) else [obj]
-        )
+    async def queue_put(
+        self,
+        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        *,
+        prefetch: bool = True,
+    ):
+        items: list[Union[QueueObject, YTSource]]
+        if isinstance(obj, list):
+            items = list(obj)  # type: ignore[arg-type]
+        else:
+            items = [obj]
         for item in items:
             await self.queue.put(item)
-
             if isinstance(item, QueueObject):
                 self.song_queue.append(_queue_display_str(item.title, item.webpage_url))
             else:
@@ -307,11 +352,29 @@ class MusicPlayer:
                     _queue_display_str(item.ytsearch or item.url or "?", "")
                 )
 
-            # Mirror to Redis and kick off stream pre-fetch (QueueObject only —
-            # YTSource items have no stable webpage_url to key the cache on).
-            if isinstance(item, QueueObject) and self._store is not None:
+        # Mirror to Redis and (optionally) kick off stream pre-fetch.
+        # prefetch=False for bulk playlist enqueues — spawning N concurrent
+        # prefetch tasks saturates the thread pool and produces stream URLs that
+        # expire before the song reaches playback position. _prefetch_next_song
+        # handles one-ahead prefetch naturally as songs play.
+        if self._store is None:
+            return
+        serializable = [i for i in items if isinstance(i, (QueueObject, YTSource))]
+        if not serializable:
+            return
+        if prefetch:
+            for item in serializable:
                 await self._store.push_queue(_serialize_queue_item(item))
-                asyncio.create_task(YTDL.prefetch_stream(item, redis=self._store.redis))
+                if isinstance(item, QueueObject):
+                    task = asyncio.create_task(
+                        YTDL.prefetch_stream(item, redis=self._store.redis)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+        else:
+            await self._store.push_queue_batch(
+                [_serialize_queue_item(item) for item in serializable]
+            )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
@@ -330,18 +393,21 @@ class MusicPlayer:
             except asyncio.CancelledError:
                 pass
 
-    async def queue_clear(self) -> None:
+    async def queue_clear(self) -> List[str]:
         await self._cancel_prefetch()
         async with self.mutex:
+            self._queue_cleared = True
             for _ in range(self.queue.qsize()):
                 try:
                     self.queue.get_nowait()
                     self.queue.task_done()
                 except asyncio.QueueEmpty:
                     break
+            cleared = list(self.song_queue)
             self.song_queue.clear()
         if self._store is not None:
             await self._store.delete_queue()
+        return cleared
 
     async def queue_shuffle(self) -> str:
         await self._cancel_prefetch()
@@ -434,9 +500,48 @@ class MusicPlayer:
             embed.set_thumbnail(url=thumbnail)
         return embed
 
-    async def update_activity(self):
-        # TODO
-        pass
+    async def update_activity(self, song: Optional[YTDL] = None) -> None:
+        if song is not None:
+            now_ms = int(time.time() * 1000)
+            timestamps: dict = {"start": now_ms}
+            if song.duration_secs > 0:
+                timestamps["end"] = now_ms + song.duration_secs * 1000
+
+            # Bot opcode-3 activities only render `name` reliably in Discord's
+            # client. Rich Presence (details, assets) requires the Discord RPC/SDK
+            # which connects to a local desktop client — incompatible with server
+            # bots. Pack the uploader into `name` as a suffix so it's visible.
+            # `details` is kept as a forward-compat fallback; `timestamps` works
+            # in the hover tooltip regardless.
+            title = song.title or "a song"
+            uploader = song.uploader
+            raw_name = f"{title} · {uploader}" if uploader else title
+            name = raw_name if len(raw_name) <= 128 else raw_name[:127] + "…"
+
+            # state renders in both hover and click card for bot activities.
+            # state_url kept for forward-compat (state renders, URL may become
+            # clickable). details/details_url confirmed non-rendering for bots.
+            activity = discord.Activity(
+                type=discord.ActivityType.listening,
+                name=name,
+                state=song.duration,
+                state_url=song.webpage_url,  # discord.py >= 2.6; silent no-op if downgraded
+                timestamps=timestamps,
+            )
+        else:
+            # Only reset when no other guild is still playing.
+            active = any(
+                vc.is_playing()
+                for vc in self.bot.voice_clients
+                if isinstance(vc, discord.VoiceClient)
+            )
+            if active:
+                return
+            activity = discord.Game(name="music")
+        try:
+            await self.bot.change_presence(activity=activity)
+        except Exception as e:
+            log.warning(f"Failed to update bot activity: {e}", exc_info=True)
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
@@ -488,6 +593,7 @@ class MusicPlayer:
         except Exception as e:
             log.error(f"embed error: {e}")
 
+    @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
         """Pre-resolve and stream the next queued song while the current one plays.
 
@@ -501,22 +607,21 @@ class MusicPlayer:
             source = self.queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
-        with _tracer.start_as_current_span(
-            "player.prefetch",
-            attributes={"discord.guild_id": str(self._guild.id)},
-        ) as span:
-            try:
-                source = await self._resolve_source(source)
-                return await self._stream_source(source)
-            except asyncio.CancelledError:
-                self.queue.task_done()
-                raise
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
-                self.queue.task_done()
-                return None
+        trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
+        try:
+            source = await self._resolve_source(source)
+            return await self._stream_source(source)
+        except asyncio.CancelledError:
+            self.queue.task_done()
+            raise
+        except Exception as e:
+            trace.get_current_span().record_exception(e)
+            trace.get_current_span().set_status(
+                StatusCode.ERROR, f"{type(e).__name__}: {e}"
+            )
+            log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
+            self.queue.task_done()
+            return None
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
@@ -533,8 +638,18 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
+                    queue_was_cleared = self._queue_cleared
+                    self._queue_cleared = False
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
+                    if prefetched_song is not None and queue_was_cleared:
+                        # The queue was cleared while _prefetch_next_song was running.
+                        # The prefetch task completed and consumed a get_nowait() — balance
+                        # it with task_done() and release the FFmpeg subprocess via cleanup()
+                        # so it doesn't leak when we discard the result.
+                        self.queue.task_done()
+                        prefetched_song.cleanup()
+                        prefetched_song = None
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
@@ -553,7 +668,9 @@ class MusicPlayer:
                         try:
                             self.song_queue.popleft()
                         except IndexError:
-                            pass
+                            log.warning(
+                                f"song_queue was empty on failed-song pop in guild {self._guild.id}"
+                            )
                         if self._store is not None:
                             await self._store.pop_queue()
                         self.queue.task_done()
@@ -561,16 +678,34 @@ class MusicPlayer:
                             await self._channel.send(
                                 "Failed to load the next song, skipping."
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log.warning(
+                                f"Failed to send skip-notification in guild {self._guild.id}: {e}"
+                            )
                         continue
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    self.song_queue.popleft()
+                    discard = False
+                    async with self.mutex:
+                        try:
+                            self.song_queue.popleft()
+                        except IndexError:
+                            # song_queue was cleared while this song was being resolved
+                            # (e.g. during the async yt_stream call). Discard without
+                            # playing; task_done() balances the queue.get() above.
+                            # cleanup() terminates the FFmpeg subprocess that yt_stream
+                            # already spawned — omitting it would leak the process.
+                            self.queue.task_done()
+                            self.current_song.cleanup()
+                            self.current_song = None
+                            discard = True
+                    if discard:
+                        continue
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
+                    assert self.current_song is not None
                     vc.play(
                         self.current_song,
                         after=lambda _: self.bot.loop.call_soon_threadsafe(
@@ -588,7 +723,7 @@ class MusicPlayer:
                             play_start_epoch=play_start,
                         )
 
-                    assert self.current_song is not None  # guarded by `if is None: continue` above
+                    await self.update_activity(self.current_song)
                     await self._send_now_playing(self.current_song)
 
                     # Gate prefetch on restore completion so _restore_state() has had a
@@ -629,8 +764,10 @@ class MusicPlayer:
 
                     self.queue.task_done()
                     self.current_song = None
+                    await self.update_activity(None)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
+                    await self.update_activity(None)
                     raise
                 except Exception as e:
                     span.record_exception(e)
@@ -659,5 +796,7 @@ class MusicPlayer:
                                 text=f"trace: {format(span_ctx.trace_id, '032x')}"
                             )
                         await self._channel.send(embed=embed)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to send playback-error embed in guild {self._guild.id}: {e}"
+                        )
