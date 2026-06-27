@@ -26,10 +26,12 @@ from opentelemetry.trace import StatusCode
 
 from src.telemetry import get_tracer
 from src.util import (
+    cancel_task,
     latency_color,
     queue_message,
     send_embed,
     send_queue_phrases,
+    trace_footer,
     get_logger,
 )
 
@@ -96,18 +98,11 @@ class MusicBot(commands.Cog):
         if guild.voice_client:
             await guild.voice_client.disconnect(force=False)
         try:
-            if mp._prefetch_task and not mp._prefetch_task.done():
-                mp._prefetch_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._prefetch_task
-            if mp._restore_task and not mp._restore_task.done():
-                mp._restore_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._restore_task
-            if mp._player and not mp._player.done():
-                mp._player.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._player
+            await asyncio.gather(
+                cancel_task(mp._prefetch_task),
+                cancel_task(mp._restore_task),
+                cancel_task(mp._player),
+            )
             if mp._store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
@@ -200,16 +195,12 @@ class MusicBot(commands.Cog):
         span = trace.get_current_span()
         span.record_exception(e)
         span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-        span_ctx = span.get_span_context()
-        footer = (
-            f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
-        )
         await send_embed(
             ctx,
             title,
             f"**{type(e).__name__}:** {e}",
             discord.Color.red(),
-            footer=footer,
+            footer=trace_footer(span),
         )
 
     @_tracer.start_as_current_span("bot.queue_source")

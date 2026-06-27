@@ -15,7 +15,7 @@ from opentelemetry.trace import StatusCode
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
-from src.util import queue_message, send_embed, get_logger
+from src.util import cancel_task, queue_message, send_embed, trace_footer, get_logger
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -24,6 +24,12 @@ from src.youtube import YTDL, QueueObject
 
 def _queue_display_str(title: str, url: str) -> str:
     return f"{title} - {url}"
+
+
+def _item_display_str(item: Union[QueueObject, YTSource]) -> str:
+    if isinstance(item, QueueObject):
+        return _queue_display_str(item.title, item.webpage_url)
+    return _queue_display_str(item.ytsearch or item.url or "?", "")
 
 
 def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
@@ -288,12 +294,7 @@ class MusicPlayer:
             items = [obj]
         for item in items:
             await self.queue.put(item)
-            if isinstance(item, QueueObject):
-                self.song_queue.append(_queue_display_str(item.title, item.webpage_url))
-            else:
-                self.song_queue.append(
-                    _queue_display_str(item.ytsearch or item.url or "?", "")
-                )
+            self.song_queue.append(_item_display_str(item))
 
         # Mirror to Redis and (optionally) kick off stream pre-fetch.
         # prefetch=False for bulk playlist enqueues — spawning N concurrent
@@ -329,12 +330,7 @@ class MusicPlayer:
         the item the prefetch already dequeued via get_nowait() is accounted for
         via its CancelledError handler before we start modifying the queue.
         """
-        if self._prefetch_task and not self._prefetch_task.done():
-            self._prefetch_task.cancel()
-            try:
-                await self._prefetch_task
-            except asyncio.CancelledError:
-                pass
+        await cancel_task(self._prefetch_task)
 
     async def queue_clear(self) -> List[str]:
         await self._cancel_prefetch()
@@ -373,12 +369,7 @@ class MusicPlayer:
             for song in shuffled:
                 try:
                     self.queue.put_nowait(song)
-                    if isinstance(song, QueueObject):
-                        squeue.append(_queue_display_str(song.title, song.webpage_url))
-                    else:
-                        squeue.append(
-                            _queue_display_str(song.ytsearch or song.url or "?", "")
-                        )
+                    squeue.append(_item_display_str(song))
                 except asyncio.QueueFull:
                     break
             self.song_queue = deque(squeue)
@@ -666,18 +657,12 @@ class MusicPlayer:
                     prefetched_song = None
                     self.current_song = None
                     try:
-                        span_ctx = span.get_span_context()
-                        footer = (
-                            f"trace: {format(span_ctx.trace_id, '032x')}"
-                            if span_ctx.is_valid
-                            else None
-                        )
                         await send_embed(
                             self._channel,
                             "Playback error — skipping song",
                             f"**{type(e).__name__}:** {e}",
                             discord.Color.red(),
-                            footer=footer,
+                            footer=trace_footer(span),
                         )
                     except Exception:
                         pass

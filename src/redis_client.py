@@ -92,6 +92,12 @@ class GuildRedisStore:
     def history_key(self) -> str:
         return GUILD_HISTORY_KEY.format(guild_id=self.guild_id)
 
+    def _pipe_expire_all(self, pipe) -> None:
+        """Queue expire commands for all three guild keys onto an existing pipeline."""
+        pipe.expire(self.queue_key(), GUILD_TTL)
+        pipe.expire(self.state_key(), GUILD_TTL)
+        pipe.expire(self.history_key(), GUILD_TTL)
+
     # Queue operations
 
     async def push_queue(self, data: bytes) -> None:
@@ -99,9 +105,7 @@ class GuildRedisStore:
         try:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), data)
-            pipe.expire(self.queue_key(), GUILD_TTL)
-            pipe.expire(self.state_key(), GUILD_TTL)
-            pipe.expire(self.history_key(), GUILD_TTL)
+            self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
@@ -113,9 +117,7 @@ class GuildRedisStore:
         try:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), *items)
-            pipe.expire(self.queue_key(), GUILD_TTL)
-            pipe.expire(self.state_key(), GUILD_TTL)
-            pipe.expire(self.history_key(), GUILD_TTL)
+            self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")

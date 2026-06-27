@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import aiohttp
 import ujson
@@ -87,41 +87,51 @@ class Spotify:
 
     # ── Cached API methods ────────────────────────────────────────────────────
 
-    @_tracer.start_as_current_span("spotify.track")
-    async def track(self, tid: str) -> str:
-        trace.get_current_span().set_attribute("spotify.track_id", tid)
-        key = f"spotify:track:{tid}"
+    async def _cached_call(
+        self,
+        key: str,
+        ttl: int,
+        fetch_fn: Callable[[], Awaitable[Any]],
+    ) -> Any:
         cached = await cache_get(self._redis, key)
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
             return cached
-        endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
-        resp = await self.http_call(endpoint)
-        result = resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
-        await cache_set(self._redis, key, result, _TRACK_TTL)
+        result = await fetch_fn()
+        await cache_set(self._redis, key, result, ttl)
         return result
+
+    @_tracer.start_as_current_span("spotify.track")
+    async def track(self, tid: str) -> str:
+        trace.get_current_span().set_attribute("spotify.track_id", tid)
+
+        async def fetch() -> str:
+            endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
+            resp = await self.http_call(endpoint)
+            return resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+
+        return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
     @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(self, pid: str) -> List[str]:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
-        key = f"spotify:playlist:{pid}"
-        cached = await cache_get(self._redis, key)
-        trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
-        if cached is not None:
-            return cached
-        endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-        data: Dict[str, Union[str, int]] = {
-            "fields": "items(track(name,artists(name)))"
-        }
-        resp = await self.http_call(endpoint, params=data)
-        track_titles = [
-            item["track"]["name"]
-            + "".join(f" {a['name']}" for a in item["track"]["artists"])
-            for item in resp.get("items", [])
-        ]
-        trace.get_current_span().set_attribute("spotify.track_count", len(track_titles))
-        await cache_set(self._redis, key, track_titles, _PLAYLIST_TTL)
-        return track_titles
+
+        async def fetch() -> List[str]:
+            endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
+            resp = await self.http_call(
+                endpoint, params={"fields": "items(track(name,artists(name)))"}
+            )
+            track_titles = [
+                item["track"]["name"]
+                + "".join(f" {a['name']}" for a in item["track"]["artists"])
+                for item in resp.get("items", [])
+            ]
+            trace.get_current_span().set_attribute(
+                "spotify.track_count", len(track_titles)
+            )
+            return track_titles
+
+        return await self._cached_call(f"spotify:playlist:{pid}", _PLAYLIST_TTL, fetch)
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[List[str], str]) -> Any:
@@ -129,17 +139,16 @@ class Spotify:
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.artist_ids", ",".join(ids))
         trace.get_current_span().set_attribute("spotify.artist_count", len(ids))
-        key = f"spotify:artist:{','.join(sorted(ids))}"
-        cached = await cache_get(self._redis, key)
-        trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
-        if cached is not None:
-            return cached
-        resp = await self.http_call(
-            self.spotify_endpoint + "v1/artists", params={"ids": ",".join(ids)}
+
+        async def fetch() -> Any:
+            resp = await self.http_call(
+                self.spotify_endpoint + "v1/artists", params={"ids": ",".join(ids)}
+            )
+            return resp.get("artists", resp)
+
+        return await self._cached_call(
+            f"spotify:artist:{','.join(sorted(ids))}", _ARTIST_TTL, fetch
         )
-        result = resp.get("artists", resp)
-        await cache_set(self._redis, key, result, _ARTIST_TTL)
-        return result
 
     @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[List[str], str]) -> Any:
@@ -147,15 +156,14 @@ class Spotify:
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.album_ids", ",".join(ids))
         trace.get_current_span().set_attribute("spotify.album_count", len(ids))
-        key = f"spotify:album:{','.join(sorted(ids))}"
-        cached = await cache_get(self._redis, key)
-        trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
-        if cached is not None:
-            return cached
-        resp = await self.http_call(
-            self.spotify_endpoint + "v1/albums", params={"ids": ",".join(ids)}
+
+        async def fetch() -> Any:
+            resp = await self.http_call(
+                self.spotify_endpoint + "v1/albums", params={"ids": ",".join(ids)}
+            )
+            log.debug(resp)
+            return resp.get("albums", resp)
+
+        return await self._cached_call(
+            f"spotify:album:{','.join(sorted(ids))}", _ALBUM_TTL, fetch
         )
-        result = resp.get("albums", resp)
-        log.debug(resp)
-        await cache_set(self._redis, key, result, _ALBUM_TTL)
-        return result

@@ -1,5 +1,7 @@
+import asyncio
+import contextlib
 import random
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import discord
 import structlog
@@ -27,6 +29,18 @@ def queue_message(songs: List[str]) -> str:
     if len(songs) > 10:
         msg += "\n..."
     return msg
+
+
+def trace_footer(span: Any) -> Optional[str]:
+    span_ctx = span.get_span_context()
+    return f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
+
+
+async def cancel_task(task: Optional[asyncio.Task]) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def latency_color(ms: float) -> discord.Color:
