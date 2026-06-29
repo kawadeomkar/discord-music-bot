@@ -1,5 +1,8 @@
 # discord-music-bot
 
+<!-- Pytest Coverage Comment:Begin -->
+<!-- Pytest Coverage Comment:End -->
+
 A self-hosted Discord music bot that streams audio from YouTube, Spotify, and SoundCloud directly into voice channels.
 
 ## Features
@@ -103,7 +106,7 @@ docker run --env-file .env --network host discord-music-bot
 **Install dev dependencies**
 
 ```bash
-poetry install --with dev
+poetry install --with test,lint
 ```
 
 **Run tests**

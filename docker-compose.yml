@@ -11,6 +11,7 @@ services:
     env_file:
     - .env
     environment:
+      - ENVIRONMENT
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev

@@ -1,10 +1,5 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
-import os
-
-# Disable OTel SDK before any src.* import — telemetry.py reads this at module level.
-os.environ.setdefault("OTEL_SDK_DISABLED", "true")
-
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
