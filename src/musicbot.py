@@ -113,21 +113,25 @@ class MusicBot(commands.Cog):
         if mp is None:
             return
         log.info("going to cleanup/disconnect")
-        if guild.voice_client:
-            await guild.voice_client.disconnect(force=False)
         try:
+            # Cancel tasks before disconnecting so the playback loop cannot
+            # wake up and start the next song between voice_client.stop() and
+            # the task cancellation. VoiceClient.disconnect() calls stop()
+            # internally, so audio is silenced when we disconnect below.
             if mp._prefetch_task and not mp._prefetch_task.done():
                 mp._prefetch_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await mp._prefetch_task
-            if mp._restore_task and not mp._restore_task.done():
-                mp._restore_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._restore_task
             if mp._player and not mp._player.done():
                 mp._player.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await mp._player
+            if mp._restore_task and not mp._restore_task.done():
+                mp._restore_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._restore_task
+            if guild.voice_client:
+                await guild.voice_client.disconnect(force=False)
             if mp._store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
@@ -392,6 +396,7 @@ class MusicBot(commands.Cog):
                     await self._enqueue_playlist(ctx, source, qobj, mp)
                 else:
                     assert isinstance(qobj, QueueObject)
+                    qobj.user_input = url
                     await self._enqueue_single(ctx, qobj, mp)
 
             except Exception as e:
@@ -417,8 +422,13 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context):
         try:
-            await ctx.invoke(self.skip)
-            if ctx.voice_client and ctx.guild is not None:
+            # Do not call skip before cleanup: skip fires voice_client.stop() which
+            # triggers the after callback (play_next.set), giving the playback loop a
+            # window to start the next song before the loop task is cancelled.
+            # cleanup() cancels _player first, then disconnects — disconnect()
+            # internally stops the audio subprocess, so no explicit skip is needed.
+            vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+            if vc is not None and ctx.guild is not None:
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
@@ -529,6 +539,45 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
+        name="remove",
+        aliases=["rm"],
+        help="remove all queued songs matching a YouTube URL",
+    )
+    @commands.before_invoke(validate_commands)
+    async def remove(self, ctx: commands.Context, url: Optional[str] = None):
+        if url is None:
+            await ctx.send(
+                "`-remove <url>` — removes all songs matching the given URL from the queue. "
+                "The URL must match the YouTube link shown in the **Now Playing** embed."
+            )
+            return
+        mp = self.get_mp(ctx)
+        positions = await mp.queue_remove(url)
+        if not positions:
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"No queued songs found matching: <{url}>",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+        count = len(positions)
+        noun = "song" if count == 1 else "songs"
+        pos_label = "Position" if count == 1 else "Positions"
+        pos_str = ", ".join(str(p) for p in positions)
+        removal_embed = (
+            discord.Embed(
+                title=f"Removed {count} {noun} from the queue",
+                color=discord.Color.orange(),
+            )
+            .add_field(name="URL", value=f"<{url}>", inline=False)
+            .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
+        )
+        await ctx.send(embed=removal_embed)
+        await ctx.send(embed=mp.get_queue())
+        await ctx.message.add_reaction("🗑️")
+
+    @commands.command(
         name="now", aliases=["np", "rn", "nowplaying"], help="display current song"
     )
     @commands.before_invoke(validate_commands)
@@ -585,9 +634,7 @@ class MusicBot(commands.Cog):
     async def queue(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            if mp and len(mp.song_queue) > 0:
-                q_songs = mp.get_queue()
-                await ctx.send(q_songs)
+            await ctx.send(embed=mp.get_queue())
         except Exception as e:
             log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)

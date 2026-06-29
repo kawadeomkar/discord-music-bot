@@ -12,6 +12,7 @@ from src.youtube import (
     QueueObject,
     _YTDL_SOURCE_OPTS,
     _YTDL_STREAM_OPTS,
+    _enrich_queueobject,
     _stream_url_ttl,
 )
 from tests.helpers import noop_ffmpeg_init
@@ -84,6 +85,25 @@ class TestQueueObject:
         qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author, ts=90)
         assert qobj.ts == 90
 
+    def test_optional_fields_default_to_none(self, mock_author):
+        qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author)
+        assert qobj.user_input is None
+        assert qobj.duration is None
+        assert qobj.uploader is None
+
+    def test_optional_fields_can_be_set(self, mock_author):
+        qobj = QueueObject(
+            "https://yt.com/watch?v=1",
+            "Title",
+            mock_author,
+            user_input="search term",
+            duration=180,
+            uploader="My Channel",
+        )
+        assert qobj.user_input == "search term"
+        assert qobj.duration == 180
+        assert qobj.uploader == "My Channel"
+
     def test_is_dataclass(self, mock_author):
         import dataclasses
 
@@ -98,6 +118,42 @@ class TestQueueObject:
         q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
         q2 = QueueObject("https://yt.com/watch?v=2", "Song", mock_author)
         assert q1 != q2
+
+
+class TestEnrichQueueObject:
+    def test_sets_duration_when_none(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        _enrich_queueobject(qobj, {"duration": 180, "uploader": "Chan"})
+        assert qobj.duration == 180
+
+    def test_does_not_overwrite_existing_duration(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=120)
+        _enrich_queueobject(qobj, {"duration": 999, "uploader": "Chan"})
+        assert qobj.duration == 120
+
+    def test_sets_uploader_when_none(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        _enrich_queueobject(qobj, {"uploader": "My Channel"})
+        assert qobj.uploader == "My Channel"
+
+    def test_does_not_overwrite_existing_uploader(self, mock_author):
+        qobj = QueueObject(
+            "https://yt.com/v=1", "Song", mock_author, uploader="Original"
+        )
+        _enrich_queueobject(qobj, {"uploader": "New Channel"})
+        assert qobj.uploader == "Original"
+
+    def test_handles_missing_keys_gracefully(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        _enrich_queueobject(qobj, {})
+        assert qobj.duration is None
+        assert qobj.uploader is None
+
+    def test_duration_cast_to_int(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        _enrich_queueobject(qobj, {"duration": 180.7})
+        assert qobj.duration == 180
+        assert isinstance(qobj.duration, int)
 
 
 class TestYTDLOpts:
@@ -214,6 +270,37 @@ class TestYTSource:
             )
 
         assert result.title == "Real Video"
+
+    async def test_yt_source_sets_user_input_fresh_extraction(self, mock_ctx):
+        """user_input is set to the search string on fresh extraction."""
+        fake_data = {
+            "webpage_url": "https://www.youtube.com/watch?v=test123",
+            "title": "Song Title",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
+            result = await YTDL.yt_source(
+                mock_ctx.author, "my search query", process=True
+            )
+        assert result.user_input == "my search query"
+
+    async def test_yt_source_sets_user_input_cache_hit(self, mock_ctx, fake_redis):
+        """user_input is set to the search string even on a Redis cache hit."""
+        import orjson as _orjson
+
+        cached = {
+            "webpage_url": "https://yt.com/v=cached",
+            "title": "Cached Song",
+            "duration": 120,
+            "uploader": "Chan",
+        }
+        await fake_redis.set(
+            "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
+        )
+        result = await YTDL.yt_source(
+            mock_ctx.author, "cached search", process=True, redis=fake_redis
+        )
+        assert result.user_input == "cached search"
 
     async def test_yt_source_passes_timestamp(self, mock_ctx):
         fake_data = {
