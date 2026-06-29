@@ -442,7 +442,11 @@ class MusicPlayer:
         if self._store is not None:
             await self._store.delete_queue()
         return [
-            item.title if isinstance(item, QueueObject) else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+            (
+                item.title
+                if isinstance(item, QueueObject)
+                else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+            )
             for item in cleared_items
         ]
 

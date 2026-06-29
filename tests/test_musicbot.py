@@ -770,9 +770,9 @@ class TestCleanup:
 
         await music_bot.cleanup(mock_guild)
 
-        assert call_order.index("cancel") < call_order.index("disconnect"), (
-            "player task must be cancelled before voice disconnect"
-        )
+        assert call_order.index("cancel") < call_order.index(
+            "disconnect"
+        ), "player task must be cancelled before voice disconnect"
 
 
 class TestStopCommand:
@@ -793,7 +793,8 @@ class TestStopCommand:
 
     async def test_stop_does_not_call_skip(self, music_bot, mock_ctx, mock_guild):
         """stop must not invoke skip — skip fires voice_client.stop() which triggers
-        the after callback and gives the playback loop a window to start the next song."""
+        the after callback and gives the playback loop a window to start the next song.
+        """
         music_bot.cleanup = AsyncMock()
         music_bot.skip = AsyncMock()
         vc = MagicMock(spec=discord.VoiceClient)
@@ -801,7 +802,9 @@ class TestStopCommand:
             await MusicBot.stop.callback(music_bot, mock_ctx)
         music_bot.skip.assert_not_called()
 
-    async def test_stop_noop_when_no_voice_client(self, music_bot, mock_ctx, mock_guild):
+    async def test_stop_noop_when_no_voice_client(
+        self, music_bot, mock_ctx, mock_guild
+    ):
         music_bot.cleanup = AsyncMock()
         with patch("discord.utils.get", return_value=None):
             await MusicBot.stop.callback(music_bot, mock_ctx)

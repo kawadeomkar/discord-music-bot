@@ -427,7 +427,8 @@ class MusicBot(commands.Cog):
             # window to start the next song before the loop task is cancelled.
             # cleanup() cancels _player first, then disconnects — disconnect()
             # internally stops the audio subprocess, so no explicit skip is needed.
-            if ctx.voice_client and ctx.guild is not None:
+            vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+            if vc is not None:
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
