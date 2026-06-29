@@ -1,10 +1,5 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
-import os
-
-# Set before any src.* import — config.py reads this at module level.
-os.environ.setdefault("ENVIRONMENT", "development")
-
 from unittest.mock import AsyncMock, MagicMock
 
 import discord

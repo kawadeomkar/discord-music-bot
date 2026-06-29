@@ -43,7 +43,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
-        log.info(f"Environment: {ENVIRONMENT.value}")
+        log.info(f"Environment: {ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         log.info(f"Bot commands: {self.intents.voice_states}")

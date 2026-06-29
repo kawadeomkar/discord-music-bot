@@ -1,22 +1,35 @@
 import os
-from enum import Enum
+import subprocess
+import warnings
 
 
-class Environment(str, Enum):
-    PRODUCTION = "production"
-    STAGING = "staging"
-    DEVELOPMENT = "development"
+def _git_branch() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        branch = result.stdout.strip()
+        if result.returncode == 0 and branch and branch != "HEAD":
+            return branch
+    except Exception:
+        pass
+    warnings.warn(
+        "Could not detect git branch; defaulting ENVIRONMENT to 'development'",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return "development"
 
 
-def _parse() -> Environment:
-    raw = os.getenv("ENVIRONMENT", "development").lower()
-    match raw:
-        case "production":
-            return Environment.PRODUCTION
-        case "staging":
-            return Environment.STAGING
-        case _:
-            return Environment.DEVELOPMENT
+def _parse() -> str:
+    raw = os.environ.get("ENVIRONMENT")
+    if raw is not None:
+        return raw
+    branch = _git_branch()
+    return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
 
-ENVIRONMENT = _parse()
+ENVIRONMENT: str = _parse()

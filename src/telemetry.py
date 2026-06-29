@@ -16,7 +16,6 @@ from opentelemetry.semconv.resource import ResourceAttributes
 
 from src.config import ENVIRONMENT
 
-_SDK_DISABLED = os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true"
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
@@ -73,7 +72,7 @@ def setup_telemetry() -> None:
     if _tracer_provider is not None:
         return
     _configure_structlog()
-    if _SDK_DISABLED:
+    if os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true":
         return
     _setup_traces()
     _setup_logs()
@@ -109,7 +108,7 @@ def _add_otel_context(logger, method, event_dict):
 
 def _add_environment(logger, method, event_dict):
     """Structlog processor: stamp every log event with the current environment."""
-    event_dict["environment"] = ENVIRONMENT.value
+    event_dict["environment"] = ENVIRONMENT
     return event_dict
 
 
@@ -149,7 +148,7 @@ def _setup_traces() -> None:
     resource = Resource.create(
         {
             SERVICE_NAME: _SERVICE_NAME,
-            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT.value,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
         }
     )
     exporter = OTLPSpanExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
@@ -168,7 +167,7 @@ def _setup_logs() -> None:
     resource = Resource.create(
         {
             SERVICE_NAME: _SERVICE_NAME,
-            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT.value,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
         }
     )
     exporter = OTLPLogExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
