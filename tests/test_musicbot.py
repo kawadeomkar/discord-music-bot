@@ -1434,7 +1434,7 @@ class TestRemoveCommand:
         msg = mock_ctx.send.call_args[0][0]
         assert "-remove" in msg
 
-    async def test_no_match_sends_not_found_message(self, music_bot, mock_ctx):
+    async def test_no_match_sends_not_found_embed(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[])
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -1444,8 +1444,8 @@ class TestRemoveCommand:
         )
 
         mock_ctx.send.assert_awaited_once()
-        msg = mock_ctx.send.call_args[0][0]
-        assert "No queued songs found" in msg
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "No queued songs found" in embed.description
 
     async def test_match_sends_removal_embed(self, music_bot, mock_ctx):
         mp = MagicMock()

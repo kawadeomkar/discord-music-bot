@@ -369,7 +369,8 @@ class TestQueueRemove:
         assert music_player.queue.qsize() == 0
         assert len(music_player.song_queue) == 0
 
-    async def test_remove_by_user_input(self, music_player, mock_author):
+    async def test_remove_by_user_input_not_supported(self, music_player, mock_author):
+        # user_input is not a match key — only webpage_url is used.
         qobj = QueueObject(
             "https://yt.com/v=abc", "Song", mock_author, user_input="my search query"
         )
@@ -377,8 +378,8 @@ class TestQueueRemove:
 
         positions = await music_player.queue_remove("my search query")
 
-        assert positions == [1]
-        assert music_player.queue.qsize() == 0
+        assert positions == []
+        assert music_player.queue.qsize() == 1
 
     async def test_no_match_returns_empty_list(self, music_player, mock_author):
         qobj = QueueObject("https://yt.com/v=abc", "Song", mock_author)
@@ -588,11 +589,11 @@ class TestGetQueue:
         assert not est_lines[0].startswith("~") or "~**" not in est_lines[0]
         assert "~**" in est_lines[1]
 
-    def test_uncertain_when_current_song_duration_parse_fails(
+    def test_uncertain_when_current_song_has_no_duration_secs(
         self, music_player, mock_author
     ):
         mock_current = MagicMock()
-        mock_current.duration = "not-a-valid-duration"
+        mock_current.duration_secs = 0
         music_player.current_song = mock_current
         music_player.song_queue.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
@@ -899,6 +900,31 @@ class TestRestoreCrashedSong:
         state = await fake_redis.hgetall(music_player._store.state_key())
         assert state.get(b"current_song_url", b"") == b""
         assert state.get(b"current_song_title", b"") == b""
+
+    async def test_crashed_song_restores_duration_and_uploader(
+        self, music_player, fake_redis, mock_author
+    ):
+        await fake_redis.hset(
+            music_player._store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_duration", b"240"
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_uploader", b"Test Channel"
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.duration == 240
+        assert first.uploader == "Test Channel"
 
     async def test_no_crash_song_when_state_empty(
         self, music_player, fake_redis, mock_author

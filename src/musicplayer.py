@@ -23,6 +23,8 @@ from src.youtube import YTDL, QueueObject
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
+# ETAs in get_queue() are rendered in Pacific time. This is intentional for a
+# single-operator bot — update to a per-guild config if multi-tenant support is added.
 _PST = ZoneInfo("America/Los_Angeles")
 
 
@@ -208,14 +210,13 @@ class MusicPlayer:
         items = list(self.song_queue)
         total = len(items)
 
-        total_secs = sum(
-            item.duration
-            for item in items
-            if isinstance(item, QueueObject) and item.duration is not None
-        )
-        duration_partial = any(
-            not isinstance(item, QueueObject) or item.duration is None for item in items
-        )
+        total_secs = 0
+        duration_partial = False
+        for item in items:
+            if isinstance(item, QueueObject) and item.duration is not None:
+                total_secs += item.duration
+            else:
+                duration_partial = True
 
         # Track whether any preceding song had an unknown duration so we can
         # flag downstream estimates as uncertain.
@@ -226,10 +227,10 @@ class MusicPlayer:
         # keeps the math simple and avoids showing "now" for everything).
         cumulative_secs = 0
         if self.current_song is not None:
-            try:
-                h, m, s = self.current_song.duration.split(":")
-                cumulative_secs = int(h) * 3600 + int(m) * 60 + int(s)
-            except (AttributeError, ValueError):
+            secs = getattr(self.current_song, "duration_secs", 0)
+            if secs:
+                cumulative_secs = secs
+            else:
                 uncertain = True
         now_pst = datetime.datetime.now(tz=_PST)
 
@@ -316,15 +317,27 @@ class MusicPlayer:
                 if crashed_url_raw:
                     crashed_url = crashed_url_raw.decode()
                     crashed_title = state.get(b"current_song_title", b"").decode()
+                    raw_dur = state.get(b"current_song_duration", b"").decode()
+                    crashed_duration = int(raw_dur) if raw_dur.isdigit() else None
+                    raw_uploader = state.get(b"current_song_uploader", b"").decode()
+                    crashed_uploader = raw_uploader or None
                     requester: Union[discord.Member, discord.User, None] = (
                         self._guild.me or self._guild.owner
                     )
                     if requester is not None:
-                        crashed = QueueObject(crashed_url, crashed_title, requester)
+                        crashed = QueueObject(
+                            crashed_url,
+                            crashed_title,
+                            requester,
+                            duration=crashed_duration,
+                            uploader=crashed_uploader,
+                        )
                         await self.queue.put(crashed)
                         self.song_queue.append(crashed)
                         await self._store.set_state("current_song_url", "")
                         await self._store.set_state("current_song_title", "")
+                        await self._store.set_state("current_song_duration", "")
+                        await self._store.set_state("current_song_uploader", "")
                         log.info(
                             f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
                         )
@@ -416,9 +429,14 @@ class MusicPlayer:
     async def _cancel_prefetch(self) -> None:
         """Cancel any in-flight prefetch task and wait for it to finish.
 
-        Must be called before any bulk queue mutation (clear, shuffle) so that
+        Must be called before any bulk queue mutation (clear, shuffle, remove) so that
         the item the prefetch already dequeued via get_nowait() is accounted for
         via its CancelledError handler before we start modifying the queue.
+
+        Note: if the prefetch task is blocked inside run_in_executor (a yt-dlp
+        extraction), cancellation cannot interrupt the running thread. The await
+        blocks until the thread exits, which may take up to socket_timeout seconds.
+        This is acceptable at single-guild scale.
         """
         if self._prefetch_task and not self._prefetch_task.done():
             self._prefetch_task.cancel()
@@ -483,7 +501,7 @@ class MusicPlayer:
             serialized = [
                 _serialize_queue_item(s)
                 for s in kept_after_shuffle
-                if isinstance(s, QueueObject)
+                if isinstance(s, (QueueObject, YTSource))
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -491,7 +509,7 @@ class MusicPlayer:
         return "Shuffled!"
 
     async def queue_remove(self, url: str) -> list[int]:
-        """Remove all queued items whose webpage_url matches url.
+        """Remove all queued items whose webpage_url (QueueObject) or url (YTSource) matches url.
 
         Returns a list of 1-indexed queue positions that were removed.
         """
@@ -512,7 +530,7 @@ class MusicPlayer:
 
             for pos, item in enumerate(drained, start=1):
                 if isinstance(item, QueueObject):
-                    match = item.webpage_url == url or item.user_input == url
+                    match = item.webpage_url == url
                 else:
                     match = (item.url or "") == url
                 if match:
@@ -526,7 +544,9 @@ class MusicPlayer:
 
         if removed_positions and self._store is not None:
             serialized = [
-                _serialize_queue_item(s) for s in kept if isinstance(s, QueueObject)
+                _serialize_queue_item(s)
+                for s in kept
+                if isinstance(s, (QueueObject, YTSource))
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -766,6 +786,13 @@ class MusicPlayer:
                         await self._store.set_state(
                             "current_song_url", self.current_song.webpage_url or ""
                         )
+                        dur = self.current_song.duration_secs
+                        await self._store.set_state(
+                            "current_song_duration", str(dur) if dur else ""
+                        )
+                        await self._store.set_state(
+                            "current_song_uploader", self.current_song.uploader or ""
+                        )
 
                     self._prefetch_task = asyncio.create_task(
                         self._prefetch_next_song()
@@ -789,6 +816,8 @@ class MusicPlayer:
                     if self._store is not None:
                         await self._store.set_state("current_song_title", "")
                         await self._store.set_state("current_song_url", "")
+                        await self._store.set_state("current_song_duration", "")
+                        await self._store.set_state("current_song_uploader", "")
 
                     self.queue.task_done()
                     self.current_song = None

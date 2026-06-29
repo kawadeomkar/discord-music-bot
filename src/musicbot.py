@@ -554,7 +554,12 @@ class MusicBot(commands.Cog):
         mp = self.get_mp(ctx)
         positions = await mp.queue_remove(url)
         if not positions:
-            await ctx.send(f"No queued songs found matching: <{url}>")
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"No queued songs found matching: <{url}>",
+                    color=discord.Color.red(),
+                )
+            )
             return
         count = len(positions)
         noun = "song" if count == 1 else "songs"
