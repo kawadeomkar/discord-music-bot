@@ -53,7 +53,7 @@ class _DiscordGatewayFilter(Sampler):
         parent_context,
         trace_id,
         name,
-        kind,
+        kind=None,
         attributes=None,
         links=None,
         trace_state=None,

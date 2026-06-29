@@ -17,6 +17,20 @@ from src.youtube import (
 from tests.helpers import noop_ffmpeg_init
 
 
+@pytest.fixture(autouse=True)
+def _suppress_ytdl_del(monkeypatch):
+    """Patch discord.AudioSource.__del__ to a no-op for every test in this module.
+
+    YTDL tests patch discord.FFmpegOpusAudio.__init__ to return_value=None so that
+    no real FFmpeg process is spawned. This leaves _process unset on the instance.
+    When Python GC collects the object, AudioSource.__del__ → FFmpegAudio.cleanup()
+    → _kill_process() → _check_process_returncode() accesses self._process and raises
+    AttributeError. Suppressing __del__ here avoids that crash without touching
+    production code.
+    """
+    monkeypatch.setattr(discord.AudioSource, "__del__", lambda self: None)
+
+
 def _fake_ytdl_data(**overrides):
     base = {
         "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",

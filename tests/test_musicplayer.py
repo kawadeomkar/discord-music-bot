@@ -15,8 +15,24 @@ from src.musicplayer import (
     _queue_display_str,
     _serialize_queue_item,
 )
+from src.sources import YTSource
 from src.youtube import QueueObject
 from tests.helpers import stub_create_task
+
+
+@pytest.fixture(autouse=True)
+def _stub_prefetch(monkeypatch):
+    """Stub YTDL.prefetch_stream for every test in this module.
+
+    queue_put() spawns asyncio.create_task(YTDL.prefetch_stream(...)) for every
+    QueueObject. Without this stub, any test that calls queue_put with a yt.com
+    test URL would trigger a real yt-dlp network request in a background task.
+    Tests that specifically assert on prefetch behaviour override this via their
+    own patch() context manager, which takes precedence.
+    """
+    from src import youtube
+
+    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
 
 @pytest.fixture
@@ -70,18 +86,6 @@ class TestQueueDisplayStr:
 
 
 class TestQueuePut:
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch):
-        """Silence background prefetch_stream tasks in tests that don't test them.
-
-        Tests that explicitly assert on prefetch behaviour patch the method
-        themselves via `with patch(...)`, which takes precedence over this stub.
-        """
-        from unittest.mock import AsyncMock
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
     async def test_put_single_queue_object(self, music_player, queue_obj):
         await music_player.queue_put(queue_obj)
         assert music_player.queue.qsize() == 1
@@ -119,8 +123,33 @@ class TestQueuePut:
         items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
+        assert data["type"] == "qobj"
         assert data["title"] == queue_obj.title
         assert data["webpage_url"] == queue_obj.webpage_url
+
+    async def test_put_mirrors_yt_source_to_redis(self, music_player, fake_redis):
+        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True)
+        await music_player.queue_put(src)
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(items) == 1
+        data = orjson.loads(items[0])
+        assert data["type"] == "ytsource"
+        assert data["ytsearch"] == "ytsearch:Never Gonna Give You Up"
+
+    async def test_put_yt_source_does_not_spawn_prefetch(
+        self, music_player, fake_redis, mock_author
+    ):
+        from unittest.mock import patch, AsyncMock
+
+        src = YTSource(ytsearch="ytsearch:test", process=True)
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put(src)
+            await asyncio.sleep(0)
+        mock_pf.assert_not_awaited()
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(items) == 1
 
     async def test_put_sets_ttl_on_redis_key(self, music_player, queue_obj, fake_redis):
         await music_player.queue_put(queue_obj)
@@ -159,6 +188,19 @@ class TestQueuePut:
             await asyncio.sleep(0)
         mock_pf.assert_not_awaited()
 
+    async def test_put_with_prefetch_false_skips_prefetch_task(
+        self, music_player, queue_obj
+    ):
+        """queue_put(prefetch=False) never spawns a background prefetch_stream task."""
+        from unittest.mock import patch, AsyncMock
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put(queue_obj, prefetch=False)
+            await asyncio.sleep(0)
+        mock_pf.assert_not_awaited()
+
 
 class TestQueueClear:
     @pytest.fixture(autouse=True)
@@ -192,6 +234,24 @@ class TestQueueClear:
         await music_player.queue_clear()
         items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert items == []
+
+    async def test_clear_returns_list_of_cleared_display_strings(
+        self, music_player, mock_author
+    ):
+        """queue_clear() returns the song_queue display strings for the cleared songs."""
+        qobjs = [
+            QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            for i in range(3)
+        ]
+        for q in qobjs:
+            await music_player.queue_put(q)
+        cleared = await music_player.queue_clear()
+        assert len(cleared) == 3
+        assert all("Song" in s for s in cleared)
+
+    async def test_clear_returns_empty_list_when_queue_was_empty(self, music_player):
+        cleared = await music_player.queue_clear()
+        assert cleared == []
 
 
 class TestQueueShuffle:
@@ -693,12 +753,6 @@ class TestSendNowPlaying:
 
 
 class TestPrefetchNextSong:
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch_stream(self, monkeypatch):
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
     async def test_returns_none_when_queue_empty(self, music_player):
         result = await music_player._prefetch_next_song()
         assert result is None
@@ -813,10 +867,76 @@ class TestSerializeQueueItem:
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author, ts=30)
         data = _serialize_queue_item(qobj)
         d = orjson.loads(data)
+        assert d["type"] == "qobj"
         assert d["webpage_url"] == "https://yt.com/v=1"
         assert d["title"] == "Test Song"
         assert d["requester_id"] == mock_author.id
         assert d["ts"] == 30
+
+    def test_ytsource_round_trip(self):
+        src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True, ts=10)
+        data = _serialize_queue_item(src)
+        d = orjson.loads(data)
+        assert d["type"] == "ytsource"
+        assert d["ytsearch"] == "ytsearch:Never Gonna Give You Up"
+        assert d["process"] is True
+        assert d["ts"] == 10
+        assert "requester_id" not in d
+
+    def test_ytsource_url_preserved(self):
+        src = YTSource(url="https://www.youtube.com/watch?v=abc", process=False)
+        data = _serialize_queue_item(src)
+        d = orjson.loads(data)
+        assert d["type"] == "ytsource"
+        assert d["url"] == "https://www.youtube.com/watch?v=abc"
+
+
+class TestDeserializeQueueItemYTSource:
+    def test_ytsource_deserialized_correctly(self, mock_guild):
+        data = orjson.dumps(
+            {
+                "type": "ytsource",
+                "ytsearch": "ytsearch:Bohemian Rhapsody Queen",
+                "url": None,
+                "process": True,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:Bohemian Rhapsody Queen"
+        assert result.process is True
+
+    def test_ytsource_with_url(self, mock_guild):
+        data = orjson.dumps(
+            {
+                "type": "ytsource",
+                "ytsearch": None,
+                "url": "https://www.youtube.com/watch?v=abc",
+                "process": False,
+                "ts": 15,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, YTSource)
+        assert result.url == "https://www.youtube.com/watch?v=abc"
+        assert result.ts == 15
+
+    def test_legacy_entry_without_type_field_deserializes_as_qobj(
+        self, mock_guild, mock_author
+    ):
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=legacy",
+                "title": "Legacy Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert isinstance(result, QueueObject)
+        assert result.webpage_url == "https://yt.com/v=legacy"
 
 
 # ── _restore_state additional paths ──────────────────────────────────────────
@@ -869,6 +989,7 @@ class TestLoop:
         song = MagicMock()
         song.title = "Loop Test Song"
         song.webpage_url = "https://yt.com/v=loop1"
+        song.duration_secs = 210
         return song
 
     async def test_exits_immediately_when_bot_closed(self, music_player):
@@ -1019,3 +1140,105 @@ class TestLoop:
         assert activity_mock.await_count == 2
         assert activity_mock.call_args_list[0].args[0] is mock_song
         assert activity_mock.call_args_list[1].args[0] is None
+
+    async def test_prefetched_song_cleaned_up_when_queue_was_cleared(
+        self, music_player, queue_obj, mock_song
+    ):
+        """When _queue_cleared is set while a prefetch is in-flight, the loop
+        discards the prefetched song and calls cleanup() so the FFmpeg subprocess
+        is not leaked.
+
+        Flow:
+          Iteration 1 — song 1 plays normally; prefetch dequeues song 2, sets
+          _queue_cleared = True, and returns a YTDL mock.
+          Iteration 2 — guard fires: task_done() + cleanup() + discard; then
+          queue_get() raises TimeoutError so the loop exits cleanly.
+        """
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        queue_obj2 = QueueObject(
+            "https://yt.com/watch?v=2", "Song 2", queue_obj.requester
+        )
+        await music_player.queue.put(queue_obj)
+        await music_player.queue.put(queue_obj2)
+        music_player.song_queue.append("Song 1 - url")
+        music_player.song_queue.append("Song 2 - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        prefetched = MagicMock()
+        prefetched.cleanup = MagicMock()
+
+        async def _prefetch_with_clear(_self):
+            try:
+                music_player.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            music_player._queue_cleared = True
+            return prefetched
+
+        async def _stop_noop(_self):
+            pass
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(MusicPlayer, "_prefetch_next_song", new=_prefetch_with_clear),
+            patch.object(
+                MusicPlayer,
+                "queue_get",
+                new=AsyncMock(side_effect=[queue_obj, asyncio.TimeoutError()]),
+            ),
+            patch.object(MusicPlayer, "stop", new=_stop_noop),
+        ):
+            await music_player.loop()
+
+        prefetched.cleanup.assert_called_once()
+
+    async def test_discards_song_and_calls_cleanup_when_song_queue_cleared_mid_stream(
+        self, music_player, queue_obj, mock_song
+    ):
+        """If song_queue is cleared while _stream_source runs, the YTDL object is
+        discarded without playing and its FFmpeg subprocess is terminated via cleanup().
+        """
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append("Test Song - url")
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+
+        mock_song.cleanup = MagicMock()
+
+        async def _stream_and_clear(_self, source):
+            # Simulate queue_clear() racing with stream resolution
+            music_player.song_queue.clear()
+            return mock_song
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(MusicPlayer, "_stream_source", new=_stream_and_clear),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        vc.play.assert_not_called()
+        mock_song.cleanup.assert_called_once()
