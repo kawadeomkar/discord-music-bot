@@ -14,16 +14,9 @@ from opentelemetry.sdk.trace.sampling import (
 )
 from opentelemetry.semconv.resource import ResourceAttributes
 
-from src.config import ENVIRONMENT, Environment
+from src.config import ENVIRONMENT
 
-_prod_or_staging = ENVIRONMENT in (Environment.PRODUCTION, Environment.STAGING)
-_SDK_DISABLED = (
-    os.getenv(
-        "OTEL_SDK_DISABLED",
-        "false" if _prod_or_staging else "true",
-    ).lower()
-    == "true"
-)
+_SDK_DISABLED = os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true"
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 

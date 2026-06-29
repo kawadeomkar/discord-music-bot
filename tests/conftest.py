@@ -2,9 +2,8 @@
 
 import os
 
-# Set environment before any src.* import — config.py and telemetry.py read this at module level.
-# ENVIRONMENT=test auto-disables the OTel SDK (no TracerProvider needed in tests).
-os.environ.setdefault("ENVIRONMENT", "test")
+# Set before any src.* import — config.py reads this at module level.
+os.environ.setdefault("ENVIRONMENT", "development")
 
 from unittest.mock import AsyncMock, MagicMock
 
