@@ -57,6 +57,7 @@ jobs:
     env:
       ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
     permissions:
+      contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
