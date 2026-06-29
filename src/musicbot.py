@@ -428,7 +428,7 @@ class MusicBot(commands.Cog):
             # cleanup() cancels _player first, then disconnects — disconnect()
             # internally stops the audio subprocess, so no explicit skip is needed.
             vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
-            if vc is not None:
+            if vc is not None and ctx.guild is not None:
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
