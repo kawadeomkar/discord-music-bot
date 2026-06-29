@@ -1,10 +1,5 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
-import os
-
-# Disable OTel SDK before any src.* import — telemetry.py reads this at module level.
-os.environ.setdefault("OTEL_SDK_DISABLED", "true")
-
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -14,6 +9,7 @@ import structlog
 
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
+from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -174,19 +170,12 @@ def ytdl_instance(mock_channel, mock_author):
         }
         if data:
             default_data.update(data)
-        from discord.utils import MISSING
-
-        with patch.object(d.FFmpegOpusAudio, "__init__", return_value=None):
-            instance = YTDL(
+        with patch.object(d.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            return YTDL(
                 mock_channel,
                 default_data["url"],
                 data=default_data,
                 requester=mock_author,
             )
-        # FFmpegAudio.__init__ was patched out, so _process is never set.
-        # Without it, AudioSource.__del__ → _kill_process → _check_process_returncode
-        # raises AttributeError. Setting to MISSING makes both guards return early.
-        instance._process = MISSING
-        return instance
 
     return _make

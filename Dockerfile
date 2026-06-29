@@ -28,20 +28,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     poetry install --only=main --no-root
 
 # ── Test stage ────────────────────────────────────────────────────────────────
-# Inherits the builder venv and adds dev deps (pytest, fakeredis, pyright).
+# Inherits the builder venv and adds test deps (pytest, fakeredis, pytest-cov).
 # Used by the container-test CI job. Never pushed to GHCR.
 FROM builder AS test
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --with dev --no-root
+    poetry install --only=main,test --no-root
 
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY pyproject.toml ./
 
+ARG ENVIRONMENT=development
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONPATH="."
+    PYTHONPATH="." \
+    ENVIRONMENT="${ENVIRONMENT}"
 
 CMD ["python", "-m", "pytest", "--tb=short", "-q"]
 
@@ -61,7 +63,9 @@ COPY --from=builder /app/.venv /app/.venv
 COPY src/ ./src/
 COPY pyproject.toml ./
 
+ARG ENVIRONMENT=production
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONPATH="."
+    PYTHONPATH="." \
+    ENVIRONMENT="${ENVIRONMENT}"
 
 CMD ["python", "-m", "src.main"]
