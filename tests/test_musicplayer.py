@@ -1,6 +1,8 @@
 """Tests for src/musicplayer.py — queue operations, embed building, and Redis integration."""
 
 import asyncio
+import contextlib
+import re
 import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -629,6 +631,69 @@ class TestGetQueue:
         assert "resolving..." in embed.description
 
 
+# ── EstimatedPlayingAt ────────────────────────────────────────────────────────
+
+
+class TestEstimatedPlayingAt:
+    def test_matches_clock_format(self, music_player):
+        result = music_player.estimated_playing_at()
+        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*$", result)
+
+    def test_uncertain_when_current_song_has_no_duration_secs(self, music_player):
+        mock_current = MagicMock()
+        mock_current.duration_secs = 0
+        music_player.current_song = mock_current
+        result = music_player.estimated_playing_at()
+        assert result.startswith("~")
+
+    def test_accounts_for_already_queued_songs(self, music_player, mock_song):
+        music_player.current_song = mock_song  # duration_secs = 210
+        empty_eta = music_player.estimated_playing_at()
+
+        music_player.song_queue.append(
+            QueueObject(
+                "https://yt.com/v=1", "Song 1", mock_song.requester, duration=600
+            )
+        )
+        later_eta = music_player.estimated_playing_at()
+
+        assert empty_eta != later_eta
+
+    def test_uncertain_when_queued_song_duration_unknown(
+        self, music_player, mock_song, mock_author
+    ):
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
+        )
+        result = music_player.estimated_playing_at()
+        assert result.startswith("~")
+
+    def test_matches_last_queue_line_eta(self, music_player, mock_song, mock_author):
+        """estimated_playing_at() should reflect the same seed used by
+        get_queue()/_build_next_up_embed() for consistency across embeds."""
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
+        )
+        eta = music_player.estimated_playing_at()
+
+        # A song appended now would start right where the last queued line's
+        # ETA ends up, so re-derive it via the same line formatter for index 2.
+        now_pst, cumulative_secs, uncertain = music_player._queue_eta_seed()
+        _, cumulative_secs, uncertain = music_player._format_queue_line(
+            music_player.song_queue[0], 1, now_pst, cumulative_secs, uncertain
+        )
+        expected_line, _, _ = music_player._format_queue_line(
+            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
+            2,
+            now_pst,
+            cumulative_secs,
+            uncertain,
+        )
+        assert eta in expected_line
+
+
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
 
 
@@ -669,6 +734,27 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
+
+    def test_description_has_estimated_finish_when_duration_known(
+        self, music_player, mock_song
+    ):
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "Estimated finish:" in embed.description
+
+    def test_estimated_finish_appears_after_requester_on_same_line(
+        self, music_player, mock_song
+    ):
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "\n" not in embed.description
+        assert re.search(
+            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) PST$",
+            embed.description,
+        )
+
+    def test_no_estimated_finish_when_duration_unknown(self, music_player, mock_song):
+        mock_song.duration_secs = 0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "Estimated finish" not in embed.description
 
 
 class TestUpdateActivity:
@@ -947,6 +1033,111 @@ class TestRestoreCrashedSong:
         assert first.title == "Normal"
 
 
+# ── RestoredEvent ─────────────────────────────────────────────────────────────
+# Regression coverage for a race where loop() could dequeue the crash-recovered
+# "current song" _restore_state() injects and call pop_queue() (Redis LPOP) for
+# it — silently deleting an unrelated, still-queued song from Redis, since the
+# crashed song was never itself on the Redis queue list. loop() now waits on
+# self._restored, which _restore_state() sets only once it has finished.
+
+
+class TestRestoredEvent:
+    async def test_restore_state_sets_restored_on_success(
+        self, music_player, fake_redis
+    ):
+        music_player._restored.clear()
+        await music_player._restore_state()
+        assert music_player._restored.is_set()
+
+    async def test_restore_state_sets_restored_on_failure(self, music_player):
+        music_player._restored.clear()
+        with patch.object(
+            music_player._store,
+            "get_state",
+            new=AsyncMock(side_effect=Exception("redis down")),
+        ):
+            await music_player._restore_state()
+        assert music_player._restored.is_set()
+
+    async def test_restore_state_sets_restored_when_no_store(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        await mp._restore_state()
+        assert mp._restored.is_set()
+
+    async def test_loop_waits_for_restore_before_dequeuing(
+        self, music_player, fake_redis, mock_author
+    ):
+        """loop() must not call pop_queue() for the crash-recovered song until
+        _restore_state() has fully populated the queue from Redis."""
+        music_player._restored.clear()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.return_value = False
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        loop_task = asyncio.create_task(music_player.loop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not loop_task.done()
+        assert music_player.queue.qsize() == 0  # loop() hasn't dequeued anything yet
+
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+
+    async def test_pop_queue_not_called_for_crash_recovered_song_before_restore_reads_queue(
+        self, music_player, fake_redis, mock_author
+    ):
+        """End-to-end guard for the original bug: seed Redis with a crashed
+        song plus 2 still-queued songs. After restore populates the queue and
+        loop() processes exactly the crash-recovered song (its stream fails
+        here, taking the "skip" path that also calls pop_queue()), both real
+        queued songs must still be present in Redis — pop_queue() must not
+        fire for the crashed song's own dequeue.
+        """
+        await fake_redis.hset(
+            music_player._store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+        )
+        for i in range(2):
+            item = orjson.dumps(
+                {
+                    "webpage_url": f"https://yt.com/v={i}",
+                    "title": f"Queued {i}",
+                    "requester_id": mock_author.id,
+                    "ts": None,
+                }
+            )
+            await fake_redis.rpush(music_player._store.queue_key(), item)
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player._restored.clear()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player._restore_state()
+        assert music_player.queue.qsize() == 3  # crashed + 2 real queued songs
+
+        # Exactly one loop() iteration — enough to process the crashed song.
+        music_player.bot.is_closed.side_effect = [False, True]
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=lambda s: s)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(remaining) == 2
+
+
 # ── ResolveSource ─────────────────────────────────────────────────────────────
 
 
@@ -1015,9 +1206,12 @@ class TestFromContext:
 
 class TestStart:
     def test_start_creates_player_and_restore_tasks(self, music_player):
-        player_task = MagicMock(name="player_task")
+        # _restore_state() is scheduled before loop() — loop() waits on
+        # self._restored before its first dequeue, so restore must be
+        # in flight first. See _restore_state()'s docstring for why.
         restore_task = MagicMock(name="restore_task")
-        returns = [player_task, restore_task]
+        player_task = MagicMock(name="player_task")
+        returns = [restore_task, player_task]
 
         def _create(coro):
             coro.close()
@@ -1028,8 +1222,8 @@ class TestStart:
         assert music_player._store is not None
         music_player.start()
 
-        assert music_player._player is player_task
         assert music_player._restore_task is restore_task
+        assert music_player._player is player_task
 
     def test_no_restore_task_when_store_absent(
         self, mock_bot, mock_guild, mock_channel, mock_ctx
@@ -1102,7 +1296,7 @@ class TestSendNowPlaying:
         await music_player._send_now_playing(mock_song)
         music_player._channel.send.assert_awaited_once()
         call_kwargs = music_player._channel.send.call_args[1]
-        assert "embed" in call_kwargs
+        assert "embeds" in call_kwargs
 
     async def test_stores_embed_as_play_message(self, music_player, mock_song):
         await music_player._send_now_playing(mock_song)
@@ -1112,6 +1306,101 @@ class TestSendNowPlaying:
     async def test_swallows_channel_send_exception(self, music_player, mock_song):
         music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
         await music_player._send_now_playing(mock_song)
+
+    async def test_sends_only_now_playing_embed_when_queue_empty(
+        self, music_player, mock_song
+    ):
+        await music_player._send_now_playing(mock_song)
+        call_kwargs = music_player._channel.send.call_args[1]
+        assert len(call_kwargs["embeds"]) == 1
+        assert call_kwargs["embeds"][0].colour == discord.Color.green()
+
+    async def test_sends_next_up_embed_when_queue_has_song(
+        self, music_player, mock_song, mock_author
+    ):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        await music_player._send_now_playing(mock_song)
+        call_kwargs = music_player._channel.send.call_args[1]
+        embeds = call_kwargs["embeds"]
+        assert len(embeds) == 2
+        assert embeds[1].colour == discord.Color.blue()
+        assert embeds[1].title == "Up next"
+        assert "Next Song" in embeds[1].description
+
+
+# ── BuildNextUpEmbed ──────────────────────────────────────────────────────────
+
+
+class TestBuildNextUpEmbed:
+    def test_returns_none_when_queue_empty(self, music_player):
+        assert music_player._build_next_up_embed() is None
+
+    def test_returns_blue_embed_with_song_details(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert embed.colour == discord.Color.blue()
+        assert embed.title == "Up next"
+        assert "Next Song" in embed.description
+        assert "https://yt.com/v=next" in embed.description
+        assert "`1:30`" in embed.description
+        assert mock_author.mention in embed.description
+
+    def test_shows_resolving_for_unresolved_ytsource(self, music_player):
+        music_player.song_queue.append(
+            YTSource(ytsearch="ytsearch:some song", process=True)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "resolving..." in embed.description
+
+    def test_shows_placeholder_duration_when_unknown(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "`?:??`" in embed.description
+
+    def test_only_uses_first_queued_song(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "First", mock_author, duration=60)
+        )
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=2", "Second", mock_author, duration=60)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "First" in embed.description
+        assert "Second" not in embed.description
+
+    def test_includes_est_playing_at_eta(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "Est. playing at" in embed.description
+        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*", embed.description)
+
+    def test_eta_matches_current_song_estimated_finish(self, music_player, mock_song):
+        """The next song's ETA should line up with the current song's finish time,
+        since both derive from the same cumulative_secs seed."""
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject(
+                "https://yt.com/v=next", "Next Song", mock_song.requester, duration=90
+            )
+        )
+        now_playing_embed = music_player._build_now_playing_embed(mock_song)
+        next_up_embed = music_player._build_next_up_embed()
+        assert next_up_embed is not None
+        finish_time = now_playing_embed.description.split("Estimated finish: ")[1]
+        assert finish_time in next_up_embed.description
 
 
 # ── PrefetchNextSong ──────────────────────────────────────────────────────────

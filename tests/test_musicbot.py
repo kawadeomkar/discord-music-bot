@@ -1155,6 +1155,40 @@ class TestPlayCommand:
         mock_ctx.send.assert_awaited()
 
 
+class TestEnqueueSingle:
+    async def test_shows_queued_embed_with_eta_when_song_playing(
+        self, music_bot, mock_ctx
+    ):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.estimated_playing_at.assert_called_once()
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "Est. playing at **7:42 PM PST**" in embed.description
+
+    async def test_no_queued_embed_when_nothing_playing(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = None
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.estimated_playing_at.assert_not_called()
+        mock_ctx.send.assert_not_awaited()
+
+
 class TestNowCommand:
     async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
         vc = object.__new__(discord.VoiceClient)

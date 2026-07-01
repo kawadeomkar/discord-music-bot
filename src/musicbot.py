@@ -345,7 +345,8 @@ class MusicBot(commands.Cog):
                         title="Queued song",
                         description=(
                             f"Requested by: [{ctx.author.mention}]\n"
-                            f"{qobj.title} - ({qobj.webpage_url})"
+                            f"{qobj.title} - ({qobj.webpage_url})\n"
+                            f"Est. playing at {mp.estimated_playing_at()}"
                         ),
                         color=discord.Color.blue(),
                     )
