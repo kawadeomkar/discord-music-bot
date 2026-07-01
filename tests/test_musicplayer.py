@@ -914,6 +914,22 @@ class TestStateRestore:
         await mp._restore_state()
         assert mp.queue.qsize() == 0
 
+    async def test_restore_fetches_queue_and_history_concurrently(
+        self, music_player, fake_redis
+    ):
+        """Guard against a future edit reintroducing a hidden ordering
+        dependency between get_queue() and get_history() — they're gathered
+        specifically because neither depends on the other's result."""
+        get_queue_spy = AsyncMock(wraps=music_player._store.get_queue)
+        get_history_spy = AsyncMock(wraps=music_player._store.get_history)
+        with (
+            patch.object(music_player._store, "get_queue", get_queue_spy),
+            patch.object(music_player._store, "get_history", get_history_spy),
+        ):
+            await music_player._restore_state()
+        get_queue_spy.assert_awaited_once()
+        get_history_spy.assert_awaited_once()
+
 
 # ── RestoreCrashedSong ────────────────────────────────────────────────────────
 

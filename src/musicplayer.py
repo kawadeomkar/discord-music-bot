@@ -365,8 +365,15 @@ class MusicPlayer:
                                 f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
                             )
 
-                    # Restore queue (Redis list → asyncio.Queue + song_queue deque)
-                    items = await self._store.get_queue()
+                    # Restore queue + history (Redis list → asyncio.Queue +
+                    # song_queue deque). Independent reads — no data dependency
+                    # between them — fetched concurrently rather than as two
+                    # sequential round-trips, since loop() now blocks on this
+                    # method finishing (see self._restored above).
+                    items, hist_items = await asyncio.gather(
+                        self._store.get_queue(),
+                        self._store.get_history(),
+                    )
                     count = 0
                     for item in items:
                         qobj = _deserialize_queue_item(item, self._guild)
@@ -380,7 +387,6 @@ class MusicPlayer:
                         )
 
                     # Restore history (Redis list is newest-first; deque appends oldest-first)
-                    hist_items = await self._store.get_history()
                     for item in reversed(hist_items):
                         try:
                             self.history.append(orjson.loads(item))
