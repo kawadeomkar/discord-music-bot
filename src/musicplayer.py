@@ -58,6 +58,22 @@ def _fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
     return f"{prefix}**{_fmt_clock_time(est_dt)}**"
 
 
+def _requester_mention(
+    requester: Optional[Union[discord.User, discord.Member]],
+) -> str:
+    return requester.mention if requester else "Unknown"
+
+
+def _fmt_finish_time(duration_secs: int) -> str:
+    """Clock time `duration_secs` from now — no uncertainty prefix, since a
+    song's own remaining duration (unlike a queued song's ETA) is never
+    uncertain once it's playing."""
+    finish_dt = datetime.datetime.now(tz=_PST) + datetime.timedelta(
+        seconds=duration_secs
+    )
+    return _fmt_clock_time(finish_dt)
+
+
 def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
     if isinstance(item, QueueObject):
         return orjson.dumps(
@@ -70,6 +86,8 @@ def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
                 "user_input": item.user_input,
                 "duration": item.duration,
                 "uploader": item.uploader,
+                "thumbnail": item.thumbnail,
+                "persisted": item.persisted,
             }
         )
     return orjson.dumps(
@@ -109,6 +127,8 @@ def _deserialize_queue_item(
             user_input=d.get("user_input"),
             duration=d.get("duration"),
             uploader=d.get("uploader"),
+            thumbnail=d.get("thumbnail"),
+            persisted=d.get("persisted", True),
         )
     except Exception as e:
         log.warning(f"Failed to deserialize queue item: {e}")
@@ -264,7 +284,7 @@ class MusicPlayer:
 
         if isinstance(item, QueueObject):
             title = item.title or "Unknown"
-            requester = item.requester.mention if item.requester else "Unknown"
+            requester = _requester_mention(item.requester)
             dur = _fmt_duration(item.duration) if item.duration is not None else "?:??"
             channel = item.uploader or "Unknown channel"
             ts_note = f"  ·  starts at `{item.ts}s`" if item.ts else ""
@@ -406,8 +426,15 @@ class MusicPlayer:
                                 f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
                             )
 
-                    # Restore queue (Redis list → asyncio.Queue + song_queue deque)
-                    items = await self._store.get_queue()
+                    # Restore queue + history (Redis list → asyncio.Queue +
+                    # song_queue deque). Independent reads — no data dependency
+                    # between them — fetched concurrently rather than as two
+                    # sequential round-trips, since loop() now blocks on this
+                    # method finishing (see self._restored above).
+                    items, hist_items = await asyncio.gather(
+                        self._store.get_queue(),
+                        self._store.get_history(),
+                    )
                     count = 0
                     for item in items:
                         qobj = _deserialize_queue_item(item, self._guild)
@@ -421,7 +448,6 @@ class MusicPlayer:
                         )
 
                     # Restore history (Redis list is newest-first; deque appends oldest-first)
-                    hist_items = await self._store.get_history()
                     for item in reversed(hist_items):
                         try:
                             self.history.append(orjson.loads(item))
@@ -575,10 +601,13 @@ class MusicPlayer:
         # not plain pipeline — a plain pipeline() leaves a window where the key
         # is empty and a concurrent LPOP sees an empty queue.
         if self._store is not None and kept_after_shuffle:
+            # persisted=False items (the crash-recovered "current song") were
+            # never RPUSHed to Redis's queue list — never write them back in.
             serialized = [
                 _serialize_queue_item(s)
                 for s in kept_after_shuffle
                 if isinstance(s, (QueueObject, YTSource))
+                and getattr(s, "persisted", True)
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -620,10 +649,13 @@ class MusicPlayer:
             self.song_queue = deque(kept)
 
         if removed_positions and self._store is not None:
+            # persisted=False items (the crash-recovered "current song") were
+            # never RPUSHed to Redis's queue list — never write them back in.
             serialized = [
                 _serialize_queue_item(s)
                 for s in kept
                 if isinstance(s, (QueueObject, YTSource))
+                and getattr(s, "persisted", True)
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -635,13 +667,11 @@ class MusicPlayer:
     # ── Embed building ────────────────────────────────────────────────────────
 
     def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
-        requester_mention = song.requester.mention if song.requester else "Unknown"
-        description = f"Requester: [{requester_mention}]"
+        description = f"Requester: [{_requester_mention(song.requester)}]"
         if song.duration_secs > 0:
-            finish_dt = datetime.datetime.now(tz=_PST) + datetime.timedelta(
-                seconds=song.duration_secs
+            description += (
+                f"  ·  Estimated finish: {_fmt_finish_time(song.duration_secs)}"
             )
-            description += f"  ·  Estimated finish: {_fmt_clock_time(finish_dt)}"
         return (
             discord.Embed(
                 title=f"**Now playing:** {song.title}",
@@ -824,6 +854,7 @@ class MusicPlayer:
                         # they were always real, Redis-mirrored queue entries.
                         should_pop_queue = True
                     else:
+                        source = None
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
@@ -832,6 +863,24 @@ class MusicPlayer:
                             log.warning("Queue timed out, disconnecting")
                             asyncio.create_task(self.stop())
                             return
+                        except Exception:
+                            # _resolve_source() raised (e.g. yt-dlp lookup failure)
+                            # after queue_get() already dequeued `source` — balance
+                            # that dequeue the same way the "current_song is None"
+                            # branch below does, then let the outer handler's
+                            # logging/error-embed path run via the re-raise.
+                            if source is not None:
+                                try:
+                                    self.song_queue.popleft()
+                                except IndexError:
+                                    log.warning(
+                                        f"song_queue was empty on resolve failure in guild {self._guild.id}"
+                                    )
+                                await self._pop_queue_for_dequeue(
+                                    getattr(source, "persisted", True)
+                                )
+                                self.queue.task_done()
+                            raise
                         self.current_song = await self._stream_source(source)
                         should_pop_queue = getattr(source, "persisted", True)
 

@@ -15,7 +15,9 @@ from src.musicplayer import (
     MusicPlayer,
     _deserialize_queue_item,
     _fmt_duration,
+    _fmt_finish_time,
     _fmt_total_duration,
+    _requester_mention,
     _serialize_queue_item,
 )
 from src.sources import YTSource
@@ -133,6 +135,26 @@ class TestFmtTotalDuration:
 
     def test_hours_and_minutes_no_seconds(self):
         assert _fmt_total_duration(3780) == "1h 3m"
+
+
+class TestRequesterMention:
+    def test_returns_mention_when_present(self, mock_author):
+        assert _requester_mention(mock_author) == mock_author.mention
+
+    def test_returns_unknown_when_none(self):
+        assert _requester_mention(None) == "Unknown"
+
+
+class TestFmtFinishTime:
+    def test_matches_clock_format(self):
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) PST$", _fmt_finish_time(90))
+
+    def test_no_uncertainty_prefix(self):
+        # Unlike _fmt_eta(), a song's own remaining duration is never
+        # uncertain — no "~" prefix and no bold markdown wrapping.
+        result = _fmt_finish_time(90)
+        assert not result.startswith("~")
+        assert "**" not in result
 
 
 # ── QueuePut ─────────────────────────────────────────────────────────────────
@@ -350,6 +372,27 @@ class TestQueueShuffle:
         urls = {orjson.loads(item)["webpage_url"] for item in items}
         assert urls == {f"https://yt.com/watch?v={i}" for i in range(5)}
 
+    async def test_shuffle_excludes_non_persisted_item_from_redis(
+        self, music_player, mock_author, fake_redis
+    ):
+        """A crash-recovered (persisted=False) item mid-queue must never be
+        written to Redis by a shuffle — it was never RPUSHed there."""
+        crashed = QueueObject(
+            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+        )
+        await music_player.queue.put(crashed)
+        music_player.song_queue.append(crashed)
+        for i in range(4):
+            qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
+            await music_player.queue_put(qobj)
+
+        await music_player.queue_shuffle()
+
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        urls = {orjson.loads(item)["webpage_url"] for item in items}
+        assert "https://yt.com/v=crashed" not in urls
+        assert len(items) == 4
+
 
 # ── QueueRemove ───────────────────────────────────────────────────────────────
 
@@ -446,6 +489,50 @@ class TestQueueRemove:
         assert len(items) == 2
         urls = [orjson.loads(item)["webpage_url"] for item in items]
         assert "https://yt.com/v=1" not in urls
+
+    async def test_remove_excludes_non_persisted_item_from_redis(
+        self, music_player, mock_author, fake_redis
+    ):
+        """A crash-recovered (persisted=False) item kept after a remove must
+        never be written to Redis — it was never RPUSHed there."""
+        crashed = QueueObject(
+            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+        )
+        await music_player.queue.put(crashed)
+        music_player.song_queue.append(crashed)
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=a", "Song A", mock_author)
+        )
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=b", "Song B", mock_author)
+        )
+
+        positions = await music_player.queue_remove("https://yt.com/v=a")
+
+        assert positions == [2]  # crashed(1), a(2), b(3) — 1-indexed
+        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        urls = {orjson.loads(item)["webpage_url"] for item in items}
+        assert "https://yt.com/v=crashed" not in urls
+        assert urls == {"https://yt.com/v=b"}
+
+    async def test_remove_deletes_redis_key_when_only_non_persisted_item_kept(
+        self, music_player, mock_author, fake_redis
+    ):
+        """If removal leaves only a non-persisted item, Redis's queue key
+        should end up empty/deleted, not populated with a phantom entry."""
+        crashed = QueueObject(
+            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+        )
+        await music_player.queue.put(crashed)
+        music_player.song_queue.append(crashed)
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=only", "Only Song", mock_author)
+        )
+
+        await music_player.queue_remove("https://yt.com/v=only")
+
+        exists = await fake_redis.exists(music_player._store.queue_key())
+        assert exists == 0
 
     async def test_remove_deletes_redis_key_when_queue_becomes_empty(
         self, music_player, mock_author, fake_redis
@@ -934,6 +1021,22 @@ class TestStateRestore:
         await mp._restore_state()
         assert mp.queue.qsize() == 0
 
+    async def test_restore_fetches_queue_and_history_concurrently(
+        self, music_player, fake_redis
+    ):
+        """Guard against a future edit reintroducing a hidden ordering
+        dependency between get_queue() and get_history() — they're gathered
+        specifically because neither depends on the other's result."""
+        get_queue_spy = AsyncMock(wraps=music_player._store.get_queue)
+        get_history_spy = AsyncMock(wraps=music_player._store.get_history)
+        with (
+            patch.object(music_player._store, "get_queue", get_queue_spy),
+            patch.object(music_player._store, "get_history", get_history_spy),
+        ):
+            await music_player._restore_state()
+        get_queue_spy.assert_awaited_once()
+        get_history_spy.assert_awaited_once()
+
 
 # ── RestoreCrashedSong ────────────────────────────────────────────────────────
 
@@ -1136,6 +1239,44 @@ class TestRestoredEvent:
 
         remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
         assert len(remaining) == 2
+
+    async def test_shuffle_during_restore_window_does_not_orphan_redis_entry(
+        self, music_player, fake_redis, mock_author
+    ):
+        """End-to-end guard for Issue 1: if a user runs -shuffle while the
+        crash-recovered song is still sitting in song_queue (before loop()
+        has dequeued it), Redis's queue list must still end up with exactly
+        the real queued songs — no phantom entry for the crashed song."""
+        await fake_redis.hset(
+            music_player._store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
+        )
+        await fake_redis.hset(
+            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+        )
+        for i in range(4):
+            item = orjson.dumps(
+                {
+                    "webpage_url": f"https://yt.com/v={i}",
+                    "title": f"Queued {i}",
+                    "requester_id": mock_author.id,
+                    "ts": None,
+                }
+            )
+            await fake_redis.rpush(music_player._store.queue_key(), item)
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+
+        await music_player._restore_state()
+        assert music_player.queue.qsize() == 5  # crashed + 4 real queued songs
+
+        # Simulates a -shuffle command running before loop() ever dequeues anything.
+        await music_player.queue_shuffle()
+
+        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        urls = {orjson.loads(item)["webpage_url"] for item in remaining}
+        assert "https://yt.com/v=crash" not in urls
+        assert len(remaining) == 4
 
 
 # ── ResolveSource ─────────────────────────────────────────────────────────────
@@ -1524,6 +1665,7 @@ class TestDeserializeQueueItem:
                 "user_input": "my search",
                 "duration": 240,
                 "uploader": "My Channel",
+                "thumbnail": "https://img.youtube.com/vi/1/0.jpg",
             }
         )
         result = _deserialize_queue_item(data, mock_guild)
@@ -1531,9 +1673,28 @@ class TestDeserializeQueueItem:
         assert result.user_input == "my search"
         assert result.duration == 240
         assert result.uploader == "My Channel"
+        assert result.thumbnail == "https://img.youtube.com/vi/1/0.jpg"
+        assert result.persisted is True
+
+    def test_deserializes_persisted_false(self, mock_guild, mock_author):
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        data = orjson.dumps(
+            {
+                "webpage_url": "https://yt.com/v=1",
+                "title": "Song",
+                "requester_id": mock_author.id,
+                "ts": None,
+                "persisted": False,
+            }
+        )
+        result = _deserialize_queue_item(data, mock_guild)
+        assert result is not None
+        assert result.persisted is False
 
     def test_backward_compat_missing_new_fields(self, mock_guild, mock_author):
-        """Old Redis entries without user_input/duration/uploader deserialize cleanly."""
+        """Old Redis entries without user_input/duration/uploader/thumbnail/persisted
+        deserialize cleanly, defaulting persisted to True (a pre-fix entry can only
+        ever have been a real, Redis-mirrored queue item)."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
         data = orjson.dumps(
             {
@@ -1548,6 +1709,8 @@ class TestDeserializeQueueItem:
         assert result.user_input is None
         assert result.duration is None
         assert result.uploader is None
+        assert result.thumbnail is None
+        assert result.persisted is True
 
 
 # ── SerializeQueueItem ────────────────────────────────────────────────────────
@@ -1563,6 +1726,7 @@ class TestSerializeQueueItem:
             user_input="my search",
             duration=240,
             uploader="My Channel",
+            thumbnail="https://img.youtube.com/vi/1/0.jpg",
         )
         data = _serialize_queue_item(qobj)
         d = orjson.loads(data)
@@ -1574,6 +1738,8 @@ class TestSerializeQueueItem:
         assert d["user_input"] == "my search"
         assert d["duration"] == 240
         assert d["uploader"] == "My Channel"
+        assert d["thumbnail"] == "https://img.youtube.com/vi/1/0.jpg"
+        assert d["persisted"] is True
 
     def test_none_optional_fields_serialize_as_null(self, mock_author):
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author)
@@ -1582,6 +1748,15 @@ class TestSerializeQueueItem:
         assert d["user_input"] is None
         assert d["duration"] is None
         assert d["uploader"] is None
+        assert d["thumbnail"] is None
+
+    def test_persisted_false_is_serialized(self, mock_author):
+        qobj = QueueObject(
+            "https://yt.com/v=1", "Test Song", mock_author, persisted=False
+        )
+        data = _serialize_queue_item(qobj)
+        d = orjson.loads(data)
+        assert d["persisted"] is False
 
     def test_ytsource_round_trip(self):
         src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True, ts=10)
@@ -1744,6 +1919,66 @@ class TestLoop:
         music_player._channel.send.assert_awaited_with(
             "Failed to load the next song, skipping."
         )
+
+    async def test_resolve_failure_balances_queue_and_redis(
+        self, music_player, queue_obj, fake_redis
+    ):
+        """If _resolve_source() raises after queue_get() already dequeued the
+        item, the dequeue must still be balanced (song_queue popped, Redis
+        popped for a persisted item, queue.task_done() called exactly once)
+        and the outer handler's error embed must still be sent."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player._store.push_queue(_serialize_queue_item(queue_obj))
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append(queue_obj)
+
+        with patch.object(
+            MusicPlayer,
+            "_resolve_source",
+            new=AsyncMock(side_effect=Exception("yt-dlp lookup failed")),
+        ):
+            await music_player.loop()
+
+        assert len(music_player.song_queue) == 0
+        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        assert len(remaining) == 0
+        assert music_player.queue._unfinished_tasks == 0  # task_done() balanced get()
+        sent_embed = music_player._channel.send.call_args.kwargs["embed"]
+        assert sent_embed.title == "Playback error — skipping song"
+
+    async def test_resolve_failure_for_non_persisted_item_does_not_pop_redis(
+        self, music_player, mock_author, fake_redis
+    ):
+        """A crash-recovered (persisted=False) item that fails to resolve
+        must not trigger a Redis pop — it was never RPUSHed there."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        crashed = QueueObject(
+            "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
+        )
+        await music_player._store.push_queue(
+            _serialize_queue_item(
+                QueueObject("https://yt.com/v=real", "Real Song", mock_author)
+            )
+        )
+        await music_player.queue.put(crashed)
+        music_player.song_queue.append(crashed)
+
+        with patch.object(
+            MusicPlayer,
+            "_resolve_source",
+            new=AsyncMock(side_effect=Exception("yt-dlp lookup failed")),
+        ):
+            await music_player.loop()
+
+        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        urls = {orjson.loads(item)["webpage_url"] for item in remaining}
+        assert urls == {"https://yt.com/v=real"}
 
     async def test_plays_song_and_updates_history(
         self, music_player, queue_obj, mock_song

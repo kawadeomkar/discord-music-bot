@@ -148,6 +148,22 @@ class TestEnrichQueueObject:
         _enrich_queueobject(qobj, {})
         assert qobj.duration is None
         assert qobj.uploader is None
+        assert qobj.thumbnail is None
+
+    def test_sets_thumbnail_when_none(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
+        _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/x.jpg"})
+        assert qobj.thumbnail == "https://img.yt.com/x.jpg"
+
+    def test_does_not_overwrite_existing_thumbnail(self, mock_author):
+        qobj = QueueObject(
+            "https://yt.com/v=1",
+            "Song",
+            mock_author,
+            thumbnail="https://img.yt.com/original.jpg",
+        )
+        _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/new.jpg"})
+        assert qobj.thumbnail == "https://img.yt.com/original.jpg"
 
     def test_duration_cast_to_int(self, mock_author):
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
@@ -217,6 +233,19 @@ class TestYTSource:
         assert result.title == "Extracted Title"
         assert result.webpage_url == "https://www.youtube.com/watch?v=test123"
         assert result.requester is mock_ctx.author
+
+    async def test_yt_source_sets_thumbnail_fresh_extraction(self, mock_ctx):
+        fake_data = {
+            "webpage_url": "https://www.youtube.com/watch?v=test123",
+            "title": "Extracted Title",
+            "thumbnail": "https://img.yt.com/test123.jpg",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
+            result = await YTDL.yt_source(
+                mock_ctx.author, "ytsearch:test song", process=True
+            )
+        assert result.thumbnail == "https://img.yt.com/test123.jpg"
 
     async def test_yt_source_raises_when_no_data(self, mock_ctx):
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
@@ -301,6 +330,45 @@ class TestYTSource:
             mock_ctx.author, "cached search", process=True, redis=fake_redis
         )
         assert result.user_input == "cached search"
+
+    async def test_yt_source_sets_thumbnail_cache_hit(self, mock_ctx, fake_redis):
+        """thumbnail is restored from the cached entry on a Redis cache hit."""
+        import orjson as _orjson
+
+        cached = {
+            "webpage_url": "https://yt.com/v=cached",
+            "title": "Cached Song",
+            "duration": 120,
+            "uploader": "Chan",
+            "thumbnail": "https://img.yt.com/cached.jpg",
+        }
+        await fake_redis.set(
+            "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
+        )
+        result = await YTDL.yt_source(
+            mock_ctx.author, "cached search", process=True, redis=fake_redis
+        )
+        assert result.thumbnail == "https://img.yt.com/cached.jpg"
+
+    async def test_yt_source_caches_thumbnail_for_next_lookup(
+        self, mock_ctx, fake_redis
+    ):
+        """A fresh extraction's thumbnail is written to the cache, not just returned."""
+        fake_data = {
+            "webpage_url": "https://www.youtube.com/watch?v=test123",
+            "title": "Song",
+            "thumbnail": "https://img.yt.com/fresh.jpg",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = fake_data
+            await YTDL.yt_source(
+                mock_ctx.author, "some search", process=True, redis=fake_redis
+            )
+
+        result = await YTDL.yt_source(
+            mock_ctx.author, "some search", process=True, redis=fake_redis
+        )
+        assert result.thumbnail == "https://img.yt.com/fresh.jpg"
 
     async def test_yt_source_passes_timestamp(self, mock_ctx):
         fake_data = {

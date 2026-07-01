@@ -1188,6 +1188,41 @@ class TestEnqueueSingle:
         mp.estimated_playing_at.assert_not_called()
         mock_ctx.send.assert_not_awaited()
 
+    async def test_queued_embed_has_thumbnail_when_present(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject(
+            "https://yt.com/v=1",
+            "Test Song",
+            mock_ctx.author,
+            thumbnail="https://img.youtube.com/vi/1/0.jpg",
+        )
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.thumbnail.url == "https://img.youtube.com/vi/1/0.jpg"
+
+    async def test_queued_embed_has_no_thumbnail_when_absent(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.thumbnail.url is None
+
 
 class TestNowCommand:
     async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
