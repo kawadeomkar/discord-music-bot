@@ -34,7 +34,7 @@ fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
 
 [tool.poetry.group.lint.dependencies]
-pyright = "^1.1.409"
+pyright = "^1.1.411"
 black = "^26.5.1"
 
 [tool.pyright]
