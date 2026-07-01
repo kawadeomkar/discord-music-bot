@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import re
 import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +15,9 @@ from src.musicplayer import (
     MusicPlayer,
     _deserialize_queue_item,
     _fmt_duration,
+    _fmt_finish_time,
     _fmt_total_duration,
+    _requester_mention,
     _serialize_queue_item,
 )
 from src.sources import YTSource
@@ -132,6 +135,26 @@ class TestFmtTotalDuration:
 
     def test_hours_and_minutes_no_seconds(self):
         assert _fmt_total_duration(3780) == "1h 3m"
+
+
+class TestRequesterMention:
+    def test_returns_mention_when_present(self, mock_author):
+        assert _requester_mention(mock_author) == mock_author.mention
+
+    def test_returns_unknown_when_none(self):
+        assert _requester_mention(None) == "Unknown"
+
+
+class TestFmtFinishTime:
+    def test_matches_clock_format(self):
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) PST$", _fmt_finish_time(90))
+
+    def test_no_uncertainty_prefix(self):
+        # Unlike _fmt_eta(), a song's own remaining duration is never
+        # uncertain — no "~" prefix and no bold markdown wrapping.
+        result = _fmt_finish_time(90)
+        assert not result.startswith("~")
+        assert "**" not in result
 
 
 # ── QueuePut ─────────────────────────────────────────────────────────────────
@@ -695,6 +718,69 @@ class TestGetQueue:
         assert "resolving..." in embed.description
 
 
+# ── EstimatedPlayingAt ────────────────────────────────────────────────────────
+
+
+class TestEstimatedPlayingAt:
+    def test_matches_clock_format(self, music_player):
+        result = music_player.estimated_playing_at()
+        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*$", result)
+
+    def test_uncertain_when_current_song_has_no_duration_secs(self, music_player):
+        mock_current = MagicMock()
+        mock_current.duration_secs = 0
+        music_player.current_song = mock_current
+        result = music_player.estimated_playing_at()
+        assert result.startswith("~")
+
+    def test_accounts_for_already_queued_songs(self, music_player, mock_song):
+        music_player.current_song = mock_song  # duration_secs = 210
+        empty_eta = music_player.estimated_playing_at()
+
+        music_player.song_queue.append(
+            QueueObject(
+                "https://yt.com/v=1", "Song 1", mock_song.requester, duration=600
+            )
+        )
+        later_eta = music_player.estimated_playing_at()
+
+        assert empty_eta != later_eta
+
+    def test_uncertain_when_queued_song_duration_unknown(
+        self, music_player, mock_song, mock_author
+    ):
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
+        )
+        result = music_player.estimated_playing_at()
+        assert result.startswith("~")
+
+    def test_matches_last_queue_line_eta(self, music_player, mock_song, mock_author):
+        """estimated_playing_at() should reflect the same seed used by
+        get_queue()/_build_next_up_embed() for consistency across embeds."""
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
+        )
+        eta = music_player.estimated_playing_at()
+
+        # A song appended now would start right where the last queued line's
+        # ETA ends up, so re-derive it via the same line formatter for index 2.
+        now_pst, cumulative_secs, uncertain = music_player._queue_eta_seed()
+        _, cumulative_secs, uncertain = music_player._format_queue_line(
+            music_player.song_queue[0], 1, now_pst, cumulative_secs, uncertain
+        )
+        expected_line, _, _ = music_player._format_queue_line(
+            QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
+            2,
+            now_pst,
+            cumulative_secs,
+            uncertain,
+        )
+        assert eta in expected_line
+
+
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
 
 
@@ -735,6 +821,27 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
+
+    def test_description_has_estimated_finish_when_duration_known(
+        self, music_player, mock_song
+    ):
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "Estimated finish:" in embed.description
+
+    def test_estimated_finish_appears_after_requester_on_same_line(
+        self, music_player, mock_song
+    ):
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "\n" not in embed.description
+        assert re.search(
+            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) PST$",
+            embed.description,
+        )
+
+    def test_no_estimated_finish_when_duration_unknown(self, music_player, mock_song):
+        mock_song.duration_secs = 0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "Estimated finish" not in embed.description
 
 
 class TestUpdateActivity:
@@ -1330,7 +1437,7 @@ class TestSendNowPlaying:
         await music_player._send_now_playing(mock_song)
         music_player._channel.send.assert_awaited_once()
         call_kwargs = music_player._channel.send.call_args[1]
-        assert "embed" in call_kwargs
+        assert "embeds" in call_kwargs
 
     async def test_stores_embed_as_play_message(self, music_player, mock_song):
         await music_player._send_now_playing(mock_song)
@@ -1340,6 +1447,101 @@ class TestSendNowPlaying:
     async def test_swallows_channel_send_exception(self, music_player, mock_song):
         music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
         await music_player._send_now_playing(mock_song)
+
+    async def test_sends_only_now_playing_embed_when_queue_empty(
+        self, music_player, mock_song
+    ):
+        await music_player._send_now_playing(mock_song)
+        call_kwargs = music_player._channel.send.call_args[1]
+        assert len(call_kwargs["embeds"]) == 1
+        assert call_kwargs["embeds"][0].colour == discord.Color.green()
+
+    async def test_sends_next_up_embed_when_queue_has_song(
+        self, music_player, mock_song, mock_author
+    ):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        await music_player._send_now_playing(mock_song)
+        call_kwargs = music_player._channel.send.call_args[1]
+        embeds = call_kwargs["embeds"]
+        assert len(embeds) == 2
+        assert embeds[1].colour == discord.Color.blue()
+        assert embeds[1].title == "Up next"
+        assert "Next Song" in embeds[1].description
+
+
+# ── BuildNextUpEmbed ──────────────────────────────────────────────────────────
+
+
+class TestBuildNextUpEmbed:
+    def test_returns_none_when_queue_empty(self, music_player):
+        assert music_player._build_next_up_embed() is None
+
+    def test_returns_blue_embed_with_song_details(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert embed.colour == discord.Color.blue()
+        assert embed.title == "Up next"
+        assert "Next Song" in embed.description
+        assert "https://yt.com/v=next" in embed.description
+        assert "`1:30`" in embed.description
+        assert mock_author.mention in embed.description
+
+    def test_shows_resolving_for_unresolved_ytsource(self, music_player):
+        music_player.song_queue.append(
+            YTSource(ytsearch="ytsearch:some song", process=True)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "resolving..." in embed.description
+
+    def test_shows_placeholder_duration_when_unknown(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "`?:??`" in embed.description
+
+    def test_only_uses_first_queued_song(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=1", "First", mock_author, duration=60)
+        )
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=2", "Second", mock_author, duration=60)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "First" in embed.description
+        assert "Second" not in embed.description
+
+    def test_includes_est_playing_at_eta(self, music_player, mock_author):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        embed = music_player._build_next_up_embed()
+        assert embed is not None
+        assert "Est. playing at" in embed.description
+        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*", embed.description)
+
+    def test_eta_matches_current_song_estimated_finish(self, music_player, mock_song):
+        """The next song's ETA should line up with the current song's finish time,
+        since both derive from the same cumulative_secs seed."""
+        music_player.current_song = mock_song
+        music_player.song_queue.append(
+            QueueObject(
+                "https://yt.com/v=next", "Next Song", mock_song.requester, duration=90
+            )
+        )
+        now_playing_embed = music_player._build_now_playing_embed(mock_song)
+        next_up_embed = music_player._build_next_up_embed()
+        assert next_up_embed is not None
+        finish_time = now_playing_embed.description.split("Estimated finish: ")[1]
+        assert finish_time in next_up_embed.description
 
 
 # ── PrefetchNextSong ──────────────────────────────────────────────────────────
@@ -1463,6 +1665,7 @@ class TestDeserializeQueueItem:
                 "user_input": "my search",
                 "duration": 240,
                 "uploader": "My Channel",
+                "thumbnail": "https://img.youtube.com/vi/1/0.jpg",
             }
         )
         result = _deserialize_queue_item(data, mock_guild)
@@ -1470,6 +1673,7 @@ class TestDeserializeQueueItem:
         assert result.user_input == "my search"
         assert result.duration == 240
         assert result.uploader == "My Channel"
+        assert result.thumbnail == "https://img.youtube.com/vi/1/0.jpg"
         assert result.persisted is True
 
     def test_deserializes_persisted_false(self, mock_guild, mock_author):
@@ -1488,7 +1692,7 @@ class TestDeserializeQueueItem:
         assert result.persisted is False
 
     def test_backward_compat_missing_new_fields(self, mock_guild, mock_author):
-        """Old Redis entries without user_input/duration/uploader/persisted
+        """Old Redis entries without user_input/duration/uploader/thumbnail/persisted
         deserialize cleanly, defaulting persisted to True (a pre-fix entry can only
         ever have been a real, Redis-mirrored queue item)."""
         mock_guild.get_member = MagicMock(return_value=mock_author)
@@ -1505,6 +1709,7 @@ class TestDeserializeQueueItem:
         assert result.user_input is None
         assert result.duration is None
         assert result.uploader is None
+        assert result.thumbnail is None
         assert result.persisted is True
 
 
@@ -1521,6 +1726,7 @@ class TestSerializeQueueItem:
             user_input="my search",
             duration=240,
             uploader="My Channel",
+            thumbnail="https://img.youtube.com/vi/1/0.jpg",
         )
         data = _serialize_queue_item(qobj)
         d = orjson.loads(data)
@@ -1532,6 +1738,7 @@ class TestSerializeQueueItem:
         assert d["user_input"] == "my search"
         assert d["duration"] == 240
         assert d["uploader"] == "My Channel"
+        assert d["thumbnail"] == "https://img.youtube.com/vi/1/0.jpg"
         assert d["persisted"] is True
 
     def test_none_optional_fields_serialize_as_null(self, mock_author):
@@ -1541,6 +1748,7 @@ class TestSerializeQueueItem:
         assert d["user_input"] is None
         assert d["duration"] is None
         assert d["uploader"] is None
+        assert d["thumbnail"] is None
 
     def test_persisted_false_is_serialized(self, mock_author):
         qobj = QueueObject(

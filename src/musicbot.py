@@ -339,18 +339,18 @@ class MusicBot(commands.Cog):
             send_queue_phrases(ctx),
         ]
         if should_show_queued:
-            coros.append(
-                ctx.send(
-                    embed=discord.Embed(
-                        title="Queued song",
-                        description=(
-                            f"Requested by: [{ctx.author.mention}]\n"
-                            f"{qobj.title} - ({qobj.webpage_url})"
-                        ),
-                        color=discord.Color.blue(),
-                    )
-                )
+            embed = discord.Embed(
+                title="Queued song",
+                description=(
+                    f"Requested by: [{ctx.author.mention}]\n"
+                    f"{qobj.title} - ({qobj.webpage_url})\n"
+                    f"Est. playing at {mp.estimated_playing_at()}"
+                ),
+                color=discord.Color.blue(),
             )
+            if qobj.thumbnail:
+                embed.set_thumbnail(url=qobj.thumbnail)
+            coros.append(ctx.send(embed=embed))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 

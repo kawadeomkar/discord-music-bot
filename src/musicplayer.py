@@ -47,6 +47,33 @@ def _fmt_total_duration(secs: int) -> str:
     return " ".join(parts) or "0s"
 
 
+def _fmt_clock_time(dt: datetime.datetime) -> str:
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{hour}:{dt.strftime('%M')} {ampm} PST"
+
+
+def _fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
+    prefix = "~" if uncertain else ""
+    return f"{prefix}**{_fmt_clock_time(est_dt)}**"
+
+
+def _requester_mention(
+    requester: Optional[Union[discord.User, discord.Member]],
+) -> str:
+    return requester.mention if requester else "Unknown"
+
+
+def _fmt_finish_time(duration_secs: int) -> str:
+    """Clock time `duration_secs` from now — no uncertainty prefix, since a
+    song's own remaining duration (unlike a queued song's ETA) is never
+    uncertain once it's playing."""
+    finish_dt = datetime.datetime.now(tz=_PST) + datetime.timedelta(
+        seconds=duration_secs
+    )
+    return _fmt_clock_time(finish_dt)
+
+
 def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
     if isinstance(item, QueueObject):
         return orjson.dumps(
@@ -59,6 +86,7 @@ def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
                 "user_input": item.user_input,
                 "duration": item.duration,
                 "uploader": item.uploader,
+                "thumbnail": item.thumbnail,
                 "persisted": item.persisted,
             }
         )
@@ -99,6 +127,7 @@ def _deserialize_queue_item(
             user_input=d.get("user_input"),
             duration=d.get("duration"),
             uploader=d.get("uploader"),
+            thumbnail=d.get("thumbnail"),
             persisted=d.get("persisted", True),
         )
     except Exception as e:
@@ -218,6 +247,76 @@ class MusicPlayer:
         self._channel = ctx.channel
         self._last_author = ctx.author
 
+    def _queue_eta_seed(self) -> tuple[datetime.datetime, int, bool]:
+        """Seed state for walking ETAs across queued songs.
+
+        Returns (now_pst, cumulative_secs, uncertain), where cumulative_secs
+        is seeded with the current song's total duration as a proxy for its
+        remaining time (we don't track elapsed; this overestimates but keeps
+        the math simple and avoids showing "now" for everything), and
+        uncertain flags whether any preceding song had an unknown duration.
+        """
+        uncertain = False
+        cumulative_secs = 0
+        if self.current_song is not None:
+            secs = getattr(self.current_song, "duration_secs", 0)
+            if secs:
+                cumulative_secs = secs
+            else:
+                uncertain = True
+        return datetime.datetime.now(tz=_PST), cumulative_secs, uncertain
+
+    def _format_queue_line(
+        self,
+        item: Union[QueueObject, YTSource],
+        index: int,
+        now_pst: datetime.datetime,
+        cumulative_secs: int,
+        uncertain: bool,
+    ) -> tuple[str, int, bool]:
+        """Format a single queue line with its "Est. playing at" ETA.
+
+        Returns (line, updated cumulative_secs, updated uncertain) so callers
+        can chain this across consecutive queue items.
+        """
+        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
+        est_str = _fmt_eta(est_dt, uncertain)
+
+        if isinstance(item, QueueObject):
+            title = item.title or "Unknown"
+            requester = _requester_mention(item.requester)
+            dur = _fmt_duration(item.duration) if item.duration is not None else "?:??"
+            channel = item.uploader or "Unknown channel"
+            ts_note = f"  ·  starts at `{item.ts}s`" if item.ts else ""
+            line = (
+                f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
+                f"{channel} · {requester}"
+            )
+            if item.duration is not None:
+                cumulative_secs += item.duration
+            else:
+                uncertain = True
+        else:
+            search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+            line = f"`{index}` {search} · *resolving...*"
+            uncertain = True
+
+        return line, cumulative_secs, uncertain
+
+    def estimated_playing_at(self) -> str:
+        """ETA text for a song appended to the queue right now — i.e. after the
+        current song and everything already queued. Reuses the same ETA-walking
+        seed as get_queue()/_build_next_up_embed() so all three stay consistent.
+        """
+        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        for item in self.song_queue:
+            if isinstance(item, QueueObject) and item.duration is not None:
+                cumulative_secs += item.duration
+            else:
+                uncertain = True
+        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
+        return _fmt_eta(est_dt, uncertain)
+
     def get_queue(self) -> discord.Embed:
         items = list(self.song_queue)
         total = len(items)
@@ -230,52 +329,14 @@ class MusicPlayer:
             else:
                 duration_partial = True
 
-        # Track whether any preceding song had an unknown duration so we can
-        # flag downstream estimates as uncertain.
-        uncertain = False
-
-        # Seed cumulative seconds with the current song's total duration as a proxy
-        # for its remaining time (we don't track elapsed; this overestimates but
-        # keeps the math simple and avoids showing "now" for everything).
-        cumulative_secs = 0
-        if self.current_song is not None:
-            secs = getattr(self.current_song, "duration_secs", 0)
-            if secs:
-                cumulative_secs = secs
-            else:
-                uncertain = True
-        now_pst = datetime.datetime.now(tz=_PST)
+        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
 
         lines = []
         for i, item in enumerate(items[:10], start=1):
-            est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
-            hour = est_dt.hour % 12 or 12
-            ampm = "AM" if est_dt.hour < 12 else "PM"
-            prefix = "~" if uncertain else ""
-            est_str = f"{prefix}**{hour}:{est_dt.strftime('%M')} {ampm}** PST"
-
-            if isinstance(item, QueueObject):
-                title = item.title or "Unknown"
-                requester = item.requester.mention if item.requester else "Unknown"
-                dur = (
-                    _fmt_duration(item.duration)
-                    if item.duration is not None
-                    else "?:??"
-                )
-                channel = item.uploader or "Unknown channel"
-                ts_note = f"  ·  starts at `{item.ts}s`" if item.ts else ""
-                lines.append(
-                    f"`{i}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
-                    f"{channel} · {requester}"
-                )
-                if item.duration is not None:
-                    cumulative_secs += item.duration
-                else:
-                    uncertain = True
-            else:
-                search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-                lines.append(f"`{i}` {search} · *resolving...*")
-                uncertain = True
+            line, cumulative_secs, uncertain = self._format_queue_line(
+                item, i, now_pst, cumulative_secs, uncertain
+            )
+            lines.append(line)
 
         header = f"Songs: **{total}**"
         if total_secs > 0:
@@ -606,11 +667,15 @@ class MusicPlayer:
     # ── Embed building ────────────────────────────────────────────────────────
 
     def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
-        requester_mention = song.requester.mention if song.requester else "Unknown"
+        description = f"Requester: [{_requester_mention(song.requester)}]"
+        if song.duration_secs > 0:
+            description += (
+                f"  ·  Estimated finish: {_fmt_finish_time(song.duration_secs)}"
+            )
         return (
             discord.Embed(
                 title=f"**Now playing:** {song.title}",
-                description=f"Requester: [{requester_mention}]",
+                description=description,
                 color=discord.Color.green(),
             )
             .add_field(name="Youtube link", value=song.webpage_url, inline=False)
@@ -623,6 +688,20 @@ class MusicPlayer:
             .set_footer(
                 text=f"Avg Bitrate: {song.abr} | Avg Sampling: {song.asr} | Acodec: {song.acodec}"
             )
+        )
+
+    def _build_next_up_embed(self) -> Optional[discord.Embed]:
+        if not self.song_queue:
+            return None
+        item = self.song_queue[0]
+        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        description, _, _ = self._format_queue_line(
+            item, 1, now_pst, cumulative_secs, uncertain
+        )
+        return discord.Embed(
+            title="Up next",
+            description=description,
+            color=discord.Color.blue(),
         )
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
@@ -698,7 +777,11 @@ class MusicPlayer:
         try:
             embed = self._build_now_playing_embed(song)
             self.play_message = embed
-            await self._channel.send(embed=embed)
+            embeds = [embed]
+            next_up_embed = self._build_next_up_embed()
+            if next_up_embed is not None:
+                embeds.append(next_up_embed)
+            await self._channel.send(embeds=embeds)
         except Exception as e:
             log.error(f"embed error: {e}")
 
