@@ -142,6 +142,11 @@ class QueueObject:
     user_input: Optional[str] = None
     duration: Optional[int] = None  # seconds, from yt-dlp at enqueue time
     uploader: Optional[str] = None  # YouTube channel name
+    # False for the crash-recovered "current song" MusicPlayer._restore_state()
+    # re-queues directly into self.queue/song_queue — it was never RPUSHed to
+    # Redis's queue list (it's tracked separately via current_song_url state),
+    # so the playback loop must skip the matching Redis pop_queue() for it.
+    persisted: bool = True
 
 
 def _enrich_queueobject(qo: QueueObject, data: dict) -> None:

@@ -59,6 +59,7 @@ def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
                 "user_input": item.user_input,
                 "duration": item.duration,
                 "uploader": item.uploader,
+                "persisted": item.persisted,
             }
         )
     return orjson.dumps(
@@ -98,6 +99,7 @@ def _deserialize_queue_item(
             user_input=d.get("user_input"),
             duration=d.get("duration"),
             uploader=d.get("uploader"),
+            persisted=d.get("persisted", True),
         )
     except Exception as e:
         log.warning(f"Failed to deserialize queue item: {e}")
@@ -123,6 +125,7 @@ class MusicPlayer:
         "_prefetch_task",
         "_store",
         "_restore_task",
+        "_restored",
         "_queue_cleared",
         "_background_tasks",
     )
@@ -144,6 +147,7 @@ class MusicPlayer:
     _prefetch_task: Optional[asyncio.Task]
     _store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
+    _restored: asyncio.Event
     _queue_cleared: bool
     _background_tasks: set
 
@@ -178,6 +182,7 @@ class MusicPlayer:
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
+        self._restored = asyncio.Event()
         self._queue_cleared: bool = False
         self._background_tasks: set = set()
 
@@ -196,10 +201,17 @@ class MusicPlayer:
         return mp
 
     def start(self) -> None:
-        """Start the playback loop and (if Redis is configured) the state restore task."""
-        self._player = self.bot.loop.create_task(self.loop())
+        """Start the playback loop and (if Redis is configured) the state restore task.
+
+        loop() blocks on self._restored before consuming from self.queue — see
+        _restore_state() for why. When there's no store, restore is a no-op, so
+        the event is set immediately rather than left for _restore_state() to set.
+        """
         if self._store is not None:
             self._restore_task = self.bot.loop.create_task(self._restore_state())
+        else:
+            self._restored.set()
+        self._player = self.bot.loop.create_task(self.loop())
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -296,90 +308,103 @@ class MusicPlayer:
         """
         Restore queue, history, and volume from Redis after a bot restart.
         Runs as a background task; waits for bot ready so guild members are cached.
+
+        loop() waits on self._restored before its first queue_get(). Without this,
+        loop() can race ahead and dequeue the crash-recovered "current song" this
+        method injects below, then call pop_queue() (Redis LPOP) as part of its
+        normal transition bookkeeping — the crashed song was never itself on the
+        Redis queue list (it's tracked separately via current_song_url state), so
+        that LPOP silently deletes an unrelated, still-queued song from Redis
+        before this method ever gets to read the queue itself.
         """
         if self._store is None:
+            self._restored.set()
             return
-        await self.bot.wait_until_ready()
-        with _tracer.start_as_current_span(
-            "player.state_restore",
-            attributes={"discord.guild_id": str(self._guild.id)},
-        ) as span:
-            try:
-                # Restore volume
-                state = await self._store.get_state()
-                if state and b"volume" in state:
-                    self.volume = float(state[b"volume"])
+        try:
+            await self.bot.wait_until_ready()
+            with _tracer.start_as_current_span(
+                "player.state_restore",
+                attributes={"discord.guild_id": str(self._guild.id)},
+            ) as span:
+                try:
+                    # Restore volume
+                    state = await self._store.get_state()
+                    if state and b"volume" in state:
+                        self.volume = float(state[b"volume"])
 
-                # Re-queue song that was playing when the bot crashed (at-most-once delivery).
-                # current_song_url is written to state when playback starts and cleared when
-                # it finishes normally. A non-empty value means the bot died mid-song.
-                crashed_url_raw = state.get(b"current_song_url", b"")
-                if crashed_url_raw:
-                    crashed_url = crashed_url_raw.decode()
-                    crashed_title = state.get(b"current_song_title", b"").decode()
-                    raw_dur = state.get(b"current_song_duration", b"").decode()
-                    crashed_duration = int(raw_dur) if raw_dur.isdigit() else None
-                    raw_uploader = state.get(b"current_song_uploader", b"").decode()
-                    crashed_uploader = raw_uploader or None
-                    requester: Union[discord.Member, discord.User, None] = (
-                        self._guild.me or self._guild.owner
-                    )
-                    if requester is not None:
-                        crashed = QueueObject(
-                            crashed_url,
-                            crashed_title,
-                            requester,
-                            duration=crashed_duration,
-                            uploader=crashed_uploader,
+                    # Re-queue song that was playing when the bot crashed (at-most-once delivery).
+                    # current_song_url is written to state when playback starts and cleared when
+                    # it finishes normally. A non-empty value means the bot died mid-song.
+                    crashed_url_raw = state.get(b"current_song_url", b"")
+                    if crashed_url_raw:
+                        crashed_url = crashed_url_raw.decode()
+                        crashed_title = state.get(b"current_song_title", b"").decode()
+                        raw_dur = state.get(b"current_song_duration", b"").decode()
+                        crashed_duration = int(raw_dur) if raw_dur.isdigit() else None
+                        raw_uploader = state.get(b"current_song_uploader", b"").decode()
+                        crashed_uploader = raw_uploader or None
+                        requester: Union[discord.Member, discord.User, None] = (
+                            self._guild.me or self._guild.owner
                         )
-                        await self.queue.put(crashed)
-                        self.song_queue.append(crashed)
-                        await self._store.set_state("current_song_url", "")
-                        await self._store.set_state("current_song_title", "")
-                        await self._store.set_state("current_song_duration", "")
-                        await self._store.set_state("current_song_uploader", "")
+                        if requester is not None:
+                            crashed = QueueObject(
+                                crashed_url,
+                                crashed_title,
+                                requester,
+                                duration=crashed_duration,
+                                uploader=crashed_uploader,
+                                persisted=False,
+                            )
+                            await self.queue.put(crashed)
+                            self.song_queue.append(crashed)
+                            await self._store.set_state("current_song_url", "")
+                            await self._store.set_state("current_song_title", "")
+                            await self._store.set_state("current_song_duration", "")
+                            await self._store.set_state("current_song_uploader", "")
+                            log.info(
+                                f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
+                            )
+
+                    # Restore queue (Redis list → asyncio.Queue + song_queue deque)
+                    items = await self._store.get_queue()
+                    count = 0
+                    for item in items:
+                        qobj = _deserialize_queue_item(item, self._guild)
+                        if qobj is not None:
+                            await self.queue.put(qobj)
+                            self.song_queue.append(qobj)
+                            count += 1
+                    if count:
                         log.info(
-                            f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
+                            f"Restored {count} queued songs for guild {self._guild.id}"
                         )
 
-                # Restore queue (Redis list → asyncio.Queue + song_queue deque)
-                items = await self._store.get_queue()
-                count = 0
-                for item in items:
-                    qobj = _deserialize_queue_item(item, self._guild)
-                    if qobj is not None:
-                        await self.queue.put(qobj)
-                        self.song_queue.append(qobj)
-                        count += 1
-                if count:
-                    log.info(
-                        f"Restored {count} queued songs for guild {self._guild.id}"
+                    # Restore history (Redis list is newest-first; deque appends oldest-first)
+                    hist_items = await self._store.get_history()
+                    for item in reversed(hist_items):
+                        try:
+                            self.history.append(orjson.loads(item))
+                        except Exception as e:
+                            log.warning(
+                                f"Failed to deserialize history item in guild {self._guild.id}: {e}"
+                            )
+
+                    span.set_attribute("restore.queue_count", count)
+                    span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
+
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                    log.error(
+                        f"State restore failed for guild {self._guild.id}: {e}",
+                        exc_info=True,
                     )
+                    return
 
-                # Restore history (Redis list is newest-first; deque appends oldest-first)
-                hist_items = await self._store.get_history()
-                for item in reversed(hist_items):
-                    try:
-                        self.history.append(orjson.loads(item))
-                    except Exception as e:
-                        log.warning(
-                            f"Failed to deserialize history item in guild {self._guild.id}: {e}"
-                        )
-
-                span.set_attribute("restore.queue_count", count)
-                span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
-
-            except Exception as e:
-                span.record_exception(e)
-                span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-                log.error(
-                    f"State restore failed for guild {self._guild.id}: {e}",
-                    exc_info=True,
-                )
-                return
-
-            # Refresh TTL on all guild keys after successful restore.
-            await self._store.refresh_ttl()
+                # Refresh TTL on all guild keys after successful restore.
+                await self._store.refresh_ttl()
+        finally:
+            self._restored.set()
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
@@ -425,6 +450,17 @@ class MusicPlayer:
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
+
+    async def _pop_queue_for_dequeue(self, should_pop: bool) -> None:
+        """Mirror one self.queue dequeue to Redis via LPOP — unless should_pop
+        is False, meaning the item was injected directly into self.queue/
+        song_queue rather than via queue_put() (e.g. the crash-recovered
+        "current song" _restore_state() re-queues with persisted=False), so it
+        was never pushed to Redis's queue list and there's nothing to pop.
+        See _restore_state()'s docstring for the bug this prevents.
+        """
+        if self._store is not None and should_pop:
+            await self._store.pop_queue()
 
     async def _cancel_prefetch(self) -> None:
         """Cancel any in-flight prefetch task and wait for it to finish.
@@ -498,10 +534,13 @@ class MusicPlayer:
         # not plain pipeline — a plain pipeline() leaves a window where the key
         # is empty and a concurrent LPOP sees an empty queue.
         if self._store is not None and kept_after_shuffle:
+            # persisted=False items (the crash-recovered "current song") were
+            # never RPUSHed to Redis's queue list — never write them back in.
             serialized = [
                 _serialize_queue_item(s)
                 for s in kept_after_shuffle
                 if isinstance(s, (QueueObject, YTSource))
+                and getattr(s, "persisted", True)
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -543,10 +582,13 @@ class MusicPlayer:
             self.song_queue = deque(kept)
 
         if removed_positions and self._store is not None:
+            # persisted=False items (the crash-recovered "current song") were
+            # never RPUSHed to Redis's queue list — never write them back in.
             serialized = [
                 _serialize_queue_item(s)
                 for s in kept
                 if isinstance(s, (QueueObject, YTSource))
+                and getattr(s, "persisted", True)
             ]
             if serialized:
                 await self._store.rebuild_queue(serialized)
@@ -688,6 +730,11 @@ class MusicPlayer:
 
     async def loop(self):
         await self.bot.wait_until_ready()
+        # Wait for _restore_state() to finish populating self.queue before
+        # dequeuing anything — see _restore_state()'s docstring for the race
+        # this prevents (an erroneous Redis pop_queue() for a crash-recovered
+        # song that was never on the Redis queue list in the first place).
+        await self._restored.wait()
         prefetched_song: Optional[YTDL] = None
 
         while not self.bot.is_closed():
@@ -714,7 +761,11 @@ class MusicPlayer:
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
+                        # Prefetched items always came through queue_get(), so
+                        # they were always real, Redis-mirrored queue entries.
+                        should_pop_queue = True
                     else:
+                        source = None
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
@@ -723,7 +774,26 @@ class MusicPlayer:
                             log.warning("Queue timed out, disconnecting")
                             asyncio.create_task(self.stop())
                             return
+                        except Exception:
+                            # _resolve_source() raised (e.g. yt-dlp lookup failure)
+                            # after queue_get() already dequeued `source` — balance
+                            # that dequeue the same way the "current_song is None"
+                            # branch below does, then let the outer handler's
+                            # logging/error-embed path run via the re-raise.
+                            if source is not None:
+                                try:
+                                    self.song_queue.popleft()
+                                except IndexError:
+                                    log.warning(
+                                        f"song_queue was empty on resolve failure in guild {self._guild.id}"
+                                    )
+                                await self._pop_queue_for_dequeue(
+                                    getattr(source, "persisted", True)
+                                )
+                                self.queue.task_done()
+                            raise
                         self.current_song = await self._stream_source(source)
+                        should_pop_queue = getattr(source, "persisted", True)
 
                     if self.current_song is None:
                         try:
@@ -732,8 +802,7 @@ class MusicPlayer:
                             log.warning(
                                 f"song_queue was empty on failed-song pop in guild {self._guild.id}"
                             )
-                        if self._store is not None:
-                            await self._store.pop_queue()
+                        await self._pop_queue_for_dequeue(should_pop_queue)
                         self.queue.task_done()
                         try:
                             await self._channel.send(
@@ -763,8 +832,7 @@ class MusicPlayer:
                             discard = True
                     if discard:
                         continue
-                    if self._store is not None:
-                        await self._store.pop_queue()
+                    await self._pop_queue_for_dequeue(should_pop_queue)
 
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)

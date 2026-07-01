@@ -181,6 +181,20 @@ class TestParseInput:
         result = parse_input(url, f"-play {url}")
         assert isinstance(result, SpotifySource)
 
+    def test_search_term_with_slash_does_not_hit_domain_regex(self):
+        """Regression: "98/99 sorisa" was misparsed as a URL with domain "98",
+        raising "Domain not supported 98" instead of falling back to search."""
+        result = parse_input("98/99", "-p 98/99 sorisa")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:98/99 sorisa"
+        assert result.url is None
+
+    def test_single_word_with_slash_still_tries_url_parse(self):
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        result = parse_input(url, f"-p {url}")
+        assert isinstance(result, YTSource)
+        assert result.url == url
+
 
 class TestSpotifyPlaylistToYTSearch:
     def test_converts_titles_to_ytsearch(self):
