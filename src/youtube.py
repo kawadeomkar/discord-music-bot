@@ -142,6 +142,7 @@ class QueueObject:
     user_input: Optional[str] = None
     duration: Optional[int] = None  # seconds, from yt-dlp at enqueue time
     uploader: Optional[str] = None  # YouTube channel name
+    thumbnail: Optional[str] = None
     # False for the crash-recovered "current song" MusicPlayer._restore_state()
     # re-queues directly into self.queue/song_queue — it was never RPUSHed to
     # Redis's queue list (it's tracked separately via current_song_url state),
@@ -163,6 +164,8 @@ def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
         qo.duration = int(data["duration"])
     if qo.uploader is None:
         qo.uploader = data.get("uploader")
+    if qo.thumbnail is None:
+        qo.thumbnail = data.get("thumbnail")
 
 
 class YTDL(discord.FFmpegOpusAudio):
@@ -351,6 +354,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     user_input=search,
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
+                    thumbnail=cached.get("thumbnail"),
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -384,6 +388,7 @@ class YTDL(discord.FFmpegOpusAudio):
         raw_duration = data.get("duration")
         duration = int(raw_duration) if raw_duration is not None else None
         uploader = data.get("uploader")
+        thumbnail = data.get("thumbnail")
         trace.get_current_span().set_attribute("ytdl.result_title", title)
 
         if redis is not None:
@@ -395,6 +400,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     "title": title,
                     "duration": duration,
                     "uploader": uploader,
+                    "thumbnail": thumbnail,
                 },
                 _YT_SOURCE_TTL,
             )
@@ -407,6 +413,7 @@ class YTDL(discord.FFmpegOpusAudio):
             user_input=search,
             duration=duration,
             uploader=uploader,
+            thumbnail=thumbnail,
         )
 
     @staticmethod
