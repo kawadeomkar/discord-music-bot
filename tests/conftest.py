@@ -124,10 +124,15 @@ async def fake_redis():
 
 @pytest.fixture
 def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
-    """Construct MusicPlayer with fake Redis. start() is NOT called — tests operate on state directly."""
-    return MusicPlayer(
-        mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
-    )
+    """Construct MusicPlayer with fake Redis. start() is NOT called — tests operate on state directly.
+
+    loop() blocks on _restored until _restore_state() finishes (see its docstring
+    for why); since start() never runs here, nothing would set it. Tests that
+    exercise that race explicitly should clear it again before calling loop().
+    """
+    mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
+    mp._restored.set()
+    return mp
 
 
 @pytest.fixture

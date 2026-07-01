@@ -123,12 +123,20 @@ def parse_input(
     """
     Top-level entry point for command input. Tries parse_url; falls back to ytsearch.
 
+    Only attempts parse_url when the command argument is a single word (a bare
+    link) — URLs never contain spaces, so multi-word input is always a search
+    query. This also avoids the loose domain regex misidentifying search terms
+    like "98/99" as a URL with an unsupported domain.
+
     :param user_input: the URL or search term from the command argument
     :param message: full message content (used to extract the search query)
     :return: source
     """
-    try:
-        return parse_url(user_input, message)
-    except ValueError:
-        ytsearch = " ".join(message.split(" ")[1:])
-        return YTSource(ytsearch=f"ytsearch:{ytsearch}", process=True)
+    args = message.split(" ")[1:]
+    if len(args) == 1:
+        try:
+            return parse_url(user_input, message)
+        except ValueError:
+            pass
+    ytsearch = " ".join(args)
+    return YTSource(ytsearch=f"ytsearch:{ytsearch}", process=True)
