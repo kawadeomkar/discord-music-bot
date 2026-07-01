@@ -739,6 +739,78 @@ class TestCleanup:
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)  # must not raise
 
+    async def test_cancels_player_task_before_disconnect(self, music_bot, mock_guild):
+        """_player must be cancelled before disconnect() so the loop cannot wake up
+        and start the next song between voice_client.stop() firing and the loop
+        being cancelled (the root cause of the brief-next-song-on-stop bug)."""
+        call_order: list[str] = []
+
+        class _AwaitableTask:
+            """Minimal awaitable task double: done()=False, cancel() tracked, await=noop."""
+
+            def done(self):
+                return False
+
+            def cancel(self, msg=None):
+                call_order.append("cancel")
+
+            def __await__(self):
+                return iter([])  # completes immediately, no exception
+
+        mp = MagicMock()
+        mp._prefetch_task = None
+        mp._restore_task = None
+        mp._player = _AwaitableTask()
+        mp._store = None
+        music_bot.mps[mock_guild.id] = mp
+
+        async def _disconnect(**_kw):
+            call_order.append("disconnect")
+
+        mock_guild.voice_client.disconnect = AsyncMock(side_effect=_disconnect)
+
+        await music_bot.cleanup(mock_guild)
+
+        assert call_order.index("cancel") < call_order.index(
+            "disconnect"
+        ), "player task must be cancelled before voice disconnect"
+
+
+class TestStopCommand:
+    async def test_stop_adds_wave_reaction(self, music_bot, mock_ctx, mock_guild):
+        music_bot.cleanup = AsyncMock()
+        vc = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.message.add_reaction = AsyncMock()
+        with patch("discord.utils.get", return_value=vc):
+            await MusicBot.stop.callback(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction.assert_awaited_once_with("👋")
+
+    async def test_stop_calls_cleanup(self, music_bot, mock_ctx, mock_guild):
+        music_bot.cleanup = AsyncMock()
+        vc = MagicMock(spec=discord.VoiceClient)
+        with patch("discord.utils.get", return_value=vc):
+            await MusicBot.stop.callback(music_bot, mock_ctx)
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+
+    async def test_stop_does_not_call_skip(self, music_bot, mock_ctx, mock_guild):
+        """stop must not invoke skip — skip fires voice_client.stop() which triggers
+        the after callback and gives the playback loop a window to start the next song.
+        """
+        music_bot.cleanup = AsyncMock()
+        music_bot.skip = AsyncMock()
+        vc = MagicMock(spec=discord.VoiceClient)
+        with patch("discord.utils.get", return_value=vc):
+            await MusicBot.stop.callback(music_bot, mock_ctx)
+        music_bot.skip.assert_not_called()
+
+    async def test_stop_noop_when_no_voice_client(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        music_bot.cleanup = AsyncMock()
+        with patch("discord.utils.get", return_value=None):
+            await MusicBot.stop.callback(music_bot, mock_ctx)
+        music_bot.cleanup.assert_not_awaited()
+
 
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot, mock_ctx):
@@ -1148,6 +1220,75 @@ class TestPlayCommand:
         mock_ctx.send.assert_awaited()
 
 
+class TestEnqueueSingle:
+    async def test_shows_queued_embed_with_eta_when_song_playing(
+        self, music_bot, mock_ctx
+    ):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.estimated_playing_at.assert_called_once()
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "Est. playing at **7:42 PM PST**" in embed.description
+
+    async def test_no_queued_embed_when_nothing_playing(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = None
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        mp.estimated_playing_at.assert_not_called()
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_queued_embed_has_thumbnail_when_present(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject(
+            "https://yt.com/v=1",
+            "Test Song",
+            mock_ctx.author,
+            thumbnail="https://img.youtube.com/vi/1/0.jpg",
+        )
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.thumbnail.url == "https://img.youtube.com/vi/1/0.jpg"
+
+    async def test_queued_embed_has_no_thumbnail_when_absent(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = True
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = MagicMock()
+        mp.queue.qsize.return_value = 0
+        mp.queue_put = AsyncMock()
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp)
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.thumbnail.url is None
+
+
 class TestNowCommand:
     async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
         vc = object.__new__(discord.VoiceClient)
@@ -1494,3 +1635,156 @@ class TestRestoreGuildChannelDeleted:
         )
 
         await music_bot_with_redis._restore_guild(mock_guild)  # must not raise
+
+
+# ── Queue command ─────────────────────────────────────────────────────────────
+
+
+class TestQueueCommand:
+    async def test_always_sends_embed(self, music_bot, mock_ctx):
+        embed = discord.Embed(
+            title="Queue", description="Songs: **0**\n\n*The queue is empty.*"
+        )
+        mp = MagicMock()
+        mp.get_queue = MagicMock(return_value=embed)
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.queue.callback(music_bot, mock_ctx)
+
+        mock_ctx.send.assert_awaited_once()
+        call_kwargs = mock_ctx.send.call_args[1]
+        assert "embed" in call_kwargs
+        assert call_kwargs["embed"] is embed
+
+    async def test_sends_embed_when_queue_is_empty(self, music_bot, mock_ctx):
+        embed = discord.Embed(
+            title="Queue", description="Songs: **0**\n\n*The queue is empty.*"
+        )
+        mp = MagicMock()
+        mp.get_queue = MagicMock(return_value=embed)
+        mp.song_queue = []
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.queue.callback(music_bot, mock_ctx)
+
+        mock_ctx.send.assert_awaited_once()
+
+    async def test_delegates_to_mp_get_queue(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.queue.callback(music_bot, mock_ctx)
+
+        mp.get_queue.assert_called_once()
+
+
+# ── Remove command ────────────────────────────────────────────────────────────
+
+
+class TestRemoveCommand:
+    async def test_no_url_sends_usage_message(self, music_bot, mock_ctx):
+        await MusicBot.remove.callback(music_bot, mock_ctx, None)
+
+        mock_ctx.send.assert_awaited_once()
+        msg = mock_ctx.send.call_args[0][0]
+        assert "-remove" in msg
+
+    async def test_no_match_sends_not_found_embed(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[])
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=notfound"
+        )
+
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "No queued songs found" in embed.description
+
+    async def test_match_sends_removal_embed(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[2])
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        calls = mock_ctx.send.await_args_list
+        # First call: removal embed
+        first_kwargs = calls[0][1]
+        assert "embed" in first_kwargs
+        removal_embed = first_kwargs["embed"]
+        assert "Removed" in removal_embed.title
+
+    async def test_match_sends_updated_queue_embed(self, music_bot, mock_ctx):
+        queue_embed = discord.Embed(title="Queue")
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.get_queue = MagicMock(return_value=queue_embed)
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        calls = mock_ctx.send.await_args_list
+        assert len(calls) == 2
+        second_kwargs = calls[1][1]
+        assert "embed" in second_kwargs
+        assert second_kwargs["embed"] is queue_embed
+
+    async def test_match_adds_trash_reaction(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        mock_ctx.message.add_reaction.assert_awaited_once_with("🗑️")
+
+    async def test_removal_embed_contains_url_field(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[3])
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        url = "https://yt.com/watch?v=abc"
+
+        await MusicBot.remove.callback(music_bot, mock_ctx, url)
+
+        removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
+        field_names = [f.name for f in removal_embed.fields]
+        assert "URL" in field_names
+
+    async def test_removal_embed_shows_positions(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[1, 4])
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
+        field_values = [f.value for f in removal_embed.fields]
+        assert any("1" in v and "4" in v for v in field_values)
+
+    async def test_removal_embed_color_is_orange(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.remove.callback(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
+        assert removal_embed.colour == discord.Color.orange()

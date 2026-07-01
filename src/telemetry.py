@@ -12,8 +12,10 @@ from opentelemetry.sdk.trace.sampling import (
     Sampler,
     SamplingResult,
 )
+from opentelemetry.semconv.resource import ResourceAttributes
 
-_SDK_DISABLED = os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true"
+from src.config import ENVIRONMENT
+
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
@@ -70,7 +72,7 @@ def setup_telemetry() -> None:
     if _tracer_provider is not None:
         return
     _configure_structlog()
-    if _SDK_DISABLED:
+    if os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true":
         return
     _setup_traces()
     _setup_logs()
@@ -104,6 +106,12 @@ def _add_otel_context(logger, method, event_dict):
     return event_dict
 
 
+def _add_environment(logger, method, event_dict):
+    """Structlog processor: stamp every log event with the current environment."""
+    event_dict["environment"] = ENVIRONMENT
+    return event_dict
+
+
 def _configure_structlog() -> None:
     structlog.configure(
         processors=[
@@ -111,6 +119,7 @@ def _configure_structlog() -> None:
             structlog.stdlib.add_log_level,
             structlog.stdlib.add_logger_name,
             structlog.processors.TimeStamper(fmt="iso"),
+            _add_environment,  # environment: production | staging | development
             _add_otel_context,  # trace_id, span_id
             structlog.processors.StackInfoRenderer(),
             structlog.processors.ExceptionRenderer(),
@@ -136,7 +145,12 @@ def _setup_traces() -> None:
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-    resource = Resource.create({SERVICE_NAME: _SERVICE_NAME})
+    resource = Resource.create(
+        {
+            SERVICE_NAME: _SERVICE_NAME,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
+        }
+    )
     exporter = OTLPSpanExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
     provider = TracerProvider(resource=resource, sampler=_DiscordGatewayFilter())
     provider.add_span_processor(BatchSpanProcessor(exporter))
@@ -150,7 +164,12 @@ def _setup_logs() -> None:
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 
-    resource = Resource.create({SERVICE_NAME: _SERVICE_NAME})
+    resource = Resource.create(
+        {
+            SERVICE_NAME: _SERVICE_NAME,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
+        }
+    )
     exporter = OTLPLogExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
     provider = LoggerProvider(resource=resource)
     provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
