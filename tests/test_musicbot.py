@@ -9,7 +9,8 @@ import fakeredis
 import pytest
 from discord.ext import commands
 
-from src.musicbot import MusicBot, _check_voice_permissions, _latency_color
+from src.musicbot import MusicBot, _check_voice_permissions
+from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
 from tests.helpers import make_mock_task, stub_create_task
@@ -75,25 +76,25 @@ class TestCheckVoicePermissions:
 
 class TestLatencyColor:
     def test_excellent_latency_is_green(self):
-        assert _latency_color(30) == 0x44FF44
+        assert latency_color(30).value == 0x44FF44
 
     def test_boundary_50ms_is_green(self):
-        assert _latency_color(50) == 0x44FF44
+        assert latency_color(50).value == 0x44FF44
 
     def test_good_latency_is_yellow(self):
-        assert _latency_color(75) == 0xFFD000
+        assert latency_color(75).value == 0xFFD000
 
     def test_boundary_100ms_is_yellow(self):
-        assert _latency_color(100) == 0xFFD000
+        assert latency_color(100).value == 0xFFD000
 
     def test_acceptable_latency_is_orange(self):
-        assert _latency_color(150) == 0xFF6600
+        assert latency_color(150).value == 0xFF6600
 
     def test_boundary_200ms_is_orange(self):
-        assert _latency_color(200) == 0xFF6600
+        assert latency_color(200).value == 0xFF6600
 
     def test_poor_latency_is_red(self):
-        assert _latency_color(300) == 0x990000
+        assert latency_color(300).value == 0x990000
 
 
 class TestQueueSource:
