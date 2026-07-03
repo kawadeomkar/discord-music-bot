@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import async_timeout
 import discord
 import orjson
+import redis.asyncio as aioredis
 from discord.ext import commands
 
 from opentelemetry import trace
@@ -88,6 +89,7 @@ _PAUSE_DEBOUNCE_SECS = 0.5
 def _build_progress_bar(
     elapsed_secs: float, duration_secs: int, width: int = _BAR_WIDTH
 ) -> str:
+    """Render a `elapsed [bar] duration` progress string, or "" if duration is unknown."""
     if duration_secs <= 0:
         return ""
     ratio = max(0.0, min(1.0, elapsed_secs / duration_secs))
@@ -113,6 +115,8 @@ def _fmt_finish_time(duration_secs: int) -> str:
 
 
 def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
+    """orjson-encode a queue item for the Redis queue mirror, tagging its type
+    so _deserialize_queue_item() can reconstruct the right dataclass."""
     if isinstance(item, QueueObject):
         return orjson.dumps(
             {
@@ -142,6 +146,9 @@ def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
 def _deserialize_queue_item(
     data: bytes, guild: discord.Guild
 ) -> Optional[Union[QueueObject, YTSource]]:
+    """Inverse of _serialize_queue_item(). Returns None (and logs) on any
+    decode failure or if the requester is no longer a guild member with no
+    fallback owner available."""
     try:
         d = orjson.loads(data)
         if d.get("type") == "ytsource":
@@ -174,6 +181,10 @@ def _deserialize_queue_item(
 
 
 class MusicPlayer:
+    """Owns one guild's playback state: the song queue, the currently playing
+    track, and the background loop that streams songs to a voice channel.
+    Optionally mirrors its queue/history/state to Redis for crash recovery."""
+
     __slots__ = (
         "bot",
         "_guild",
@@ -230,8 +241,8 @@ class MusicPlayer:
         guild: discord.Guild,
         channel: discord.TextChannel,
         cog: Any,
-        redis=None,
-    ):
+        redis: Optional[aioredis.Redis] = None,
+    ) -> None:
         self.bot = bot
         self._guild = guild
         self._channel = channel
@@ -267,7 +278,7 @@ class MusicPlayer:
         cls,
         bot: commands.Bot,
         ctx: commands.Context,
-        redis=None,
+        redis: Optional[aioredis.Redis] = None,
     ) -> "MusicPlayer":
         assert ctx.guild is not None
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -365,6 +376,8 @@ class MusicPlayer:
         return _fmt_eta(est_dt, uncertain)
 
     def get_queue(self) -> discord.Embed:
+        """Build the "Queue" embed: up to 10 upcoming songs with per-song ETAs
+        and a running total duration."""
         items = list(self.song_queue)
         total = len(items)
 
@@ -402,7 +415,7 @@ class MusicPlayer:
             color=discord.Color.blue(),
         )
 
-    async def stop(self):
+    async def stop(self) -> None:
         await self._cog.cleanup(self._guild)
 
     async def redis_set_state(self, field: str, value: str) -> None:
@@ -523,7 +536,10 @@ class MusicPlayer:
         obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
         *,
         prefetch: bool = True,
-    ):
+    ) -> None:
+        """Enqueue one or more items into both the in-memory queue and the
+        Redis mirror. When prefetch is True, also spawns a background stream
+        pre-fetch per QueueObject so it's ready to play by the time it's next."""
         items: list[Union[QueueObject, YTSource]]
         if isinstance(obj, list):
             items = list(obj)  # type: ignore[arg-type]
@@ -584,6 +600,7 @@ class MusicPlayer:
         await cancel_task(self._prefetch_task)
 
     async def queue_clear(self) -> List[str]:
+        """Drain the queue and Redis mirror, returning the titles/search terms removed."""
         await self._cancel_prefetch()
         async with self.mutex:
             self._queue_cleared = True
@@ -607,6 +624,8 @@ class MusicPlayer:
         ]
 
     async def queue_shuffle(self) -> str:
+        """Shuffle the queue in place (min 4 items) and rebuild the Redis mirror
+        atomically. Returns a user-facing status message."""
         await self._cancel_prefetch()
 
         shuffled: List[Union[QueueObject, YTSource]] = []
@@ -744,6 +763,7 @@ class MusicPlayer:
         )
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
+        """Build an "Up next" embed for the head of the queue, or None if empty."""
         if not self.song_queue:
             return None
         item = self.song_queue[0]
@@ -758,6 +778,9 @@ class MusicPlayer:
         )
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
+        """Set the bot's Discord Activity to the given song (listening status
+        with a live-ish progress bar), or reset to "Playing music" if no song
+        is given and no other guild is still playing."""
         if song is not None:
             timestamps: dict = {}
             vc = self._guild.voice_client
@@ -873,6 +896,8 @@ class MusicPlayer:
             return None
 
     async def _send_now_playing(self, song: YTDL) -> None:
+        """Send the now-playing (+ up-next) embed and start the periodic
+        progress-bar updater task if the song is long enough to show one."""
         # Reset before attempting the send (not after failure) so a failed/partial
         # send never leaves this pointing at the *previous* song's message — a
         # stale reference here would let a later mark_paused()/mark_resumed() on
@@ -957,6 +982,8 @@ class MusicPlayer:
         self._spawn_background(self._finalize_now_playing(song, message))
 
     async def _progress_updater(self, song: YTDL, message: discord.Message) -> None:
+        """Periodically edit the now-playing embed to advance the progress bar
+        until the song changes, the message is deleted, or the task is cancelled."""
         interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
         try:
             while True:
@@ -1031,7 +1058,10 @@ class MusicPlayer:
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
-    async def loop(self):
+    async def loop(self) -> None:
+        """Main playback loop: dequeues songs, streams them to the voice
+        client, and waits for each to finish before advancing. Runs for the
+        lifetime of the MusicPlayer; cancelled by MusicBot.cleanup()."""
         await self.bot.wait_until_ready()
         # Wait for _restore_state() to finish populating self.queue before
         # dequeuing anything — see _restore_state()'s docstring for the race

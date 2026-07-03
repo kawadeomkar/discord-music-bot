@@ -5,12 +5,13 @@ from any test file or conftest without routing through pytest's plugin machinery
 """
 
 import asyncio
+from typing import Any, Coroutine, Optional
 from unittest.mock import MagicMock
 
 from discord.utils import MISSING as _DISCORD_MISSING
 
 
-def noop_ffmpeg_init(self, *args, **kwargs):
+def noop_ffmpeg_init(self: Any, *args: Any, **kwargs: Any) -> None:
     """Replacement for FFmpegOpusAudio.__init__ that stubs all pre-spawn attributes.
 
     When a test patches FFmpegOpusAudio.__init__, the instance is created without
@@ -27,7 +28,7 @@ def noop_ffmpeg_init(self, *args, **kwargs):
     self._stderr = None
 
 
-def stub_create_task(return_value=None):
+def stub_create_task(return_value: Optional[Any] = None) -> MagicMock:
     """Return a mock that replaces loop.create_task or asyncio.create_task.
 
     The real create_task schedules and owns the coroutine.  A plain
@@ -37,7 +38,7 @@ def stub_create_task(return_value=None):
     Task so callers' return-value assertions still pass.
     """
 
-    def _impl(coro):
+    def _impl(coro: Coroutine[Any, Any, Any]) -> Any:
         coro.close()
         return return_value if return_value is not None else MagicMock()
 

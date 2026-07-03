@@ -3,7 +3,7 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
 import discord
@@ -150,7 +150,7 @@ class QueueObject:
     persisted: bool = True
 
 
-def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
+def _enrich_queueobject(qo: QueueObject, data: Dict[str, Any]) -> None:
     """Back-fill QueueObject fields that yt_source() couldn't populate.
 
     yt_source() uses _YTDL_SOURCE_OPTS (no format selection), which often
@@ -179,11 +179,11 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         url: str,
         *,
-        data: dict,
-        requester=None,
+        data: Dict[str, Any],
+        requester: Optional[Union[discord.User, discord.Member]] = None,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
-    ):
+    ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
         )
@@ -213,10 +213,11 @@ class YTDL(discord.FFmpegOpusAudio):
 
         self._frames_read: int = 0
 
-    def __getitem__(self, item: str):
+    def __getitem__(self, item: str) -> Any:
         return self.__getattribute__(item)
 
     def read(self) -> bytes:
+        """Read the next audio frame, tracking frame count for elapsed_secs."""
         data = super().read()
         if data:
             self._frames_read += 1
@@ -290,7 +291,9 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         volume: float = 1.0,
         redis: Optional[aioredis.Redis] = None,
-    ):
+    ) -> "YTDL":
+        """Resolve a queued song to a playable YTDL source, using the Redis
+        stream-URL cache if present and extracting fresh via yt-dlp otherwise."""
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
         loop = asyncio.get_running_loop()
 
@@ -347,6 +350,8 @@ class YTDL(discord.FFmpegOpusAudio):
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
+        """Resolve a search term or URL to a QueueObject via yt-dlp, using the
+        Redis source cache if present."""
         trace.get_current_span().set_attribute("ytdl.search", search)
         trace.get_current_span().set_attribute("ytdl.process", process)
         # Cache key: normalise search so "Destiny" and "destiny " both hit.
@@ -437,6 +442,7 @@ class YTDL(discord.FFmpegOpusAudio):
         url: str,
         requester: Union[discord.User, discord.Member],
     ) -> List[QueueObject]:
+        """Fetch flat entry metadata for every video in a YouTube playlist."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         loop = asyncio.get_running_loop()
         data = await loop.run_in_executor(

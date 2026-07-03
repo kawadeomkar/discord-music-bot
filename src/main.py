@@ -22,7 +22,7 @@ EXTENSIONS = ("src.musicbot",)
 # setup_hook is a method override on the Bot subclass, NOT a @bot.event dispatcher.
 # In discord.py 2.x, setup_hook is invoked by the library before the bot connects.
 class MusicBotApp(commands.AutoShardedBot):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             command_prefix="-",
             intents=intents,
@@ -38,7 +38,7 @@ class MusicBotApp(commands.AutoShardedBot):
         for extension in EXTENSIONS:
             await self.load_extension(extension)
 
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         activity = discord.Game(name="music", type=3)
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
@@ -63,7 +63,7 @@ class MusicBotApp(commands.AutoShardedBot):
 bot = MusicBotApp()
 
 
-def main():
+def main() -> None:
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves

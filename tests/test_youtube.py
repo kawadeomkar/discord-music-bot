@@ -1,11 +1,14 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import time
+from typing import Any, Callable, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import orjson
 import pytest
+from redis.asyncio import Redis
+
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -19,7 +22,7 @@ from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True)
-def _suppress_ytdl_del(monkeypatch):
+def _suppress_ytdl_del(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch discord.AudioSource.__del__ to a no-op for every test in this module.
 
     YTDL tests patch discord.FFmpegOpusAudio.__init__ to return_value=None so that
@@ -32,7 +35,7 @@ def _suppress_ytdl_del(monkeypatch):
     monkeypatch.setattr(discord.AudioSource, "__del__", lambda self: None)
 
 
-def _fake_ytdl_data(**overrides):
+def _fake_ytdl_data(**overrides: Any) -> Dict[str, Any]:
     base = {
         "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",
         "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -56,12 +59,12 @@ def _fake_ytdl_data(**overrides):
 
 
 class TestYTDLGetItem:
-    def test_getitem_returns_attribute(self, ytdl_instance):
+    def test_getitem_returns_attribute(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
         assert song["title"] == "Test Song"
         assert song["webpage_url"] == "https://www.youtube.com/watch?v=test"
 
-    def test_getitem_returns_uploader(self, ytdl_instance):
+    def test_getitem_returns_uploader(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
         assert song["uploader"] == "Test Channel"
 
@@ -74,38 +77,46 @@ class TestYTDLElapsedSecs:
     _packet_iter, since noop_ffmpeg_init doesn't set that up.
     """
 
-    def test_zero_before_any_read(self, ytdl_instance):
+    def test_zero_before_any_read(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
         assert song.elapsed_secs == 0.0
 
-    def test_increments_by_20ms_per_frame_with_data(self, ytdl_instance):
+    def test_increments_by_20ms_per_frame_with_data(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
             song.read()
         assert song.elapsed_secs == pytest.approx(0.02)
 
-    def test_accumulates_across_multiple_reads(self, ytdl_instance):
+    def test_accumulates_across_multiple_reads(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
             for _ in range(5):
                 song.read()
         assert song.elapsed_secs == pytest.approx(0.10)
 
-    def test_does_not_increment_on_empty_read(self, ytdl_instance):
+    def test_does_not_increment_on_empty_read(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b""):
             song.read()
             song.read()
         assert song.elapsed_secs == 0.0
 
-    def test_read_returns_underlying_data(self, ytdl_instance):
+    def test_read_returns_underlying_data(
+        self, ytdl_instance: Callable[..., Any]
+    ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
             assert song.read() == b"opus-frame"
 
 
 class TestQueueObject:
-    def test_required_fields(self, mock_author):
+    def test_required_fields(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             webpage_url="https://www.youtube.com/watch?v=abc",
             title="My Song",
@@ -115,21 +126,21 @@ class TestQueueObject:
         assert qobj.title == "My Song"
         assert qobj.requester is mock_author
 
-    def test_ts_defaults_to_none(self, mock_author):
+    def test_ts_defaults_to_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author)
         assert qobj.ts is None
 
-    def test_ts_can_be_set(self, mock_author):
+    def test_ts_can_be_set(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author, ts=90)
         assert qobj.ts == 90
 
-    def test_optional_fields_default_to_none(self, mock_author):
+    def test_optional_fields_default_to_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/watch?v=1", "Title", mock_author)
         assert qobj.user_input is None
         assert qobj.duration is None
         assert qobj.uploader is None
 
-    def test_optional_fields_can_be_set(self, mock_author):
+    def test_optional_fields_can_be_set(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             "https://yt.com/watch?v=1",
             "Title",
@@ -142,58 +153,60 @@ class TestQueueObject:
         assert qobj.duration == 180
         assert qobj.uploader == "My Channel"
 
-    def test_is_dataclass(self, mock_author):
+    def test_is_dataclass(self, mock_author: MagicMock) -> None:
         import dataclasses
 
         assert dataclasses.is_dataclass(QueueObject)
 
-    def test_equality(self, mock_author):
+    def test_equality(self, mock_author: MagicMock) -> None:
         q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
         q2 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
         assert q1 == q2
 
-    def test_inequality_different_url(self, mock_author):
+    def test_inequality_different_url(self, mock_author: MagicMock) -> None:
         q1 = QueueObject("https://yt.com/watch?v=1", "Song", mock_author)
         q2 = QueueObject("https://yt.com/watch?v=2", "Song", mock_author)
         assert q1 != q2
 
 
 class TestEnrichQueueObject:
-    def test_sets_duration_when_none(self, mock_author):
+    def test_sets_duration_when_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
         _enrich_queueobject(qobj, {"duration": 180, "uploader": "Chan"})
         assert qobj.duration == 180
 
-    def test_does_not_overwrite_existing_duration(self, mock_author):
+    def test_does_not_overwrite_existing_duration(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author, duration=120)
         _enrich_queueobject(qobj, {"duration": 999, "uploader": "Chan"})
         assert qobj.duration == 120
 
-    def test_sets_uploader_when_none(self, mock_author):
+    def test_sets_uploader_when_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
         _enrich_queueobject(qobj, {"uploader": "My Channel"})
         assert qobj.uploader == "My Channel"
 
-    def test_does_not_overwrite_existing_uploader(self, mock_author):
+    def test_does_not_overwrite_existing_uploader(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(
             "https://yt.com/v=1", "Song", mock_author, uploader="Original"
         )
         _enrich_queueobject(qobj, {"uploader": "New Channel"})
         assert qobj.uploader == "Original"
 
-    def test_handles_missing_keys_gracefully(self, mock_author):
+    def test_handles_missing_keys_gracefully(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
         _enrich_queueobject(qobj, {})
         assert qobj.duration is None
         assert qobj.uploader is None
         assert qobj.thumbnail is None
 
-    def test_sets_thumbnail_when_none(self, mock_author):
+    def test_sets_thumbnail_when_none(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
         _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/x.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/x.jpg"
 
-    def test_does_not_overwrite_existing_thumbnail(self, mock_author):
+    def test_does_not_overwrite_existing_thumbnail(
+        self, mock_author: MagicMock
+    ) -> None:
         qobj = QueueObject(
             "https://yt.com/v=1",
             "Song",
@@ -203,7 +216,7 @@ class TestEnrichQueueObject:
         _enrich_queueobject(qobj, {"thumbnail": "https://img.yt.com/new.jpg"})
         assert qobj.thumbnail == "https://img.yt.com/original.jpg"
 
-    def test_duration_cast_to_int(self, mock_author):
+    def test_duration_cast_to_int(self, mock_author: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=1", "Song", mock_author)
         _enrich_queueobject(qobj, {"duration": 180.7})
         assert qobj.duration == 180
@@ -211,51 +224,51 @@ class TestEnrichQueueObject:
 
 
 class TestYTDLOpts:
-    def test_format_is_bestaudio(self):
+    def test_format_is_bestaudio(self) -> None:
         assert YTDL_OPTS["format"] == "bestaudio/best"
 
-    def test_noplaylist_is_true(self):
+    def test_noplaylist_is_true(self) -> None:
         assert YTDL_OPTS["noplaylist"] is True
 
-    def test_source_address_is_ipv4_any(self):
+    def test_source_address_is_ipv4_any(self) -> None:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
-    def test_default_search_is_auto(self):
+    def test_default_search_is_auto(self) -> None:
         # default_search belongs to the source (search) opts, not the stream opts
         assert _YTDL_SOURCE_OPTS["default_search"] == "auto"
 
-    def test_retries_is_set(self):
+    def test_retries_is_set(self) -> None:
         assert YTDL_OPTS["retries"] > 0
 
-    def test_socket_timeout_is_set(self):
+    def test_socket_timeout_is_set(self) -> None:
         assert YTDL_OPTS["socket_timeout"] > 0
 
-    def test_extractor_args_include_youtube(self):
+    def test_extractor_args_include_youtube(self) -> None:
         assert "youtube" in YTDL_OPTS["extractor_args"]
 
-    def test_stream_opts_have_format(self):
+    def test_stream_opts_have_format(self) -> None:
         assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best"
 
-    def test_source_opts_no_format(self):
+    def test_source_opts_no_format(self) -> None:
         # yt_source only needs metadata; format resolution is deferred to yt_stream
         assert "format" not in _YTDL_SOURCE_OPTS
 
-    def test_no_verbose_or_rm_cachedir(self):
+    def test_no_verbose_or_rm_cachedir(self) -> None:
         for opts in (_YTDL_SOURCE_OPTS, _YTDL_STREAM_OPTS):
             assert not opts.get("verbose")
             assert not opts.get("rm_cachedir")
 
 
 class TestYTDLFfmpegOpts:
-    def test_before_options_has_reconnect_flag(self):
+    def test_before_options_has_reconnect_flag(self) -> None:
         assert "-reconnect" in YTDL.FFMPEG_OPTS["before_options"]
 
-    def test_options_strips_video(self):
+    def test_options_strips_video(self) -> None:
         assert "-vn" in YTDL.FFMPEG_OPTS["options"]
 
 
 class TestYTSource:
-    async def test_yt_source_returns_queue_object(self, mock_ctx):
+    async def test_yt_source_returns_queue_object(self, mock_ctx: MagicMock) -> None:
         fake_data = {
             "webpage_url": "https://www.youtube.com/watch?v=test123",
             "title": "Extracted Title",
@@ -272,7 +285,9 @@ class TestYTSource:
         assert result.webpage_url == "https://www.youtube.com/watch?v=test123"
         assert result.requester is mock_ctx.author
 
-    async def test_yt_source_sets_thumbnail_fresh_extraction(self, mock_ctx):
+    async def test_yt_source_sets_thumbnail_fresh_extraction(
+        self, mock_ctx: MagicMock
+    ) -> None:
         fake_data = {
             "webpage_url": "https://www.youtube.com/watch?v=test123",
             "title": "Extracted Title",
@@ -285,13 +300,15 @@ class TestYTSource:
             )
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
 
-    async def test_yt_source_raises_when_no_data(self, mock_ctx):
+    async def test_yt_source_raises_when_no_data(self, mock_ctx: MagicMock) -> None:
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
                 await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing", process=True)
 
-    async def test_yt_source_picks_first_entry_from_playlist(self, mock_ctx):
+    async def test_yt_source_picks_first_entry_from_playlist(
+        self, mock_ctx: MagicMock
+    ) -> None:
         fake_data = {
             "entries": [
                 {
@@ -315,7 +332,9 @@ class TestYTSource:
         assert result.title == "Entry One"
         assert "entry1" in result.webpage_url
 
-    async def test_yt_source_skips_playlist_type_entries(self, mock_ctx):
+    async def test_yt_source_skips_playlist_type_entries(
+        self, mock_ctx: MagicMock
+    ) -> None:
         fake_data = {
             "entries": [
                 {
@@ -338,7 +357,9 @@ class TestYTSource:
 
         assert result.title == "Real Video"
 
-    async def test_yt_source_sets_user_input_fresh_extraction(self, mock_ctx):
+    async def test_yt_source_sets_user_input_fresh_extraction(
+        self, mock_ctx: MagicMock
+    ) -> None:
         """user_input is set to the search string on fresh extraction."""
         fake_data = {
             "webpage_url": "https://www.youtube.com/watch?v=test123",
@@ -351,7 +372,9 @@ class TestYTSource:
             )
         assert result.user_input == "my search query"
 
-    async def test_yt_source_sets_user_input_cache_hit(self, mock_ctx, fake_redis):
+    async def test_yt_source_sets_user_input_cache_hit(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """user_input is set to the search string even on a Redis cache hit."""
         import orjson as _orjson
 
@@ -369,7 +392,9 @@ class TestYTSource:
         )
         assert result.user_input == "cached search"
 
-    async def test_yt_source_sets_thumbnail_cache_hit(self, mock_ctx, fake_redis):
+    async def test_yt_source_sets_thumbnail_cache_hit(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """thumbnail is restored from the cached entry on a Redis cache hit."""
         import orjson as _orjson
 
@@ -389,8 +414,8 @@ class TestYTSource:
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
 
     async def test_yt_source_caches_thumbnail_for_next_lookup(
-        self, mock_ctx, fake_redis
-    ):
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """A fresh extraction's thumbnail is written to the cache, not just returned."""
         fake_data = {
             "webpage_url": "https://www.youtube.com/watch?v=test123",
@@ -408,7 +433,7 @@ class TestYTSource:
         )
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
 
-    async def test_yt_source_passes_timestamp(self, mock_ctx):
+    async def test_yt_source_passes_timestamp(self, mock_ctx: MagicMock) -> None:
         fake_data = {
             "webpage_url": "https://www.youtube.com/watch?v=ts_test",
             "title": "Timestamped Song",
@@ -421,7 +446,7 @@ class TestYTSource:
 
         assert result.ts == 45
 
-    async def test_yt_source_passes_download_flag(self, mock_ctx):
+    async def test_yt_source_passes_download_flag(self, mock_ctx: MagicMock) -> None:
         fake_data = {
             "webpage_url": "https://yt.com/v=dl",
             "title": "Download Song",
@@ -439,7 +464,7 @@ class TestYTSource:
 
 
 class TestYTStreamRuntimeError:
-    async def test_raises_when_extract_returns_none(self, mock_ctx):
+    async def test_raises_when_extract_returns_none(self, mock_ctx: MagicMock) -> None:
         qobj = QueueObject("https://yt.com/v=none", "None Song", mock_ctx.author)
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -449,7 +474,7 @@ class TestYTStreamRuntimeError:
 
 
 class TestYTStream:
-    async def test_yt_stream_returns_ytdl_instance(self, mock_ctx):
+    async def test_yt_stream_returns_ytdl_instance(self, mock_ctx: MagicMock) -> None:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -466,7 +491,9 @@ class TestYTStream:
         assert isinstance(result, YTDL)
         assert result.title == "Test Song"
 
-    async def test_yt_stream_appends_volume_filter_when_not_default(self, mock_ctx):
+    async def test_yt_stream_appends_volume_filter_when_not_default(
+        self, mock_ctx: MagicMock
+    ) -> None:
         """volume != 1.0 must append -filter:a to ffmpeg options."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
@@ -477,7 +504,14 @@ class TestYTStream:
 
         captured_options = {}
 
-        def capture_init(self, url, *, executable, before_options, options):
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            executable: str,
+            before_options: str,
+            options: str,
+        ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
 
@@ -489,7 +523,9 @@ class TestYTStream:
 
         assert "volume=0.5" in captured_options["options"]
 
-    async def test_yt_stream_appends_seek_when_ts_set(self, mock_ctx):
+    async def test_yt_stream_appends_seek_when_ts_set(
+        self, mock_ctx: MagicMock
+    ) -> None:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -499,7 +535,14 @@ class TestYTStream:
 
         captured_options = {}
 
-        def capture_init(self, url, *, executable, before_options, options):
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            executable: str,
+            before_options: str,
+            options: str,
+        ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
 
@@ -513,34 +556,36 @@ class TestYTStream:
 
 
 class TestStreamUrlTtl:
-    def test_returns_seconds_minus_margin(self):
+    def test_returns_seconds_minus_margin(self) -> None:
         future = int(time.time()) + 7200  # 2h from now
         url = f"https://r2.googlevideo.com/stream?expire={future}&other=x"
         ttl = _stream_url_ttl(url)
         assert ttl is not None
         assert 7200 - 1800 - 5 <= ttl <= 7200 - 1800 + 5
 
-    def test_returns_none_when_no_expire_param(self):
+    def test_returns_none_when_no_expire_param(self) -> None:
         ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?other=x")
         assert ttl is None
 
-    def test_returns_none_when_already_expired(self):
+    def test_returns_none_when_already_expired(self) -> None:
         past = int(time.time()) - 100
         url = f"https://r2.googlevideo.com/stream?expire={past}"
         assert _stream_url_ttl(url) is None
 
-    def test_returns_none_when_ttl_too_short(self):
+    def test_returns_none_when_ttl_too_short(self) -> None:
         soon = int(time.time()) + 30  # 30s — below 60s threshold
         url = f"https://r2.googlevideo.com/stream?expire={soon}"
         assert _stream_url_ttl(url) is None
 
-    def test_returns_none_on_non_numeric_expire(self):
+    def test_returns_none_on_non_numeric_expire(self) -> None:
         ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?expire=notanumber")
         assert ttl is None
 
 
 class TestStreamCache:
-    async def test_cache_hit_skips_executor(self, mock_ctx, fake_redis):
+    async def test_cache_hit_skips_executor(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """Second yt_stream call with same URL should use Redis cache."""
         future = int(time.time()) + 7200
         cached_data = _fake_ytdl_data(
@@ -565,8 +610,8 @@ class TestStreamCache:
         mock_extract.assert_not_called()
 
     async def test_cache_miss_calls_executor_and_populates_cache(
-        self, mock_ctx, fake_redis
-    ):
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """On cache miss, executor is called and result is written to Redis."""
         fake_data = _fake_ytdl_data(
             webpage_url="https://yt.com/v=cache_miss",
@@ -586,7 +631,7 @@ class TestStreamCache:
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=cache_miss")
         assert cached is not None
 
-    async def test_cache_graceful_on_redis_error(self, mock_ctx):
+    async def test_cache_graceful_on_redis_error(self, mock_ctx: MagicMock) -> None:
         """Redis failure during cache check must not crash yt_stream; executor is called."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=err")
         bad_redis = AsyncMock()
@@ -605,7 +650,9 @@ class TestStreamCache:
 
 
 class TestPrefetchStream:
-    async def test_populates_cache_on_miss(self, mock_ctx, fake_redis):
+    async def test_populates_cache_on_miss(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """prefetch_stream calls yt-dlp and writes to Redis when key is absent."""
         fake_data = _fake_ytdl_data(
             webpage_url="https://yt.com/v=pf1", title="Prefetch Song"
@@ -622,14 +669,16 @@ class TestPrefetchStream:
         assert cached is not None
         assert orjson.loads(cached)["title"] == "Prefetch Song"
 
-    async def test_no_op_when_redis_none(self, mock_ctx):
+    async def test_no_op_when_redis_none(self, mock_ctx: MagicMock) -> None:
         """prefetch_stream returns immediately when redis is None — no exception."""
         qobj = QueueObject("https://yt.com/v=pf2", "No Redis", mock_ctx.author)
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=None)
         mock_extract.assert_not_called()
 
-    async def test_no_op_when_already_cached(self, mock_ctx, fake_redis):
+    async def test_no_op_when_already_cached(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """prefetch_stream skips yt-dlp extraction when the key is already in Redis."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=pf3")
         await fake_redis.set(
@@ -642,7 +691,9 @@ class TestPrefetchStream:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         mock_extract.assert_not_called()
 
-    async def test_swallows_extraction_errors(self, mock_ctx, fake_redis):
+    async def test_swallows_extraction_errors(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """prefetch_stream does not propagate yt-dlp exceptions."""
         qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
         with patch(
@@ -652,7 +703,9 @@ class TestPrefetchStream:
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
         assert cached is None
 
-    async def test_skips_write_when_ttl_too_short(self, mock_ctx, fake_redis):
+    async def test_skips_write_when_ttl_too_short(
+        self, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
         """prefetch_stream does not cache a URL that is already near expiry."""
         soon = int(time.time()) + 30  # 30s — below the 60s threshold
         fake_data = _fake_ytdl_data(

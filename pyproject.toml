@@ -40,6 +40,8 @@ black = "^26.5.1"
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "basic"
+reportMissingParameterType = "error"
+reportMissingReturnType = "error"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

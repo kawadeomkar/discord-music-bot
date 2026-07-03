@@ -76,16 +76,17 @@ class MusicBot(commands.Cog):
         "_restore_tasks",
     )
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
         self.spotify = Spotify(redis=self.redis)
-        self.mps = {}
+        self.mps: dict[int, MusicPlayer] = {}
         self._active_spans: dict = {}  # id(ctx) → (Span, context_token)
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
+        """Return the guild's MusicPlayer, creating and starting one if absent."""
         assert ctx.guild is not None
         if ctx.guild.id in self.mps:
             mp = self.mps[ctx.guild.id]
@@ -98,6 +99,9 @@ class MusicBot(commands.Cog):
 
     @_tracer.start_as_current_span("bot.cleanup")
     async def cleanup(self, guild: discord.Guild) -> None:
+        """Tear down the guild's MusicPlayer: cancel its background tasks,
+        disconnect from voice, and clear persisted connection state. Safe to
+        call concurrently — only the first caller for a given guild proceeds."""
         # Cancel any pending alone-disconnect timer before the atomic gate so it
         # cannot fire after cleanup completes and attempt a second cleanup.
         existing = self._alone_timers.pop(guild.id, None)
@@ -137,7 +141,9 @@ class MusicBot(commands.Cog):
             record_span_error(trace.get_current_span(), e)
             log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
 
-    async def cog_before_invoke(self, ctx: commands.Context):
+    async def cog_before_invoke(self, ctx: commands.Context) -> None:
+        """discord.py hook run before every command: binds log context, opens
+        the per-command trace span, and persists the invoking text channel."""
         from structlog.contextvars import bind_contextvars
 
         bind_contextvars(
@@ -182,7 +188,9 @@ class MusicBot(commands.Cog):
             otel_context.detach(token)
             raise
 
-    async def cog_after_invoke(self, ctx: commands.Context):
+    async def cog_after_invoke(self, ctx: commands.Context) -> None:
+        """discord.py hook run after every command: clears log context and
+        closes the per-command trace span opened by cog_before_invoke."""
         from structlog.contextvars import clear_contextvars
 
         clear_contextvars()
@@ -192,7 +200,10 @@ class MusicBot(commands.Cog):
             span.end()
             otel_context.detach(token)
 
-    async def cog_command_error(self, ctx: commands.Context, error: Exception):
+    async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
+        """discord.py hook run when a command raises: records the error on the
+        active span and, for errors with no other user-visible output, notifies the user.
+        """
         # Peek (don't pop) — cog_after_invoke runs in the finally block after this
         # and is responsible for ending the span.
         pair = self._active_spans.get(id(ctx))
@@ -212,6 +223,8 @@ class MusicBot(commands.Cog):
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
+        """before_invoke hook: rejects the command with a user-facing message
+        if the author isn't in a usable voice channel."""
         vc = ctx.voice_client
         voice_client = vc if isinstance(vc, discord.VoiceClient) else None
         command_name = ctx.command.name if ctx.command is not None else ""
@@ -242,6 +255,12 @@ class MusicBot(commands.Cog):
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
     ) -> Union[QueueObject, List[str], List[QueueObject]]:
+        """Resolve a parsed URL/search source into something enqueueable.
+
+        Returns a List[str] of track titles for a Spotify playlist (still
+        needing per-title YouTube resolution), a List[QueueObject] for a
+        YouTube playlist (already resolved), or a single QueueObject otherwise.
+        """
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             return await self.spotify.playlist(source.id)
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
@@ -275,6 +294,9 @@ class MusicBot(commands.Cog):
         qobj: Union[List[str], List[QueueObject]],
         mp: MusicPlayer,
     ) -> None:
+        """Queue a resolved playlist and notify the channel — branches on
+        source type since Spotify playlists arrive as titles needing YouTube
+        search resolution while YouTube playlists arrive pre-resolved."""
         if isinstance(source, SpotifySource):
             titles: List[str] = qobj  # type: ignore[assignment]
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
@@ -343,7 +365,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="play", aliases=["p", "sing"], help="play a youtube song")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
-    async def play(self, ctx: commands.Context, url):
+    async def play(self, ctx: commands.Context, url: str) -> None:
         async with ctx.typing():
             try:
                 source = parse_input(url, ctx.message.content)
@@ -392,7 +414,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="skip", aliases=["sk"], help="skips current song")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.skip")
-    async def skip(self, ctx: commands.Context):
+    async def skip(self, ctx: commands.Context) -> None:
         try:
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
@@ -406,7 +428,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="stop", aliases=["st"], help="stops current song")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.stop")
-    async def stop(self, ctx: commands.Context):
+    async def stop(self, ctx: commands.Context) -> None:
         try:
             # Do not call skip before cleanup: skip fires voice_client.stop() which
             # triggers the after callback (play_next.set), giving the playback loop a
@@ -424,7 +446,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="pause", aliases=["po"], help="pause the current song")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.pause")
-    async def pause(self, ctx: commands.Context):
+    async def pause(self, ctx: commands.Context) -> None:
         try:
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
@@ -438,7 +460,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="resume", aliases=["r"], help="resume the current song")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.resume")
-    async def resume(self, ctx: commands.Context):
+    async def resume(self, ctx: commands.Context) -> None:
         try:
             vc = ctx.voice_client
             if (
@@ -456,7 +478,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.shuffle")
-    async def shuffle(self, ctx: commands.Context):
+    async def shuffle(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
             async with ctx.typing():
@@ -471,7 +493,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="join", aliases=["summon"], help="join the channel")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.join")
-    async def join(self, ctx: commands.Context):
+    async def join(self, ctx: commands.Context) -> None:
         try:
             assert (
                 isinstance(ctx.author, discord.Member) and ctx.author.voice is not None
@@ -504,7 +526,7 @@ class MusicBot(commands.Cog):
     @commands.command(name="clear", aliases=["c"], help="clears the queue")
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.clear")
-    async def clear(self, ctx: commands.Context):
+    async def clear(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
             cleared = await mp.queue_clear()
@@ -531,7 +553,7 @@ class MusicBot(commands.Cog):
         help="remove all queued songs matching a YouTube URL",
     )
     @commands.before_invoke(validate_commands)
-    async def remove(self, ctx: commands.Context, url: Optional[str] = None):
+    async def remove(self, ctx: commands.Context, url: Optional[str] = None) -> None:
         if url is None:
             await ctx.send(
                 "`-remove <url>` — removes all songs matching the given URL from the queue. "
@@ -567,7 +589,7 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.now")
-    async def now(self, ctx: commands.Context):
+    async def now(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
             vc = ctx.guild.voice_client if ctx.guild else None
@@ -590,7 +612,7 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.history")
-    async def history(self, ctx: commands.Context):
+    async def history(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
             if mp and mp.history:
@@ -605,7 +627,7 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.jump")
-    async def jump(self, ctx: commands.Context):
+    async def jump(self, ctx: commands.Context) -> None:
         try:
             await ctx.send("currently in development")
         except Exception as e:
@@ -617,7 +639,7 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.queue")
-    async def queue(self, ctx: commands.Context):
+    async def queue(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
             await ctx.send(embed=mp.get_queue())
@@ -632,18 +654,18 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.volume")
-    async def volume(self, ctx: commands.Context, volume):
+    async def volume(self, ctx: commands.Context, volume: str) -> None:
         try:
-            if isinstance(volume, str):
-                try:
-                    volume = int(volume)
-                except ValueError:
-                    await ctx.send("Volume must be a number between 0 and 100")
-                    return
-            if not 0 <= volume <= 100:
-                return await ctx.send("Volume must be between 0 and 100")
+            try:
+                volume_pct = int(volume)
+            except ValueError:
+                await ctx.send("Volume must be a number between 0 and 100")
+                return
+            if not 0 <= volume_pct <= 100:
+                await ctx.send("Volume must be between 0 and 100")
+                return
             mp = self.get_mp(ctx)
-            mp.volume = volume / 100
+            mp.volume = volume_pct / 100
             await mp.redis_set_state("volume", str(mp.volume))
             await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
         except Exception as e:
@@ -655,7 +677,7 @@ class MusicBot(commands.Cog):
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.ping")
-    async def ping(self, ctx: commands.Context):
+    async def ping(self, ctx: commands.Context) -> None:
         try:
             ms = self.bot.latency * 1000
             await send_embed(
@@ -671,6 +693,8 @@ class MusicBot(commands.Cog):
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 
     async def _alone_countdown(self, guild: discord.Guild) -> None:
+        """Warn the guild's text channel, wait 10s, then disconnect if the
+        bot is still alone in its voice channel. Cancelled if a human rejoins."""
         try:
             mp = self.mps.get(guild.id)
             text_channel = mp._channel if mp is not None else None
@@ -716,7 +740,7 @@ class MusicBot(commands.Cog):
     # ── Restart recovery listeners ────────────────────────────────────────────
 
     @commands.Cog.listener()
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         """Fires on cold start or session loss (NOT on WebSocket resume).
         Spawns a recovery task per guild so we don't block the event loop."""
         if self.redis is None:
@@ -807,6 +831,10 @@ class MusicBot(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        """Handles two cases: the bot itself being disconnected/moved (full
+        cleanup or stale-timer cancellation) and a human member's channel
+        change relative to the bot's current channel (starts/cancels the
+        10s alone-disconnect countdown)."""
         guild = member.guild
 
         # ── Case A: bot itself was disconnected or moved ──────────────────────
@@ -865,5 +893,5 @@ class MusicBot(commands.Cog):
                 existing.cancel()
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(MusicBot(bot))

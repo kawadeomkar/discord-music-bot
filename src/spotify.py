@@ -24,6 +24,10 @@ _ALBUM_TTL = 86400  # 24h
 
 
 class Spotify:
+    """Thin async client for the Spotify Web API: handles client-credentials
+    auth (with auto-refresh) and Redis-backed caching of track/playlist/artist/
+    album lookups."""
+
     spotify_endpoint = "https://api.spotify.com/"
     auth_endpoint = "https://accounts.spotify.com/api/token"
 
@@ -31,7 +35,7 @@ class Spotify:
         self,
         redis: Optional[aioredis.Redis] = None,
         session_factory: Optional[Callable[..., Any]] = None,
-    ):
+    ) -> None:
         self.client_id = os.getenv("SPOTIFY_CLIENT_ID")
         self.client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         self.token_expiry = 0.0
@@ -40,12 +44,13 @@ class Spotify:
         self._redis = redis
         self._session_factory = session_factory or aiohttp.ClientSession
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.auth_token
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
     async def _refresh_token(self) -> None:
+        """Fetch a fresh access token via the client-credentials flow and update expiry."""
         self.token_expiry = time.time()
         data = {
             "grant_type": "client_credentials",
@@ -66,6 +71,8 @@ class Spotify:
         data: Optional[Dict[str, str]] = None,
         http_method: str = "GET",
     ) -> Any:
+        """Make an authenticated request to the Spotify API, refreshing the
+        token first if it has expired. Raises on any non-2xx response."""
         if time.time() > self.token_expiry:
             async with self._auth_lock:
                 if time.time() > self.token_expiry:
@@ -93,6 +100,8 @@ class Spotify:
         ttl: int,
         fetch_fn: Callable[[], Awaitable[Any]],
     ) -> Any:
+        """Cache-aside helper: return the cached value for `key`, or call
+        `fetch_fn` and cache its result under `ttl` seconds on a miss."""
         cached = await cache_get(self._redis, key)
         trace.get_current_span().set_attribute("spotify.cache_hit", cached is not None)
         if cached is not None:
@@ -103,6 +112,7 @@ class Spotify:
 
     @_tracer.start_as_current_span("spotify.track")
     async def track(self, tid: str) -> str:
+        """Return "<title> <artist1> <artist2> ..." for a track ID, cached for 24h."""
         trace.get_current_span().set_attribute("spotify.track_id", tid)
 
         async def fetch() -> str:
@@ -114,6 +124,7 @@ class Spotify:
 
     @_tracer.start_as_current_span("spotify.playlist")
     async def playlist(self, pid: str) -> List[str]:
+        """Return "<title> <artist1> <artist2> ..." for every track in a playlist, cached for 1h."""
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
 
         async def fetch() -> List[str]:
@@ -135,6 +146,7 @@ class Spotify:
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[List[str], str]) -> Any:
+        """Return raw Spotify artist objects for one or more artist IDs, cached for 24h."""
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.artist_ids", ",".join(ids))
@@ -152,6 +164,7 @@ class Spotify:
 
     @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[List[str], str]) -> Any:
+        """Return raw Spotify album objects for one or more album IDs, cached for 24h."""
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.album_ids", ",".join(ids))

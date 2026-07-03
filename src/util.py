@@ -1,15 +1,16 @@
 import asyncio
 import contextlib
 import random
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import discord
 import structlog
 from discord.ext import commands
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import Span, StatusCode
 
 
-async def send_queue_phrases(ctx: commands.Context):
+async def send_queue_phrases(ctx: commands.Context) -> None:
+    """Send an author-specific easter-egg reaction phrase, if any is configured."""
     if ctx.message.author.name == "pineapplecat":
         phrases = [
             "great choice king! :3",
@@ -32,7 +33,8 @@ def queue_message(songs: List[str]) -> str:
     return msg
 
 
-def trace_footer(span: Any) -> Optional[str]:
+def trace_footer(span: Span) -> Optional[str]:
+    """Return an embed-footer string identifying the current trace, or None if untraced."""
     span_ctx = span.get_span_context()
     return f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
 
@@ -44,7 +46,8 @@ async def cancel_task(task: Optional[asyncio.Task]) -> None:
             await task
 
 
-def record_span_error(span: Any, e: Exception) -> None:
+def record_span_error(span: Span, e: Exception) -> None:
+    """Record an exception on a span and mark its status as ERROR."""
     span.record_exception(e)
     span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
 

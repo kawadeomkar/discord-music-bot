@@ -3,6 +3,7 @@ from typing import Any, Optional
 
 import orjson
 import redis.asyncio as aioredis
+from redis.asyncio.client import Pipeline
 
 from src.util import get_logger
 
@@ -92,7 +93,7 @@ class GuildRedisStore:
     def history_key(self) -> str:
         return GUILD_HISTORY_KEY.format(guild_id=self.guild_id)
 
-    def _pipe_expire_all(self, pipe) -> None:
+    def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for all three guild keys onto an existing pipeline."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
@@ -193,7 +194,7 @@ class GuildRedisStore:
                 f"[guild:{self.guild_id}] Redis set_state [{field}={value}] failed: {e}"
             )
 
-    async def get_state(self) -> dict:
+    async def get_state(self) -> dict[bytes, bytes]:
         """HGETALL the state hash. Returns empty dict on error."""
         try:
             return await self.redis.hgetall(self.state_key())  # type: ignore[misc]
