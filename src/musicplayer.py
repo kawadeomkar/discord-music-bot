@@ -12,13 +12,12 @@ import orjson
 from discord.ext import commands
 
 from opentelemetry import trace
-from opentelemetry.trace import StatusCode
 
 from src import config
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
-from src.util import cancel_task, queue_message, send_embed, trace_footer, get_logger
+from src.util import cancel_task, record_span_error, send_embed, trace_footer, get_logger
 from src.youtube import YTDL, QueueObject
 
 log = get_logger(__name__)
@@ -460,10 +459,7 @@ class MusicPlayer:
                             )
                             await self.queue.put(crashed)
                             self.song_queue.append(crashed)
-                            await self._store.set_state("current_song_url", "")
-                            await self._store.set_state("current_song_title", "")
-                            await self._store.set_state("current_song_duration", "")
-                            await self._store.set_state("current_song_uploader", "")
+                            await self._clear_current_song()
                             log.info(
                                 f"Re-queued crashed song '{crashed_title}' for guild {self._guild.id}"
                             )
@@ -502,8 +498,7 @@ class MusicPlayer:
                     span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
 
                 except Exception as e:
-                    span.record_exception(e)
-                    span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                    record_span_error(span, e)
                     log.error(
                         f"State restore failed for guild {self._guild.id}: {e}",
                         exc_info=True,
@@ -546,11 +541,9 @@ class MusicPlayer:
             for item in serializable:
                 await self._store.push_queue(_serialize_queue_item(item))
                 if isinstance(item, QueueObject):
-                    task = asyncio.create_task(
+                    self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self._store.redis)
                     )
-                    self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
         else:
             await self._store.push_queue_batch(
                 [_serialize_queue_item(item) for item in serializable]
@@ -834,10 +827,7 @@ class MusicPlayer:
             and not self._pause_debounce_task.done()
         ):
             self._pause_debounce_task.cancel()
-        task = asyncio.create_task(self._debounced_pause_update())
-        self._pause_debounce_task = task
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._pause_debounce_task = self._spawn_background(self._debounced_pause_update())
 
     async def _debounced_pause_update(self) -> None:
         try:
@@ -845,12 +835,8 @@ class MusicPlayer:
         except asyncio.CancelledError:
             return
         if self._progress_task is not None and self._now_playing_message is not None:
-            task = asyncio.create_task(self._edit_now_playing_once())
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-        activity_task = asyncio.create_task(self.update_activity(self.current_song))
-        self._background_tasks.add(activity_task)
-        activity_task.add_done_callback(self._background_tasks.discard)
+            self._spawn_background(self._edit_now_playing_once())
+        self._spawn_background(self.update_activity(self.current_song))
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
@@ -952,10 +938,15 @@ class MusicPlayer:
             song, message, elapsed_override=song.duration_secs
         )
 
-    def _fire_finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
-        task = asyncio.create_task(self._finalize_now_playing(song, message))
+    def _spawn_background(self, coro: Any) -> asyncio.Task:
+        """Create a fire-and-forget task tracked in _background_tasks."""
+        task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _fire_finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
+        self._spawn_background(self._finalize_now_playing(song, message))
 
     async def _progress_updater(self, song: YTDL, message: discord.Message) -> None:
         interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
@@ -973,29 +964,35 @@ class MusicPlayer:
             raise
 
     async def _cancel_progress_task(self) -> None:
-        """Cancel any in-flight progress-updater task and wait for it to finish.
-
-        Mirrors _cancel_prefetch() (musicplayer.py:532). Must be awaited — not just
-        cancelled — before the next song's _send_now_playing() sends its message,
-        otherwise an in-flight message.edit() for the old song could still be
-        resolving concurrently with the new message being sent.
-        """
-        if self._progress_task and not self._progress_task.done():
-            self._progress_task.cancel()
-            try:
-                await self._progress_task
-            except asyncio.CancelledError:
-                pass
+        """Must be awaited before the next song's _send_now_playing() to prevent a
+        concurrent message.edit() for the old song from racing the new message send."""
+        await cancel_task(self._progress_task)
         self._progress_task = None
 
     async def _cancel_pause_debounce(self) -> None:
-        if self._pause_debounce_task and not self._pause_debounce_task.done():
-            self._pause_debounce_task.cancel()
-            try:
-                await self._pause_debounce_task
-            except asyncio.CancelledError:
-                pass
+        await cancel_task(self._pause_debounce_task)
         self._pause_debounce_task = None
+
+    async def _persist_current_song(self, song: YTDL) -> None:
+        if self._store is None:
+            return
+        dur = song.duration_secs
+        await asyncio.gather(
+            self._store.set_state("current_song_title", song.title or ""),
+            self._store.set_state("current_song_url", song.webpage_url or ""),
+            self._store.set_state("current_song_duration", str(dur) if dur else ""),
+            self._store.set_state("current_song_uploader", song.uploader or ""),
+        )
+
+    async def _clear_current_song(self) -> None:
+        if self._store is None:
+            return
+        await asyncio.gather(
+            self._store.set_state("current_song_title", ""),
+            self._store.set_state("current_song_url", ""),
+            self._store.set_state("current_song_duration", ""),
+            self._store.set_state("current_song_uploader", ""),
+        )
 
     @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
@@ -1019,10 +1016,7 @@ class MusicPlayer:
             self.queue.task_done()
             raise
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(
-                StatusCode.ERROR, f"{type(e).__name__}: {e}"
-            )
+            record_span_error(trace.get_current_span(), e)
             log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
             self.queue.task_done()
             return None
@@ -1147,21 +1141,7 @@ class MusicPlayer:
                     await self.update_activity(self.current_song)
                     await self._send_now_playing(self.current_song)
 
-                    # Mirror now-playing song to Redis state
-                    if self._store is not None and self.current_song is not None:
-                        await self._store.set_state(
-                            "current_song_title", self.current_song.title or ""
-                        )
-                        await self._store.set_state(
-                            "current_song_url", self.current_song.webpage_url or ""
-                        )
-                        dur = self.current_song.duration_secs
-                        await self._store.set_state(
-                            "current_song_duration", str(dur) if dur else ""
-                        )
-                        await self._store.set_state(
-                            "current_song_uploader", self.current_song.uploader or ""
-                        )
+                    await self._persist_current_song(self.current_song)
 
                     self._prefetch_task = asyncio.create_task(
                         self._prefetch_next_song()
@@ -1201,12 +1181,7 @@ class MusicPlayer:
                         if self._store is not None:
                             await self._store.push_history(orjson.dumps(history_entry))
 
-                    # Clear now-playing state
-                    if self._store is not None:
-                        await self._store.set_state("current_song_title", "")
-                        await self._store.set_state("current_song_url", "")
-                        await self._store.set_state("current_song_duration", "")
-                        await self._store.set_state("current_song_uploader", "")
+                    await self._clear_current_song()
 
                     self.queue.task_done()
                     self.current_song = None
@@ -1218,8 +1193,7 @@ class MusicPlayer:
                     await self.update_activity(None)
                     raise
                 except Exception as e:
-                    span.record_exception(e)
-                    span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+                    record_span_error(span, e)
                     log.error(
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,

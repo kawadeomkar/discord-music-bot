@@ -29,6 +29,7 @@ from src.util import (
     cancel_task,
     latency_color,
     queue_message,
+    record_span_error,
     send_embed,
     send_queue_phrases,
     trace_footer,
@@ -133,10 +134,7 @@ class MusicBot(commands.Cog):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(
-                StatusCode.ERROR, f"{type(e).__name__}: {e}"
-            )
+            record_span_error(trace.get_current_span(), e)
             log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
 
     async def cog_before_invoke(self, ctx: commands.Context):
@@ -229,8 +227,7 @@ class MusicBot(commands.Cog):
         title: str = "Command failed",
     ) -> None:
         span = trace.get_current_span()
-        span.record_exception(e)
-        span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
+        record_span_error(span, e)
         await send_embed(
             ctx,
             title,
@@ -544,26 +541,22 @@ class MusicBot(commands.Cog):
         mp = self.get_mp(ctx)
         positions = await mp.queue_remove(url)
         if not positions:
-            await ctx.send(
-                embed=discord.Embed(
-                    description=f"No queued songs found matching: <{url}>",
-                    color=discord.Color.red(),
-                )
-            )
+            await send_embed(ctx, "", f"No queued songs found matching: <{url}>", discord.Color.red())
             return
         count = len(positions)
         noun = "song" if count == 1 else "songs"
         pos_label = "Position" if count == 1 else "Positions"
         pos_str = ", ".join(str(p) for p in positions)
-        removal_embed = (
-            discord.Embed(
-                title=f"Removed {count} {noun} from the queue",
-                color=discord.Color.orange(),
-            )
-            .add_field(name="URL", value=f"<{url}>", inline=False)
-            .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
+        await send_embed(
+            ctx,
+            f"Removed {count} {noun} from the queue",
+            "",
+            discord.Color.orange(),
+            fields=[
+                ("URL", f"<{url}>", False),
+                (f"{pos_label} removed", pos_str, False),
+            ],
         )
-        await ctx.send(embed=removal_embed)
         await ctx.send(embed=mp.get_queue())
         await ctx.message.add_reaction("🗑️")
 
@@ -682,12 +675,11 @@ class MusicBot(commands.Cog):
 
             if text_channel is not None:
                 try:
-                    await text_channel.send(
-                        embed=discord.Embed(
-                            title="No users remaining in voice channel",
-                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                            color=discord.Color.orange(),
-                        )
+                    await send_embed(
+                        text_channel,
+                        "No users remaining in voice channel",
+                        "All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                        discord.Color.orange(),
                     )
                 except Exception as e:
                     log.warning(
@@ -801,10 +793,7 @@ class MusicBot(commands.Cog):
                 f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
             )
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(
-                StatusCode.ERROR, f"{type(e).__name__}: {e}"
-            )
+            record_span_error(trace.get_current_span(), e)
             log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
         finally:
             await store.release_recovery_lock()
