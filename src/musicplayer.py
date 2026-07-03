@@ -721,8 +721,10 @@ class MusicPlayer:
             )
             bar = _build_progress_bar(elapsed, song.duration_secs)
             if bar:
-                # Bar sits directly under the title, above the requester line.
+                # Bar sits directly under the title, above the requester line,
+                # with a blank line between them for visual separation.
                 lines.append(bar)
+                lines.append("")
         requester_line = f"Requester: [{_requester_mention(song.requester)}]"
         if song.duration_secs > 0:
             requester_line += (

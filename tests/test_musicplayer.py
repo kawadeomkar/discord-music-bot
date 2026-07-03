@@ -905,7 +905,15 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         lines = embed.description.split("\n")
         assert "🔘" in lines[0]
-        assert lines[1].startswith("Requester:")
+        assert lines[2].startswith("Requester:")
+
+    def test_blank_line_separates_bar_from_requester_line(
+        self, music_player, mock_song
+    ):
+        mock_song.elapsed_secs = 30.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        lines = embed.description.split("\n")
+        assert lines[1] == ""
 
     def test_no_estimated_finish_when_duration_unknown(self, music_player, mock_song):
         mock_song.duration_secs = 0
