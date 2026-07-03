@@ -122,6 +122,14 @@ class MusicBot(commands.Cog):
                 mp._prefetch_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await mp._prefetch_task
+            if mp._progress_task and not mp._progress_task.done():
+                mp._progress_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._progress_task
+            if mp._pause_debounce_task and not mp._pause_debounce_task.done():
+                mp._pause_debounce_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mp._pause_debounce_task
             if mp._player and not mp._player.done():
                 mp._player.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -443,6 +451,7 @@ class MusicBot(commands.Cog):
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
                 vc.pause()
+                self.get_mp(ctx).mark_paused()
                 await ctx.message.add_reaction("⏸️")
         except Exception as e:
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
@@ -460,6 +469,7 @@ class MusicBot(commands.Cog):
                 and vc.is_paused()
             ):
                 vc.resume()
+                self.get_mp(ctx).mark_resumed()
                 await ctx.message.add_reaction("⏭️")
         except Exception as e:
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
@@ -589,10 +599,11 @@ class MusicBot(commands.Cog):
             if (
                 vc is not None
                 and isinstance(vc, discord.VoiceClient)
-                and vc.is_playing()
-                and mp.play_message
+                and (vc.is_playing() or vc.is_paused())
+                and mp.current_song is not None
             ):
-                await ctx.send(embed=mp.play_message)
+                embed = mp._build_now_playing_embed(mp.current_song)
+                await ctx.send(embed=embed)
             else:
                 await ctx.send("No songs are currently playing.")
         except Exception as e:

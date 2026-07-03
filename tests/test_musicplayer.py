@@ -13,6 +13,7 @@ import pytest
 
 from src.musicplayer import (
     MusicPlayer,
+    _build_progress_bar,
     _deserialize_queue_item,
     _fmt_duration,
     _fmt_finish_time,
@@ -55,6 +56,7 @@ def mock_song():
     song.dislikes = 500
     song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
     song.duration_secs = 210
+    song.elapsed_secs = 0.0
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
@@ -784,6 +786,61 @@ class TestEstimatedPlayingAt:
 # ── BuildNowPlayingEmbed ──────────────────────────────────────────────────────
 
 
+class TestBuildProgressBar:
+    def test_empty_string_when_duration_unknown(self):
+        assert _build_progress_bar(0.0, 0) == ""
+        assert _build_progress_bar(10.0, -1) == ""
+
+    def test_head_at_start_when_elapsed_zero(self):
+        bar = _build_progress_bar(0.0, 200, width=10)
+        assert bar.count("🔘") == 1
+        # head is the first bar character after the leading `elapsed` code span
+        assert "`0:00`" in bar
+
+    def test_head_at_end_when_elapsed_equals_duration(self):
+        bar = _build_progress_bar(200.0, 200, width=10)
+        assert bar.count("🔘") == 1
+        # clamped to width - 1: fully "done" up to the head, nothing remaining
+        assert bar.count("🟦") == 9
+        assert bar.count("⬜") == 0
+
+    def test_head_roughly_midpoint_at_half_duration(self):
+        bar = _build_progress_bar(100.0, 200, width=10)
+        # head_pos = int(0.5 * 10) = 5 done blocks before the head, 4 remaining after
+        middle = bar.split("`")[2]  # text between the two backtick-wrapped times
+        head_index = middle.index("🔘")
+        assert middle[:head_index].count("🟦") == 5
+        assert middle[head_index + 1 :].count("⬜") == 4
+
+    def test_clamped_when_elapsed_exceeds_duration(self):
+        """Involuntary drift (e.g. a stale duration_secs) must not overflow the bar."""
+        bar = _build_progress_bar(500.0, 200, width=10)
+        assert bar.count("🔘") == 1
+        assert bar.count("🟦") == 9
+        assert bar.count("⬜") == 0
+
+    def test_head_clamped_to_start_when_elapsed_negative(self):
+        """elapsed_secs is never negative in practice (Design §1's read()-counter
+        starts at 0 and only increments), but ratio clamping must not crash or
+        push the head off the bar if it ever were."""
+        bar = _build_progress_bar(-5.0, 200, width=10)
+        assert bar.count("🔘") == 1
+        assert bar.count("🟦") == 0
+        middle = bar.split("`")[2].strip()
+        assert middle.startswith(
+            "🔘"
+        )  # head pinned to the start, no done blocks before it
+
+    def test_width_is_customizable(self):
+        bar = _build_progress_bar(0.0, 200, width=5)
+        assert bar.count("🟦") + bar.count("🔘") + bar.count("⬜") == 5
+
+    def test_includes_formatted_elapsed_and_duration(self):
+        bar = _build_progress_bar(65.0, 200)
+        assert "`1:05`" in bar
+        assert "`3:20`" in bar
+
+
 class TestBuildNowPlayingEmbed:
     def test_returns_discord_embed(self, music_player, mock_song):
         embed = music_player._build_now_playing_embed(mock_song)
@@ -831,17 +888,61 @@ class TestBuildNowPlayingEmbed:
     def test_estimated_finish_appears_after_requester_on_same_line(
         self, music_player, mock_song
     ):
+        """The requester/finish-time line stays on one line — the progress bar
+        (Design §2 of the progress-bar plan) sits above it as its own line, not
+        interleaved with it."""
         embed = music_player._build_now_playing_embed(mock_song)
-        assert "\n" not in embed.description
+        requester_line = embed.description.split("\n")[-1]
         assert re.search(
             r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) PST$",
-            embed.description,
+            requester_line,
         )
+
+    def test_progress_bar_appears_above_requester_line(self, music_player, mock_song):
+        """UI update: the bar sits directly under the title, above the
+        requester/finish-time line — not the other way around."""
+        mock_song.elapsed_secs = 30.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        lines = embed.description.split("\n")
+        assert "🔘" in lines[0]
+        assert lines[1].startswith("Requester:")
 
     def test_no_estimated_finish_when_duration_unknown(self, music_player, mock_song):
         mock_song.duration_secs = 0
         embed = music_player._build_now_playing_embed(mock_song)
         assert "Estimated finish" not in embed.description
+
+    def test_progress_bar_line_present_when_duration_known(
+        self, music_player, mock_song
+    ):
+        mock_song.elapsed_secs = 30.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "🔘" in embed.description
+        assert "\n" in embed.description  # progress bar is on its own line
+
+    def test_progress_bar_reflects_elapsed_secs(self, music_player, mock_song):
+        mock_song.elapsed_secs = 105.0  # roughly halfway through 210s
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert _fmt_duration(105) in embed.description
+
+    def test_no_progress_bar_line_when_duration_unknown(self, music_player, mock_song):
+        mock_song.duration_secs = 0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "🔘" not in embed.description
+
+    def test_elapsed_override_replaces_song_elapsed_secs(self, music_player, mock_song):
+        """Used by _finalize_now_playing() to render the bar fully completed
+        once a song has ended, regardless of song.elapsed_secs's live value."""
+        mock_song.elapsed_secs = 30.0
+        mock_song.duration_secs = 210
+        embed = music_player._build_now_playing_embed(mock_song, elapsed_override=210.0)
+        assert _fmt_duration(210) in embed.description
+        assert _fmt_duration(30) not in embed.description
+
+    def test_no_override_falls_back_to_song_elapsed_secs(self, music_player, mock_song):
+        mock_song.elapsed_secs = 30.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert _fmt_duration(30) in embed.description
 
 
 class TestUpdateActivity:
@@ -933,6 +1034,68 @@ class TestUpdateActivity:
         )
         # Must not raise — playback loop must not be interrupted by a presence failure
         await music_player.update_activity(mock_song)
+
+    async def test_backdates_start_by_elapsed_secs(self, music_player, mock_song):
+        """start must be backdated by elapsed time, not always "now" — otherwise
+        resuming a song already 60s in would make `end` land a full duration_secs
+        in the future instead of the correct remaining time (Design §6)."""
+        music_player.bot.change_presence = AsyncMock()
+        mock_song.elapsed_secs = 60.0
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        now_ms = int(time.time() * 1000)
+        assert activity.timestamps["start"] <= now_ms - 60_000 + 1000
+        assert activity.timestamps["start"] >= now_ms - 60_000 - 2000
+        # end still lands duration_secs after the (backdated) start, not "now"
+        assert (
+            abs(
+                activity.timestamps["end"]
+                - (activity.timestamps["start"] + mock_song.duration_secs * 1000)
+            )
+            < 1000
+        )
+
+
+class TestUpdateActivityPause:
+    """Design review (2026-07-01): update_activity() previously set timestamps
+    once at song start and never accounted for pause state at all."""
+
+    async def test_omits_timestamps_entirely_while_paused(
+        self, music_player, mock_song
+    ):
+        music_player.bot.change_presence = AsyncMock()
+        music_player._guild.voice_client.is_paused.return_value = True
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert activity.timestamps == {}
+
+    async def test_still_sets_name_and_state_while_paused(
+        self, music_player, mock_song
+    ):
+        """Only the ticking timestamps are dropped — the rest of the activity
+        (title/uploader/state) still renders while paused."""
+        music_player.bot.change_presence = AsyncMock()
+        music_player._guild.voice_client.is_paused.return_value = True
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
+        assert activity.state == mock_song.duration
+
+    async def test_resumed_timestamps_reflect_elapsed_not_full_duration(
+        self, music_player, mock_song
+    ):
+        """On resume, elapsed_secs already reflects time played before the pause
+        (Design §1 — YTDL.read() counting freezes during a pause), so a normal
+        (non-paused) update_activity() call after resume must still backdate
+        `start` by that elapsed time rather than restarting the countdown."""
+        music_player.bot.change_presence = AsyncMock()
+        music_player._guild.voice_client.is_paused.return_value = False
+        mock_song.elapsed_secs = 60.0  # paused at 1:00 into a 3:30 track, now resumed
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        remaining_ms = activity.timestamps["end"] - int(time.time() * 1000)
+        expected_remaining_ms = (mock_song.duration_secs - 60) * 1000
+        assert abs(remaining_ms - expected_remaining_ms) < 2000
 
 
 class TestMusicPlayerInitialState:
@@ -1433,6 +1596,14 @@ class TestCancelPrefetch:
 
 
 class TestSendNowPlaying:
+    @pytest.fixture(autouse=True)
+    async def _cleanup_progress_task(self, music_player):
+        """_send_now_playing() may spawn a real _progress_task (Design §4). Tests
+        in this class don't drive loop() to retire it themselves, so clean it up
+        here rather than leaking a pending asyncio.sleep() task past the test."""
+        yield
+        await music_player._cancel_progress_task()
+
     async def test_sends_embed_to_channel(self, music_player, mock_song):
         await music_player._send_now_playing(mock_song)
         music_player._channel.send.assert_awaited_once()
@@ -1447,6 +1618,19 @@ class TestSendNowPlaying:
     async def test_swallows_channel_send_exception(self, music_player, mock_song):
         music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
         await music_player._send_now_playing(mock_song)
+
+    async def test_resets_stale_now_playing_message_on_send_failure(
+        self, music_player, mock_song
+    ):
+        """Regression (code review): a failed/partial send must not leave
+        _now_playing_message pointing at the *previous* song's message —
+        otherwise a later mark_paused()/mark_resumed() on the new song would
+        silently edit the wrong (old, already-finished) song's embed."""
+        stale_message = MagicMock(spec=discord.Message)
+        music_player._now_playing_message = stale_message
+        music_player._channel.send = AsyncMock(side_effect=Exception("channel gone"))
+        await music_player._send_now_playing(mock_song)
+        assert music_player._now_playing_message is None
 
     async def test_sends_only_now_playing_embed_when_queue_empty(
         self, music_player, mock_song
@@ -1469,6 +1653,376 @@ class TestSendNowPlaying:
         assert embeds[1].colour == discord.Color.blue()
         assert embeds[1].title == "Up next"
         assert "Next Song" in embeds[1].description
+
+    async def test_stores_sent_message(self, music_player, mock_song):
+        sent_message = MagicMock(spec=discord.Message)
+        music_player._channel.send = AsyncMock(return_value=sent_message)
+        await music_player._send_now_playing(mock_song)
+        assert music_player._now_playing_message is sent_message
+
+    async def test_starts_progress_task_for_normal_duration_song(
+        self, music_player, mock_song
+    ):
+        mock_song.duration_secs = 210
+        await music_player._send_now_playing(mock_song)
+        assert music_player._progress_task is not None
+        assert not music_player._progress_task.done()
+
+    async def test_no_progress_task_for_sub_5s_song(self, music_player, mock_song):
+        mock_song.duration_secs = 4
+        await music_player._send_now_playing(mock_song)
+        assert music_player._progress_task is None
+
+    async def test_no_progress_task_for_zero_duration_song(
+        self, music_player, mock_song
+    ):
+        mock_song.duration_secs = 0
+        await music_player._send_now_playing(mock_song)
+        assert music_player._progress_task is None
+
+    async def test_progress_task_starts_for_exactly_5s_song(
+        self, music_player, mock_song
+    ):
+        mock_song.duration_secs = 5
+        await music_player._send_now_playing(mock_song)
+        assert music_player._progress_task is not None
+
+
+# ── FinalizeNowPlaying ────────────────────────────────────────────────────────
+
+
+class TestFinalizeNowPlaying:
+    """A song freezing mid-bar (e.g. `3:04 / 3:07`) after it ends — because the
+    last periodic tick landed before the true end — is fixed by one last,
+    fire-and-forget edit showing the bar fully completed."""
+
+    async def test_edits_message_with_full_duration(self, music_player, mock_song):
+        mock_song.elapsed_secs = 184.0  # song ended mid-tick, e.g. 3:04 / 3:07
+        mock_song.duration_secs = 210
+        message = AsyncMock(spec=discord.Message)
+
+        await music_player._finalize_now_playing(mock_song, message)
+
+        message.edit.assert_awaited_once()
+        embed = message.edit.call_args.kwargs["embeds"][0]
+        assert _fmt_duration(210) in embed.description
+        assert _fmt_duration(184) not in embed.description
+
+    async def test_noop_when_duration_unknown(self, music_player, mock_song):
+        mock_song.duration_secs = 0
+        message = AsyncMock(spec=discord.Message)
+        await music_player._finalize_now_playing(mock_song, message)
+        message.edit.assert_not_awaited()
+
+    async def test_includes_next_up_embed_when_queue_has_song(
+        self, music_player, mock_song, mock_author
+    ):
+        music_player.song_queue.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        message = AsyncMock(spec=discord.Message)
+        await music_player._finalize_now_playing(mock_song, message)
+        embeds = message.edit.call_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        assert embeds[1].title == "Up next"
+
+    async def test_swallows_not_found(self, music_player, mock_song):
+        message = AsyncMock(spec=discord.Message)
+        message.edit.side_effect = discord.NotFound(MagicMock(), "message deleted")
+        await music_player._finalize_now_playing(mock_song, message)  # must not raise
+
+    async def test_swallows_and_logs_http_exception(self, music_player, mock_song):
+        message = AsyncMock(spec=discord.Message)
+        message.edit.side_effect = discord.HTTPException(MagicMock(), "rate limited")
+        await music_player._finalize_now_playing(mock_song, message)  # must not raise
+
+    async def test_operates_on_captured_song_and_message_args(
+        self, music_player, mock_song
+    ):
+        """Must use the song/message passed in, not self.current_song /
+        self._now_playing_message — those may already point at the next song
+        by the time this fire-and-forget task actually runs."""
+        other_message = AsyncMock(spec=discord.Message)
+        music_player.current_song = MagicMock()  # a different, "next" song
+        music_player._now_playing_message = other_message
+
+        message = AsyncMock(spec=discord.Message)
+        await music_player._finalize_now_playing(mock_song, message)
+
+        message.edit.assert_awaited_once()
+        other_message.edit.assert_not_awaited()
+
+
+class TestFireFinalizeNowPlaying:
+    async def test_spawns_tracked_background_task(self, music_player, mock_song):
+        message = AsyncMock(spec=discord.Message)
+        music_player._fire_finalize_now_playing(mock_song, message)
+        task = next(iter(music_player._background_tasks))
+        assert task in music_player._background_tasks
+        await task
+        message.edit.assert_awaited_once()
+        assert task not in music_player._background_tasks
+
+
+# ── ProgressUpdater ───────────────────────────────────────────────────────────
+
+
+class TestProgressUpdater:
+    @staticmethod
+    def _make_sleep(n_ticks: int):
+        """asyncio.sleep double that lets the loop run n_ticks times, then raises
+        CancelledError — deterministic without waiting on the real interval."""
+        calls = 0
+
+        async def _sleep(_secs):
+            nonlocal calls
+            calls += 1
+            if calls > n_ticks:
+                raise asyncio.CancelledError()
+
+        return _sleep
+
+    async def test_ticks_and_edits_message(self, music_player, mock_song):
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        music_player._guild.voice_client = vc
+        message = AsyncMock(spec=discord.Message)
+
+        with patch("asyncio.sleep", new=self._make_sleep(1)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song, message)
+
+        message.edit.assert_awaited_once()
+        assert "embeds" in message.edit.call_args.kwargs
+
+    async def test_skips_edit_while_paused(self, music_player, mock_song):
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
+        music_player._guild.voice_client = vc
+        message = AsyncMock(spec=discord.Message)
+
+        with patch("asyncio.sleep", new=self._make_sleep(2)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song, message)
+
+        message.edit.assert_not_awaited()
+
+    async def test_returns_when_song_changed_under_it(self, music_player, mock_song):
+        """loop() owns cancellation on song transition, but this guard protects
+        against a stray tick landing after the song changed (Design §4)."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = MagicMock()  # a different song than the one passed in
+        vc.is_paused.return_value = False
+        music_player._guild.voice_client = vc
+        message = AsyncMock(spec=discord.Message)
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await music_player._progress_updater(
+                mock_song, message
+            )  # returns, no raise
+
+        message.edit.assert_not_awaited()
+
+    async def test_stops_cleanly_on_message_not_found(self, music_player, mock_song):
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        music_player._guild.voice_client = vc
+        message = AsyncMock(spec=discord.Message)
+        message.edit.side_effect = discord.NotFound(MagicMock(), "message deleted")
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await music_player._progress_updater(
+                mock_song, message
+            )  # returns, no raise
+
+        message.edit.assert_awaited_once()
+
+    async def test_logs_and_continues_on_http_exception(self, music_player, mock_song):
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        music_player._guild.voice_client = vc
+        message = AsyncMock(spec=discord.Message)
+        message.edit.side_effect = discord.HTTPException(MagicMock(), "rate limited")
+
+        with patch("asyncio.sleep", new=self._make_sleep(2)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._progress_updater(mock_song, message)
+
+        assert message.edit.await_count == 2  # kept ticking despite the failure
+
+
+# ── CancelProgressTask ────────────────────────────────────────────────────────
+
+
+class TestCancelProgressTask:
+    async def test_noop_when_no_progress_task(self, music_player):
+        music_player._progress_task = None
+        await music_player._cancel_progress_task()
+
+    async def test_noop_when_progress_task_already_done(self, music_player):
+        task = MagicMock(spec=asyncio.Task)
+        task.done.return_value = True
+        music_player._progress_task = task
+        await music_player._cancel_progress_task()
+        task.cancel.assert_not_called()
+
+    async def test_cancels_and_awaits_in_flight_progress_task(self, music_player):
+        async def _long():
+            await asyncio.sleep(100)
+
+        task = asyncio.create_task(_long())
+        music_player._progress_task = task
+        await music_player._cancel_progress_task()
+        assert task.cancelled()
+        assert music_player._progress_task is None
+
+    async def test_song_transition_retires_task_before_next_send(
+        self, music_player, mock_song
+    ):
+        """Closes the song-transition race found in design review: the previous
+        song's progress task must be fully retired — not just .cancel()'d —
+        before the next song's _send_now_playing() sends a new message."""
+        call_order: list[str] = []
+
+        async def _never_finishes():
+            try:
+                await asyncio.sleep(100)
+            finally:
+                call_order.append("old_task_retired")
+
+        music_player._progress_task = asyncio.create_task(_never_finishes())
+        await asyncio.sleep(0)  # let the task actually start before cancelling it
+
+        original_send = music_player._channel.send
+
+        async def _tracked_send(*a, **kw):
+            call_order.append("new_message_sent")
+            return await original_send(*a, **kw)
+
+        music_player._channel.send = AsyncMock(side_effect=_tracked_send)
+
+        await music_player._cancel_progress_task()
+        await music_player._send_now_playing(mock_song)
+
+        assert call_order == ["old_task_retired", "new_message_sent"]
+        await music_player._cancel_progress_task()  # clean up the new song's task
+
+
+# ── Pause/resume debounce ─────────────────────────────────────────────────────
+
+
+class TestPauseDebounce:
+    @pytest.fixture(autouse=True)
+    async def _cleanup(self, music_player):
+        yield
+        await music_player._cancel_pause_debounce()
+        # _progress_task in these tests is a bare MagicMock sentinel (truthy for
+        # the "is not None" check), not a real awaitable task — reset directly
+        # rather than going through _cancel_progress_task()'s await.
+        music_player._progress_task = None
+
+    async def test_noop_when_no_current_song(self, music_player):
+        music_player.current_song = None
+        music_player.mark_paused()
+        assert music_player._pause_debounce_task is None
+
+    async def test_single_call_fires_after_debounce_window(
+        self, music_player, mock_song
+    ):
+        music_player.current_song = mock_song
+        music_player._now_playing_message = AsyncMock(spec=discord.Message)
+        music_player._progress_task = MagicMock(spec=asyncio.Task)
+        music_player._progress_task.done.return_value = False
+        music_player.bot.change_presence = AsyncMock()
+
+        music_player.mark_paused()
+        assert music_player._pause_debounce_task is not None
+        await music_player._pause_debounce_task
+
+        music_player._now_playing_message.edit.assert_awaited_once()
+        music_player.bot.change_presence.assert_awaited_once()
+
+    async def test_rapid_toggling_collapses_to_one_trailing_update(
+        self, music_player, mock_song
+    ):
+        music_player.current_song = mock_song
+        music_player._now_playing_message = AsyncMock(spec=discord.Message)
+        music_player._progress_task = MagicMock(spec=asyncio.Task)
+        music_player._progress_task.done.return_value = False
+        music_player.bot.change_presence = AsyncMock()
+
+        music_player.mark_paused()
+        music_player.mark_resumed()
+        music_player.mark_paused()
+        music_player.mark_resumed()
+        # Only the last debounce task should still be alive/pending.
+        final_task = music_player._pause_debounce_task
+        assert final_task is not None
+        await final_task
+
+        music_player._now_playing_message.edit.assert_awaited_once()
+        music_player.bot.change_presence.assert_awaited_once()
+
+    async def test_no_embed_edit_when_no_progress_task_or_message(
+        self, music_player, mock_song
+    ):
+        music_player.current_song = mock_song
+        music_player._now_playing_message = None
+        music_player._progress_task = None
+        music_player.bot.change_presence = AsyncMock()
+
+        music_player.mark_paused()
+        await music_player._pause_debounce_task
+
+        music_player.bot.change_presence.assert_awaited_once()
+
+
+# ── MarkPausedResumed ──────────────────────────────────────────────────────────
+
+
+class TestMarkPausedResumed:
+    @pytest.fixture(autouse=True)
+    async def _cleanup(self, music_player):
+        yield
+        await music_player._cancel_pause_debounce()
+        music_player._progress_task = None
+
+    async def test_mark_paused_schedules_debounced_update(
+        self, music_player, mock_song
+    ):
+        music_player.current_song = mock_song
+        music_player.mark_paused()
+        assert music_player._pause_debounce_task is not None
+
+    async def test_mark_resumed_schedules_debounced_update(
+        self, music_player, mock_song
+    ):
+        music_player.current_song = mock_song
+        music_player.mark_resumed()
+        assert music_player._pause_debounce_task is not None
+
+    async def test_scheduled_tasks_tracked_via_background_tasks(
+        self, music_player, mock_song
+    ):
+        """The debounce task itself, and the embed-edit/activity tasks it spawns,
+        must be tracked via _background_tasks (not bare create_task() calls) —
+        design review flagged this as the same GC-pending-task risk the codebase
+        already guards against elsewhere (musicplayer.py:511-512)."""
+        music_player.current_song = mock_song
+        music_player._now_playing_message = AsyncMock(spec=discord.Message)
+        music_player._progress_task = MagicMock(spec=asyncio.Task)
+        music_player._progress_task.done.return_value = False
+        music_player.bot.change_presence = AsyncMock()
+
+        music_player.mark_paused()
+        assert music_player._pause_debounce_task in music_player._background_tasks
+        await music_player._pause_debounce_task
+        # Debounce task itself is discarded from the set once done (done_callback).
+        assert music_player._pause_debounce_task not in music_player._background_tasks
 
 
 # ── BuildNextUpEmbed ──────────────────────────────────────────────────────────
@@ -1540,7 +2094,10 @@ class TestBuildNextUpEmbed:
         now_playing_embed = music_player._build_now_playing_embed(mock_song)
         next_up_embed = music_player._build_next_up_embed()
         assert next_up_embed is not None
-        finish_time = now_playing_embed.description.split("Estimated finish: ")[1]
+        # Last line only — the progress bar sits above it as its own line and
+        # isn't part of the finish-time text being compared here.
+        requester_line = now_playing_embed.description.split("\n")[-1]
+        finish_time = requester_line.split("Estimated finish: ")[1]
         assert finish_time in next_up_embed.description
 
 
@@ -2014,6 +2571,49 @@ class TestLoop:
         assert len(music_player.history) == 1
         assert mock_song.title in music_player.history[0]
 
+    async def test_fires_finalize_task_when_song_ends(
+        self, music_player, queue_obj, mock_song
+    ):
+        """When a song ends, loop() must fire the finalize-embed task with the
+        song/message that just finished, before current_song/_now_playing_message
+        get overwritten for the next iteration."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue.put(queue_obj)
+        music_player.song_queue.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        sent_message = MagicMock(spec=discord.Message)
+
+        async def _fake_send_now_playing(_self, song):
+            _self._now_playing_message = sent_message
+
+        finalize_mock = MagicMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=_fake_send_now_playing),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "_fire_finalize_now_playing", new=finalize_mock),
+        ):
+            await music_player.loop()
+
+        finalize_mock.assert_called_once_with(mock_song, sent_message)
+
     async def test_unhandled_exception_sends_error_message(
         self, music_player, queue_obj
     ):
@@ -2139,6 +2739,10 @@ class TestLoop:
                 new=AsyncMock(side_effect=[queue_obj, asyncio.TimeoutError()]),
             ),
             patch.object(MusicPlayer, "stop", new=_stop_noop),
+            # Unrelated to this test (prefetch/cleanup) — the bare object.__new__()
+            # VoiceClient double below has no real _player, so the real
+            # update_activity() would crash calling vc.is_paused() on it.
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
         ):
             await music_player.loop()
 

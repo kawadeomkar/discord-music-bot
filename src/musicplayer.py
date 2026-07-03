@@ -14,6 +14,7 @@ from discord.ext import commands
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src import config
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -62,6 +63,38 @@ def _requester_mention(
     requester: Optional[Union[discord.User, discord.Member]],
 ) -> str:
     return requester.mention if requester else "Unknown"
+
+
+# Square emoji blocks read as noticeably thicker/higher-contrast than a thin
+# dash character, and — unlike a single-color fill — let the played portion
+# render in a visibly different color from the remaining portion. Width is
+# lower than a typical thin-dash bar since each block glyph is much wider.
+_BAR_WIDTH = 12
+_BAR_FILL_DONE = "🟦"
+_BAR_FILL_REMAINING = "⬜"
+_BAR_HEAD = "🔘"
+
+# How long mark_paused()/mark_resumed() wait before firing the embed edit +
+# Activity refresh — collapses rapid -pause/-resume toggling into one trailing
+# update instead of one Discord API call pair per toggle (Design §5).
+_PAUSE_DEBOUNCE_SECS = 0.5
+
+
+def _build_progress_bar(
+    elapsed_secs: float, duration_secs: int, width: int = _BAR_WIDTH
+) -> str:
+    if duration_secs <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, elapsed_secs / duration_secs))
+    head_pos = min(width - 1, int(ratio * width))
+    bar = (
+        _BAR_FILL_DONE * head_pos
+        + _BAR_HEAD
+        + _BAR_FILL_REMAINING * (width - head_pos - 1)
+    )
+    return (
+        f"`{_fmt_duration(int(elapsed_secs))}` {bar} `{_fmt_duration(duration_secs)}`"
+    )
 
 
 def _fmt_finish_time(duration_secs: int) -> str:
@@ -157,6 +190,9 @@ class MusicPlayer:
         "_restored",
         "_queue_cleared",
         "_background_tasks",
+        "_progress_task",
+        "_now_playing_message",
+        "_pause_debounce_task",
     )
 
     bot: commands.Bot
@@ -179,6 +215,9 @@ class MusicPlayer:
     _restored: asyncio.Event
     _queue_cleared: bool
     _background_tasks: set
+    _progress_task: Optional[asyncio.Task]
+    _now_playing_message: Optional[discord.Message]
+    _pause_debounce_task: Optional[asyncio.Task]
 
     def __init__(
         self,
@@ -214,6 +253,9 @@ class MusicPlayer:
         self._restored = asyncio.Event()
         self._queue_cleared: bool = False
         self._background_tasks: set = set()
+        self._progress_task: Optional[asyncio.Task] = None
+        self._now_playing_message: Optional[discord.Message] = None
+        self._pause_debounce_task: Optional[asyncio.Task] = None
 
     @classmethod
     def from_context(
@@ -666,12 +708,28 @@ class MusicPlayer:
 
     # ── Embed building ────────────────────────────────────────────────────────
 
-    def _build_now_playing_embed(self, song: YTDL) -> discord.Embed:
-        description = f"Requester: [{_requester_mention(song.requester)}]"
+    def _build_now_playing_embed(
+        self, song: YTDL, *, elapsed_override: Optional[float] = None
+    ) -> discord.Embed:
+        """elapsed_override lets a caller render the bar at a specific position
+        rather than song.elapsed_secs's live value — used by _finalize_now_playing()
+        to show the bar fully completed once the song has actually ended."""
+        lines = []
         if song.duration_secs > 0:
-            description += (
+            elapsed = (
+                elapsed_override if elapsed_override is not None else song.elapsed_secs
+            )
+            bar = _build_progress_bar(elapsed, song.duration_secs)
+            if bar:
+                # Bar sits directly under the title, above the requester line.
+                lines.append(bar)
+        requester_line = f"Requester: [{_requester_mention(song.requester)}]"
+        if song.duration_secs > 0:
+            requester_line += (
                 f"  ·  Estimated finish: {_fmt_finish_time(song.duration_secs)}"
             )
+        lines.append(requester_line)
+        description = "\n".join(lines)
         return (
             discord.Embed(
                 title=f"**Now playing:** {song.title}",
@@ -706,10 +764,22 @@ class MusicPlayer:
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
         if song is not None:
-            now_ms = int(time.time() * 1000)
-            timestamps: dict = {"start": now_ms}
-            if song.duration_secs > 0:
-                timestamps["end"] = now_ms + song.duration_secs * 1000
+            timestamps: dict = {}
+            vc = self._guild.voice_client
+            is_paused = isinstance(vc, discord.VoiceClient) and vc.is_paused()
+            if not is_paused:
+                # Backdated by elapsed time (not always "now") so that resuming
+                # mid-song still lands `end` the correct remaining duration in
+                # the future, not a full duration_secs from the resume moment.
+                now_ms = int(time.time() * 1000)
+                elapsed_ms = int(song.elapsed_secs * 1000)
+                timestamps["start"] = now_ms - elapsed_ms
+                if song.duration_secs > 0:
+                    timestamps["end"] = timestamps["start"] + song.duration_secs * 1000
+            # else: paused — timestamps stays {} so Discord shows static text with
+            # no ticking bar, instead of a bar that keeps animating through the
+            # pause (Discord's Activity schema has no "frozen" representation
+            # other than omitting timestamps entirely).
 
             # Bot opcode-3 activities only render `name` reliably in Discord's
             # client. Rich Presence (details, assets) requires the Discord RPC/SDK
@@ -747,6 +817,45 @@ class MusicPlayer:
         except Exception as e:
             log.warning(f"Failed to update bot activity: {e}", exc_info=True)
 
+    def mark_paused(self) -> None:
+        self._fire_pause_state_updates()
+
+    def mark_resumed(self) -> None:
+        self._fire_pause_state_updates()
+
+    def _fire_pause_state_updates(self) -> None:
+        """Debounced trigger for pause()/resume() commands: refreshes the
+        now-playing embed and the Activity presence to reflect the new pause
+        state. Debounced (not immediate) because nothing rate-limits how fast
+        -pause/-resume can be invoked — see Design §5 of the progress-bar plan
+        for why an undebounced version could spam two rate-limited Discord
+        endpoints under rapid toggling.
+        """
+        if self.current_song is None:
+            return
+        if (
+            self._pause_debounce_task is not None
+            and not self._pause_debounce_task.done()
+        ):
+            self._pause_debounce_task.cancel()
+        task = asyncio.create_task(self._debounced_pause_update())
+        self._pause_debounce_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _debounced_pause_update(self) -> None:
+        try:
+            await asyncio.sleep(_PAUSE_DEBOUNCE_SECS)
+        except asyncio.CancelledError:
+            return
+        if self._progress_task is not None and self._now_playing_message is not None:
+            task = asyncio.create_task(self._edit_now_playing_once())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        activity_task = asyncio.create_task(self.update_activity(self.current_song))
+        self._background_tasks.add(activity_task)
+        activity_task.add_done_callback(self._background_tasks.discard)
+
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
     async def _resolve_source(
@@ -774,6 +883,11 @@ class MusicPlayer:
             return None
 
     async def _send_now_playing(self, song: YTDL) -> None:
+        # Reset before attempting the send (not after failure) so a failed/partial
+        # send never leaves this pointing at the *previous* song's message — a
+        # stale reference here would let a later mark_paused()/mark_resumed() on
+        # the new song silently overwrite the old song's already-sent embed.
+        self._now_playing_message = None
         try:
             embed = self._build_now_playing_embed(song)
             self.play_message = embed
@@ -781,9 +895,111 @@ class MusicPlayer:
             next_up_embed = self._build_next_up_embed()
             if next_up_embed is not None:
                 embeds.append(next_up_embed)
-            await self._channel.send(embeds=embeds)
+            message = await self._channel.send(embeds=embeds)
+            self._now_playing_message = message
+            if song.duration_secs >= 5:
+                self._progress_task = asyncio.create_task(
+                    self._progress_updater(song, message)
+                )
         except Exception as e:
             log.error(f"embed error: {e}")
+
+    async def _push_now_playing_edit(
+        self,
+        song: YTDL,
+        message: discord.Message,
+        *,
+        elapsed_override: Optional[float] = None,
+    ) -> bool:
+        """Rebuild the now-playing + up-next embeds and push a single edit.
+
+        Shared by the periodic tick, the debounced pause/resume refresh, and the
+        song-end finalize edit — all three previously duplicated this exact
+        build-embeds/edit/except block. Returns False if the message no longer
+        exists (deleted) so callers that loop (_progress_updater) know to stop;
+        the one-shot callers just ignore the return value.
+        """
+        try:
+            embed = self._build_now_playing_embed(
+                song, elapsed_override=elapsed_override
+            )
+            next_up = self._build_next_up_embed()
+            embeds = [embed] + ([next_up] if next_up else [])
+            await message.edit(embeds=embeds)
+            return True
+        except discord.NotFound:
+            return False
+        except discord.HTTPException as e:
+            log.warning(f"Now-playing edit failed for guild {self._guild.id}: {e}")
+            return True
+
+    async def _edit_now_playing_once(self) -> None:
+        """Rebuild and push a single embed edit outside the periodic tick — used
+        for the debounced pause/resume refresh (mark_paused()/mark_resumed())."""
+        song = self.current_song
+        message = self._now_playing_message
+        if song is None or message is None:
+            return
+        await self._push_now_playing_edit(song, message)
+
+    async def _finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
+        """One last embed edit once a song has actually ended, showing the bar
+        fully completed (elapsed == duration) rather than left frozen wherever
+        the last periodic tick happened to land. song/message are captured by
+        the caller rather than read off self.current_song/self._now_playing_message
+        at run time, since both may already point at the next song by the time
+        this (fire-and-forget) task actually runs.
+        """
+        if song.duration_secs <= 0:
+            return  # no bar was ever shown for this song — nothing to finalize
+        await self._push_now_playing_edit(
+            song, message, elapsed_override=song.duration_secs
+        )
+
+    def _fire_finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
+        task = asyncio.create_task(self._finalize_now_playing(song, message))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _progress_updater(self, song: YTDL, message: discord.Message) -> None:
+        interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                vc = self._guild.voice_client
+                if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
+                    return  # song changed under us; loop() owns cancellation but guard defensively
+                if vc.is_paused():
+                    continue  # frozen — mark_resumed() below fires a debounced edit instead
+                if not await self._push_now_playing_edit(song, message):
+                    return  # user deleted the message — stop editing a message that no longer exists
+        except asyncio.CancelledError:
+            raise
+
+    async def _cancel_progress_task(self) -> None:
+        """Cancel any in-flight progress-updater task and wait for it to finish.
+
+        Mirrors _cancel_prefetch() (musicplayer.py:532). Must be awaited — not just
+        cancelled — before the next song's _send_now_playing() sends its message,
+        otherwise an in-flight message.edit() for the old song could still be
+        resolving concurrently with the new message being sent.
+        """
+        if self._progress_task and not self._progress_task.done():
+            self._progress_task.cancel()
+            try:
+                await self._progress_task
+            except asyncio.CancelledError:
+                pass
+        self._progress_task = None
+
+    async def _cancel_pause_debounce(self) -> None:
+        if self._pause_debounce_task and not self._pause_debounce_task.done():
+            self._pause_debounce_task.cancel()
+            try:
+                await self._pause_debounce_task
+            except asyncio.CancelledError:
+                pass
+        self._pause_debounce_task = None
 
     @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
@@ -957,6 +1173,26 @@ class MusicPlayer:
 
                     await self.play_next.wait()
 
+                    # Must fully retire before the next iteration's _send_now_playing()
+                    # sends a new message — otherwise an in-flight message.edit() for
+                    # this song could still be resolving concurrently with the new
+                    # message being sent (see Design §4 of the progress-bar plan).
+                    await self._cancel_progress_task()
+                    await self._cancel_pause_debounce()
+
+                    # Song has actually ended (naturally or via -skip) — one last,
+                    # fire-and-forget edit so the bar always ends up showing fully
+                    # completed instead of frozen at the last periodic tick's
+                    # position. Captures current_song/_now_playing_message now,
+                    # since both are about to be overwritten for the next song.
+                    if (
+                        self.current_song is not None
+                        and self._now_playing_message is not None
+                    ):
+                        self._fire_finalize_now_playing(
+                            self.current_song, self._now_playing_message
+                        )
+
                     try:
                         prefetched_song = await self._prefetch_task
                     except asyncio.CancelledError:
@@ -981,6 +1217,8 @@ class MusicPlayer:
                     await self.update_activity(None)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
+                    await self._cancel_progress_task()
+                    await self._cancel_pause_debounce()
                     await self.update_activity(None)
                     raise
                 except Exception as e:
@@ -993,6 +1231,8 @@ class MusicPlayer:
                     if self._prefetch_task and not self._prefetch_task.done():
                         self._prefetch_task.cancel()
                     self._prefetch_task = None
+                    await self._cancel_progress_task()
+                    await self._cancel_pause_debounce()
                     prefetched_song = None
                     self.current_song = None
                     try:

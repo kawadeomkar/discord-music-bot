@@ -33,3 +33,7 @@ def _parse() -> str:
 
 
 ENVIRONMENT: str = _parse()
+
+NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
+    os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
+)
