@@ -73,7 +73,7 @@ async def send_embed(
         embed.set_footer(text=footer)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
-    for name, value, inline in (fields or []):
+    for name, value, inline in fields or []:
         embed.add_field(name=name, value=value, inline=inline)
     return await destination.send(embed=embed)
 

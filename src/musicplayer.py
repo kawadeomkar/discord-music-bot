@@ -17,7 +17,13 @@ from src import config
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
-from src.util import cancel_task, record_span_error, send_embed, trace_footer, get_logger
+from src.util import (
+    cancel_task,
+    record_span_error,
+    send_embed,
+    trace_footer,
+    get_logger,
+)
 from src.youtube import YTDL, QueueObject
 
 log = get_logger(__name__)
@@ -827,7 +833,9 @@ class MusicPlayer:
             and not self._pause_debounce_task.done()
         ):
             self._pause_debounce_task.cancel()
-        self._pause_debounce_task = self._spawn_background(self._debounced_pause_update())
+        self._pause_debounce_task = self._spawn_background(
+            self._debounced_pause_update()
+        )
 
     async def _debounced_pause_update(self) -> None:
         try:
