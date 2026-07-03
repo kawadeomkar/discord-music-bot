@@ -59,10 +59,13 @@ async def send_embed(
     description: str,
     color: Optional[discord.Color] = None,
     footer: Optional[str] = None,
+    thumbnail: Optional[str] = None,
 ) -> None:
     embed = discord.Embed(title=title, description=description, color=color)
     if footer:
         embed.set_footer(text=footer)
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
     await destination.send(embed=embed)
 
 

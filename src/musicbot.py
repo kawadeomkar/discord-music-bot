@@ -65,7 +65,15 @@ class MusicBot(commands.Cog):
     class for music bot
     """
 
-    __slots__ = ("bot", "mps", "spotify", "redis", "_active_spans")
+    __slots__ = (
+        "bot",
+        "mps",
+        "spotify",
+        "redis",
+        "_active_spans",
+        "_alone_timers",
+        "_restore_tasks",
+    )
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -73,6 +81,8 @@ class MusicBot(commands.Cog):
         self.spotify = Spotify(redis=self.redis)
         self.mps = {}
         self._active_spans: dict = {}  # id(ctx) → (Span, context_token)
+        self._alone_timers: dict[int, asyncio.Task] = {}
+        self._restore_tasks: set[asyncio.Task] = set()
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         assert ctx.guild is not None
@@ -87,6 +97,12 @@ class MusicBot(commands.Cog):
 
     @_tracer.start_as_current_span("bot.cleanup")
     async def cleanup(self, guild: discord.Guild) -> None:
+        # Cancel any pending alone-disconnect timer before the atomic gate so it
+        # cannot fire after cleanup completes and attempt a second cleanup.
+        existing = self._alone_timers.pop(guild.id, None)
+        if existing and not existing.done() and existing is not asyncio.current_task():
+            existing.cancel()
+
         # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
         # on_voice_state_update firing while stop's disconnect is in-flight) gets None
         # and returns immediately, preventing the KeyError TOCTOU race.
@@ -95,14 +111,20 @@ class MusicBot(commands.Cog):
         if mp is None:
             return
         log.info("going to cleanup/disconnect")
-        if guild.voice_client:
-            await guild.voice_client.disconnect(force=False)
         try:
+            # Cancel tasks before disconnecting so the playback loop cannot
+            # wake up and start the next song between voice_client.stop() and
+            # the task cancellation. VoiceClient.disconnect() calls stop()
+            # internally, so audio is silenced when we disconnect below.
             await asyncio.gather(
                 cancel_task(mp._prefetch_task),
-                cancel_task(mp._restore_task),
+                cancel_task(mp._progress_task),
+                cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
+                cancel_task(mp._restore_task),
             )
+            if guild.voice_client:
+                await guild.voice_client.disconnect(force=False)
             if mp._store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
@@ -138,7 +160,21 @@ class MusicBot(commands.Cog):
         self._active_spans[id(ctx)] = (span, token)
 
         try:
-            self.get_mp(ctx)
+            if ctx.guild is None:
+                return
+            old_channel = (
+                self.mps[ctx.guild.id]._channel if ctx.guild.id in self.mps else None
+            )
+            mp = self.get_mp(ctx)
+            if (
+                isinstance(ctx.channel, discord.TextChannel)
+                and old_channel != ctx.channel
+                and mp._store is not None
+                and ctx.guild is not None
+            ):
+                vc = ctx.guild.voice_client
+                if isinstance(vc, discord.VoiceClient) and vc.channel is not None:
+                    await mp._store.set_connection(vc.channel.id, ctx.channel.id)
         except Exception as e:
             # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
             self._active_spans.pop(id(ctx))
@@ -295,8 +331,13 @@ class MusicBot(commands.Cog):
                 send_embed(
                     ctx,
                     "Queued song",
-                    f"Requested by: [{ctx.author.mention}]\n{qobj.title} - ({qobj.webpage_url})",
+                    (
+                        f"Requested by: [{ctx.author.mention}]\n"
+                        f"{qobj.title} - ({qobj.webpage_url})\n"
+                        f"Est. playing at {mp.estimated_playing_at()}"
+                    ),
                     discord.Color.blue(),
+                    thumbnail=qobj.thumbnail,
                 )
             )
         await asyncio.gather(*coros)
@@ -344,6 +385,7 @@ class MusicBot(commands.Cog):
                     await self._enqueue_playlist(ctx, source, qobj, mp)
                 else:
                     assert isinstance(qobj, QueueObject)
+                    qobj.user_input = url
                     await self._enqueue_single(ctx, qobj, mp)
 
             except Exception as e:
@@ -369,8 +411,13 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context):
         try:
-            await ctx.invoke(self.skip)
-            if ctx.voice_client and ctx.guild is not None:
+            # Do not call skip before cleanup: skip fires voice_client.stop() which
+            # triggers the after callback (play_next.set), giving the playback loop a
+            # window to start the next song before the loop task is cancelled.
+            # cleanup() cancels _player first, then disconnects — disconnect()
+            # internally stops the audio subprocess, so no explicit skip is needed.
+            vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
+            if vc is not None and ctx.guild is not None:
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
@@ -385,6 +432,7 @@ class MusicBot(commands.Cog):
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
                 vc.pause()
+                self.get_mp(ctx).mark_paused()
                 await ctx.message.add_reaction("⏸️")
         except Exception as e:
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
@@ -402,6 +450,7 @@ class MusicBot(commands.Cog):
                 and vc.is_paused()
             ):
                 vc.resume()
+                self.get_mp(ctx).mark_resumed()
                 await ctx.message.add_reaction("⏭️")
         except Exception as e:
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
@@ -480,6 +529,45 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
+        name="remove",
+        aliases=["rm"],
+        help="remove all queued songs matching a YouTube URL",
+    )
+    @commands.before_invoke(validate_commands)
+    async def remove(self, ctx: commands.Context, url: Optional[str] = None):
+        if url is None:
+            await ctx.send(
+                "`-remove <url>` — removes all songs matching the given URL from the queue. "
+                "The URL must match the YouTube link shown in the **Now Playing** embed."
+            )
+            return
+        mp = self.get_mp(ctx)
+        positions = await mp.queue_remove(url)
+        if not positions:
+            await ctx.send(
+                embed=discord.Embed(
+                    description=f"No queued songs found matching: <{url}>",
+                    color=discord.Color.red(),
+                )
+            )
+            return
+        count = len(positions)
+        noun = "song" if count == 1 else "songs"
+        pos_label = "Position" if count == 1 else "Positions"
+        pos_str = ", ".join(str(p) for p in positions)
+        removal_embed = (
+            discord.Embed(
+                title=f"Removed {count} {noun} from the queue",
+                color=discord.Color.orange(),
+            )
+            .add_field(name="URL", value=f"<{url}>", inline=False)
+            .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
+        )
+        await ctx.send(embed=removal_embed)
+        await ctx.send(embed=mp.get_queue())
+        await ctx.message.add_reaction("🗑️")
+
+    @commands.command(
         name="now", aliases=["np", "rn", "nowplaying"], help="display current song"
     )
     @commands.before_invoke(validate_commands)
@@ -491,10 +579,11 @@ class MusicBot(commands.Cog):
             if (
                 vc is not None
                 and isinstance(vc, discord.VoiceClient)
-                and vc.is_playing()
-                and mp.play_message
+                and (vc.is_playing() or vc.is_paused())
+                and mp.current_song is not None
             ):
-                await ctx.send(embed=mp.play_message)
+                embed = mp._build_now_playing_embed(mp.current_song)
+                await ctx.send(embed=embed)
             else:
                 await ctx.send("No songs are currently playing.")
         except Exception as e:
@@ -536,9 +625,7 @@ class MusicBot(commands.Cog):
     async def queue(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            if mp and len(mp.song_queue) > 0:
-                q_songs = mp.get_queue()
-                await ctx.send(q_songs)
+            await ctx.send(embed=mp.get_queue())
         except Exception as e:
             log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -586,6 +673,52 @@ class MusicBot(commands.Cog):
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
+    # ── Alone-channel disconnect ──────────────────────────────────────────────
+
+    async def _alone_countdown(self, guild: discord.Guild) -> None:
+        try:
+            mp = self.mps.get(guild.id)
+            text_channel = mp._channel if mp is not None else None
+
+            if text_channel is not None:
+                try:
+                    await text_channel.send(
+                        embed=discord.Embed(
+                            title="No users remaining in voice channel",
+                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                            color=discord.Color.orange(),
+                        )
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
+                    )
+
+            await asyncio.sleep(10)
+
+            # Span covers only the post-sleep decision so it doesn't stay open for
+            # the full 10 seconds (which confuses OTLP exporters and leaks OTel context).
+            with _tracer.start_as_current_span(
+                "bot.alone_countdown",
+                attributes={"discord.guild_id": str(guild.id)},
+            ):
+                vc = guild.voice_client
+                if (
+                    isinstance(vc, discord.VoiceClient)
+                    and vc.channel is not None
+                    and not any(not m.bot for m in vc.channel.members)
+                ):
+                    log.info(
+                        f"Bot still alone in guild {guild.id} after 10s — disconnecting"
+                    )
+                    await self.cleanup(guild)
+        except asyncio.CancelledError:
+            pass  # user rejoined or explicit stop; timer was cancelled
+        except Exception as e:
+            log.error(f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True)
+        finally:
+            self._alone_timers.pop(guild.id, None)
+
     # ── Restart recovery listeners ────────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -595,7 +728,9 @@ class MusicBot(commands.Cog):
         if self.redis is None:
             return
         for guild in self.bot.guilds:
-            asyncio.create_task(self._restore_guild(guild))
+            task = asyncio.create_task(self._restore_guild(guild))
+            self._restore_tasks.add(task)
+            task.add_done_callback(self._restore_tasks.discard)
 
     @_tracer.start_as_current_span("guild.restore")
     async def _restore_guild(self, guild: discord.Guild) -> None:
@@ -681,21 +816,62 @@ class MusicBot(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Detect when the bot itself is disconnected from a voice channel."""
-        if self.bot.user is None or member.id != self.bot.user.id:
+        guild = member.guild
+
+        # ── Case A: bot itself was disconnected or moved ──────────────────────
+        if self.bot.user is not None and member.id == self.bot.user.id:
+            if before.channel is not None and after.channel is None:
+                # Bot ejected — full cleanup.
+                if guild.id in self.mps:
+                    with _tracer.start_as_current_span(
+                        "bot.voice_state_update",
+                        attributes={"discord.guild_id": str(guild.id)},
+                    ):
+                        log.info(
+                            f"Bot disconnected from voice in guild {guild.id}, cleaning up"
+                        )
+                        await self.cleanup(guild)
+            elif before.channel is not None and after.channel is not None:
+                # Bot moved to a different channel — cancel any stale alone-timer
+                # that was counting down for the old channel.
+                existing = self._alone_timers.pop(guild.id, None)
+                if existing and not existing.done():
+                    existing.cancel()
             return
-        if before.channel is not None and after.channel is None:
-            # Bot was removed from voice — clean up in-memory state.
-            guild = member.guild
-            if guild.id in self.mps:
-                with _tracer.start_as_current_span(
-                    "bot.voice_state_update",
-                    attributes={"discord.guild_id": str(guild.id)},
-                ):
-                    log.info(
-                        f"Bot disconnected from voice in guild {guild.id}, cleaning up"
-                    )
-                    await self.cleanup(guild)
+
+        # ── Case B: a human member's voice state changed ──────────────────────
+        if guild.id not in self.mps:
+            return  # bot isn't active in this guild
+
+        vc = guild.voice_client
+        if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
+            return
+
+        # Skip mute/deafen/server-deafen events — channel is unchanged.
+        if before.channel == after.channel:
+            return
+
+        # Only care about events that affect the bot's current channel.
+        if before.channel != vc.channel and after.channel != vc.channel:
+            return
+
+        human_members = [m for m in vc.channel.members if not m.bot]
+
+        if len(human_members) == 0:
+            # Bot is now alone — start (or restart) the 10-second countdown.
+            existing = self._alone_timers.pop(guild.id, None)
+            if existing and not existing.done():
+                existing.cancel()
+            log.info(f"Bot is alone in guild {guild.id}, starting 10s disconnect timer")
+            self._alone_timers[guild.id] = asyncio.create_task(
+                self._alone_countdown(guild)
+            )
+        else:
+            # A human is present — cancel any running alone-timer.
+            existing = self._alone_timers.pop(guild.id, None)
+            if existing and not existing.done():
+                log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
+                existing.cancel()
 
 
 async def setup(bot):
