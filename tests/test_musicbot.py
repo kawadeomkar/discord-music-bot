@@ -661,6 +661,8 @@ class TestCleanup:
         mp._restore_task = None
         mp._player = None
         mp._store = None
+        mp._progress_task = None
+        mp._pause_debounce_task = None
         for attr, val in overrides.items():
             setattr(mp, attr, val)
         music_bot.mps[mock_guild.id] = mp
@@ -701,6 +703,24 @@ class TestCleanup:
         task.done.return_value = False
         task.cancel = MagicMock()
         self._make_minimal_mp(music_bot, mock_guild, _prefetch_task=task)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        task.cancel.assert_called_once()
+
+    async def test_cancels_in_flight_progress_task(self, music_bot, mock_guild):
+        task = AsyncMock(spec=asyncio.Task)
+        task.done.return_value = False
+        task.cancel = MagicMock()
+        self._make_minimal_mp(music_bot, mock_guild, _progress_task=task)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        task.cancel.assert_called_once()
+
+    async def test_cancels_in_flight_pause_debounce_task(self, music_bot, mock_guild):
+        task = AsyncMock(spec=asyncio.Task)
+        task.done.return_value = False
+        task.cancel = MagicMock()
+        self._make_minimal_mp(music_bot, mock_guild, _pause_debounce_task=task)
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
         task.cancel.assert_called_once()
@@ -942,8 +962,11 @@ class TestPauseCommand:
         vc.pause = MagicMock()
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
+        mp = MagicMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.pause.callback(music_bot, mock_ctx)
         vc.pause.assert_called_once()
+        mp.mark_paused.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
@@ -962,8 +985,11 @@ class TestResumeCommand:
         vc.resume = MagicMock()
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
+        mp = MagicMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.resume.callback(music_bot, mock_ctx)
         vc.resume.assert_called_once()
+        mp.mark_resumed.assert_called_once()
 
 
 class TestVolumeCommand:
@@ -1228,11 +1254,32 @@ class TestNowCommand:
     async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
         mock_guild.voice_client = vc
         mock_ctx.guild = mock_guild
 
         mp = MagicMock()
-        mp.play_message = discord.Embed(title="Now Playing")
+        mp.current_song = MagicMock()
+        mp._build_now_playing_embed.return_value = discord.Embed(title="Now Playing")
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.now.callback(music_bot, mock_ctx)
+        mock_ctx.send.assert_awaited_once()
+        mp._build_now_playing_embed.assert_called_once_with(mp.current_song)
+
+    async def test_sends_live_embed_when_paused(self, music_bot, mock_ctx, mock_guild):
+        """Design review (2026-07-01): -now while paused used to reply "No songs
+        are currently playing." — this is an intentional behavior change, not an
+        incidental side effect of making the embed live."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=True)
+        mock_guild.voice_client = vc
+        mock_ctx.guild = mock_guild
+
+        mp = MagicMock()
+        mp.current_song = MagicMock()
+        mp._build_now_playing_embed.return_value = discord.Embed(title="Now Playing")
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.now.callback(music_bot, mock_ctx)
@@ -1244,7 +1291,6 @@ class TestNowCommand:
         mock_guild.voice_client = None
         mock_ctx.guild = mock_guild
         mp = MagicMock()
-        mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.now.callback(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_with("No songs are currently playing.")

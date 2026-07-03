@@ -66,6 +66,44 @@ class TestYTDLGetItem:
         assert song["uploader"] == "Test Channel"
 
 
+class TestYTDLElapsedSecs:
+    """Elapsed-time tracking via YTDL.read() call counting — see Design §1 of
+    docs/NOW_PLAYING_PROGRESS_BAR_PLAN.md. Deterministic call counting, no
+    time-mocking needed: patches the parent FFmpegOpusAudio.read() (which
+    super().read() resolves to) directly rather than relying on the real
+    _packet_iter, since noop_ffmpeg_init doesn't set that up.
+    """
+
+    def test_zero_before_any_read(self, ytdl_instance):
+        song = ytdl_instance()
+        assert song.elapsed_secs == 0.0
+
+    def test_increments_by_20ms_per_frame_with_data(self, ytdl_instance):
+        song = ytdl_instance()
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
+            song.read()
+        assert song.elapsed_secs == pytest.approx(0.02)
+
+    def test_accumulates_across_multiple_reads(self, ytdl_instance):
+        song = ytdl_instance()
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
+            for _ in range(5):
+                song.read()
+        assert song.elapsed_secs == pytest.approx(0.10)
+
+    def test_does_not_increment_on_empty_read(self, ytdl_instance):
+        song = ytdl_instance()
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b""):
+            song.read()
+            song.read()
+        assert song.elapsed_secs == 0.0
+
+    def test_read_returns_underlying_data(self, ytdl_instance):
+        song = ytdl_instance()
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
+            assert song.read() == b"opus-frame"
+
+
 class TestQueueObject:
     def test_required_fields(self, mock_author):
         qobj = QueueObject(

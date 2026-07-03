@@ -211,8 +211,23 @@ class YTDL(discord.FFmpegOpusAudio):
         self.asr = data.get("asr")
         self.acodec = data.get("acodec")
 
+        self._frames_read: int = 0
+
     def __getitem__(self, item: str):
         return self.__getattribute__(item)
+
+    def read(self) -> bytes:
+        data = super().read()
+        if data:
+            self._frames_read += 1
+        return data
+
+    @property
+    def elapsed_secs(self) -> float:
+        """Seconds of audio actually delivered to the player so far. Frozen during
+        any pause — explicit (`-pause`) or involuntary (voice reconnect stall) —
+        because AudioPlayer simply doesn't call read() during either."""
+        return self._frames_read * (discord.opus.Encoder.FRAME_LENGTH / 1000.0)
 
     @classmethod
     @_tracer.start_as_current_span("ytdl.prefetch_stream")
