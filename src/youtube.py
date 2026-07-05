@@ -114,15 +114,22 @@ _STREAM_CACHE_FIELDS = frozenset(
 )
 
 
-class YTDLVideoInfo(TypedDict, total=False):
+class _YTDLVideoInfoRequired(TypedDict):
+    """`url`/`webpage_url` are the only fields this codebase accesses via
+    direct subscript (`data["url"]`) rather than `.get()` — yt-dlp always
+    populates both once `data` is narrowed to a single video."""
+
+    url: str
+    webpage_url: str
+
+
+class YTDLVideoInfo(_YTDLVideoInfoRequired, total=False):
     """The subset of yt-dlp's info-dict fields this codebase actually reads,
     once `data` has been narrowed to a single video (see yt_source()'s
     "entries" un-wrapping). `total=False` because yt-dlp's own dict is not a
     stable, fully-populated contract — any field may be absent depending on
     extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field."""
 
-    url: str
-    webpage_url: str
     title: str
     uploader: str
     uploader_url: str
@@ -284,7 +291,7 @@ class YTDL(discord.FFmpegOpusAudio):
             trace.get_current_span().set_attribute("ytdl.skipped", True)
             return
         cache_key = f"ytdl:stream:{qo.webpage_url}"
-        cached = await cache_get(redis, cache_key)
+        cached: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
         if already_cached:
@@ -292,7 +299,7 @@ class YTDL(discord.FFmpegOpusAudio):
             return
         loop = asyncio.get_running_loop()
         try:
-            data = await loop.run_in_executor(
+            data: Optional[YTDLVideoInfo] = await loop.run_in_executor(
                 _YTDLP_POOL,
                 _ytdlp_extract,
                 qo.webpage_url,
@@ -334,7 +341,7 @@ class YTDL(discord.FFmpegOpusAudio):
 
         # ── Cache check ───────────────────────────────────────────────────────
         cache_key = f"ytdl:stream:{qo.webpage_url}"
-        data = await cache_get(redis, cache_key)
+        data: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
         trace.get_current_span().set_attribute("ytdl.cache_hit", data is not None)
 
         # ── Extract (only if cache miss) ──────────────────────────────────────
@@ -438,12 +445,16 @@ class YTDL(discord.FFmpegOpusAudio):
             # ytdl.prepare_filename(data)
             pass
 
-        webpage_url = data["webpage_url"]
-        title = data.get("title", "")
-        raw_duration = data.get("duration")
+        # `data` is genuinely Any before this point (video dict vs search/playlist wrapper —
+        # see _ytdlp_extract's docstring); the narrowing above always leaves it single-video shaped.
+        video_data: YTDLVideoInfo = data
+
+        webpage_url = video_data["webpage_url"]
+        title = video_data.get("title", "")
+        raw_duration = video_data.get("duration")
         duration = int(raw_duration) if raw_duration is not None else None
-        uploader = data.get("uploader")
-        thumbnail = data.get("thumbnail")
+        uploader = video_data.get("uploader")
+        thumbnail = video_data.get("thumbnail")
         trace.get_current_span().set_attribute("ytdl.result_title", title)
 
         if redis is not None:

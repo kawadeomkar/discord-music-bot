@@ -337,6 +337,20 @@ class TestGetState:
         assert state.voice_channel_id is None
         assert state.text_channel_id is None
 
+    async def test_returns_default_field_on_malformed_numeric_value(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        """A non-numeric value in a numeric field must not raise — it should
+        degrade to that field's default, matching the class's 'never raise' contract."""
+        await fake_redis.hset(
+            store.state_key(), b"current_song_duration", b"not-a-number"
+        )
+        await fake_redis.hset(
+            store.state_key(), b"current_song_title", b"Still Readable"
+        )
+        state = await store.get_state()  # must not raise
+        assert state == GuildState()
+
 
 # ── TTL management ────────────────────────────────────────────────────────────
 
@@ -376,6 +390,30 @@ class TestSetConnection:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.set_connection(1, 2)  # must not raise
+
+
+class TestSetCurrentSong:
+    async def test_writes_all_four_fields_in_one_pipeline(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        await store.set_current_song(
+            title="Song", url="https://yt.com/v=1", duration="180", uploader="Channel"
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_title"] == b"Song"
+        assert state[b"current_song_url"] == b"https://yt.com/v=1"
+        assert state[b"current_song_duration"] == b"180"
+        assert state[b"current_song_uploader"] == b"Channel"
+
+    async def test_sets_ttl(self, store: GuildRedisStore, fake_redis: Redis) -> None:
+        await store.set_current_song(title="", url="", duration="", uploader="")
+        ttl = await fake_redis.ttl(store.state_key())
+        assert ttl > 0
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        await broken_store.set_current_song(
+            title="x", url="x", duration="x", uploader="x"
+        )  # must not raise
 
 
 class TestClearConnection:

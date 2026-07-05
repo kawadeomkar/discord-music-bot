@@ -212,33 +212,34 @@ class GuildRedisStore:
 
     async def get_state(self) -> GuildState:
         """HGETALL the state hash and decode it into a GuildState. Returns
-        GuildState() (all-default) on a missing hash or any Redis error."""
+        GuildState() (all-default) on a missing hash, any Redis error, or
+        malformed field data."""
         try:
             raw: dict[bytes, bytes] = await self.redis.hgetall(self.state_key())  # type: ignore[misc]
+            if not raw:
+                return GuildState()
+
+            def _int(key: bytes) -> Optional[int]:
+                v = raw.get(key)
+                return int(v) if v else None
+
+            def _str(key: bytes) -> str:
+                v = raw.get(key)
+                return v.decode() if v else ""
+
+            volume_raw = raw.get(b"volume")
+            return GuildState(
+                volume=float(volume_raw) if volume_raw else None,
+                current_song_title=_str(b"current_song_title"),
+                current_song_url=_str(b"current_song_url"),
+                current_song_duration=_int(b"current_song_duration"),
+                current_song_uploader=_str(b"current_song_uploader") or None,
+                voice_channel_id=_int(b"voice_channel_id"),
+                text_channel_id=_int(b"text_channel_id"),
+            )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_state failed: {e}")
             return GuildState()
-        if not raw:
-            return GuildState()
-
-        def _int(key: bytes) -> Optional[int]:
-            v = raw.get(key)
-            return int(v) if v else None
-
-        def _str(key: bytes) -> str:
-            v = raw.get(key)
-            return v.decode() if v else ""
-
-        volume_raw = raw.get(b"volume")
-        return GuildState(
-            volume=float(volume_raw) if volume_raw else None,
-            current_song_title=_str(b"current_song_title"),
-            current_song_url=_str(b"current_song_url"),
-            current_song_duration=_int(b"current_song_duration"),
-            current_song_uploader=_str(b"current_song_uploader") or None,
-            voice_channel_id=_int(b"voice_channel_id"),
-            text_channel_id=_int(b"text_channel_id"),
-        )
 
     # TTL management
 
@@ -246,8 +247,7 @@ class GuildRedisStore:
         """Refresh GUILD_TTL on all guild keys."""
         try:
             pipe = self.redis.pipeline()
-            for key in [self.queue_key(), self.state_key(), self.history_key()]:
-                pipe.expire(key, GUILD_TTL)
+            self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis refresh_ttl failed: {e}")
@@ -264,6 +264,23 @@ class GuildRedisStore:
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_connection failed: {e}")
+
+    async def set_current_song(
+        self, title: str, url: str, duration: str, uploader: str
+    ) -> None:
+        """HSET all four 'current song' fields in one pipeline and refresh TTL.
+        Pass all-empty strings to clear them (used by MusicPlayer._clear_current_song).
+        """
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hset(self.state_key(), "current_song_title", title)
+            pipe.hset(self.state_key(), "current_song_url", url)
+            pipe.hset(self.state_key(), "current_song_duration", duration)
+            pipe.hset(self.state_key(), "current_song_uploader", uploader)
+            pipe.expire(self.state_key(), GUILD_TTL)
+            await pipe.execute()  # type: ignore[misc]
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] set_current_song failed: {e}")
 
     async def clear_connection(self) -> None:
         """Remove channel IDs and now-playing state from the hash on intentional cleanup."""

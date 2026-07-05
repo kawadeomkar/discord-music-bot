@@ -33,6 +33,7 @@ from src.util import (
     record_span_error,
     send_embed,
     send_queue_phrases,
+    spawn_background,
     trace_footer,
     get_logger,
 )
@@ -765,9 +766,7 @@ class MusicBot(commands.Cog):
         if self.redis is None:
             return
         for guild in self.bot.guilds:
-            task = asyncio.create_task(self._restore_guild(guild))
-            self._restore_tasks.add(task)
-            task.add_done_callback(self._restore_tasks.discard)
+            spawn_background(self._restore_guild(guild), self._restore_tasks)
 
     @_tracer.start_as_current_span("guild.restore")
     async def _restore_guild(self, guild: discord.Guild) -> None:

@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import random
-from typing import List, Optional
+from typing import Any, Coroutine, List, Optional
 
 import discord
 import structlog
@@ -44,6 +44,16 @@ async def cancel_task(task: Optional[asyncio.Task]) -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+def spawn_background(
+    coro: Coroutine[Any, Any, Any], tasks: "set[asyncio.Task]"
+) -> asyncio.Task:
+    """Create a fire-and-forget task tracked in `tasks`, auto-discarded on completion."""
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
 
 
 def record_span_error(span: Span, e: Exception) -> None:

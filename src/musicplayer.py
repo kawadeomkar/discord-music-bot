@@ -23,6 +23,7 @@ from src.util import (
     cancel_task,
     record_span_error,
     send_embed,
+    spawn_background,
     trace_footer,
     get_logger,
 )
@@ -976,10 +977,7 @@ class MusicPlayer:
 
     def _spawn_background(self, coro: Any) -> asyncio.Task:
         """Create a fire-and-forget task tracked in _background_tasks."""
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+        return spawn_background(coro, self._background_tasks)
 
     def _fire_finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
         self._spawn_background(self._finalize_now_playing(song, message))
@@ -1015,22 +1013,17 @@ class MusicPlayer:
         if self._store is None:
             return
         dur = song.duration_secs
-        await asyncio.gather(
-            self._store.set_state("current_song_title", song.title or ""),
-            self._store.set_state("current_song_url", song.webpage_url or ""),
-            self._store.set_state("current_song_duration", str(dur) if dur else ""),
-            self._store.set_state("current_song_uploader", song.uploader or ""),
+        await self._store.set_current_song(
+            title=song.title or "",
+            url=song.webpage_url or "",
+            duration=str(dur) if dur else "",
+            uploader=song.uploader or "",
         )
 
     async def _clear_current_song(self) -> None:
         if self._store is None:
             return
-        await asyncio.gather(
-            self._store.set_state("current_song_title", ""),
-            self._store.set_state("current_song_url", ""),
-            self._store.set_state("current_song_duration", ""),
-            self._store.set_state("current_song_uploader", ""),
-        )
+        await self._store.set_current_song(title="", url="", duration="", uploader="")
 
     @_tracer.start_as_current_span("player.prefetch")
     async def _prefetch_next_song(self) -> Optional[YTDL]:
@@ -1199,8 +1192,10 @@ class MusicPlayer:
                     # sends a new message — otherwise an in-flight message.edit() for
                     # this song could still be resolving concurrently with the new
                     # message being sent (see Design §4 of the progress-bar plan).
-                    await self._cancel_progress_task()
-                    await self._cancel_pause_debounce()
+                    await asyncio.gather(
+                        self._cancel_progress_task(),
+                        self._cancel_pause_debounce(),
+                    )
 
                     # Song has actually ended (naturally or via -skip) — one last,
                     # fire-and-forget edit so the bar always ends up showing fully
@@ -1234,8 +1229,10 @@ class MusicPlayer:
                     await self.update_activity(None)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
-                    await self._cancel_progress_task()
-                    await self._cancel_pause_debounce()
+                    await asyncio.gather(
+                        self._cancel_progress_task(),
+                        self._cancel_pause_debounce(),
+                    )
                     await self.update_activity(None)
                     raise
                 except Exception as e:
@@ -1247,8 +1244,10 @@ class MusicPlayer:
                     if self._prefetch_task and not self._prefetch_task.done():
                         self._prefetch_task.cancel()
                     self._prefetch_task = None
-                    await self._cancel_progress_task()
-                    await self._cancel_pause_debounce()
+                    await asyncio.gather(
+                        self._cancel_progress_task(),
+                        self._cancel_pause_debounce(),
+                    )
                     prefetched_song = None
                     self.current_song = None
                     try:
