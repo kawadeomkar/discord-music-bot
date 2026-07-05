@@ -11,7 +11,12 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
-from src.musicbot import MusicBot, _check_voice_permissions
+from src.musicbot import (
+    MusicBot,
+    ResolvedSpotifyPlaylist,
+    ResolvedYoutubePlaylist,
+    _check_voice_permissions,
+)
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
@@ -107,7 +112,7 @@ class TestQueueSource:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(mock_ctx, source)
-        assert result == ["Song A", "Song B"]
+        assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
 
     async def test_spotify_track_calls_yt_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -166,7 +171,7 @@ class TestQueueSource:
         mock_playlist.assert_awaited_once_with(
             "https://www.youtube.com/playlist?list=PLtest123", mock_ctx.author
         )
-        assert result == fake_qobjs
+        assert result == ResolvedYoutubePlaylist(tracks=fake_qobjs)
 
     async def test_youtube_playlist_raises_if_list_id_missing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -225,7 +230,9 @@ class TestEnqueuePlaylist:
         ]
         mp = self._make_enqueue_mp(mock_ctx)
 
-        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+        )
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "2 songs" in embed.title
@@ -243,7 +250,9 @@ class TestEnqueuePlaylist:
         qobjs = [QueueObject("https://yt.com/watch?v=1", "Only Track", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
-        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+        )
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "1 song" in embed.title
@@ -260,7 +269,9 @@ class TestEnqueuePlaylist:
         qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
-        await music_bot._enqueue_playlist(mock_ctx, source, qobjs, mp)
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+        )
 
         mp.queue_put.assert_awaited_once()
         _, call_kwargs = mp.queue_put.call_args
@@ -275,7 +286,9 @@ class TestEnqueuePlaylist:
         titles = ["Song A", "Song B", "Song C"]
         mp = self._make_enqueue_mp(mock_ctx)
 
-        await music_bot._enqueue_playlist(mock_ctx, source, titles, mp)
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedSpotifyPlaylist(titles=titles), mp
+        )
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist" in embed.title
@@ -288,7 +301,9 @@ class TestEnqueuePlaylist:
         titles = ["Song A", "Song B"]
         mp = self._make_enqueue_mp(mock_ctx)
 
-        await music_bot._enqueue_playlist(mock_ctx, source, titles, mp)
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedSpotifyPlaylist(titles=titles), mp
+        )
 
         mp.queue_put.assert_awaited_once()
         _, call_kwargs = mp.queue_put.call_args

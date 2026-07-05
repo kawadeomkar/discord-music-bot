@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from itertools import islice
 from typing import Any, Coroutine, List, Optional, Union, assert_never
 
@@ -40,6 +41,21 @@ log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
 from src.youtube import YTDL, QueueObject
+
+
+@dataclass
+class ResolvedSpotifyPlaylist:
+    """A Spotify playlist resolved to track titles — still needs per-title
+    YouTube search resolution before it can be queued."""
+
+    titles: List[str]
+
+
+@dataclass
+class ResolvedYoutubePlaylist:
+    """A YouTube playlist already resolved to playable QueueObjects."""
+
+    tracks: List[QueueObject]
 
 
 def _check_voice_permissions(
@@ -254,22 +270,24 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
-    ) -> Union[QueueObject, List[str], List[QueueObject]]:
+    ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable.
 
-        Returns a List[str] of track titles for a Spotify playlist (still
-        needing per-title YouTube resolution), a List[QueueObject] for a
-        YouTube playlist (already resolved), or a single QueueObject otherwise.
+        Returns a ResolvedSpotifyPlaylist for a Spotify playlist (titles still
+        needing per-title YouTube resolution), a ResolvedYoutubePlaylist for a
+        YouTube playlist (already resolved), or a bare QueueObject otherwise.
         """
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            return await self.spotify.playlist(source.id)
+            return ResolvedSpotifyPlaylist(await self.spotify.playlist(source.id))
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
             )
-            return await YTDL.yt_playlist(playlist_url, ctx.author)
+            return ResolvedYoutubePlaylist(
+                await YTDL.yt_playlist(playlist_url, ctx.author)
+            )
         else:
             ts: Optional[int] = None
             search: str
@@ -291,14 +309,14 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
-        qobj: Union[List[str], List[QueueObject]],
+        qobj: Union[ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
         mp: MusicPlayer,
     ) -> None:
-        """Queue a resolved playlist and notify the channel — branches on
-        source type since Spotify playlists arrive as titles needing YouTube
+        """Queue a resolved playlist and notify the channel — branches on the
+        resolved shape since Spotify playlists arrive as titles needing YouTube
         search resolution while YouTube playlists arrive pre-resolved."""
-        if isinstance(source, SpotifySource):
-            titles: List[str] = qobj  # type: ignore[assignment]
+        if isinstance(qobj, ResolvedSpotifyPlaylist):
+            titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
@@ -317,7 +335,7 @@ class MusicBot(commands.Cog):
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
             )
-            tracks: List[QueueObject] = qobj  # type: ignore[assignment]
+            tracks = qobj.tracks
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
             await asyncio.gather(
@@ -327,7 +345,7 @@ class MusicBot(commands.Cog):
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
-                mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
+                mp.queue_put(tracks, prefetch=False),
                 ctx.message.add_reaction("👍"),
                 send_queue_phrases(ctx),
             )
@@ -370,7 +388,9 @@ class MusicBot(commands.Cog):
             try:
                 source = parse_input(url, ctx.message.content)
 
-                qobj: Union[QueueObject, List[str], List[QueueObject]]
+                qobj: Union[
+                    QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
+                ]
                 if not ctx.voice_client:
                     # Launch join concurrently with queue_source — both are pure I/O
                     # (Discord WebSocket handshake vs yt-dlp extraction) with no data
@@ -400,12 +420,11 @@ class MusicBot(commands.Cog):
                 mp = self.get_mp(ctx)
                 log.info(f"Voice client: {ctx.voice_client}")
 
-                if isinstance(qobj, list):
-                    await self._enqueue_playlist(ctx, source, qobj, mp)
-                else:
-                    assert isinstance(qobj, QueueObject)
+                if isinstance(qobj, QueueObject):
                     qobj.user_input = url
                     await self._enqueue_single(ctx, qobj, mp)
+                else:
+                    await self._enqueue_playlist(ctx, source, qobj, mp)
 
             except Exception as e:
                 log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
@@ -770,12 +789,15 @@ class MusicBot(commands.Cog):
             )
             return
         try:
-            vc_id, tc_id = await store.get_connection()
-            if vc_id is None or tc_id is None:
+            guild_state = await store.get_state()
+            if (
+                guild_state.voice_channel_id is None
+                or guild_state.text_channel_id is None
+            ):
                 return
 
-            voice_channel = guild.get_channel(vc_id)
-            text_channel = guild.get_channel(tc_id)
+            voice_channel = guild.get_channel(guild_state.voice_channel_id)
+            text_channel = guild.get_channel(guild_state.text_channel_id)
             if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
                 text_channel, discord.TextChannel
             ):
@@ -783,8 +805,7 @@ class MusicBot(commands.Cog):
 
             # Check there is something to restore before connecting.
             queue_items = await store.get_queue()
-            state = await store.get_state()
-            has_crashed_song = bool(state.get(b"current_song_url", b""))
+            has_crashed_song = bool(guild_state.current_song_url)
             if not queue_items and not has_crashed_song:
                 return
 

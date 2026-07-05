@@ -3,6 +3,7 @@ import datetime
 import random
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, List, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,8 @@ from src.youtube import YTDL, QueueObject
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
+
+QueueItem = Union[QueueObject, YTSource]
 
 # ETAs in get_queue() are rendered in Pacific time. This is intentional for a
 # single-operator bot — update to a per-guild config if multi-tenant support is added.
@@ -114,7 +117,7 @@ def _fmt_finish_time(duration_secs: int) -> str:
     return _fmt_clock_time(finish_dt)
 
 
-def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
+def _serialize_queue_item(item: QueueItem) -> bytes:
     """orjson-encode a queue item for the Redis queue mirror, tagging its type
     so _deserialize_queue_item() can reconstruct the right dataclass."""
     if isinstance(item, QueueObject):
@@ -143,9 +146,7 @@ def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
     )
 
 
-def _deserialize_queue_item(
-    data: bytes, guild: discord.Guild
-) -> Optional[Union[QueueObject, YTSource]]:
+def _deserialize_queue_item(data: bytes, guild: discord.Guild) -> Optional[QueueItem]:
     """Inverse of _serialize_queue_item(). Returns None (and logs) on any
     decode failure or if the requester is no longer a guild member with no
     fallback owner available."""
@@ -178,6 +179,16 @@ def _deserialize_queue_item(
     except Exception as e:
         log.warning(f"Failed to deserialize queue item: {e}")
         return None
+
+
+@dataclass
+class EtaWalk:
+    """Accumulator threaded through the queue's ETA-walking fold. `now_pst`
+    is deliberately excluded — it's invariant across a single walk, unlike
+    these two fields, and is passed alongside instead of bundled in."""
+
+    cumulative_secs: int
+    uncertain: bool
 
 
 class MusicPlayer:
@@ -305,14 +316,14 @@ class MusicPlayer:
         self._channel = ctx.channel
         self._last_author = ctx.author
 
-    def _queue_eta_seed(self) -> tuple[datetime.datetime, int, bool]:
+    def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs.
 
-        Returns (now_pst, cumulative_secs, uncertain), where cumulative_secs
-        is seeded with the current song's total duration as a proxy for its
-        remaining time (we don't track elapsed; this overestimates but keeps
-        the math simple and avoids showing "now" for everything), and
-        uncertain flags whether any preceding song had an unknown duration.
+        Returns (now_pst, walk), where walk.cumulative_secs is seeded with the
+        current song's total duration as a proxy for its remaining time (we
+        don't track elapsed; this overestimates but keeps the math simple and
+        avoids showing "now" for everything), and walk.uncertain flags
+        whether any preceding song had an unknown duration.
         """
         uncertain = False
         cumulative_secs = 0
@@ -322,23 +333,22 @@ class MusicPlayer:
                 cumulative_secs = secs
             else:
                 uncertain = True
-        return datetime.datetime.now(tz=_PST), cumulative_secs, uncertain
+        return datetime.datetime.now(tz=_PST), EtaWalk(cumulative_secs, uncertain)
 
     def _format_queue_line(
         self,
-        item: Union[QueueObject, YTSource],
+        item: QueueItem,
         index: int,
         now_pst: datetime.datetime,
-        cumulative_secs: int,
-        uncertain: bool,
-    ) -> tuple[str, int, bool]:
+        walk: EtaWalk,
+    ) -> tuple[str, EtaWalk]:
         """Format a single queue line with its "Est. playing at" ETA.
 
-        Returns (line, updated cumulative_secs, updated uncertain) so callers
-        can chain this across consecutive queue items.
+        Returns (line, updated walk) so callers can chain this across
+        consecutive queue items.
         """
-        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
-        est_str = _fmt_eta(est_dt, uncertain)
+        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        est_str = _fmt_eta(est_dt, walk.uncertain)
 
         if isinstance(item, QueueObject):
             title = item.title or "Unknown"
@@ -351,29 +361,29 @@ class MusicPlayer:
                 f"{channel} · {requester}"
             )
             if item.duration is not None:
-                cumulative_secs += item.duration
+                walk.cumulative_secs += item.duration
             else:
-                uncertain = True
+                walk.uncertain = True
         else:
             search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
             line = f"`{index}` {search} · *resolving...*"
-            uncertain = True
+            walk.uncertain = True
 
-        return line, cumulative_secs, uncertain
+        return line, walk
 
     def estimated_playing_at(self) -> str:
         """ETA text for a song appended to the queue right now — i.e. after the
         current song and everything already queued. Reuses the same ETA-walking
         seed as get_queue()/_build_next_up_embed() so all three stay consistent.
         """
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        now_pst, walk = self._queue_eta_seed()
         for item in self.song_queue:
             if isinstance(item, QueueObject) and item.duration is not None:
-                cumulative_secs += item.duration
+                walk.cumulative_secs += item.duration
             else:
-                uncertain = True
-        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
-        return _fmt_eta(est_dt, uncertain)
+                walk.uncertain = True
+        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        return _fmt_eta(est_dt, walk.uncertain)
 
     def get_queue(self) -> discord.Embed:
         """Build the "Queue" embed: up to 10 upcoming songs with per-song ETAs
@@ -389,13 +399,11 @@ class MusicPlayer:
             else:
                 duration_partial = True
 
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        now_pst, walk = self._queue_eta_seed()
 
         lines = []
         for i, item in enumerate(items[:10], start=1):
-            line, cumulative_secs, uncertain = self._format_queue_line(
-                item, i, now_pst, cumulative_secs, uncertain
-            )
+            line, walk = self._format_queue_line(item, i, now_pst, walk)
             lines.append(line)
 
         header = f"Songs: **{total}**"
@@ -449,21 +457,18 @@ class MusicPlayer:
             ) as span:
                 try:
                     # Restore volume
-                    state = await self._store.get_state()
-                    if state and b"volume" in state:
-                        self.volume = float(state[b"volume"])
+                    guild_state = await self._store.get_state()
+                    if guild_state.volume is not None:
+                        self.volume = guild_state.volume
 
                     # Re-queue song that was playing when the bot crashed (at-most-once delivery).
                     # current_song_url is written to state when playback starts and cleared when
                     # it finishes normally. A non-empty value means the bot died mid-song.
-                    crashed_url_raw = state.get(b"current_song_url", b"")
-                    if crashed_url_raw:
-                        crashed_url = crashed_url_raw.decode()
-                        crashed_title = state.get(b"current_song_title", b"").decode()
-                        raw_dur = state.get(b"current_song_duration", b"").decode()
-                        crashed_duration = int(raw_dur) if raw_dur.isdigit() else None
-                        raw_uploader = state.get(b"current_song_uploader", b"").decode()
-                        crashed_uploader = raw_uploader or None
+                    if guild_state.current_song_url:
+                        crashed_url = guild_state.current_song_url
+                        crashed_title = guild_state.current_song_title
+                        crashed_duration = guild_state.current_song_duration
+                        crashed_uploader = guild_state.current_song_uploader
                         requester: Union[discord.Member, discord.User, None] = (
                             self._guild.me or self._guild.owner
                         )
@@ -514,7 +519,9 @@ class MusicPlayer:
                             )
 
                     span.set_attribute("restore.queue_count", count)
-                    span.set_attribute("restore.crashed_song", bool(crashed_url_raw))
+                    span.set_attribute(
+                        "restore.crashed_song", bool(guild_state.current_song_url)
+                    )
 
                 except Exception as e:
                     record_span_error(span, e)
@@ -540,7 +547,7 @@ class MusicPlayer:
         """Enqueue one or more items into both the in-memory queue and the
         Redis mirror. When prefetch is True, also spawns a background stream
         pre-fetch per QueueObject so it's ready to play by the time it's next."""
-        items: list[Union[QueueObject, YTSource]]
+        items: list[QueueItem]
         if isinstance(obj, list):
             items = list(obj)  # type: ignore[arg-type]
         else:
@@ -571,7 +578,7 @@ class MusicPlayer:
                 [_serialize_queue_item(item) for item in serializable]
             )
 
-    async def queue_get(self) -> Union[QueueObject, YTSource]:
+    async def queue_get(self) -> QueueItem:
         return await self.queue.get()
 
     async def _pop_queue_for_dequeue(self, should_pop: bool) -> None:
@@ -628,7 +635,7 @@ class MusicPlayer:
         atomically. Returns a user-facing status message."""
         await self._cancel_prefetch()
 
-        shuffled: List[Union[QueueObject, YTSource]] = []
+        shuffled: List[QueueItem] = []
 
         if self.queue.qsize() < 4:
             return "There must be at least 3 songs to shuffle the queue"
@@ -675,11 +682,11 @@ class MusicPlayer:
         """
         await self._cancel_prefetch()
         removed_positions: list[int] = []
-        kept: List[Union[QueueObject, YTSource]] = []
+        kept: List[QueueItem] = []
 
         async with self.mutex:
             # Drain everything first so positions are numbered before partitioning.
-            drained: List[Union[QueueObject, YTSource]] = []
+            drained: List[QueueItem] = []
             for _ in range(self.queue.qsize()):
                 try:
                     item = self.queue.get_nowait()
@@ -767,10 +774,8 @@ class MusicPlayer:
         if not self.song_queue:
             return None
         item = self.song_queue[0]
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
-        description, _, _ = self._format_queue_line(
-            item, 1, now_pst, cumulative_secs, uncertain
-        )
+        now_pst, walk = self._queue_eta_seed()
+        description, _ = self._format_queue_line(item, 1, now_pst, walk)
         return discord.Embed(
             title="Up next",
             description=description,
@@ -871,9 +876,7 @@ class MusicPlayer:
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
-    async def _resolve_source(
-        self, source: Union[QueueObject, YTSource]
-    ) -> QueueObject:
+    async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
                 self._last_author,
@@ -1176,10 +1179,15 @@ class MusicPlayer:
                             self.play_next.set
                         ),
                     )
-                    await self.update_activity(self.current_song)
-                    await self._send_now_playing(self.current_song)
-
-                    await self._persist_current_song(self.current_song)
+                    # Independent side effects (presence update, embed send,
+                    # Redis persist) — none reads what another writes, and each
+                    # already swallows its own exceptions internally, so run
+                    # them concurrently instead of as three sequential round-trips.
+                    await asyncio.gather(
+                        self.update_activity(self.current_song),
+                        self._send_now_playing(self.current_song),
+                        self._persist_current_song(self.current_song),
+                    )
 
                     self._prefetch_task = asyncio.create_task(
                         self._prefetch_next_song()

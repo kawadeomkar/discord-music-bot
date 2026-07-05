@@ -893,16 +893,15 @@ class TestEstimatedPlayingAt:
 
         # A song appended now would start right where the last queued line's
         # ETA ends up, so re-derive it via the same line formatter for index 2.
-        now_pst, cumulative_secs, uncertain = music_player._queue_eta_seed()
-        _, cumulative_secs, uncertain = music_player._format_queue_line(
-            music_player.song_queue[0], 1, now_pst, cumulative_secs, uncertain
+        now_pst, walk = music_player._queue_eta_seed()
+        _, walk = music_player._format_queue_line(
+            music_player.song_queue[0], 1, now_pst, walk
         )
-        expected_line, _, _ = music_player._format_queue_line(
+        expected_line, _ = music_player._format_queue_line(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
             2,
             now_pst,
-            cumulative_secs,
-            uncertain,
+            walk,
         )
         assert eta in expected_line
 

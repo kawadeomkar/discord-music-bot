@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import orjson
@@ -73,6 +74,21 @@ async def cache_set(
 
 
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
+
+
+@dataclass
+class GuildState:
+    """Typed, decoded view of a guild's `guild:{id}:state` Redis hash.
+    All fields default to their "not set" value so a missing/empty hash
+    round-trips as GuildState() with no special-casing at call sites."""
+
+    volume: Optional[float] = None
+    current_song_title: str = ""
+    current_song_url: str = ""
+    current_song_duration: Optional[int] = None
+    current_song_uploader: Optional[str] = None
+    voice_channel_id: Optional[int] = None
+    text_channel_id: Optional[int] = None
 
 
 class GuildRedisStore:
@@ -194,13 +210,35 @@ class GuildRedisStore:
                 f"[guild:{self.guild_id}] Redis set_state [{field}={value}] failed: {e}"
             )
 
-    async def get_state(self) -> dict[bytes, bytes]:
-        """HGETALL the state hash. Returns empty dict on error."""
+    async def get_state(self) -> GuildState:
+        """HGETALL the state hash and decode it into a GuildState. Returns
+        GuildState() (all-default) on a missing hash or any Redis error."""
         try:
-            return await self.redis.hgetall(self.state_key())  # type: ignore[misc]
+            raw: dict[bytes, bytes] = await self.redis.hgetall(self.state_key())  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_state failed: {e}")
-            return {}
+            return GuildState()
+        if not raw:
+            return GuildState()
+
+        def _int(key: bytes) -> Optional[int]:
+            v = raw.get(key)
+            return int(v) if v else None
+
+        def _str(key: bytes) -> str:
+            v = raw.get(key)
+            return v.decode() if v else ""
+
+        volume_raw = raw.get(b"volume")
+        return GuildState(
+            volume=float(volume_raw) if volume_raw else None,
+            current_song_title=_str(b"current_song_title"),
+            current_song_url=_str(b"current_song_url"),
+            current_song_duration=_int(b"current_song_duration"),
+            current_song_uploader=_str(b"current_song_uploader") or None,
+            voice_channel_id=_int(b"voice_channel_id"),
+            text_channel_id=_int(b"text_channel_id"),
+        )
 
     # TTL management
 
@@ -226,19 +264,6 @@ class GuildRedisStore:
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_connection failed: {e}")
-
-    async def get_connection(self) -> tuple[Optional[int], Optional[int]]:
-        """Return (voice_channel_id, text_channel_id) or (None, None) if not stored."""
-        try:
-            state = await self.redis.hgetall(self.state_key())  # type: ignore[misc]
-            vc_raw = state.get(b"voice_channel_id")
-            tc_raw = state.get(b"text_channel_id")
-            vc_id = int(vc_raw) if vc_raw else None
-            tc_id = int(tc_raw) if tc_raw else None
-            return vc_id, tc_id
-        except Exception as e:
-            log.warning(f"[guild:{self.guild_id}] get_connection failed: {e}")
-            return None, None
 
     async def clear_connection(self) -> None:
         """Remove channel IDs and now-playing state from the hash on intentional cleanup."""

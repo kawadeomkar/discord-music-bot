@@ -10,6 +10,7 @@ from redis.asyncio import Redis
 from src.redis_client import (
     GUILD_TTL,
     GuildRedisStore,
+    GuildState,
     cache_get,
     cache_set,
     close_redis_pool,
@@ -301,19 +302,40 @@ class TestGetState:
     ) -> None:
         await fake_redis.hset(store.state_key(), b"volume", b"0.5")
         state = await store.get_state()
-        assert state[b"volume"] == b"0.5"
+        assert state.volume == 0.5
 
     async def test_returns_empty_dict_when_missing(
         self, store: GuildRedisStore
     ) -> None:
         state = await store.get_state()
-        assert state == {}
+        assert state == GuildState()
 
     async def test_returns_empty_dict_on_error(
         self, broken_store: GuildRedisStore
     ) -> None:
         result = await broken_store.get_state()
-        assert result == {}
+        assert result == GuildState()
+
+    async def test_returns_channel_ids_when_set(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        await fake_redis.hset(store.state_key(), b"voice_channel_id", b"111")
+        await fake_redis.hset(store.state_key(), b"text_channel_id", b"222")
+        state = await store.get_state()
+        assert state.voice_channel_id == 111
+        assert state.text_channel_id == 222
+
+    async def test_returns_none_none_when_not_set(self, store: GuildRedisStore) -> None:
+        state = await store.get_state()
+        assert state.voice_channel_id is None
+        assert state.text_channel_id is None
+
+    async def test_returns_none_none_on_error(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        state = await broken_store.get_state()
+        assert state.voice_channel_id is None
+        assert state.text_channel_id is None
 
 
 # ── TTL management ────────────────────────────────────────────────────────────
@@ -354,29 +376,6 @@ class TestSetConnection:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.set_connection(1, 2)  # must not raise
-
-
-class TestGetConnection:
-    async def test_returns_channel_ids_when_set(
-        self, store: GuildRedisStore, fake_redis: Redis
-    ) -> None:
-        await fake_redis.hset(store.state_key(), b"voice_channel_id", b"111")
-        await fake_redis.hset(store.state_key(), b"text_channel_id", b"222")
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id == 111
-        assert tc_id == 222
-
-    async def test_returns_none_none_when_not_set(self, store: GuildRedisStore) -> None:
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
-
-    async def test_returns_none_none_on_error(
-        self, broken_store: GuildRedisStore
-    ) -> None:
-        vc_id, tc_id = await broken_store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
 
 
 class TestClearConnection:

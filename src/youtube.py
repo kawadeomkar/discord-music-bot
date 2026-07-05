@@ -3,7 +3,7 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, List, Optional, TypedDict, Union
 from urllib.parse import parse_qs, urlparse
 
 import discord
@@ -114,6 +114,40 @@ _STREAM_CACHE_FIELDS = frozenset(
 )
 
 
+class YTDLVideoInfo(TypedDict, total=False):
+    """The subset of yt-dlp's info-dict fields this codebase actually reads,
+    once `data` has been narrowed to a single video (see yt_source()'s
+    "entries" un-wrapping). `total=False` because yt-dlp's own dict is not a
+    stable, fully-populated contract — any field may be absent depending on
+    extractor/client. Mirrors _STREAM_CACHE_FIELDS field-for-field."""
+
+    url: str
+    webpage_url: str
+    title: str
+    uploader: str
+    uploader_url: str
+    upload_date: str
+    thumbnail: str
+    description: str
+    duration: int
+    tags: List[str]
+    view_count: int
+    like_count: int
+    dislike_count: int
+    abr: float
+    asr: int
+    acodec: str
+
+
+class YTDLFlatPlaylistEntry(TypedDict, total=False):
+    """One entry from a flat playlist listing (_YTDL_PLAYLIST_OPTS,
+    extract_flat=True) — a much sparser shape than YTDLVideoInfo."""
+
+    id: str
+    title: str
+    url: str
+
+
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """Returns seconds until stream URL expiry minus 30-min safety margin, or None if too short.
 
@@ -150,7 +184,7 @@ class QueueObject:
     persisted: bool = True
 
 
-def _enrich_queueobject(qo: QueueObject, data: Dict[str, Any]) -> None:
+def _enrich_queueobject(qo: QueueObject, data: YTDLVideoInfo) -> None:
     """Back-fill QueueObject fields that yt_source() couldn't populate.
 
     yt_source() uses _YTDL_SOURCE_OPTS (no format selection), which often
@@ -160,8 +194,9 @@ def _enrich_queueobject(qo: QueueObject, data: Dict[str, Any]) -> None:
     the complete data — this helper writes it back onto the same QueueObject
     instance so get_queue() sees the enriched values.
     """
-    if qo.duration is None and data.get("duration") is not None:
-        qo.duration = int(data["duration"])
+    fetched_duration = data.get("duration")
+    if qo.duration is None and fetched_duration is not None:
+        qo.duration = int(fetched_duration)
     if qo.uploader is None:
         qo.uploader = data.get("uploader")
     if qo.thumbnail is None:
@@ -179,7 +214,7 @@ class YTDL(discord.FFmpegOpusAudio):
         channel: discord.TextChannel,
         url: str,
         *,
-        data: Dict[str, Any],
+        data: YTDLVideoInfo,
         requester: Optional[Union[discord.User, discord.Member]] = None,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
@@ -459,6 +494,7 @@ class YTDL(discord.FFmpegOpusAudio):
         trace.get_current_span().set_attribute("ytdl.playlist_size", len(entries))
         qobjs: List[QueueObject] = []
         for i, entry in enumerate(entries):
+            entry: YTDLFlatPlaylistEntry = entry
             if not entry:
                 log.warning("Skipping null entry at playlist index %d for %s", i, url)
                 continue
