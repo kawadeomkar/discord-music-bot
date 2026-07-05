@@ -25,7 +25,16 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.telemetry import get_tracer
-from src.util import queue_message, send_queue_phrases, get_logger
+from src.util import (
+    cancel_task,
+    latency_color,
+    queue_message,
+    record_span_error,
+    send_embed,
+    send_queue_phrases,
+    trace_footer,
+    get_logger,
+)
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -50,16 +59,6 @@ def _check_voice_permissions(
     ):
         return f"Bot is already being used in channel {voice_client.channel}"
     return None
-
-
-def _latency_color(ms: float) -> int:
-    if ms <= 50:
-        return 0x44FF44
-    if ms <= 100:
-        return 0xFFD000
-    if ms <= 200:
-        return 0xFF6600
-    return 0x990000
 
 
 class MusicBot(commands.Cog):
@@ -118,26 +117,13 @@ class MusicBot(commands.Cog):
             # wake up and start the next song between voice_client.stop() and
             # the task cancellation. VoiceClient.disconnect() calls stop()
             # internally, so audio is silenced when we disconnect below.
-            if mp._prefetch_task and not mp._prefetch_task.done():
-                mp._prefetch_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._prefetch_task
-            if mp._progress_task and not mp._progress_task.done():
-                mp._progress_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._progress_task
-            if mp._pause_debounce_task and not mp._pause_debounce_task.done():
-                mp._pause_debounce_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._pause_debounce_task
-            if mp._player and not mp._player.done():
-                mp._player.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._player
-            if mp._restore_task and not mp._restore_task.done():
-                mp._restore_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mp._restore_task
+            await asyncio.gather(
+                cancel_task(mp._prefetch_task),
+                cancel_task(mp._progress_task),
+                cancel_task(mp._pause_debounce_task),
+                cancel_task(mp._player),
+                cancel_task(mp._restore_task),
+            )
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
             if mp._store is not None:
@@ -148,10 +134,7 @@ class MusicBot(commands.Cog):
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(
-                StatusCode.ERROR, f"{type(e).__name__}: {e}"
-            )
+            record_span_error(trace.get_current_span(), e)
             log.error(f"cleanup error: {type(e).__name__}: {e}", exc_info=True)
 
     async def cog_before_invoke(self, ctx: commands.Context):
@@ -244,17 +227,14 @@ class MusicBot(commands.Cog):
         title: str = "Command failed",
     ) -> None:
         span = trace.get_current_span()
-        span.record_exception(e)
-        span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-        span_ctx = span.get_span_context()
-        embed = discord.Embed(
-            title=title,
-            description=f"**{type(e).__name__}:** {e}",
-            color=discord.Color.red(),
+        record_span_error(span, e)
+        await send_embed(
+            ctx,
+            title,
+            f"**{type(e).__name__}:** {e}",
+            discord.Color.red(),
+            footer=trace_footer(span),
         )
-        if span_ctx.is_valid:
-            embed.set_footer(text=f"trace: {format(span_ctx.trace_id, '032x')}")
-        await ctx.send(embed=embed)
 
     @_tracer.start_as_current_span("bot.queue_source")
     async def queue_source(
@@ -299,13 +279,13 @@ class MusicBot(commands.Cog):
             titles: List[str] = qobj  # type: ignore[assignment]
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
-            embed = discord.Embed(
-                title="Queued playlist",
-                description=f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
-                color=discord.Color.blue(),
-            )
             await asyncio.gather(
-                ctx.send(embed=embed),
+                send_embed(
+                    ctx,
+                    "Queued playlist",
+                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    discord.Color.blue(),
+                ),
                 mp.queue_put(qobjs_yt, prefetch=False),
                 ctx.message.add_reaction("👍"),
                 send_queue_phrases(ctx),
@@ -318,16 +298,13 @@ class MusicBot(commands.Cog):
             tracks: List[QueueObject] = qobj  # type: ignore[assignment]
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
-            embed = discord.Embed(
-                title=f"Queued playlist — {count} song{'s' if count != 1 else ''}",
-                description=(
-                    f"Requested by: [{ctx.author.mention}]\n"
-                    f"{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}"
-                ),
-                color=discord.Color.blue(),
-            )
             await asyncio.gather(
-                ctx.send(embed=embed),
+                send_embed(
+                    ctx,
+                    f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    discord.Color.blue(),
+                ),
                 mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
                 ctx.message.add_reaction("👍"),
                 send_queue_phrases(ctx),
@@ -347,18 +324,19 @@ class MusicBot(commands.Cog):
             send_queue_phrases(ctx),
         ]
         if should_show_queued:
-            embed = discord.Embed(
-                title="Queued song",
-                description=(
-                    f"Requested by: [{ctx.author.mention}]\n"
-                    f"{qobj.title} - ({qobj.webpage_url})\n"
-                    f"Est. playing at {mp.estimated_playing_at()}"
-                ),
-                color=discord.Color.blue(),
+            coros.append(
+                send_embed(
+                    ctx,
+                    "Queued song",
+                    (
+                        f"Requested by: [{ctx.author.mention}]\n"
+                        f"{qobj.title} - ({qobj.webpage_url})\n"
+                        f"Est. playing at {mp.estimated_playing_at()}"
+                    ),
+                    discord.Color.blue(),
+                    thumbnail=qobj.thumbnail,
+                )
             )
-            if qobj.thumbnail:
-                embed.set_thumbnail(url=qobj.thumbnail)
-            coros.append(ctx.send(embed=embed))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
@@ -536,12 +514,11 @@ class MusicBot(commands.Cog):
             description = queue_message(cleared)
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
-                ctx.send(
-                    embed=discord.Embed(
-                        title=f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
-                        description=description,
-                        color=discord.Color.red(),
-                    )
+                send_embed(
+                    ctx,
+                    f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
+                    description,
+                    discord.Color.red(),
                 ),
             )
         except Exception as e:
@@ -564,26 +541,24 @@ class MusicBot(commands.Cog):
         mp = self.get_mp(ctx)
         positions = await mp.queue_remove(url)
         if not positions:
-            await ctx.send(
-                embed=discord.Embed(
-                    description=f"No queued songs found matching: <{url}>",
-                    color=discord.Color.red(),
-                )
+            await send_embed(
+                ctx, "", f"No queued songs found matching: <{url}>", discord.Color.red()
             )
             return
         count = len(positions)
         noun = "song" if count == 1 else "songs"
         pos_label = "Position" if count == 1 else "Positions"
         pos_str = ", ".join(str(p) for p in positions)
-        removal_embed = (
-            discord.Embed(
-                title=f"Removed {count} {noun} from the queue",
-                color=discord.Color.orange(),
-            )
-            .add_field(name="URL", value=f"<{url}>", inline=False)
-            .add_field(name=f"{pos_label} removed", value=pos_str, inline=False)
+        await send_embed(
+            ctx,
+            f"Removed {count} {noun} from the queue",
+            "",
+            discord.Color.orange(),
+            fields=[
+                ("URL", f"<{url}>", False),
+                (f"{pos_label} removed", pos_str, False),
+            ],
         )
-        await ctx.send(embed=removal_embed)
         await ctx.send(embed=mp.get_queue())
         await ctx.message.add_reaction("🗑️")
 
@@ -683,12 +658,12 @@ class MusicBot(commands.Cog):
     async def ping(self, ctx: commands.Context):
         try:
             ms = self.bot.latency * 1000
-            embed = discord.Embed(
-                title="Ping - latency in ms",
-                description=f"Ping: **{round(ms)}** milliseconds!",
+            await send_embed(
+                ctx,
+                "Ping - latency in ms",
+                f"Ping: **{round(ms)}** milliseconds!",
+                latency_color(ms),
             )
-            embed.color = _latency_color(ms)
-            await ctx.send(embed=embed)
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -702,12 +677,11 @@ class MusicBot(commands.Cog):
 
             if text_channel is not None:
                 try:
-                    await text_channel.send(
-                        embed=discord.Embed(
-                            title="No users remaining in voice channel",
-                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                            color=discord.Color.orange(),
-                        )
+                    await send_embed(
+                        text_channel,
+                        "No users remaining in voice channel",
+                        "All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                        discord.Color.orange(),
                     )
                 except Exception as e:
                     log.warning(
@@ -821,10 +795,7 @@ class MusicBot(commands.Cog):
                 f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
             )
         except Exception as e:
-            trace.get_current_span().record_exception(e)
-            trace.get_current_span().set_status(
-                StatusCode.ERROR, f"{type(e).__name__}: {e}"
-            )
+            record_span_error(trace.get_current_span(), e)
             log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
         finally:
             await store.release_recovery_lock()

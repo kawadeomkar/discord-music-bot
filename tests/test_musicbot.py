@@ -9,7 +9,8 @@ import fakeredis
 import pytest
 from discord.ext import commands
 
-from src.musicbot import MusicBot, _check_voice_permissions, _latency_color
+from src.musicbot import MusicBot, _check_voice_permissions
+from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
 from tests.helpers import make_mock_task, stub_create_task
@@ -75,25 +76,25 @@ class TestCheckVoicePermissions:
 
 class TestLatencyColor:
     def test_excellent_latency_is_green(self):
-        assert _latency_color(30) == 0x44FF44
+        assert latency_color(30).value == 0x44FF44
 
     def test_boundary_50ms_is_green(self):
-        assert _latency_color(50) == 0x44FF44
+        assert latency_color(50).value == 0x44FF44
 
     def test_good_latency_is_yellow(self):
-        assert _latency_color(75) == 0xFFD000
+        assert latency_color(75).value == 0xFFD000
 
     def test_boundary_100ms_is_yellow(self):
-        assert _latency_color(100) == 0xFFD000
+        assert latency_color(100).value == 0xFFD000
 
     def test_acceptable_latency_is_orange(self):
-        assert _latency_color(150) == 0xFF6600
+        assert latency_color(150).value == 0xFF6600
 
     def test_boundary_200ms_is_orange(self):
-        assert _latency_color(200) == 0xFF6600
+        assert latency_color(200).value == 0xFF6600
 
     def test_poor_latency_is_red(self):
-        assert _latency_color(300) == 0x990000
+        assert latency_color(300).value == 0x990000
 
 
 class TestQueueSource:
@@ -595,39 +596,24 @@ class TestVoiceStateConsistency:
 
 
 class TestMusicBotInit:
+    @pytest.fixture(autouse=True)
+    def _spotify_env(self, monkeypatch):
+        monkeypatch.setenv("SPOTIFY_CLIENT_ID", "x")
+        monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "y")
+
     def test_sets_bot_attribute(self, mock_bot):
-        with patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
-        ):
-            cog = MusicBot(mock_bot)
-        assert cog.bot is mock_bot
+        assert MusicBot(mock_bot).bot is mock_bot
 
     def test_mps_starts_empty(self, mock_bot):
-        with patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
-        ):
-            cog = MusicBot(mock_bot)
-        assert cog.mps == {}
+        assert MusicBot(mock_bot).mps == {}
 
     def test_alone_timers_starts_empty(self, mock_bot):
-        with patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
-        ):
-            cog = MusicBot(mock_bot)
-        assert cog._alone_timers == {}
+        assert MusicBot(mock_bot)._alone_timers == {}
 
     def test_reads_redis_from_bot(self, mock_bot):
         mock_redis = MagicMock()
         mock_bot.redis = mock_redis
-        with patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
-        ):
-            cog = MusicBot(mock_bot)
-        assert cog.redis is mock_redis
+        assert MusicBot(mock_bot).redis is mock_redis
 
 
 class TestGetMp:
@@ -1484,15 +1470,16 @@ class TestAloneCountdown:
 
 
 class TestSetup:
+    @pytest.fixture(autouse=True)
+    def _spotify_env(self, monkeypatch):
+        monkeypatch.setenv("SPOTIFY_CLIENT_ID", "x")
+        monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "y")
+
     async def test_adds_music_bot_cog(self):
         from src.musicbot import setup
 
         mock_bot = AsyncMock()
-        with patch.dict(
-            "os.environ",
-            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
-        ):
-            await setup(mock_bot)
+        await setup(mock_bot)
         mock_bot.add_cog.assert_awaited_once()
 
 
