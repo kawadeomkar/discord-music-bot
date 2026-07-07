@@ -126,11 +126,11 @@ class MusicBot(commands.Cog):
             )
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
-            if mp._store is not None:
+            if mp.store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
-                await mp._store.clear_connection()
-                await mp._store.refresh_ttl()
+                await mp.store.clear_connection()
+                await mp.store.refresh_ttl()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -167,12 +167,12 @@ class MusicBot(commands.Cog):
             if (
                 isinstance(ctx.channel, discord.TextChannel)
                 and old_channel != ctx.channel
-                and mp._store is not None
+                and mp.store is not None
                 and ctx.guild is not None
             ):
                 vc = ctx.guild.voice_client
                 if isinstance(vc, discord.VoiceClient) and vc.channel is not None:
-                    await mp._store.set_connection(vc.channel.id, ctx.channel.id)
+                    await mp.store.set_connection(vc.channel.id, ctx.channel.id)
         except Exception as e:
             # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
             self._active_spans.pop(id(ctx))
@@ -488,8 +488,8 @@ class MusicBot(commands.Cog):
             )
 
             mp = self.get_mp(ctx)
-            if mp._store is not None and isinstance(ctx.channel, discord.TextChannel):
-                await mp._store.set_connection(channel.id, ctx.channel.id)
+            if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):
+                await mp.store.set_connection(channel.id, ctx.channel.id)
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
@@ -647,7 +647,8 @@ class MusicBot(commands.Cog):
                 return await ctx.send("Volume must be between 0 and 100")
             mp = self.get_mp(ctx)
             mp.volume = volume / 100
-            await mp.redis_set_state("volume", str(mp.volume))
+            if mp.store is not None:
+                await mp.store.set_volume(mp.volume)
             await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
         except Exception as e:
             log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
@@ -749,7 +750,17 @@ class MusicBot(commands.Cog):
             )
             return
         try:
-            vc_id, tc_id = await store.get_connection()
+            guild_state = await store.get_guild_state()
+            if guild_state is None:
+                # Redis read failed — do NOT treat as "nothing to restore". Skip
+                # this attempt; the recovery lock expires in 60s and the next
+                # on_ready (session re-establishment) retries.
+                log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
+                return
+            # Equivalent to `not guild_state.has_active_connection`, spelled as
+            # explicit None checks so the channel IDs narrow to int below.
+            vc_id = guild_state.voice_channel_id
+            tc_id = guild_state.text_channel_id
             if vc_id is None or tc_id is None:
                 return
 
@@ -807,18 +818,18 @@ class MusicBot(commands.Cog):
                         )
                 return
 
-            # Check there is something to restore before connecting.
+            # Check there is something to restore before connecting. The state
+            # snapshot read above covers the crashed-song check — one HGETALL
+            # serves both this gate and the connection gate.
             queue_items = await store.get_queue()
-            state = await store.get_state()
-            has_crashed_song = bool(state.get(b"current_song_url", b""))
-            if not queue_items and not has_crashed_song:
+            if not queue_items and not guild_state.has_crashed_song:
                 return
 
             trace.get_current_span().set_attribute(
                 "restore.queue_count", len(queue_items)
             )
             trace.get_current_span().set_attribute(
-                "restore.crashed_song", has_crashed_song
+                "restore.crashed_song", guild_state.has_crashed_song
             )
 
             try:
