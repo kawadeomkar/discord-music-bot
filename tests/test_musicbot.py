@@ -819,9 +819,9 @@ class TestStopCommand:
 
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot, mock_ctx):
-        mp = MagicMock()
-        mp._store = None  # skip the channel-persistence branch
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_mp = MagicMock()
+        mock_mp._store = None  # skip the channel-persistence branch
+        music_bot.get_mp = MagicMock(return_value=mock_mp)
         await music_bot.cog_before_invoke(mock_ctx)
         music_bot.get_mp.assert_called_once_with(mock_ctx)
 
@@ -839,6 +839,7 @@ class TestCogBeforeInvoke:
         mp = MagicMock()
         mp._channel = old_channel
         mp._store = store
+        mp.redis_set_state = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -864,6 +865,7 @@ class TestCogBeforeInvoke:
         mp = MagicMock()
         mp._channel = channel  # same object → no change
         mp._store = store
+        mp.redis_set_state = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -885,6 +887,7 @@ class TestCogBeforeInvoke:
         mp = MagicMock()
         mp._channel = old_channel
         mp._store = store
+        mp.redis_set_state = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -945,22 +948,23 @@ class TestPauseCommand:
     async def test_pauses_when_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
-        vc.pause = MagicMock()
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
         mp = MagicMock()
+        mp.pause = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.pause.callback(music_bot, mock_ctx)
-        vc.pause.assert_called_once()
-        mp.mark_paused.assert_called_once()
+        mp.pause.assert_awaited_once_with(vc)
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
-        vc.pause = MagicMock()
         mock_ctx.voice_client = vc
+        mp = MagicMock()
+        mp.pause = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.pause.callback(music_bot, mock_ctx)
-        vc.pause.assert_not_called()
+        mp.pause.assert_not_awaited()
 
 
 class TestResumeCommand:
@@ -968,14 +972,24 @@ class TestResumeCommand:
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
-        vc.resume = MagicMock()
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
         mp = MagicMock()
+        mp.resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.resume.callback(music_bot, mock_ctx)
-        vc.resume.assert_called_once()
-        mp.mark_resumed.assert_called_once()
+        mp.resume.assert_awaited_once_with(vc)
+
+    async def test_noop_when_not_paused(self, music_bot, mock_ctx):
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=False)
+        mock_ctx.voice_client = vc
+        mp = MagicMock()
+        mp.resume = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.resume.callback(music_bot, mock_ctx)
+        mp.resume.assert_not_awaited()
 
 
 class TestVolumeCommand:
@@ -1277,9 +1291,42 @@ class TestNowCommand:
         mock_guild.voice_client = None
         mock_ctx.guild = mock_guild
         mp = MagicMock()
+        mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.now.callback(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_with("No songs are currently playing.")
+
+    async def test_now_reports_nothing_playing_after_song_ends(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        """After a song finishes, loop() nulls both current_song and
+        play_message — the recovery-snapshot elif must not serve the finished
+        song's embed as "Now playing"."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=False)
+        mock_guild.voice_client = vc
+        mock_ctx.guild = mock_guild
+        mp = MagicMock()
+        mp.current_song = None
+        mp.play_message = None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.now.callback(music_bot, mock_ctx)
+        mock_ctx.send.assert_awaited_with("No songs are currently playing.")
+
+    async def test_sends_restored_snapshot_during_recovery_window(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        """current_song isn't live yet (crash-recovery window), but a
+        now-playing snapshot survived the restart via play_message."""
+        mock_guild.voice_client = None
+        mock_ctx.guild = mock_guild
+        mp = MagicMock()
+        mp.current_song = None
+        mp.play_message = discord.Embed(title="Now Playing")
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.now.callback(music_bot, mock_ctx)
+        mock_ctx.send.assert_awaited_once_with(embed=mp.play_message)
 
 
 class TestOnReady:
@@ -1481,6 +1528,128 @@ class TestSetup:
         mock_bot = AsyncMock()
         await setup(mock_bot)
         mock_bot.add_cog.assert_awaited_once()
+
+
+# ── _restore_guild Gap 3: channel-deleted notification ────────────────────────
+
+
+class TestRestoreGuildChannelDeleted:
+    async def test_clears_connection_when_both_channels_deleted(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When both stored channels are gone, Redis state is cleared so the
+        guild is not retried on the next on_ready."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None  # both resolved to None
+        mock_guild.system_channel.send = AsyncMock()
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        vc_id, tc_id = await store.get_connection()
+        assert vc_id is None
+        assert tc_id is None
+
+    async def test_sends_notification_via_system_channel(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """Notification is sent via system_channel when both stored channels are deleted."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.send = AsyncMock()
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        mock_guild.system_channel.send.assert_awaited_once()
+        msg = mock_guild.system_channel.send.call_args[0][0]
+        assert "⚠️" in msg
+        assert "voice channel" in msg
+        assert "text channel" in msg
+        assert "were deleted" in msg
+
+    async def test_falls_back_to_text_channels_when_system_channel_no_perms(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When system_channel denies send_messages, falls back to guild.text_channels."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=False
+        )
+
+        fallback = MagicMock(spec=discord.TextChannel)
+        fallback.send = AsyncMock()
+        fallback.permissions_for = MagicMock(
+            return_value=discord.Permissions(send_messages=True)
+        )
+        mock_guild.text_channels = [fallback]
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        fallback.send.assert_awaited_once()
+        mock_guild.system_channel.send.assert_not_called()
+
+    async def test_notifies_via_text_channel_when_only_voice_deleted(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """When only the voice channel is gone, notify via the still-valid text channel."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        text_channel = MagicMock(spec=discord.TextChannel)
+        text_channel.send = AsyncMock()
+
+        def _get_channel(ch_id):
+            if ch_id == 888000000000000001:
+                return None  # voice deleted
+            return text_channel  # text still exists
+
+        mock_guild.get_channel.side_effect = _get_channel
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        text_channel.send.assert_awaited_once()
+        msg = text_channel.send.call_args[0][0]
+        assert "voice channel" in msg
+        assert "was deleted" in msg
+
+    async def test_swallows_notify_send_failure(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """A failure sending the notification must not propagate out of _restore_guild."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.send = AsyncMock(
+            side_effect=Exception("channel gone")
+        )
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
+
+        await music_bot_with_redis._restore_guild(mock_guild)  # must not raise
 
 
 # ── Queue command ─────────────────────────────────────────────────────────────

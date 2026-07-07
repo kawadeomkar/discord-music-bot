@@ -428,8 +428,7 @@ class MusicBot(commands.Cog):
         try:
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-                vc.pause()
-                self.get_mp(ctx).mark_paused()
+                await self.get_mp(ctx).pause(vc)
                 await ctx.message.add_reaction("⏸️")
         except Exception as e:
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
@@ -446,8 +445,7 @@ class MusicBot(commands.Cog):
                 and not vc.is_playing()
                 and vc.is_paused()
             ):
-                vc.resume()
-                self.get_mp(ctx).mark_resumed()
+                await self.get_mp(ctx).resume(vc)
                 await ctx.message.add_reaction("⏭️")
         except Exception as e:
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
@@ -579,6 +577,11 @@ class MusicBot(commands.Cog):
             ):
                 embed = mp._build_now_playing_embed(mp.current_song)
                 await ctx.send(embed=embed)
+            elif mp.play_message is not None:
+                # Crash-recovery window: current_song isn't live yet, but a
+                # now-playing snapshot survived the restart. Best-effort static
+                # embed (no live progress bar) until loop() starts real playback.
+                await ctx.send(embed=mp.play_message)
             else:
                 await ctx.send("No songs are currently playing.")
         except Exception as e:
@@ -752,9 +755,56 @@ class MusicBot(commands.Cog):
 
             voice_channel = guild.get_channel(vc_id)
             text_channel = guild.get_channel(tc_id)
-            if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
-                text_channel, discord.TextChannel
-            ):
+            voice_ok = isinstance(voice_channel, discord.VoiceChannel)
+            text_ok = isinstance(text_channel, discord.TextChannel)
+
+            if not voice_ok or not text_ok:
+                # Clear stale channel IDs so this guild is not re-attempted on every reconnect.
+                await store.clear_connection()
+                trace.get_current_span().set_attribute("restore.channel_missing", True)
+                log.warning(
+                    f"Recovery skipped for guild {guild.id}: "
+                    f"voice_channel_id={vc_id} (resolved={voice_ok}) "
+                    f"text_channel_id={tc_id} (resolved={text_ok})"
+                )
+
+                notify_channel: Optional[discord.TextChannel] = None
+                if text_ok:
+                    notify_channel = text_channel  # type: ignore[assignment]
+                elif guild.me is not None:
+                    if (
+                        guild.system_channel is not None
+                        and guild.system_channel.permissions_for(guild.me).send_messages
+                    ):
+                        notify_channel = guild.system_channel
+                    else:
+                        notify_channel = next(
+                            (
+                                ch
+                                for ch in guild.text_channels
+                                if ch.permissions_for(guild.me).send_messages
+                            ),
+                            None,
+                        )
+
+                if notify_channel is not None:
+                    deleted: List[str] = []
+                    if not voice_ok:
+                        deleted.append("voice channel")
+                    if not text_ok:
+                        deleted.append("text channel")
+                    what = " and ".join(deleted)
+                    verb = "was" if len(deleted) == 1 else "were"
+                    try:
+                        await notify_channel.send(
+                            f"⚠️ I came back online but the {what} I was playing in "
+                            f"{verb} deleted. Use `-play` in a voice channel to start fresh."
+                        )
+                    except Exception as notify_err:
+                        log.warning(
+                            f"Failed to send channel-deleted notification for "
+                            f"guild {guild.id}: {notify_err}"
+                        )
                 return
 
             # Check there is something to restore before connecting.
