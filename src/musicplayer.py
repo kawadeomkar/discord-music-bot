@@ -173,10 +173,10 @@ def _deserialize_queue_item(
         return None
 
 
-def _song_now_playing_snapshot(song: YTDL) -> dict[str, str]:
-    """String-field extraction from a live song for the Redis now_playing
-    snapshot — the fields _build_now_playing_embed_from_data() reads back
-    after a restart."""
+def _song_now_playing_fields(song: YTDL) -> dict[str, str]:
+    """Canonical string-field extraction from a live song — the single source
+    of truth for both the live embed and the Redis now_playing snapshot, so
+    the two can't drift out of sync."""
     return {
         "title": song.title or "",
         "webpage_url": song.webpage_url or "",
@@ -191,6 +191,36 @@ def _song_now_playing_snapshot(song: YTDL) -> dict[str, str]:
         "requester_id": str(song.requester.id) if song.requester else "",
         "requester_mention": _requester_mention(song.requester),
     }
+
+
+def _build_now_playing_base_embed(
+    *,
+    title: str,
+    description: str,
+    webpage_url: str,
+    duration: str,
+    uploader: str,
+    views: str,
+    likes: str,
+    abr: str,
+    asr: str,
+    acodec: str,
+    thumbnail: str,
+) -> discord.Embed:
+    """Shared field layout — used by both the live (YTDL-backed) and
+    Redis-recovery (bytes-backed) now-playing embed builders."""
+    embed = (
+        discord.Embed(title=title, description=description, color=discord.Color.green())
+        .add_field(name="Youtube link", value=webpage_url, inline=False)
+        .add_field(name="Duration", value=duration)
+        .add_field(name="Channel", value=uploader)
+        .add_field(name="Views", value=views)
+        .add_field(name="Likes", value=likes)
+        .set_footer(text=f"Avg Bitrate: {abr} | Avg Sampling: {asr} | Acodec: {acodec}")
+    )
+    if thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+    return embed
 
 
 class MusicPlayer:
@@ -816,22 +846,19 @@ class MusicPlayer:
             )
         lines.append(requester_line)
         description = "\n".join(lines)
-        return (
-            discord.Embed(
-                title=f"**Now playing:** {song.title}",
-                description=description,
-                color=discord.Color.green(),
-            )
-            .add_field(name="Youtube link", value=song.webpage_url, inline=False)
-            .add_field(name="Duration", value=song.duration)
-            .add_field(name="Channel", value=song.uploader)
-            .add_field(name="Views", value=str(song.views))
-            .add_field(name="Likes", value=str(song.likes))
-            .add_field(name="Dislikes", value=str(song.dislikes))
-            .set_thumbnail(url=song.thumbnail)
-            .set_footer(
-                text=f"Avg Bitrate: {song.abr} | Avg Sampling: {song.asr} | Acodec: {song.acodec}"
-            )
+        fields = _song_now_playing_fields(song)
+        return _build_now_playing_base_embed(
+            title=f"**Now playing:** {song.title}",
+            description=description,
+            webpage_url=fields["webpage_url"],
+            duration=fields["duration"],
+            uploader=fields["uploader"],
+            views=fields["view_count"],
+            likes=fields["like_count"],
+            abr=fields["abr"],
+            asr=fields["asr"],
+            acodec=fields["acodec"],
+            thumbnail=fields["thumbnail"],
         )
 
     @staticmethod
@@ -841,25 +868,19 @@ class MusicPlayer:
         def field(key: str) -> str:
             return data.get(key.encode(), b"").decode()
 
-        embed = (
-            discord.Embed(
-                title=f"**Now playing:** {field('title')}",
-                description=f"Requester: [{field('requester_mention')}]",
-                color=discord.Color.green(),
-            )
-            .add_field(name="Youtube link", value=field("webpage_url"), inline=False)
-            .add_field(name="Duration", value=field("duration"))
-            .add_field(name="Channel", value=field("uploader"))
-            .add_field(name="Views", value=field("view_count"))
-            .add_field(name="Likes", value=field("like_count"))
-            .set_footer(
-                text=f"Avg Bitrate: {field('abr')} | "
-                f"Avg Sampling: {field('asr')} | Acodec: {field('acodec')}"
-            )
+        return _build_now_playing_base_embed(
+            title=f"**Now playing:** {field('title')}",
+            description=f"Requester: [{field('requester_mention')}]",
+            webpage_url=field("webpage_url"),
+            duration=field("duration"),
+            uploader=field("uploader"),
+            views=field("view_count"),
+            likes=field("like_count"),
+            abr=field("abr"),
+            asr=field("asr"),
+            acodec=field("acodec"),
+            thumbnail=field("thumbnail"),
         )
-        if field("thumbnail"):
-            embed.set_thumbnail(url=field("thumbnail"))
-        return embed
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
         if not self.song_queue:
@@ -1283,7 +1304,7 @@ class MusicPlayer:
                         backdated_start = play_start - song.start_offset
                         dur = song.duration_secs or None
                         requester = song.requester
-                        np_fields = _song_now_playing_snapshot(song)
+                        np_fields = _song_now_playing_fields(song)
                         if should_pop_queue:
                             await self._store.pop_queue_and_start_song(
                                 url=song.webpage_url or "",

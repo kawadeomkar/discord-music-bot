@@ -879,6 +879,28 @@ class TestBuildNowPlayingEmbed:
         assert str(mock_song.abr) in embed.footer.text
         assert str(mock_song.acodec) in embed.footer.text
 
+    def test_embed_does_not_have_dislikes_field(self, music_player, mock_song):
+        embed = music_player._build_now_playing_embed(mock_song)
+        field_names = [f.name for f in embed.fields]
+        assert "Dislikes" not in field_names
+
+    def test_zero_views_and_likes_render_as_zero_not_blank(
+        self, music_player, mock_song
+    ):
+        """A legitimate 0 must render as "0", not collapse to an empty field
+        (the `str(x or "")` bug this shared extraction fixed)."""
+        mock_song.views = 0
+        mock_song.likes = 0
+        embed = music_player._build_now_playing_embed(mock_song)
+        fields_by_name = {f.name: f.value for f in embed.fields}
+        assert fields_by_name["Views"] == "0"
+        assert fields_by_name["Likes"] == "0"
+
+    def test_embed_thumbnail_not_set_when_none(self, music_player, mock_song):
+        mock_song.thumbnail = None
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert not embed.thumbnail.url
+
     def test_description_has_estimated_finish_when_duration_known(
         self, music_player, mock_song
     ):
@@ -2699,7 +2721,7 @@ class TestRestoreStateTtlRefresh:
 class TestLoop:
     @pytest.fixture
     def mock_song(self):
-        # Real (str/int/None) values for every field _song_now_playing_snapshot()
+        # Real (str/int/None) values for every field _song_now_playing_fields()
         # reads — loop() now serializes the song into the Redis start
         # transaction, and MagicMock attribute values are not HSET-able.
         song = MagicMock()
