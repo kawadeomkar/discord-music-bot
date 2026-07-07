@@ -21,7 +21,7 @@ async def send_queue_phrases(ctx: commands.Context):
         ]
         await ctx.send(f"{random.choice(phrases)}")
     elif ctx.message.author.name == "Bryan":
-        await ctx.send(f"terrible choice bryan, cringepilled taste beta simp")
+        await ctx.send("terrible choice bryan, cringepilled taste beta simp")
 
 
 def queue_message(songs: List[str]) -> str:

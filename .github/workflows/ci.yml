@@ -45,8 +45,14 @@ jobs:
           poetry config virtualenvs.in-project true
           poetry install --only=main,lint --no-root
 
-      - name: black --check
-        run: poetry run black --check src/ tests/ --target-version py314
+      - name: compile (syntax check)
+        run: poetry run python -m compileall src/
+
+      - name: ruff format --check
+        run: poetry run ruff format --check src/ tests/
+
+      - name: ruff check
+        run: poetry run ruff check src/ tests/
 
       - name: pyright
         run: poetry run pyright src/

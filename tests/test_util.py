@@ -3,8 +3,6 @@
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-import structlog
 
 from src.util import get_logger, queue_message, send_queue_phrases
 

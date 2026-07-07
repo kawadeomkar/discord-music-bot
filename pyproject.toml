@@ -35,11 +35,17 @@ pytest-cov = "^7.1.0"
 
 [tool.poetry.group.lint.dependencies]
 pyright = "^1.1.409"
-black = "^26.5.1"
+ruff = "^0.15.20"
 
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "basic"
+
+[tool.ruff]
+target-version = "py314"
+# Default lint rules (pyflakes F + a pycodestyle E subset) already cover unused
+# imports, undefined names, and import placement. ruff format is black-compatible
+# and replaces black as the formatter.
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

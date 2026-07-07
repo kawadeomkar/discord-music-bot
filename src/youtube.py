@@ -14,7 +14,6 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_get, cache_set
-from src.spotify import Spotify
 from src.telemetry import get_tracer
 from src.util import get_logger
 

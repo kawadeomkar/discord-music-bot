@@ -10,7 +10,9 @@ fi
 export ENVIRONMENT
 
 poetry install --only=main,lint --no-root
-poetry run python -m black src/ tests/ --target-version py313
+poetry run python -m compileall src/
+poetry run ruff format src/ tests/
+poetry run ruff check src/ tests/
 
 export GIT_SHA="$(git rev-parse HEAD)"
 BUILD_TAG="discord-music-bot:$GIT_SHA"
