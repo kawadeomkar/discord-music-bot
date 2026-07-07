@@ -511,6 +511,40 @@ class TestYTStream:
 
         assert "-ss 90" in captured_options["options"]
 
+    async def test_yt_stream_carries_ts_as_start_offset(self, mock_ctx):
+        """QueueObject.ts must survive onto the YTDL object — loop() backdates
+        play_start_epoch by it so crash recovery resumes at the true position."""
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
+        )
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            result = await YTDL.yt_stream(qobj, channel)
+
+        assert result.start_offset == 90
+
+    async def test_yt_stream_start_offset_zero_without_ts(self, mock_ctx):
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author
+        )
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            result = await YTDL.yt_stream(qobj, channel)
+
+        assert result.start_offset == 0
+
 
 class TestStreamUrlTtl:
     def test_returns_seconds_minus_margin(self):

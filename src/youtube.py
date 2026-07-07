@@ -181,6 +181,7 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         data: dict,
         requester=None,
+        start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
     ):
@@ -190,6 +191,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
         self.requester = requester
         self.channel = channel
+        # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
+        self.start_offset: int = start_offset
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -331,6 +334,7 @@ class YTDL(discord.FFmpegOpusAudio):
             data["url"],
             data=data,
             requester=qo.requester,
+            start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
         )

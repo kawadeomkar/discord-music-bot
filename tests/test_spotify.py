@@ -65,6 +65,78 @@ class TestSpotifyRefreshToken:
         await spotify._refresh_token()
         assert spotify.token_expiry > time.time()
 
+    async def test_refresh_token_uses_redis_cache_on_hit(self, spotify, fake_redis):
+        """When Redis holds a valid token, _refresh_token returns it without calling the API."""
+        await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
+
+        factory_calls: list = []
+        spotify._session_factory = lambda **kw: factory_calls.append(1)  # type: ignore[func-returns-value]
+
+        await spotify._refresh_token()
+
+        assert spotify.auth_token == "cached_bearer_token"
+        assert factory_calls == []  # session factory never called
+
+    async def test_refresh_token_sets_expiry_from_real_ttl(self, spotify, fake_redis):
+        """token_expiry should reflect the key's actual remaining TTL, not a flat guess."""
+        await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
+
+        before = time.time()
+        await spotify._refresh_token()
+
+        assert 115 <= spotify.token_expiry - before <= 121
+
+    async def test_refresh_token_falls_through_on_expired_key(
+        self, spotify, fake_redis, mock_auth_response
+    ):
+        """A cached key with no remaining TTL (already expired but not yet
+        evicted) must not be trusted — fall through to a fresh HTTP fetch."""
+        await fake_redis.set("spotify:auth:token", b"stale_bearer_token")
+        await fake_redis.persist("spotify:auth:token")  # ensure no TTL is set
+
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        mock_session = _make_mock_session(mock_resp)
+        spotify._session_factory = lambda **kw: mock_session
+
+        await spotify._refresh_token()
+
+        assert spotify.auth_token == "test_access_token_xyz"
+
+    async def test_refresh_token_writes_to_redis_on_api_call(
+        self, spotify, fake_redis, mock_auth_response
+    ):
+        """On a Redis cache miss, _refresh_token fetches from Spotify and writes to Redis."""
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        mock_session = _make_mock_session(mock_resp)
+        spotify._session_factory = lambda **kw: mock_session
+
+        await spotify._refresh_token()
+
+        stored = await fake_redis.get("spotify:auth:token")
+        assert stored == b"test_access_token_xyz"
+
+    async def test_refresh_token_without_redis_calls_api(self, mock_auth_response):
+        """Spotify instance with redis=None always calls the Spotify API."""
+        from src.spotify import Spotify
+
+        with patch.dict(
+            "os.environ",
+            {"SPOTIFY_CLIENT_ID": "x", "SPOTIFY_CLIENT_SECRET": "y"},
+        ):
+            sp = Spotify(redis=None)
+
+        mock_resp = AsyncMock()
+        mock_resp.json = AsyncMock(return_value=mock_auth_response)
+        mock_session = _make_mock_session(mock_resp)
+        sp._session_factory = lambda **kw: mock_session
+
+        await sp._refresh_token()
+
+        assert sp.auth_token == "test_access_token_xyz"
+        mock_session.post.assert_awaited_once()
+
     def test_str_returns_auth_token(self, spotify):
         spotify.auth_token = "my_token"
         assert str(spotify) == "my_token"
@@ -176,6 +248,8 @@ class TestSpotifyPlaylist:
 class TestSpotifyHttpCall:
 
     async def test_http_call_raises_on_non_200(self, spotify):
+        spotify.auth_token = "prefetched_token"
+        spotify.token_expiry = time.time() + 3600  # skip _refresh_token
         mock_response = AsyncMock()
         mock_response.status = 404
         mock_session = _make_mock_session(mock_response)
