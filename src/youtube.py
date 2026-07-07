@@ -127,7 +127,7 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
         expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
         ttl = expire - int(time.time()) - 1800
         return ttl if ttl > 60 else None
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         return None
 
 
