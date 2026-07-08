@@ -567,21 +567,21 @@ class TestQueueRemove:
 class TestGetQueue:
     def test_returns_discord_embed(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        result = music_player.get_queue()
+        result = music_player.queue_embed()
         assert isinstance(result, discord.Embed)
 
     def test_embed_title_is_queue(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.title == "Queue"
 
     def test_embed_color_is_blue(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.colour == discord.Color.blue()
 
     def test_empty_queue_description(self, music_player):
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Songs: **0**" in embed.description
         assert "*The queue is empty.*" in embed.description
 
@@ -592,7 +592,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=120
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Songs: **3**" in embed.description
 
     def test_total_duration_in_header_when_all_known(self, music_player, mock_author):
@@ -602,7 +602,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=90)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Total Duration: **3m**" in embed.description
         assert "~" not in embed.description.split("Total Duration:")[1].split("\n")[0]
 
@@ -613,7 +613,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=None)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~" in embed.description
 
     def test_total_duration_partial_with_ytsource(self, music_player, mock_author):
@@ -623,36 +623,36 @@ class TestGetQueue:
         music_player.queue._display.append(
             YTSource(ytsearch="ytsearch:unresolved", process=True)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~" in embed.description
 
     def test_song_title_appears_in_description(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Test Song" in embed.description
 
     def test_song_duration_appears_when_known(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "`3:30`" in embed.description
 
     def test_song_duration_unknown_shows_placeholder(
         self, music_player, queue_obj_no_meta
     ):
         music_player.queue._display.append(queue_obj_no_meta)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "`?:??`" in embed.description
 
     def test_uploader_shown_when_known(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Test Channel" in embed.description
 
     def test_unknown_channel_shown_when_uploader_none(
         self, music_player, queue_obj_no_meta
     ):
         music_player.queue._display.append(queue_obj_no_meta)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Unknown channel" in embed.description
 
     def test_est_playing_at_present_for_each_song(self, music_player, mock_author):
@@ -662,7 +662,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.description.count("Est. playing at") == 3
 
     def test_uncertain_prefix_after_no_duration_song(self, music_player, mock_author):
@@ -672,7 +672,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         # First song: no preceding unknown → no ~
         # Second song: preceding song had unknown duration → ~
         lines = embed.description.split("\n")
@@ -689,7 +689,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~**" in embed.description
 
     def test_caps_display_at_ten_songs(self, music_player, mock_author):
@@ -699,7 +699,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.description.count("Est. playing at") == 10
 
     def test_shows_more_indicator_when_over_ten(self, music_player, mock_author):
@@ -709,14 +709,14 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "... and 5 more" in embed.description
 
     def test_ytsource_shows_resolving(self, music_player):
         music_player.queue._display.append(
             YTSource(ytsearch="ytsearch:some song", process=True)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "resolving..." in embed.description
 
 
@@ -760,7 +760,7 @@ class TestEstimatedPlayingAt:
 
     def test_matches_last_queue_line_eta(self, music_player, mock_song, mock_author):
         """estimated_playing_at() should reflect the same seed used by
-        get_queue()/_build_next_up_embed() for consistency across embeds."""
+        queue_embed()/_build_next_up_embed() for consistency across embeds."""
         music_player.current_song = mock_song
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)

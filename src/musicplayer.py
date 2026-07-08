@@ -30,7 +30,7 @@ from src.youtube import YTDL, QueueObject
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-# ETAs in get_queue() are rendered in Pacific time. This is intentional for a
+# ETAs in queue_embed() are rendered in Pacific time. This is intentional for a
 # single-operator bot — update to a per-guild config if multi-tenant support is added.
 _PST = ZoneInfo("America/Los_Angeles")
 
@@ -318,7 +318,7 @@ class MusicPlayer:
     def estimated_playing_at(self) -> str:
         """ETA text for a song appended to the queue right now — i.e. after the
         current song and everything already queued. Reuses the same ETA-walking
-        seed as get_queue()/_build_next_up_embed() so all three stay consistent.
+        seed as queue_embed()/_build_next_up_embed() so all three stay consistent.
         """
         now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
         for item in self.queue.display_items():
@@ -329,7 +329,7 @@ class MusicPlayer:
         est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
         return _fmt_eta(est_dt, uncertain)
 
-    def get_queue(self) -> discord.Embed:
+    def queue_embed(self) -> discord.Embed:
         items = self.queue.display_items()
         total = len(items)
 
@@ -993,17 +993,17 @@ class MusicPlayer:
                             # branch below does, then let the outer handler's
                             # logging/error-embed path run via the re-raise.
                             if source is not None:
-                                self.queue.pop_display_head("resolve failure")
-                                await self.queue.redis_pop_for(source)
-                                self.queue.task_done()
+                                await self.queue.finish_failed_dequeue(
+                                    source, context="resolve failure"
+                                )
                             raise
                         self.current_song = await self._stream_source(source)
                         should_pop_queue = getattr(source, "persisted", True)
 
                     if self.current_song is None:
-                        self.queue.pop_display_head("failed-song pop")
-                        await self.queue.redis_pop_for(source)
-                        self.queue.task_done()
+                        await self.queue.finish_failed_dequeue(
+                            source, context="failed-song pop"
+                        )
                         try:
                             await self._channel.send(
                                 "Failed to load the next song, skipping."
@@ -1016,19 +1016,15 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    discard = False
-                    async with self.queue.mutex:
-                        if not self.queue.try_pop_display_head():
-                            # The queue was cleared while this song was being resolved
-                            # (e.g. during the async yt_stream call). Discard without
-                            # playing; task_done() balances the queue.get() above.
-                            # cleanup() terminates the FFmpeg subprocess that yt_stream
-                            # already spawned — omitting it would leak the process.
-                            self.queue.task_done()
-                            self.current_song.cleanup()
-                            self.current_song = None
-                            discard = True
-                    if discard:
+                    if not await self.queue.try_commit_dequeue():
+                        # The queue was cleared while this song was being resolved
+                        # (e.g. during the async yt_stream call). Discard without
+                        # playing; task_done() balances the queue.get() above.
+                        # cleanup() terminates the FFmpeg subprocess that yt_stream
+                        # already spawned — omitting it would leak the process.
+                        self.queue.task_done()
+                        self.current_song.cleanup()
+                        self.current_song = None
                         continue
 
                     vc = self._guild.voice_client

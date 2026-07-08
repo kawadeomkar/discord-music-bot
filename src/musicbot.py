@@ -557,7 +557,7 @@ class MusicBot(commands.Cog):
                 (f"{pos_label} removed", pos_str, False),
             ],
         )
-        await ctx.send(embed=mp.get_queue())
+        await ctx.send(embed=mp.queue_embed())
         await ctx.message.add_reaction("🗑️")
 
     @commands.command(
@@ -623,7 +623,7 @@ class MusicBot(commands.Cog):
     async def queue(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            await ctx.send(embed=mp.get_queue())
+            await ctx.send(embed=mp.queue_embed())
         except Exception as e:
             log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)

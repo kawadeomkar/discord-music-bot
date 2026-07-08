@@ -410,13 +410,47 @@ class TestDequeueBookkeeping:
         assert gq.try_pop_display_head() is True
         assert gq.display_items() == []
 
-    async def test_mutex_is_the_bulk_mutation_lock(self, gq, mock_author):
-        """A held mutex blocks clear() until released — the discard-race
-        guard and the bulk ops really do share one lock."""
+    async def test_commit_dequeue_shares_the_bulk_mutation_lock(self, gq, mock_author):
+        """try_commit_dequeue() and the bulk ops really do serialize on one
+        lock — a held lock blocks clear() until released. (Whitebox: the lock
+        is deliberately not part of the public API since Phase 5.)"""
         await gq.put([_qobj(1, mock_author)])
-        async with gq.mutex:
+        async with gq._mutex:
             clear_task = asyncio.create_task(gq.clear())
             await asyncio.sleep(0)
-            assert not clear_task.done()  # blocked on the mutex we hold
+            assert not clear_task.done()  # blocked on the lock we hold
         cleared = await clear_task
         assert len(cleared) == 1
+
+    async def test_finish_failed_dequeue_triplet(
+        self, gq, fake_redis, store, mock_author
+    ):
+        """One call retires a failed dequeue on all three legs: display head
+        popped, Redis LPOPed, task_done balanced."""
+        item = _qobj(1, mock_author)
+        await gq.put([item])
+        _ = await gq.get()  # the loop dequeued it
+        await gq.finish_failed_dequeue(item)
+        assert gq.display_items() == []
+        assert await fake_redis.exists(store.queue_key()) == 0
+        assert gq._pending._unfinished_tasks == 0
+
+    async def test_finish_failed_dequeue_skips_redis_for_unpersisted(
+        self, gq, fake_redis, store, mock_author
+    ):
+        await gq.put([_qobj(1, mock_author)])  # the real, persisted entry
+        crashed = _qobj(99, mock_author, persisted=False)
+        await gq._pending.put(crashed)
+        gq._display.append(crashed)
+        _ = await gq.get()
+        await gq.finish_failed_dequeue(crashed)
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert len(redis_items) == 1  # persisted entry untouched
+
+    async def test_try_commit_dequeue_true_then_false_after_clear(
+        self, gq, mock_author
+    ):
+        await gq.put([_qobj(1, mock_author)])
+        assert await gq.try_commit_dequeue() is True
+        await gq.clear()
+        assert await gq.try_commit_dequeue() is False

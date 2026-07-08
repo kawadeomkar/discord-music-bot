@@ -94,14 +94,6 @@ class GuildQueue:
     def qsize(self) -> int:
         return self._pending.qsize()
 
-    @property
-    def mutex(self) -> asyncio.Lock:
-        """The bulk-mutation lock. Exposed for the playback loop's
-        cleared-while-resolving discard race (it must pair a display-head pop
-        with playback-side cleanup under the same lock the bulk mutations
-        hold). Everything else should use the named operations."""
-        return self._mutex
-
     def consume_cleared_flag(self) -> bool:
         """Read-and-reset the queue-was-cleared flag.
 
@@ -315,13 +307,37 @@ class GuildQueue:
     def try_pop_display_head(self) -> bool:
         """Pop the display head for a song about to play. Returns False when
         the display is empty — meaning the queue was cleared while the song
-        was resolving, and the caller must discard it. Call under `mutex` so
-        the check cannot race a concurrent clear()/shuffle()."""
+        was resolving, and the caller must discard it. Use try_commit_dequeue()
+        unless already holding the bulk-mutation lock — the check must not
+        race a concurrent clear()/shuffle()."""
         try:
             self._display.popleft()
             return True
         except IndexError:
             return False
+
+    async def finish_failed_dequeue(
+        self, item: Optional[QueueItem], *, context: str = "dequeue"
+    ) -> None:
+        """Retire one dequeued item that will never play (stream returned
+        nothing / resolve raised): drop the display head, mirror the dequeue
+        to Redis, and balance the get() with task_done() — the triplet the
+        playback loop's failure paths share. `context` labels the
+        empty-display warning."""
+        self.pop_display_head(context)
+        await self.redis_pop_for(item)
+        self._pending.task_done()
+
+    async def try_commit_dequeue(self) -> bool:
+        """Commit the display-side dequeue for a song about to play.
+
+        Takes the bulk-mutation lock so the emptiness check cannot race a
+        concurrent clear()/shuffle(). Returns False when the display is empty
+        — the queue was cleared while the song was resolving — in which case
+        the caller discards the song (its task_done() and FFmpeg cleanup are
+        playback concerns and stay caller-side)."""
+        async with self._mutex:
+            return self.try_pop_display_head()
 
     async def redis_pop_for(self, item: Optional[QueueItem]) -> None:
         """Mirror one in-memory dequeue to Redis via LPOP — unless the item
