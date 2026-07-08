@@ -207,21 +207,6 @@ class TestPopQueue:
         await broken_store.pop_queue()  # must not raise
 
 
-class TestGetQueue:
-    async def test_returns_all_items_oldest_first(self, store, fake_redis):
-        await fake_redis.rpush(store.queue_key(), b"a", b"b", b"c")
-        items = await store.get_queue()
-        assert items == [b"a", b"b", b"c"]
-
-    async def test_returns_empty_list_when_key_missing(self, store):
-        items = await store.get_queue()
-        assert items == []
-
-    async def test_returns_empty_list_on_error(self, broken_store):
-        result = await broken_store.get_queue()
-        assert result == []
-
-
 class TestDeleteQueue:
     async def test_deletes_queue_key(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"x")

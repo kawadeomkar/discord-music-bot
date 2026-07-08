@@ -1545,14 +1545,15 @@ class TestRestoreGuildStateReadFailed:
     async def test_recovery_skipped_when_state_read_fails(
         self, music_bot_with_redis, mock_guild, fake_redis_bot, caplog
     ):
-        """get_guild_state() returning None (Redis unavailable) must NOT be
-        treated as "nothing to restore": recovery is skipped with a warning and
-        no channel resolution or player creation is attempted. Distinguishable
-        from the empty-snapshot case, which also skips but silently."""
+        """get_playback_snapshot() returning None (Redis unavailable) must NOT
+        be treated as "nothing to restore": recovery is skipped with a warning
+        and no channel resolution or player creation is attempted.
+        Distinguishable from the empty-snapshot case, which also skips but
+        silently."""
         from src.redis_client import GuildRedisStore
 
         with patch.object(
-            GuildRedisStore, "get_guild_state", new=AsyncMock(return_value=None)
+            GuildRedisStore, "get_playback_snapshot", new=AsyncMock(return_value=None)
         ):
             with caplog.at_level("WARNING", logger="src.musicbot"):
                 await music_bot_with_redis._restore_guild(mock_guild)

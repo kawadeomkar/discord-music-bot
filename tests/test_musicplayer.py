@@ -1583,12 +1583,12 @@ class TestRestoreCompleteLoopGuard:
         assert music_player._restore_complete.is_set()
 
     async def test_restore_state_sets_restore_complete_on_failure(self, music_player):
-        # get_guild_state() swallows Redis errors and returns None, so the
-        # failure path here is the None early-return, not an exception.
+        # get_playback_snapshot() swallows Redis errors and returns None, so
+        # the failure path here is the None early-return, not an exception.
         music_player._restore_complete.clear()
         with patch.object(
             music_player.store,
-            "get_guild_state",
+            "get_playback_snapshot",
             new=AsyncMock(return_value=None),
         ):
             await music_player._restore_state()
@@ -3062,33 +3062,36 @@ class TestRestoreCompleteEvent:
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
             music_player.store,
-            "get_guild_state",
+            "get_playback_snapshot",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
 
     async def test_set_and_restore_aborted_when_state_read_fails(self, music_player):
-        """get_guild_state() returning None (Redis unavailable) aborts the
-        restore early — no queue restore is attempted — but the loop guard
-        event is still set."""
+        """get_playback_snapshot() returning None (Redis unavailable) aborts
+        the restore early — no history/now-playing reads are attempted — but
+        the loop guard event is still set."""
         music_player.bot.wait_until_ready = AsyncMock()
-        get_queue_spy = AsyncMock(wraps=music_player.store.get_queue)
+        get_history_spy = AsyncMock(wraps=music_player.store.get_history)
         with (
             patch.object(
-                music_player.store, "get_guild_state", new=AsyncMock(return_value=None)
+                music_player.store,
+                "get_playback_snapshot",
+                new=AsyncMock(return_value=None),
             ),
-            patch.object(music_player.store, "get_queue", get_queue_spy),
+            patch.object(music_player.store, "get_history", get_history_spy),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
-        get_queue_spy.assert_not_awaited()
+        assert music_player.queue.qsize() == 0
+        get_history_spy.assert_not_awaited()
 
-    async def test_set_even_when_queue_restore_fails(self, music_player):
+    async def test_set_even_when_history_read_fails(self, music_player):
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
             music_player.store,
-            "get_queue",
+            "get_history",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
             await music_player._restore_state()

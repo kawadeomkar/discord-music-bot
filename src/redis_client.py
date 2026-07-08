@@ -312,14 +312,6 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_current_song_state failed: {e}")
 
-    async def get_queue(self) -> list[bytes]:
-        """Return all queued items oldest-first."""
-        try:
-            return await self.redis.lrange(self.queue_key(), 0, -1)  # type: ignore[misc]
-        except Exception as e:
-            log.warning(f"[guild:{self.guild_id}] Redis get_queue failed: {e}")
-            return []
-
     async def delete_queue(self) -> None:
         """DELETE the queue key."""
         try:
