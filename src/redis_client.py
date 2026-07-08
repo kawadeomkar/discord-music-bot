@@ -1,10 +1,18 @@
 import os
+from collections.abc import Sequence
 from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
 
-from src.guild_state import GuildStateData, NowPlayingData, StateField
+from src.guild_state import (
+    GuildPlaybackSnapshot,
+    GuildStateData,
+    NowPlayingData,
+    QueueEntry,
+    StateField,
+    parse_queue_entry,
+)
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -183,23 +191,23 @@ class GuildRedisStore:
 
     # Queue operations
 
-    async def push_queue(self, data: bytes) -> None:
-        """RPUSH one serialized item and refresh TTL on all guild keys."""
+    async def push_queue(self, entry: QueueEntry) -> None:
+        """RPUSH one queue entry and refresh TTL on all guild keys."""
         try:
             pipe = self.redis.pipeline()
-            pipe.rpush(self.queue_key(), data)
+            pipe.rpush(self.queue_key(), entry.to_redis())
             self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
 
-    async def push_queue_batch(self, items: list[bytes]) -> None:
-        """RPUSH all items in one pipeline round-trip and refresh TTL on all guild keys."""
-        if not items:
+    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> None:
+        """RPUSH all entries in one pipeline round-trip and refresh TTL on all guild keys."""
+        if not entries:
             return
         try:
             pipe = self.redis.pipeline()
-            pipe.rpush(self.queue_key(), *items)
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
@@ -319,12 +327,12 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis delete_queue failed: {e}")
 
-    async def rebuild_queue(self, items: list[bytes]) -> None:
-        """Atomically DELETE + RPUSH all items. Uses MULTI/EXEC to avoid empty-window race."""
+    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> None:
+        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race."""
         try:
             pipe = self.redis.pipeline(transaction=True)
             pipe.delete(self.queue_key())
-            pipe.rpush(self.queue_key(), *items)
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             pipe.expire(self.queue_key(), GUILD_TTL)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
@@ -461,6 +469,36 @@ class GuildRedisStore:
             return GuildStateData.from_redis(raw)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] get_guild_state failed: {e}")
+            return None
+
+    async def get_playback_snapshot(self) -> Optional[GuildPlaybackSnapshot]:
+        """HGETALL the state hash and LRANGE the queue in one pipeline
+        round-trip, returning the typed playback aggregate.
+
+        Returns None when the read failed (same error-vs-empty contract as
+        get_guild_state: an empty guild yields a snapshot with zero-value
+        state and an empty queue, never None). Corrupt queue entries are
+        dropped with a warning by parse_queue_entry.
+
+        Not MULTI: the two reads are not atomic relative to a concurrent
+        writer, which matches the previous back-to-back reads exactly —
+        recovery holds the guild recovery lock during the window that matters.
+        """
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hgetall(self.state_key())
+            pipe.lrange(self.queue_key(), 0, -1)
+            raw_state, raw_queue = await pipe.execute()
+            entries = tuple(
+                entry
+                for entry in (parse_queue_entry(item) for item in raw_queue)
+                if entry is not None
+            )
+            return GuildPlaybackSnapshot(
+                state=GuildStateData.from_redis(raw_state), queue=entries
+            )
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] get_playback_snapshot failed: {e}")
             return None
 
     async def set_volume(self, volume: float) -> None:

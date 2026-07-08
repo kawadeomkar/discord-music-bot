@@ -14,7 +14,12 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.guild_state import NowPlayingData
+from src.guild_state import (
+    NowPlayingData,
+    QueueEntry,
+    SearchQueueEntry,
+    SongQueueEntry,
+)
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -113,31 +118,13 @@ def _fmt_finish_time(duration_secs: int) -> str:
     return _fmt_clock_time(finish_dt)
 
 
-def _serialize_queue_item(item: Union[QueueObject, YTSource]) -> bytes:
+def _to_queue_entry(item: Union[QueueObject, YTSource]) -> QueueEntry:
+    """Live queue item → at-rest entry for the Redis mirror. (Interim home:
+    moves into GuildQueue with the rest of the queue logic in Phase 4 of
+    docs/GUILD_QUEUE_SCHEMA_PLAN.md.)"""
     if isinstance(item, QueueObject):
-        return orjson.dumps(
-            {
-                "type": "qobj",
-                "webpage_url": item.webpage_url,
-                "title": item.title,
-                "requester_id": item.requester.id,
-                "ts": item.ts,
-                "user_input": item.user_input,
-                "duration": item.duration,
-                "uploader": item.uploader,
-                "thumbnail": item.thumbnail,
-                "persisted": item.persisted,
-            }
-        )
-    return orjson.dumps(
-        {
-            "type": "ytsource",
-            "ytsearch": item.ytsearch,
-            "url": item.url,
-            "process": item.process,
-            "ts": item.ts,
-        }
-    )
+        return SongQueueEntry.from_queue_object(item)
+    return SearchQueueEntry.from_ytsource(item)
 
 
 def _deserialize_queue_item(
@@ -635,14 +622,14 @@ class MusicPlayer:
             return
         if prefetch:
             for item in serializable:
-                await self.store.push_queue(_serialize_queue_item(item))
+                await self.store.push_queue(_to_queue_entry(item))
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
         else:
             await self.store.push_queue_batch(
-                [_serialize_queue_item(item) for item in serializable]
+                [_to_queue_entry(item) for item in serializable]
             )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
@@ -728,14 +715,14 @@ class MusicPlayer:
         if self.store is not None and kept_after_shuffle:
             # persisted=False items (the crash-recovered "current song") were
             # never RPUSHed to Redis's queue list — never write them back in.
-            serialized = [
-                _serialize_queue_item(s)
+            entries = [
+                _to_queue_entry(s)
                 for s in kept_after_shuffle
                 if isinstance(s, (QueueObject, YTSource))
                 and getattr(s, "persisted", True)
             ]
-            if serialized:
-                await self.store.rebuild_queue(serialized)
+            if entries:
+                await self.store.rebuild_queue(entries)
 
         return "Shuffled!"
 
@@ -776,14 +763,14 @@ class MusicPlayer:
         if removed_positions and self.store is not None:
             # persisted=False items (the crash-recovered "current song") were
             # never RPUSHed to Redis's queue list — never write them back in.
-            serialized = [
-                _serialize_queue_item(s)
+            entries = [
+                _to_queue_entry(s)
                 for s in kept
                 if isinstance(s, (QueueObject, YTSource))
                 and getattr(s, "persisted", True)
             ]
-            if serialized:
-                await self.store.rebuild_queue(serialized)
+            if entries:
+                await self.store.rebuild_queue(entries)
             else:
                 await self.store.delete_queue()
 
