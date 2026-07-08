@@ -6,7 +6,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.guild_state import GuildStateData, NowPlayingData
+from src.guild_state import (
+    GuildPlaybackSnapshot,
+    GuildStateData,
+    NowPlayingData,
+    SearchQueueEntry,
+    SongQueueEntry,
+    parse_queue_entry,
+)
 
 
 def _full_state_hash() -> dict[bytes, bytes]:
@@ -271,3 +278,200 @@ class TestNowPlayingDataImmutability:
         data = NowPlayingData()
         with pytest.raises(dataclasses.FrozenInstanceError):
             data.title = "x"  # type: ignore[misc]
+
+
+# ── Queue-entry value objects ─────────────────────────────────────────────────
+
+# Golden wire fixtures — byte literals captured from the original
+# _serialize_queue_item() output on the pre-migration code. These pin the wire
+# format in both directions so a rolling restart can mix old and new writers.
+
+_GOLDEN_QOBJ_FULL = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
+_GOLDEN_QOBJ_BARE = b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true}'
+_GOLDEN_QOBJ_UNPERSISTED = b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false}'
+_GOLDEN_YTSOURCE = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
+_GOLDEN_LEGACY_NO_TYPE = (
+    b'{"webpage_url":"https://yt.com/v=3","title":"Legacy","requester_id":7,"ts":null}'
+)
+
+_FULL_ENTRY = SongQueueEntry(
+    webpage_url="https://yt.com/v=1",
+    title="Golden Song",
+    requester_id=222222222222222222,
+    ts=30,
+    user_input="golden song",
+    duration=240,
+    uploader="Golden Channel",
+    thumbnail="https://img.yt/1.jpg",
+)
+
+
+class TestSongQueueEntryWire:
+    def test_writer_matches_golden_bytes(self):
+        assert _FULL_ENTRY.to_redis() == _GOLDEN_QOBJ_FULL
+
+    def test_writer_matches_golden_bytes_nulls(self):
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=2", title="Bare", requester_id=42
+        )
+        assert entry.to_redis() == _GOLDEN_QOBJ_BARE
+
+    def test_writer_matches_golden_bytes_unpersisted(self):
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=4",
+            title="Crashed",
+            requester_id=8,
+            ts=95,
+            duration=180,
+            persisted=False,
+        )
+        assert entry.to_redis() == _GOLDEN_QOBJ_UNPERSISTED
+
+    def test_reader_parses_golden_bytes(self):
+        assert parse_queue_entry(_GOLDEN_QOBJ_FULL) == _FULL_ENTRY
+
+    def test_reader_parses_legacy_entry_without_type_as_song(self):
+        entry = parse_queue_entry(_GOLDEN_LEGACY_NO_TYPE)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.webpage_url == "https://yt.com/v=3"
+        assert entry.requester_id == 7
+        assert entry.persisted is True  # default when field absent
+
+    def test_reader_preserves_persisted_false(self):
+        entry = parse_queue_entry(_GOLDEN_QOBJ_UNPERSISTED)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.persisted is False
+
+    def test_round_trip(self):
+        assert parse_queue_entry(_FULL_ENTRY.to_redis()) == _FULL_ENTRY
+
+    def test_snowflake_requester_id_exact(self):
+        entry = parse_queue_entry(_GOLDEN_QOBJ_FULL)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.requester_id == 222222222222222222  # no float path
+
+    def test_from_queue_object(self):
+        item = SimpleNamespace(
+            webpage_url="https://yt.com/v=1",
+            title="Golden Song",
+            requester=SimpleNamespace(id=222222222222222222),
+            ts=30,
+            user_input="golden song",
+            duration=240,
+            uploader="Golden Channel",
+            thumbnail="https://img.yt/1.jpg",
+            persisted=True,
+        )
+        assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
+
+
+class TestSearchQueueEntryWire:
+    def test_writer_matches_golden_bytes(self):
+        entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
+        assert entry.to_redis() == _GOLDEN_YTSOURCE
+
+    def test_reader_parses_golden_bytes(self):
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE)
+        assert entry == SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
+
+    def test_round_trip(self):
+        entry = SearchQueueEntry(url="https://yt.com/v=9", ts=10)
+        assert parse_queue_entry(entry.to_redis()) == entry
+
+    def test_from_ytsource(self):
+        source = SimpleNamespace(ytsearch="ytsearch:x", url=None, process=True, ts=None)
+        entry = SearchQueueEntry.from_ytsource(source)
+        assert entry == SearchQueueEntry(ytsearch="ytsearch:x", process=True)
+
+
+class TestParseQueueEntryCorrupt:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"not json at all",
+            b'{"type":"qobj","title":"missing url and requester"}',
+            b"",
+        ],
+    )
+    def test_corrupt_entry_dropped_with_warning(self, raw, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_queue_entry(raw) is None
+        assert "corrupt queue entry" in caplog.text
+
+
+class TestFromCrashedState:
+    def test_none_when_no_crashed_song(self):
+        assert SongQueueEntry.from_crashed_state(GuildStateData(), position=10) is None
+
+    def test_maps_crashed_fields(self):
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=crash",
+            current_song_title="Crashed",
+            current_song_duration=180,
+            current_song_uploader="Chan",
+            current_song_requester_id=42,
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=95)
+        assert entry == SongQueueEntry(
+            webpage_url="https://yt.com/v=crash",
+            title="Crashed",
+            requester_id=42,
+            ts=95,
+            duration=180,
+            uploader="Chan",
+            persisted=False,
+        )
+
+    def test_persisted_false_and_position_none_passthrough(self):
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert entry.persisted is False
+        assert entry.ts is None
+        assert entry.requester_id is None  # no requester recorded
+
+
+class TestGuildPlaybackSnapshot:
+    @pytest.mark.parametrize(
+        "queue,crashed,expected",
+        [
+            ((), False, False),
+            ((), True, True),
+            (("entry",), False, True),
+            (("entry",), True, True),
+        ],
+    )
+    def test_has_restorable_playback_truth_table(self, queue, crashed, expected):
+        state = GuildStateData(current_song_url="https://x" if crashed else "")
+        entries = tuple(
+            SongQueueEntry(webpage_url="https://q", title="Q", requester_id=1)
+            for _ in queue
+        )
+        snap = GuildPlaybackSnapshot(state=state, queue=entries)
+        assert snap.has_restorable_playback is expected
+
+    def test_pending_count(self):
+        entry = SongQueueEntry(webpage_url="https://q", title="Q", requester_id=1)
+        assert GuildPlaybackSnapshot(state=GuildStateData()).pending_count == 0
+        assert (
+            GuildPlaybackSnapshot(
+                state=GuildStateData(), queue=(entry, entry)
+            ).pending_count
+            == 2
+        )
+
+    def test_frozen(self):
+        snap = GuildPlaybackSnapshot(state=GuildStateData())
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            snap.queue = ()  # type: ignore[misc]
+
+
+class TestQueueEntryImmutability:
+    def test_song_entry_frozen(self):
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _FULL_ENTRY.title = "x"  # type: ignore[misc]
+
+    def test_search_entry_frozen(self):
+        entry = SearchQueueEntry()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            entry.url = "x"  # type: ignore[misc]
