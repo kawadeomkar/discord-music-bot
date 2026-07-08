@@ -323,12 +323,16 @@ class GuildQueue:
         except IndexError:
             return False
 
-    async def redis_pop_for(self, item: QueueItem) -> None:
+    async def redis_pop_for(self, item: Optional[QueueItem]) -> None:
         """Mirror one in-memory dequeue to Redis via LPOP — unless the item
         was never on the Redis list (persisted=False: the crash-recovered
         "current song", whose LPOP committed in the start transaction of the
         run that crashed). LPOPing for it here would silently delete an
-        unrelated, still-queued song."""
+        unrelated, still-queued song.
+
+        item=None means the dequeue came through the prefetch path, where the
+        original item is no longer in hand — prefetched items always came
+        through get() on real, Redis-mirrored entries, so None pops."""
         if self._store is not None and getattr(item, "persisted", True):
             await self._store.pop_queue()
 
