@@ -566,16 +566,29 @@ class TestSpotifyTokenCache:
 # ── pop_queue_and_start_song ──────────────────────────────────────────────────
 
 
+def _current(url: str = "url", title: str = "title", **kwargs) -> SongQueueEntry:
+    """The start-transaction carrier: the queue-entry view of the song that is
+    about to play (its fields get parked in the state hash as current_song_*)."""
+    return SongQueueEntry(
+        webpage_url=url,
+        title=title,
+        requester_id=kwargs.pop("requester_id", None),
+        **kwargs,
+    )
+
+
 class TestPopQueueAndStartSong:
     async def test_lpop_removes_first_item_only(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"second"]
 
     async def test_writes_now_playing_fields_atomically(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("https://yt.com/v=1", "Test Song", 1000.5)
+        await store.pop_queue_and_start_song(
+            _current("https://yt.com/v=1", "Test Song"), 1000.5
+        )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
         assert state[b"current_song_title"] == b"Test Song"
@@ -585,12 +598,8 @@ class TestPopQueueAndStartSong:
     async def test_writes_duration_uploader_and_requester_id(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(
-            "url",
-            "title",
+            _current(duration=210, uploader="Some Channel", requester_id=42),
             1000.0,
-            duration=210,
-            uploader="Some Channel",
-            requester_id=42,
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_duration"] == b"210"
@@ -601,7 +610,7 @@ class TestPopQueueAndStartSong:
         self, store, fake_redis
     ):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_duration"] == b""
         assert state[b"current_song_uploader"] == b""
@@ -610,13 +619,13 @@ class TestPopQueueAndStartSong:
     async def test_clears_pause_epoch_on_start(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"pause_start_epoch", b"999.0")
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert b"pause_start_epoch" not in state
 
     async def test_sets_ttl_on_state(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         ttl = await fake_redis.ttl(store.state_key())
         assert ttl > 0
 
@@ -625,7 +634,7 @@ class TestPopQueueAndStartSong:
     ):
         """LPOP on an empty list returns nil, but the HSET still runs atomically."""
         await store.pop_queue_and_start_song(
-            "https://yt.com/v=1", "No Queue Song", 500.0
+            _current("https://yt.com/v=1", "No Queue Song"), 500.0
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
@@ -639,8 +648,7 @@ class TestPopQueueAndStartSong:
     ):
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(
-            "url",
-            "title",
+            _current(),
             1000.0,
             now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
@@ -652,12 +660,12 @@ class TestPopQueueAndStartSong:
 
     async def test_now_playing_untouched_when_fields_omitted(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.pop_queue_and_start_song(
-            "url", "title", 1000.0
+            _current(), 1000.0
         )  # must not raise
 
 
@@ -667,12 +675,14 @@ class TestSetCurrentSongState:
 
     async def test_writes_now_playing_fields(self, store, fake_redis):
         await store.set_current_song_state(
-            "https://yt.com/v=1",
-            "Test Song",
+            _current(
+                "https://yt.com/v=1",
+                "Test Song",
+                duration=210,
+                uploader="Some Channel",
+                requester_id=42,
+            ),
             1000.5,
-            duration=210,
-            uploader="Some Channel",
-            requester_id=42,
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
@@ -685,13 +695,13 @@ class TestSetCurrentSongState:
 
     async def test_does_not_touch_queue(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"untouched")
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"untouched"]
 
     async def test_clears_pause_epoch(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"pause_start_epoch", b"999.0")
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert b"pause_start_epoch" not in state
 
@@ -699,8 +709,7 @@ class TestSetCurrentSongState:
         self, store, fake_redis
     ):
         await store.set_current_song_state(
-            "url",
-            "title",
+            _current(),
             1000.0,
             now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
@@ -711,13 +720,11 @@ class TestSetCurrentSongState:
         assert ttl > 0
 
     async def test_now_playing_untouched_when_fields_omitted(self, store, fake_redis):
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.set_current_song_state(
-            "url", "title", 1000.0
-        )  # must not raise
+        await broken_store.set_current_song_state(_current(), 1000.0)  # must not raise
 
 
 # ── Now-playing operations ────────────────────────────────────────────────────

@@ -1059,28 +1059,15 @@ class MusicPlayer:
                         # ?t= songs and double-crash recoveries resume
                         # start_offset seconds early.
                         backdated_start = play_start - song.start_offset
-                        dur = song.duration_secs or None
-                        requester = song.requester
+                        current = SongQueueEntry.from_song(song)
                         now_playing = NowPlayingData.from_song(song)
                         if should_pop_queue:
                             await self.store.pop_queue_and_start_song(
-                                url=song.webpage_url or "",
-                                title=song.title or "",
-                                play_start_epoch=backdated_start,
-                                duration=dur,
-                                uploader=song.uploader,
-                                requester_id=requester.id if requester else None,
-                                now_playing=now_playing,
+                                current, backdated_start, now_playing=now_playing
                             )
                         else:
                             await self.store.set_current_song_state(
-                                url=song.webpage_url or "",
-                                title=song.title or "",
-                                play_start_epoch=backdated_start,
-                                duration=dur,
-                                uploader=song.uploader,
-                                requester_id=requester.id if requester else None,
-                                now_playing=now_playing,
+                                current, backdated_start, now_playing=now_playing
                             )
 
                     await self.update_activity(song)

@@ -10,6 +10,7 @@ from src.guild_state import (
     GuildStateData,
     NowPlayingData,
     QueueEntry,
+    SongQueueEntry,
     StateField,
     parse_queue_entry,
 )
@@ -224,21 +225,20 @@ class GuildRedisStore:
             log.warning(f"[guild:{self.guild_id}] Redis pop_queue failed: {e}")
 
     def _now_playing_state_mapping(
-        self,
-        url: str,
-        title: str,
-        play_start_epoch: float,
-        duration: Optional[int],
-        uploader: Optional[str],
-        requester_id: Optional[int],
+        self, current: SongQueueEntry, play_start_epoch: float
     ) -> dict[str, str]:
+        """The current_song_* state fields ARE a parked queue entry — this one
+        signature enforces the identity that SongQueueEntry.from_song() /
+        from_crashed_state() rely on for crash recovery."""
         return {
-            StateField.CURRENT_SONG_URL: url,
-            StateField.CURRENT_SONG_TITLE: title,
-            StateField.CURRENT_SONG_DURATION: str(duration) if duration else "",
-            StateField.CURRENT_SONG_UPLOADER: uploader or "",
+            StateField.CURRENT_SONG_URL: current.webpage_url,
+            StateField.CURRENT_SONG_TITLE: current.title,
+            StateField.CURRENT_SONG_DURATION: (
+                str(current.duration) if current.duration else ""
+            ),
+            StateField.CURRENT_SONG_UPLOADER: current.uploader or "",
             StateField.CURRENT_SONG_REQUESTER_ID: (
-                str(requester_id) if requester_id else ""
+                str(current.requester_id) if current.requester_id else ""
             ),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
@@ -246,15 +246,11 @@ class GuildRedisStore:
 
     async def pop_queue_and_start_song(
         self,
-        url: str,
-        title: str,
+        current: SongQueueEntry,
         play_start_epoch: float,
-        duration: Optional[int] = None,
-        uploader: Optional[str] = None,
-        requester_id: Optional[int] = None,
         now_playing: Optional[NowPlayingData] = None,
     ) -> None:
-        """Atomically LPOP the queue and write all now-playing state fields.
+        """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
         Uses MULTI/EXEC so the song is always in one of two consistent states:
           (a) still in guild:{id}:queue, current_song_url empty  — transaction not executed
@@ -268,9 +264,7 @@ class GuildRedisStore:
         pointing at song B while the snapshot still shows song A.
         """
         try:
-            mapping = self._now_playing_state_mapping(
-                url, title, play_start_epoch, duration, uploader, requester_id
-            )
+            mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.lpop(self.queue_key())
             pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
@@ -285,12 +279,8 @@ class GuildRedisStore:
 
     async def set_current_song_state(
         self,
-        url: str,
-        title: str,
+        current: SongQueueEntry,
         play_start_epoch: float,
-        duration: Optional[int] = None,
-        uploader: Optional[str] = None,
-        requester_id: Optional[int] = None,
         now_playing: Optional[NowPlayingData] = None,
     ) -> None:
         """Same fields as pop_queue_and_start_song, in one transaction, but
@@ -298,9 +288,7 @@ class GuildRedisStore:
         was never RPUSHed to the Redis queue list in the first place.
         """
         try:
-            mapping = self._now_playing_state_mapping(
-                url, title, play_start_epoch, duration, uploader, requester_id
-            )
+            mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)

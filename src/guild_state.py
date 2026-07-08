@@ -364,6 +364,24 @@ class SongQueueEntry:
         )
 
     @classmethod
+    def from_song(cls, song: YTDL) -> Self:
+        """The queue-entry view of a now-playing song — the write-side twin of
+        from_crashed_state(). The playback loop hands this to the atomic
+        start-song transaction, which parks these fields in the state hash as
+        current_song_*; a crash then rebuilds the same entry via
+        from_crashed_state(), closing the loop:
+
+            from_song → HSET state → crash → from_crashed_state → re-queue
+        """
+        return cls(
+            webpage_url=song.webpage_url or "",
+            title=song.title or "",
+            requester_id=song.requester.id if song.requester else None,
+            duration=song.duration_secs or None,
+            uploader=song.uploader,
+        )
+
+    @classmethod
     def from_crashed_state(
         cls, state: GuildStateData, *, position: int | None
     ) -> Self | None:

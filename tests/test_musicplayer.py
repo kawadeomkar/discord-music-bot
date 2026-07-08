@@ -2778,10 +2778,11 @@ class TestLoop:
             await music_player.loop()
 
         pop_spy.assert_awaited_once()
-        call_kwargs = pop_spy.call_args.kwargs
-        assert call_kwargs["duration"] == 240
-        assert call_kwargs["uploader"] == "Test Channel"
-        assert call_kwargs["requester_id"] == mock_author.id
+        current = pop_spy.call_args.args[0]  # the SongQueueEntry carrier
+        assert isinstance(current, SongQueueEntry)
+        assert current.duration == 240
+        assert current.uploader == "Test Channel"
+        assert current.requester_id == mock_author.id
 
     async def test_loop_clears_play_message_on_song_end(
         self, music_player, queue_obj, mock_song
@@ -2891,7 +2892,7 @@ class TestLoop:
         after = time.time()
 
         pop_spy.assert_awaited_once()
-        epoch = pop_spy.call_args.kwargs["play_start_epoch"]
+        epoch = pop_spy.call_args.args[1]  # play_start_epoch
         assert before - 90 <= epoch <= after - 90
 
     async def test_now_playing_hash_committed_before_send_now_playing(
