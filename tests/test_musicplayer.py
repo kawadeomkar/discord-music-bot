@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import dataclasses
 import re
 import time
 from collections import deque
@@ -11,6 +12,7 @@ import discord
 import orjson
 import pytest
 
+from src.guild_state import NowPlayingData
 from src.musicplayer import (
     MusicPlayer,
     _build_progress_bar,
@@ -196,7 +198,7 @@ class TestQueuePut:
         self, music_player, queue_obj, fake_redis
     ):
         await music_player.queue_put(queue_obj)
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
         assert data["type"] == "qobj"
@@ -206,7 +208,7 @@ class TestQueuePut:
     async def test_put_mirrors_yt_source_to_redis(self, music_player, fake_redis):
         src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True)
         await music_player.queue_put(src)
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
         data = orjson.loads(items[0])
         assert data["type"] == "ytsource"
@@ -224,12 +226,12 @@ class TestQueuePut:
             await music_player.queue_put(src)
             await asyncio.sleep(0)
         mock_pf.assert_not_awaited()
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
 
     async def test_put_sets_ttl_on_redis_key(self, music_player, queue_obj, fake_redis):
         await music_player.queue_put(queue_obj)
-        ttl = await fake_redis.ttl(music_player._store.queue_key())
+        ttl = await fake_redis.ttl(music_player.store.queue_key())
         assert ttl > 0
 
     async def test_put_spawns_prefetch_stream_for_queue_object(
@@ -299,7 +301,7 @@ class TestQueueClear:
     async def test_clear_deletes_redis_key(self, music_player, queue_obj, fake_redis):
         await music_player.queue_put(queue_obj)
         await music_player.queue_clear()
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert items == []
 
     async def test_clear_returns_list_of_cleared_display_strings(
@@ -369,7 +371,7 @@ class TestQueueShuffle:
 
         await music_player.queue_shuffle()
 
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 5
         urls = {orjson.loads(item)["webpage_url"] for item in items}
         assert urls == {f"https://yt.com/watch?v={i}" for i in range(5)}
@@ -390,7 +392,7 @@ class TestQueueShuffle:
 
         await music_player.queue_shuffle()
 
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         urls = {orjson.loads(item)["webpage_url"] for item in items}
         assert "https://yt.com/v=crashed" not in urls
         assert len(items) == 4
@@ -487,7 +489,7 @@ class TestQueueRemove:
 
         await music_player.queue_remove("https://yt.com/v=1")
 
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 2
         urls = [orjson.loads(item)["webpage_url"] for item in items]
         assert "https://yt.com/v=1" not in urls
@@ -512,7 +514,7 @@ class TestQueueRemove:
         positions = await music_player.queue_remove("https://yt.com/v=a")
 
         assert positions == [2]  # crashed(1), a(2), b(3) — 1-indexed
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         urls = {orjson.loads(item)["webpage_url"] for item in items}
         assert "https://yt.com/v=crashed" not in urls
         assert urls == {"https://yt.com/v=b"}
@@ -533,7 +535,7 @@ class TestQueueRemove:
 
         await music_player.queue_remove("https://yt.com/v=only")
 
-        exists = await fake_redis.exists(music_player._store.queue_key())
+        exists = await fake_redis.exists(music_player.store.queue_key())
         assert exists == 0
 
     async def test_remove_deletes_redis_key_when_queue_becomes_empty(
@@ -545,7 +547,7 @@ class TestQueueRemove:
 
         await music_player.queue_remove("https://yt.com/v=only")
 
-        exists = await fake_redis.exists(music_player._store.queue_key())
+        exists = await fake_redis.exists(music_player.store.queue_key())
         assert exists == 0
 
     async def test_remove_does_not_modify_redis_on_no_match(
@@ -557,7 +559,7 @@ class TestQueueRemove:
 
         await music_player.queue_remove("https://yt.com/v=xyz")
 
-        items = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
 
 
@@ -1157,20 +1159,20 @@ class TestMusicPlayerInitialState:
 class TestRedisHelpers:
     async def test_redis_push_history_capped_at_50(self, music_player, fake_redis):
         for i in range(55):
-            await music_player._store.push_history(orjson.dumps(f"Song {i} - url{i}"))
-        items = await fake_redis.lrange(music_player._store.history_key(), 0, -1)
+            await music_player.store.push_history(orjson.dumps(f"Song {i} - url{i}"))
+        items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
         assert len(items) == 50
 
-    async def test_redis_set_state_updates_volume(self, music_player, fake_redis):
-        await music_player.redis_set_state("volume", "0.75")
-        state = await fake_redis.hgetall(music_player._store.state_key())
+    async def test_store_set_volume_updates_volume(self, music_player, fake_redis):
+        await music_player.store.set_volume(0.75)
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert state[b"volume"] == b"0.75"
 
     async def test_redis_pop_queue_removes_first_item(self, music_player, fake_redis):
-        await fake_redis.rpush(music_player._store.queue_key(), b"item1")
-        await fake_redis.rpush(music_player._store.queue_key(), b"item2")
-        await music_player._store.pop_queue()
-        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        await fake_redis.rpush(music_player.store.queue_key(), b"item1")
+        await fake_redis.rpush(music_player.store.queue_key(), b"item2")
+        await music_player.store.pop_queue()
+        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(remaining) == 1
         assert remaining[0] == b"item2"
 
@@ -1178,7 +1180,7 @@ class TestRedisHelpers:
         self, mock_bot, mock_guild, mock_channel, mock_ctx
     ):
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
-        assert mp._store is None
+        assert mp.store is None
 
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
@@ -1194,7 +1196,7 @@ class TestStateRestore:
                 "ts": None,
             }
         )
-        await fake_redis.rpush(music_player._store.queue_key(), item)
+        await fake_redis.rpush(music_player.store.queue_key(), item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()
@@ -1203,7 +1205,7 @@ class TestStateRestore:
         assert music_player.song_queue[0].title == "Restored Song"
 
     async def test_restore_sets_volume(self, music_player, fake_redis):
-        await fake_redis.hset(music_player._store.state_key(), b"volume", b"0.5")
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.5")
         await music_player._restore_state()
         assert music_player.volume == 0.5
 
@@ -1220,11 +1222,11 @@ class TestStateRestore:
         """Guard against a future edit reintroducing a hidden ordering
         dependency between get_queue() and get_history() — they're gathered
         specifically because neither depends on the other's result."""
-        get_queue_spy = AsyncMock(wraps=music_player._store.get_queue)
-        get_history_spy = AsyncMock(wraps=music_player._store.get_history)
+        get_queue_spy = AsyncMock(wraps=music_player.store.get_queue)
+        get_history_spy = AsyncMock(wraps=music_player.store.get_history)
         with (
-            patch.object(music_player._store, "get_queue", get_queue_spy),
-            patch.object(music_player._store, "get_history", get_history_spy),
+            patch.object(music_player.store, "get_queue", get_queue_spy),
+            patch.object(music_player.store, "get_history", get_history_spy),
         ):
             await music_player._restore_state()
         get_queue_spy.assert_awaited_once()
@@ -1239,12 +1241,12 @@ class TestRestoreCrashedSong:
         self, music_player, fake_redis, mock_author
     ):
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
         )
         normal_item = orjson.dumps(
             {
@@ -1254,7 +1256,7 @@ class TestRestoreCrashedSong:
                 "ts": None,
             }
         )
-        await fake_redis.rpush(music_player._store.queue_key(), normal_item)
+        await fake_redis.rpush(music_player.store.queue_key(), normal_item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()
@@ -1268,18 +1270,18 @@ class TestRestoreCrashedSong:
         self, music_player, fake_redis
     ):
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
         )
         music_player._guild.get_member = MagicMock(return_value=None)
 
         await music_player._restore_state()
 
-        state = await fake_redis.hgetall(music_player._store.state_key())
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"current_song_url" not in state
         assert b"current_song_title" not in state
 
@@ -1287,18 +1289,18 @@ class TestRestoreCrashedSong:
         self, music_player, fake_redis, mock_author
     ):
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_duration", b"240"
+            music_player.store.state_key(), b"current_song_duration", b"240"
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_uploader", b"Test Channel"
+            music_player.store.state_key(), b"current_song_uploader", b"Test Channel"
         )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
@@ -1315,12 +1317,12 @@ class TestRestoreCrashedSong:
         re-queued — but current_song_url must still be cleared to avoid an infinite
         retry loop on every subsequent restart."""
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Ghost Song"
+            music_player.store.state_key(), b"current_song_title", b"Ghost Song"
         )
         music_player._guild.get_member = MagicMock(return_value=None)
         music_player._guild.me = None
@@ -1328,7 +1330,7 @@ class TestRestoreCrashedSong:
 
         await music_player._restore_state()
 
-        state = await fake_redis.hgetall(music_player._store.state_key())
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"current_song_url" not in state
         assert b"current_song_title" not in state
         # Song was not re-queued since requester was unresolvable.
@@ -1345,7 +1347,7 @@ class TestRestoreCrashedSong:
                 "ts": None,
             }
         )
-        await fake_redis.rpush(music_player._store.queue_key(), normal_item)
+        await fake_redis.rpush(music_player.store.queue_key(), normal_item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()
@@ -1360,15 +1362,15 @@ class TestRestoreCrashedSong:
         """current_song_requester_id (persisted atomically with the song at
         start-transaction time) resolves to the guild member who requested it."""
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed"
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
         )
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_requester_id",
             str(mock_author.id).encode(),
         )
@@ -1387,12 +1389,12 @@ class TestRestoreCrashedSong:
         """State without current_song_requester_id (or a departed member) falls
         back to guild.me so the song is still re-queued."""
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed"
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
         )
         music_player._guild.get_member = MagicMock(return_value=None)
         bot_member = MagicMock(spec=discord.Member)
@@ -1412,18 +1414,18 @@ class TestRestoreCrashedSong:
 
         start = time.time() - 90  # started 90 seconds ago, 10s of pauses
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed"
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"play_start_epoch", str(start).encode()
+            music_player.store.state_key(), b"play_start_epoch", str(start).encode()
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"total_pause_seconds", b"10"
+            music_player.store.state_key(), b"total_pause_seconds", b"10"
         )
         music_player._guild.get_member = MagicMock(return_value=None)
         music_player.bot.wait_until_ready = AsyncMock()
@@ -1440,12 +1442,12 @@ class TestRestoreCrashedSong:
     ):
         """When play_start_epoch is absent, ts on the restored QueueObject is None."""
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed"
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
         )
         music_player._guild.get_member = MagicMock(return_value=None)
         music_player.bot.wait_until_ready = AsyncMock()
@@ -1465,23 +1467,23 @@ class TestRestoreCrashedSong:
         play_start = time.time() - 90  # song started 90 s ago
         pause_start = time.time() - 20  # paused 20 s ago (still paused at crash)
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Paused Crash"
+            music_player.store.state_key(), b"current_song_title", b"Paused Crash"
         )
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"play_start_epoch",
             str(play_start).encode(),
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"total_pause_seconds", b"10"
+            music_player.store.state_key(), b"total_pause_seconds", b"10"
         )
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"pause_start_epoch",
             str(pause_start).encode(),
         )
@@ -1494,6 +1496,72 @@ class TestRestoreCrashedSong:
         # elapsed=90s, prior_pause=10s, active_pause≈20s → position ≈ 90-10-20 = 60s
         assert first.ts is not None
         assert 50 <= first.ts <= 70
+
+    async def test_crashed_song_position_capped_by_cached_stream_duration(
+        self, music_player, fake_redis, mock_author
+    ):
+        """The recovery position is capped at cached stream duration − 10s so
+        FFmpeg never seeks past EOF."""
+        import time
+
+        start = time.time() - 90  # computed position ≈ 90s
+        await fake_redis.hset(
+            music_player.store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
+        )
+        await fake_redis.hset(
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
+        )
+        await fake_redis.hset(
+            music_player.store.state_key(), b"play_start_epoch", str(start).encode()
+        )
+        # Cached stream metadata says the song is only 60s long.
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=crash", orjson.dumps({"duration": 60})
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.ts == 50  # min(≈90, 60 − 10)
+
+    async def test_crashed_song_position_uncapped_when_cached_duration_malformed(
+        self, music_player, fake_redis, mock_author
+    ):
+        """A malformed cached stream duration degrades to "no cap" — the
+        computed position is kept and the restore still completes (clears the
+        crashed-song state) instead of aborting."""
+        import time
+
+        start = time.time() - 90
+        await fake_redis.hset(
+            music_player.store.state_key(),
+            b"current_song_url",
+            b"https://yt.com/v=crash",
+        )
+        await fake_redis.hset(
+            music_player.store.state_key(), b"current_song_title", b"Crashed"
+        )
+        await fake_redis.hset(
+            music_player.store.state_key(), b"play_start_epoch", str(start).encode()
+        )
+        await fake_redis.set(
+            "ytdl:stream:https://yt.com/v=crash",
+            orjson.dumps({"duration": "not-a-number"}),
+        )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.ts is not None
+        assert 80 <= first.ts <= 100  # uncapped ≈90s position survives
+        state = await fake_redis.hgetall(music_player.store.state_key())
+        assert b"current_song_url" not in state  # restore completed and cleared
 
 
 # ── RestoreCompleteEvent (loop guard) ─────────────────────────────────────────
@@ -1513,14 +1581,18 @@ class TestRestoreCompleteLoopGuard:
         assert music_player._restore_complete.is_set()
 
     async def test_restore_state_sets_restore_complete_on_failure(self, music_player):
+        # get_guild_state() swallows Redis errors and returns None, so the
+        # failure path here is the None early-return, not an exception.
         music_player._restore_complete.clear()
         with patch.object(
-            music_player._store,
-            "get_state",
-            new=AsyncMock(side_effect=Exception("redis down")),
+            music_player.store,
+            "get_guild_state",
+            new=AsyncMock(return_value=None),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
+        # Restore aborted before touching the queue.
+        assert music_player.queue.qsize() == 0
 
     async def test_restore_state_sets_restore_complete_when_no_store(
         self, mock_bot, mock_guild, mock_channel, mock_ctx
@@ -1560,12 +1632,12 @@ class TestRestoreCompleteLoopGuard:
         fire for the crashed song's own dequeue.
         """
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
         )
         for i in range(2):
             item = orjson.dumps(
@@ -1576,7 +1648,7 @@ class TestRestoreCompleteLoopGuard:
                     "ts": None,
                 }
             )
-            await fake_redis.rpush(music_player._store.queue_key(), item)
+            await fake_redis.rpush(music_player.store.queue_key(), item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player._restore_complete.clear()
         music_player.bot.wait_until_ready = AsyncMock()
@@ -1597,7 +1669,7 @@ class TestRestoreCompleteLoopGuard:
         ):
             await music_player.loop()
 
-        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(remaining) == 2
 
     async def test_shuffle_during_restore_window_does_not_orphan_redis_entry(
@@ -1608,12 +1680,12 @@ class TestRestoreCompleteLoopGuard:
         has dequeued it), Redis's queue list must still end up with exactly
         the real queued songs — no phantom entry for the crashed song."""
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
         await fake_redis.hset(
-            music_player._store.state_key(), b"current_song_title", b"Crashed Song"
+            music_player.store.state_key(), b"current_song_title", b"Crashed Song"
         )
         for i in range(4):
             item = orjson.dumps(
@@ -1624,7 +1696,7 @@ class TestRestoreCompleteLoopGuard:
                     "ts": None,
                 }
             )
-            await fake_redis.rpush(music_player._store.queue_key(), item)
+            await fake_redis.rpush(music_player.store.queue_key(), item)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()
@@ -1633,7 +1705,7 @@ class TestRestoreCompleteLoopGuard:
         # Simulates a -shuffle command running before loop() ever dequeues anything.
         await music_player.queue_shuffle()
 
-        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         urls = {orjson.loads(item)["webpage_url"] for item in remaining}
         assert "https://yt.com/v=crash" not in urls
         assert len(remaining) == 4
@@ -1699,7 +1771,7 @@ class TestFromContext:
 
     def test_attaches_store_when_redis_provided(self, mock_bot, mock_ctx, fake_redis):
         mp = MusicPlayer.from_context(mock_bot, mock_ctx, redis=fake_redis)
-        assert mp._store is not None
+        assert mp.store is not None
 
 
 # ── Start ─────────────────────────────────────────────────────────────────────
@@ -1720,7 +1792,7 @@ class TestStart:
 
         music_player.bot.loop = MagicMock()
         music_player.bot.loop.create_task = MagicMock(side_effect=_create)
-        assert music_player._store is not None
+        assert music_player.store is not None
         music_player.start()
 
         assert music_player._restore_task is restore_task
@@ -2232,7 +2304,7 @@ class TestPlayerPauseResume:
         music_player.current_song = mock_song
         vc = MagicMock(spec=discord.VoiceClient)
         await music_player.pause(vc)
-        state = await fake_redis.hgetall(music_player._store.state_key())
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"pause_start_epoch" in state
 
     async def test_pause_schedules_debounced_update(self, music_player, mock_song):
@@ -2258,10 +2330,10 @@ class TestPlayerPauseResume:
 
     async def test_resume_writes_to_store(self, music_player, mock_song, fake_redis):
         music_player.current_song = mock_song
-        await music_player._store.on_pause(1000.0)
+        await music_player.store.on_pause(1000.0)
         vc = MagicMock(spec=discord.VoiceClient)
         await music_player.resume(vc)
-        state = await fake_redis.hgetall(music_player._store.state_key())
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert b"pause_start_epoch" not in state
 
     async def test_resume_schedules_debounced_update(self, music_player, mock_song):
@@ -2684,12 +2756,12 @@ class TestRestoreStateTtlRefresh:
     async def test_ttl_refreshed_after_successful_restore(
         self, music_player, fake_redis
     ):
-        await fake_redis.hset(music_player._store.state_key(), b"volume", b"0.8")
-        await fake_redis.expire(music_player._store.state_key(), 10)
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.8")
+        await fake_redis.expire(music_player.store.state_key(), 10)
 
         await music_player._restore_state()
 
-        ttl = await fake_redis.ttl(music_player._store.state_key())
+        ttl = await fake_redis.ttl(music_player.store.state_key())
         assert ttl > 1000
 
     async def test_restore_continues_after_bad_queue_item(
@@ -2703,9 +2775,7 @@ class TestRestoreStateTtlRefresh:
                 "ts": None,
             }
         )
-        await fake_redis.rpush(
-            music_player._store.queue_key(), b"!!!bad json!!!", valid
-        )
+        await fake_redis.rpush(music_player.store.queue_key(), b"!!!bad json!!!", valid)
         music_player._guild.get_member = MagicMock(return_value=mock_author)
 
         await music_player._restore_state()
@@ -2721,7 +2791,7 @@ class TestRestoreStateTtlRefresh:
 class TestLoop:
     @pytest.fixture
     def mock_song(self):
-        # Real (str/int/None) values for every field _song_now_playing_fields()
+        # Real (str/int/None) values for every field NowPlayingData.from_song()
         # reads — loop() now serializes the song into the Redis start
         # transaction, and MagicMock attribute values are not HSET-able.
         song = MagicMock()
@@ -2797,7 +2867,7 @@ class TestLoop:
         music_player.bot.is_closed.side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        await music_player._store.push_queue(_serialize_queue_item(queue_obj))
+        await music_player.store.push_queue(_serialize_queue_item(queue_obj))
         await music_player.queue.put(queue_obj)
         music_player.song_queue.append(queue_obj)
 
@@ -2809,7 +2879,7 @@ class TestLoop:
             await music_player.loop()
 
         assert len(music_player.song_queue) == 0
-        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(remaining) == 0
         assert music_player.queue._unfinished_tasks == 0  # task_done() balanced get()
         sent_embed = music_player._channel.send.call_args.kwargs["embed"]
@@ -2827,7 +2897,7 @@ class TestLoop:
         crashed = QueueObject(
             "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
         )
-        await music_player._store.push_queue(
+        await music_player.store.push_queue(
             _serialize_queue_item(
                 QueueObject("https://yt.com/v=real", "Real Song", mock_author)
             )
@@ -2842,7 +2912,7 @@ class TestLoop:
         ):
             await music_player.loop()
 
-        remaining = await fake_redis.lrange(music_player._store.queue_key(), 0, -1)
+        remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         urls = {orjson.loads(item)["webpage_url"] for item in remaining}
         assert urls == {"https://yt.com/v=real"}
 
@@ -2907,7 +2977,7 @@ class TestLoop:
         music_player._guild.voice_client = vc
         music_player.play_next.wait = AsyncMock()
 
-        pop_spy = AsyncMock(wraps=music_player._store.pop_queue_and_start_song)
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
 
         with (
             patch.object(
@@ -2921,7 +2991,7 @@ class TestLoop:
                 MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
             ),
             patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
-            patch.object(music_player._store, "pop_queue_and_start_song", pop_spy),
+            patch.object(music_player.store, "pop_queue_and_start_song", pop_spy),
         ):
             await music_player.loop()
 
@@ -3018,7 +3088,7 @@ class TestLoop:
         music_player._guild.voice_client = vc
         music_player.play_next.wait = AsyncMock()
 
-        pop_spy = AsyncMock(wraps=music_player._store.pop_queue_and_start_song)
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
 
         before = time.time()
         with (
@@ -3033,7 +3103,7 @@ class TestLoop:
                 MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
             ),
             patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
-            patch.object(music_player._store, "pop_queue_and_start_song", pop_spy),
+            patch.object(music_player.store, "pop_queue_and_start_song", pop_spy),
         ):
             await music_player.loop()
         after = time.time()
@@ -3065,7 +3135,7 @@ class TestLoop:
 
         async def _capture_send(_self, song):
             np_at_send_time.update(
-                await fake_redis.hgetall(music_player._store.now_playing_key())
+                await fake_redis.hgetall(music_player.store.now_playing_key())
             )
 
         with (
@@ -3177,7 +3247,7 @@ class TestLoop:
 
         # Seed Redis so a restart would see a crashed song.
         await fake_redis.hset(
-            music_player._store.state_key(),
+            music_player.store.state_key(),
             b"current_song_url",
             b"https://yt.com/v=crash",
         )
@@ -3192,7 +3262,7 @@ class TestLoop:
         ):
             await music_player.loop()
 
-        state = await fake_redis.hgetall(music_player._store.state_key())
+        state = await fake_redis.hgetall(music_player.store.state_key())
         assert state.get(b"current_song_url", b"") == b""
         assert state.get(b"current_song_title", b"") == b""
 
@@ -3209,17 +3279,33 @@ class TestRestoreCompleteEvent:
     async def test_set_even_when_restore_raises(self, music_player):
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
-            music_player._store,
-            "get_state",
+            music_player.store,
+            "get_guild_state",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
 
+    async def test_set_and_restore_aborted_when_state_read_fails(self, music_player):
+        """get_guild_state() returning None (Redis unavailable) aborts the
+        restore early — no queue restore is attempted — but the loop guard
+        event is still set."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        get_queue_spy = AsyncMock(wraps=music_player.store.get_queue)
+        with (
+            patch.object(
+                music_player.store, "get_guild_state", new=AsyncMock(return_value=None)
+            ),
+            patch.object(music_player.store, "get_queue", get_queue_spy),
+        ):
+            await music_player._restore_state()
+        assert music_player._restore_complete.is_set()
+        get_queue_spy.assert_not_awaited()
+
     async def test_set_even_when_queue_restore_fails(self, music_player):
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
-            music_player._store,
+            music_player.store,
             "get_queue",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
@@ -3229,20 +3315,20 @@ class TestRestoreCompleteEvent:
 
 # ── _build_now_playing_embed_from_data ────────────────────────────────────────
 
-_NP_DATA: dict[bytes, bytes] = {
-    b"title": b"Test Song",
-    b"webpage_url": b"https://yt.com/v=1",
-    b"uploader": b"Test Channel",
-    b"duration": b"3:30",
-    b"thumbnail": b"https://img.yt.com/thumb.jpg",
-    b"view_count": b"1000",
-    b"like_count": b"50",
-    b"abr": b"128",
-    b"asr": b"44100",
-    b"acodec": b"opus",
-    b"requester_id": b"123",
-    b"requester_mention": b"<@123>",
-}
+_NP_DATA = NowPlayingData(
+    title="Test Song",
+    webpage_url="https://yt.com/v=1",
+    uploader="Test Channel",
+    duration="3:30",
+    thumbnail="https://img.yt.com/thumb.jpg",
+    view_count="1000",
+    like_count="50",
+    abr="128",
+    asr="44100",
+    acodec="opus",
+    requester_id="123",
+    requester_mention="<@123>",
+)
 
 
 class TestBuildNowPlayingEmbedFromData:
@@ -3263,8 +3349,7 @@ class TestBuildNowPlayingEmbedFromData:
         assert embed.thumbnail.url == "https://img.yt.com/thumb.jpg"
 
     def test_thumbnail_not_set_when_empty(self, music_player):
-        data = dict(_NP_DATA)
-        data[b"thumbnail"] = b""
+        data = dataclasses.replace(_NP_DATA, thumbnail="")
         embed = music_player._build_now_playing_embed_from_data(data)
         assert not embed.thumbnail.url
 
@@ -3272,8 +3357,8 @@ class TestBuildNowPlayingEmbedFromData:
         embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
         assert "128" in embed.footer.text
 
-    def test_missing_field_defaults_to_empty_string(self, music_player):
-        data = {b"title": b"Minimal"}  # all other fields absent
+    def test_default_fields_render_as_empty_strings(self, music_player):
+        data = NowPlayingData(title="Minimal")  # all other fields defaulted
         embed = music_player._build_now_playing_embed_from_data(data)
         assert "Minimal" in embed.title
 
@@ -3285,7 +3370,7 @@ class TestRestoreStateNowPlaying:
     async def test_restores_play_message_from_redis(self, music_player, fake_redis):
         """If now_playing hash exists in Redis, play_message is populated on restore."""
         await fake_redis.hset(
-            music_player._store.now_playing_key(),
+            music_player.store.now_playing_key(),
             mapping={
                 "title": "Restored Song",
                 "webpage_url": "https://yt.com/v=1",

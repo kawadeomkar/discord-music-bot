@@ -313,8 +313,8 @@ class TestJoinChannelPersistence:
         mock_ctx.channel = text_channel
 
         mp = MagicMock()
-        mp._store = MagicMock()
-        mp._store.set_connection = AsyncMock()
+        mp.store = MagicMock()
+        mp.store.set_connection = AsyncMock()
         music_bot_with_redis.mps[mock_guild.id] = mp
 
         # join is a @commands.command — call the underlying callback directly.
@@ -326,7 +326,7 @@ class TestJoinChannelPersistence:
             music_bot_with_redis.get_mp = MagicMock(return_value=mp)
             await MusicBot.join.callback(music_bot_with_redis, mock_ctx)
 
-        mp._store.set_connection.assert_awaited_once_with(
+        mp.store.set_connection.assert_awaited_once_with(
             voice_channel.id, text_channel.id
         )
 
@@ -376,7 +376,7 @@ class TestVoiceStateConsistency:
         self._wire_bot_user(music_bot_with_redis)
 
         mp = MagicMock()
-        mp._store = None
+        mp.store = None
         mp._prefetch_task = None
         mp._restore_task = None
         mp._player = None
@@ -646,7 +646,7 @@ class TestCleanup:
         mp._prefetch_task = None
         mp._restore_task = None
         mp._player = None
-        mp._store = None
+        mp.store = None
         mp._progress_task = None
         mp._pause_debounce_task = None
         for attr, val in overrides.items():
@@ -734,11 +734,11 @@ class TestCleanup:
         store = MagicMock()
         store.clear_connection = AsyncMock()
         store.refresh_ttl = AsyncMock()
-        mp = self._make_minimal_mp(music_bot, mock_guild, _store=store)
+        mp = self._make_minimal_mp(music_bot, mock_guild, store=store)
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
-        mp._store.clear_connection.assert_awaited_once()
-        mp._store.refresh_ttl.assert_awaited_once()
+        mp.store.clear_connection.assert_awaited_once()
+        mp.store.refresh_ttl.assert_awaited_once()
 
     async def test_noop_when_guild_not_in_mps(self, music_bot, mock_guild):
         mock_guild.voice_client = None
@@ -766,7 +766,7 @@ class TestCleanup:
         mp._prefetch_task = None
         mp._restore_task = None
         mp._player = _AwaitableTask()
-        mp._store = None
+        mp.store = None
         music_bot.mps[mock_guild.id] = mp
 
         async def _disconnect(**_kw):
@@ -820,7 +820,7 @@ class TestStopCommand:
 class TestCogBeforeInvoke:
     async def test_calls_get_mp(self, music_bot, mock_ctx):
         mock_mp = MagicMock()
-        mock_mp._store = None  # skip the channel-persistence branch
+        mock_mp.store = None  # skip the channel-persistence branch
         music_bot.get_mp = MagicMock(return_value=mock_mp)
         await music_bot.cog_before_invoke(mock_ctx)
         music_bot.get_mp.assert_called_once_with(mock_ctx)
@@ -838,8 +838,7 @@ class TestCogBeforeInvoke:
 
         mp = MagicMock()
         mp._channel = old_channel
-        mp._store = store
-        mp.redis_set_state = AsyncMock()
+        mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -864,8 +863,7 @@ class TestCogBeforeInvoke:
 
         mp = MagicMock()
         mp._channel = channel  # same object → no change
-        mp._store = store
-        mp.redis_set_state = AsyncMock()
+        mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -886,8 +884,7 @@ class TestCogBeforeInvoke:
 
         mp = MagicMock()
         mp._channel = old_channel
-        mp._store = store
-        mp.redis_set_state = AsyncMock()
+        mp.store = store
         music_bot.mps[mock_guild.id] = mp
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -995,7 +992,18 @@ class TestResumeCommand:
 class TestVolumeCommand:
     async def test_sets_player_volume(self, music_bot, mock_ctx, mock_guild):
         mp = MagicMock()
-        mp.redis_set_state = AsyncMock()
+        mp.store.set_volume = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.volume.callback(music_bot, mock_ctx, "50")
+        assert mp.volume == 0.5
+        mp.store.set_volume.assert_awaited_once_with(0.5)
+        mock_ctx.send.assert_awaited()
+
+    async def test_volume_persists_nothing_without_store(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        mp = MagicMock()
+        mp.store = None
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.volume.callback(music_bot, mock_ctx, "50")
         assert mp.volume == 0.5
@@ -1530,6 +1538,42 @@ class TestSetup:
         mock_bot.add_cog.assert_awaited_once()
 
 
+# ── _restore_guild: Redis-failure gate ────────────────────────────────────────
+
+
+class TestRestoreGuildStateReadFailed:
+    async def test_recovery_skipped_when_state_read_fails(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot, caplog
+    ):
+        """get_guild_state() returning None (Redis unavailable) must NOT be
+        treated as "nothing to restore": recovery is skipped with a warning and
+        no channel resolution or player creation is attempted. Distinguishable
+        from the empty-snapshot case, which also skips but silently."""
+        from src.redis_client import GuildRedisStore
+
+        with patch.object(
+            GuildRedisStore, "get_guild_state", new=AsyncMock(return_value=None)
+        ):
+            with caplog.at_level("WARNING", logger="src.musicbot"):
+                await music_bot_with_redis._restore_guild(mock_guild)
+
+        assert "state read failed" in caplog.text
+        mock_guild.get_channel.assert_not_called()
+        assert mock_guild.id not in music_bot_with_redis.mps
+
+    async def test_recovery_skipped_silently_when_nothing_stored(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot, caplog
+    ):
+        """Empty state hash (zero-value snapshot, no connection) skips recovery
+        without the failure warning."""
+        with caplog.at_level("WARNING", logger="src.musicbot"):
+            await music_bot_with_redis._restore_guild(mock_guild)
+
+        assert "state read failed" not in caplog.text
+        mock_guild.get_channel.assert_not_called()
+        assert mock_guild.id not in music_bot_with_redis.mps
+
+
 # ── _restore_guild Gap 3: channel-deleted notification ────────────────────────
 
 
@@ -1552,9 +1596,11 @@ class TestRestoreGuildChannelDeleted:
 
         await music_bot_with_redis._restore_guild(mock_guild)
 
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
+        state = await store.get_guild_state()
+        assert state is not None
+        assert state.voice_channel_id is None
+        assert state.text_channel_id is None
+        assert not state.has_active_connection
 
     async def test_sends_notification_via_system_channel(
         self, music_bot_with_redis, mock_guild, fake_redis_bot

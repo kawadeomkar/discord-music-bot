@@ -6,6 +6,7 @@ import orjson
 import pytest
 import redis.asyncio as aioredis
 
+from src.guild_state import GuildStateData, NowPlayingData
 from src.redis_client import (
     GUILD_TTL,
     GuildRedisStore,
@@ -267,34 +268,38 @@ class TestGetHistory:
 # ── State operations ──────────────────────────────────────────────────────────
 
 
-class TestSetState:
-    async def test_writes_field_to_hash(self, store, fake_redis):
-        await store.set_state("volume", "0.75")
+class TestSetVolume:
+    async def test_writes_volume_to_hash(self, store, fake_redis):
+        await store.set_volume(0.75)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"volume"] == b"0.75"
 
     async def test_sets_ttl_on_state_key(self, store, fake_redis):
-        await store.set_state("volume", "1.0")
+        await store.set_volume(1.0)
         ttl = await fake_redis.ttl(store.state_key())
         assert ttl > 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.set_state("field", "val")  # must not raise
+        await broken_store.set_volume(0.5)  # must not raise
 
 
-class TestGetState:
-    async def test_returns_hash_fields(self, store, fake_redis):
+class TestGetGuildState:
+    async def test_returns_typed_snapshot(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"volume", b"0.5")
-        state = await store.get_state()
-        assert state[b"volume"] == b"0.5"
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        state = await store.get_guild_state()
+        assert state == GuildStateData(volume=0.5, current_song_url="https://x")
 
-    async def test_returns_empty_dict_when_missing(self, store):
-        state = await store.get_state()
-        assert state == {}
+    async def test_returns_zero_value_snapshot_when_missing(self, store):
+        state = await store.get_guild_state()
+        assert state == GuildStateData()
 
-    async def test_returns_empty_dict_on_error(self, broken_store):
-        result = await broken_store.get_state()
-        assert result == {}
+    async def test_returns_none_on_error_not_defaults(self, broken_store):
+        # None (read failed) must be distinguishable from GuildStateData()
+        # (nothing stored) — _restore_guild relies on this to avoid silently
+        # skipping recovery during a Redis outage.
+        result = await broken_store.get_guild_state()
+        assert result is None
 
 
 # ── TTL management ────────────────────────────────────────────────────────────
@@ -339,23 +344,22 @@ class TestSetConnection:
         await broken_store.set_connection(1, 2)  # must not raise
 
 
-class TestGetConnection:
+class TestConnectionViaGuildState:
     async def test_returns_channel_ids_when_set(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"voice_channel_id", b"111")
         await fake_redis.hset(store.state_key(), b"text_channel_id", b"222")
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id == 111
-        assert tc_id == 222
+        state = await store.get_guild_state()
+        assert state is not None
+        assert state.voice_channel_id == 111
+        assert state.text_channel_id == 222
+        assert state.has_active_connection
 
-    async def test_returns_none_none_when_not_set(self, store):
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
-
-    async def test_returns_none_none_on_error(self, broken_store):
-        vc_id, tc_id = await broken_store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
+    async def test_no_active_connection_when_not_set(self, store):
+        state = await store.get_guild_state()
+        assert state is not None
+        assert state.voice_channel_id is None
+        assert state.text_channel_id is None
+        assert not state.has_active_connection
 
 
 class TestClearConnection:
@@ -573,7 +577,7 @@ class TestPopQueueAndStartSong:
             "url",
             "title",
             1000.0,
-            now_playing_fields={"title": "Song", "uploader": "Channel"},
+            now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
         np_data = await fake_redis.hgetall(store.now_playing_key())
         assert np_data[b"title"] == b"Song"
@@ -633,7 +637,7 @@ class TestSetCurrentSongState:
             "url",
             "title",
             1000.0,
-            now_playing_fields={"title": "Song", "uploader": "Channel"},
+            now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
         np_data = await fake_redis.hgetall(store.now_playing_key())
         assert np_data[b"title"] == b"Song"
@@ -657,18 +661,19 @@ class TestSetCurrentSongState:
 
 
 class TestNowPlayingOperations:
-    async def test_get_now_playing_returns_fields(self, store, fake_redis):
+    async def test_get_now_playing_returns_typed_snapshot(self, store, fake_redis):
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
         data = await store.get_now_playing()
-        assert data[b"title"] == b"Song"
+        assert data is not None
+        assert data.title == "Song"
 
-    async def test_get_now_playing_returns_empty_dict_when_missing(self, store):
+    async def test_get_now_playing_returns_none_when_missing(self, store):
         data = await store.get_now_playing()
-        assert data == {}
+        assert data is None
 
-    async def test_get_returns_empty_dict_on_error(self, broken_store):
+    async def test_get_now_playing_returns_none_on_error(self, broken_store):
         result = await broken_store.get_now_playing()
-        assert result == {}
+        assert result is None
 
 
 # ── Playback position tracking ────────────────────────────────────────────────
