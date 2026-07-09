@@ -1,18 +1,26 @@
 """
 Guild state schema — single source of truth for all Redis state stored per guild.
 
-The two Redis hashes each have a corresponding frozen dataclass (value object).
-GuildRedisStore in redis_client.py uses these for typed reads and field-name constants.
-Callers never touch raw bytes from Redis directly.
+The two Redis hashes and the queue list each have corresponding frozen dataclasses
+(value objects). GuildRedisStore in redis_client.py uses these for typed reads and
+field-name constants; GuildQueue in guild_queue.py converts between at-rest queue
+entries and live queue items. Callers never touch raw bytes from Redis directly.
+
+This module is pure schema: constructors, serializers, and derived read-only
+properties only — no domain logic, and no runtime imports from the rest of the
+project (orjson is the project-wide wire codec).
 """
 
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Final, Self, Union
+
+import orjson
 
 if TYPE_CHECKING:
-    from src.youtube import YTDL
+    from src.sources import YTSource
+    from src.youtube import QueueObject, YTDL
 
 log = logging.getLogger(__name__)
 
@@ -285,3 +293,215 @@ class NowPlayingData:
             NowPlayingField.REQUESTER_ID: self.requester_id,
             NowPlayingField.REQUESTER_MENTION: self.requester_mention,
         }
+
+
+# ── guild:{id}:queue list — JSON field name constants ────────────────────────
+
+
+class QueueEntryField:
+    TYPE: Final[str] = "type"
+    # "qobj" entries
+    WEBPAGE_URL: Final[str] = "webpage_url"
+    TITLE: Final[str] = "title"
+    REQUESTER_ID: Final[str] = "requester_id"
+    TS: Final[str] = "ts"
+    USER_INPUT: Final[str] = "user_input"
+    DURATION: Final[str] = "duration"
+    UPLOADER: Final[str] = "uploader"
+    THUMBNAIL: Final[str] = "thumbnail"
+    PERSISTED: Final[str] = "persisted"
+    # "ytsource" entries
+    YTSEARCH: Final[str] = "ytsearch"
+    URL: Final[str] = "url"
+    PROCESS: Final[str] = "process"
+
+
+# Wire discriminator values — kept verbatim from the original serializer so
+# entries written before and after the migration stay mutually readable.
+_ENTRY_TYPE_SONG: Final[str] = "qobj"
+_ENTRY_TYPE_SEARCH: Final[str] = "ytsource"
+
+
+# ── Queue-entry value objects — the guild:{id}:queue list at rest ────────────
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SongQueueEntry:
+    """A resolved song at rest ("qobj" on the wire) — the pure-data twin of
+    src.youtube.QueueObject.
+
+    requester is stored as an ID because a live discord.Member cannot exist at
+    rest; rehydration back to a QueueObject (which needs a guild for member
+    resolution) happens in GuildQueue. requester_id is None only for the
+    crashed-head entry derived from state via from_crashed_state() — wire
+    entries always carry a real int, and snowflakes stay exact end-to-end
+    (orjson native ints; never a float path).
+    """
+
+    webpage_url: str
+    title: str
+    requester_id: int | None
+    ts: int | None = None
+    user_input: str | None = None
+    duration: int | None = None
+    uploader: str | None = None
+    thumbnail: str | None = None
+    persisted: bool = True
+
+    @classmethod
+    def from_queue_object(cls, item: QueueObject) -> Self:
+        """Snapshot a live queue item for persistence."""
+        return cls(
+            webpage_url=item.webpage_url,
+            title=item.title,
+            requester_id=item.requester.id,
+            ts=item.ts,
+            user_input=item.user_input,
+            duration=item.duration,
+            uploader=item.uploader,
+            thumbnail=item.thumbnail,
+            persisted=item.persisted,
+        )
+
+    @classmethod
+    def from_crashed_state(
+        cls, state: GuildStateData, *, position: int | None
+    ) -> Self | None:
+        """The crashed "current song" reborn as a queue entry — the typed
+        inverse of pop_queue_and_start_song(): the current_song_* state fields
+        are the fields of the entry that transaction atomically LPOPed when
+        the song started. Returns None when no crashed song is recorded.
+
+        persisted=False: the LPOP already committed, so this entry is not on
+        the Redis list and the playback loop must not LPOP again for it.
+
+        position is the caller-computed resume offset (crashed_position_at()
+        plus its duration cap) — passed in so this stays a pure field mapping.
+        """
+        if not state.has_crashed_song:
+            return None
+        return cls(
+            webpage_url=state.current_song_url,
+            title=state.current_song_title,
+            requester_id=state.current_song_requester_id,
+            ts=position,
+            duration=state.current_song_duration,
+            uploader=state.current_song_uploader,
+            persisted=False,
+        )
+
+    def to_redis(self) -> bytes:
+        """Serialize to the wire format. Field table spelled out (same
+        rationale as NowPlayingData.to_redis_mapping): the wire schema is
+        pinned to QueueEntryField, not to Python attribute names."""
+        return orjson.dumps(
+            {
+                QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
+                QueueEntryField.WEBPAGE_URL: self.webpage_url,
+                QueueEntryField.TITLE: self.title,
+                QueueEntryField.REQUESTER_ID: self.requester_id,
+                QueueEntryField.TS: self.ts,
+                QueueEntryField.USER_INPUT: self.user_input,
+                QueueEntryField.DURATION: self.duration,
+                QueueEntryField.UPLOADER: self.uploader,
+                QueueEntryField.THUMBNAIL: self.thumbnail,
+                QueueEntryField.PERSISTED: self.persisted,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SearchQueueEntry:
+    """An unresolved search at rest ("ytsource" on the wire) — e.g. a Spotify
+    playlist track awaiting yt-dlp resolution. Mirrors exactly the four
+    YTSource fields the wire format persists; the remaining YTSource fields
+    are reconstructed as defaults on rehydration."""
+
+    ytsearch: str | None = None
+    url: str | None = None
+    process: bool | None = None
+    ts: int | None = None
+
+    @classmethod
+    def from_ytsource(cls, source: YTSource) -> Self:
+        return cls(
+            ytsearch=source.ytsearch,
+            url=source.url,
+            process=source.process,
+            ts=source.ts,
+        )
+
+    def to_redis(self) -> bytes:
+        return orjson.dumps(
+            {
+                QueueEntryField.TYPE: _ENTRY_TYPE_SEARCH,
+                QueueEntryField.YTSEARCH: self.ytsearch,
+                QueueEntryField.URL: self.url,
+                QueueEntryField.PROCESS: self.process,
+                QueueEntryField.TS: self.ts,
+            }
+        )
+
+
+QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
+
+
+def parse_queue_entry(data: bytes) -> QueueEntry | None:
+    """Deserialize one queue-list entry into a value object.
+
+    Entries without a "type" field are legacy writes from before the
+    discriminator existed and parse as songs. Corrupt entries (bad JSON,
+    missing required fields) return None with a warning — the entry is
+    dropped and the rest of the queue survives, matching the original
+    _deserialize_queue_item behavior.
+    """
+    try:
+        d = orjson.loads(data)
+        if d.get(QueueEntryField.TYPE) == _ENTRY_TYPE_SEARCH:
+            return SearchQueueEntry(
+                ytsearch=d.get(QueueEntryField.YTSEARCH),
+                url=d.get(QueueEntryField.URL),
+                process=d.get(QueueEntryField.PROCESS),
+                ts=d.get(QueueEntryField.TS),
+            )
+        return SongQueueEntry(
+            webpage_url=d[QueueEntryField.WEBPAGE_URL],
+            title=d[QueueEntryField.TITLE],
+            requester_id=d[QueueEntryField.REQUESTER_ID],
+            ts=d.get(QueueEntryField.TS),
+            user_input=d.get(QueueEntryField.USER_INPUT),
+            duration=d.get(QueueEntryField.DURATION),
+            uploader=d.get(QueueEntryField.UPLOADER),
+            thumbnail=d.get(QueueEntryField.THUMBNAIL),
+            persisted=d.get(QueueEntryField.PERSISTED, True),
+        )
+    except Exception as e:
+        log.warning(f"guild_state: corrupt queue entry dropped: {e}")
+        return None
+
+
+# ── The aggregate — a guild's persisted playback state, read as one unit ─────
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuildPlaybackSnapshot:
+    """A guild's persisted playback aggregate: the state hash plus the pending
+    queue, read together in one round-trip (GuildRedisStore.get_playback_snapshot).
+
+    This is the "a guild owns a queue" relationship as a type: recovery
+    decisions that span both halves live here as named properties instead of
+    boolean expressions at call sites.
+    """
+
+    state: GuildStateData
+    queue: tuple[QueueEntry, ...] = ()
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.queue)
+
+    @property
+    def has_restorable_playback(self) -> bool:
+        """The _restore_guild gate: True when a restart has anything to resume
+        — pending queue entries or a song that was mid-play at crash time."""
+        return bool(self.queue) or self.state.has_crashed_song

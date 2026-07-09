@@ -12,7 +12,7 @@ import discord
 import orjson
 import pytest
 
-from src.guild_state import NowPlayingData
+from src.guild_state import NowPlayingData, SearchQueueEntry, SongQueueEntry
 from src.musicplayer import (
     MusicPlayer,
     _build_progress_bar,
@@ -21,7 +21,7 @@ from src.musicplayer import (
     _fmt_finish_time,
     _fmt_total_duration,
     _requester_mention,
-    _serialize_queue_item,
+    _to_queue_entry,
 )
 from src.sources import YTSource
 from src.youtube import QueueObject
@@ -2638,67 +2638,27 @@ class TestDeserializeQueueItem:
         assert result.persisted is True
 
 
-# ── SerializeQueueItem ────────────────────────────────────────────────────────
+# ── _to_queue_entry ───────────────────────────────────────────────────────────
+# (Wire-format coverage lives in tests/test_guild_state.py — golden fixtures
+#  pin the exact bytes. Here we only cover the live-item → entry dispatch.)
 
 
-class TestSerializeQueueItem:
-    def test_round_trip_all_fields(self, mock_author):
-        qobj = QueueObject(
-            "https://yt.com/v=1",
-            "Test Song",
-            mock_author,
-            ts=30,
-            user_input="my search",
-            duration=240,
-            uploader="My Channel",
-            thumbnail="https://img.youtube.com/vi/1/0.jpg",
-        )
-        data = _serialize_queue_item(qobj)
-        d = orjson.loads(data)
-        assert d["type"] == "qobj"
-        assert d["webpage_url"] == "https://yt.com/v=1"
-        assert d["title"] == "Test Song"
-        assert d["requester_id"] == mock_author.id
-        assert d["ts"] == 30
-        assert d["user_input"] == "my search"
-        assert d["duration"] == 240
-        assert d["uploader"] == "My Channel"
-        assert d["thumbnail"] == "https://img.youtube.com/vi/1/0.jpg"
-        assert d["persisted"] is True
+class TestToQueueEntry:
+    def test_queue_object_becomes_song_entry(self, mock_author):
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author, ts=30)
+        entry = _to_queue_entry(qobj)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.webpage_url == "https://yt.com/v=1"
+        assert entry.requester_id == mock_author.id
+        assert entry.persisted is True
 
-    def test_none_optional_fields_serialize_as_null(self, mock_author):
-        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_author)
-        data = _serialize_queue_item(qobj)
-        d = orjson.loads(data)
-        assert d["user_input"] is None
-        assert d["duration"] is None
-        assert d["uploader"] is None
-        assert d["thumbnail"] is None
-
-    def test_persisted_false_is_serialized(self, mock_author):
-        qobj = QueueObject(
-            "https://yt.com/v=1", "Test Song", mock_author, persisted=False
-        )
-        data = _serialize_queue_item(qobj)
-        d = orjson.loads(data)
-        assert d["persisted"] is False
-
-    def test_ytsource_round_trip(self):
+    def test_ytsource_becomes_search_entry(self):
         src = YTSource(ytsearch="ytsearch:Never Gonna Give You Up", process=True, ts=10)
-        data = _serialize_queue_item(src)
-        d = orjson.loads(data)
-        assert d["type"] == "ytsource"
-        assert d["ytsearch"] == "ytsearch:Never Gonna Give You Up"
-        assert d["process"] is True
-        assert d["ts"] == 10
-        assert "requester_id" not in d
-
-    def test_ytsource_url_preserved(self):
-        src = YTSource(url="https://www.youtube.com/watch?v=abc", process=False)
-        data = _serialize_queue_item(src)
-        d = orjson.loads(data)
-        assert d["type"] == "ytsource"
-        assert d["url"] == "https://www.youtube.com/watch?v=abc"
+        entry = _to_queue_entry(src)
+        assert isinstance(entry, SearchQueueEntry)
+        assert entry.ytsearch == "ytsearch:Never Gonna Give You Up"
+        assert entry.process is True
+        assert entry.ts == 10
 
 
 class TestDeserializeQueueItemYTSource:
@@ -2867,7 +2827,7 @@ class TestLoop:
         music_player.bot.is_closed.side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        await music_player.store.push_queue(_serialize_queue_item(queue_obj))
+        await music_player.store.push_queue(_to_queue_entry(queue_obj))
         await music_player.queue.put(queue_obj)
         music_player.song_queue.append(queue_obj)
 
@@ -2898,7 +2858,7 @@ class TestLoop:
             "https://yt.com/v=crashed", "Crashed Song", mock_author, persisted=False
         )
         await music_player.store.push_queue(
-            _serialize_queue_item(
+            _to_queue_entry(
                 QueueObject("https://yt.com/v=real", "Real Song", mock_author)
             )
         )
