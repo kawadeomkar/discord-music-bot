@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
+    GuildRecoveryGate,
     GuildStateData,
     NowPlayingData,
     SongQueueEntry,
@@ -239,32 +240,43 @@ class TestRebuildQueue:
 
 class TestPushHistory:
     async def test_prepends_item_newest_first(self, store, fake_redis):
-        await store.push_history(b"song1")
-        await store.push_history(b"song2")
+        await store.push_history("song1")
+        await store.push_history("song2")
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert items[0] == b"song2"  # newest first
+        assert items[0] == b'"song2"'  # newest first, JSON-string wire format
 
     async def test_trims_to_50(self, store, fake_redis):
         for i in range(55):
-            await store.push_history(orjson.dumps(f"song {i}"))
+            await store.push_history(f"song {i}")
         items = await fake_redis.lrange(store.history_key(), 0, -1)
         assert len(items) == 50
 
     async def test_sets_ttl(self, store, fake_redis):
-        await store.push_history(b"entry")
+        await store.push_history("entry")
         ttl = await fake_redis.ttl(store.history_key())
         assert ttl > 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.push_history(b"item")  # must not raise
+        await broken_store.push_history("item")  # must not raise
 
 
 class TestGetHistory:
     async def test_returns_up_to_50_items(self, store, fake_redis):
         for i in range(60):
-            await fake_redis.lpush(store.history_key(), f"song{i}".encode())
+            await fake_redis.lpush(store.history_key(), orjson.dumps(f"song{i}"))
         items = await store.get_history()
         assert len(items) == 50
+        assert all(isinstance(item, str) for item in items)
+
+    async def test_round_trips_push(self, store):
+        await store.push_history("Song Title - https://yt.com/v=1")
+        assert await store.get_history() == ["Song Title - https://yt.com/v=1"]
+
+    async def test_drops_corrupt_entries(self, store, fake_redis):
+        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), b"not json")
+        await fake_redis.lpush(store.history_key(), orjson.dumps({"not": "a string"}))
+        assert await store.get_history() == ["good"]
 
     async def test_returns_empty_list_when_missing(self, store):
         items = await store.get_history()
@@ -338,6 +350,29 @@ class TestGetPlaybackSnapshot:
         assert snap is not None
         assert snap.queue == (_entry(1),)
 
+    async def test_includes_now_playing_and_history(self, store, fake_redis):
+        await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
+        await store.push_history("old - url1")
+        await store.push_history("new - url2")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.now_playing is not None
+        assert snap.now_playing.title == "Song"
+        assert snap.history == ("new - url2", "old - url1")  # newest first
+
+    async def test_empty_guild_has_no_now_playing_and_empty_history(self, store):
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.now_playing is None
+        assert snap.history == ()
+
+    async def test_corrupt_history_entries_dropped(self, store, fake_redis):
+        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), b"not json")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.history == ("good",)
+
     async def test_returns_none_on_error(self, broken_store):
         assert await broken_store.get_playback_snapshot() is None
 
@@ -364,6 +399,79 @@ class TestGetPlaybackSnapshot:
         finally:
             fake_redis.pipeline = real_pipeline
         assert snap is not None
+        assert len(execute_counts) == 1
+
+
+class TestGetRecoveryGate:
+    async def test_returns_state_and_queue_length(self, store, fake_redis):
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.rpush(
+            store.queue_key(), _entry(1).to_redis(), _entry(2).to_redis()
+        )
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.state.current_song_url == "https://x"
+        assert gate.pending_count == 2
+        assert gate.has_restorable_playback
+
+    async def test_empty_guild_yields_zero_gate_not_none(self, store):
+        gate = await store.get_recovery_gate()
+        assert gate == GuildRecoveryGate(state=GuildStateData())
+        assert gate.pending_count == 0
+        assert not gate.has_restorable_playback
+
+    async def test_does_not_transfer_queue_contents(self, store, fake_redis):
+        """The whole point of the gate: it reads LLEN, never LRANGE, so the
+        queue payload never rides the wire on the recovery path."""
+        real_lrange = fake_redis.lrange
+        lrange_keys = []
+
+        async def spy_lrange(key, *args, **kwargs):
+            lrange_keys.append(key)
+            return await real_lrange(key, *args, **kwargs)
+
+        await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
+        fake_redis.lrange = spy_lrange
+        try:
+            gate = await store.get_recovery_gate()
+        finally:
+            fake_redis.lrange = real_lrange
+        assert gate is not None and gate.pending_count == 1
+        assert store.queue_key() not in lrange_keys
+
+    async def test_crashed_song_makes_empty_queue_restorable(self, store, fake_redis):
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.pending_count == 0
+        assert gate.has_restorable_playback  # crashed song, empty queue
+
+    async def test_returns_none_on_error(self, broken_store):
+        assert await broken_store.get_recovery_gate() is None
+
+    async def test_single_pipeline_round_trip(self, fake_redis):
+        """State HGETALL and queue LLEN ride one pipeline execute()."""
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        real_pipeline = fake_redis.pipeline
+        execute_counts = []
+
+        def counting_pipeline(*args, **kwargs):
+            pipe = real_pipeline(*args, **kwargs)
+            original_execute = pipe.execute
+
+            async def counted_execute():
+                execute_counts.append(1)
+                return await original_execute()
+
+            pipe.execute = counted_execute
+            return pipe
+
+        fake_redis.pipeline = counting_pipeline
+        try:
+            gate = await store.get_recovery_gate()
+        finally:
+            fake_redis.pipeline = real_pipeline
+        assert gate is not None
         assert len(execute_counts) == 1
 
 

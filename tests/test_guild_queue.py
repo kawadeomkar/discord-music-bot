@@ -6,11 +6,11 @@ operation, the asyncio queue, the display deque, and the Redis mirror agree
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.guild_queue import GuildQueue, ShuffleOutcome
+from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
@@ -43,8 +43,25 @@ async def _assert_triad_sync(gq: GuildQueue, fake_redis, store) -> None:
     items = gq.display_items()
     assert gq.qsize() == len(items)
     redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
-    persisted = [i for i in items if getattr(i, "persisted", True)]
+    persisted = [i for i in items if is_persisted(i)]
     assert len(redis_items) == len(persisted)
+
+
+# ── is_persisted ──────────────────────────────────────────────────────────────
+
+
+class TestIsPersisted:
+    def test_queue_object_reflects_flag(self, mock_author):
+        assert is_persisted(_qobj(1, mock_author)) is True
+        assert is_persisted(_qobj(1, mock_author, persisted=False)) is False
+
+    def test_ytsource_always_persisted(self):
+        assert is_persisted(YTSource(ytsearch="artist song")) is True
+
+    def test_none_is_persisted(self):
+        # The prefetch path's dequeues are always of real, Redis-mirrored
+        # entries — redis_pop_for(None) must pop.
+        assert is_persisted(None) is True
 
 
 # ── put ───────────────────────────────────────────────────────────────────────
@@ -454,3 +471,184 @@ class TestDequeueBookkeeping:
         assert await gq.try_commit_dequeue() is True
         await gq.clear()
         assert await gq.try_commit_dequeue() is False
+
+
+# ── requeue_front ─────────────────────────────────────────────────────────────
+
+
+class TestRequeueFront:
+    async def test_restores_item_to_front_in_order(
+        self, gq, store, fake_redis, mock_author
+    ):
+        a, b, c = (_qobj(n, mock_author) for n in (1, 2, 3))
+        await gq.put([a, b, c])
+        got = gq.get_nowait()
+        assert got is a
+        gq.requeue_front(got)
+        assert gq.qsize() == 3
+        assert gq.display_items() == [a, b, c]
+        await _assert_triad_sync(gq, fake_redis, store)
+        assert gq.get_nowait() is a
+
+    async def test_task_slot_transfers_to_future_consumer(self, gq, mock_author):
+        a = _qobj(1, mock_author)
+        await gq.put([a])
+        gq.requeue_front(gq.get_nowait())
+        assert gq.get_nowait() is a
+        gq.task_done()
+        await asyncio.wait_for(gq._pending.join(), timeout=1)
+
+    async def test_accepts_resolved_substitute(self, gq_no_redis, mock_author):
+        # A YTSource dequeued by the prefetch may come back in resolved form.
+        src = YTSource(ytsearch="artist song")
+        await gq_no_redis.put([src])
+        gq_no_redis.get_nowait()
+        resolved = _qobj(9, mock_author)
+        gq_no_redis.requeue_front(resolved)
+        assert gq_no_redis.qsize() == 1
+        assert gq_no_redis.get_nowait() is resolved
+
+
+# ── bulk mutations vs in-flight dequeue ───────────────────────────────────────
+
+
+class TestShuffleWithInFlightDequeue:
+    async def test_in_flight_head_keeps_display_and_redis_position(
+        self, gq, store, fake_redis, mock_author
+    ):
+        """The loop dequeued an item and is resolving it (display/Redis heads
+        not yet committed); -shuffle must reorder only the pending items and
+        carry the in-flight head through on both legs — otherwise the
+        eventual commit retires someone else's entry and the triad desyncs
+        permanently."""
+        items = [_qobj(n, mock_author) for n in range(1, 6)]
+        await gq.put(items)
+        in_flight = await gq.get()  # the loop's dequeue; commit comes later
+
+        assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+
+        display = gq.display_items()
+        assert display[0] is in_flight
+        assert len(display) == 5
+        assert gq.qsize() == 4
+        assert sorted(id(i) for i in display[1:]) == sorted(id(i) for i in items[1:])
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert len(redis_items) == 5
+        assert parse_queue_entry(redis_items[0]) == SongQueueEntry.from_queue_object(
+            in_flight
+        )
+
+        # The loop finishes resolving and commits, exactly as musicplayer
+        # does: display pop + the start transaction's LPOP.
+        assert await gq.try_commit_dequeue() is True
+        await store.pop_queue()
+        gq.task_done()
+        await _assert_triad_sync(gq, fake_redis, store)
+        redis_after = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert [parse_queue_entry(r) for r in redis_after] == [
+            SongQueueEntry.from_queue_object(i) for i in gq.display_items()
+        ]
+
+    async def test_unpersisted_in_flight_head_kept_on_display_not_redis(
+        self, gq, store, fake_redis, mock_guild, mock_author
+    ):
+        """The crash-recovered head (persisted=False) mid-resolve: shuffle
+        must keep its display-head position but never write it to Redis."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        crashed = SongQueueEntry(
+            webpage_url="https://yt.com/v=crash",
+            title="Crashed",
+            requester_id=mock_author.id,
+            persisted=False,
+        )
+        assert await gq.restore_crashed(crashed, requester_fallback=mock_guild.me)
+        await gq.put([_qobj(n, mock_author) for n in range(1, 5)])
+        in_flight = await gq.get()
+        assert in_flight.persisted is False
+
+        assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
+
+        assert gq.display_items()[0] is in_flight
+        assert len(gq.display_items()) == 5
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert len(redis_items) == 4  # the crashed head is never persisted
+
+
+class TestRemoveWithInFlightDequeue:
+    async def test_in_flight_head_survives_and_positions_match_embed(
+        self, gq, store, fake_redis, mock_author
+    ):
+        items = [_qobj(n, mock_author) for n in range(1, 6)]
+        await gq.put(items)
+        in_flight = await gq.get()  # items[0]
+
+        removed = await gq.remove(items[2].webpage_url)
+
+        # The queue embed numbers display items from 1 with the in-flight
+        # head included, so items[2] shows as #3.
+        assert removed == [3]
+        display = gq.display_items()
+        assert display[0] is in_flight
+        assert display == [in_flight, items[1], items[3], items[4]]
+        assert gq.qsize() == 3
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert parse_queue_entry(redis_items[0]) == SongQueueEntry.from_queue_object(
+            in_flight
+        )
+
+        assert await gq.try_commit_dequeue() is True
+        await store.pop_queue()
+        gq.task_done()
+        await _assert_triad_sync(gq, fake_redis, store)
+
+    async def test_in_flight_head_never_removed_even_on_url_match(
+        self, gq, store, fake_redis, mock_author
+    ):
+        """Removing the resolving/starting song is -skip's job: a URL match
+        against the in-flight head removes only pending duplicates."""
+        a1 = _qobj(1, mock_author)
+        a_dup = _qobj(1, mock_author)  # same URL, still pending
+        b = _qobj(2, mock_author)
+        await gq.put([a1, a_dup, b])
+        in_flight = await gq.get()
+        assert in_flight is a1
+
+        removed = await gq.remove(a1.webpage_url)
+
+        assert removed == [2]  # only the pending duplicate, embed-numbered
+        assert gq.display_items() == [a1, b]
+        assert gq.qsize() == 1
+
+
+# ── put vs clear mutual exclusion ─────────────────────────────────────────────
+
+
+class TestPutClearMutualExclusion:
+    async def test_clear_cannot_interleave_between_puts_memory_and_redis_writes(
+        self, gq, store, fake_redis, mock_author
+    ):
+        """put() suspends at its Redis push; a concurrent clear() must block
+        on the mutex instead of draining at that point — otherwise the push
+        lands after clear's DEL and resurrects the entry as a ghost that the
+        next dequeue would LPOP instead of its own."""
+        release = asyncio.Event()
+        original_push = store.push_queue
+
+        async def gated_push(entry):
+            await release.wait()
+            await original_push(entry)
+
+        with patch.object(store, "push_queue", new=gated_push):
+            put_task = asyncio.create_task(gq.put([_qobj(1, mock_author)]))
+            await asyncio.sleep(0)  # put reaches the gated push, holding the mutex
+            clear_task = asyncio.create_task(gq.clear())
+            await asyncio.sleep(0)
+            assert not clear_task.done()  # blocked on the mutex, not interleaved
+            release.set()
+            await put_task
+            cleared = await clear_task
+
+        assert [i.title for i in cleared] == ["Song 1"]
+        assert gq.qsize() == 0
+        assert gq.display_items() == []
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == []

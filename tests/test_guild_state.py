@@ -8,11 +8,14 @@ import pytest
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
+    GuildRecoveryGate,
     GuildStateData,
     NowPlayingData,
     SearchQueueEntry,
     SongQueueEntry,
+    parse_history_entry,
     parse_queue_entry,
+    serialize_history_entry,
 )
 
 
@@ -399,6 +402,34 @@ class TestParseQueueEntryCorrupt:
         assert "corrupt queue entry" in caplog.text
 
 
+class TestHistoryEntryWire:
+    def test_golden_bytes(self):
+        # Wire format pinned: entries written before the migration are
+        # JSON-encoded strings and must stay readable across restarts.
+        assert (
+            serialize_history_entry("Song Title - https://yt.com/v=1")
+            == b'"Song Title - https://yt.com/v=1"'
+        )
+
+    def test_round_trip(self):
+        entry = "Song Title - https://yt.com/v=1"
+        assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"not json at all",
+            b'{"a": "json object, not a string"}',
+            b"123",
+            b"",
+        ],
+    )
+    def test_corrupt_entry_dropped_with_warning(self, raw, caplog):
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_history_entry(raw) is None
+        assert "corrupt history entry" in caplog.text
+
+
 class TestFromCrashedState:
     def test_none_when_no_crashed_song(self):
         assert SongQueueEntry.from_crashed_state(GuildStateData(), position=10) is None
@@ -464,6 +495,31 @@ class TestGuildPlaybackSnapshot:
         snap = GuildPlaybackSnapshot(state=GuildStateData())
         with pytest.raises(dataclasses.FrozenInstanceError):
             snap.queue = ()  # type: ignore[misc]
+
+
+class TestGuildRecoveryGate:
+    @pytest.mark.parametrize(
+        "pending_count,crashed,expected",
+        [
+            (0, False, False),
+            (0, True, True),
+            (2, False, True),
+            (2, True, True),
+        ],
+    )
+    def test_has_restorable_playback_truth_table(
+        self, pending_count, crashed, expected
+    ):
+        """Mirrors GuildPlaybackSnapshot's gate, over the queue length instead
+        of the queue tuple."""
+        state = GuildStateData(current_song_url="https://x" if crashed else "")
+        gate = GuildRecoveryGate(state=state, pending_count=pending_count)
+        assert gate.has_restorable_playback is expected
+
+    def test_frozen(self):
+        gate = GuildRecoveryGate(state=GuildStateData())
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            gate.pending_count = 5  # type: ignore[misc]
 
 
 class TestQueueEntryImmutability:

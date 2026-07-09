@@ -1157,7 +1157,7 @@ class TestMusicPlayerInitialState:
 class TestRedisHelpers:
     async def test_redis_push_history_capped_at_50(self, music_player, fake_redis):
         for i in range(55):
-            await music_player.store.push_history(orjson.dumps(f"Song {i} - url{i}"))
+            await music_player.store.push_history(f"Song {i} - url{i}")
         items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
         assert len(items) == 50
 
@@ -1214,13 +1214,13 @@ class TestStateRestore:
         await mp._restore_state()
         assert mp.queue.qsize() == 0
 
-    async def test_restore_reads_snapshot_then_gathers_np_and_history(
+    async def test_restore_reads_everything_in_one_snapshot_call(
         self, music_player, fake_redis
     ):
-        """The queue rides the playback snapshot (one pipelined read with the
-        state hash); now_playing and history are independent reads gathered
-        afterwards — guard against a future edit reintroducing a hidden
-        ordering dependency or an extra queue round-trip."""
+        """State, queue, now-playing, and history all ride the single
+        pipelined get_playback_snapshot() read — guard against a future edit
+        reintroducing per-key reads (recovery was 3 round trips per guild
+        before the snapshot absorbed now_playing/history)."""
         snapshot_spy = AsyncMock(wraps=music_player.store.get_playback_snapshot)
         get_np_spy = AsyncMock(wraps=music_player.store.get_now_playing)
         get_history_spy = AsyncMock(wraps=music_player.store.get_history)
@@ -1231,8 +1231,26 @@ class TestStateRestore:
         ):
             await music_player._restore_state()
         snapshot_spy.assert_awaited_once()
-        get_np_spy.assert_awaited_once()
-        get_history_spy.assert_awaited_once()
+        get_np_spy.assert_not_awaited()
+        get_history_spy.assert_not_awaited()
+
+    async def test_restore_populates_history_from_snapshot(
+        self, music_player, fake_redis
+    ):
+        await music_player.store.push_history("Old Song - url1")
+        await music_player.store.push_history("New Song - url2")
+        await music_player._restore_state()
+        assert list(music_player.history) == ["Old Song - url1", "New Song - url2"]
+
+    async def test_restore_populates_play_message_from_snapshot(
+        self, music_player, fake_redis
+    ):
+        await fake_redis.hset(
+            music_player.store.now_playing_key(), b"title", b"Crashed Song"
+        )
+        await music_player._restore_state()
+        assert music_player.play_message is not None
+        assert "Crashed Song" in music_player.play_message.title
 
 
 # ── RestoreCrashedSong ────────────────────────────────────────────────────────
@@ -2495,28 +2513,111 @@ class TestPrefetchNextSong:
             result = await music_player._prefetch_next_song()
         assert result is mock_song
 
-    async def test_returns_none_and_calls_task_done_on_stream_error(
-        self, music_player, queue_obj
+    async def test_stream_error_retires_dequeue_on_all_three_legs(
+        self, music_player, queue_obj, fake_redis
     ):
-        await music_player.queue._pending.put(queue_obj)
+        """A prefetch whose resolve/stream raises must retire its dequeue
+        everywhere — pending was popped by get_nowait(), so leaving the
+        display/Redis heads in place would make the next commit retire the
+        wrong entry."""
+        await music_player.queue.put([queue_obj])
         with patch(
             "src.musicplayer.YTDL.yt_stream",
             new=AsyncMock(side_effect=Exception("network")),
         ):
             result = await music_player._prefetch_next_song()
         assert result is None
+        assert music_player.queue.qsize() == 0
+        assert music_player.queue.display_items() == []
+        queue_key = music_player.store.queue_key()
+        assert await fake_redis.lrange(queue_key, 0, -1) == []
 
-    async def test_reraises_cancelled_error_and_calls_task_done(
-        self, music_player, queue_obj
+    async def test_swallowed_stream_failure_retires_dequeue(
+        self, music_player, queue_obj, fake_redis
     ):
-        await music_player.queue._pending.put(queue_obj)
+        """_stream_source catches its own exceptions and returns None — that
+        path must retire the dequeue exactly like the raise path."""
+        await music_player.queue.put([queue_obj])
         with patch.object(
-            MusicPlayer,
-            "_resolve_source",
-            new=AsyncMock(side_effect=asyncio.CancelledError()),
+            MusicPlayer, "_stream_source", new=AsyncMock(return_value=None)
         ):
+            result = await music_player._prefetch_next_song()
+        assert result is None
+        assert music_player.queue.qsize() == 0
+        assert music_player.queue.display_items() == []
+        queue_key = music_player.store.queue_key()
+        assert await fake_redis.lrange(queue_key, 0, -1) == []
+
+    async def test_cancellation_requeues_held_item_at_front(
+        self, music_player, queue_obj, queue_obj_no_meta, fake_redis
+    ):
+        """-clear/-shuffle/-remove cancel the prefetch before mutating; the
+        item it holds must return to the front of the pending queue — not be
+        dropped — so the mutation drains/reorders it with everything else
+        instead of silently losing the next song."""
+        await music_player.queue.put([queue_obj, queue_obj_no_meta])
+        started = asyncio.Event()
+        never_set = asyncio.Event()
+
+        async def hang(self, source):
+            started.set()
+            await never_set.wait()
+            return source
+
+        with patch.object(MusicPlayer, "_resolve_source", new=hang):
+            task = asyncio.create_task(music_player._prefetch_next_song())
+            await started.wait()
+            task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await music_player._prefetch_next_song()
+                await task
+
+        assert music_player.queue.qsize() == 2
+        assert music_player.queue.display_items() == [queue_obj, queue_obj_no_meta]
+        # Original order restored, and the transferred task slot balances:
+        # consuming both items normally lets join() complete.
+        assert music_player.queue.get_nowait() is queue_obj
+        music_player.queue.task_done()
+        assert music_player.queue.get_nowait() is queue_obj_no_meta
+        music_player.queue.task_done()
+        await asyncio.wait_for(music_player.queue._pending.join(), timeout=1)
+
+
+# ── Loop task accounting ──────────────────────────────────────────────────────
+
+
+class TestLoopTaskAccounting:
+    async def test_exception_after_commit_still_balances_task_counter(
+        self, music_player, queue_obj, mock_song
+    ):
+        """A failure landing between the committed dequeue and the normal
+        song-end task_done() (here: the voice client vanished during resolve,
+        so the isinstance assert fails before vc.play) must still balance the
+        get() in the loop's exception handler — otherwise the queue's task
+        counter drifts upward on every such failure."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+        music_player._guild.voice_client = None
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        await asyncio.wait_for(music_player.queue._pending.join(), timeout=1)
 
 
 # ── QueueGet ──────────────────────────────────────────────────────────────────
@@ -3071,32 +3172,18 @@ class TestRestoreCompleteEvent:
 
     async def test_set_and_restore_aborted_when_state_read_fails(self, music_player):
         """get_playback_snapshot() returning None (Redis unavailable) aborts
-        the restore early — no history/now-playing reads are attempted — but
-        the loop guard event is still set."""
+        the restore early — nothing is fabricated — but the loop guard event
+        is still set."""
         music_player.bot.wait_until_ready = AsyncMock()
-        get_history_spy = AsyncMock(wraps=music_player.store.get_history)
-        with (
-            patch.object(
-                music_player.store,
-                "get_playback_snapshot",
-                new=AsyncMock(return_value=None),
-            ),
-            patch.object(music_player.store, "get_history", get_history_spy),
+        with patch.object(
+            music_player.store,
+            "get_playback_snapshot",
+            new=AsyncMock(return_value=None),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
         assert music_player.queue.qsize() == 0
-        get_history_spy.assert_not_awaited()
-
-    async def test_set_even_when_history_read_fails(self, music_player):
-        music_player.bot.wait_until_ready = AsyncMock()
-        with patch.object(
-            music_player.store,
-            "get_history",
-            new=AsyncMock(side_effect=Exception("redis down")),
-        ):
-            await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
+        assert len(music_player.history) == 0
 
 
 # ── _build_now_playing_embed_from_data ────────────────────────────────────────
