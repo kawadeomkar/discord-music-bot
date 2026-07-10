@@ -424,8 +424,12 @@ class MusicBot(commands.Cog):
         try:
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-                await self.get_mp(ctx).pause(vc)
+                mp = self.get_mp(ctx)
+                await mp.pause(vc)
                 await ctx.message.add_reaction("⏸️")
+                embed = mp.build_pause_confirmation_embed()
+                if embed is not None:
+                    await ctx.send(embed=embed)
         except Exception as e:
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
