@@ -90,7 +90,11 @@ def _build_progress_bar(
 ) -> str:
     if duration_secs <= 0:
         return ""
-    ratio = max(0.0, min(1.0, elapsed_secs / duration_secs))
+    # Clamp before formatting so the elapsed label can never overshoot the
+    # duration label (imprecise duration metadata plus an FFmpeg -ss start
+    # offset can push the raw position past the reported duration).
+    elapsed_secs = max(0.0, min(elapsed_secs, float(duration_secs)))
+    ratio = elapsed_secs / duration_secs
     head_pos = min(width - 1, int(ratio * width))
     bar = (
         _BAR_FILL_DONE * head_pos
@@ -709,13 +713,24 @@ class MusicPlayer:
     # deleted if it was a dedicated NP message, strip-edited back to its own
     # embeds otherwise. Full design: docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md.
 
-    def np_embed_block(self) -> list[discord.Embed]:
+    def np_embed_block(
+        self, *, now_playing: Optional[discord.Embed] = None
+    ) -> list[discord.Embed]:
         """The [now_playing, next_up?] embed block, or [] when no song is live.
-        The single place encoding the block's internal order."""
+        The single place encoding the block's internal order. `now_playing`
+        lets a caller that already built this song's NP embed supply it instead
+        of building an identical one (_send_now_playing stores it as
+        play_message first)."""
         song = self.current_song
         if song is None:
             return []
-        block = [self._build_now_playing_embed(song)]
+        block = [
+            (
+                now_playing
+                if now_playing is not None
+                else self._build_now_playing_embed(song)
+            )
+        ]
         next_up = self._build_next_up_embed()
         if next_up is not None:
             block.append(next_up)
@@ -736,6 +751,13 @@ class MusicPlayer:
         old_msg = self._np_host_message
         old_own = self._np_host_own_embeds
         old_dedicated = self._np_host_dedicated
+        if old_msg is not None and message.id < old_msg.id:
+            # Two overlapping sends can complete out of order: channel position
+            # is send-START order, but adopts run in send-RETURN order. Adopting
+            # the older message would pull the block up from the true bottom —
+            # keep the newer host and shed the older message's block instead.
+            self._spawn_background(self._retire_np_host(message, own_embeds, dedicated))
+            return
         self._np_host_message = message
         self._np_host_own_embeds = own_embeds
         self._np_host_dedicated = dedicated
@@ -743,6 +765,29 @@ class MusicPlayer:
             self._spawn_background(
                 self._retire_np_host(old_msg, old_own, old_dedicated)
             )
+
+    def _adopt_np_host_if_current(
+        self,
+        message: discord.Message,
+        own_embeds: list[discord.Embed],
+        song: Optional[YTDL],
+        *,
+        dedicated: bool = False,
+    ) -> bool:
+        """Adopt gate for every attach site: the NP block inside `message` was
+        built for `song` BEFORE the send's await, and the song may have ended
+        (or been replaced) while the HTTP call was in flight. Adopting then
+        would install a stale block as host — and delete-retire the next
+        song's freshly sent NP message, or (with an empty queue) leave a bogus
+        frozen block that nothing ever cleans up. Instead the just-sent
+        message sheds the stale block it is carrying (strip-edit back to its
+        own embeds, or delete when it is a dedicated NP message). Returns True
+        when the message was adopted."""
+        if song is not None and self.current_song is song:
+            self._adopt_np_host(message, own_embeds, dedicated=dedicated)
+            return True
+        self._spawn_background(self._retire_np_host(message, own_embeds, dedicated))
+        return False
 
     async def _retire_np_host(
         self,
@@ -775,6 +820,22 @@ class MusicPlayer:
         self._np_host_own_embeds = []
         self._np_host_dedicated = False
 
+    async def retire_np_host_on_stop(self) -> None:
+        """-stop / alone-disconnect teardown: dispose of the host so no message
+        keeps a live-looking bar for a player that no longer exists. Song end
+        RELEASES instead — a completed bar is a truthful historical record — but
+        a bar frozen mid-song on a stopped player is not, so here the dedicated
+        NP message is deleted and a response host is stripped back to its own
+        embeds. Called by cleanup() after the progress/loop tasks are cancelled,
+        so no tick can race the retire."""
+        host = self._np_host_message
+        own = self._np_host_own_embeds
+        dedicated = self._np_host_dedicated
+        if host is None:
+            return
+        self._release_np_host()
+        await self._retire_np_host(host, own, dedicated)
+
     async def send_with_np(
         self,
         content: Optional[str] = None,
@@ -785,6 +846,7 @@ class MusicPlayer:
         MusicContext's attach hook) but must still keep the NP block at the
         bottom — same splice-send-adopt sequence as MusicContext.send."""
         own = [embed] if embed is not None else []
+        song = self.current_song  # the song the block below is built for
         block = self.np_embed_block()
         embeds = block + own
         if embeds:
@@ -792,7 +854,7 @@ class MusicPlayer:
         else:
             message = await self._channel.send(content)
         if block:
-            self._adopt_np_host(message, own)
+            self._adopt_np_host_if_current(message, own, song)
         return message
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
@@ -927,23 +989,41 @@ class MusicPlayer:
             log.error(f"Error processing song: {type(e).__name__}: {e}", exc_info=True)
             return None
 
-    async def _send_np_host_message(self) -> Optional[discord.Message]:
+    async def _send_np_host_message(
+        self, *, now_playing: Optional[discord.Embed] = None
+    ) -> Optional[discord.Message]:
         """Send a dedicated NP host message (its embeds are only the NP block)
         and adopt it — the adopt retires whatever hosted the block before.
-        Returns None when there is no live song to describe."""
-        block = self.np_embed_block()
+        Returns None when there is no live song to describe, or when the song
+        changed while the send was in flight (the stale message is deleted
+        instead of adopted)."""
+        song = self.current_song
+        block = self.np_embed_block(now_playing=now_playing)
         if not block:
             return None
         message = await self._channel.send(embeds=block)
-        self._adopt_np_host(message, [], dedicated=True)
+        if not self._adopt_np_host_if_current(message, [], song, dedicated=True):
+            return None
         return message
 
     async def repin_now_playing(self) -> bool:
         """-now: re-host the NP block at the bottom of the channel as a fresh
         dedicated message. Does NOT touch _progress_task — the running updater
         follows the host pointer and picks up the new message on its next tick.
-        Returns False when no song is live."""
+        Returns False when no song is live (including a song that ended while
+        the send was in flight) so the command can respond another way."""
         return await self._send_np_host_message() is not None
+
+    async def rehost_np_after_resume(self) -> None:
+        """-resume: if a command response currently hosts the block — typically
+        the -pause confirmation — re-host onto a fresh dedicated message. The
+        old response is strip-retired back to its own embeds, so a "⏸️ Paused
+        at…" line becomes plain history instead of being re-rendered beneath a
+        live, advancing bar by every tick for the rest of the song. A dedicated
+        host has no stale state to shed, so it is left alone."""
+        if self._np_host_message is None or self._np_host_dedicated:
+            return
+        await self._send_np_host_message()
 
     async def _send_now_playing(self, song: YTDL) -> None:
         # Release before attempting the send (not after failure) so a failed/
@@ -953,7 +1033,7 @@ class MusicPlayer:
         self._release_np_host()
         try:
             self.play_message = self._build_now_playing_embed(song)
-            message = await self._send_np_host_message()
+            message = await self._send_np_host_message(now_playing=self.play_message)
             if message is None:
                 return
             if song.duration_secs >= 5:
@@ -982,6 +1062,11 @@ class MusicPlayer:
             )
             next_up = self._build_next_up_embed()
             embeds = [embed] + ([next_up] if next_up else []) + own_embeds
+            # ≤10 is Discord's per-message embed cap: an attach accepted at the
+            # cap can overflow here if a next-up embed appears later. Drop the
+            # own-embeds tail, never the block (parity with MusicContext.send's
+            # attach guard; unreachable with current commands, max own = 1).
+            embeds = embeds[:10]
             await message.edit(embeds=embeds)
             return True
         except discord.NotFound:
@@ -1003,7 +1088,11 @@ class MusicPlayer:
             if host is None:
                 return
             if not await self._push_np_edit(song, host, self._np_host_own_embeds):
-                self._release_np_host()
+                # Adopt is lock-free, so a command response may have swapped in
+                # a new host while this PATCH was in flight — releasing then
+                # would orphan the new host's block. Only release OUR host.
+                if self._np_host_message is host:
+                    self._release_np_host()
 
     async def _finalize_now_playing(
         self,
@@ -1018,13 +1107,18 @@ class MusicPlayer:
         self._np_host_message at run time, since both may already point at the
         next song by the time this (fire-and-forget) task actually runs. The
         host has already been released by loop() before this fires, so no tick
-        or retire can target the message — no lock needed.
+        or retire can START against the message — but a debounce-spawned
+        _edit_now_playing_once that captured the host before the release can
+        still have a PATCH in flight (resume ≤ debounce window before song
+        end); it holds _np_edit_lock across its edit, so taking the lock here
+        orders this completed-bar write after it (last write wins).
         """
         if song.duration_secs <= 0:
             return  # no bar was ever shown for this song — nothing to finalize
-        await self._push_np_edit(
-            song, message, own_embeds, position_override=song.duration_secs
-        )
+        async with self._np_edit_lock:
+            await self._push_np_edit(
+                song, message, own_embeds, position_override=song.duration_secs
+            )
 
     def _spawn_background(self, coro: Any) -> asyncio.Task:
         """Create a fire-and-forget task tracked in _background_tasks."""
@@ -1058,8 +1152,12 @@ class MusicPlayer:
                         song, host, self._np_host_own_embeds
                     ):
                         # host deleted by a user — go dormant rather than die;
-                        # the next command response (or -now) re-hosts the block
-                        self._release_np_host()
+                        # the next command response (or -now) re-hosts the
+                        # block. Adopt is lock-free, so if a new host was
+                        # swapped in while this PATCH was in flight, releasing
+                        # would orphan it — only release OUR host.
+                        if self._np_host_message is host:
+                            self._release_np_host()
         except asyncio.CancelledError:
             raise
 

@@ -35,10 +35,15 @@ class MusicContext(commands.Context):
         mp = self._np_player()
         if mp is None:
             return await super().send(content, **kwargs)
-        own: list[discord.Embed] = list(kwargs.pop("embeds", None) or [])
+        embeds_kwarg = kwargs.pop("embeds", None)
         single = kwargs.pop("embed", None)
+        if single is not None and embeds_kwarg is not None:
+            # match discord.py's own send() contract instead of silently merging
+            raise TypeError("cannot pass both embed and embeds parameter to send()")
+        own: list[discord.Embed] = list(embeds_kwarg or [])
         if single is not None:
             own.append(single)
+        song = mp.current_song  # the song the block below is built for
         block = mp.np_embed_block()
         # ≤10 is Discord's per-message embed cap — defensive; never expected
         # to trip with this bot's embed counts (worst case is 3).
@@ -49,7 +54,10 @@ class MusicContext(commands.Context):
         else:
             message = await super().send(content, **kwargs)
         if attached:
-            mp._adopt_np_host(message, own)
+            # Gate on the song still being current — the send's await may have
+            # crossed a song boundary, making the attached block stale (the
+            # gate sheds it from the just-sent message instead of adopting).
+            mp._adopt_np_host_if_current(message, own, song)
         return message
 
     def _np_player(self) -> Optional["MusicPlayer"]:
