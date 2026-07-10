@@ -557,7 +557,7 @@ class MusicBot(commands.Cog):
                 (f"{pos_label} removed", pos_str, False),
             ],
         )
-        await ctx.send(embed=mp.get_queue())
+        await ctx.send(embed=mp.queue_embed())
         await ctx.message.add_reaction("🗑️")
 
     @commands.command(
@@ -623,7 +623,7 @@ class MusicBot(commands.Cog):
     async def queue(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            await ctx.send(embed=mp.get_queue())
+            await ctx.send(embed=mp.queue_embed())
         except Exception as e:
             log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -750,13 +750,17 @@ class MusicBot(commands.Cog):
             )
             return
         try:
-            guild_state = await store.get_guild_state()
-            if guild_state is None:
+            # One pipelined read serves every gate below: the connection gate
+            # (state hash) and the anything-to-restore gate (queue + crashed
+            # song, via the playback aggregate).
+            snapshot = await store.get_playback_snapshot()
+            if snapshot is None:
                 # Redis read failed — do NOT treat as "nothing to restore". Skip
                 # this attempt; the recovery lock expires in 60s and the next
                 # on_ready (session re-establishment) retries.
                 log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
                 return
+            guild_state = snapshot.state
             # Equivalent to `not guild_state.has_active_connection`, spelled as
             # explicit None checks so the channel IDs narrow to int below.
             vc_id = guild_state.voice_channel_id
@@ -818,15 +822,12 @@ class MusicBot(commands.Cog):
                         )
                 return
 
-            # Check there is something to restore before connecting. The state
-            # snapshot read above covers the crashed-song check — one HGETALL
-            # serves both this gate and the connection gate.
-            queue_items = await store.get_queue()
-            if not queue_items and not guild_state.has_crashed_song:
+            # Check there is something to restore before connecting.
+            if not snapshot.has_restorable_playback:
                 return
 
             trace.get_current_span().set_attribute(
-                "restore.queue_count", len(queue_items)
+                "restore.queue_count", snapshot.pending_count
             )
             trace.get_current_span().set_attribute(
                 "restore.crashed_song", guild_state.has_crashed_song

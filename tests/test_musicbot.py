@@ -1545,14 +1545,15 @@ class TestRestoreGuildStateReadFailed:
     async def test_recovery_skipped_when_state_read_fails(
         self, music_bot_with_redis, mock_guild, fake_redis_bot, caplog
     ):
-        """get_guild_state() returning None (Redis unavailable) must NOT be
-        treated as "nothing to restore": recovery is skipped with a warning and
-        no channel resolution or player creation is attempted. Distinguishable
-        from the empty-snapshot case, which also skips but silently."""
+        """get_playback_snapshot() returning None (Redis unavailable) must NOT
+        be treated as "nothing to restore": recovery is skipped with a warning
+        and no channel resolution or player creation is attempted.
+        Distinguishable from the empty-snapshot case, which also skips but
+        silently."""
         from src.redis_client import GuildRedisStore
 
         with patch.object(
-            GuildRedisStore, "get_guild_state", new=AsyncMock(return_value=None)
+            GuildRedisStore, "get_playback_snapshot", new=AsyncMock(return_value=None)
         ):
             with caplog.at_level("WARNING", logger="src.musicbot"):
                 await music_bot_with_redis._restore_guild(mock_guild)
@@ -1707,7 +1708,7 @@ class TestQueueCommand:
             title="Queue", description="Songs: **0**\n\n*The queue is empty.*"
         )
         mp = MagicMock()
-        mp.get_queue = MagicMock(return_value=embed)
+        mp.queue_embed = MagicMock(return_value=embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.queue.callback(music_bot, mock_ctx)
@@ -1722,7 +1723,7 @@ class TestQueueCommand:
             title="Queue", description="Songs: **0**\n\n*The queue is empty.*"
         )
         mp = MagicMock()
-        mp.get_queue = MagicMock(return_value=embed)
+        mp.queue_embed = MagicMock(return_value=embed)
         mp.song_queue = []
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -1732,12 +1733,12 @@ class TestQueueCommand:
 
     async def test_delegates_to_mp_get_queue(self, music_bot, mock_ctx):
         mp = MagicMock()
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.queue.callback(music_bot, mock_ctx)
 
-        mp.get_queue.assert_called_once()
+        mp.queue_embed.assert_called_once()
 
 
 # ── Remove command ────────────────────────────────────────────────────────────
@@ -1767,7 +1768,7 @@ class TestRemoveCommand:
     async def test_match_sends_removal_embed(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[2])
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.remove.callback(
@@ -1785,7 +1786,7 @@ class TestRemoveCommand:
         queue_embed = discord.Embed(title="Queue")
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
-        mp.get_queue = MagicMock(return_value=queue_embed)
+        mp.queue_embed = MagicMock(return_value=queue_embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.remove.callback(
@@ -1801,7 +1802,7 @@ class TestRemoveCommand:
     async def test_match_adds_trash_reaction(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.remove.callback(
@@ -1813,7 +1814,7 @@ class TestRemoveCommand:
     async def test_removal_embed_contains_url_field(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[3])
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
         url = "https://yt.com/watch?v=abc"
 
@@ -1826,7 +1827,7 @@ class TestRemoveCommand:
     async def test_removal_embed_shows_positions(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1, 4])
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.remove.callback(
@@ -1840,7 +1841,7 @@ class TestRemoveCommand:
     async def test_removal_embed_color_is_orange(self, music_bot, mock_ctx):
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
-        mp.get_queue = MagicMock(return_value=discord.Embed(title="Queue"))
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.remove.callback(

@@ -567,21 +567,21 @@ class TestQueueRemove:
 class TestGetQueue:
     def test_returns_discord_embed(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        result = music_player.get_queue()
+        result = music_player.queue_embed()
         assert isinstance(result, discord.Embed)
 
     def test_embed_title_is_queue(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.title == "Queue"
 
     def test_embed_color_is_blue(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.colour == discord.Color.blue()
 
     def test_empty_queue_description(self, music_player):
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Songs: **0**" in embed.description
         assert "*The queue is empty.*" in embed.description
 
@@ -592,7 +592,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=120
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Songs: **3**" in embed.description
 
     def test_total_duration_in_header_when_all_known(self, music_player, mock_author):
@@ -602,7 +602,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=90)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Total Duration: **3m**" in embed.description
         assert "~" not in embed.description.split("Total Duration:")[1].split("\n")[0]
 
@@ -613,7 +613,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=None)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~" in embed.description
 
     def test_total_duration_partial_with_ytsource(self, music_player, mock_author):
@@ -623,36 +623,36 @@ class TestGetQueue:
         music_player.queue._display.append(
             YTSource(ytsearch="ytsearch:unresolved", process=True)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~" in embed.description
 
     def test_song_title_appears_in_description(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Test Song" in embed.description
 
     def test_song_duration_appears_when_known(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "`3:30`" in embed.description
 
     def test_song_duration_unknown_shows_placeholder(
         self, music_player, queue_obj_no_meta
     ):
         music_player.queue._display.append(queue_obj_no_meta)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "`?:??`" in embed.description
 
     def test_uploader_shown_when_known(self, music_player, queue_obj):
         music_player.queue._display.append(queue_obj)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Test Channel" in embed.description
 
     def test_unknown_channel_shown_when_uploader_none(
         self, music_player, queue_obj_no_meta
     ):
         music_player.queue._display.append(queue_obj_no_meta)
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "Unknown channel" in embed.description
 
     def test_est_playing_at_present_for_each_song(self, music_player, mock_author):
@@ -662,7 +662,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.description.count("Est. playing at") == 3
 
     def test_uncertain_prefix_after_no_duration_song(self, music_player, mock_author):
@@ -672,7 +672,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         # First song: no preceding unknown → no ~
         # Second song: preceding song had unknown duration → ~
         lines = embed.description.split("\n")
@@ -689,7 +689,7 @@ class TestGetQueue:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "~**" in embed.description
 
     def test_caps_display_at_ten_songs(self, music_player, mock_author):
@@ -699,7 +699,7 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert embed.description.count("Est. playing at") == 10
 
     def test_shows_more_indicator_when_over_ten(self, music_player, mock_author):
@@ -709,14 +709,14 @@ class TestGetQueue:
                     f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=60
                 )
             )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "... and 5 more" in embed.description
 
     def test_ytsource_shows_resolving(self, music_player):
         music_player.queue._display.append(
             YTSource(ytsearch="ytsearch:some song", process=True)
         )
-        embed = music_player.get_queue()
+        embed = music_player.queue_embed()
         assert "resolving..." in embed.description
 
 
@@ -760,7 +760,7 @@ class TestEstimatedPlayingAt:
 
     def test_matches_last_queue_line_eta(self, music_player, mock_song, mock_author):
         """estimated_playing_at() should reflect the same seed used by
-        get_queue()/_build_next_up_embed() for consistency across embeds."""
+        queue_embed()/_build_next_up_embed() for consistency across embeds."""
         music_player.current_song = mock_song
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=60)
@@ -1583,12 +1583,12 @@ class TestRestoreCompleteLoopGuard:
         assert music_player._restore_complete.is_set()
 
     async def test_restore_state_sets_restore_complete_on_failure(self, music_player):
-        # get_guild_state() swallows Redis errors and returns None, so the
-        # failure path here is the None early-return, not an exception.
+        # get_playback_snapshot() swallows Redis errors and returns None, so
+        # the failure path here is the None early-return, not an exception.
         music_player._restore_complete.clear()
         with patch.object(
             music_player.store,
-            "get_guild_state",
+            "get_playback_snapshot",
             new=AsyncMock(return_value=None),
         ):
             await music_player._restore_state()
@@ -2778,10 +2778,11 @@ class TestLoop:
             await music_player.loop()
 
         pop_spy.assert_awaited_once()
-        call_kwargs = pop_spy.call_args.kwargs
-        assert call_kwargs["duration"] == 240
-        assert call_kwargs["uploader"] == "Test Channel"
-        assert call_kwargs["requester_id"] == mock_author.id
+        current = pop_spy.call_args.args[0]  # the SongQueueEntry carrier
+        assert isinstance(current, SongQueueEntry)
+        assert current.duration == 240
+        assert current.uploader == "Test Channel"
+        assert current.requester_id == mock_author.id
 
     async def test_loop_clears_play_message_on_song_end(
         self, music_player, queue_obj, mock_song
@@ -2891,7 +2892,7 @@ class TestLoop:
         after = time.time()
 
         pop_spy.assert_awaited_once()
-        epoch = pop_spy.call_args.kwargs["play_start_epoch"]
+        epoch = pop_spy.call_args.args[1]  # play_start_epoch
         assert before - 90 <= epoch <= after - 90
 
     async def test_now_playing_hash_committed_before_send_now_playing(
@@ -3062,33 +3063,36 @@ class TestRestoreCompleteEvent:
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
             music_player.store,
-            "get_guild_state",
+            "get_playback_snapshot",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
 
     async def test_set_and_restore_aborted_when_state_read_fails(self, music_player):
-        """get_guild_state() returning None (Redis unavailable) aborts the
-        restore early — no queue restore is attempted — but the loop guard
-        event is still set."""
+        """get_playback_snapshot() returning None (Redis unavailable) aborts
+        the restore early — no history/now-playing reads are attempted — but
+        the loop guard event is still set."""
         music_player.bot.wait_until_ready = AsyncMock()
-        get_queue_spy = AsyncMock(wraps=music_player.store.get_queue)
+        get_history_spy = AsyncMock(wraps=music_player.store.get_history)
         with (
             patch.object(
-                music_player.store, "get_guild_state", new=AsyncMock(return_value=None)
+                music_player.store,
+                "get_playback_snapshot",
+                new=AsyncMock(return_value=None),
             ),
-            patch.object(music_player.store, "get_queue", get_queue_spy),
+            patch.object(music_player.store, "get_history", get_history_spy),
         ):
             await music_player._restore_state()
         assert music_player._restore_complete.is_set()
-        get_queue_spy.assert_not_awaited()
+        assert music_player.queue.qsize() == 0
+        get_history_spy.assert_not_awaited()
 
-    async def test_set_even_when_queue_restore_fails(self, music_player):
+    async def test_set_even_when_history_read_fails(self, music_player):
         music_player.bot.wait_until_ready = AsyncMock()
         with patch.object(
             music_player.store,
-            "get_queue",
+            "get_history",
             new=AsyncMock(side_effect=Exception("redis down")),
         ):
             await music_player._restore_state()

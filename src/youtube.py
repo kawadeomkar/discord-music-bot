@@ -158,7 +158,7 @@ def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
     YouTube's search results page doesn't include all metadata fields.
     prefetch_stream() uses _YTDL_STREAM_OPTS (full extraction) and has
     the complete data — this helper writes it back onto the same QueueObject
-    instance so get_queue() sees the enriched values.
+    instance so queue_embed() sees the enriched values.
     """
     if qo.duration is None and data.get("duration") is not None:
         qo.duration = int(data["duration"])
