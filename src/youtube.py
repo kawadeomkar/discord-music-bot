@@ -233,6 +233,18 @@ class YTDL(discord.FFmpegOpusAudio):
         because AudioPlayer simply doesn't call read() during either."""
         return self._frames_read * (discord.opus.Encoder.FRAME_LENGTH / 1000.0)
 
+    @property
+    def position_secs(self) -> float:
+        """True audio position: seconds skipped via FFmpeg -ss (start_offset)
+        plus seconds actually delivered (elapsed_secs); frozen during any pause
+        since elapsed_secs is. The single source of truth for every position
+        surface — progress bar, Activity presence, pause confirmation — so a
+        song started via ?t= or resumed mid-stream by crash recovery can't
+        report different positions in different places. (The playback loop's
+        crash-recovery math mirrors this by backdating play_start_epoch by
+        start_offset.)"""
+        return self.start_offset + self.elapsed_secs
+
     @classmethod
     @_tracer.start_as_current_span("ytdl.prefetch_stream")
     async def prefetch_stream(

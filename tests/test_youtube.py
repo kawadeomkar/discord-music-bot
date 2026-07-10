@@ -104,6 +104,33 @@ class TestYTDLElapsedSecs:
             assert song.read() == b"opus-frame"
 
 
+class TestYTDLPositionSecs:
+    """position_secs = start_offset + elapsed_secs — the single source of
+    truth for every position surface (progress bar, Activity presence, pause
+    confirmation), so a -ss/?t= song can't report different positions in
+    different places."""
+
+    def test_equals_elapsed_when_no_offset(self, ytdl_instance):
+        song = ytdl_instance()
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
+            for _ in range(5):
+                song.read()
+        assert song.position_secs == song.elapsed_secs == pytest.approx(0.10)
+
+    def test_includes_start_offset(self, ytdl_instance):
+        song = ytdl_instance()
+        song.start_offset = 90
+        with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
+            for _ in range(5):
+                song.read()
+        assert song.position_secs == pytest.approx(90.10)
+
+    def test_offset_only_before_any_read(self, ytdl_instance):
+        song = ytdl_instance()
+        song.start_offset = 90
+        assert song.position_secs == 90.0
+
+
 class TestQueueObject:
     def test_required_fields(self, mock_author):
         qobj = QueueObject(
