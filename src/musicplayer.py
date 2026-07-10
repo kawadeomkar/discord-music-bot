@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import random
 import time
 from collections import deque
 from typing import Any, List, Optional, Union
@@ -14,12 +13,8 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.guild_state import (
-    NowPlayingData,
-    QueueEntry,
-    SearchQueueEntry,
-    SongQueueEntry,
-)
+from src.guild_queue import GuildQueue, ShuffleOutcome
+from src.guild_state import NowPlayingData, SongQueueEntry
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -118,49 +113,6 @@ def _fmt_finish_time(duration_secs: int) -> str:
     return _fmt_clock_time(finish_dt)
 
 
-def _to_queue_entry(item: Union[QueueObject, YTSource]) -> QueueEntry:
-    """Live queue item → at-rest entry for the Redis mirror. (Interim home:
-    moves into GuildQueue with the rest of the queue logic in Phase 4 of
-    docs/GUILD_QUEUE_SCHEMA_PLAN.md.)"""
-    if isinstance(item, QueueObject):
-        return SongQueueEntry.from_queue_object(item)
-    return SearchQueueEntry.from_ytsource(item)
-
-
-def _deserialize_queue_item(
-    data: bytes, guild: discord.Guild
-) -> Optional[Union[QueueObject, YTSource]]:
-    try:
-        d = orjson.loads(data)
-        if d.get("type") == "ytsource":
-            return YTSource(
-                ytsearch=d.get("ytsearch"),
-                url=d.get("url"),
-                process=d.get("process"),
-                ts=d.get("ts"),
-            )
-        # "qobj" type or legacy entries written before the type field was added
-        member: Union[discord.Member, discord.User, None] = (
-            guild.get_member(d["requester_id"]) or guild.owner
-        )
-        if member is None:
-            return None
-        return QueueObject(
-            d["webpage_url"],
-            d["title"],
-            member,
-            ts=d.get("ts"),
-            user_input=d.get("user_input"),
-            duration=d.get("duration"),
-            uploader=d.get("uploader"),
-            thumbnail=d.get("thumbnail"),
-            persisted=d.get("persisted", True),
-        )
-    except Exception as e:
-        log.warning(f"Failed to deserialize queue item: {e}")
-        return None
-
-
 def _build_now_playing_base_embed(
     *,
     title: str,
@@ -201,17 +153,14 @@ class MusicPlayer:
         "current_song",
         "play_next",
         "queue",
-        "mutex",
         "play_message",
         "history",
-        "song_queue",
         "volume",
         "_player",
         "_prefetch_task",
         "store",
         "_restore_task",
         "_restore_complete",
-        "_queue_cleared",
         "_background_tasks",
         "_progress_task",
         "_now_playing_message",
@@ -225,18 +174,15 @@ class MusicPlayer:
     _cog: Any
     current_song: Optional[YTDL]
     play_next: asyncio.Event
-    queue: asyncio.Queue
-    mutex: asyncio.Lock
+    queue: GuildQueue
     play_message: Optional[discord.Embed]
     history: deque
-    song_queue: deque
     volume: float
     _player: Optional[asyncio.Task]
     _prefetch_task: Optional[asyncio.Task]
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
-    _queue_cleared: bool
     _background_tasks: set
     _progress_task: Optional[asyncio.Task]
     _now_playing_message: Optional[discord.Message]
@@ -259,22 +205,21 @@ class MusicPlayer:
 
         self.current_song = None
         self.play_next = asyncio.Event()
-        self.queue = asyncio.Queue()
-        self.mutex = asyncio.Lock()
 
         self.play_message = None
         self.history = deque(maxlen=50)
-        self.song_queue = deque()
         self.volume = 1.0
 
         self.store = (
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
+        # All queue state (asyncio queue, display order, Redis mirror, bulk
+        # mutex, cleared-flag) lives behind this one object — see guild_queue.py.
+        self.queue = GuildQueue(guild, self.store)
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
-        self._queue_cleared: bool = False
         self._background_tasks: set = set()
         self._progress_task: Optional[asyncio.Task] = None
         self._now_playing_message: Optional[discord.Message] = None
@@ -376,7 +321,7 @@ class MusicPlayer:
         seed as get_queue()/_build_next_up_embed() so all three stay consistent.
         """
         now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
-        for item in self.song_queue:
+        for item in self.queue.display_items():
             if isinstance(item, QueueObject) and item.duration is not None:
                 cumulative_secs += item.duration
             else:
@@ -385,7 +330,7 @@ class MusicPlayer:
         return _fmt_eta(est_dt, uncertain)
 
     def get_queue(self) -> discord.Embed:
-        items = list(self.song_queue)
+        items = self.queue.display_items()
         total = len(items)
 
         total_secs = 0
@@ -450,17 +395,20 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    guild_state = await self.store.get_guild_state()
-                    if guild_state is None:
+                    # One pipelined read covers the state hash AND the pending
+                    # queue (the playback aggregate).
+                    snapshot = await self.store.get_playback_snapshot()
+                    if snapshot is None:
                         # Redis read failed — abort restore rather than proceeding
-                        # with fabricated defaults (the queue/history reads would
-                        # fail the same way). _restore_complete is still set in
-                        # the finally block, so loop() is never blocked.
+                        # with fabricated defaults (the history/now-playing reads
+                        # would fail the same way). _restore_complete is still set
+                        # in the finally block, so loop() is never blocked.
                         log.warning(
                             f"State restore aborted for guild {self._guild.id}: "
                             f"Redis unavailable"
                         )
                         return
+                    guild_state = snapshot.state
 
                     # Restore volume — only when a value was actually stored.
                     # An unconditional assign would clobber a concurrently
@@ -468,8 +416,12 @@ class MusicPlayer:
                     if guild_state.volume is not None:
                         self.volume = guild_state.volume
 
-                    # Restore now-playing embed so -now works if a song is playing on recovery.
-                    np_data = await self.store.get_now_playing()
+                    # Now-playing snapshot (so -now works if a song was playing
+                    # on recovery) and history — independent reads, gathered.
+                    np_data, hist_items = await asyncio.gather(
+                        self.store.get_now_playing(),
+                        self.store.get_history(),
+                    )
                     if np_data is not None:
                         self.play_message = self._build_now_playing_embed_from_data(
                             np_data
@@ -478,18 +430,7 @@ class MusicPlayer:
                     # Re-queue song that was playing when the bot crashed (at-most-once delivery).
                     # current_song_url is set atomically with the LPOP; a non-empty value means
                     # the bot died after the transaction committed but before the song finished.
-                    count = 0
                     if guild_state.has_crashed_song:
-                        # Resolve the requester from the ID persisted with the song
-                        # itself at start-transaction time.
-                        requester: Union[discord.Member, discord.User, None] = None
-                        if guild_state.current_song_requester_id is not None:
-                            requester = self._guild.get_member(
-                                guild_state.current_song_requester_id
-                            )
-                        if requester is None:
-                            requester = self._guild.me or self._guild.owner
-
                         # Approximate playback position at crash time — pure math
                         # on the snapshot.
                         position = guild_state.crashed_position_at(time.time())
@@ -518,47 +459,34 @@ class MusicPlayer:
                                 f"'{guild_state.current_song_title}'"
                             )
 
-                        if requester is not None:
-                            # persisted=False: this item was never RPUSHed to Redis's
-                            # queue list (it's tracked separately via current_song_url
-                            # state), so the playback loop must skip the matching
-                            # Redis pop_queue() for it — see _pop_queue_for_dequeue().
-                            crashed = QueueObject(
-                                guild_state.current_song_url,
-                                guild_state.current_song_title,
-                                requester,
-                                ts=position,
-                                duration=guild_state.current_song_duration,
-                                uploader=guild_state.current_song_uploader,
-                                persisted=False,
+                        # The crashed current_song_* state fields ARE a queue
+                        # entry — the one the start transaction LPOPed. Rebuild
+                        # it and re-queue through the same rehydration path as
+                        # every other entry. The crashed requester chain falls
+                        # back to guild.me then guild.owner.
+                        crashed_entry = SongQueueEntry.from_crashed_state(
+                            guild_state, position=position
+                        )
+                        if (
+                            crashed_entry is not None
+                            and await self.queue.restore_crashed(
+                                crashed_entry,
+                                requester_fallback=self._guild.me or self._guild.owner,
                             )
-                            await self.queue.put(crashed)
-                            self.song_queue.append(crashed)
+                        ):
                             log.info(
                                 f"Re-queued crashed song "
                                 f"'{guild_state.current_song_title}' for guild {self._guild.id}"
                             )
-                        # Always clear regardless of whether requester was resolvable;
-                        # leaving current_song_url set would cause every subsequent
-                        # restart to re-enter this block and never escape until the
-                        # TTL expires.
+                        # Always clear regardless of whether the song could be
+                        # re-queued; leaving current_song_url set would cause every
+                        # subsequent restart to re-enter this block and never
+                        # escape until the TTL expires.
                         await self.store.clear_song_end_state()
 
-                    # Restore queue + history (Redis list → asyncio.Queue +
-                    # song_queue deque). Independent reads — no data dependency
-                    # between them — fetched concurrently rather than as two
-                    # sequential round-trips, since loop() now blocks on this
-                    # method finishing (see self._restore_complete above).
-                    items, hist_items = await asyncio.gather(
-                        self.store.get_queue(),
-                        self.store.get_history(),
-                    )
-                    for item in items:
-                        restored = _deserialize_queue_item(item, self._guild)
-                        if restored is not None:
-                            await self.queue.put(restored)
-                            self.song_queue.append(restored)
-                            count += 1
+                    # Restore the pending queue (after the crashed head, so the
+                    # interrupted song plays first).
+                    count = await self.queue.restore_entries(snapshot.queue)
                     if count:
                         log.info(
                             f"Restored {count} queued songs for guild {self._guild.id}"
@@ -601,50 +529,29 @@ class MusicPlayer:
         *,
         prefetch: bool = True,
     ):
+        """Enqueue and (optionally) kick off stream pre-fetch.
+
+        prefetch=False for bulk playlist enqueues — the Redis mirror is
+        written in one batch round-trip, and no per-item prefetch tasks are
+        spawned (N concurrent prefetches saturate the thread pool and produce
+        stream URLs that expire before the song reaches playback position;
+        _prefetch_next_song handles one-ahead prefetch naturally as songs play).
+        """
         items: list[Union[QueueObject, YTSource]]
         if isinstance(obj, list):
             items = list(obj)  # type: ignore[arg-type]
         else:
             items = [obj]
-        for item in items:
-            await self.queue.put(item)
-            self.song_queue.append(item)
-
-        # Mirror to Redis and (optionally) kick off stream pre-fetch.
-        # prefetch=False for bulk playlist enqueues — spawning N concurrent
-        # prefetch tasks saturates the thread pool and produces stream URLs that
-        # expire before the song reaches playback position. _prefetch_next_song
-        # handles one-ahead prefetch naturally as songs play.
-        if self.store is None:
-            return
-        serializable = [i for i in items if isinstance(i, (QueueObject, YTSource))]
-        if not serializable:
-            return
-        if prefetch:
-            for item in serializable:
-                await self.store.push_queue(_to_queue_entry(item))
+        await self.queue.put(items, batch=not prefetch)
+        if prefetch and self.store is not None:
+            for item in items:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
-        else:
-            await self.store.push_queue_batch(
-                [_to_queue_entry(item) for item in serializable]
-            )
 
     async def queue_get(self) -> Union[QueueObject, YTSource]:
         return await self.queue.get()
-
-    async def _pop_queue_for_dequeue(self, should_pop: bool) -> None:
-        """Mirror one self.queue dequeue to Redis via LPOP — unless should_pop
-        is False, meaning the item was injected directly into self.queue/
-        song_queue rather than via queue_put() (e.g. the crash-recovered
-        "current song" _restore_state() re-queues with persisted=False), so it
-        was never pushed to Redis's queue list and there's nothing to pop.
-        See _restore_state()'s docstring for the bug this prevents.
-        """
-        if self.store is not None and should_pop:
-            await self.store.pop_queue()
 
     async def _cancel_prefetch(self) -> None:
         """Cancel any in-flight prefetch task and wait for it to finish.
@@ -661,19 +568,8 @@ class MusicPlayer:
         await cancel_task(self._prefetch_task)
 
     async def queue_clear(self) -> List[str]:
-        await self._cancel_prefetch()
-        async with self.mutex:
-            self._queue_cleared = True
-            for _ in range(self.queue.qsize()):
-                try:
-                    self.queue.get_nowait()
-                    self.queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
-            cleared_items = list(self.song_queue)
-            self.song_queue.clear()
-        if self.store is not None:
-            await self.store.delete_queue()
+        await self._cancel_prefetch()  # before the drain — see _cancel_prefetch
+        cleared_items = await self.queue.clear()
         return [
             (
                 item.title
@@ -684,46 +580,13 @@ class MusicPlayer:
         ]
 
     async def queue_shuffle(self) -> str:
+        # Cancel BEFORE the too-few guard (inside shuffle()), matching the
+        # original ordering: a prefetch holding a dequeued item must be
+        # accounted for even when the shuffle ends up a no-op.
         await self._cancel_prefetch()
-
-        shuffled: List[Union[QueueObject, YTSource]] = []
-
-        if self.queue.qsize() < 4:
+        outcome = await self.queue.shuffle()
+        if outcome is ShuffleOutcome.TOO_FEW_SONGS:
             return "There must be at least 3 songs to shuffle the queue"
-
-        async with self.mutex:
-            for _ in range(self.queue.qsize()):
-                try:
-                    song = self.queue.get_nowait()
-                    self.queue.task_done()
-                    shuffled.append(song)
-                except asyncio.QueueEmpty:
-                    break
-            random.shuffle(shuffled)
-            kept_after_shuffle = []
-            for song in shuffled:
-                try:
-                    self.queue.put_nowait(song)
-                    kept_after_shuffle.append(song)
-                except asyncio.QueueFull:
-                    break
-            self.song_queue = deque(kept_after_shuffle)
-
-        # Rebuild Redis mirror atomically: DELETE + RPUSH must be MULTI/EXEC,
-        # not plain pipeline — a plain pipeline() leaves a window where the key
-        # is empty and a concurrent LPOP sees an empty queue.
-        if self.store is not None and kept_after_shuffle:
-            # persisted=False items (the crash-recovered "current song") were
-            # never RPUSHed to Redis's queue list — never write them back in.
-            entries = [
-                _to_queue_entry(s)
-                for s in kept_after_shuffle
-                if isinstance(s, (QueueObject, YTSource))
-                and getattr(s, "persisted", True)
-            ]
-            if entries:
-                await self.store.rebuild_queue(entries)
-
         return "Shuffled!"
 
     async def queue_remove(self, url: str) -> list[int]:
@@ -732,49 +595,7 @@ class MusicPlayer:
         Returns a list of 1-indexed queue positions that were removed.
         """
         await self._cancel_prefetch()
-        removed_positions: list[int] = []
-        kept: List[Union[QueueObject, YTSource]] = []
-
-        async with self.mutex:
-            # Drain everything first so positions are numbered before partitioning.
-            drained: List[Union[QueueObject, YTSource]] = []
-            for _ in range(self.queue.qsize()):
-                try:
-                    item = self.queue.get_nowait()
-                    self.queue.task_done()
-                    drained.append(item)
-                except asyncio.QueueEmpty:
-                    break
-
-            for pos, item in enumerate(drained, start=1):
-                if isinstance(item, QueueObject):
-                    match = item.webpage_url == url
-                else:
-                    match = (item.url or "") == url
-                if match:
-                    removed_positions.append(pos)
-                else:
-                    kept.append(item)
-
-            for item in kept:
-                self.queue.put_nowait(item)
-            self.song_queue = deque(kept)
-
-        if removed_positions and self.store is not None:
-            # persisted=False items (the crash-recovered "current song") were
-            # never RPUSHed to Redis's queue list — never write them back in.
-            entries = [
-                _to_queue_entry(s)
-                for s in kept
-                if isinstance(s, (QueueObject, YTSource))
-                and getattr(s, "persisted", True)
-            ]
-            if entries:
-                await self.store.rebuild_queue(entries)
-            else:
-                await self.store.delete_queue()
-
-        return removed_positions
+        return await self.queue.remove(url)
 
     # ── Embed building ────────────────────────────────────────────────────────
 
@@ -835,9 +656,9 @@ class MusicPlayer:
         )
 
     def _build_next_up_embed(self) -> Optional[discord.Embed]:
-        if not self.song_queue:
+        item = self.queue.peek_next()
+        if item is None:
             return None
-        item = self.song_queue[0]
         now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
         description, _, _ = self._format_queue_line(
             item, 1, now_pst, cumulative_secs, uncertain
@@ -1135,8 +956,7 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    queue_was_cleared = self._queue_cleared
-                    self._queue_cleared = False
+                    queue_was_cleared = self.queue.consume_cleared_flag()
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
                     if prefetched_song is not None and queue_was_cleared:
@@ -1152,6 +972,9 @@ class MusicPlayer:
                         prefetched_song = None
                         # Prefetched items always came through queue_get(), so
                         # they were always real, Redis-mirrored queue entries.
+                        # source stays None: redis_pop_for(None) treats the
+                        # dequeue as persisted, matching that guarantee.
+                        source = None
                         should_pop_queue = True
                     else:
                         source = None
@@ -1170,28 +993,16 @@ class MusicPlayer:
                             # branch below does, then let the outer handler's
                             # logging/error-embed path run via the re-raise.
                             if source is not None:
-                                try:
-                                    self.song_queue.popleft()
-                                except IndexError:
-                                    log.warning(
-                                        f"song_queue was empty on resolve failure in guild {self._guild.id}"
-                                    )
-                                await self._pop_queue_for_dequeue(
-                                    getattr(source, "persisted", True)
-                                )
+                                self.queue.pop_display_head("resolve failure")
+                                await self.queue.redis_pop_for(source)
                                 self.queue.task_done()
                             raise
                         self.current_song = await self._stream_source(source)
                         should_pop_queue = getattr(source, "persisted", True)
 
                     if self.current_song is None:
-                        try:
-                            self.song_queue.popleft()
-                        except IndexError:
-                            log.warning(
-                                f"song_queue was empty on failed-song pop in guild {self._guild.id}"
-                            )
-                        await self._pop_queue_for_dequeue(should_pop_queue)
+                        self.queue.pop_display_head("failed-song pop")
+                        await self.queue.redis_pop_for(source)
                         self.queue.task_done()
                         try:
                             await self._channel.send(
@@ -1206,11 +1017,9 @@ class MusicPlayer:
                     span.set_attribute("song.title", self.current_song.title or "")
 
                     discard = False
-                    async with self.mutex:
-                        try:
-                            self.song_queue.popleft()
-                        except IndexError:
-                            # song_queue was cleared while this song was being resolved
+                    async with self.queue.mutex:
+                        if not self.queue.try_pop_display_head():
+                            # The queue was cleared while this song was being resolved
                             # (e.g. during the async yt_stream call). Discard without
                             # playing; task_done() balances the queue.get() above.
                             # cleanup() terminates the FFmpeg subprocess that yt_stream
