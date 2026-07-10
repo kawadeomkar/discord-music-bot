@@ -1284,8 +1284,29 @@ class TestEnqueueSingle:
         assert embed.thumbnail.url is None
 
 
+class TestAloneCountdownNotice:
+    async def test_notice_routes_through_send_with_np(self, music_bot, mock_guild):
+        """The countdown notice can fire mid-song — it must go through
+        mp.send_with_np so it can't bury the NP host message."""
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        mock_guild.voice_client = None  # post-sleep check: nothing to disconnect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await music_bot._alone_countdown(mock_guild)
+
+        mp.send_with_np.assert_awaited_once()
+        embed = mp.send_with_np.call_args.kwargs["embed"]
+        assert "disconnect" in embed.description
+
+
 class TestNowCommand:
-    async def test_sends_embed_when_playing(self, music_bot, mock_ctx, mock_guild):
+    async def test_repins_now_playing_when_playing(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        """-now re-hosts the live NP block at the bottom of the channel (the
+        old host is retired) instead of sending a static snapshot embed."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
         vc.is_paused = MagicMock(return_value=False)
@@ -1294,14 +1315,14 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._build_now_playing_embed.return_value = discord.Embed(title="Now Playing")
+        mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.now.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        mp._build_now_playing_embed.assert_called_once_with(mp.current_song)
+        mp.repin_now_playing.assert_awaited_once()
+        mock_ctx.send.assert_not_awaited()
 
-    async def test_sends_live_embed_when_paused(self, music_bot, mock_ctx, mock_guild):
+    async def test_repins_live_block_when_paused(self, music_bot, mock_ctx, mock_guild):
         """Design review (2026-07-01): -now while paused used to reply "No songs
         are currently playing." — this is an intentional behavior change, not an
         incidental side effect of making the embed live."""
@@ -1313,11 +1334,11 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
-        mp._build_now_playing_embed.return_value = discord.Embed(title="Now Playing")
+        mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.now.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
+        mp.repin_now_playing.assert_awaited_once()
 
     async def test_sends_not_playing_when_no_song(
         self, music_bot, mock_ctx, mock_guild

@@ -571,8 +571,10 @@ class MusicBot(commands.Cog):
                 and (vc.is_playing() or vc.is_paused())
                 and mp.current_song is not None
             ):
-                embed = mp._build_now_playing_embed(mp.current_song)
-                await ctx.send(embed=embed)
+                # Re-host the live NP block at the bottom of the channel (the
+                # old host is retired) instead of sending a static snapshot
+                # that immediately goes stale.
+                await mp.repin_now_playing()
             elif mp.play_message is not None:
                 # Crash-recovery window: current_song isn't live yet, but a
                 # now-playing snapshot survived the restart. Best-effort static
@@ -673,16 +675,17 @@ class MusicBot(commands.Cog):
     async def _alone_countdown(self, guild: discord.Guild) -> None:
         try:
             mp = self.mps.get(guild.id)
-            text_channel = mp._channel if mp is not None else None
 
-            if text_channel is not None:
+            if mp is not None:
                 try:
-                    await send_embed(
-                        text_channel,
-                        "No users remaining in voice channel",
-                        "All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                        discord.Color.orange(),
+                    # send_with_np (not a bare channel send): this can fire
+                    # mid-song, and a bare send would bury the NP host message.
+                    embed = discord.Embed(
+                        title="No users remaining in voice channel",
+                        description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                        color=discord.Color.orange(),
                     )
+                    await mp.send_with_np(embed=embed)
                 except Exception as e:
                     log.warning(
                         f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
