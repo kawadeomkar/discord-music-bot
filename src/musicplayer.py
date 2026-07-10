@@ -1,19 +1,18 @@
 import asyncio
 import datetime
 import time
-from collections import deque
 from typing import Any, List, Optional, Union
 from zoneinfo import ZoneInfo
 
 import async_timeout
 import discord
-import orjson
 from discord.ext import commands
 
 from opentelemetry import trace
 
 from src import config
-from src.guild_queue import GuildQueue, ShuffleOutcome
+from src.guild_history import GuildHistory
+from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import NowPlayingData, SongQueueEntry
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
@@ -176,7 +175,7 @@ class MusicPlayer:
     play_next: asyncio.Event
     queue: GuildQueue
     play_message: Optional[discord.Embed]
-    history: deque
+    history: GuildHistory
     volume: float
     _player: Optional[asyncio.Task]
     _prefetch_task: Optional[asyncio.Task]
@@ -207,7 +206,6 @@ class MusicPlayer:
         self.play_next = asyncio.Event()
 
         self.play_message = None
-        self.history = deque(maxlen=50)
         self.volume = 1.0
 
         self.store = (
@@ -216,6 +214,8 @@ class MusicPlayer:
         # All queue state (asyncio queue, display order, Redis mirror, bulk
         # mutex, cleared-flag) lives behind this one object — see guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
+        # Played-song history (in-memory ring + Redis mirror) — see guild_history.py.
+        self.history = GuildHistory(self.store)
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
@@ -395,13 +395,12 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    # One pipelined read covers the state hash AND the pending
-                    # queue (the playback aggregate).
+                    # One pipelined read covers the whole playback aggregate:
+                    # state hash, pending queue, now-playing snapshot, history.
                     snapshot = await self.store.get_playback_snapshot()
                     if snapshot is None:
                         # Redis read failed — abort restore rather than proceeding
-                        # with fabricated defaults (the history/now-playing reads
-                        # would fail the same way). _restore_complete is still set
+                        # with fabricated defaults. _restore_complete is still set
                         # in the finally block, so loop() is never blocked.
                         log.warning(
                             f"State restore aborted for guild {self._guild.id}: "
@@ -416,15 +415,11 @@ class MusicPlayer:
                     if guild_state.volume is not None:
                         self.volume = guild_state.volume
 
-                    # Now-playing snapshot (so -now works if a song was playing
-                    # on recovery) and history — independent reads, gathered.
-                    np_data, hist_items = await asyncio.gather(
-                        self.store.get_now_playing(),
-                        self.store.get_history(),
-                    )
-                    if np_data is not None:
+                    # Now-playing display snapshot — so -now works if a song
+                    # was playing on recovery.
+                    if snapshot.now_playing is not None:
                         self.play_message = self._build_now_playing_embed_from_data(
-                            np_data
+                            snapshot.now_playing
                         )
 
                     # Re-queue song that was playing when the bot crashed (at-most-once delivery).
@@ -492,14 +487,8 @@ class MusicPlayer:
                             f"Restored {count} queued songs for guild {self._guild.id}"
                         )
 
-                    # Restore history (Redis list is newest-first; deque appends oldest-first)
-                    for item in reversed(hist_items):
-                        try:
-                            self.history.append(orjson.loads(item))
-                        except Exception as e:
-                            log.warning(
-                                f"Failed to deserialize history item in guild {self._guild.id}: {e}"
-                            )
+                    # Corrupt entries were already dropped at parse time.
+                    self.history.restore(snapshot.history)
 
                     span.set_attribute("restore.queue_count", count)
                     span.set_attribute(
@@ -557,8 +546,10 @@ class MusicPlayer:
         """Cancel any in-flight prefetch task and wait for it to finish.
 
         Must be called before any bulk queue mutation (clear, shuffle, remove) so that
-        the item the prefetch already dequeued via get_nowait() is accounted for
-        via its CancelledError handler before we start modifying the queue.
+        the item the prefetch already dequeued via get_nowait() is returned to the
+        front of the pending queue (requeue_front, in its CancelledError handler)
+        before the mutation drains — the mutation then clears/shuffles/removes it
+        together with everything else instead of stranding it.
 
         Note: if the prefetch task is blocked inside run_in_executor (a yt-dlp
         extraction), cancellation cannot interrupt the running thread. The await
@@ -914,8 +905,13 @@ class MusicPlayer:
         """Pre-resolve and stream the next queued song while the current one plays.
 
         Only runs if there is already an item in the queue (non-blocking).
-        Calls queue.task_done() itself if dequeue succeeds but streaming fails,
-        so the main loop's task_done() always accounts for exactly one get().
+        Accounts for its own dequeue on every non-success path: cancellation
+        returns the item to the front of the line (requeue_front — a bulk
+        mutation is about to drain/reorder it with everything else), and
+        failure retires the item on all three queue legs (finish_failed_dequeue
+        — leaving the display/Redis heads in place would make the next
+        commit retire the wrong entry). On success the dequeue stays open and
+        the main loop's commit/task_done() closes it.
         """
         if self.queue.empty():
             return None
@@ -926,15 +922,22 @@ class MusicPlayer:
         trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
         try:
             source = await self._resolve_source(source)
-            return await self._stream_source(source)
+            song = await self._stream_source(source)
         except asyncio.CancelledError:
-            self.queue.task_done()
+            self.queue.requeue_front(source)
             raise
         except Exception as e:
             record_span_error(trace.get_current_span(), e)
             log.error(f"Prefetch error: {type(e).__name__}: {e}", exc_info=True)
-            self.queue.task_done()
+            await self.queue.finish_failed_dequeue(source, context="prefetch failure")
             return None
+        if song is None:
+            # _stream_source swallowed a stream failure — retire the dequeue
+            # the same way the raise path above does, or the display/Redis
+            # heads would sit one entry ahead of _pending indefinitely.
+            await self.queue.finish_failed_dequeue(source, context="prefetch failure")
+            return None
+        return song
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
@@ -949,6 +952,12 @@ class MusicPlayer:
 
         while not self.bot.is_closed():
             self.play_next.clear()
+            # True while this iteration holds a dequeue it has not yet balanced
+            # with task_done() — lets the outer exception handler close the
+            # books when a failure lands between the dequeue and the normal
+            # song-end task_done() (e.g. the voice client vanished during
+            # resolve), instead of drifting the queue's task counter forever.
+            dequeue_owed = False
             # Each iteration spans the full song duration (3–5 min typically).
             # This is expected — the span stays open across play_next.wait().
             with _tracer.start_as_current_span(
@@ -970,6 +979,7 @@ class MusicPlayer:
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
+                        dequeue_owed = True  # the prefetch's get_nowait() is now ours
                         # Prefetched items always came through queue_get(), so
                         # they were always real, Redis-mirrored queue entries.
                         # source stays None: redis_pop_for(None) treats the
@@ -981,6 +991,7 @@ class MusicPlayer:
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
+                                dequeue_owed = True
                                 source = await self._resolve_source(source)
                         except asyncio.TimeoutError:
                             log.warning("Queue timed out, disconnecting")
@@ -996,14 +1007,16 @@ class MusicPlayer:
                                 await self.queue.finish_failed_dequeue(
                                     source, context="resolve failure"
                                 )
+                                dequeue_owed = False
                             raise
                         self.current_song = await self._stream_source(source)
-                        should_pop_queue = getattr(source, "persisted", True)
+                        should_pop_queue = is_persisted(source)
 
                     if self.current_song is None:
                         await self.queue.finish_failed_dequeue(
                             source, context="failed-song pop"
                         )
+                        dequeue_owed = False
                         try:
                             await self._channel.send(
                                 "Failed to load the next song, skipping."
@@ -1023,6 +1036,7 @@ class MusicPlayer:
                         # cleanup() terminates the FFmpeg subprocess that yt_stream
                         # already spawned — omitting it would leak the process.
                         self.queue.task_done()
+                        dequeue_owed = False
                         self.current_song.cleanup()
                         self.current_song = None
                         continue
@@ -1106,15 +1120,15 @@ class MusicPlayer:
                     self._prefetch_task = None
 
                     if self.current_song is not None:
-                        history_entry = f"{self.current_song.title} - {self.current_song.webpage_url}"
-                        self.history.append(history_entry)
-                        if self.store is not None:
-                            await self.store.push_history(orjson.dumps(history_entry))
+                        await self.history.add(
+                            f"{self.current_song.title} - {self.current_song.webpage_url}"
+                        )
 
                     if self.store is not None:
                         await self.store.clear_song_end_state()
 
                     self.queue.task_done()
+                    dequeue_owed = False
                     self.current_song = None
                     self.play_message = None  # -now must not serve the finished song
                     await self.update_activity(None)
@@ -1130,6 +1144,8 @@ class MusicPlayer:
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,
                     )
+                    if dequeue_owed:
+                        self.queue.task_done()
                     if self._prefetch_task and not self._prefetch_task.done():
                         self._prefetch_task.cancel()
                     self._prefetch_task = None

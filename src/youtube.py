@@ -144,9 +144,10 @@ class QueueObject:
     uploader: Optional[str] = None  # YouTube channel name
     thumbnail: Optional[str] = None
     # False for the crash-recovered "current song" MusicPlayer._restore_state()
-    # re-queues directly into self.queue/song_queue — it was never RPUSHed to
+    # re-queues via GuildQueue.restore_crashed() — it was never RPUSHed to
     # Redis's queue list (it's tracked separately via current_song_url state),
-    # so the playback loop must skip the matching Redis pop_queue() for it.
+    # so the playback loop must skip the matching GuildQueue.redis_pop_for() for
+    # it. Read through the guild_queue.is_persisted() helper, never getattr.
     persisted: bool = True
 
 

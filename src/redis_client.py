@@ -7,12 +7,15 @@ import redis.asyncio as aioredis
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
+    GuildRecoveryGate,
     GuildStateData,
     NowPlayingData,
     QueueEntry,
     SongQueueEntry,
     StateField,
+    parse_history_entry,
     parse_queue_entry,
+    serialize_history_entry,
 )
 from src.util import get_logger
 
@@ -23,6 +26,7 @@ GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 GUILD_TTL = 86400  # 24h idle expiry
+HISTORY_LIMIT = 50  # entries kept on both history legs (deque maxlen + LTRIM)
 
 # Transient per-song fields cleared together on song end / disconnect, and the
 # playback-position fields cleared together alongside them. Shared here so
@@ -320,24 +324,28 @@ class GuildRedisStore:
 
     # History operations
 
-    async def push_history(self, data: bytes) -> None:
-        """LPUSH one serialized entry, trim list to 50, and refresh TTL."""
+    async def push_history(self, entry: str) -> None:
+        """LPUSH one entry, trim list to HISTORY_LIMIT, and refresh TTL."""
         try:
             pipe = self.redis.pipeline()
-            pipe.lpush(self.history_key(), data)
-            pipe.ltrim(self.history_key(), 0, 49)
+            pipe.lpush(self.history_key(), serialize_history_entry(entry))
+            pipe.ltrim(self.history_key(), 0, HISTORY_LIMIT - 1)
             pipe.expire(self.history_key(), GUILD_TTL)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")
 
-    async def get_history(self) -> list[bytes]:
-        """Return up to 50 history items newest-first."""
+    async def get_history(self) -> list[str]:
+        """Return up to HISTORY_LIMIT history entries newest-first. Corrupt
+        entries are dropped (parse_history_entry warns per entry)."""
         try:
-            return await self.redis.lrange(self.history_key(), 0, 49)  # type: ignore[misc]
+            raw: list[bytes] = await self.redis.lrange(  # type: ignore[misc]
+                self.history_key(), 0, HISTORY_LIMIT - 1
+            )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_history failed: {e}")
             return []
+        return [e for e in map(parse_history_entry, raw) if e is not None]
 
     # Now-playing operations
     # (Writes happen inside pop_queue_and_start_song()/set_current_song_state()
@@ -451,31 +459,71 @@ class GuildRedisStore:
             log.warning(f"[guild:{self.guild_id}] get_guild_state failed: {e}")
             return None
 
+    async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
+        """State hash + pending-queue *length* in one pipeline — the lightweight
+        connection/restorable gate for `_restore_guild`.
+
+        Deliberately does NOT transfer the queue contents, now-playing, or
+        history: a `-stop`ped guild keeps a possibly-long queue list by design,
+        and gating on LLEN keeps that payload off the wire on every `on_ready`.
+        `_restore_state` re-reads the full snapshot after a successful connect,
+        so the contents are fetched exactly once, only when they are used.
+
+        Same RTT count as get_playback_snapshot (one pipeline) but a fixed,
+        tiny payload. Returns None on read failure (same error-vs-empty
+        contract as get_guild_state).
+        """
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hgetall(self.state_key())
+            pipe.llen(self.queue_key())
+            raw_state, queue_len = await pipe.execute()
+            return GuildRecoveryGate(
+                state=GuildStateData.from_redis(raw_state),
+                pending_count=int(queue_len),
+            )
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] get_recovery_gate failed: {e}")
+            return None
+
     async def get_playback_snapshot(self) -> Optional[GuildPlaybackSnapshot]:
-        """HGETALL the state hash and LRANGE the queue in one pipeline
-        round-trip, returning the typed playback aggregate.
+        """Read the complete playback aggregate — state hash, pending queue,
+        now-playing snapshot, and history — in one pipeline round-trip.
 
         Returns None when the read failed (same error-vs-empty contract as
         get_guild_state: an empty guild yields a snapshot with zero-value
-        state and an empty queue, never None). Corrupt queue entries are
-        dropped with a warning by parse_queue_entry.
+        state and empty queue/history, never None). Because all four reads
+        ride one pipeline, a failure aborts the whole snapshot — the caller
+        restores everything or nothing, rather than a partially-fabricated
+        state. Corrupt queue/history entries are dropped with a warning by
+        their parsers.
 
-        Not MULTI: the two reads are not atomic relative to a concurrent
-        writer, which matches the previous back-to-back reads exactly —
-        recovery holds the guild recovery lock during the window that matters.
+        Not MULTI: the reads are not atomic relative to a concurrent writer,
+        which matches the previous back-to-back reads exactly — recovery
+        holds the guild recovery lock during the window that matters.
         """
         try:
             pipe = self.redis.pipeline()
             pipe.hgetall(self.state_key())
             pipe.lrange(self.queue_key(), 0, -1)
-            raw_state, raw_queue = await pipe.execute()
+            pipe.hgetall(self.now_playing_key())
+            pipe.lrange(self.history_key(), 0, HISTORY_LIMIT - 1)
+            raw_state, raw_queue, raw_np, raw_history = await pipe.execute()
             entries = tuple(
                 entry
                 for entry in (parse_queue_entry(item) for item in raw_queue)
                 if entry is not None
             )
+            history = tuple(
+                entry
+                for entry in (parse_history_entry(item) for item in raw_history)
+                if entry is not None
+            )
             return GuildPlaybackSnapshot(
-                state=GuildStateData.from_redis(raw_state), queue=entries
+                state=GuildStateData.from_redis(raw_state),
+                queue=entries,
+                now_playing=NowPlayingData.from_redis(raw_np),
+                history=history,
             )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] get_playback_snapshot failed: {e}")

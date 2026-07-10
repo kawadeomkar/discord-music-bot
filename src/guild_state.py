@@ -498,21 +498,55 @@ def parse_queue_entry(data: bytes) -> QueueEntry | None:
         return None
 
 
+# ── guild:{id}:history list — wire format ────────────────────────────────────
+# One JSON-encoded string per entry ("<title> - <webpage_url>"). JSON rather
+# than raw UTF-8 because entries written before this module existed are JSON
+# strings — the encoding is pinned for rolling-restart compatibility.
+
+
+def serialize_history_entry(entry: str) -> bytes:
+    return orjson.dumps(entry)
+
+
+def parse_history_entry(data: bytes) -> str | None:
+    """Deserialize one history-list entry. Corrupt entries (bad JSON, or JSON
+    that is not a string) return None with a warning — the entry is dropped
+    and the rest of the history survives, matching parse_queue_entry."""
+    try:
+        entry = orjson.loads(data)
+    except Exception as e:
+        log.warning(f"guild_state: corrupt history entry dropped: {e}")
+        return None
+    if not isinstance(entry, str):
+        log.warning(
+            f"guild_state: corrupt history entry dropped: not a string ({type(entry).__name__})"
+        )
+        return None
+    return entry
+
+
 # ── The aggregate — a guild's persisted playback state, read as one unit ─────
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildPlaybackSnapshot:
-    """A guild's persisted playback aggregate: the state hash plus the pending
-    queue, read together in one round-trip (GuildRedisStore.get_playback_snapshot).
+    """A guild's complete persisted playback aggregate — the state hash, the
+    pending queue, the now-playing display snapshot, and the played-song
+    history — read together in one pipelined round-trip
+    (GuildRedisStore.get_playback_snapshot).
 
-    This is the "a guild owns a queue" relationship as a type: recovery
-    decisions that span both halves live here as named properties instead of
-    boolean expressions at call sites.
+    This is the "a guild owns a queue (and a history)" relationship as a
+    type: recovery decisions that span the halves live here as named
+    properties instead of boolean expressions at call sites.
     """
 
     state: GuildStateData
     queue: tuple[QueueEntry, ...] = ()
+    # None when no song was playing (the hash is DELETE'd wholesale on song
+    # end, so empty == no song — same contract as NowPlayingData.from_redis).
+    now_playing: NowPlayingData | None = None
+    # Newest-first, as stored (GuildHistory.restore() handles the reversal).
+    history: tuple[str, ...] = ()
 
     @property
     def pending_count(self) -> int:
@@ -523,3 +557,27 @@ class GuildPlaybackSnapshot:
         """The _restore_guild gate: True when a restart has anything to resume
         — pending queue entries or a song that was mid-play at crash time."""
         return bool(self.queue) or self.state.has_crashed_song
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuildRecoveryGate:
+    """The minimal read `_restore_guild` needs to decide whether to reconnect:
+    the state hash plus the pending queue's *length* — never its contents.
+
+    `_restore_guild` only ever consults the connection gate (state), the
+    channel IDs (state), and whether there is anything to resume; it does not
+    replay the queue, now-playing, or history — `_restore_state` re-reads the
+    full GuildPlaybackSnapshot after a successful voice connect. Reading only
+    the length here keeps a `-stop`ped guild's (possibly long) leftover queue
+    off the wire on every `on_ready` (see GuildRedisStore.get_recovery_gate).
+    """
+
+    state: GuildStateData
+    pending_count: int = 0
+
+    @property
+    def has_restorable_playback(self) -> bool:
+        """True when a restart has anything to resume — pending queue entries
+        or a song that was mid-play at crash time. Mirrors
+        GuildPlaybackSnapshot.has_restorable_playback, over the queue length."""
+        return self.pending_count > 0 or self.state.has_crashed_song

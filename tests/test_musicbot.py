@@ -361,6 +361,32 @@ class TestEagerRestore:
         await music_bot_with_redis._restore_guild(mock_guild)
         assert mock_guild.id not in music_bot_with_redis.mps
 
+    async def test_restore_guild_gates_without_reading_queue_payload(
+        self, music_bot_with_redis, mock_guild, fake_redis_bot
+    ):
+        """NIT-7: a -stop'ped guild keeps its (possibly long) queue list, so the
+        recovery gate must never pull the full playback aggregate just to
+        conclude "nothing to do" — it reads state + LLEN via get_recovery_gate,
+        not get_playback_snapshot."""
+        from src.guild_state import SongQueueEntry
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        # Connection cleared (stopped) but a leftover queue survives by design.
+        for i in range(3):
+            await store.push_queue(
+                SongQueueEntry(
+                    webpage_url=f"https://yt.com/v={i}", title=f"S{i}", requester_id=i
+                )
+            )
+
+        snapshot_spy = AsyncMock(wraps=store.get_playback_snapshot)
+        with patch.object(GuildRedisStore, "get_playback_snapshot", snapshot_spy):
+            await music_bot_with_redis._restore_guild(mock_guild)
+
+        snapshot_spy.assert_not_awaited()
+        assert mock_guild.id not in music_bot_with_redis.mps
+
 
 class TestVoiceStateConsistency:
     @staticmethod
@@ -1545,15 +1571,15 @@ class TestRestoreGuildStateReadFailed:
     async def test_recovery_skipped_when_state_read_fails(
         self, music_bot_with_redis, mock_guild, fake_redis_bot, caplog
     ):
-        """get_playback_snapshot() returning None (Redis unavailable) must NOT
+        """get_recovery_gate() returning None (Redis unavailable) must NOT
         be treated as "nothing to restore": recovery is skipped with a warning
         and no channel resolution or player creation is attempted.
-        Distinguishable from the empty-snapshot case, which also skips but
+        Distinguishable from the empty-gate case, which also skips but
         silently."""
         from src.redis_client import GuildRedisStore
 
         with patch.object(
-            GuildRedisStore, "get_playback_snapshot", new=AsyncMock(return_value=None)
+            GuildRedisStore, "get_recovery_gate", new=AsyncMock(return_value=None)
         ):
             with caplog.at_level("WARNING", logger="src.musicbot"):
                 await music_bot_with_redis._restore_guild(mock_guild)

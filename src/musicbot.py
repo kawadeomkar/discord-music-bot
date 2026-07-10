@@ -751,16 +751,19 @@ class MusicBot(commands.Cog):
             return
         try:
             # One pipelined read serves every gate below: the connection gate
-            # (state hash) and the anything-to-restore gate (queue + crashed
-            # song, via the playback aggregate).
-            snapshot = await store.get_playback_snapshot()
-            if snapshot is None:
+            # (state hash) and the anything-to-restore gate (queue length +
+            # crashed song). Only the queue *length* is read here — the actual
+            # queue/now-playing/history payload is re-read by _restore_state
+            # after a successful connect, so a stopped guild's leftover queue
+            # never rides the wire on the common "nothing to do" path.
+            gate = await store.get_recovery_gate()
+            if gate is None:
                 # Redis read failed — do NOT treat as "nothing to restore". Skip
                 # this attempt; the recovery lock expires in 60s and the next
                 # on_ready (session re-establishment) retries.
                 log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
                 return
-            guild_state = snapshot.state
+            guild_state = gate.state
             # Equivalent to `not guild_state.has_active_connection`, spelled as
             # explicit None checks so the channel IDs narrow to int below.
             vc_id = guild_state.voice_channel_id
@@ -823,11 +826,11 @@ class MusicBot(commands.Cog):
                 return
 
             # Check there is something to restore before connecting.
-            if not snapshot.has_restorable_playback:
+            if not gate.has_restorable_playback:
                 return
 
             trace.get_current_span().set_attribute(
-                "restore.queue_count", snapshot.pending_count
+                "restore.queue_count", gate.pending_count
             )
             trace.get_current_span().set_attribute(
                 "restore.crashed_song", guild_state.has_crashed_song
