@@ -147,11 +147,11 @@ class MusicBot(commands.Cog):
             )
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
-            if mp._store is not None:
+            if mp.store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
-                await mp._store.clear_connection()
-                await mp._store.refresh_ttl()
+                await mp.store.clear_connection()
+                await mp.store.refresh_ttl()
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -190,12 +190,12 @@ class MusicBot(commands.Cog):
             if (
                 isinstance(ctx.channel, discord.TextChannel)
                 and old_channel != ctx.channel
-                and mp._store is not None
+                and mp.store is not None
                 and ctx.guild is not None
             ):
                 vc = ctx.guild.voice_client
                 if isinstance(vc, discord.VoiceClient) and vc.channel is not None:
-                    await mp._store.set_connection(vc.channel.id, ctx.channel.id)
+                    await mp.store.set_connection(vc.channel.id, ctx.channel.id)
         except Exception as e:
             # cog_after_invoke won't fire if cog_before_invoke raises — end span now.
             self._active_spans.pop(id(ctx))
@@ -470,8 +470,7 @@ class MusicBot(commands.Cog):
         try:
             vc = ctx.voice_client
             if isinstance(vc, discord.VoiceClient) and vc.is_playing():
-                vc.pause()
-                self.get_mp(ctx).mark_paused()
+                await self.get_mp(ctx).pause(vc)
                 await ctx.message.add_reaction("⏸️")
         except Exception as e:
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
@@ -488,8 +487,7 @@ class MusicBot(commands.Cog):
                 and not vc.is_playing()
                 and vc.is_paused()
             ):
-                vc.resume()
-                self.get_mp(ctx).mark_resumed()
+                await self.get_mp(ctx).resume(vc)
                 await ctx.message.add_reaction("⏭️")
         except Exception as e:
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
@@ -532,8 +530,8 @@ class MusicBot(commands.Cog):
             )
 
             mp = self.get_mp(ctx)
-            if mp._store is not None and isinstance(ctx.channel, discord.TextChannel):
-                await mp._store.set_connection(channel.id, ctx.channel.id)
+            if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):
+                await mp.store.set_connection(channel.id, ctx.channel.id)
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
@@ -601,7 +599,7 @@ class MusicBot(commands.Cog):
                 (f"{pos_label} removed", pos_str, False),
             ],
         )
-        await ctx.send(embed=mp.get_queue())
+        await ctx.send(embed=mp.queue_embed())
         await ctx.message.add_reaction("🗑️")
 
     @commands.command(
@@ -621,6 +619,11 @@ class MusicBot(commands.Cog):
             ):
                 embed = mp._build_now_playing_embed(mp.current_song)
                 await ctx.send(embed=embed)
+            elif mp.play_message is not None:
+                # Crash-recovery window: current_song isn't live yet, but a
+                # now-playing snapshot survived the restart. Best-effort static
+                # embed (no live progress bar) until loop() starts real playback.
+                await ctx.send(embed=mp.play_message)
             else:
                 await ctx.send("No songs are currently playing.")
         except Exception as e:
@@ -662,7 +665,7 @@ class MusicBot(commands.Cog):
     async def queue(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
-            await ctx.send(embed=mp.get_queue())
+            await ctx.send(embed=mp.queue_embed())
         except Exception as e:
             log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -686,8 +689,9 @@ class MusicBot(commands.Cog):
                 return
             mp = self.get_mp(ctx)
             mp.volume = volume_pct / 100
-            await mp.redis_set_state("volume", str(mp.volume))
-            await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
+            if mp.store is not None:
+                await mp.store.set_volume(mp.volume)
+            await ctx.send(f"Set volume to {volume_pct}% (takes effect on next song)")
         except Exception as e:
             log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -788,31 +792,90 @@ class MusicBot(commands.Cog):
             )
             return
         try:
-            guild_state = await store.get_state()
-            if (
-                guild_state.voice_channel_id is None
-                or guild_state.text_channel_id is None
-            ):
+            # One pipelined read serves every gate below: the connection gate
+            # (state hash) and the anything-to-restore gate (queue length +
+            # crashed song). Only the queue *length* is read here — the actual
+            # queue/now-playing/history payload is re-read by _restore_state
+            # after a successful connect, so a stopped guild's leftover queue
+            # never rides the wire on the common "nothing to do" path.
+            gate = await store.get_recovery_gate()
+            if gate is None:
+                # Redis read failed — do NOT treat as "nothing to restore". Skip
+                # this attempt; the recovery lock expires in 60s and the next
+                # on_ready (session re-establishment) retries.
+                log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
+                return
+            guild_state = gate.state
+            # Equivalent to `not guild_state.has_active_connection`, spelled as
+            # explicit None checks so the channel IDs narrow to int below.
+            vc_id = guild_state.voice_channel_id
+            tc_id = guild_state.text_channel_id
+            if vc_id is None or tc_id is None:
                 return
 
-            voice_channel = guild.get_channel(guild_state.voice_channel_id)
-            text_channel = guild.get_channel(guild_state.text_channel_id)
-            if not isinstance(voice_channel, discord.VoiceChannel) or not isinstance(
-                text_channel, discord.TextChannel
-            ):
+            voice_channel = guild.get_channel(vc_id)
+            text_channel = guild.get_channel(tc_id)
+            voice_ok = isinstance(voice_channel, discord.VoiceChannel)
+            text_ok = isinstance(text_channel, discord.TextChannel)
+
+            if not voice_ok or not text_ok:
+                # Clear stale channel IDs so this guild is not re-attempted on every reconnect.
+                await store.clear_connection()
+                trace.get_current_span().set_attribute("restore.channel_missing", True)
+                log.warning(
+                    f"Recovery skipped for guild {guild.id}: "
+                    f"voice_channel_id={vc_id} (resolved={voice_ok}) "
+                    f"text_channel_id={tc_id} (resolved={text_ok})"
+                )
+
+                notify_channel: Optional[discord.TextChannel] = None
+                if text_ok:
+                    notify_channel = text_channel  # type: ignore[assignment]
+                elif guild.me is not None:
+                    if (
+                        guild.system_channel is not None
+                        and guild.system_channel.permissions_for(guild.me).send_messages
+                    ):
+                        notify_channel = guild.system_channel
+                    else:
+                        notify_channel = next(
+                            (
+                                ch
+                                for ch in guild.text_channels
+                                if ch.permissions_for(guild.me).send_messages
+                            ),
+                            None,
+                        )
+
+                if notify_channel is not None:
+                    deleted: List[str] = []
+                    if not voice_ok:
+                        deleted.append("voice channel")
+                    if not text_ok:
+                        deleted.append("text channel")
+                    what = " and ".join(deleted)
+                    verb = "was" if len(deleted) == 1 else "were"
+                    try:
+                        await notify_channel.send(
+                            f"⚠️ I came back online but the {what} I was playing in "
+                            f"{verb} deleted. Use `-play` in a voice channel to start fresh."
+                        )
+                    except Exception as notify_err:
+                        log.warning(
+                            f"Failed to send channel-deleted notification for "
+                            f"guild {guild.id}: {notify_err}"
+                        )
                 return
 
             # Check there is something to restore before connecting.
-            queue_items = await store.get_queue()
-            has_crashed_song = bool(guild_state.current_song_url)
-            if not queue_items and not has_crashed_song:
+            if not gate.has_restorable_playback:
                 return
 
             trace.get_current_span().set_attribute(
-                "restore.queue_count", len(queue_items)
+                "restore.queue_count", gate.pending_count
             )
             trace.get_current_span().set_attribute(
-                "restore.crashed_song", has_crashed_song
+                "restore.crashed_song", guild_state.has_crashed_song
             )
 
             try:

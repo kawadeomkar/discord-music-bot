@@ -168,7 +168,7 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
         expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
         ttl = expire - int(time.time()) - 1800
         return ttl if ttl > 60 else None
-    except (ValueError, IndexError):
+    except ValueError, IndexError:
         return None
 
 
@@ -185,9 +185,10 @@ class QueueObject:
     uploader: Optional[str] = None  # YouTube channel name
     thumbnail: Optional[str] = None
     # False for the crash-recovered "current song" MusicPlayer._restore_state()
-    # re-queues directly into self.queue/song_queue — it was never RPUSHed to
+    # re-queues via GuildQueue.restore_crashed() — it was never RPUSHed to
     # Redis's queue list (it's tracked separately via current_song_url state),
-    # so the playback loop must skip the matching Redis pop_queue() for it.
+    # so the playback loop must skip the matching GuildQueue.redis_pop_for() for
+    # it. Read through the guild_queue.is_persisted() helper, never getattr.
     persisted: bool = True
 
 
@@ -199,7 +200,7 @@ def _enrich_queueobject(qo: QueueObject, data: YTDLVideoInfo) -> None:
     YouTube's search results page doesn't include all metadata fields.
     prefetch_stream() uses _YTDL_STREAM_OPTS (full extraction) and has
     the complete data — this helper writes it back onto the same QueueObject
-    instance so get_queue() sees the enriched values.
+    instance so queue_embed() sees the enriched values.
     """
     fetched_duration = data.get("duration")
     if qo.duration is None and fetched_duration is not None:
@@ -223,6 +224,7 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         data: YTDLVideoInfo,
         requester: Optional[Union[discord.User, discord.Member]] = None,
+        start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
     ) -> None:
@@ -232,6 +234,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
         self.requester = requester
         self.channel = channel
+        # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
+        self.start_offset: int = start_offset
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -376,6 +380,7 @@ class YTDL(discord.FFmpegOpusAudio):
             data["url"],
             data=data,
             requester=qo.requester,
+            start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
         )

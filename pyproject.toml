@@ -38,7 +38,7 @@ pyright = "^1.1.409"
 black = "^26.5.1"
 
 [tool.pyright]
-pythonVersion = "3.13"
+pythonVersion = "3.14"
 typeCheckingMode = "basic"
 reportMissingParameterType = "error"
 reportMissingReturnType = "error"
@@ -53,6 +53,9 @@ filterwarnings = [
     # audioop was removed in Python 3.13 but discord.py's Ogg/Opus parser still
     # imports it at module load time. Suppress until discord.py drops the reference.
     "ignore:'audioop' is deprecated:DeprecationWarning",
+    # discord.py's Command.__init__ still calls asyncio.iscoroutinefunction, deprecated
+    # in Python 3.14. Suppress until discord.py switches to inspect.iscoroutinefunction.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
 ]
 
 [tool.coverage.run]
@@ -70,4 +73,4 @@ dynamic = ["version", "dependencies"]
 readme = "README.md"
 authors = []
 maintainers = []
-requires-python = '>=3.11,<4.0'
+requires-python = '>=3.14,<4.0'
