@@ -42,6 +42,25 @@ def latency_color(ms: float) -> discord.Color:
     return discord.Color(0x990000)
 
 
+def notice_embed(
+    message: str,
+    color: Optional[discord.Color] = None,
+    *,
+    title: Optional[str] = None,
+) -> discord.Embed:
+    """Build a lightweight single-message embed for short status/notice replies.
+
+    The one place that turns a plain status string ("Shuffled!", "Volume set…",
+    validation errors) into an embed. Every command response must be an embed
+    now that MusicContext.send funnels responses and prepends the Now Playing
+    block: a bare `content` string would render as loose text above the block,
+    breaking the uniform embed stack. Pairs with the richer send_embed (which
+    forces a title/description split) for the one-liner case where a body-only
+    embed reads best.
+    """
+    return discord.Embed(title=title, description=message, color=color)
+
+
 async def send_embed(
     destination: discord.abc.Messageable,
     title: str,

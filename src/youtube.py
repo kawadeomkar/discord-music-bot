@@ -16,7 +16,7 @@ from opentelemetry.trace import StatusCode
 from src.redis_client import cache_get, cache_set
 from src.spotify import Spotify
 from src.telemetry import get_tracer
-from src.util import get_logger
+from src.util import get_logger, notice_embed
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -338,7 +338,11 @@ class YTDL(discord.FFmpegOpusAudio):
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
-            await channel.send(f"Starting song at {qo.ts} seconds")
+            await channel.send(
+                embed=notice_embed(
+                    f"Starting song at {qo.ts} seconds", discord.Color.blue()
+                )
+            )
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
