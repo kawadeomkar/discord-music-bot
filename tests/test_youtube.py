@@ -13,7 +13,9 @@ from src.youtube import (
     _YTDL_SOURCE_OPTS,
     _YTDL_STREAM_OPTS,
     _enrich_queueobject,
+    _stream_url_playable,
     _stream_url_ttl,
+    _YtdlpLogger,
 )
 from tests.helpers import noop_ffmpeg_init
 
@@ -30,6 +32,19 @@ def _suppress_ytdl_del(monkeypatch):
     production code.
     """
     monkeypatch.setattr(discord.AudioSource, "__del__", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
+def playable_urls(monkeypatch):
+    """Treat every stream URL as playable unless a test says otherwise.
+
+    yt_stream() probes each URL before handing it to ffmpeg. Left unpatched that is a
+    real HTTP call to a fake googlevideo host in every test. Tests that exercise the
+    revocation path set the returned mock's return_value to False.
+    """
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr("src.youtube._stream_url_playable", probe)
+    return probe
 
 
 def _fake_ytdl_data(**overrides):
@@ -250,6 +265,30 @@ class TestYTDLOpts:
     def test_default_search_is_auto(self):
         # default_search belongs to the source (search) opts, not the stream opts
         assert _YTDL_SOURCE_OPTS["default_search"] == "auto"
+
+    def test_ytdlp_warnings_are_not_suppressed(self):
+        """yt-dlp's warnings are the early-warning system for YouTube changing the rules
+        ("formats skipped", "SABR-only experiment"). Silencing them again would mean the
+        first sign of an outage is users reporting that songs stopped playing."""
+        assert YTDL_OPTS["no_warnings"] is False
+        assert isinstance(YTDL_OPTS["logger"], _YtdlpLogger)
+
+
+class TestYtdlpLogger:
+    def test_warnings_and_errors_reach_the_log(self):
+        with patch("src.youtube.log") as mock_log:
+            _YtdlpLogger().warning("web client https formats have been skipped")
+            _YtdlpLogger().error("boom")
+        assert "skipped" in mock_log.warning.call_args.args[0]
+        assert "boom" in mock_log.error.call_args.args[0]
+
+    def test_per_video_chatter_is_dropped(self):
+        """One line per song for "Downloading android vr player API JSON" is noise."""
+        with patch("src.youtube.log") as mock_log:
+            _YtdlpLogger().debug("[debug] Loading youtube player")
+            _YtdlpLogger().info("Downloading android vr player API JSON")
+        mock_log.warning.assert_not_called()
+        mock_log.error.assert_not_called()
 
     def test_retries_is_set(self):
         assert YTDL_OPTS["retries"] > 0
@@ -574,12 +613,23 @@ class TestYTStream:
 
 
 class TestStreamUrlTtl:
-    def test_returns_seconds_minus_margin(self):
+    def test_caps_ttl_regardless_of_expire(self):
+        """A URL claiming hours of life is still only cached for the cap.
+
+        YouTube revokes stream URLs long before their `expire`; trusting it meant a
+        revoked URL was replayed for hours and the song failed every time.
+        """
         future = int(time.time()) + 7200  # 2h from now
+        url = f"https://r2.googlevideo.com/stream?expire={future}&other=x"
+        assert _stream_url_ttl(url) == 1800
+
+    def test_expire_shortens_ttl_below_the_cap(self):
+        """Near the end of a URL's life `expire` binds instead of the cap."""
+        future = int(time.time()) + 2400  # 40m from now
         url = f"https://r2.googlevideo.com/stream?expire={future}&other=x"
         ttl = _stream_url_ttl(url)
         assert ttl is not None
-        assert 7200 - 1800 - 5 <= ttl <= 7200 - 1800 + 5
+        assert 2400 - 1800 - 5 <= ttl <= 2400 - 1800 + 5
 
     def test_returns_none_when_no_expire_param(self):
         ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?other=x")
@@ -598,6 +648,109 @@ class TestStreamUrlTtl:
     def test_returns_none_on_non_numeric_expire(self):
         ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?expire=notanumber")
         assert ttl is None
+
+
+class TestRevokedStreamUrl:
+    """The regression this guards: YouTube revoked a cached stream URL, the bot replayed
+    it on every -play of that song, and each attempt died silently in ffmpeg."""
+
+    async def _cache(self, fake_redis, webpage_url, title="Revoked Song"):
+        await fake_redis.set(
+            f"ytdl:stream:{webpage_url}",
+            orjson.dumps(_fake_ytdl_data(webpage_url=webpage_url, title=title)),
+            ex=1800,
+        )
+
+    async def test_revoked_cached_url_is_dropped_and_re_extracted(
+        self, mock_ctx, fake_redis, playable_urls
+    ):
+        webpage_url = "https://yt.com/v=revoked"
+        await self._cache(fake_redis, webpage_url)
+        # The cached URL is dead; the freshly extracted replacement plays.
+        playable_urls.side_effect = [False, True]
+        fresh = _fake_ytdl_data(webpage_url=webpage_url, title="Fresh Song")
+        qobj = QueueObject(webpage_url, "Revoked Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fresh) as mock_extract,
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(qobj, channel, redis=fake_redis)
+
+        mock_extract.assert_called_once()
+        assert song.title == "Fresh Song"
+        # Re-cached with the URL that actually played, not the revoked one.
+        cached = orjson.loads(await fake_redis.get(f"ytdl:stream:{webpage_url}"))
+        assert cached["url"] == fresh["url"]
+
+    async def test_raises_when_youtube_refuses_even_a_fresh_url(
+        self, mock_ctx, fake_redis, playable_urls
+    ):
+        """Both attempts refused — surface it so the player reports a failed song
+        instead of handing ffmpeg a URL that will 403 into silence."""
+        webpage_url = "https://yt.com/v=always_dead"
+        await self._cache(fake_redis, webpage_url)
+        playable_urls.return_value = False
+        qobj = QueueObject(webpage_url, "Dead Song", mock_ctx.author)
+        channel = AsyncMock(spec=discord.TextChannel)
+
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=_fake_ytdl_data(webpage_url=webpage_url),
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+            pytest.raises(RuntimeError, match="refused the audio stream"),
+        ):
+            await YTDL.yt_stream(qobj, channel, redis=fake_redis)
+
+        assert await fake_redis.get(f"ytdl:stream:{webpage_url}") is None
+
+    async def test_unplayable_fresh_url_is_never_cached(self, mock_ctx, fake_redis):
+        """prefetch_stream must not cache a URL that is already dead."""
+        webpage_url = "https://yt.com/v=prefetch_dead"
+        qobj = QueueObject(webpage_url, "Prefetch Song", mock_ctx.author)
+
+        with (
+            patch("src.youtube._stream_url_playable", AsyncMock(return_value=False)),
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=_fake_ytdl_data(webpage_url=webpage_url),
+            ),
+        ):
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+
+        assert await fake_redis.get(f"ytdl:stream:{webpage_url}") is None
+
+    async def test_probe_opens_the_request_the_way_ffmpeg_does(self):
+        """Load-bearing: a revoked URL still answers 206 to a *ranged* GET while refusing
+        the open-ended one ffmpeg actually sends. Probing with a Range header (or HEAD)
+        reports a dead URL as healthy — which is the bug this whole path exists to catch.
+        """
+        response = MagicMock()
+        response.status = 403
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=response)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("aiohttp.ClientSession.get", return_value=ctx) as mock_get:
+            assert await _stream_url_playable("https://r2.googlevideo.com/s") is False
+
+        assert "headers" not in mock_get.call_args.kwargs
+
+    async def test_probe_failure_assumes_playable(self):
+        """A probe that cannot complete is a statement about the network, not the URL —
+        it must never be the reason a song refuses to play."""
+        with patch(
+            "aiohttp.ClientSession.get", side_effect=OSError("network unreachable")
+        ):
+            assert (
+                await _stream_url_playable("https://r2.googlevideo.com/stream") is True
+            )
+
+    async def test_empty_url_is_not_playable(self):
+        assert await _stream_url_playable("") is False
 
 
 class TestStreamCache:
