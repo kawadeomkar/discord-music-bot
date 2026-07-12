@@ -31,7 +31,6 @@ from src.util import (
     queue_message,
     record_span_error,
     send_embed,
-    send_queue_phrases,
     trace_footer,
     get_logger,
 )
@@ -288,7 +287,6 @@ class MusicBot(commands.Cog):
                 ),
                 mp.queue_put(qobjs_yt, prefetch=False),
                 ctx.message.add_reaction("👍"),
-                send_queue_phrases(ctx),
             )
         else:
             assert isinstance(source, YTSource)
@@ -307,7 +305,6 @@ class MusicBot(commands.Cog):
                 ),
                 mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
                 ctx.message.add_reaction("👍"),
-                send_queue_phrases(ctx),
             )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
@@ -321,7 +318,6 @@ class MusicBot(commands.Cog):
         coros: list[Coroutine[Any, Any, Any]] = [
             mp.queue_put(qobj),
             ctx.message.add_reaction("👍"),
-            send_queue_phrases(ctx),
         ]
         if should_show_queued:
             coros.append(

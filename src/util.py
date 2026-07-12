@@ -1,27 +1,10 @@
 import asyncio
 import contextlib
-import random
 from typing import Any, List, Optional
 
 import discord
 import structlog
-from discord.ext import commands
 from opentelemetry.trace import StatusCode
-
-
-async def send_queue_phrases(ctx: commands.Context):
-    if ctx.message.author.name == "pineapplecat":
-        phrases = [
-            "great choice king! :3",
-            "my god you gigachad, impressive choice",
-            "splendid choice pogdaddy",
-            "turbo taste fam",
-            "terrific taste turbo chad",
-            "vibrations are retro daddy",
-        ]
-        await ctx.send(f"{random.choice(phrases)}")
-    elif ctx.message.author.name == "Bryan":
-        await ctx.send(f"terrible choice bryan, cringepilled taste beta simp")
 
 
 def queue_message(songs: List[str]) -> str:
