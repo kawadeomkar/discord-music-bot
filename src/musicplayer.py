@@ -645,6 +645,30 @@ class MusicPlayer:
             thumbnail=fields.thumbnail,
         )
 
+    def build_pause_confirmation_embed(self) -> Optional[discord.Embed]:
+        """Slim confirmation embed for the -pause command: just the pause
+        position. The -pause response message hosts the live NP block directly
+        below this embed (MusicContext attach), so the bar, requester, link
+        fields, and thumbnail would all render twice if repeated here — the
+        one thing the NP block does NOT show is the paused state itself.
+        position_secs is frozen while paused, so it captures the exact pause
+        point (including any FFmpeg -ss start offset). Returns None when
+        there's no live song to describe."""
+        song = self.current_song
+        if song is None:
+            return None
+        position = int(song.position_secs)
+        duration_secs = song.duration_secs
+        if duration_secs > 0:
+            paused_at = f"{_fmt_duration(position)} / {_fmt_duration(duration_secs)}"
+        else:
+            paused_at = _fmt_duration(position)
+        return discord.Embed(
+            title=f"⏸️ Paused: {song.title}",
+            description=f"Paused at: `{paused_at}`",
+            color=discord.Color.orange(),
+        )
+
     @staticmethod
     def _build_now_playing_embed_from_data(data: NowPlayingData) -> discord.Embed:
         """Reconstruct a now-playing embed from the recovered Redis snapshot."""

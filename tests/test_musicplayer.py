@@ -994,6 +994,79 @@ class TestBuildNowPlayingEmbed:
         assert _fmt_duration(30) not in embed.description
 
 
+class TestBuildPauseConfirmationEmbed:
+    """Slim by design: the -pause response message hosts the live NP block
+    directly below this embed (MusicContext attach), so the bar, requester,
+    link fields, and thumbnail would all render twice if repeated here. The
+    embed carries only what the NP block doesn't: the paused state and the
+    exact pause position."""
+
+    def test_returns_none_when_no_current_song(self, music_player):
+        music_player.current_song = None
+        assert music_player.build_pause_confirmation_embed() is None
+
+    def test_returns_discord_embed(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert isinstance(embed, discord.Embed)
+
+    def test_title_contains_song_title(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert mock_song.title in embed.title
+
+    def test_color_is_orange(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert embed.colour == discord.Color.orange()
+
+    def test_paused_at_reflects_elapsed_secs(self, music_player, mock_song):
+        mock_song.elapsed_secs = 65.0
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        # position 1:05 of total 3:30
+        assert "Paused at: `1:05 / 3:30`" in embed.description
+
+    def test_paused_at_includes_start_offset(self, music_player, mock_song):
+        """A song resumed mid-stream via FFmpeg -ss reports true audio position
+        (YTDL.position_secs), not just elapsed_secs."""
+        mock_song.start_offset = 60
+        mock_song.elapsed_secs = 65.0
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        # position = 60 + 65 = 125s = 2:05
+        assert "Paused at: `2:05 / 3:30`" in embed.description
+
+    def test_paused_at_omits_total_when_duration_unknown(self, music_player, mock_song):
+        mock_song.elapsed_secs = 65.0
+        mock_song.duration_secs = 0
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert "Paused at: `1:05`" in embed.description
+        assert "/" not in embed.description.split("Paused at:")[1].split("\n")[0]
+
+    def test_no_progress_bar(self, music_player, mock_song):
+        mock_song.elapsed_secs = 65.0
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert "🔘" not in embed.description
+
+    def test_no_requester_line(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert mock_song.requester.mention not in embed.description
+
+    def test_no_fields(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert embed.fields == []
+
+    def test_no_thumbnail(self, music_player, mock_song):
+        music_player.current_song = mock_song
+        embed = music_player.build_pause_confirmation_embed()
+        assert not embed.thumbnail.url
+
+
 class TestUpdateActivity:
     async def test_sets_playing_activity_when_song_playing(
         self, music_player, mock_song
