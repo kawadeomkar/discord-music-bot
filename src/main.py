@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 
 from src.config import ENVIRONMENT
+from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
 
@@ -90,8 +91,11 @@ class MusicBotApp(commands.AutoShardedBot):
         super().__init__(
             command_prefix="-",
             intents=intents,
-            description="music bot",
+            description="Plays YouTube, Spotify and SoundCloud audio in voice channels.",
             strip_after_prefix=True,
+            # Replaces discord.py's DefaultHelpCommand, whose plaintext codeblock
+            # output cannot show aliases and clashes with the all-embed responses.
+            help_command=MusicHelpCommand(),
         )
         self._redis_pool = None
         self.redis = None
