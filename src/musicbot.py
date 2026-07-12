@@ -123,6 +123,11 @@ class MusicBot(commands.Cog):
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),
             )
+            # Tasks are down — no tick can race this. Dispose of the NP host so
+            # no message keeps a mid-song bar frozen by the stop (dedicated NP
+            # message → deleted; command-response host → stripped back to its
+            # own embeds).
+            await mp.retire_np_host_on_stop()
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
             if mp.store is not None:
@@ -445,8 +450,13 @@ class MusicBot(commands.Cog):
                 and not vc.is_playing()
                 and vc.is_paused()
             ):
-                await self.get_mp(ctx).resume(vc)
+                mp = self.get_mp(ctx)
+                await mp.resume(vc)
                 await ctx.message.add_reaction("⏭️")
+                # If the -pause confirmation hosts the block, re-host it so
+                # "⏸️ Paused at…" becomes plain history instead of sitting
+                # beneath a live, advancing bar for the rest of the song.
+                await mp.rehost_np_after_resume()
         except Exception as e:
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -569,17 +579,27 @@ class MusicBot(commands.Cog):
         try:
             mp = self.get_mp(ctx)
             vc = ctx.guild.voice_client if ctx.guild else None
+            song = mp.current_song
             if (
                 vc is not None
                 and isinstance(vc, discord.VoiceClient)
                 and (vc.is_playing() or vc.is_paused())
-                and mp.current_song is not None
+                and song is not None
             ):
+                if ctx.channel.id != mp._channel.id:
+                    # Invoked outside the player's home channel: the host never
+                    # leaves home, so answer HERE with a static snapshot (the
+                    # MusicContext channel guard keeps it unattached).
+                    await ctx.send(embed=mp._build_now_playing_embed(song))
+                    return
                 # Re-host the live NP block at the bottom of the channel (the
                 # old host is retired) instead of sending a static snapshot
                 # that immediately goes stale.
-                await mp.repin_now_playing()
-            elif mp.play_message is not None:
+                if await mp.repin_now_playing():
+                    return
+                # Song ended between the liveness check and the repin — fall
+                # through to the static/none responses instead of silence.
+            if mp.play_message is not None:
                 # Crash-recovery window: current_song isn't live yet, but a
                 # now-playing snapshot survived the restart. Best-effort static
                 # embed (no live progress bar) until loop() starts real playback.

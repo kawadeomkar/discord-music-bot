@@ -675,6 +675,7 @@ class TestCleanup:
         mp.store = None
         mp._progress_task = None
         mp._pause_debounce_task = None
+        mp.retire_np_host_on_stop = AsyncMock()
         for attr, val in overrides.items():
             setattr(mp, attr, val)
         music_bot.mps[mock_guild.id] = mp
@@ -737,6 +738,33 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
         task.cancel.assert_called_once()
 
+    async def test_retires_np_host_after_task_cancellation(self, music_bot, mock_guild):
+        """-stop / alone-disconnect must dispose of the NP host (delete a
+        dedicated NP message, strip a response host) so no message keeps a
+        mid-song bar frozen by the stop — and only after the progress/loop
+        tasks are down, so no tick can race the retire."""
+        call_order: list[str] = []
+
+        class _AwaitableTask:
+            def done(self):
+                return False
+
+            def cancel(self, msg=None):
+                call_order.append("cancel")
+
+            def __await__(self):
+                return iter([])  # completes immediately, no exception
+
+        mp = self._make_minimal_mp(
+            music_bot, mock_guild, _progress_task=_AwaitableTask()
+        )
+        mp.retire_np_host_on_stop = AsyncMock(
+            side_effect=lambda: call_order.append("retire")
+        )
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        assert call_order == ["cancel", "retire"]
+
     async def test_cancels_running_alone_timer(self, music_bot, mock_guild):
         timer = make_mock_task()
         music_bot._alone_timers[mock_guild.id] = timer
@@ -793,6 +821,7 @@ class TestCleanup:
         mp._restore_task = None
         mp._player = _AwaitableTask()
         mp.store = None
+        mp.retire_np_host_on_stop = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
 
         async def _disconnect(**_kw):
@@ -1024,9 +1053,26 @@ class TestResumeCommand:
         mock_ctx.message.add_reaction = AsyncMock()
         mp = MagicMock()
         mp.resume = AsyncMock()
+        mp.rehost_np_after_resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.resume.callback(music_bot, mock_ctx)
         mp.resume.assert_awaited_once_with(vc)
+
+    async def test_rehosts_np_block_after_resume(self, music_bot, mock_ctx):
+        """If the -pause confirmation hosts the block, resume re-hosts it so
+        "⏸️ Paused at…" becomes plain history instead of sitting beneath a
+        live, advancing bar (branch review M3)."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=False)
+        vc.is_paused = MagicMock(return_value=True)
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+        mp = MagicMock()
+        mp.resume = AsyncMock()
+        mp.rehost_np_after_resume = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.resume.callback(music_bot, mock_ctx)
+        mp.rehost_np_after_resume.assert_awaited_once()
 
     async def test_noop_when_not_paused(self, music_bot, mock_ctx):
         vc = object.__new__(discord.VoiceClient)
@@ -1340,6 +1386,7 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
+        mp._channel = mock_ctx.channel  # invoked from the player's home channel
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -1359,11 +1406,61 @@ class TestNowCommand:
 
         mp = MagicMock()
         mp.current_song = MagicMock()
+        mp._channel = mock_ctx.channel
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await MusicBot.now.callback(music_bot, mock_ctx)
         mp.repin_now_playing.assert_awaited_once()
+
+    async def test_cross_channel_sends_static_embed_where_invoked(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        """-now from a channel other than the player's home channel must
+        answer THERE with a static snapshot — the host never leaves home, so
+        repinning would leave the invoking channel with no response at all
+        (branch review M2)."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        mock_guild.voice_client = vc
+        mock_ctx.guild = mock_guild
+
+        mp = MagicMock()
+        mp.current_song = MagicMock()
+        mp._channel = MagicMock()  # distinct from ctx.channel → distinct .id
+        static = discord.Embed(title="NP snapshot")
+        mp._build_now_playing_embed = MagicMock(return_value=static)
+        mp.repin_now_playing = AsyncMock(return_value=True)
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.now.callback(music_bot, mock_ctx)
+        mp.repin_now_playing.assert_not_awaited()
+        mp._build_now_playing_embed.assert_called_once_with(mp.current_song)
+        mock_ctx.send.assert_awaited_once_with(embed=static)
+
+    async def test_falls_back_when_repin_reports_no_song(
+        self, music_bot, mock_ctx, mock_guild
+    ):
+        """The song can end between the liveness check and the repin —
+        repin_now_playing() returns False and -now must still respond
+        instead of silently doing nothing (branch review L3)."""
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        mock_guild.voice_client = vc
+        mock_ctx.guild = mock_guild
+
+        mp = MagicMock()
+        mp.current_song = MagicMock()
+        mp._channel = mock_ctx.channel
+        mp.play_message = None
+        mp.repin_now_playing = AsyncMock(return_value=False)
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await MusicBot.now.callback(music_bot, mock_ctx)
+        mp.repin_now_playing.assert_awaited_once()
+        mock_ctx.send.assert_awaited_with("No songs are currently playing.")
 
     async def test_sends_not_playing_when_no_song(
         self, music_bot, mock_ctx, mock_guild
