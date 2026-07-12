@@ -6,7 +6,7 @@ import dataclasses
 import re
 import time
 from collections import deque
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 import orjson
@@ -57,9 +57,15 @@ def mock_song():
     song.thumbnail = "https://img.youtube.com/vi/testid/0.jpg"
     song.duration_secs = 210
     song.elapsed_secs = 0.0
+    song.start_offset = 0
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
+    # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
+    # so tests that set either attribute get the derived position automatically.
+    type(song).position_secs = PropertyMock(
+        side_effect=lambda: song.start_offset + song.elapsed_secs
+    )
     return song
 
 
@@ -960,19 +966,32 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert "🔘" not in embed.description
 
-    def test_elapsed_override_replaces_song_elapsed_secs(self, music_player, mock_song):
+    def test_position_override_replaces_live_position(self, music_player, mock_song):
         """Used by _finalize_now_playing() to render the bar fully completed
-        once a song has ended, regardless of song.elapsed_secs's live value."""
+        once a song has ended, regardless of song.position_secs's live value."""
         mock_song.elapsed_secs = 30.0
         mock_song.duration_secs = 210
-        embed = music_player._build_now_playing_embed(mock_song, elapsed_override=210.0)
+        embed = music_player._build_now_playing_embed(
+            mock_song, position_override=210.0
+        )
         assert _fmt_duration(210) in embed.description
         assert _fmt_duration(30) not in embed.description
 
-    def test_no_override_falls_back_to_song_elapsed_secs(self, music_player, mock_song):
+    def test_no_override_falls_back_to_live_position(self, music_player, mock_song):
         mock_song.elapsed_secs = 30.0
         embed = music_player._build_now_playing_embed(mock_song)
         assert _fmt_duration(30) in embed.description
+
+    def test_progress_bar_includes_start_offset(self, music_player, mock_song):
+        """A ?t= song or a crash-recovered song resumed mid-stream via FFmpeg
+        -ss renders its true audio position (start_offset + elapsed_secs) —
+        all position surfaces read YTDL.position_secs, so the bar can't
+        disagree with the pause embed or the Activity tooltip."""
+        mock_song.start_offset = 60
+        mock_song.elapsed_secs = 30.0
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert _fmt_duration(90) in embed.description
+        assert _fmt_duration(30) not in embed.description
 
 
 class TestUpdateActivity:
@@ -1084,6 +1103,19 @@ class TestUpdateActivity:
             )
             < 1000
         )
+
+    async def test_backdate_includes_start_offset(self, music_player, mock_song):
+        """A ?t=/crash-recovered song's tooltip must agree with the progress
+        bar: start is backdated by position_secs (start_offset + elapsed), so
+        Discord shows e.g. 1:30 elapsed, not 0:30."""
+        music_player.bot.change_presence = AsyncMock()
+        mock_song.start_offset = 60
+        mock_song.elapsed_secs = 30.0
+        await music_player.update_activity(mock_song)
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        now_ms = int(time.time() * 1000)
+        assert activity.timestamps["start"] <= now_ms - 90_000 + 1000
+        assert activity.timestamps["start"] >= now_ms - 90_000 - 2000
 
 
 class TestUpdateActivityPause:

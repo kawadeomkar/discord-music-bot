@@ -591,17 +591,19 @@ class MusicPlayer:
     # ── Embed building ────────────────────────────────────────────────────────
 
     def _build_now_playing_embed(
-        self, song: YTDL, *, elapsed_override: Optional[float] = None
+        self, song: YTDL, *, position_override: Optional[float] = None
     ) -> discord.Embed:
-        """elapsed_override lets a caller render the bar at a specific position
-        rather than song.elapsed_secs's live value — used by _finalize_now_playing()
+        """position_override lets a caller render the bar at a specific position
+        rather than song.position_secs's live value — used by _finalize_now_playing()
         to show the bar fully completed once the song has actually ended."""
         lines = []
         if song.duration_secs > 0:
-            elapsed = (
-                elapsed_override if elapsed_override is not None else song.elapsed_secs
+            position = (
+                position_override
+                if position_override is not None
+                else song.position_secs
             )
-            bar = _build_progress_bar(elapsed, song.duration_secs)
+            bar = _build_progress_bar(position, song.duration_secs)
             if bar:
                 # Bar sits directly under the title, above the requester line,
                 # with a blank line between them for visual separation.
@@ -666,12 +668,13 @@ class MusicPlayer:
             vc = self._guild.voice_client
             is_paused = isinstance(vc, discord.VoiceClient) and vc.is_paused()
             if not is_paused:
-                # Backdated by elapsed time (not always "now") so that resuming
-                # mid-song still lands `end` the correct remaining duration in
-                # the future, not a full duration_secs from the resume moment.
+                # Backdated by the true audio position (not always "now") so
+                # that resuming mid-song still lands `end` the correct remaining
+                # duration in the future, and a -ss/crash-recovered song's
+                # tooltip agrees with the progress bar (both read position_secs).
                 now_ms = int(time.time() * 1000)
-                elapsed_ms = int(song.elapsed_secs * 1000)
-                timestamps["start"] = now_ms - elapsed_ms
+                position_ms = int(song.position_secs * 1000)
+                timestamps["start"] = now_ms - position_ms
                 if song.duration_secs > 0:
                     timestamps["end"] = timestamps["start"] + song.duration_secs * 1000
             # else: paused — timestamps stays {} so Discord shows static text with
@@ -818,7 +821,7 @@ class MusicPlayer:
         song: YTDL,
         message: discord.Message,
         *,
-        elapsed_override: Optional[float] = None,
+        position_override: Optional[float] = None,
     ) -> bool:
         """Rebuild the now-playing + up-next embeds and push a single edit.
 
@@ -830,7 +833,7 @@ class MusicPlayer:
         """
         try:
             embed = self._build_now_playing_embed(
-                song, elapsed_override=elapsed_override
+                song, position_override=position_override
             )
             next_up = self._build_next_up_embed()
             embeds = [embed] + ([next_up] if next_up else [])
@@ -853,7 +856,7 @@ class MusicPlayer:
 
     async def _finalize_now_playing(self, song: YTDL, message: discord.Message) -> None:
         """One last embed edit once a song has actually ended, showing the bar
-        fully completed (elapsed == duration) rather than left frozen wherever
+        fully completed (position == duration) rather than left frozen wherever
         the last periodic tick happened to land. song/message are captured by
         the caller rather than read off self.current_song/self._now_playing_message
         at run time, since both may already point at the next song by the time
@@ -862,7 +865,7 @@ class MusicPlayer:
         if song.duration_secs <= 0:
             return  # no bar was ever shown for this song — nothing to finalize
         await self._push_now_playing_edit(
-            song, message, elapsed_override=song.duration_secs
+            song, message, position_override=song.duration_secs
         )
 
     def _spawn_background(self, coro: Any) -> asyncio.Task:
