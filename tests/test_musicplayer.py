@@ -4618,3 +4618,103 @@ class TestHistorySkipMarker:
         assert len(music_player.history) == 1
         assert mock_song.title in music_player.history[0]
         assert music_player._skip_history_for is None
+
+
+class TestInterjectPostNeutralizeRecheck:
+    async def test_song_changed_during_neutralize_returns_none(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        """Neutralize can block up to yt-dlp's socket timeout (cancellation
+        can't interrupt the executor thread) — if the song ended and the loop
+        moved on in that window, interject bails to the command's fallback
+        instead of building a resume entry for a finished song."""
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        async def neutralize_and_advance(_self):
+            music_player.current_song = MagicMock()
+
+        with patch.object(
+            MusicPlayer, "_neutralize_prefetch", new=neutralize_and_advance
+        ):
+            outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        assert outcome is None
+        assert music_player.queue.display_items() == []  # nothing inserted
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_for is None
+
+
+class TestPlaynowLoopStart:
+    """Loop-level behavior for -playnow entries at song start (review gap):
+    start_paused parks the player, is_resume announces from the start path."""
+
+    async def _run_one_song(self, music_player, queue_obj, mock_song, vc):
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "pause", new=AsyncMock()) as pause_mock,
+            patch.object(
+                MusicPlayer, "_announce_resume", new=AsyncMock()
+            ) as announce_mock,
+        ):
+            await music_player.loop()
+        return pause_mock, announce_mock
+
+    def _vc(self):
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        vc.pause = MagicMock()
+        return vc
+
+    async def test_start_paused_parks_synchronously_and_engages_bookkeeping(
+        self, music_player, queue_obj, mock_song
+    ):
+        mock_song.start_paused = True
+        vc = self._vc()
+        pause_mock, _ = await self._run_one_song(music_player, queue_obj, mock_song, vc)
+        # Synchronous park right after vc.play (frame-leak guard) …
+        vc.pause.assert_called_once()
+        # … plus the full pause() entry point (Redis epochs, debounced refresh).
+        pause_mock.assert_awaited_once()
+
+    async def test_resume_entry_announced_at_start(
+        self, music_player, queue_obj, mock_song
+    ):
+        mock_song.is_resume = True
+        vc = self._vc()
+        _, announce_mock = await self._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
+        announce_mock.assert_awaited_once_with(mock_song)
+
+    async def test_plain_song_neither_parks_nor_announces(
+        self, music_player, queue_obj, mock_song
+    ):
+        vc = self._vc()
+        pause_mock, announce_mock = await self._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
+        vc.pause.assert_not_called()
+        pause_mock.assert_not_awaited()
+        announce_mock.assert_not_awaited()

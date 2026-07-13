@@ -2146,28 +2146,33 @@ class TestPlaynow:
         assert "Replaced" in embed.description
         assert "will not return" in embed.description
 
-    async def test_interject_none_enqueues_resolved_qobj_directly(
+    async def test_interject_none_front_enqueues_with_confirmation(
         self, music_bot, mock_ctx, live_mp, live_vc
     ):
-        """Song ended mid-resolve: the already-resolved qobj is enqueued via
-        _enqueue_single — NOT by re-invoking -play, which would re-parse,
-        re-resolve, and (for playlists) enqueue every track right after the
-        first-track-only notice."""
+        """Song ended mid-resolve: the already-resolved qobj is front-inserted
+        directly (the user asked for "now" and the window can be seconds long)
+        — NOT by re-invoking -play, which would re-parse, re-resolve, and
+        (for playlists) enqueue every track right after the first-track-only
+        notice — and the user always gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
+        live_mp.queue.put_front = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         mock_ctx.invoke = AsyncMock()
-        music_bot._enqueue_single = AsyncMock()
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
         await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_not_awaited()
-        music_bot._enqueue_single.assert_awaited_once_with(mock_ctx, qobj, live_mp)
+        live_mp.queue.put_front.assert_awaited_once_with([qobj])
         # The interjection marker must not leak onto a normally queued song —
         # a later -playnow would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "Playing next" in embed.title
+        assert "already ended" in embed.description
+        mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
 
     async def test_spotify_playlist_interjects_first_track_only(
         self, music_bot, mock_ctx, live_mp, live_vc

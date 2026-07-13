@@ -1040,11 +1040,17 @@ class MusicPlayer:
         (current.interjected), no resume entry is built for it — the ORIGINAL
         song's resume entry, still at the queue front, is untouched.
 
-        Returns None when there is no current song — the command falls back to
-        plain -play. Residual race, documented not defended: if the current
-        song ends naturally while this method awaits, the front-inserted
+        Returns None when there is no current song (or it ended during the
+        prefetch neutralization) — the command falls back to a plain
+        front-enqueue. Residual race, documented not defended: if the current
+        song ends naturally while put_front below awaits, the front-inserted
         entries still play next (after whatever the loop already committed),
         and a just-finished song's resume entry replays its final seconds.
+        The widest variant of that window is the loop awaiting a STILL-RUNNING
+        prefetch it claimed before this method ran — put_front then executes
+        against a real in-flight head, which its rebuild branch handles (see
+        GuildQueue.put_front: that branch is load-bearing here, not
+        defensive).
         """
         current = self.current_song
         if current is None:
@@ -1054,10 +1060,15 @@ class MusicPlayer:
         span.set_attribute("song.interjected_title", qobj.title or "")
 
         # A completed prefetch bypasses the queue and would play INSTEAD of
-        # the front-inserted qobj — take it off the board first. Also
-        # guarantees put_front sees no in-flight head (mid-song, the prefetch
-        # is the only possible one).
+        # the front-inserted qobj — take it off the board first.
         await self._neutralize_prefetch()
+
+        # Re-check after the awaits above (cancellation can block up to
+        # yt-dlp's socket timeout): if the song ended and the loop moved on,
+        # there is nothing to interrupt — bail to the command's fallback
+        # rather than building a resume entry for a finished song.
+        if self.current_song is not current:
+            return None
 
         was_paused = vc.is_paused()
         replaced = current.interjected
@@ -1551,6 +1562,15 @@ class MusicPlayer:
                             self.play_next.set
                         ),
                     )
+                    if song.start_paused:
+                        # Park the player thread SYNCHRONOUSLY — before any
+                        # await — so a song returning paused leaks at most a
+                        # frame or two of audio, not a Redis round-trip's
+                        # worth. Idempotent with the full pause() below, which
+                        # runs after the start transaction so its
+                        # pause_start_epoch write isn't clobbered by the
+                        # transaction's HDEL.
+                        vc.pause()
                     play_start = time.time()  # capture immediately before any awaits
 
                     # Mirror now-playing song to Redis state. For a real queue item
@@ -1583,10 +1603,12 @@ class MusicPlayer:
 
                     if song.start_paused:
                         # -playnow interrupted this song while it was paused —
-                        # return it parked at the same spot. pause() (not bare
-                        # vc.pause()) so the Redis pause epochs and the
-                        # debounced embed/Activity refresh all engage; the
-                        # activity/NP builds below then render the paused state.
+                        # it returns parked at the same spot (the player thread
+                        # was already paused synchronously at vc.play above).
+                        # The full pause() entry point runs here so the Redis
+                        # pause epochs and the debounced embed/Activity refresh
+                        # all engage; the activity/NP builds below then render
+                        # the paused state.
                         await self.pause(vc)
                     if song.is_resume:
                         await self._announce_resume(song)

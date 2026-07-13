@@ -223,7 +223,14 @@ class GuildRedisStore:
         """LPUSH entries so entries[0] ends up at the queue head, and refresh
         TTL on all guild keys — the -playnow front insert. LPUSH pushes each
         successive argument to the head, so the batch is reversed first to
-        preserve the given order."""
+        preserve the given order.
+
+        Failure note (store policy: log, never raise): a swallowed failure
+        here degrades WORSE than a tail-push failure. The in-memory legs end
+        up len(entries) ahead of Redis at the HEAD, so the next commit-time
+        LPOPs retire other songs' entries — a crash before the mismatch
+        drains restores a queue shifted by up to that many songs, not just
+        missing the entries that failed to push."""
         if not entries:
             return
         try:

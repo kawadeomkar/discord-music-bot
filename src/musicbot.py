@@ -470,14 +470,30 @@ class MusicBot(commands.Cog):
                 if outcome is None:
                     # The song ended while the input was resolving — nothing
                     # to interrupt anymore. The input is already parsed and
-                    # resolved, so enqueue the qobj directly through play's
-                    # enqueue path rather than re-invoking -play, which would
-                    # re-parse and re-resolve — and, for a playlist, enqueue
-                    # ALL tracks right after the first-track-only notice above.
-                    # Reset the marker: a normally queued song must not trigger
-                    # replace semantics when a later -playnow interrupts it.
+                    # resolved, so insert the qobj directly rather than
+                    # re-invoking -play, which would re-parse and re-resolve —
+                    # and, for a playlist, enqueue ALL tracks right after the
+                    # first-track-only notice above. FRONT insert, not append:
+                    # the user asked for "now", and this window can be seconds
+                    # long (the loop mid-resolve on the next song) with more
+                    # songs queued behind it. Reset the marker: a normally
+                    # queued song must not trigger replace semantics when a
+                    # later -playnow interrupts it.
                     qobj.interjected = False
-                    return await self._enqueue_single(ctx, qobj, mp)
+                    await mp.queue.put_front([qobj])
+                    await asyncio.gather(
+                        send_embed(
+                            ctx,
+                            f"▶️ Playing next: {qobj.title}",
+                            f"Requested by: [{ctx.author.mention}]\n"
+                            "The song being interrupted already ended — "
+                            "queued to play next instead.",
+                            discord.Color.blue(),
+                            thumbnail=qobj.thumbnail,
+                        ),
+                        ctx.message.add_reaction("⏯️"),
+                    )
+                    return
 
                 if outcome.replaced:
                     desc = (

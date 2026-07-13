@@ -200,8 +200,15 @@ class GuildQueue:
         down the rebuild path: the in-flight item's Redis entry is still at
         the list head awaiting its commit-time LPOP, so a plain LPUSH in
         front of it would make that LPOP eat the new head instead.
-        MusicPlayer.interject() neutralizes the prefetch before calling this,
-        so the in-flight branch is defensive, not load-bearing.
+
+        The in-flight branch is LOAD-BEARING, not defensive — do not remove
+        it as dead code. MusicPlayer.interject() neutralizes the prefetch
+        before calling this, but one interleaving still reaches here with a
+        real in-flight head: the current song ends naturally, the loop
+        synchronously claims a still-running prefetch task and awaits it (up
+        to yt-dlp's socket timeout), and interject() runs inside that await —
+        its neutralize sees no task to take, while the prefetch's dequeued
+        item sits uncommitted at the display head.
         """
         if not items:
             return
