@@ -28,22 +28,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     poetry install --only=main --no-root
 
 # ── Test stage ────────────────────────────────────────────────────────────────
-# Inherits the builder venv and adds test deps (pytest, fakeredis, pytest-cov).
+# Inherits the builder venv and adds test deps (pytest, fakeredis, pytest-cov)
+# plus lint deps (black, pyright). Runs pytest by default; build.sh overrides the
+# command to run black against a bind-mounted src/ and tests/.
 # Used by the container-test CI job. Never pushed to GHCR.
 FROM builder AS test
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main,test --no-root
+    poetry install --only=main,test,lint --no-root
 
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY pyproject.toml ./
 
 ARG ENVIRONMENT=development
+# BLACK_CACHE_DIR is under /tmp so it stays writable when the container runs as
+# the host uid (needed so black's rewrites come out host-owned, not root-owned).
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
-    ENVIRONMENT="${ENVIRONMENT}"
+    ENVIRONMENT="${ENVIRONMENT}" \
+    BLACK_CACHE_DIR=/tmp/black-cache
 
 CMD ["python", "-m", "pytest", "--tb=short", "-q"]
 

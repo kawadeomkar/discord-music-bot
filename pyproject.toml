@@ -37,6 +37,9 @@ pytest-cov = "^7.1.0"
 pyright = "^1.1.409"
 black = "^26.5.1"
 
+[tool.black]
+target-version = ["py314"]
+
 [tool.pyright]
 pythonVersion = "3.14"
 typeCheckingMode = "basic"
