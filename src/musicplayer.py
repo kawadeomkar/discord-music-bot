@@ -1690,11 +1690,24 @@ class MusicPlayer:
                     # frozen at the last periodic tick's position.
                     finished_host = self._np_host_message
                     finished_own = self._np_host_own_embeds
+                    finished_dedicated = self._np_host_dedicated
                     self._release_np_host()
-                    if self.current_song is not None and finished_host is not None:
-                        self._fire_finalize_now_playing(
-                            self.current_song, finished_host, finished_own
-                        )
+                    if finished_host is not None:
+                        if stream_failed:
+                            # A completed bar is a truthful record only for a song
+                            # that played. This one delivered nothing, so the NP
+                            # block is disposed of (same rationale as
+                            # retire_np_host_on_stop) rather than finalized to
+                            # 100% right above the failure notice.
+                            self._spawn_background(
+                                self._retire_np_host(
+                                    finished_host, finished_own, finished_dedicated
+                                )
+                            )
+                        elif self.current_song is not None:
+                            self._fire_finalize_now_playing(
+                                self.current_song, finished_host, finished_own
+                            )
 
                     # Claim-then-await: interject() may have neutralized (and
                     # nulled) the task while this iteration sat in

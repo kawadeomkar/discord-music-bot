@@ -643,6 +643,18 @@ class TestStreamUrlTtl:
         assert ttl is not None
         assert 2400 - 1800 - 5 <= ttl <= 2400 - 1800 + 5
 
+    def test_reads_expire_from_hls_manifest_path_segment(self):
+        """HLS manifest URLs — the muxed formats the degraded web_safari rung
+        serves — carry expire as a path segment, not a query param. Missing it
+        would leave the entire fallback rung uncached: a full re-extract on
+        every play of every degraded song."""
+        future = int(time.time()) + 7200
+        url = (
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist"
+            f"/expire/{future}/ei/abcdefgh/id/xyz/playlist/index.m3u8"
+        )
+        assert _stream_url_ttl(url) == 1800
+
     def test_returns_none_when_no_expire_param(self):
         ttl = _stream_url_ttl("https://r2.googlevideo.com/stream?other=x")
         assert ttl is None

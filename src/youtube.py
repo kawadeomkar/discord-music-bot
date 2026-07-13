@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -240,9 +241,18 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
 
     The `ip` parameter is inside `sparams` (HMAC-signed), so URLs are also bound to the IP that
     extracted them and can never be reused from another host.
+
+    `expire` lives in the query string on https formats, but HLS manifest URLs — the muxed
+    formats the degraded web_safari rung serves — carry it as a path segment
+    (`/expire/<epoch>/`). Both forms are read; missing either would leave that rung uncached,
+    silently re-extracting 3-5s on every play.
     """
     try:
-        expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
+        parsed = urlparse(stream_url)
+        expire = int(parse_qs(parsed.query).get("expire", [0])[0])
+        if not expire:
+            match = re.search(r"/expire/(\d+)(?:/|$)", parsed.path)
+            expire = int(match.group(1)) if match else 0
         ttl = min(expire - int(time.time()) - 1800, _STREAM_URL_MAX_TTL)
         return ttl if ttl > 60 else None
     except ValueError, IndexError:
@@ -538,12 +548,24 @@ class YTDL(discord.FFmpegOpusAudio):
                 return data
 
             span.set_attribute("ytdl.stream_url_revoked", True)
-            log.warning(
-                f"YouTube revoked the stream URL for {qo.webpage_url} "
-                f"(attempt {attempt + 1}/2, {'fresh' if extracted_fresh else 'cached'}) "
-                "— dropping it from the cache and re-extracting"
-            )
-            await cache_del(redis, cache_key)
+            if not extracted_fresh:
+                # Only a cached URL has a cache entry to drop — a fresh one is
+                # cached exclusively on probe success, above.
+                log.warning(
+                    f"YouTube revoked the cached stream URL for {qo.webpage_url} "
+                    "— dropping it from the cache and re-extracting"
+                )
+                await cache_del(redis, cache_key)
+            elif attempt == 0:
+                log.warning(
+                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    "dead — re-extracting once"
+                )
+            else:
+                log.warning(
+                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    "dead again — giving up"
+                )
             data = None
 
         raise RuntimeError(
