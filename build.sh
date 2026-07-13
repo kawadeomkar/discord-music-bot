@@ -9,8 +9,24 @@ if [ -z "${ENVIRONMENT:-}" ]; then
 fi
 export ENVIRONMENT
 
-poetry install --only=main,lint --no-root
-poetry run python -m black src/ tests/ --target-version py313
+# One image carries both black and pytest. Both runs bind-mount src/ and tests/
+# over the image's baked-in copy, so pytest sees exactly what black just wrote.
+echo "Building test image"
+docker build --build-arg ENVIRONMENT="$ENVIRONMENT" -t "discord-music-bot:test" --target test -f Dockerfile .
+
+echo "Formatting src/ and tests/ with black"
+docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -v "$PWD/src:/app/src" \
+    -v "$PWD/tests:/app/tests" \
+    "discord-music-bot:test" \
+    black src/ tests/
+
+echo "Running tests"
+docker run --rm \
+    -v "$PWD/src:/app/src" \
+    -v "$PWD/tests:/app/tests" \
+    "discord-music-bot:test"
 
 export GIT_SHA="$(git rev-parse HEAD)"
 BUILD_TAG="discord-music-bot:$GIT_SHA"
