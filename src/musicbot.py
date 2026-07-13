@@ -349,7 +349,7 @@ class MusicBot(commands.Cog):
         name="play",
         aliases=["p", "sing"],
         brief="queue a song and start playing",
-        usage="<url or search terms>",
+        usage="<url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
             "playlist, a Spotify track or playlist link, a SoundCloud link, or "
@@ -460,7 +460,7 @@ class MusicBot(commands.Cog):
         name="playnow",
         aliases=["pn"],
         brief="play a song immediately, resuming the current one after",
-        usage="<url or search terms>",
+        usage="<url|search>",
         help=(
             "Interrupts whatever is playing so your song starts right now. The "
             "interrupted song is not lost — it comes back from the exact position "

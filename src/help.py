@@ -11,7 +11,8 @@ src/musicbot.py) rather than in a table here, so a new command shows up in the
 help output as soon as it is declared.
 """
 
-from typing import Any, List, Mapping, Optional
+import textwrap
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 import discord
 from discord.ext import commands
@@ -32,6 +33,28 @@ UNCATEGORISED = "Other"
 
 # Discord's hard cap on an embed field value.
 _FIELD_LIMIT = 1024
+
+# The command list is a monospace table. Discord has no table primitive, so columns
+# can only be aligned inside a code block — and a code block does not soft-wrap: past
+# roughly 60 characters it scrolls sideways on mobile. Hence the width budget, and
+# hence the deliberately terse usage= strings on the commands (`<url|search>`, not
+# `<url or search terms>`): one long signature would otherwise set the column width
+# for every row. Cells that still overflow are wrapped rather than truncated — the
+# table may grow a line, but it never silently loses text.
+_TABLE_WIDTH = 62
+_MIN_DESC_WIDTH = 20
+# Aliases are capped rather than measured: one long alias list (`np, rn, nowplaying`)
+# would otherwise claim a third of the table and starve the description column into
+# wrapping every row. Capped, it wraps instead — and it is the least important column.
+_MAX_ALIAS_WIDTH = 13
+_GUTTER = "  "
+_HEADERS: Tuple[str, str, str] = ("Command", "Aliases", "Description")
+_FENCE = "```"
+
+# A row's cell triple: signature, aliases, one-line summary.
+Row = Tuple[str, str, str]
+# Column widths: command, aliases, description.
+Widths = Tuple[int, int, int]
 
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
@@ -114,33 +137,78 @@ class MusicHelpCommand(commands.HelpCommand):
     def _aliases(self, command: commands.Command) -> str:
         return " ".join(f"`{alias}`" for alias in command.aliases)
 
-    def _entry(self, command: commands.Command) -> str:
-        """One command's two-line block in the command list."""
-        signature = f"**`{self.get_command_signature(command).strip()}`**"
-        aliases = self._aliases(command)
-        header = f"{signature}  ·  {aliases}" if aliases else signature
-        summary = command.brief or command.short_doc or "no description"
-        return f"{header}\n{summary}"
+    def _row(self, command: commands.Command) -> Row:
+        return (
+            self.get_command_signature(command).strip(),
+            ", ".join(command.aliases),
+            command.brief or command.short_doc or "no description",
+        )
 
-    def _add_command_field(
-        self, embed: discord.Embed, category: str, entries: List[str]
+    def _widths(self, rows: Sequence[Row]) -> Widths:
+        """Column widths, measured across *every* command rather than per category,
+        so the separate category tables share one grid and read as a single table."""
+        command_width = max(len(_HEADERS[0]), *(len(row[0]) for row in rows))
+        alias_width = min(
+            _MAX_ALIAS_WIDTH,
+            max(len(_HEADERS[1]), *(len(row[1]) for row in rows)),
+        )
+        description_width = max(
+            _MIN_DESC_WIDTH,
+            _TABLE_WIDTH - command_width - alias_width - 2 * len(_GUTTER),
+        )
+        return command_width, alias_width, description_width
+
+    def _line(self, cells: Sequence[str], widths: Widths) -> str:
+        command, alias, description = cells
+        return (
+            f"{command:<{widths[0]}}{_GUTTER}{alias:<{widths[1]}}{_GUTTER}{description}"
+        ).rstrip()
+
+    def _head(self, widths: Widths) -> List[str]:
+        rule = "-" * (widths[0] + widths[1] + widths[2] + 2 * len(_GUTTER))
+        return [self._line(_HEADERS, widths), rule]
+
+    def _row_lines(self, row: Row, widths: Widths) -> List[str]:
+        """One command's row — several physical lines when a cell has to wrap."""
+        columns = [
+            textwrap.wrap(cell, width) or [""] for cell, width in zip(row, widths)
+        ]
+        height = max(len(column) for column in columns)
+        return [
+            self._line(
+                [column[i] if i < len(column) else "" for column in columns], widths
+            )
+            for i in range(height)
+        ]
+
+    def _add_table_field(
+        self, embed: discord.Embed, category: str, rows: Sequence[Row], widths: Widths
     ) -> None:
-        """Add one category field, splitting across continuation fields rather
-        than letting Discord reject an over-long value (>1024 chars)."""
+        """Add one category's table, continuing into further fields rather than
+        letting Discord reject an over-long value (>1024 chars). Each continuation
+        repeats the header, so a split table still has labelled columns."""
         emoji = CATEGORY_EMOJI.get(category, CATEGORY_EMOJI[UNCATEGORISED])
         name = f"{emoji} {category}"
-        chunk: List[str] = []
-        length = 0
-        for entry in entries:
-            # +1 for the newline joining this entry to the previous one.
-            if chunk and length + len(entry) + 1 > _FIELD_LIMIT:
-                embed.add_field(name=name, value="\n".join(chunk), inline=False)
+        head = self._head(widths)
+        # The fences and their newlines are part of the field value Discord measures.
+        budget = _FIELD_LIMIT - (2 * len(_FENCE) + 2)
+
+        def size(lines: Sequence[str]) -> int:
+            return sum(len(line) + 1 for line in lines)
+
+        chunk = list(head)
+        for row in rows:
+            lines = self._row_lines(row, widths)
+            if len(chunk) > len(head) and size(chunk) + size(lines) > budget:
+                embed.add_field(name=name, value=self._fence(chunk), inline=False)
                 name = f"{emoji} {category} (cont.)"
-                chunk, length = [], 0
-            chunk.append(entry)
-            length += len(entry) + 1
-        if chunk:
-            embed.add_field(name=name, value="\n".join(chunk), inline=False)
+                chunk = list(head)
+            chunk.extend(lines)
+        if len(chunk) > len(head):
+            embed.add_field(name=name, value=self._fence(chunk), inline=False)
+
+    def _fence(self, lines: Sequence[str]) -> str:
+        return f"{_FENCE}\n" + "\n".join(lines) + f"\n{_FENCE}"
 
     # ── dispatch ──────────────────────────────────────────────────────────────
 
@@ -162,14 +230,16 @@ class MusicHelpCommand(commands.HelpCommand):
             color=HELP_COLOR,
         )
 
-        buckets: dict[str, List[str]] = {}
+        buckets: dict[str, List[Row]] = {}
         for command in visible:
-            buckets.setdefault(self._category(command), []).append(self._entry(command))
+            buckets.setdefault(self._category(command), []).append(self._row(command))
 
-        ordered = [c for c in CATEGORY_ORDER if c in buckets]
-        ordered += [c for c in buckets if c not in CATEGORY_ORDER]
-        for category in ordered:
-            self._add_command_field(embed, category, buckets[category])
+        if buckets:
+            widths = self._widths([row for rows in buckets.values() for row in rows])
+            ordered = [c for c in CATEGORY_ORDER if c in buckets]
+            ordered += [c for c in buckets if c not in CATEGORY_ORDER]
+            for category in ordered:
+                self._add_table_field(embed, category, buckets[category], widths)
 
         embed.add_field(name="🎧 What you can play", value=SOURCES, inline=False)
         embed.add_field(name="💡 Good to know", value=TIPS, inline=False)
