@@ -3443,9 +3443,8 @@ class TestLoop:
         ):
             await music_player.loop()
 
-        music_player._channel.send.assert_awaited_with(
-            "Failed to load the next song, skipping."
-        )
+        sent_embeds = music_player._channel.send.call_args.kwargs["embeds"]
+        assert sent_embeds[0].description == "Failed to load the next song, skipping."
 
     async def test_resolve_failure_balances_queue_and_redis(
         self, music_player, queue_obj, fake_redis

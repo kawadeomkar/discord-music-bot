@@ -47,7 +47,7 @@ services:
     container_name: discord-otel-lgtm
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3000:3000"    # Grafana UI (localhost only)
+      - "127.0.0.1:3014:3000"    # Grafana UI (localhost only)
       - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
       - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
     volumes:

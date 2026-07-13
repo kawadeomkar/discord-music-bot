@@ -1132,7 +1132,10 @@ class TestClearCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.clear.callback(music_bot, mock_ctx)
         mp.queue_clear.assert_awaited_once()
-        mock_ctx.send.assert_awaited_once_with("The queue is already empty.")
+        assert (
+            mock_ctx.send.await_args.kwargs["embed"].description
+            == "The queue is already empty."
+        )
 
     async def test_sends_embed_with_cleared_songs(self, music_bot, mock_ctx):
         cleared = ["Song A - https://yt.com/1", "Song B - https://yt.com/2"]
@@ -1460,7 +1463,10 @@ class TestNowCommand:
 
         await MusicBot.now.callback(music_bot, mock_ctx)
         mp.repin_now_playing.assert_awaited_once()
-        mock_ctx.send.assert_awaited_with("No songs are currently playing.")
+        assert (
+            mock_ctx.send.await_args.kwargs["embed"].description
+            == "No songs are currently playing."
+        )
 
     async def test_sends_not_playing_when_no_song(
         self, music_bot, mock_ctx, mock_guild
@@ -1471,7 +1477,10 @@ class TestNowCommand:
         mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.now.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_with("No songs are currently playing.")
+        assert (
+            mock_ctx.send.await_args.kwargs["embed"].description
+            == "No songs are currently playing."
+        )
 
     async def test_now_reports_nothing_playing_after_song_ends(
         self, music_bot, mock_ctx, mock_guild
@@ -1489,7 +1498,10 @@ class TestNowCommand:
         mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
         await MusicBot.now.callback(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_with("No songs are currently playing.")
+        assert (
+            mock_ctx.send.await_args.kwargs["embed"].description
+            == "No songs are currently playing."
+        )
 
     async def test_sends_restored_snapshot_during_recovery_window(
         self, music_bot, mock_ctx, mock_guild
@@ -1790,7 +1802,7 @@ class TestRestoreGuildChannelDeleted:
         await music_bot_with_redis._restore_guild(mock_guild)
 
         mock_guild.system_channel.send.assert_awaited_once()
-        msg = mock_guild.system_channel.send.call_args[0][0]
+        msg = mock_guild.system_channel.send.call_args.kwargs["embed"].description
         assert "⚠️" in msg
         assert "voice channel" in msg
         assert "text channel" in msg
@@ -1844,7 +1856,7 @@ class TestRestoreGuildChannelDeleted:
         await music_bot_with_redis._restore_guild(mock_guild)
 
         text_channel.send.assert_awaited_once()
-        msg = text_channel.send.call_args[0][0]
+        msg = text_channel.send.call_args.kwargs["embed"].description
         assert "voice channel" in msg
         assert "was deleted" in msg
 
@@ -1918,7 +1930,7 @@ class TestRemoveCommand:
         await MusicBot.remove.callback(music_bot, mock_ctx, None)
 
         mock_ctx.send.assert_awaited_once()
-        msg = mock_ctx.send.call_args[0][0]
+        msg = mock_ctx.send.call_args.kwargs["embed"].description
         assert "-remove" in msg
 
     async def test_no_match_sends_not_found_embed(self, music_bot, mock_ctx):

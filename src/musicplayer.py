@@ -19,6 +19,7 @@ from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    notice_embed,
     record_span_error,
     send_embed,
     trace_footer,
@@ -1289,8 +1290,11 @@ class MusicPlayer:
                         )
                         dequeue_owed = False
                         try:
-                            await self._channel.send(
-                                "Failed to load the next song, skipping."
+                            await self.send_with_np(
+                                embed=notice_embed(
+                                    "Failed to load the next song, skipping.",
+                                    discord.Color.red(),
+                                )
                             )
                         except Exception as e:
                             log.warning(

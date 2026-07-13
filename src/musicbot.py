@@ -28,6 +28,7 @@ from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     latency_color,
+    notice_embed,
     queue_message,
     record_span_error,
     send_embed,
@@ -211,8 +212,11 @@ class MusicBot(commands.Cog):
             cmd = ctx.command
             usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
             await ctx.send(
-                f"Missing argument: `{error.param.name}`."
-                + (f" Usage: {usage}" if usage else "")
+                embed=notice_embed(
+                    f"Missing argument: `{error.param.name}`."
+                    + (f" Usage: {usage}" if usage else ""),
+                    discord.Color.red(),
+                )
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
@@ -221,7 +225,7 @@ class MusicBot(commands.Cog):
         command_name = ctx.command.name if ctx.command is not None else ""
         msg = _check_voice_permissions(ctx.author, voice_client, command_name)
         if msg:
-            await ctx.send(msg)
+            await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)
 
     async def _command_error(
@@ -468,10 +472,12 @@ class MusicBot(commands.Cog):
         try:
             mp = self.get_mp(ctx)
             async with ctx.typing():
-                await ctx.send("Please wait... shuffling")
+                await ctx.send(
+                    embed=notice_embed("Please wait... shuffling", discord.Color.blue())
+                )
                 msg = await mp.queue_shuffle()
                 await ctx.message.add_reaction("🔀")
-                await ctx.send(msg)
+                await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
         except Exception as e:
             log.error(f"shuffle failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -517,7 +523,11 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             cleared = await mp.queue_clear()
             if not cleared:
-                await ctx.send("The queue is already empty.")
+                await ctx.send(
+                    embed=notice_embed(
+                        "The queue is already empty.", discord.Color.orange()
+                    )
+                )
                 return
             description = queue_message(cleared)
             await asyncio.gather(
@@ -542,8 +552,11 @@ class MusicBot(commands.Cog):
     async def remove(self, ctx: commands.Context, url: Optional[str] = None):
         if url is None:
             await ctx.send(
-                "`-remove <url>` — removes all songs matching the given URL from the queue. "
-                "The URL must match the YouTube link shown in the **Now Playing** embed."
+                embed=notice_embed(
+                    "`-remove <url>` — removes all songs matching the given URL from the queue. "
+                    "The URL must match the YouTube link shown in the **Now Playing** embed.",
+                    discord.Color.blue(),
+                )
             )
             return
         mp = self.get_mp(ctx)
@@ -605,7 +618,11 @@ class MusicBot(commands.Cog):
                 # embed (no live progress bar) until loop() starts real playback.
                 await ctx.send(embed=mp.play_message)
             else:
-                await ctx.send("No songs are currently playing.")
+                await ctx.send(
+                    embed=notice_embed(
+                        "No songs are currently playing.", discord.Color.orange()
+                    )
+                )
         except Exception as e:
             log.error(f"now failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -620,7 +637,9 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             if mp and mp.history:
                 q_history = queue_message(list(mp.history)[:10])
-                await ctx.send(q_history)
+                await ctx.send(
+                    embed=notice_embed(q_history, discord.Color.blue(), title="History")
+                )
         except Exception as e:
             log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -632,7 +651,9 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.jump")
     async def jump(self, ctx: commands.Context):
         try:
-            await ctx.send("currently in development")
+            await ctx.send(
+                embed=notice_embed("currently in development", discord.Color.blue())
+            )
         except Exception as e:
             log.error(f"jump failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -663,15 +684,29 @@ class MusicBot(commands.Cog):
                 try:
                     volume = int(volume)
                 except ValueError:
-                    await ctx.send("Volume must be a number between 0 and 100")
+                    await ctx.send(
+                        embed=notice_embed(
+                            "Volume must be a number between 0 and 100",
+                            discord.Color.red(),
+                        )
+                    )
                     return
             if not 0 <= volume <= 100:
-                return await ctx.send("Volume must be between 0 and 100")
+                return await ctx.send(
+                    embed=notice_embed(
+                        "Volume must be between 0 and 100", discord.Color.red()
+                    )
+                )
             mp = self.get_mp(ctx)
             mp.volume = volume / 100
             if mp.store is not None:
                 await mp.store.set_volume(mp.volume)
-            await ctx.send(f"Set volume to {volume}% (takes effect on next song)")
+            await ctx.send(
+                embed=notice_embed(
+                    f"Set volume to {volume}% (takes effect on next song)",
+                    discord.Color.blue(),
+                )
+            )
         except Exception as e:
             log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
@@ -838,8 +873,11 @@ class MusicBot(commands.Cog):
                     verb = "was" if len(deleted) == 1 else "were"
                     try:
                         await notify_channel.send(
-                            f"⚠️ I came back online but the {what} I was playing in "
-                            f"{verb} deleted. Use `-play` in a voice channel to start fresh."
+                            embed=notice_embed(
+                                f"⚠️ I came back online but the {what} I was playing in "
+                                f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
+                                discord.Color.orange(),
+                            )
                         )
                     except Exception as notify_err:
                         log.warning(
