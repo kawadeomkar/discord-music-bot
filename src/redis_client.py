@@ -38,6 +38,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_DURATION,
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
+    StateField.CURRENT_SONG_INTERJECTED,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
@@ -218,6 +219,21 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
 
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+        """LPUSH entries so entries[0] ends up at the queue head, and refresh
+        TTL on all guild keys — the -playnow front insert. LPUSH pushes each
+        successive argument to the head, so the batch is reversed first to
+        preserve the given order."""
+        if not entries:
+            return
+        try:
+            pipe = self.redis.pipeline()
+            pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
+            self._pipe_expire_all(pipe)
+            await pipe.execute()  # type: ignore[misc]
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] Redis push_queue_front failed: {e}")
+
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes the item immediately with no ack.
         # If the bot crashes after this call, the song is lost from Redis.
@@ -244,6 +260,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_REQUESTER_ID: (
                 str(current.requester_id) if current.requester_id else ""
             ),
+            StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }

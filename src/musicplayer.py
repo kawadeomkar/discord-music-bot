@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import time
+from dataclasses import dataclass
 from typing import Any, List, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -84,6 +85,42 @@ _BAR_HEAD = "🔘"
 # Activity refresh — collapses rapid -pause/-resume toggling into one trailing
 # update instead of one Discord API call pair per toggle (Design §5).
 _PAUSE_DEBOUNCE_SECS = 0.5
+
+# ── -playnow interjection (docs/PLAYNOW_PROPOSAL.md) ──────────────────────────
+# Songs with less than this many seconds remaining get no resume entry when
+# interjected — there is nothing meaningful to return to.
+_MIN_RESUME_REMAINING_SECS = 5
+# EOF guard for the resume seek (duration metadata is imprecise), matching the
+# crash-recovery position cap in _restore_state().
+_RESUME_EOF_MARGIN_SECS = 10
+
+
+@dataclass(frozen=True)
+class InterjectOutcome:
+    """What MusicPlayer.interject() did — everything the -playnow command
+    needs for its confirmation wording."""
+
+    interrupted_title: str
+    # None → no resume entry was created (the interrupted song was itself an
+    # interjection, was nearly finished, or had no webpage_url to rebuild from).
+    resume_position: Optional[int]
+    was_paused: bool
+    replaced: bool  # the interrupted song was itself a -playnow interjection
+
+    @property
+    def resume_position_str(self) -> str:
+        return _fmt_duration(self.resume_position or 0)
+
+
+def _remaining_secs(item: QueueObject) -> Optional[int]:
+    """A queued item's expected playtime: full duration, minus the resume
+    offset for a -playnow resume entry — it only plays its tail, so ETA math
+    counting its full duration would overestimate everything behind it."""
+    if item.duration is None:
+        return None
+    if item.is_resume and item.ts:
+        return max(0, item.duration - item.ts)
+    return item.duration
 
 
 def _build_progress_bar(
@@ -172,6 +209,7 @@ class MusicPlayer:
         "_np_host_dedicated",
         "_np_edit_lock",
         "_pause_debounce_task",
+        "_skip_history_once",
     )
 
     bot: commands.Bot
@@ -197,6 +235,7 @@ class MusicPlayer:
     _np_host_dedicated: bool
     _np_edit_lock: asyncio.Lock
     _pause_debounce_task: Optional[asyncio.Task]
+    _skip_history_once: bool
 
     def __init__(
         self,
@@ -243,6 +282,11 @@ class MusicPlayer:
         self._np_host_dedicated: bool = False
         self._np_edit_lock = asyncio.Lock()
         self._pause_debounce_task: Optional[asyncio.Task] = None
+        # Set by interject() when it stops a song that will RETURN (a resume
+        # entry was front-inserted): the stop-transition's history step skips
+        # one add, so the song is recorded once — when its tail finishes —
+        # instead of twice. Consumed read-and-reset, like the cleared-flag.
+        self._skip_history_once: bool = False
 
     @classmethod
     def from_context(
@@ -318,13 +362,19 @@ class MusicPlayer:
             requester = _requester_mention(item.requester)
             dur = _fmt_duration(item.duration) if item.duration is not None else "?:??"
             channel = item.uploader or "Unknown channel"
-            ts_note = f"  ·  starts at `{item.ts}s`" if item.ts else ""
+            if item.is_resume and item.ts:
+                ts_note = f"  ·  ⏮ resumes at `{_fmt_duration(item.ts)}`"
+            elif item.ts:
+                ts_note = f"  ·  starts at `{item.ts}s`"
+            else:
+                ts_note = ""
             line = (
                 f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
                 f"{channel} · {requester}"
             )
-            if item.duration is not None:
-                cumulative_secs += item.duration
+            remaining = _remaining_secs(item)
+            if remaining is not None:
+                cumulative_secs += remaining
             else:
                 uncertain = True
         else:
@@ -341,8 +391,9 @@ class MusicPlayer:
         """
         now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
         for item in self.queue.display_items():
-            if isinstance(item, QueueObject) and item.duration is not None:
-                cumulative_secs += item.duration
+            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
+            if remaining is not None:
+                cumulative_secs += remaining
             else:
                 uncertain = True
         est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
@@ -355,8 +406,9 @@ class MusicPlayer:
         total_secs = 0
         duration_partial = False
         for item in items:
-            if isinstance(item, QueueObject) and item.duration is not None:
-                total_secs += item.duration
+            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
+            if remaining is not None:
+                total_secs += remaining
             else:
                 duration_partial = True
 
@@ -616,6 +668,7 @@ class MusicPlayer:
         rather than song.position_secs's live value — used by _finalize_now_playing()
         to show the bar fully completed once the song has actually ended."""
         lines = []
+        position = 0.0
         if song.duration_secs > 0:
             position = (
                 position_override
@@ -630,9 +683,11 @@ class MusicPlayer:
                 lines.append("")
         requester_line = f"Requester: [{_requester_mention(song.requester)}]"
         if song.duration_secs > 0:
-            requester_line += (
-                f"  ·  Estimated finish: {_fmt_finish_time(song.duration_secs)}"
-            )
+            # Remaining time, not total duration: a song started mid-stream
+            # (?t= link, crash recovery, -playnow resume) finishes sooner than
+            # its full length from now.
+            remaining = max(0, song.duration_secs - int(position))
+            requester_line += f"  ·  Estimated finish: {_fmt_finish_time(remaining)}"
         lines.append(requester_line)
         description = "\n".join(lines)
         fields = NowPlayingData.from_song(song)
@@ -963,6 +1018,163 @@ class MusicPlayer:
         if self._progress_task is not None and self._np_host_message is not None:
             self._spawn_background(self._edit_now_playing_once())
         self._spawn_background(self.update_activity(self.current_song))
+
+    # ── -playnow interjection ─────────────────────────────────────────────────
+
+    @_tracer.start_as_current_span("player.interject")
+    async def interject(
+        self, qobj: QueueObject, vc: discord.VoiceClient
+    ) -> Optional[InterjectOutcome]:
+        """Play `qobj` immediately; the interrupted song returns afterwards.
+
+        Mechanism (docs/PLAYNOW_PROPOSAL.md §4): capture the current song's
+        exact position (frame-counted position_secs — frozen if paused),
+        front-insert [qobj, resume-entry(ts=position)] on the queue, and stop
+        the current song. The playback loop's ordinary dequeue → FFmpeg -ss →
+        play cycle does the rest, and because both entries are persisted
+        (LPUSHed to Redis), crash recovery mid-interjection works unchanged.
+
+        Replace semantics: when the interrupted song is itself an interjection
+        (current.interjected), no resume entry is built for it — the ORIGINAL
+        song's resume entry, still at the queue front, is untouched.
+
+        Returns None when there is no current song — the command falls back to
+        plain -play. Residual race, documented not defended: if the current
+        song ends naturally while this method awaits, the front-inserted
+        entries still play next (after whatever the loop already committed),
+        and a just-finished song's resume entry replays its final seconds.
+        """
+        current = self.current_song
+        if current is None:
+            return None
+        span = trace.get_current_span()
+        span.set_attribute("discord.guild_id", str(self._guild.id))
+        span.set_attribute("song.interjected_title", qobj.title or "")
+
+        # A completed prefetch bypasses the queue and would play INSTEAD of
+        # the front-inserted qobj — take it off the board first. Also
+        # guarantees put_front sees no in-flight head (mid-song, the prefetch
+        # is the only possible one).
+        await self._neutralize_prefetch()
+
+        was_paused = vc.is_paused()
+        replaced = current.interjected
+        position = int(current.position_secs)
+        resume: Optional[QueueObject] = None
+        if not replaced and current.webpage_url:
+            # Near-end check on the RAW position — the EOF cap below pulls the
+            # position back by its margin, which would mask "almost over".
+            near_end = (
+                current.duration_secs > 0
+                and current.duration_secs - position < _MIN_RESUME_REMAINING_SECS
+            )
+            if current.duration_secs > 0:
+                # EOF guard, matching the crash-recovery cap: imprecise
+                # duration metadata must not make FFmpeg seek past the end.
+                position = min(
+                    position,
+                    max(0, current.duration_secs - _RESUME_EOF_MARGIN_SECS),
+                )
+            if not near_end:
+                resume = QueueObject(
+                    current.webpage_url,
+                    current.title or "",
+                    current.requester or self._last_author,
+                    ts=position,
+                    duration=current.duration_secs or None,
+                    uploader=current.uploader,
+                    thumbnail=current.thumbnail,
+                    is_resume=True,
+                    start_paused=was_paused,
+                )
+
+        items = [qobj] if resume is None else [qobj, resume]
+        await self.queue.put_front(items)
+
+        # Stop only if the song we measured is still the one playing — if the
+        # loop already moved on, the front-inserted entries play next anyway
+        # and stopping would kill the WRONG (next) song.
+        if self.current_song is current:
+            if resume is not None:
+                # The interrupted song returns — record it in history once,
+                # when its tail finishes, not also now. A replaced
+                # interjection (no resume) keeps its entry, matching -skip.
+                self._skip_history_once = True
+            vc.stop()
+
+        span.set_attribute("interject.replaced", replaced)
+        span.set_attribute("interject.resume_position", position if resume else -1)
+        return InterjectOutcome(
+            interrupted_title=current.title or "Unknown",
+            resume_position=position if resume is not None else None,
+            was_paused=was_paused,
+            replaced=replaced,
+        )
+
+    async def _neutralize_prefetch(self) -> None:
+        """Take the in-flight prefetch (if any) off the board so the loop's
+        next dequeue comes from the queue head.
+
+        Claim-then-settle: _prefetch_task is nulled synchronously before any
+        await, and the loop's matching read in its prefetch-await step is also
+        a synchronous read-and-null — so exactly one of interject()/loop()
+        consumes any given prefetch result.
+
+        - running task → cancel; its CancelledError handler returns the
+          dequeued item to the pending front (requeue_front), exactly as the
+          bulk mutations rely on.
+        - completed task → rebuild an equivalent QueueObject from the resolved
+          song, return it to the pending front, and kill its FFmpeg
+          subprocess. The display/Redis legs never moved for the prefetch's
+          dequeue, so the rebuilt item re-aligns all three legs
+          (requeue_front's documented "resolved form" tolerance).
+        - completed-with-None → the prefetch failed and already retired its
+          own dequeue (finish_failed_dequeue); nothing to undo.
+        """
+        task = self._prefetch_task
+        self._prefetch_task = None
+        if task is None:
+            return
+        if not task.done():
+            await cancel_task(task)
+            return
+        try:
+            song = task.result()
+        except asyncio.CancelledError, Exception:
+            song = None
+        if song is None:
+            return
+        rebuilt = QueueObject(
+            song.webpage_url or "",
+            song.title or "",
+            song.requester or self._last_author,
+            duration=song.duration_secs or None,
+            uploader=song.uploader,
+            thumbnail=song.thumbnail,
+        )
+        self.queue.requeue_front(rebuilt)
+        song.cleanup()
+
+    async def _announce_resume(self, song: YTDL) -> None:
+        """One-line notice when an interrupted song returns. Sent from the
+        loop's start path — yt_stream's construction-time "Starting song at…"
+        notice is suppressed for resume entries because prefetch constructs
+        them while the interjected song is still playing. Plain channel send,
+        NOT send_with_np: this song's NP host hasn't been sent yet, and
+        send_with_np would adopt the notice as host only for
+        _send_now_playing to immediately retire it."""
+        position = _fmt_duration(int(song.position_secs))
+        if song.start_paused:
+            text = (
+                f"⏮ Returned to **{song.title}** at `{position}` — still paused. "
+                f"Use `-resume` to continue."
+            )
+        else:
+            text = f"⏮ Resuming **{song.title}** at `{position}`"
+        try:
+            await self._channel.send(embed=notice_embed(text, discord.Color.blue()))
+        except Exception as e:
+            log.warning(f"Failed to send resume notice in guild {self._guild.id}: {e}")
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
@@ -1359,6 +1571,16 @@ class MusicPlayer:
                                 current, backdated_start, now_playing=now_playing
                             )
 
+                    if song.start_paused:
+                        # -playnow interrupted this song while it was paused —
+                        # return it parked at the same spot. pause() (not bare
+                        # vc.pause()) so the Redis pause epochs and the
+                        # debounced embed/Activity refresh all engage; the
+                        # activity/NP builds below then render the paused state.
+                        await self.pause(vc)
+                    if song.is_resume:
+                        await self._announce_resume(song)
+
                     await self.update_activity(song)
                     await self._send_now_playing(song)
 
@@ -1389,16 +1611,29 @@ class MusicPlayer:
                             self.current_song, finished_host, finished_own
                         )
 
-                    try:
-                        prefetched_song = await self._prefetch_task
-                    except asyncio.CancelledError:
-                        prefetched_song = None
+                    # Claim-then-await: interject() may have neutralized (and
+                    # nulled) the task while this iteration sat in
+                    # play_next.wait(). Both sides read-and-null synchronously,
+                    # so exactly one consumer sees any given prefetch result;
+                    # a task interject() cancelled resolves here to None.
+                    prefetch_task = self._prefetch_task
                     self._prefetch_task = None
+                    prefetched_song = None
+                    if prefetch_task is not None:
+                        try:
+                            prefetched_song = await prefetch_task
+                        except asyncio.CancelledError:
+                            prefetched_song = None
 
                     if self.current_song is not None:
-                        await self.history.add(
-                            f"{self.current_song.title} - {self.current_song.webpage_url}"
-                        )
+                        if self._skip_history_once:
+                            # interject() stopped this song with a resume entry
+                            # pending — history records it when the tail ends.
+                            self._skip_history_once = False
+                        else:
+                            await self.history.add(
+                                f"{self.current_song.title} - {self.current_song.webpage_url}"
+                            )
 
                     if self.store is not None:
                         await self.store.clear_song_end_state()
@@ -1431,6 +1666,7 @@ class MusicPlayer:
                     # released so the next song starts from a clean slate.
                     self._release_np_host()
                     prefetched_song = None
+                    self._skip_history_once = False
                     self.current_song = None
                     self.play_message = None
                     if self.store is not None:

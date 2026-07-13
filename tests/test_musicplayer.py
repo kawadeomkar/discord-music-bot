@@ -61,6 +61,11 @@ def mock_song():
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
+    # -playnow flags a real YTDL always carries — as bare MagicMock attributes
+    # they'd read truthy and trip the loop's start_paused/is_resume gates.
+    song.interjected = False
+    song.is_resume = False
+    song.start_paused = False
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -3399,6 +3404,11 @@ class TestLoop:
         song.acodec = ""
         song.requester = None
         song.start_offset = 0
+        # -playnow flags a real YTDL always carries — truthy MagicMock
+        # attributes would trip the loop's start_paused/is_resume gates.
+        song.interjected = False
+        song.is_resume = False
+        song.start_paused = False
         return song
 
     async def test_exits_immediately_when_bot_closed(self, music_player):
@@ -4009,6 +4019,11 @@ class TestLoopAdditional:
         song.acodec = ""
         song.requester = None
         song.start_offset = 0
+        # -playnow flags a real YTDL always carries — truthy MagicMock
+        # attributes would trip the loop's start_paused/is_resume gates.
+        song.interjected = False
+        song.is_resume = False
+        song.start_paused = False
         return song
 
     async def test_update_activity_called_at_song_start_and_end(
@@ -4154,3 +4169,326 @@ class TestLoopAdditional:
 
         vc.play.assert_not_called()
         mock_song.cleanup.assert_called_once()
+
+
+# ── -playnow interjection ─────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_vc():
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = True
+    vc.is_paused.return_value = False
+    return vc
+
+
+@pytest.fixture
+def live_song(mock_song):
+    """mock_song with the -playnow flags a real YTDL carries (a bare MagicMock
+    attribute would read as a truthy mock and trip the replace-semantics gate)."""
+    mock_song.interjected = False
+    mock_song.is_resume = False
+    mock_song.start_paused = False
+    return mock_song
+
+
+@pytest.fixture
+def playnow_obj(mock_author):
+    return QueueObject(
+        webpage_url="https://www.youtube.com/watch?v=urgent",
+        title="Urgent Song",
+        requester=mock_author,
+        duration=120,
+        interjected=True,
+    )
+
+
+class TestInterject:
+    async def test_returns_none_without_current_song(
+        self, music_player, playnow_obj, mock_vc
+    ):
+        music_player.current_song = None
+        assert await music_player.interject(playnow_obj, mock_vc) is None
+        mock_vc.stop.assert_not_called()
+
+    async def test_front_inserts_playnow_then_resume(
+        self, music_player, live_song, playnow_obj, mock_vc, mock_author
+    ):
+        live_song.elapsed_secs = 42.0
+        music_player.current_song = live_song
+        queued = QueueObject("https://yt.com/v=b", "Queued B", mock_author)
+        await music_player.queue.put([queued])
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        items = music_player.queue.display_items()
+        assert items[0] is playnow_obj
+        resume = items[1]
+        assert isinstance(resume, QueueObject)
+        assert resume.is_resume is True
+        assert resume.start_paused is False
+        assert resume.ts == 42
+        assert resume.webpage_url == live_song.webpage_url
+        assert resume.duration == live_song.duration_secs
+        assert items[2] is queued
+
+        mock_vc.stop.assert_called_once()
+        assert music_player._skip_history_once is True
+        assert outcome is not None
+        assert outcome.interrupted_title == live_song.title
+        assert outcome.resume_position == 42
+        assert outcome.was_paused is False
+        assert outcome.replaced is False
+
+    async def test_paused_song_returns_start_paused(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        mock_vc.is_paused.return_value = True
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        resume = music_player.queue.display_items()[1]
+        assert isinstance(resume, QueueObject)
+        assert resume.start_paused is True
+        assert outcome is not None and outcome.was_paused is True
+
+    async def test_replace_semantics_skip_resume_for_interjection(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.interjected = True  # the playing song IS a -playnow song
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        assert music_player.queue.display_items() == [playnow_obj]
+        assert music_player._skip_history_once is False  # discarded, not returning
+        mock_vc.stop.assert_called_once()
+        assert outcome is not None
+        assert outcome.replaced is True
+        assert outcome.resume_position is None
+
+    async def test_near_end_skips_resume(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.elapsed_secs = 207.0  # 3s left of 210 — below the 5s floor
+        music_player.current_song = live_song
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        assert music_player.queue.display_items() == [playnow_obj]
+        assert outcome is not None and outcome.resume_position is None
+        assert music_player._skip_history_once is False
+
+    async def test_eof_cap_pulls_position_back(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.elapsed_secs = 205.0  # 5s left: resumable, but capped to 200
+        music_player.current_song = live_song
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        resume = music_player.queue.display_items()[1]
+        assert isinstance(resume, QueueObject)
+        assert resume.ts == 200  # duration 210 − 10s EOF margin
+        assert outcome is not None and outcome.resume_position == 200
+
+    async def test_no_webpage_url_skips_resume(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.webpage_url = None
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        outcome = await music_player.interject(playnow_obj, mock_vc)
+
+        assert music_player.queue.display_items() == [playnow_obj]
+        assert outcome is not None and outcome.resume_position is None
+
+    async def test_stop_skipped_when_song_changed_during_insert(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+
+        async def put_front_and_advance(items):
+            music_player.current_song = MagicMock()  # loop moved on mid-await
+
+        from src.guild_queue import GuildQueue
+
+        # Class-level patch: GuildQueue uses __slots__, so patch.object on the
+        # instance can't set the attribute.
+        with patch.object(GuildQueue, "put_front", side_effect=put_front_and_advance):
+            await music_player.interject(playnow_obj, mock_vc)
+
+        mock_vc.stop.assert_not_called()
+        assert music_player._skip_history_once is False
+
+    async def test_neutralizes_running_prefetch_first(
+        self, music_player, live_song, playnow_obj, mock_vc
+    ):
+        live_song.elapsed_secs = 30.0
+        music_player.current_song = live_song
+        blocker = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = blocker
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        assert blocker.cancelled()
+        assert music_player._prefetch_task is None
+
+
+class TestNeutralizePrefetch:
+    async def test_no_task_is_noop(self, music_player):
+        music_player._prefetch_task = None
+        await music_player._neutralize_prefetch()  # must not raise
+
+    async def test_running_task_cancelled_and_cleared(self, music_player):
+        task = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = task
+        await music_player._neutralize_prefetch()
+        assert task.cancelled()
+        assert music_player._prefetch_task is None
+
+    async def test_completed_task_requeues_rebuilt_item_and_kills_ffmpeg(
+        self, music_player, live_song, mock_author
+    ):
+        # Simulate the prefetch's own dequeue: pending pops, display keeps the
+        # entry (the prefetch commit was still pending).
+        original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.cleanup = MagicMock()
+
+        async def _done():
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        assert music_player._prefetch_task is None
+        live_song.cleanup.assert_called_once()
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.webpage_url == live_song.webpage_url
+        assert rebuilt.title == live_song.title
+
+    async def test_completed_task_with_none_result_is_noop(self, music_player):
+        async def _done():
+            return None
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+        await music_player._neutralize_prefetch()
+        assert music_player.queue.qsize() == 0
+
+    async def test_completed_task_that_raised_is_swallowed(self, music_player):
+        async def _boom():
+            raise RuntimeError("prefetch exploded")
+
+        task = asyncio.create_task(_boom())
+        with contextlib.suppress(RuntimeError):
+            await task
+        music_player._prefetch_task = task
+        await music_player._neutralize_prefetch()  # must not raise
+        assert music_player.queue.qsize() == 0
+
+
+class TestAnnounceResume:
+    async def test_playing_wording(self, music_player, live_song, mock_channel):
+        live_song.elapsed_secs = 42.0
+        live_song.is_resume = True
+        await music_player._announce_resume(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert "Resuming" in embed.description
+        assert "0:42" in embed.description
+
+    async def test_paused_wording(self, music_player, live_song, mock_channel):
+        live_song.elapsed_secs = 42.0
+        live_song.is_resume = True
+        live_song.start_paused = True
+        await music_player._announce_resume(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert "still paused" in embed.description
+        assert "-resume" in embed.description
+
+    async def test_send_failure_swallowed(self, music_player, live_song, mock_channel):
+        mock_channel.send.side_effect = RuntimeError("channel gone")
+        await music_player._announce_resume(live_song)  # must not raise
+
+
+class TestRemainingSecs:
+    def test_normal_item_full_duration(self, queue_obj):
+        from src.musicplayer import _remaining_secs
+
+        assert _remaining_secs(queue_obj) == 210
+
+    def test_resume_entry_counts_only_tail(self, mock_author):
+        from src.musicplayer import _remaining_secs
+
+        item = QueueObject(
+            "https://yt.com/v=1", "T", mock_author, ts=150, duration=210, is_resume=True
+        )
+        assert _remaining_secs(item) == 60
+
+    def test_unknown_duration_is_none(self, queue_obj_no_meta):
+        from src.musicplayer import _remaining_secs
+
+        assert _remaining_secs(queue_obj_no_meta) is None
+
+    def test_non_resume_ts_does_not_shrink_duration(self, mock_author):
+        # A ?t= start offset is a playback preference, not a shorter song —
+        # only resume entries are known to play just their tail.
+        from src.musicplayer import _remaining_secs
+
+        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=150, duration=210)
+        assert _remaining_secs(item) == 210
+
+
+class TestResumeEntryDisplay:
+    async def test_queue_embed_shows_resume_note(self, music_player, mock_author):
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "Interrupted Song",
+            mock_author,
+            ts=150,
+            duration=210,
+            is_resume=True,
+        )
+        await music_player.queue.put([item])
+        embed = music_player.queue_embed()
+        assert "⏮ resumes at `2:30`" in embed.description
+
+    async def test_plain_ts_note_unchanged(self, music_player, mock_author):
+        item = QueueObject("https://yt.com/v=1", "T", mock_author, ts=30, duration=210)
+        await music_player.queue.put([item])
+        embed = music_player.queue_embed()
+        assert "starts at `30s`" in embed.description
+
+
+class TestEstimatedFinishUsesRemaining:
+    def test_offset_start_finishes_sooner(self, music_player, live_song):
+        from src.musicplayer import _fmt_finish_time
+
+        live_song.start_offset = 100  # 110s of the 210s song remain
+        before = _fmt_finish_time(110)
+        embed = music_player._build_now_playing_embed(live_song)
+        after = _fmt_finish_time(110)
+        assert (before in embed.description) or (after in embed.description)
+
+    def test_position_override_shrinks_remaining(self, music_player, live_song):
+        from src.musicplayer import _fmt_finish_time
+
+        before = _fmt_finish_time(10)
+        embed = music_player._build_now_playing_embed(
+            live_song, position_override=200.0
+        )
+        after = _fmt_finish_time(10)
+        assert (before in embed.description) or (after in embed.description)

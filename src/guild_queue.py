@@ -189,6 +189,53 @@ class GuildQueue:
                 for entry in entries:
                     await self._store.push_queue(entry)
 
+    async def put_front(self, items: Sequence[QueueItem]) -> None:
+        """Insert items at the FRONT of the line on all three legs — the
+        -playnow interjection path (docs/PLAYNOW_PROPOSAL.md §4.2).
+
+        Runs under the bulk-mutation mutex like every other multi-leg
+        mutation. An in-flight head (a dequeued-but-uncommitted item, e.g. a
+        completed prefetch awaiting its commit) keeps its position AHEAD of
+        the inserted items on the display leg, and forces the Redis mirror
+        down the rebuild path: the in-flight item's Redis entry is still at
+        the list head awaiting its commit-time LPOP, so a plain LPUSH in
+        front of it would make that LPOP eat the new head instead.
+        MusicPlayer.interject() neutralizes the prefetch before calling this,
+        so the in-flight branch is defensive, not load-bearing.
+        """
+        if not items:
+            return
+        new_items = list(items)
+        async with self._mutex:
+            drained: list[QueueItem] = []
+            for _ in range(self._pending.qsize()):
+                try:
+                    drained.append(self._pending.get_nowait())
+                    self._pending.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            in_flight = self._in_flight_head(drained_count=len(drained))
+            for item in new_items + drained:
+                self._pending.put_nowait(item)
+            self._display = deque(in_flight + new_items + drained)
+
+            if self._store is None:
+                return
+            if in_flight:
+                entries = [
+                    _to_entry(s)
+                    for s in in_flight + new_items + drained
+                    if is_persisted(s)
+                ]
+                if entries:
+                    await self._store.rebuild_queue(entries)
+                else:
+                    await self._store.delete_queue()
+            else:
+                entries = [_to_entry(s) for s in new_items if is_persisted(s)]
+                if entries:
+                    await self._store.push_queue_front(entries)
+
     # ── Bulk operations ───────────────────────────────────────────────────────
     # Callers with a prefetch task (MusicPlayer) must cancel it BEFORE any of
     # these — a still-running prefetch holds an item from get_nowait(), and
@@ -489,4 +536,7 @@ class GuildQueue:
             uploader=entry.uploader,
             thumbnail=entry.thumbnail,
             persisted=entry.persisted,
+            interjected=entry.interjected,
+            is_resume=entry.is_resume,
+            start_paused=entry.start_paused,
         )

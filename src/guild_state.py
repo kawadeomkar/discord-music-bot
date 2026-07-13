@@ -37,6 +37,9 @@ class StateField:
     CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
+    # "1" when the playing song was queued via -playnow — preserves replace
+    # semantics across a crash mid-interjection (docs/PLAYNOW_PROPOSAL.md §4.1).
+    CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
@@ -137,6 +140,7 @@ class GuildStateData:
     current_song_duration: int | None = None
     current_song_uploader: str | None = None
     current_song_requester_id: int | None = None
+    current_song_interjected: bool = False
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
@@ -199,6 +203,9 @@ class GuildStateData:
             current_song_uploader=_b_str(raw, StateField.CURRENT_SONG_UPLOADER) or None,
             current_song_requester_id=_b_opt_int(
                 raw, StateField.CURRENT_SONG_REQUESTER_ID
+            ),
+            current_song_interjected=(
+                _b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1"
             ),
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
@@ -310,6 +317,10 @@ class QueueEntryField:
     UPLOADER: Final[str] = "uploader"
     THUMBNAIL: Final[str] = "thumbnail"
     PERSISTED: Final[str] = "persisted"
+    # -playnow flags — absent on pre-feature entries, parsed as False.
+    INTERJECTED: Final[str] = "interjected"
+    IS_RESUME: Final[str] = "is_resume"
+    START_PAUSED: Final[str] = "start_paused"
     # "ytsource" entries
     YTSEARCH: Final[str] = "ytsearch"
     URL: Final[str] = "url"
@@ -347,6 +358,10 @@ class SongQueueEntry:
     uploader: str | None = None
     thumbnail: str | None = None
     persisted: bool = True
+    # -playnow flags — see the matching QueueObject field comments.
+    interjected: bool = False
+    is_resume: bool = False
+    start_paused: bool = False
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -361,6 +376,9 @@ class SongQueueEntry:
             uploader=item.uploader,
             thumbnail=item.thumbnail,
             persisted=item.persisted,
+            interjected=item.interjected,
+            is_resume=item.is_resume,
+            start_paused=item.start_paused,
         )
 
     @classmethod
@@ -379,6 +397,7 @@ class SongQueueEntry:
             requester_id=song.requester.id if song.requester else None,
             duration=song.duration_secs or None,
             uploader=song.uploader,
+            interjected=song.interjected,
         )
 
     @classmethod
@@ -406,6 +425,10 @@ class SongQueueEntry:
             duration=state.current_song_duration,
             uploader=state.current_song_uploader,
             persisted=False,
+            # A crash mid-interjection must not demote the recovered song to a
+            # "normal" song: a -playnow after recovery still replaces it
+            # (no resume entry) instead of stacking one.
+            interjected=state.current_song_interjected,
         )
 
     def to_redis(self) -> bytes:
@@ -424,6 +447,9 @@ class SongQueueEntry:
                 QueueEntryField.UPLOADER: self.uploader,
                 QueueEntryField.THUMBNAIL: self.thumbnail,
                 QueueEntryField.PERSISTED: self.persisted,
+                QueueEntryField.INTERJECTED: self.interjected,
+                QueueEntryField.IS_RESUME: self.is_resume,
+                QueueEntryField.START_PAUSED: self.start_paused,
             }
         )
 
@@ -492,6 +518,9 @@ def parse_queue_entry(data: bytes) -> QueueEntry | None:
             uploader=d.get(QueueEntryField.UPLOADER),
             thumbnail=d.get(QueueEntryField.THUMBNAIL),
             persisted=d.get(QueueEntryField.PERSISTED, True),
+            interjected=d.get(QueueEntryField.INTERJECTED, False),
+            is_resume=d.get(QueueEntryField.IS_RESUME, False),
+            start_paused=d.get(QueueEntryField.START_PAUSED, False),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")

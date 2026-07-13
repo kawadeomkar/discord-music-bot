@@ -2031,3 +2031,198 @@ class TestRemoveCommand:
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         assert removal_embed.colour == discord.Color.orange()
+
+
+# ── -playnow ──────────────────────────────────────────────────────────────────
+
+
+class TestPlaynow:
+    @pytest.fixture
+    def live_mp(self):
+        """A MusicPlayer mock with a song currently playing."""
+        from src.musicplayer import InterjectOutcome
+
+        mp = MagicMock()
+        mp.current_song = MagicMock()
+        mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Original Song",
+                resume_position=151,
+                was_paused=False,
+                replaced=False,
+            )
+        )
+        return mp
+
+    @pytest.fixture
+    def live_vc(self):
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        return vc
+
+    async def test_idle_delegates_to_play(self, music_bot, mock_ctx):
+        mp = MagicMock()
+        mp.current_song = None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
+
+    async def test_no_voice_client_delegates_to_play(
+        self, music_bot, mock_ctx, live_mp
+    ):
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = AsyncMock()
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
+
+    async def test_live_song_interjects(self, music_bot, mock_ctx, live_mp, live_vc):
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.message.content = "-playnow test song"
+        qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        music_bot.queue_source = AsyncMock(return_value=qobj)
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        assert qobj.interjected is True
+        assert qobj.user_input == "test"
+        live_mp.interject.assert_awaited_once_with(qobj, live_vc)
+        # Confirmation embed names both songs and the resume position.
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "Urgent" in embed.title
+        assert "Original Song" in embed.description
+        assert "2:31" in embed.description
+        mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
+
+    async def test_paused_wording(self, music_bot, mock_ctx, live_mp, live_vc):
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Original Song",
+                resume_position=151,
+                was_paused=True,
+                replaced=False,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        )
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "return paused" in embed.description
+
+    async def test_replaced_wording(self, music_bot, mock_ctx, live_mp, live_vc):
+        from src.musicplayer import InterjectOutcome
+
+        live_mp.interject = AsyncMock(
+            return_value=InterjectOutcome(
+                interrupted_title="Old Interjection",
+                resume_position=None,
+                was_paused=False,
+                replaced=True,
+            )
+        )
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        )
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert "Replaced" in embed.description
+        assert "will not return" in embed.description
+
+    async def test_interject_none_enqueues_resolved_qobj_directly(
+        self, music_bot, mock_ctx, live_mp, live_vc
+    ):
+        """Song ended mid-resolve: the already-resolved qobj is enqueued via
+        _enqueue_single — NOT by re-invoking -play, which would re-parse,
+        re-resolve, and (for playlists) enqueue every track right after the
+        first-track-only notice."""
+        live_mp.interject = AsyncMock(return_value=None)
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.invoke = AsyncMock()
+        music_bot._enqueue_single = AsyncMock()
+        qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        music_bot.queue_source = AsyncMock(return_value=qobj)
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        mock_ctx.invoke.assert_not_awaited()
+        music_bot._enqueue_single.assert_awaited_once_with(mock_ctx, qobj, live_mp)
+        # The interjection marker must not leak onto a normally queued song —
+        # a later -playnow would otherwise "replace" it without a resume entry.
+        assert qobj.interjected is False
+
+    async def test_spotify_playlist_interjects_first_track_only(
+        self, music_bot, mock_ctx, live_mp, live_vc
+    ):
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        mock_ctx.message.content = f"-playnow {url}"
+        music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
+        qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
+
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
+        ) as ys:
+            await MusicBot.playnow.callback(music_bot, mock_ctx, url)
+
+        music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
+        ys.assert_awaited_once()
+        assert ys.call_args.args[1] == "ytsearch:First Song"
+        live_mp.interject.assert_awaited_once()
+        assert live_mp.interject.call_args.args[0] is qobj
+        # First-track notice + confirmation.
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs
+        ]
+        assert any("first track" in d for d in notices)
+
+    async def test_yt_playlist_interjects_first_track_only(
+        self, music_bot, mock_ctx, live_mp, live_vc
+    ):
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        url = "https://www.youtube.com/playlist?list=PLtest123"
+        mock_ctx.message.content = f"-playnow {url}"
+        first = QueueObject("https://yt.com/v=1", "Track One", mock_ctx.author)
+        second = QueueObject("https://yt.com/v=2", "Track Two", mock_ctx.author)
+
+        with patch(
+            "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[first, second])
+        ):
+            await MusicBot.playnow.callback(music_bot, mock_ctx, url)
+
+        live_mp.interject.assert_awaited_once()
+        assert live_mp.interject.call_args.args[0] is first
+
+    async def test_error_shows_command_error(
+        self, music_bot, mock_ctx, live_mp, live_vc
+    ):
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+
+        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        live_mp.interject.assert_not_awaited()
+        mock_ctx.send.assert_awaited()  # error embed
