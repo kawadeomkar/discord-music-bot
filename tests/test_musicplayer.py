@@ -4233,7 +4233,7 @@ class TestInterject:
         assert items[2] is queued
 
         mock_vc.stop.assert_called_once()
-        assert music_player._skip_history_once is True
+        assert music_player._skip_history_for is live_song
         assert outcome is not None
         assert outcome.interrupted_title == live_song.title
         assert outcome.resume_position == 42
@@ -4264,7 +4264,7 @@ class TestInterject:
         outcome = await music_player.interject(playnow_obj, mock_vc)
 
         assert music_player.queue.display_items() == [playnow_obj]
-        assert music_player._skip_history_once is False  # discarded, not returning
+        assert music_player._skip_history_for is None  # discarded, not returning
         mock_vc.stop.assert_called_once()
         assert outcome is not None
         assert outcome.replaced is True
@@ -4280,7 +4280,7 @@ class TestInterject:
 
         assert music_player.queue.display_items() == [playnow_obj]
         assert outcome is not None and outcome.resume_position is None
-        assert music_player._skip_history_once is False
+        assert music_player._skip_history_for is None
 
     async def test_eof_cap_pulls_position_back(
         self, music_player, live_song, playnow_obj, mock_vc
@@ -4324,7 +4324,7 @@ class TestInterject:
             await music_player.interject(playnow_obj, mock_vc)
 
         mock_vc.stop.assert_not_called()
-        assert music_player._skip_history_once is False
+        assert music_player._skip_history_for is None
 
     async def test_neutralizes_running_prefetch_first(
         self, music_player, live_song, playnow_obj, mock_vc
@@ -4378,6 +4378,77 @@ class TestNeutralizePrefetch:
         assert isinstance(rebuilt, QueueObject)
         assert rebuilt.webpage_url == live_song.webpage_url
         assert rebuilt.title == live_song.title
+
+    async def test_completed_task_rebuild_keeps_offset_and_playnow_flags(
+        self, music_player, live_song, mock_author
+    ):
+        """Nested -playnow regression: the prefetcher resolves the FIRST
+        interjection's resume entry within seconds (cache hit), so a second
+        -playnow neutralizes a completed prefetch holding a flagged, offset
+        entry. A rebuild that drops ts/is_resume/start_paused would restart
+        the interrupted song from 0:00, unpaused and unannounced."""
+        original = QueueObject(
+            "https://yt.com/v=orig",
+            "Interrupted Song",
+            mock_author,
+            ts=151,
+            duration=210,
+            is_resume=True,
+            start_paused=True,
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        # The resolved YTDL for that entry, as yt_stream would build it.
+        live_song.start_offset = 151
+        live_song.is_resume = True
+        live_song.start_paused = True
+        live_song.cleanup = MagicMock()
+
+        async def _done():
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.ts == 151
+        assert rebuilt.is_resume is True
+        assert rebuilt.start_paused is True
+        assert rebuilt.interjected is False
+
+    async def test_completed_task_rebuild_keeps_interjected_flag(
+        self, music_player, live_song, mock_author
+    ):
+        """A parked playnow entry must keep its marker through the rebuild —
+        losing it would make a later -playnow stack a resume entry for it
+        instead of applying replace semantics."""
+        original = QueueObject(
+            "https://yt.com/v=pn", "Playnow Song", mock_author, interjected=True
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.interjected = True
+        live_song.cleanup = MagicMock()
+
+        async def _done():
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.interjected is True
+        assert rebuilt.ts is None  # start_offset 0 → no bogus -ss
 
     async def test_completed_task_with_none_result_is_noop(self, music_player):
         async def _done():
@@ -4492,3 +4563,58 @@ class TestEstimatedFinishUsesRemaining:
         )
         after = _fmt_finish_time(10)
         assert (before in embed.description) or (after in embed.description)
+
+
+class TestHistorySkipMarker:
+    """The _skip_history_for identity marker consumed by loop()'s history step."""
+
+    async def _run_one_song(self, music_player, queue_obj, mock_song):
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+    async def test_marker_for_current_song_skips_history_once(
+        self, music_player, queue_obj, mock_song
+    ):
+        """interject() marked this song (resume entry pending) — its stop
+        transition must not record it; the tail's own end will."""
+        music_player._skip_history_for = mock_song
+        await self._run_one_song(music_player, queue_obj, mock_song)
+        assert len(music_player.history) == 0
+        assert music_player._skip_history_for is None
+
+    async def test_stale_marker_does_not_eat_next_songs_history(
+        self, music_player, queue_obj, mock_song
+    ):
+        """A marker left for a song that ended naturally during interject()'s
+        awaits (its history step already ran) must not suppress the NEXT
+        song's entry — the identity check makes it a no-op that clears."""
+        music_player._skip_history_for = MagicMock()  # some other, ended song
+        await self._run_one_song(music_player, queue_obj, mock_song)
+        assert len(music_player.history) == 1
+        assert mock_song.title in music_player.history[0]
+        assert music_player._skip_history_for is None

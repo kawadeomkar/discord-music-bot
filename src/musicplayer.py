@@ -209,7 +209,7 @@ class MusicPlayer:
         "_np_host_dedicated",
         "_np_edit_lock",
         "_pause_debounce_task",
-        "_skip_history_once",
+        "_skip_history_for",
     )
 
     bot: commands.Bot
@@ -235,7 +235,7 @@ class MusicPlayer:
     _np_host_dedicated: bool
     _np_edit_lock: asyncio.Lock
     _pause_debounce_task: Optional[asyncio.Task]
-    _skip_history_once: bool
+    _skip_history_for: Optional[YTDL]
 
     def __init__(
         self,
@@ -282,11 +282,13 @@ class MusicPlayer:
         self._np_host_dedicated: bool = False
         self._np_edit_lock = asyncio.Lock()
         self._pause_debounce_task: Optional[asyncio.Task] = None
-        # Set by interject() when it stops a song that will RETURN (a resume
-        # entry was front-inserted): the stop-transition's history step skips
-        # one add, so the song is recorded once — when its tail finishes —
-        # instead of twice. Consumed read-and-reset, like the cleared-flag.
-        self._skip_history_once: bool = False
+        # Set by interject() to the song it stopped WITH a resume entry
+        # pending: the stop-transition's history step skips that song's add,
+        # so it is recorded once — when its tail finishes — instead of twice.
+        # Holds the song's identity (not a bare flag) because the song can end
+        # naturally during interject()'s awaits, after its own history step
+        # already ran; a stale boolean would then eat the NEXT song's entry.
+        self._skip_history_for: Optional[YTDL] = None
 
     @classmethod
     def from_context(
@@ -1099,7 +1101,7 @@ class MusicPlayer:
                 # The interrupted song returns — record it in history once,
                 # when its tail finishes, not also now. A replaced
                 # interjection (no resume) keeps its entry, matching -skip.
-                self._skip_history_once = True
+                self._skip_history_for = current
             vc.stop()
 
         span.set_attribute("interject.replaced", replaced)
@@ -1144,13 +1146,21 @@ class MusicPlayer:
             song = None
         if song is None:
             return
+        # Carry the -ss offset and every -playnow flag through the rebuild —
+        # dropping them here would make a neutralized resume entry restart its
+        # song from 0:00 (unpaused, unannounced) after the nested interjection,
+        # and lose the ?t= offset of an ordinary prefetched song.
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",
             song.requester or self._last_author,
+            ts=song.start_offset or None,
             duration=song.duration_secs or None,
             uploader=song.uploader,
             thumbnail=song.thumbnail,
+            interjected=song.interjected,
+            is_resume=song.is_resume,
+            start_paused=song.start_paused,
         )
         self.queue.requeue_front(rebuilt)
         song.cleanup()
@@ -1626,11 +1636,15 @@ class MusicPlayer:
                             prefetched_song = None
 
                     if self.current_song is not None:
-                        if self._skip_history_once:
-                            # interject() stopped this song with a resume entry
-                            # pending — history records it when the tail ends.
-                            self._skip_history_once = False
-                        else:
+                        # interject() stopped this song with a resume entry
+                        # pending — history records it when the tail ends.
+                        # Identity match, and the marker clears either way: a
+                        # marker left for a song that ended naturally during
+                        # interject()'s awaits must not eat this (different)
+                        # song's entry.
+                        skip_history = self._skip_history_for is self.current_song
+                        self._skip_history_for = None
+                        if not skip_history:
                             await self.history.add(
                                 f"{self.current_song.title} - {self.current_song.webpage_url}"
                             )
@@ -1666,7 +1680,7 @@ class MusicPlayer:
                     # released so the next song starts from a clean slate.
                     self._release_np_host()
                     prefetched_song = None
-                    self._skip_history_once = False
+                    self._skip_history_for = None
                     self.current_song = None
                     self.play_message = None
                     if self.store is not None:

@@ -2226,3 +2226,37 @@ class TestPlaynow:
 
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
+
+    async def test_warms_stream_cache_before_interjecting(
+        self, music_bot, mock_ctx, live_mp, live_vc
+    ):
+        """The stream-URL cache is warmed BEFORE interject stops the current
+        song — a cache miss at dequeue would otherwise put yt-dlp dead air
+        between the interrupt and the playnow song starting."""
+        from src.musicplayer import InterjectOutcome
+
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
+        music_bot.queue_source = AsyncMock(return_value=qobj)
+
+        order: list[str] = []
+        prefetch = AsyncMock(side_effect=lambda *a, **k: order.append("prefetch"))
+        outcome = InterjectOutcome(
+            interrupted_title="Original Song",
+            resume_position=151,
+            was_paused=False,
+            replaced=False,
+        )
+
+        def _interject_effect(*args, **kwargs):
+            order.append("interject")
+            return outcome
+
+        live_mp.interject = AsyncMock(side_effect=_interject_effect)
+
+        with patch("src.musicbot.YTDL.prefetch_stream", new=prefetch):
+            await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+
+        prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
+        assert order == ["prefetch", "interject"]

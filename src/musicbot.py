@@ -457,6 +457,15 @@ class MusicBot(commands.Cog):
                 qobj.user_input = url
                 qobj.interjected = True
 
+                # Warm the stream-URL cache BEFORE interrupting the current
+                # song — a cache miss at dequeue would otherwise put seconds
+                # of yt-dlp dead air between the interrupt and the playnow
+                # song starting. Awaited (not spawned like queue_put's
+                # warm-up): the current song keeps playing through the wait,
+                # which beats stopping it into silence. No-op without Redis;
+                # also back-fills duration/thumbnail for the embeds below.
+                await YTDL.prefetch_stream(qobj, redis=self.redis)
+
                 outcome = await mp.interject(qobj, vc)
                 if outcome is None:
                     # The song ended while the input was resolving — nothing
