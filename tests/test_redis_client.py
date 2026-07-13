@@ -194,6 +194,30 @@ class TestPushQueueBatch:
         await broken_store.push_queue_batch([_entry(1)])  # must not raise
 
 
+class TestPushQueueFront:
+    async def test_entries_land_at_head_in_given_order(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), _entry(3).to_redis())
+        await store.push_queue_front([_entry(1), _entry(2)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [
+            _entry(1).to_redis(),
+            _entry(2).to_redis(),
+            _entry(3).to_redis(),
+        ]
+
+    async def test_sets_ttl_on_queue_key(self, store, fake_redis):
+        await store.push_queue_front([_entry(1)])
+        ttl = await fake_redis.ttl(store.queue_key())
+        assert ttl > 0
+
+    async def test_noop_on_empty_sequence(self, store, fake_redis):
+        await store.push_queue_front([])
+        assert await fake_redis.exists(store.queue_key()) == 0
+
+    async def test_swallows_redis_error(self, broken_store):
+        await broken_store.push_queue_front([_entry(1)])  # must not raise
+
+
 class TestPopQueue:
     async def test_removes_first_item(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
@@ -731,6 +755,18 @@ class TestPopQueueAndStartSong:
         state = await fake_redis.hgetall(store.state_key())
         assert b"pause_start_epoch" not in state
 
+    async def test_writes_interjected_flag(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(interjected=True), 1000.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_interjected"] == b"1"
+
+    async def test_interjected_false_writes_empty(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_interjected"] == b""
+
     async def test_sets_ttl_on_state(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(_current(), 1000.0)
@@ -936,6 +972,7 @@ class TestClearSongEndState:
                 b"current_song_duration": b"210",
                 b"current_song_uploader": b"Some Channel",
                 b"current_song_requester_id": b"42",
+                b"current_song_interjected": b"1",
             },
         )
         await store.clear_song_end_state()
@@ -945,6 +982,7 @@ class TestClearSongEndState:
         assert b"current_song_duration" not in state
         assert b"current_song_uploader" not in state
         assert b"current_song_requester_id" not in state
+        assert b"current_song_interjected" not in state
 
     async def test_deletes_now_playing_hash(self, store, fake_redis):
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
