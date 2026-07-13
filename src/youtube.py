@@ -313,6 +313,18 @@ class QueueObject:
     # so the playback loop must skip the matching GuildQueue.redis_pop_for() for
     # it. Read through the guild_queue.is_persisted() helper, never getattr.
     persisted: bool = True
+    # ── -playnow interjection flags (docs/PLAYNOW_PROPOSAL.md) ──
+    # True for a song queued via -playnow. A later -playnow REPLACES a playing
+    # interjection (no resume entry is built for it) instead of stacking.
+    interjected: bool = False
+    # True for the rebuilt tail of an interrupted song (ts = interrupt
+    # position). Drives display/notice wording and suppresses yt_stream's
+    # construction-time "Starting song at Xs" notice — the loop announces
+    # "Resuming…" when the entry actually starts instead.
+    is_resume: bool = False
+    # True when the interrupted song was paused at interjection time: the loop
+    # re-pauses immediately after vc.play() so the song returns parked.
+    start_paused: bool = False
 
 
 def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
@@ -349,6 +361,9 @@ class YTDL(discord.FFmpegOpusAudio):
         start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
+        interjected: bool = False,
+        is_resume: bool = False,
+        start_paused: bool = False,
     ):
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -358,6 +373,12 @@ class YTDL(discord.FFmpegOpusAudio):
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
+        # -playnow flags, carried through from the QueueObject (see its field
+        # comments): interjected drives replace semantics, is_resume/start_paused
+        # drive the loop's resume announcement and re-pause on start.
+        self.interjected: bool = interjected
+        self.is_resume: bool = is_resume
+        self.start_paused: bool = start_paused
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -546,11 +567,16 @@ class YTDL(discord.FFmpegOpusAudio):
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
-            await channel.send(
-                embed=notice_embed(
-                    f"Starting song at {qo.ts} seconds", discord.Color.blue()
+            # Resume entries skip this construction-time notice: prefetch
+            # constructs them while the interjected song is still playing, so
+            # it would fire at the wrong moment — the playback loop announces
+            # "Resuming…" when the entry actually starts instead.
+            if not qo.is_resume:
+                await channel.send(
+                    embed=notice_embed(
+                        f"Starting song at {qo.ts} seconds", discord.Color.blue()
+                    )
                 )
-            )
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
@@ -562,6 +588,9 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
+            interjected=qo.interjected,
+            is_resume=qo.is_resume,
+            start_paused=qo.start_paused,
         )
 
     @classmethod

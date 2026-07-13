@@ -126,6 +126,20 @@ class TestGuildStateDataFromRedis:
         assert data.current_song_duration is None
         assert data.current_song_requester_id is None
 
+    def test_interjected_parses_one_as_true(self):
+        data = GuildStateData.from_redis({b"current_song_interjected": b"1"})
+        assert data.current_song_interjected is True
+
+    @pytest.mark.parametrize("raw", [b"", b"0", b"true"])
+    def test_interjected_anything_but_one_is_false(self, raw):
+        # The write path stores exactly "1" or "" — anything else (including
+        # a missing field on pre-playnow state hashes) reads as False.
+        data = GuildStateData.from_redis({b"current_song_interjected": raw})
+        assert data.current_song_interjected is False
+
+    def test_interjected_missing_is_false(self):
+        assert GuildStateData.from_redis({}).current_song_interjected is False
+
 
 class TestGuildStateDataProperties:
     def test_has_active_connection_true_with_both_ids(self):
@@ -285,13 +299,28 @@ class TestNowPlayingDataImmutability:
 
 # ── Queue-entry value objects ─────────────────────────────────────────────────
 
-# Golden wire fixtures — byte literals captured from the original
-# _serialize_queue_item() output on the pre-migration code. These pin the wire
-# format in both directions so a rolling restart can mix old and new writers.
+# Golden wire fixtures — byte literals capturing the current writer output.
+# These pin the wire format in both directions so a rolling restart can mix
+# old and new writers. The _PRE_PLAYNOW golden pins the reader against entries
+# written before the -playnow flags existed (parsed as False).
 
-_GOLDEN_QOBJ_FULL = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
-_GOLDEN_QOBJ_BARE = b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true}'
-_GOLDEN_QOBJ_UNPERSISTED = b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false}'
+_PLAYNOW_FLAGS_FALSE = b'"interjected":false,"is_resume":false,"start_paused":false'
+_GOLDEN_QOBJ_FULL = (
+    b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
+    + _PLAYNOW_FLAGS_FALSE
+    + b"}"
+)
+_GOLDEN_QOBJ_BARE = (
+    b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true,'
+    + _PLAYNOW_FLAGS_FALSE
+    + b"}"
+)
+_GOLDEN_QOBJ_UNPERSISTED = (
+    b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false,'
+    + _PLAYNOW_FLAGS_FALSE
+    + b"}"
+)
+_GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
 _GOLDEN_LEGACY_NO_TYPE = (
     b'{"webpage_url":"https://yt.com/v=3","title":"Legacy","requester_id":7,"ts":null}'
@@ -348,6 +377,24 @@ class TestSongQueueEntryWire:
     def test_round_trip(self):
         assert parse_queue_entry(_FULL_ENTRY.to_redis()) == _FULL_ENTRY
 
+    def test_reader_parses_pre_playnow_entry_with_false_flags(self):
+        # Entries written before the -playnow fields existed must parse with
+        # all three flags defaulting False.
+        assert parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW) == _FULL_ENTRY
+
+    def test_playnow_flags_round_trip(self):
+        entry = dataclasses.replace(
+            _FULL_ENTRY, interjected=True, is_resume=True, start_paused=True
+        )
+        parsed = parse_queue_entry(entry.to_redis())
+        assert parsed == entry
+        assert isinstance(parsed, SongQueueEntry)
+        assert (parsed.interjected, parsed.is_resume, parsed.start_paused) == (
+            True,
+            True,
+            True,
+        )
+
     def test_snowflake_requester_id_exact(self):
         entry = parse_queue_entry(_GOLDEN_QOBJ_FULL)
         assert isinstance(entry, SongQueueEntry)
@@ -364,8 +411,31 @@ class TestSongQueueEntryWire:
             uploader="Golden Channel",
             thumbnail="https://img.yt/1.jpg",
             persisted=True,
+            interjected=False,
+            is_resume=False,
+            start_paused=False,
         )
         assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
+
+    def test_from_queue_object_carries_playnow_flags(self):
+        item = SimpleNamespace(
+            webpage_url="https://yt.com/v=1",
+            title="Golden Song",
+            requester=SimpleNamespace(id=222222222222222222),
+            ts=151,
+            user_input=None,
+            duration=240,
+            uploader="Golden Channel",
+            thumbnail=None,
+            persisted=True,
+            interjected=False,
+            is_resume=True,
+            start_paused=True,
+        )
+        entry = SongQueueEntry.from_queue_object(item)
+        assert entry.is_resume is True
+        assert entry.start_paused is True
+        assert entry.interjected is False
 
 
 class TestSearchQueueEntryWire:
@@ -460,6 +530,24 @@ class TestFromCrashedState:
         assert entry.persisted is False
         assert entry.ts is None
         assert entry.requester_id is None  # no requester recorded
+
+    def test_interjected_flag_survives_crash(self):
+        # A crash mid-interjection must not demote the recovered song: a
+        # -playnow after recovery still replaces it instead of stacking.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_interjected=True,
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert entry.interjected is True
+
+    def test_interjected_defaults_false(self):
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert entry.interjected is False
 
 
 class TestGuildPlaybackSnapshot:
