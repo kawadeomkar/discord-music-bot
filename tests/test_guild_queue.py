@@ -132,6 +132,92 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+# ── put_front (-playnow interjection) ─────────────────────────────────────────
+
+
+class TestPutFront:
+    async def test_front_inserts_on_all_three_legs(
+        self, gq, fake_redis, store, mock_author
+    ):
+        b, c = _qobj(2, mock_author), _qobj(3, mock_author)
+        await gq.put([b, c])
+        x, r = _qobj(10, mock_author), _qobj(11, mock_author)
+        await gq.put_front([x, r])
+
+        assert gq.display_items() == [x, r, b, c]
+        # Pending leg dequeues in the same order.
+        assert [gq.get_nowait() for _ in range(4)] == [x, r, b, c]
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert redis_items == [
+            SongQueueEntry.from_queue_object(i).to_redis() for i in (x, r, b, c)
+        ]
+
+    async def test_empty_items_is_noop(self, gq, fake_redis, store, mock_author):
+        await gq.put([_qobj(1, mock_author)])
+        await gq.put_front([])
+        assert gq.qsize() == 1
+        await _assert_triad_sync(gq, fake_redis, store)
+
+    async def test_in_flight_head_stays_ahead_and_redis_rebuilt(
+        self, gq, fake_redis, store, mock_author
+    ):
+        """A dequeued-but-uncommitted head (completed prefetch) must keep its
+        place AHEAD of the inserted items on display and Redis — its
+        commit-time LPOP retires ITS entry, not the new front item."""
+        a, b = _qobj(1, mock_author), _qobj(2, mock_author)
+        await gq.put([a, b])
+        assert gq.get_nowait() is a  # prefetch-style dequeue; display untouched
+
+        x = _qobj(10, mock_author)
+        await gq.put_front([x])
+
+        assert gq.display_items() == [a, x, b]
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert redis_items == [
+            SongQueueEntry.from_queue_object(i).to_redis() for i in (a, x, b)
+        ]
+        # Pending resumes at the inserted item (a is still held by the "prefetch").
+        assert [gq.get_nowait() for _ in range(2)] == [x, b]
+
+    async def test_unpersisted_head_excluded_from_redis(
+        self, gq, fake_redis, store, mock_author
+    ):
+        """A crash-recovered head (persisted=False) sits in front on the
+        in-memory legs; LPUSHed items must land at the REDIS head without it."""
+        crashed = _qobj(1, mock_author, persisted=False)
+        b = _qobj(2, mock_author)
+        await gq.put([crashed, b])
+        # restore_crashed() puts the crashed head on the in-memory legs only;
+        # rebuild the Redis leg to mirror that state (put() above wrote both).
+        await fake_redis.delete(store.queue_key())
+        await store.push_queue(SongQueueEntry.from_queue_object(b))
+
+        x = _qobj(10, mock_author)
+        await gq.put_front([x])
+
+        assert gq.display_items() == [x, crashed, b]
+        redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert redis_items == [
+            SongQueueEntry.from_queue_object(i).to_redis() for i in (x, b)
+        ]
+
+    async def test_task_accounting_balanced(self, gq, mock_author):
+        await gq.put([_qobj(1, mock_author)])
+        await gq.put_front([_qobj(2, mock_author)])
+        # Every pending item can be consumed and task_done'd without the
+        # counter over- or under-flowing.
+        while gq.qsize():
+            gq.get_nowait()
+            gq.task_done()
+        with pytest.raises(ValueError):
+            gq.task_done()  # one extra would mean the counter drifted
+
+    async def test_works_without_redis(self, gq_no_redis, mock_author):
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        await gq_no_redis.put_front([_qobj(2, mock_author)])
+        assert [i.title for i in gq_no_redis.display_items()] == ["Song 2", "Song 1"]
+
+
 # ── clear ─────────────────────────────────────────────────────────────────────
 
 
@@ -310,6 +396,24 @@ class TestRestoreEntries:
         count = await gq.restore_entries([self._entry(1, 12345)])
         assert count == 0
         assert gq.qsize() == 0
+
+    async def test_playnow_flags_rehydrate(self, gq, mock_guild, mock_author):
+        mock_guild.get_member.return_value = mock_author
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Resume Tail",
+            requester_id=mock_author.id,
+            ts=151,
+            is_resume=True,
+            start_paused=True,
+        )
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert isinstance(item, QueueObject)
+        assert item.is_resume is True
+        assert item.start_paused is True
+        assert item.interjected is False
+        assert item.ts == 151
 
     async def test_search_entries_rehydrate_to_ytsource(self, gq, mock_guild):
         entry = SearchQueueEntry(ytsearch="ytsearch:abc", process=True)

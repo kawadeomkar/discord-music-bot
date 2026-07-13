@@ -421,6 +421,165 @@ class MusicBot(commands.Cog):
                 log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to queue song")
 
+    async def _resolve_playnow_source(
+        self,
+        ctx: commands.Context,
+        source: Union[SpotifySource, YTSource, SoundcloudSource],
+    ) -> QueueObject:
+        """Resolve -playnow input to exactly ONE QueueObject. Playlists
+        collapse to their first track (interjecting a whole playlist would
+        delay the interrupted song's return indefinitely — use -play)."""
+        playlist_notice = notice_embed(
+            "Playlists can't be interjected — playing the **first track** now. "
+            "Use `-play` for the full playlist.",
+            discord.Color.orange(),
+        )
+        if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
+            titles = await self.spotify.playlist(source.id)
+            if not titles:
+                raise ValueError("Playlist has no tracks")
+            await ctx.send(embed=playlist_notice)
+            yts = spotify_playlist_to_ytsearch(titles[:1])[0]
+            return await YTDL.yt_source(
+                ctx.author, yts.ytsearch or "", yts.process or False, redis=self.redis
+            )
+        if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
+            playlist_url = (
+                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
+            )
+            tracks = await YTDL.yt_playlist(playlist_url, ctx.author)
+            if not tracks:
+                raise ValueError("Playlist has no tracks")
+            await ctx.send(embed=playlist_notice)
+            return tracks[0]
+        qobj = await self.queue_source(ctx, source)
+        assert isinstance(qobj, QueueObject)
+        return qobj
+
+    @commands.command(
+        name="playnow",
+        aliases=["pn"],
+        brief="play a song immediately, resuming the current one after",
+        usage="<url or search terms>",
+        help=(
+            "Interrupts whatever is playing so your song starts right now. The "
+            "interrupted song is not lost — it comes back from the exact position "
+            "it left off at, and if it was paused it returns paused.\n\n"
+            "Takes the same input as `-play`. If nothing is playing there is "
+            "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
+            "A playlist can't be interjected — only its **first track** is played, "
+            "since queueing the whole thing would delay the interrupted song "
+            "indefinitely. Use `-play` for the full playlist."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": [
+                "-playnow never gonna give you up",
+                "-pn https://youtu.be/dQw4w9WgXcQ",
+            ],
+            "note": (
+                "`-play` adds to the back of the queue; `-playnow` cuts the line and "
+                "hands the current song back afterwards. A song that was nearly over "
+                "will not return, and interjecting on top of another `-playnow` song "
+                "replaces it rather than stacking."
+            ),
+        },
+    )
+    @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.playnow")
+    async def playnow(self, ctx: commands.Context, url):
+        async with ctx.typing():
+            try:
+                mp = self.get_mp(ctx)
+                vc = ctx.voice_client
+                # Nothing live to interrupt → equivalent to -play (also covers
+                # not-connected: play joins first). Playlists enqueue in full
+                # on this path — interjection semantics don't apply to an
+                # idle player (docs/PLAYNOW_PROPOSAL.md §3).
+                if (
+                    mp.current_song is None
+                    or not isinstance(vc, discord.VoiceClient)
+                    or not (vc.is_playing() or vc.is_paused())
+                ):
+                    return await ctx.invoke(self.play, url=url)
+
+                source = parse_input(url, ctx.message.content)
+                qobj = await self._resolve_playnow_source(ctx, source)
+                qobj.user_input = url
+                qobj.interjected = True
+
+                # Warm the stream-URL cache BEFORE interrupting the current
+                # song — a cache miss at dequeue would otherwise put seconds
+                # of yt-dlp dead air between the interrupt and the playnow
+                # song starting. Awaited (not spawned like queue_put's
+                # warm-up): the current song keeps playing through the wait,
+                # which beats stopping it into silence. No-op without Redis;
+                # also back-fills duration/thumbnail for the embeds below.
+                await YTDL.prefetch_stream(qobj, redis=self.redis)
+
+                outcome = await mp.interject(qobj, vc)
+                if outcome is None:
+                    # The song ended while the input was resolving — nothing
+                    # to interrupt anymore. The input is already parsed and
+                    # resolved, so insert the qobj directly rather than
+                    # re-invoking -play, which would re-parse and re-resolve —
+                    # and, for a playlist, enqueue ALL tracks right after the
+                    # first-track-only notice above. FRONT insert, not append:
+                    # the user asked for "now", and this window can be seconds
+                    # long (the loop mid-resolve on the next song) with more
+                    # songs queued behind it. Reset the marker: a normally
+                    # queued song must not trigger replace semantics when a
+                    # later -playnow interrupts it.
+                    qobj.interjected = False
+                    await mp.queue.put_front([qobj])
+                    await asyncio.gather(
+                        send_embed(
+                            ctx,
+                            f"▶️ Playing next: {qobj.title}",
+                            f"Requested by: [{ctx.author.mention}]\n"
+                            "The song being interrupted already ended — "
+                            "queued to play next instead.",
+                            discord.Color.blue(),
+                            thumbnail=qobj.thumbnail,
+                        ),
+                        ctx.message.add_reaction("⏯️"),
+                    )
+                    return
+
+                if outcome.replaced:
+                    desc = (
+                        f"Replaced **{outcome.interrupted_title}** (also played "
+                        f"via `-playnow` — it will not return)."
+                    )
+                elif outcome.resume_position is None:
+                    desc = (
+                        f"**{outcome.interrupted_title}** was nearly finished "
+                        f"and will not resume."
+                    )
+                elif outcome.was_paused:
+                    desc = (
+                        f"**{outcome.interrupted_title}** will return paused at "
+                        f"`{outcome.resume_position_str}`."
+                    )
+                else:
+                    desc = (
+                        f"**{outcome.interrupted_title}** will resume at "
+                        f"`{outcome.resume_position_str}`."
+                    )
+                await asyncio.gather(
+                    send_embed(
+                        ctx,
+                        f"▶️ Playing now: {qobj.title}",
+                        f"Requested by: [{ctx.author.mention}]\n{desc}",
+                        discord.Color.blue(),
+                        thumbnail=qobj.thumbnail,
+                    ),
+                    ctx.message.add_reaction("⏯️"),
+                )
+            except Exception as e:
+                log.error(f"playnow failed: {type(e).__name__}: {e}", exc_info=True)
+                await self._command_error(ctx, e, title="Failed to play song now")
+
     @commands.command(
         name="skip",
         aliases=["sk"],
