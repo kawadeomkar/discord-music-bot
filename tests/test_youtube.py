@@ -10,9 +10,12 @@ from src.youtube import (
     YTDL,
     YTDL_OPTS,
     QueueObject,
+    _DEGRADED_FORMAT_WARNED,
+    _STREAM_CACHE_FIELDS,
     _YTDL_SOURCE_OPTS,
     _YTDL_STREAM_OPTS,
     _enrich_queueobject,
+    _record_serving_format,
     _stream_url_playable,
     _stream_url_ttl,
     _YtdlpLogger,
@@ -253,8 +256,11 @@ class TestEnrichQueueObject:
 
 
 class TestYTDLOpts:
-    def test_format_is_bestaudio(self):
-        assert YTDL_OPTS["format"] == "bestaudio/best"
+    def test_format_prefers_audio_only_then_small_muxed(self):
+        """bestaudio is the healthy android_vr path; the ≤360p middle rung keeps the
+        muxed fallback (web_safari / degraded android_vr) from streaming 1080p video
+        just for ffmpeg -vn to discard."""
+        assert YTDL_OPTS["format"] == "bestaudio/best[height<=360]/best"
 
     def test_noplaylist_is_true(self):
         assert YTDL_OPTS["noplaylist"] is True
@@ -299,8 +305,14 @@ class TestYtdlpLogger:
     def test_extractor_args_include_youtube(self):
         assert "youtube" in YTDL_OPTS["extractor_args"]
 
+    def test_extractor_args_point_at_pot_provider(self):
+        """The bgutil plugin is what lets web_safari serve audio as a fallback client;
+        losing this key silently reverts the fallback to token-less (video-only)."""
+        pot_args = YTDL_OPTS["extractor_args"]["youtubepot-bgutilhttp"]
+        assert pot_args["base_url"] == ["http://127.0.0.1:4416"]
+
     def test_stream_opts_have_format(self):
-        assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best"
+        assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best[height<=360]/best"
 
     def test_source_opts_no_format(self):
         # yt_source only needs metadata; format resolution is deferred to yt_stream
@@ -816,6 +828,57 @@ class TestStreamCache:
             await YTDL.yt_stream(qobj, channel, redis=bad_redis)
 
         mock_extract.assert_called_once()
+
+
+class TestRecordServingFormat:
+    """_record_serving_format is the fallback-ladder telemetry: an audio-only serve is
+    business as usual; a muxed A/V serve means the primary path is degraded — either
+    android_vr fell back to muxed-only (yt-dlp#16150) or web_safari is serving."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned_formats(self):
+        _DEGRADED_FORMAT_WARNED.clear()
+        yield
+        _DEGRADED_FORMAT_WARNED.clear()
+
+    def test_audio_only_format_never_warns(self):
+        with patch("src.youtube.log") as mock_log:
+            _record_serving_format(
+                {"format_id": "251", "protocol": "https", "vcodec": "none"}
+            )
+        mock_log.warning.assert_not_called()
+
+    def test_muxed_format_warns_once_per_format(self):
+        """A real android_vr outage affects every song — one warning per format, not
+        one per song."""
+        muxed = {"format_id": "18", "protocol": "https", "vcodec": "avc1.42001E"}
+        with patch("src.youtube.log") as mock_log:
+            _record_serving_format(muxed)
+            _record_serving_format(muxed)
+        assert mock_log.warning.call_count == 1
+        assert "format_id=18" in mock_log.warning.call_args.args[0]
+
+    def test_distinct_muxed_formats_each_warn(self):
+        with patch("src.youtube.log") as mock_log:
+            _record_serving_format(
+                {"format_id": "18", "protocol": "https", "vcodec": "avc1.42001E"}
+            )
+            _record_serving_format(
+                {"format_id": "96", "protocol": "m3u8_native", "vcodec": "avc1.640028"}
+            )
+        assert mock_log.warning.call_count == 2
+
+    def test_missing_vcodec_is_treated_as_healthy(self):
+        """Cache entries written before vcodec was persisted must never warn —
+        the song they describe may be perfectly healthy."""
+        with patch("src.youtube.log") as mock_log:
+            _record_serving_format({"format_id": "251", "protocol": "https"})
+        mock_log.warning.assert_not_called()
+
+    def test_format_shape_survives_the_cache_strip(self):
+        """The shape fields must be in _STREAM_CACHE_FIELDS, or cache-hit plays would
+        lose attribution and the degraded-primary signal would only fire on misses."""
+        assert {"format_id", "protocol", "vcodec"} <= _STREAM_CACHE_FIELDS
 
 
 class TestPrefetchStream:
