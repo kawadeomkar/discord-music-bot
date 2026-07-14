@@ -1,4 +1,4 @@
-"""Tests for src/help.py — MusicHelpCommand embed rendering."""
+"""Tests for src/help.py — MusicHelpCommand man-page-styled embed rendering."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6,7 +6,12 @@ import discord
 import pytest
 from discord.ext import commands
 
-from src.help import CATEGORY_ORDER, MusicHelpCommand, _TABLE_WIDTH as TABLE_WIDTH
+from src.help import (
+    CATEGORY_COMMANDS,
+    CATEGORY_ORDER,
+    MusicHelpCommand,
+    _WIDTH as WIDTH,
+)
 from src.musicbot import MusicBot
 
 # Discord's hard caps: an embed field value is 1024 chars, a description 4096.
@@ -66,34 +71,12 @@ class TestBotHelp:
         for command in bot.commands:
             assert f"-{command.name}" in body
 
-    async def test_shows_aliases(self, help_command, ctx):
+    async def test_shows_every_alias(self, help_command, ctx, bot):
         await help_command.command_callback(ctx, command=None)
         body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
-        # Plain text, not backticked: the table lives inside a code block, which is
-        # the only way Discord will align columns at all.
-        for alias in ("p", "sing", "sk", "np", "nowplaying", "rm", "vol", "summon"):
-            assert alias in body
-
-    async def test_signature_shows_arguments(self, help_command, ctx):
-        await help_command.command_callback(ctx, command=None)
-        body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
-        # Signatures must survive the table intact — an argument split across a
-        # wrapped line would be worse than useless. This is what the terse usage=
-        # strings buy: `<url|search>` fits the column, `<url or search terms>` did not.
-        assert "-play <url|search>" in body
-        assert "-volume <0-100>" in body
-        # Aliases are their own column; they must not be inlined into the name
-        # the way discord.py's base get_command_signature does it.
-        assert "[play|p|sing]" not in body
-
-    async def test_categories_render_in_order(self, help_command, ctx):
-        await help_command.command_callback(ctx, command=None)
-        names = [f.name or "" for f in sent_embed(ctx).fields]
-        positions = [
-            next(i for i, n in enumerate(names) if category in n)
-            for category in CATEGORY_ORDER
-        ]
-        assert positions == sorted(positions)
+        for command in bot.commands:
+            for alias in command.aliases:
+                assert f"-{alias}" in body, f"alias {alias} of {command.name} missing"
 
     async def test_documents_sources_and_behaviour(self, help_command, ctx):
         await help_command.command_callback(ctx, command=None)
@@ -110,61 +93,85 @@ class TestBotHelp:
         assert len(embed) <= 6000
 
 
-class TestCommandTable:
-    """The command list is a monospace table. Discord aligns nothing on its own — the
-    alignment only survives inside a code block, and only if every line is padded to
-    the same grid."""
+class TestCommandList:
+    """The command list renders the way man(1) renders OPTIONS: a hanging-indent
+    entry per command — every invocable form on the heading line, the summary
+    indented beneath — inside a code block, the only construct Discord renders
+    in monospace so the indent survives."""
 
-    def _tables(self, ctx) -> list[list[str]]:
-        """The code-block body of each category field, as lines."""
-        tables = []
+    def _sections(self, ctx) -> dict[str, list[str]]:
+        """The code-block body of each *COMMANDS field, as lines."""
+        sections = {}
         for field in sent_embed(ctx).fields:
             value = field.value or ""
-            if value.startswith("```"):
-                tables.append(value.strip("`").strip("\n").splitlines())
-        return tables
+            if "COMMANDS" in (field.name or "") and value.startswith("```"):
+                sections[field.name or ""] = value.strip("`").strip("\n").splitlines()
+        return sections
 
-    async def test_every_category_is_a_fenced_table_with_a_header(
+    async def test_synopsis_comes_first(self, help_command, ctx):
+        await help_command.command_callback(ctx, command=None)
+        fields = sent_embed(ctx).fields
+        assert fields[0].name == "SYNOPSIS"
+        assert "-<command> [argument ...]" in (fields[0].value or "")
+
+    async def test_one_section_per_category_in_order(self, help_command, ctx):
+        await help_command.command_callback(ctx, command=None)
+        names = list(self._sections(ctx))
+        assert names == [f"{category.upper()} COMMANDS" for category in CATEGORY_ORDER]
+
+    async def test_heading_lines_list_every_form_of_the_command(
         self, help_command, ctx
     ):
+        """Aliases join the heading comma-list the way man writes `-h, --help`,
+        and arguments survive unwrapped — not discord.py's `-[play|p|sing]`."""
         await help_command.command_callback(ctx, command=None)
-        tables = self._tables(ctx)
-        assert tables, "no fenced tables rendered"
-        for lines in tables:
-            assert lines[0].split() == ["Command", "Aliases", "Description"]
-            assert set(lines[1]) == {"-"}  # the rule
+        body = "\n".join("\n".join(lines) for lines in self._sections(ctx).values())
+        assert "-play, -p, -sing <url|search>" in body
+        assert "-volume, -v, -vol, -sound <0-100>" in body
+        assert "-now, -np, -rn, -nowplaying" in body
+        assert "[play|p|sing]" not in body
 
-    async def test_columns_align_on_one_grid_across_categories(self, help_command, ctx):
-        """Categories are separate fields but must share one grid, or the tables read
-        as unrelated blocks rather than one reference."""
+    async def test_entries_follow_importance_order(self, help_command, ctx):
+        """Within a category, commands render by importance/frequency of use
+        (play before playnow before pause…), not alphabetically — which put
+        `pause` above `play`."""
         await help_command.command_callback(ctx, command=None)
-        headers = {lines[0] for lines in self._tables(ctx)}
-        assert len(headers) == 1, f"categories disagree on column widths: {headers}"
+        for name, lines in self._sections(ctx).items():
+            category = name.removesuffix(" COMMANDS").capitalize()
+            rendered = [
+                line.split(",")[0].split()[0].lstrip("-")
+                for line in lines
+                if line.startswith("-")
+            ]
+            expected = [c for c in CATEGORY_COMMANDS[category] if c in rendered]
+            assert rendered == expected, f"{name}: {rendered}"
+
+    async def test_entries_hang_indent(self, help_command, ctx):
+        """Heading lines sit at column 0 and start with the prefix; summary
+        lines are indented — reading the left edge scans the command names."""
+        await help_command.command_callback(ctx, command=None)
+        for lines in self._sections(ctx).values():
+            for line in lines:
+                if not line:
+                    continue  # blank separator between entries
+                assert line.startswith("-") or line.startswith("    "), repr(line)
 
     async def test_no_line_exceeds_the_width_budget(self, help_command, ctx):
-        """A code block does not soft-wrap — an over-long line scrolls sideways on
-        mobile instead. Cells wrap so that never happens."""
+        """A code block does not soft-wrap — an over-long line scrolls sideways
+        on mobile instead. Cells wrap so that never happens."""
         await help_command.command_callback(ctx, command=None)
-        for lines in self._tables(ctx):
+        for lines in self._sections(ctx).values():
             for line in lines:
-                assert len(line) <= TABLE_WIDTH, f"{len(line)} chars: {line!r}"
+                assert len(line) <= WIDTH, f"{len(line)} chars: {line!r}"
 
     async def test_wrapping_never_drops_text(self, help_command, ctx, bot):
-        """Cells wrap rather than truncate, and reading straight down the Description
-        column reassembles every brief in full.
-
-        Slicing at the header's column offset is the point: it only reconstructs the
-        text if each continuation line is padded onto the same grid. A row that wraps
-        two cells at once (-now wraps both its aliases and its description) would
-        otherwise interleave the columns.
-        """
+        """Summaries wrap rather than truncate: reading the indented lines top
+        to bottom reassembles every brief in full."""
         await help_command.command_callback(ctx, command=None)
-        descriptions = []
-        for lines in self._tables(ctx):
-            offset = lines[0].index("Description")
-            column = " ".join(line[offset:].strip() for line in lines[2:])
-            descriptions.append(" ".join(column.split()))
-        reassembled = " ".join(descriptions)
+        indented = []
+        for lines in self._sections(ctx).values():
+            indented += [line.strip() for line in lines if line.startswith("    ")]
+        reassembled = " ".join(" ".join(indented).split())
 
         assert "…" not in reassembled and "..." not in reassembled
         for command in bot.commands:
@@ -172,38 +179,59 @@ class TestCommandTable:
 
     async def test_cog_help_renders_the_full_list(self, help_command, ctx):
         await help_command.command_callback(ctx, command="MusicBot")
-        assert "command reference" in (sent_embed(ctx).title or "")
+        assert sent_embed(ctx).title == "MUSICBOT(1)"
 
 
 class TestCommandHelp:
-    async def test_renders_long_description_and_examples(self, help_command, ctx):
+    async def test_renders_man_sections(self, help_command, ctx):
         await help_command.command_callback(ctx, command="play")
         embed = sent_embed(ctx)
-        assert embed.title == "▶️ -play"
-        assert "SoundCloud" in (embed.description or "")
+        assert embed.title == "-play(1)"
+        # NAME, as man writes it: name — one-line summary.
+        assert (embed.description or "").startswith("**play** — ")
         fields = {f.name: f.value or "" for f in embed.fields}
-        assert fields["Usage"] == "`-play <url|search>`"
-        assert "`-p`" in fields["Aliases"] and "`-sing`" in fields["Aliases"]
-        assert "-play never gonna give you up" in fields["Examples"]
+        assert "SoundCloud" in fields["DESCRIPTION"]
+        assert "-play never gonna give you up" in fields["EXAMPLES"]
+
+    async def test_synopsis_lists_every_form(self, help_command, ctx):
+        """One line per spelling, aliases included — man-page SYNOPSIS style,
+        instead of a separate Aliases blurb the reader has to recombine with
+        the usage line themselves."""
+        await help_command.command_callback(ctx, command="play")
+        fields = {f.name: f.value or "" for f in sent_embed(ctx).fields}
+        lines = fields["SYNOPSIS"].strip("`").strip("\n").splitlines()
+        assert lines == [
+            "-play <url|search>",
+            "-p <url|search>",
+            "-sing <url|search>",
+        ]
 
     async def test_resolves_an_alias_to_its_command(self, help_command, ctx):
         await help_command.command_callback(ctx, command="np")
-        assert sent_embed(ctx).title == "🎶 -now"
+        assert sent_embed(ctx).title == "-now(1)"
 
-    async def test_omits_alias_field_for_command_without_aliases(
+    async def test_command_without_aliases_has_single_synopsis_line(
         self, help_command, ctx
     ):
         await help_command.command_callback(ctx, command="shuffle")
-        names = [f.name for f in sent_embed(ctx).fields]
-        assert "Aliases" not in names
+        fields = {f.name: f.value or "" for f in sent_embed(ctx).fields}
+        assert fields["SYNOPSIS"].strip("`").strip("\n").splitlines() == ["-shuffle"]
 
     async def test_every_command_has_help_metadata(self, bot):
-        """A new command must not silently land in the help output bare."""
+        """A new command must not silently land in the help output bare — and
+        its long help has to fit the DESCRIPTION field's 1024-char cap."""
         for command in bot.commands:
             assert command.brief, f"{command.name} is missing brief="
             assert command.help, f"{command.name} is missing help="
+            assert len(command.help) <= FIELD_LIMIT, f"{command.name} help too long"
             category = (command.extras or {}).get("category")
             assert category in CATEGORY_ORDER, f"{command.name} category={category!r}"
+            # …and must be placed in its category's importance ranking.
+            assert command.name in CATEGORY_COMMANDS[category], (
+                f"{command.name} missing from CATEGORY_COMMANDS[{category!r}]"
+            )
+            note = (command.extras or {}).get("note")
+            assert note is None or len(note) <= FIELD_LIMIT
 
 
 class TestErrors:

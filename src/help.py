@@ -1,4 +1,4 @@
-"""Embed-based help command.
+"""Man-page-styled embed help command.
 
 discord.py ships two built-in implementations (DefaultHelpCommand,
 MinimalHelpCommand); both format through a Paginator into plain text, so an
@@ -6,13 +6,18 @@ embed-only bot has to subclass HelpCommand directly. Only the dispatch methods
 are overridden — command_callback still does the resolution, which means
 `-help p` (an alias) and `-help MusicBot` (the cog) keep working for free.
 
+The layout borrows from man(1): caps section headers (NAME, SYNOPSIS,
+DESCRIPTION, EXAMPLES, NOTES) and a command list of hanging-indent entries —
+every form of a command on one line, its summary indented beneath — rather
+than a column-aligned table, whose grid read poorly at Discord widths.
+
 Per-command copy lives on the commands themselves (brief/help/usage/extras in
 src/musicbot.py) rather than in a table here, so a new command shows up in the
 help output as soon as it is declared.
 """
 
 import textwrap
-from typing import Any, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, List, Mapping, Optional, Sequence
 
 import discord
 from discord.ext import commands
@@ -21,40 +26,29 @@ from src.util import notice_embed
 
 HELP_COLOR = discord.Color.blurple()
 
-# Display order of the extras["category"] buckets in the command list.
-CATEGORY_ORDER: tuple[str, ...] = ("Playback", "Queue", "Utility")
-CATEGORY_EMOJI: dict[str, str] = {
-    "Playback": "▶️",
-    "Queue": "🎶",
-    "Utility": "🔧",
-    "Other": "📌",
+# The command list, in display order: categories as rendered, and within each
+# category the commands by importance/frequency of use — the daily verbs first,
+# housekeeping last — not alphabetically, which put `pause` above `play`.
+CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
+    "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
+    "Queue": ("queue", "now", "history", "shuffle", "remove", "clear", "jump"),
+    "Utility": ("help", "join", "ping"),
 }
+CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"
 
 # Discord's hard cap on an embed field value.
 _FIELD_LIMIT = 1024
 
-# The command list is a monospace table. Discord has no table primitive, so columns
-# can only be aligned inside a code block — and a code block does not soft-wrap: past
-# roughly 60 characters it scrolls sideways on mobile. Hence the width budget, and
-# hence the deliberately terse usage= strings on the commands (`<url|search>`, not
-# `<url or search terms>`): one long signature would otherwise set the column width
-# for every row. Cells that still overflow are wrapped rather than truncated — the
-# table may grow a line, but it never silently loses text.
-_TABLE_WIDTH = 62
-_MIN_DESC_WIDTH = 20
-# Aliases are capped rather than measured: one long alias list (`np, rn, nowplaying`)
-# would otherwise claim a third of the table and starve the description column into
-# wrapping every row. Capped, it wraps instead — and it is the least important column.
-_MAX_ALIAS_WIDTH = 13
-_GUTTER = "  "
-_HEADERS: Tuple[str, str, str] = ("Command", "Aliases", "Description")
+# Command entries live in code blocks — the only construct Discord renders in
+# a monospace grid, and so the only place a hanging indent survives. But
+# Discord soft-wraps code blocks at the embed's rendered width (roughly 54
+# monospace characters on desktop, less on mobile), and its wrap restarts at
+# column 0 — destroying the indent. Hard-wrapping narrower than any common
+# embed width keeps the wrapping ours, so continuations stay indented.
+_WIDTH = 48
+_INDENT = "    "
 _FENCE = "```"
-
-# A row's cell triple: signature, aliases, one-line summary.
-Row = Tuple[str, str, str]
-# Column widths: command, aliases, description.
-Widths = Tuple[int, int, int]
 
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
@@ -76,7 +70,7 @@ TIPS = (
 
 
 class MusicHelpCommand(commands.HelpCommand):
-    """Renders the command list and per-command help as embeds."""
+    """Renders the command list and per-command help as man(1)-styled embeds."""
 
     def __init__(self, **options: Any) -> None:
         super().__init__(
@@ -118,12 +112,13 @@ class MusicHelpCommand(commands.HelpCommand):
         return self.context.clean_prefix
 
     def get_command_signature(self, command: commands.Command, /) -> str:
-        """`-play <url or search terms>`.
+        """`-play <url|search>` — the canonical form only.
 
         The base implementation inlines aliases into the name as
-        `-[play|p|sing] …`; aliases get their own field here, so keep the
-        signature to the canonical name plus its arguments. Command.signature
-        returns the `usage=` kwarg verbatim when one is set.
+        `-[play|p|sing] …`; here each alias is instead its own SYNOPSIS line
+        (per-command help) or joins the comma list heading the command's list
+        entry, the way man pages write `-h, --help`. Command.signature returns
+        the `usage=` kwarg verbatim when one is set.
         """
         return f"{self.prefix}{command.qualified_name} {command.signature}".strip()
 
@@ -134,78 +129,65 @@ class MusicHelpCommand(commands.HelpCommand):
         category = self._extras(command).get("category", UNCATEGORISED)
         return category if category in CATEGORY_ORDER else UNCATEGORISED
 
-    def _aliases(self, command: commands.Command) -> str:
-        return " ".join(f"`{alias}`" for alias in command.aliases)
+    def _rank(self, command: commands.Command) -> tuple[int, str]:
+        """Sort key placing a command at its CATEGORY_COMMANDS position;
+        commands missing from the ranking sink to the end, alphabetically."""
+        order = CATEGORY_COMMANDS.get(self._category(command), ())
+        try:
+            return (order.index(command.qualified_name), command.qualified_name)
+        except ValueError:
+            return (len(order), command.qualified_name)
 
-    def _row(self, command: commands.Command) -> Row:
-        return (
-            self.get_command_signature(command).strip(),
-            ", ".join(command.aliases),
-            command.brief or command.short_doc or "no description",
-        )
-
-    def _widths(self, rows: Sequence[Row]) -> Widths:
-        """Column widths, measured across *every* command rather than per category,
-        so the separate category tables share one grid and read as a single table."""
-        command_width = max(len(_HEADERS[0]), *(len(row[0]) for row in rows))
-        alias_width = min(
-            _MAX_ALIAS_WIDTH,
-            max(len(_HEADERS[1]), *(len(row[1]) for row in rows)),
-        )
-        description_width = max(
-            _MIN_DESC_WIDTH,
-            _TABLE_WIDTH - command_width - alias_width - 2 * len(_GUTTER),
-        )
-        return command_width, alias_width, description_width
-
-    def _line(self, cells: Sequence[str], widths: Widths) -> str:
-        command, alias, description = cells
-        return (
-            f"{command:<{widths[0]}}{_GUTTER}{alias:<{widths[1]}}{_GUTTER}{description}"
-        ).rstrip()
-
-    def _head(self, widths: Widths) -> List[str]:
-        rule = "-" * (widths[0] + widths[1] + widths[2] + 2 * len(_GUTTER))
-        return [self._line(_HEADERS, widths), rule]
-
-    def _row_lines(self, row: Row, widths: Widths) -> List[str]:
-        """One command's row — several physical lines when a cell has to wrap."""
-        columns = [
-            textwrap.wrap(cell, width) or [""] for cell, width in zip(row, widths)
-        ]
-        height = max(len(column) for column in columns)
+    def _forms(self, command: commands.Command) -> List[str]:
+        """Every way to invoke the command, canonical name first."""
         return [
-            self._line(
-                [column[i] if i < len(column) else "" for column in columns], widths
-            )
-            for i in range(height)
+            f"{self.prefix}{name}"
+            for name in (command.qualified_name, *command.aliases)
         ]
 
-    def _add_table_field(
-        self, embed: discord.Embed, category: str, rows: Sequence[Row], widths: Widths
+    def _entry_lines(self, command: commands.Command) -> List[str]:
+        """One command as a hanging-indent entry, the way man(1) lists options:
+
+            -play, -p, -sing <url|search>
+                queue a song and start playing
+
+        Cells that overflow the width budget wrap rather than truncate — an
+        entry may grow a line, but it never silently loses text. A wrapped
+        heading continues two spaces past the summary indent so the two can't
+        be mistaken for each other.
+        """
+        heading = f"{', '.join(self._forms(command))} {command.signature}".strip()
+        summary = command.brief or command.short_doc or "no description"
+        return textwrap.wrap(
+            heading, _WIDTH, subsequent_indent=_INDENT + "  "
+        ) + textwrap.wrap(
+            summary, _WIDTH, initial_indent=_INDENT, subsequent_indent=_INDENT
+        )
+
+    def _add_entries_field(
+        self, embed: discord.Embed, name: str, entries: Sequence[List[str]]
     ) -> None:
-        """Add one category's table, continuing into further fields rather than
-        letting Discord reject an over-long value (>1024 chars). Each continuation
-        repeats the header, so a split table still has labelled columns."""
-        emoji = CATEGORY_EMOJI.get(category, CATEGORY_EMOJI[UNCATEGORISED])
-        name = f"{emoji} {category}"
-        head = self._head(widths)
+        """Add one section of entries (blank line between them), continuing into
+        "(cont.)" fields rather than letting Discord reject an over-long value
+        (>1024 chars)."""
         # The fences and their newlines are part of the field value Discord measures.
         budget = _FIELD_LIMIT - (2 * len(_FENCE) + 2)
 
         def size(lines: Sequence[str]) -> int:
             return sum(len(line) + 1 for line in lines)
 
-        chunk = list(head)
-        for row in rows:
-            lines = self._row_lines(row, widths)
-            if len(chunk) > len(head) and size(chunk) + size(lines) > budget:
-                embed.add_field(name=name, value=self._fence(chunk), inline=False)
-                name = f"{emoji} {category} (cont.)"
-                chunk = list(head)
-            chunk.extend(lines)
-        if len(chunk) > len(head):
-            embed.add_field(name=name, value=self._fence(chunk), inline=False)
+        field_name = name
+        chunk: List[str] = []
+        for lines in entries:
+            spaced = lines if not chunk else ["", *lines]
+            if chunk and size(chunk) + size(spaced) > budget:
+                embed.add_field(name=field_name, value=self._fence(chunk), inline=False)
+                field_name = f"{name} (cont.)"
+                chunk = list(lines)
+            else:
+                chunk.extend(spaced)
+        if chunk:
+            embed.add_field(name=field_name, value=self._fence(chunk), inline=False)
 
     def _fence(self, lines: Sequence[str]) -> str:
         return f"{_FENCE}\n" + "\n".join(lines) + f"\n{_FENCE}"
@@ -220,29 +202,38 @@ class MusicHelpCommand(commands.HelpCommand):
         visible = await self.filter_commands(everything, sort=True)
 
         embed = discord.Embed(
-            title="🎵 Music Bot — command reference",
+            title="MUSICBOT(1)",
             description=(
-                "Plays audio from YouTube, Spotify and SoundCloud in your voice "
-                f"channel.\n\nEvery command starts with `{prefix}` — for example "
-                f"`{prefix}play lofi hip hop`. Run `{prefix}help <command>` for a "
-                "command's usage, aliases and examples."
+                "**musicbot** — plays YouTube, Spotify and SoundCloud audio "
+                "in your voice channel"
             ),
             color=HELP_COLOR,
         )
+        embed.add_field(
+            name="SYNOPSIS",
+            value=self._fence(
+                [f"{prefix}<command> [argument ...]", f"{prefix}help [command]"]
+            ),
+            inline=False,
+        )
 
-        buckets: dict[str, List[Row]] = {}
+        buckets: dict[str, List[commands.Command]] = {}
         for command in visible:
-            buckets.setdefault(self._category(command), []).append(self._row(command))
+            buckets.setdefault(self._category(command), []).append(command)
+        ordered = [c for c in CATEGORY_ORDER if c in buckets]
+        ordered += [c for c in buckets if c not in CATEGORY_ORDER]
+        for category in ordered:
+            self._add_entries_field(
+                embed,
+                f"{category.upper()} COMMANDS",
+                [
+                    self._entry_lines(command)
+                    for command in sorted(buckets[category], key=self._rank)
+                ],
+            )
 
-        if buckets:
-            widths = self._widths([row for rows in buckets.values() for row in rows])
-            ordered = [c for c in CATEGORY_ORDER if c in buckets]
-            ordered += [c for c in buckets if c not in CATEGORY_ORDER]
-            for category in ordered:
-                self._add_table_field(embed, category, buckets[category], widths)
-
-        embed.add_field(name="🎧 What you can play", value=SOURCES, inline=False)
-        embed.add_field(name="💡 Good to know", value=TIPS, inline=False)
+        embed.add_field(name="SOURCES", value=SOURCES, inline=False)
+        embed.add_field(name="NOTES", value=TIPS, inline=False)
         embed.set_footer(
             text=f"{len(visible)} commands · {prefix}help <command> for details"
         )
@@ -257,34 +248,36 @@ class MusicHelpCommand(commands.HelpCommand):
         prefix = self.prefix
         extras = self._extras(command)
         category = self._category(command)
-        emoji = CATEGORY_EMOJI.get(category, CATEGORY_EMOJI[UNCATEGORISED])
 
         embed = discord.Embed(
-            title=f"{emoji} {prefix}{command.qualified_name}",
-            description=command.help or command.brief or "no description",
+            title=f"{prefix}{command.qualified_name}(1)",
+            # The NAME section, as man(1) writes it: name — one-line summary.
+            description=(
+                f"**{command.qualified_name}** — "
+                f"{command.brief or command.short_doc or 'no description'}"
+            ),
             color=HELP_COLOR,
         )
         embed.add_field(
-            name="Usage",
-            value=f"`{self.get_command_signature(command).strip()}`",
+            name="SYNOPSIS",
+            # One line per invocable form, aliases included — how a man page's
+            # SYNOPSIS lists every spelling of a command.
+            value=self._fence(
+                [f"{form} {command.signature}".strip() for form in self._forms(command)]
+            ),
             inline=False,
         )
-        if command.aliases:
-            embed.add_field(
-                name="Aliases",
-                value=" ".join(f"`{prefix}{alias}`" for alias in command.aliases),
-                inline=False,
-            )
+        embed.add_field(
+            name="DESCRIPTION",
+            value=command.help or command.brief or "no description",
+            inline=False,
+        )
         examples: List[str] = extras.get("examples", [])
         if examples:
-            embed.add_field(
-                name="Examples",
-                value="\n".join(f"`{example}`" for example in examples),
-                inline=False,
-            )
+            embed.add_field(name="EXAMPLES", value=self._fence(examples), inline=False)
         note: Optional[str] = extras.get("note")
         if note:
-            embed.add_field(name="Note", value=note, inline=False)
+            embed.add_field(name="NOTES", value=note, inline=False)
         embed.set_footer(text=f"{category} · {prefix}help for the full command list")
         await self.get_destination().send(embed=embed)
 
