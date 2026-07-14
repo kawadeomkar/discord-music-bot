@@ -17,13 +17,8 @@ finish_failed_dequeue) runs under one bulk-mutation mutex, so no two of them
 can interleave between a memory write and its mirror write. Bulk mutations
 carry a dequeued-but-uncommitted head through untouched (_in_flight_head),
 so a shuffle/remove during a multi-second resolve can't retire the wrong
-entry. One known residual window remains, by design: the playback loop's
-try_commit_dequeue() → pop_queue_and_start_song() handoff releases the mutex
-before the store's atomic LPOP+HSET transaction dispatches (the start
-transaction is a store-level atomicity boundary — see
-GUILD_QUEUE_SCHEMA_PLAN §4); a bulk mutation scheduled in that single
-event-loop tick can race the LPOP server-side. The class also owns the
-cleared-flag the playback loop consumes.
+entry. One residual window remains open — see the ISSUE below. The class also
+owns the cleared-flag the playback loop consumes.
 
 What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md §2.2):
 - stream prefetch (yt-dlp/FFmpeg) — MusicPlayer cancels its prefetch task
@@ -34,6 +29,17 @@ What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md 
 - the state hash — crash recovery hands this class ready-made queue entries
   (SongQueueEntry.from_crashed_state bridges the two schemas)
 """
+
+# ISSUE: one queue-desync window is still open. The playback loop's
+# try_commit_dequeue() → pop_queue_and_start_song() handoff releases the bulk mutex
+# before the store's atomic LPOP+HSET transaction dispatches (the start transaction is a
+# store-level atomicity boundary — see GUILD_QUEUE_SCHEMA_PLAN §4), so a bulk mutation
+# scheduled in that single event-loop tick races the LPOP server-side: a -clear landing
+# between commit and dispatch lets the transaction pop an entry the clear already
+# deleted, drifting memory and Redis by one entry until the next rebuild — and a crash
+# inside that drift restores the queue one song out of alignment. Accepted by design so
+# far, never fixed. Cheapest fix is to hold the mutex across the store dispatch (one
+# ~1ms localhost round-trip): docs/ARCHITECTURE_PLAN.md §3.6.
 
 import asyncio
 import random
@@ -283,6 +289,12 @@ class GuildQueue:
         An in-flight dequeue (see _in_flight_head) keeps its display/Redis
         head position: shuffling only reorders items still in _pending.
         """
+        # FIXME: the threshold contradicts what the user is told. Shuffling needs 4
+        # queued items here, but MusicPlayer.queue_shuffle() answers the refusal with
+        # "There must be at least 3 songs to shuffle the queue" and -shuffle's help
+        # text advertises "(3+ songs)" — so a user with exactly 3 songs queued is
+        # refused by a message stating the requirement they have already met. Pick
+        # one: drop this to < 3, or correct both user-facing strings to say 4.
         if self._pending.qsize() < 4:
             return ShuffleOutcome.TOO_FEW_SONGS
 

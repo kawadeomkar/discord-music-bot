@@ -771,6 +771,13 @@ class MusicBot(commands.Cog):
         try:
             mp = self.get_mp(ctx)
             if mp and mp.history:
+                # FIXME: -history shows the 10 OLDEST retained songs, not the 10 most
+                # recent. GuildHistory is an oldest-first ring, so [:10] takes the
+                # front of it — once a guild has played more than 10 songs, the
+                # command stops surfacing anything recent (it repeats the same stale
+                # list until the 50-entry cap rotates it out). Needs [-10:] reversed,
+                # or the richer rework in docs/HISTORY_OVERHAUL_PLAN.md (designed,
+                # not implemented), which also adds an empty-history notice.
                 q_history = queue_message(list(mp.history)[:10])
                 await ctx.send(
                     embed=notice_embed(q_history, discord.Color.blue(), title="History")
@@ -786,6 +793,11 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.jump")
     async def jump(self, ctx: commands.Context):
         try:
+            # TODO: -jump is a stub that has advertised itself in the help text since
+            # early history while doing nothing but replying "currently in development".
+            # Either implement it (jump-to-position is a drain/rotate over GuildQueue,
+            # in the shape of remove()) or delete the command so help stops promising a
+            # feature that does not exist. See docs/ARCHITECTURE_PLAN.md §3.8.
             await ctx.send(
                 embed=notice_embed("currently in development", discord.Color.blue())
             )

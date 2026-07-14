@@ -21,6 +21,12 @@ from src.util import get_logger, notice_embed
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
+# ISSUE: yt-dlp extraction is only half I/O — JSON parsing, signature decryption and
+# format selection are GIL-bound Python, so these 8 threads contend for the GIL instead
+# of running in parallel. Every extraction therefore adds latency to the event loop that
+# is also serving voice heartbeats, and concurrent plays across guilds degrade each
+# other. Should be a ProcessPoolExecutor (the extract worker is already a top-level,
+# picklable function): docs/ARCHITECTURE_PLAN.md §3.1.
 _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 
@@ -31,14 +37,19 @@ def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     )
 
 
-# TODO: PO token may be required eventually
+# TODO: PO token support is declared but not wired up — PO_TOKEN is an empty
+# placeholder that no code path reads, and _EXTRACTOR_ARGS below passes no po_token to
+# yt-dlp. The client list works without one today, but YouTube has been tightening GVS
+# PO Token enforcement; when it reaches these clients, extraction fails for every guild
+# at once and there is no fallback to switch to. A sidecar token provider is designed
+# and built on branch task/ytdlp-revoke-cache (unmerged): docs/PO_TOKEN_SIDECAR_PLAN.md.
 PO_TOKEN = ""
 
 _EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["default", "-tv_simply"],
-        # TODO: PO token — not yet required with the above client list.
-        # When needed: 'po_token': f'mweb.player+{PO_TOKEN}'
+        # Token wiring goes here when it becomes necessary:
+        #   'po_token': f'mweb.player+{PO_TOKEN}'
     }
 }
 
@@ -435,17 +446,27 @@ class YTDL(discord.FFmpegOpusAudio):
             process,
         )
         if data is None:
-            # TODO: create custom YTDL exceptions
+            # TODO: yt-dlp failures all surface as a bare Exception("Could not find
+            # song"), so callers cannot tell "no such video" from "extractor broken" or
+            # "network down" — every cause renders the same generic error embed, and
+            # nothing can retry selectively. Needs typed YTDL exceptions (pairs with the
+            # error-handling consolidation in docs/ARCHITECTURE_PLAN.md §3.3).
             raise Exception("Could not find song")
 
-        if "entries" in data:  # TOOD: narrow down to https urls and right bitrate
+        if "entries" in data:
+            # TODO: a search result is accepted purely on being the first non-playlist
+            # entry — there is no check that it carries an https audio URL at a usable
+            # bitrate, so a format-less or low-quality entry can win and only fails
+            # later, at stream time.
             for entry in data["entries"]:
                 if entry and entry.get("_type", None) != "playlist":
                     data = entry
                     break
         if download:
-            # TODO: Handle downloading?
-            # ytdl.prepare_filename(data)
+            # TODO: download=True is accepted by this signature but does nothing — the
+            # file is never named (prepare_filename) or handed back, so a caller passing
+            # it gets streaming behavior and no error. Implement file-backed playback or
+            # drop the parameter.
             pass
 
         webpage_url = data["webpage_url"]

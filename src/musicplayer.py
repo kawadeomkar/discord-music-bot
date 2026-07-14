@@ -31,8 +31,12 @@ from src.youtube import YTDL, QueueObject
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-# ETAs in queue_embed() are rendered in Pacific time. This is intentional for a
-# single-operator bot — update to a per-guild config if multi-tenant support is added.
+# HACK: every guild's ETAs and "estimated finish" times are rendered in Pacific
+# time, hardcoded. Fine while the bot serves one operator's servers; wrong for any
+# user outside US/Pacific, who is told a song starts at a clock time that is not
+# their clock (the "PST" suffix is the only thing saving it from being unreadable).
+# Needs a per-guild timezone setting, or Discord relative timestamps (<t:epoch:R>),
+# which the client renders in each viewer's own locale and would delete this constant.
 _PST = ZoneInfo("America/Los_Angeles")
 
 

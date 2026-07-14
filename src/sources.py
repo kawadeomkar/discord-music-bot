@@ -53,7 +53,10 @@ class YTSource:
 
 @dataclass(frozen=True)
 class SoundcloudSource:
-    # TODO timestamp regex
+    # TODO: SoundCloud timestamp links are silently ignored. parse_url() extracts `t`/`ts`
+    # for youtube.com only, so this ts field is never populated for a SoundCloud URL and
+    # the track always starts at 0:00 — a user who pastes a link with a timestamp gets no
+    # seek and no explanation, while the same link shape works for YouTube.
     url: str
     ts: Optional[int] = None
     process: bool = False
