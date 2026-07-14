@@ -132,12 +132,14 @@ class Spotify:
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
 
         async def fetch() -> List[str]:
-            # FIXME: Spotify playlists longer than 100 tracks are silently truncated.
-            # /v1/playlists/{id}/tracks is a paged endpoint (100 items per page); this
-            # call reads the first page only and never follows resp["next"], so a
-            # 300-track playlist queues its first 100 tracks with no error and no
-            # warning to the user. Fix: add `next` to the fields mask (it is excluded
-            # today) and follow the cursor until it is null.
+            # FIXME: Spotify playlists over 100 tracks are silently truncated.
+            # /v1/playlists/{id}/tracks is a paged endpoint returning 100 items per
+            # page. This call reads the first page only and never follows the `next`
+            # cursor, so a 300-track playlist queues its first 100 tracks and the user
+            # is told the playlist was queued — no error, no warning, no indication that
+            # two thirds of it is missing.
+            # Fix: add `next` to the fields mask (it is excluded by the mask today) and
+            # follow the cursor until it comes back null.
             endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
             resp = await self.http_call(
                 endpoint, params={"fields": "items(track(name,artists(name)))"}

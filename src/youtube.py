@@ -21,12 +21,14 @@ from src.util import get_logger, notice_embed
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-# ISSUE: yt-dlp extraction is only half I/O — JSON parsing, signature decryption and
-# format selection are GIL-bound Python, so these 8 threads contend for the GIL instead
-# of running in parallel. Every extraction therefore adds latency to the event loop that
-# is also serving voice heartbeats, and concurrent plays across guilds degrade each
-# other. Should be a ProcessPoolExecutor (the extract worker is already a top-level,
-# picklable function): docs/ARCHITECTURE_PLAN.md §3.1.
+# ISSUE: Move yt-dlp extraction off threads and onto a ProcessPoolExecutor.
+# yt-dlp extraction is only half I/O — JSON parsing, signature decryption and format
+# selection are all GIL-bound Python, so the 8 threads here contend for the GIL rather
+# than running in parallel. Every extraction therefore steals time from the event loop
+# that is also serving voice heartbeats, and concurrent plays across guilds degrade one
+# another. The extract worker (_ytdlp_extract) is already a top-level, picklable
+# function, so the swap is mostly mechanical.
+# Design: docs/ARCHITECTURE_PLAN.md §3.1.
 _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 
@@ -37,12 +39,14 @@ def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     )
 
 
-# TODO: PO token support is declared but not wired up — PO_TOKEN is an empty
-# placeholder that no code path reads, and _EXTRACTOR_ARGS below passes no po_token to
-# yt-dlp. The client list works without one today, but YouTube has been tightening GVS
-# PO Token enforcement; when it reaches these clients, extraction fails for every guild
-# at once and there is no fallback to switch to. A sidecar token provider is designed
-# and built on branch task/ytdlp-revoke-cache (unmerged): docs/PO_TOKEN_SIDECAR_PLAN.md.
+# TODO: Wire up PO token support before YouTube starts requiring it.
+# PO_TOKEN is an empty placeholder that no code path reads, and _EXTRACTOR_ARGS below
+# passes no po_token to yt-dlp. The current client list works without one, but YouTube
+# has been steadily tightening GVS PO Token enforcement; when it reaches these clients,
+# extraction fails for every guild at once and there is no fallback client to fall back
+# to. A sidecar token provider is already designed and built on branch
+# task/ytdlp-revoke-cache (unmerged).
+# Design: docs/PO_TOKEN_SIDECAR_PLAN.md, docs/ARCHITECTURE_PLAN.md §3.10.
 PO_TOKEN = ""
 
 _EXTRACTOR_ARGS = {
@@ -446,27 +450,30 @@ class YTDL(discord.FFmpegOpusAudio):
             process,
         )
         if data is None:
-            # TODO: yt-dlp failures all surface as a bare Exception("Could not find
-            # song"), so callers cannot tell "no such video" from "extractor broken" or
-            # "network down" — every cause renders the same generic error embed, and
-            # nothing can retry selectively. Needs typed YTDL exceptions (pairs with the
-            # error-handling consolidation in docs/ARCHITECTURE_PLAN.md §3.3).
+            # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
+            # Every failure mode raises the same untyped Exception("Could not find
+            # song"), so callers cannot distinguish "no such video" from "extractor
+            # broken" from "network down". All three render the identical generic error
+            # embed to the user, and nothing upstream can retry selectively or degrade
+            # differently per cause.
+            # Pairs with the error-handling consolidation in docs/ARCHITECTURE_PLAN.md §3.3.
             raise Exception("Could not find song")
 
         if "entries" in data:
-            # TODO: a search result is accepted purely on being the first non-playlist
-            # entry — there is no check that it carries an https audio URL at a usable
-            # bitrate, so a format-less or low-quality entry can win and only fails
-            # later, at stream time.
+            # TODO: Validate search results have a usable audio format before accepting.
+            # An entry wins purely by being the first non-playlist result — nothing
+            # checks that it carries an https audio URL at a usable bitrate. A
+            # format-less or low-quality entry is therefore selected here and only
+            # blows up later, at stream time, where the failure looks unrelated.
             for entry in data["entries"]:
                 if entry and entry.get("_type", None) != "playlist":
                     data = entry
                     break
         if download:
-            # TODO: download=True is accepted by this signature but does nothing — the
-            # file is never named (prepare_filename) or handed back, so a caller passing
-            # it gets streaming behavior and no error. Implement file-backed playback or
-            # drop the parameter.
+            # TODO: Implement or remove yt_source's dead download=True parameter.
+            # The parameter is accepted by the signature but does nothing: the file is
+            # never named (prepare_filename) or handed back to the caller, so anyone
+            # passing download=True silently gets streaming behavior and no error.
             pass
 
         webpage_url = data["webpage_url"]

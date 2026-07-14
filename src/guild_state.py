@@ -167,15 +167,16 @@ class GuildStateData:
         """
         return self.pause_start_epoch is not None
 
-    # FIXME: downtime is counted as playback, so a restart resumes the crashed song at
-    # the wrong position. `now` is read at RESTART time while play_start_epoch was
-    # written when the song started, so a bot that was down for 10 minutes adds those
-    # 10 minutes to the computed position — a song that crashed 30s in comes back near
-    # its end (landing on the caller's duration−10s EOF cap) instead of at 30s. Only a
-    # pause that was already active at crash time is subtracted; the crash gap itself is
-    # never tracked. Fix is a periodic playback heartbeat in Redis so recovery reads the
-    # last known position rather than extrapolating from the start epoch:
-    # docs/CRASH_RECOVERY_HEARTBEAT_PLAN.md (designed, not implemented).
+    # FIXME: Crash recovery counts bot downtime as playback position.
+    # `now` is read at RESTART time while play_start_epoch was written when the song
+    # started, so a bot that was down for 10 minutes adds those 10 minutes straight onto
+    # the computed position. A song that crashed 30 seconds in therefore comes back near
+    # its end — landing on the caller's duration−10s EOF cap — instead of at 0:30. Only
+    # a pause that was already active at crash time is subtracted; the crash gap itself
+    # is never tracked at all.
+    # Fix is a periodic playback heartbeat written to Redis, so recovery reads the last
+    # known position instead of extrapolating from the start epoch.
+    # Design: docs/CRASH_RECOVERY_HEARTBEAT_PLAN.md (designed, not implemented).
     def crashed_position_at(self, now: float) -> int | None:
         """Approximate playback position (seconds) at crash time, or None when
         no play_start_epoch was recorded.

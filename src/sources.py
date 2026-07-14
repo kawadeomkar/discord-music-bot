@@ -53,10 +53,11 @@ class YTSource:
 
 @dataclass(frozen=True)
 class SoundcloudSource:
-    # TODO: SoundCloud timestamp links are silently ignored. parse_url() extracts `t`/`ts`
-    # for youtube.com only, so this ts field is never populated for a SoundCloud URL and
-    # the track always starts at 0:00 — a user who pastes a link with a timestamp gets no
-    # seek and no explanation, while the same link shape works for YouTube.
+    # TODO: SoundCloud timestamp links are ignored, so the track always starts at 0:00.
+    # parse_url() extracts the `t`/`ts` query param for youtube.com only, so this ts
+    # field is never populated for a SoundCloud URL. A user who pastes a SoundCloud link
+    # with a timestamp gets no seek and no explanation — the identical link shape works
+    # for YouTube, which makes the inconsistency look like a bug rather than a gap.
     url: str
     ts: Optional[int] = None
     process: bool = False

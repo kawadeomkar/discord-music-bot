@@ -609,13 +609,14 @@ class GuildRedisStore:
                 StateField.VOICE_CHANNEL_ID,
                 StateField.TEXT_CHANNEL_ID,
                 *_TRANSIENT_SONG_FIELDS,
-                # HACK: last_author_id is dead schema. Nothing writes it any more —
-                # this HDEL only scrubs state hashes left behind by builds that did,
-                # which is why it is a bare literal rather than a StateField constant.
-                # Every guild disconnect now pays for a field that, on any hash written
-                # since that build, does not exist. Delete once no pre-migration hash
-                # can still be live (guild keys carry a 24h TTL, so one release is
-                # already more than enough).
+                # HACK: last_author_id is dead schema still scrubbed on every disconnect.
+                # Nothing writes this field any more; the HDEL exists only to clean up
+                # state hashes left behind by older builds that did, which is why it is
+                # a bare string literal rather than a StateField constant. Every guild
+                # disconnect now pays to delete a field that cannot exist on any hash
+                # written since that migration.
+                # Safe to delete once no pre-migration hash can still be live — guild
+                # keys carry a 24h TTL, so one release is already more than enough.
                 "last_author_id",
                 *_PLAYBACK_POSITION_FIELDS,
             )

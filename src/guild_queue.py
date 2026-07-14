@@ -30,16 +30,17 @@ What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md 
   (SongQueueEntry.from_crashed_state bridges the two schemas)
 """
 
-# ISSUE: one queue-desync window is still open. The playback loop's
-# try_commit_dequeue() → pop_queue_and_start_song() handoff releases the bulk mutex
-# before the store's atomic LPOP+HSET transaction dispatches (the start transaction is a
-# store-level atomicity boundary — see GUILD_QUEUE_SCHEMA_PLAN §4), so a bulk mutation
-# scheduled in that single event-loop tick races the LPOP server-side: a -clear landing
-# between commit and dispatch lets the transaction pop an entry the clear already
-# deleted, drifting memory and Redis by one entry until the next rebuild — and a crash
-# inside that drift restores the queue one song out of alignment. Accepted by design so
-# far, never fixed. Cheapest fix is to hold the mutex across the store dispatch (one
-# ~1ms localhost round-trip): docs/ARCHITECTURE_PLAN.md §3.6.
+# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
+# The playback loop's try_commit_dequeue() → pop_queue_and_start_song() handoff releases
+# the bulk mutex before the store's atomic LPOP+HSET transaction dispatches (the start
+# transaction is a store-level atomicity boundary — see GUILD_QUEUE_SCHEMA_PLAN §4). A
+# bulk mutation scheduled in that single event-loop tick therefore races the LPOP
+# server-side: a -clear landing between commit and dispatch lets the transaction pop an
+# entry the clear already deleted, drifting memory and Redis by one entry until the next
+# rebuild — and a crash inside that drift restores the queue one song out of alignment.
+# Documented and accepted so far, never actually fixed.
+# Cheapest fix is to hold the mutex across the store dispatch, costing one ~1ms
+# localhost round-trip. Design: docs/ARCHITECTURE_PLAN.md §3.6.
 
 import asyncio
 import random
@@ -289,12 +290,13 @@ class GuildQueue:
         An in-flight dequeue (see _in_flight_head) keeps its display/Redis
         head position: shuffling only reorders items still in _pending.
         """
-        # FIXME: the threshold contradicts what the user is told. Shuffling needs 4
-        # queued items here, but MusicPlayer.queue_shuffle() answers the refusal with
-        # "There must be at least 3 songs to shuffle the queue" and -shuffle's help
-        # text advertises "(3+ songs)" — so a user with exactly 3 songs queued is
-        # refused by a message stating the requirement they have already met. Pick
-        # one: drop this to < 3, or correct both user-facing strings to say 4.
+        # FIXME: -shuffle requires 4 queued songs but tells the user it needs 3.
+        # The threshold here is 4, while MusicPlayer.queue_shuffle() phrases the refusal
+        # as "There must be at least 3 songs to shuffle the queue" and the -shuffle help
+        # text advertises "(3+ songs)". A user with exactly 3 songs queued is therefore
+        # refused by a message stating a requirement they have already met, with no way
+        # to tell what is actually wrong.
+        # Fix: either drop this check to < 3, or correct both user-facing strings to 4.
         if self._pending.qsize() < 4:
             return ShuffleOutcome.TOO_FEW_SONGS
 
