@@ -6,6 +6,8 @@ import discord
 import structlog
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import HistoryEntry
+
 
 def queue_message(songs: List[str]) -> str:
     capped = songs[:10]
@@ -78,6 +80,51 @@ async def send_embed(
     for name, value, inline in fields or []:
         embed.add_field(name=name, value=value, inline=inline)
     return await destination.send(embed=embed)
+
+
+def fmt_duration(secs: int) -> str:
+    """Compact clock rendering: 225 → "3:45", 3725 → "1:02:05"."""
+    m, s = divmod(max(0, secs), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
+    """One embed per played song, in the given (newest-first) order.
+
+    Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
+    webpage_url on its own line (Discord auto-links it), then one line with
+    played/duration, requester, and the absolute played-at timestamp
+    (<t:…:f> — viewer-local absolute date/time). Legacy pre-upgrade entries
+    have no metadata and degrade to a marker line; nothing is fabricated.
+    """
+    embeds = []
+    for i, entry in enumerate(entries, start=1):
+        lines = []
+        if entry.webpage_url:
+            lines.append(entry.webpage_url)
+        if entry.is_legacy:
+            lines.append("*played before the history upgrade*")
+        else:
+            requested_by = (
+                f"<@{entry.requester_id}>"
+                if entry.requester_id
+                else (entry.requester_name or "unknown")
+            )
+            lines.append(
+                f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
+                f" · requested by {requested_by}"
+                f" · <t:{int(entry.played_at)}:f>"
+            )
+        embed = discord.Embed(
+            title=f"{i}. {entry.title}",
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        if entry.thumbnail:
+            embed.set_thumbnail(url=entry.thumbnail)
+        embeds.append(embed)
+    return embeds
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

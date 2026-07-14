@@ -4,12 +4,14 @@ import dataclasses
 import logging
 from types import SimpleNamespace
 
+import orjson
 import pytest
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
+    HistoryEntry,
     NowPlayingData,
     SearchQueueEntry,
     SongQueueEntry,
@@ -472,32 +474,138 @@ class TestParseQueueEntryCorrupt:
         assert "corrupt queue entry" in caplog.text
 
 
+def _history_entry(**overrides) -> HistoryEntry:
+    fields: dict = dict(
+        title="Song Title",
+        webpage_url="https://yt.com/v=1",
+        duration_secs=242,
+        played_secs=225,
+        requester_id=42,
+        requester_name="Omkar",
+        thumbnail="https://i.ytimg.com/t.jpg",
+        uploader="Chan",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
+
+
 class TestHistoryEntryWire:
     def test_golden_bytes(self):
-        # Wire format pinned: entries written before the migration are
-        # JSON-encoded strings and must stay readable across restarts.
-        assert (
-            serialize_history_entry("Song Title - https://yt.com/v=1")
-            == b'"Song Title - https://yt.com/v=1"'
+        # v2 wire format pinned: rolling restarts mix writers, so the field
+        # names and value encodings must not drift.
+        assert serialize_history_entry(_history_entry()) == (
+            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0}'
         )
 
     def test_round_trip(self):
-        entry = "Song Title - https://yt.com/v=1"
+        entry = _history_entry()
         assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+    def test_legacy_string_upgrades_to_entry(self):
+        # v1 entries are JSON strings "<title> - <webpage_url>"; the split is
+        # on the LAST " - " because titles may contain the separator.
+        raw = orjson.dumps("Song - With Dash - https://yt.com/v=1")
+        entry = parse_history_entry(raw)
+        assert entry == HistoryEntry(
+            title="Song - With Dash", webpage_url="https://yt.com/v=1"
+        )
+        assert entry.is_legacy
+
+    def test_legacy_string_without_url_becomes_title(self):
+        # A tail that is not a URL must not be mistaken for one.
+        entry = parse_history_entry(orjson.dumps("Artist - Song"))
+        assert entry == HistoryEntry(title="Artist - Song", webpage_url="")
+
+    def test_v2_entry_is_not_legacy(self):
+        assert not _history_entry().is_legacy
+
+    def test_unknown_keys_ignored_and_missing_keys_default(self):
+        # Forward/backward tolerance: a newer writer's extra field must not
+        # break this reader, and absent fields become zero-values.
+        raw = orjson.dumps({"title": "x", "future_field": 1})
+        assert parse_history_entry(raw) == HistoryEntry(title="x")
 
     @pytest.mark.parametrize(
         "raw",
         [
             b"not json at all",
-            b'{"a": "json object, not a string"}',
             b"123",
+            b"[1, 2]",
             b"",
+            b'{"title": "x", "duration_secs": "not a number"}',
+            b'{"title": "x", "played_at": {"nested": true}}',
         ],
     )
     def test_corrupt_entry_dropped_with_warning(self, raw, caplog):
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_history_entry(raw) is None
         assert "corrupt history entry" in caplog.text
+
+
+def _history_song_stub(**overrides) -> SimpleNamespace:
+    fields: dict = dict(
+        title="Test Song",
+        webpage_url="https://youtu.be/abc",
+        uploader="Test Channel",
+        duration_secs=242,
+        position_secs=225.0,
+        thumbnail="https://img/x.jpg",
+        requester=SimpleNamespace(id=333, display_name="Omkar"),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestHistoryEntryFromSong:
+    def test_maps_song_fields(self):
+        entry = HistoryEntry.from_song(_history_song_stub(), played_at=1752530000.0)
+        assert entry == HistoryEntry(
+            title="Test Song",
+            webpage_url="https://youtu.be/abc",
+            duration_secs=242,
+            played_secs=225,
+            requester_id=333,
+            requester_name="Omkar",
+            thumbnail="https://img/x.jpg",
+            uploader="Test Channel",
+            played_at=1752530000.0,
+        )
+
+    def test_played_secs_is_position_reached(self):
+        song = _history_song_stub(position_secs=100.4)
+        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 100
+
+    def test_played_secs_capped_at_duration(self):
+        # position can exceed duration by fractions of a frame at natural end.
+        song = _history_song_stub(position_secs=243.02)
+        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 242
+
+    def test_unknown_duration_leaves_position_uncapped(self):
+        song = _history_song_stub(duration_secs=0, position_secs=99.6)
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.duration_secs == 0
+        assert entry.played_secs == 100
+
+    def test_no_requester_degrades_to_zero_values(self):
+        song = _history_song_stub(requester=None)
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.requester_id == 0
+        assert entry.requester_name == ""
+
+    def test_none_metadata_degrades_to_zero_values(self):
+        # yt-dlp can return None for any metadata field.
+        song = _history_song_stub(
+            title=None, webpage_url=None, uploader=None, thumbnail=None
+        )
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.title == ""
+        assert entry.webpage_url == ""
+        assert entry.uploader == ""
+        assert entry.thumbnail == ""
 
 
 class TestFromCrashedState:

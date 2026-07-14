@@ -14,7 +14,7 @@ from opentelemetry import trace
 from src import config
 from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
-from src.guild_state import NowPlayingData, SongQueueEntry
+from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -1668,7 +1668,9 @@ class MusicPlayer:
                         self._skip_history_for = None
                         if not skip_history:
                             await self.history.add(
-                                f"{self.current_song.title} - {self.current_song.webpage_url}"
+                                HistoryEntry.from_song(
+                                    self.current_song, played_at=time.time()
+                                )
                             )
 
                     if self.store is not None:

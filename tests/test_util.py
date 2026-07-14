@@ -2,7 +2,8 @@
 
 import logging
 
-from src.util import get_logger, queue_message
+from src.guild_state import HistoryEntry
+from src.util import fmt_duration, get_logger, history_embeds, queue_message
 
 
 class TestQueueMessage:
@@ -85,3 +86,88 @@ class TestGetLogger:
         logger_b = get_logger("module.b")
         assert logger_a is not logger_b
         assert logger_a.name != logger_b.name
+
+
+class TestFmtDuration:
+    def test_minutes_seconds(self):
+        assert fmt_duration(225) == "3:45"
+
+    def test_hours_zero_pads_minutes_and_seconds(self):
+        assert fmt_duration(3725) == "1:02:05"
+
+    def test_zero(self):
+        assert fmt_duration(0) == "0:00"
+
+    def test_negative_clamps_to_zero(self):
+        assert fmt_duration(-5) == "0:00"
+
+    def test_under_a_minute(self):
+        assert fmt_duration(7) == "0:07"
+
+
+def _rich_entry(**overrides) -> HistoryEntry:
+    fields: dict = dict(
+        title="Rich Song",
+        webpage_url="https://yt.com/v=rich",
+        duration_secs=242,
+        played_secs=225,
+        requester_id=42,
+        requester_name="Omkar",
+        thumbnail="https://i.ytimg.com/t.jpg",
+        uploader="Chan",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
+
+
+class TestHistoryEmbeds:
+    def test_layout_title_url_then_info_line(self):
+        # Plan §6: numbered title; webpage_url on its own line beneath it;
+        # played/duration · requester · absolute timestamp on ONE line below.
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.title == "1. Rich Song"
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>",
+        ]
+
+    def test_numbering_follows_given_order(self):
+        embeds = history_embeds([_rich_entry(), _rich_entry(title="Second")])
+        assert embeds[0].title == "1. Rich Song"
+        assert embeds[1].title == "2. Second"
+
+    def test_thumbnail_set_when_present(self):
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.thumbnail.url == "https://i.ytimg.com/t.jpg"
+
+    def test_no_thumbnail_when_absent(self):
+        [embed] = history_embeds([_rich_entry(thumbnail="")])
+        assert embed.thumbnail.url is None
+
+    def test_requester_mention_survives_member_departure(self):
+        # The raw <@id> mention needs no member cache to render.
+        [embed] = history_embeds([_rich_entry(requester_id=999)])
+        assert "<@999>" in embed.description
+
+    def test_requester_name_fallback_when_id_unknown(self):
+        [embed] = history_embeds(
+            [_rich_entry(requester_id=0, requester_name="SomeUser")]
+        )
+        assert "requested by SomeUser" in embed.description
+
+    def test_legacy_entry_degrades(self):
+        legacy = HistoryEntry(title="Old Song", webpage_url="https://yt.com/v=old")
+        [embed] = history_embeds([legacy])
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=old",
+            "*played before the history upgrade*",
+        ]
+        assert embed.thumbnail.url is None
+
+    def test_legacy_entry_without_url(self):
+        [embed] = history_embeds([HistoryEntry(title="Old Song")])
+        assert embed.description == "*played before the history upgrade*"
+
+    def test_empty_input(self):
+        assert history_embeds([]) == []

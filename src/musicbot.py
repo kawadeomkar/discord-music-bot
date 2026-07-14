@@ -9,7 +9,7 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from src.musicplayer import MusicPlayer
-from src.redis_client import GuildRedisStore
+from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -27,6 +27,7 @@ from opentelemetry.trace import StatusCode
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    history_embeds,
     latency_color,
     notice_embed,
     queue_message,
@@ -40,6 +41,18 @@ log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
 from src.youtube import YTDL, QueueObject
+
+HISTORY_MIN_LIMIT = 1
+# The ceiling is the display cache depth — -history reads only the in-memory
+# cache, never the (unbounded) Redis list. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
+# 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
+# Discord's per-message cap — so the block always fits and is never shed.
+HISTORY_EMBEDS_PER_MESSAGE = 8
+
+
+class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
+    limit: int = 10
 
 
 def _check_voice_permissions(
@@ -217,6 +230,12 @@ class MusicBot(commands.Cog):
                     + (f" Usage: {usage}" if usage else ""),
                     discord.Color.red(),
                 )
+            )
+        elif isinstance(error, commands.FlagError):
+            # Flag parsing fails before the command body runs, so its
+            # try/except never sees it — e.g. `-history --limit abc`.
+            await ctx.send(
+                embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
@@ -763,17 +782,40 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
-        name="history", aliases=["h"], help="display history of songs played"
+        name="history",
+        aliases=["h"],
+        help="show recently played songs (--limit 1..50, default 10)",
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.history")
-    async def history(self, ctx: commands.Context):
+    async def history(self, ctx: commands.Context, *, flags: HistoryFlags):
         try:
-            mp = self.get_mp(ctx)
-            if mp and mp.history:
-                q_history = queue_message(list(mp.history)[:10])
+            if not (HISTORY_MIN_LIMIT <= flags.limit <= HISTORY_MAX_LIMIT):
                 await ctx.send(
-                    embed=notice_embed(q_history, discord.Color.blue(), title="History")
+                    embed=notice_embed(
+                        f"--limit must be between {HISTORY_MIN_LIMIT} and {HISTORY_MAX_LIMIT}",
+                        discord.Color.red(),
+                    )
+                )
+                return
+            mp = self.get_mp(ctx)
+            entries = mp.history.recent(flags.limit)
+            if not entries:
+                await ctx.send(
+                    embed=notice_embed(
+                        "No songs have been played yet.", discord.Color.orange()
+                    )
+                )
+                return
+            embeds = history_embeds(entries)
+            # 8 per message: with the NP block (≤2 embeds) MusicContext.send
+            # prepends while a song is live, every chunk stays within Discord's
+            # 10-embed cap. Every chunk goes through ctx.send (key invariant #8
+            # — never bare channel.send in the player's channel), so the
+            # adopt/retire machinery walks the NP block down to the last chunk.
+            for start in range(0, len(embeds), HISTORY_EMBEDS_PER_MESSAGE):
+                await ctx.send(
+                    embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
                 )
         except Exception as e:
             log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
