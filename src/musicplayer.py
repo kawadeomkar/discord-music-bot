@@ -1584,13 +1584,19 @@ class MusicPlayer:
                     # referring to the same song even if current_song is reassigned.
                     song = self.current_song
 
+                    # Written from the player thread, read after play_next.wait();
+                    # call_soon_threadsafe orders the write before the wait returns.
+                    play_error: list[Optional[Exception]] = [None]
+
                     def _after_play(
                         error: Optional[Exception], _title: str = song.title or ""
                     ) -> None:
                         # discord.py hands ffmpeg's failure here and nowhere else; the
                         # previous `lambda _:` dropped it, so a stream that never opened
-                        # was indistinguishable from a song that ended.
+                        # was indistinguishable from a song that ended. A deliberate
+                        # vc.stop() (skip/interject) arrives as error=None.
                         if error is not None:
+                            play_error[0] = error
                             log.error(f"playback error for {_title}: {error}")
                         self.bot.loop.call_soon_threadsafe(self.play_next.set)
 
@@ -1655,10 +1661,18 @@ class MusicPlayer:
 
                     await self.play_next.wait()
 
-                    # A song that ended without delivering a single frame never played:
-                    # ffmpeg failed to open the stream. Captured before the teardown
-                    # below so the cleanup path can distinguish it from a real finish.
-                    stream_failed = not song.produced_audio
+                    # A song that ended with zero frames AND an ffmpeg error never
+                    # played: the stream never opened (typically a 403 on a revoked
+                    # URL, which discord.py surfaces as FFmpegProcessError). Both
+                    # conditions matter — zero frames alone also describes a song
+                    # parked paused by -playnow or stopped the instant it started
+                    # (vc.stop() reports no error), and an error alone also describes
+                    # a mid-song death that delivered real audio and earns its
+                    # history entry. Captured before the teardown below so the
+                    # cleanup path can distinguish it from a real finish.
+                    stream_failed = (
+                        not song.produced_audio and play_error[0] is not None
+                    )
                     span.set_attribute("song.stream_failed", stream_failed)
 
                     # Must fully retire before the next iteration's _send_now_playing()
@@ -1676,11 +1690,24 @@ class MusicPlayer:
                     # frozen at the last periodic tick's position.
                     finished_host = self._np_host_message
                     finished_own = self._np_host_own_embeds
+                    finished_dedicated = self._np_host_dedicated
                     self._release_np_host()
-                    if self.current_song is not None and finished_host is not None:
-                        self._fire_finalize_now_playing(
-                            self.current_song, finished_host, finished_own
-                        )
+                    if finished_host is not None:
+                        if stream_failed:
+                            # A completed bar is a truthful record only for a song
+                            # that played. This one delivered nothing, so the NP
+                            # block is disposed of (same rationale as
+                            # retire_np_host_on_stop) rather than finalized to
+                            # 100% right above the failure notice.
+                            self._spawn_background(
+                                self._retire_np_host(
+                                    finished_host, finished_own, finished_dedicated
+                                )
+                            )
+                        elif self.current_song is not None:
+                            self._fire_finalize_now_playing(
+                                self.current_song, finished_host, finished_own
+                            )
 
                     # Claim-then-await: interject() may have neutralized (and
                     # nulled) the task while this iteration sat in
@@ -1702,12 +1729,11 @@ class MusicPlayer:
                         # Identity match, and the marker clears either way: a
                         # marker left for a song that ended naturally during
                         # interject()'s awaits must not eat this (different)
-                        # song's entry.
+                        # song's entry. A song that never produced audio was
+                        # never played and doesn't belong in history either —
+                        # -history is a record of what was heard.
                         skip_history = self._skip_history_for is self.current_song
                         self._skip_history_for = None
-                        # A song that never produced audio was never played, so it
-                        # does not belong in history — -history is a record of what
-                        # was heard.
                         if not skip_history and not stream_failed:
                             await self.history.add(
                                 f"{self.current_song.title} - {self.current_song.webpage_url}"

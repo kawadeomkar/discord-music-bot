@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -60,28 +62,40 @@ class _YtdlpLogger:
 
 _YTDLP_LOGGER = _YtdlpLogger()
 
-# Playback rides entirely on `android_vr`. yt-dlp's `default` is (android_vr, web_safari), but
-# web_safari contributes nothing here: web-family clients need a JS runtime + yt-dlp-ejs to
-# solve the signature / n challenges (we ship neither), and even with those they only return
-# HLS video — the audio-only https formats stay withheld without a GVS PO Token. android_vr
-# needs neither, which is the only reason this works.
+# Client strategy: android_vr primary, web_safari as a *working* fallback.
 #
-# A PO Token would NOT help android_vr: it is documented as "Not required" for that client
-# (yt-dlp wiki, PO-Token-Guide) and extraction emits no PO-token warning. The previous TODO
-# here proposed `po_token: mweb.player+<constant>`, which was wrong twice over — mweb needs a
-# *gvs* token, not player, and tokens are bound to the video ID, so a hardcoded constant can
-# never work; minting them per-video needs a provider plugin (e.g. bgutil-ytdlp-pot-provider).
+# yt-dlp resolves `default` by JS-runtime availability: ('android_vr',) without one,
+# ('android_vr', 'web_safari') with one. We ship Deno via yt-dlp's `deno` extra (the
+# binary lands in the venv scripts dir, where yt-dlp looks first) and yt-dlp-ejs via
+# the `default` extra, so web_safari's signature/n challenges are solvable. What that
+# buys today (verified 2026-07): web_safari serves *muxed* formats only (HLS itags
+# 91-96 and https itag 18) — the `/best` leg of our `bestaudio/best` selector picks
+# one and ffmpeg's -vn drops the video. GVS Proof-of-Origin tokens — minted per
+# visitor session by the bgutil-pot-provider sidecar (docker-compose.yml, port 4416)
+# via the bgutil-ytdlp-pot-provider plugin — are not yet *enforced* for those muxed
+# formats, but that enforcement is YouTube's documented trajectory (PO-Token-Guide:
+# HLS exempt "currently"); the sidecar is what keeps this fallback alive when it
+# flips. android_vr needs none of this — PO tokens are "Not required" for it — and
+# stays first; fetch_pot=auto means the provider is only consulted when needed.
 #
-# The real exposure is being single-homed on a client YouTube has been destabilising (yt-dlp
-# #16150: android_vr erratic since 2026-03, SABR-only experiment). Mitigation, when we want it,
-# is a genuine fallback — Deno + yt-dlp[default] + a PO-token provider sidecar — not a constant.
-# Until then, revoked URLs are handled by _resolve_playable_stream()'s probe-and-re-extract.
+# Degradation ladder — every rung lands on a previously-working configuration:
+#   android_vr healthy   → exactly the pre-fallback behavior (audio-only, e.g. 251/opus)
+#   android_vr out       → web_safari serves muxed audio; WARNING via _record_serving_format
+#   sidecar down         → plugin warns; web_safari keeps working until POT enforcement lands
+#   Deno broken          → yt-dlp reverts to the JS-less default (android_vr only)
+# Revoked URLs are handled separately by _resolve_playable_stream()'s probe-and-
+# re-extract — which now has two clients to heal from. See docs/PO_TOKEN_SIDECAR_PLAN.md.
 #
 # `-tv_simply` is a no-op against today's defaults; kept as a guard in case it is added back.
 _EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["default", "-tv_simply"],
-    }
+    },
+    # The plugin's own default is already 127.0.0.1:4416; set explicitly so a
+    # deployment where the provider lives elsewhere overrides via env, not code.
+    "youtubepot-bgutilhttp": {
+        "base_url": [os.environ.get("POT_PROVIDER_URL", "http://127.0.0.1:4416")],
+    },
 }
 
 # Shared base opts for both extraction paths.
@@ -110,9 +124,15 @@ _YTDL_SOURCE_OPTS = {
 
 # Used by yt_stream / prefetch_stream: resolves a webpage_url to a CDN stream URL.
 # check_formats=False skips HEAD requests that probe format URL availability.
+#
+# Format ladder: audio-only when available (the healthy android_vr path); otherwise a
+# *small* muxed format — ffmpeg's -vn keeps only its audio, so on the fallback rung
+# picking plain `best` would stream 1080p video (~120MB/song) just to throw the
+# picture away, while 360p muxed (itag 18 / HLS 93) carries the same mp4a audio for
+# ~a tenth of that. Bare `best` stays as the final rung for videos with nothing ≤360p.
 _YTDL_STREAM_OPTS = {
     **_YTDL_BASE_OPTS,
-    "format": "bestaudio/best",
+    "format": "bestaudio/best[height<=360]/best",
     "check_formats": False,
     "retries": 10,
 }
@@ -163,8 +183,47 @@ _STREAM_CACHE_FIELDS = frozenset(
         "abr",
         "asr",
         "acodec",
+        # Format-shape fields — how _record_serving_format tells a healthy audio-only
+        # serve from a degraded muxed/HLS one; kept so cache hits stay attributable.
+        "format_id",
+        "protocol",
+        "vcodec",
     }
 )
+
+# format_ids already warned about by _record_serving_format — once per format per
+# process, so a real android_vr outage doesn't emit a warning for every song.
+_DEGRADED_FORMAT_WARNED: set = set()
+
+
+def _record_serving_format(data: dict) -> None:
+    """Record the shape of the format a song will play from.
+
+    yt-dlp strips per-format client attribution (`__yt_dlp_client`) before formats
+    leave the extractor, so *which client* served a song is not directly observable.
+    The format shape is the sharper signal anyway: the healthy path is an audio-only
+    format (vcodec == "none", bestaudio from android_vr); a muxed or HLS selection
+    means either android_vr degraded to muxed-only (yt-dlp#16150's "ONLY -f=18" mode)
+    or web_safari is serving as the fallback. Both mean the primary path is degraded —
+    worth one warning, since playback itself continues and nothing else surfaces it.
+
+    A missing vcodec (pre-upgrade cache entries) is treated as healthy: never warn on
+    a song that may be fine.
+    """
+    span = trace.get_current_span()
+    format_id = data.get("format_id")
+    span.set_attribute("ytdl.format_id", str(format_id))
+    span.set_attribute("ytdl.protocol", str(data.get("protocol")))
+    audio_only = data.get("vcodec") in (None, "none")
+    span.set_attribute("ytdl.audio_only", audio_only)
+    if not audio_only and format_id not in _DEGRADED_FORMAT_WARNED:
+        _DEGRADED_FORMAT_WARNED.add(format_id)
+        log.warning(
+            f"songs are being served a muxed A/V format "
+            f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
+            "primary audio-only path (android_vr) is degraded and the player is "
+            "on the fallback ladder"
+        )
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -182,9 +241,18 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
 
     The `ip` parameter is inside `sparams` (HMAC-signed), so URLs are also bound to the IP that
     extracted them and can never be reused from another host.
+
+    `expire` lives in the query string on https formats, but HLS manifest URLs — the muxed
+    formats the degraded web_safari rung serves — carry it as a path segment
+    (`/expire/<epoch>/`). Both forms are read; missing either would leave that rung uncached,
+    silently re-extracting 3-5s on every play.
     """
     try:
-        expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
+        parsed = urlparse(stream_url)
+        expire = int(parse_qs(parsed.query).get("expire", [0])[0])
+        if not expire:
+            match = re.search(r"/expire/(\d+)(?:/|$)", parsed.path)
+            expire = int(match.group(1)) if match else 0
         ttl = min(expire - int(time.time()) - 1800, _STREAM_URL_MAX_TTL)
         return ttl if ttl > 60 else None
     except ValueError, IndexError:
@@ -426,6 +494,7 @@ class YTDL(discord.FFmpegOpusAudio):
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return
         if data is not None:
+            _record_serving_format(data)
             # Only a URL that has been proven playable earns a cache entry — caching an
             # already-revoked one would hand yt_stream a dead URL it then has to discard.
             if await _stream_url_playable(data.get("url", "")):
@@ -473,17 +542,30 @@ class YTDL(discord.FFmpegOpusAudio):
                 extracted_fresh = True
 
             if await _stream_url_playable(data.get("url", "")):
+                _record_serving_format(data)
                 if extracted_fresh:
                     await _cache_stream(redis, cache_key, data)
                 return data
 
             span.set_attribute("ytdl.stream_url_revoked", True)
-            log.warning(
-                f"YouTube revoked the stream URL for {qo.webpage_url} "
-                f"(attempt {attempt + 1}/2, {'fresh' if extracted_fresh else 'cached'}) "
-                "— dropping it from the cache and re-extracting"
-            )
-            await cache_del(redis, cache_key)
+            if not extracted_fresh:
+                # Only a cached URL has a cache entry to drop — a fresh one is
+                # cached exclusively on probe success, above.
+                log.warning(
+                    f"YouTube revoked the cached stream URL for {qo.webpage_url} "
+                    "— dropping it from the cache and re-extracting"
+                )
+                await cache_del(redis, cache_key)
+            elif attempt == 0:
+                log.warning(
+                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    "dead — re-extracting once"
+                )
+            else:
+                log.warning(
+                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    "dead again — giving up"
+                )
             data = None
 
         raise RuntimeError(
