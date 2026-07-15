@@ -1,9 +1,22 @@
 import os
+from collections.abc import Sequence
 from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
 
+from src.guild_state import (
+    GuildPlaybackSnapshot,
+    GuildRecoveryGate,
+    GuildStateData,
+    NowPlayingData,
+    QueueEntry,
+    SongQueueEntry,
+    StateField,
+    parse_history_entry,
+    parse_queue_entry,
+    serialize_history_entry,
+)
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -13,22 +26,24 @@ GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 GUILD_TTL = 86400  # 24h idle expiry
+HISTORY_LIMIT = 50  # entries kept on both history legs (deque maxlen + LTRIM)
 
 # Transient per-song fields cleared together on song end / disconnect, and the
 # playback-position fields cleared together alongside them. Shared here so
 # clear_song_end_state()/clear_connection() can't drift out of sync with each
 # other by hand-editing one and forgetting the other.
 _TRANSIENT_SONG_FIELDS = (
-    "current_song_url",
-    "current_song_title",
-    "current_song_duration",
-    "current_song_uploader",
-    "current_song_requester_id",
+    StateField.CURRENT_SONG_URL,
+    StateField.CURRENT_SONG_TITLE,
+    StateField.CURRENT_SONG_DURATION,
+    StateField.CURRENT_SONG_UPLOADER,
+    StateField.CURRENT_SONG_REQUESTER_ID,
+    StateField.CURRENT_SONG_INTERJECTED,
 )
 _PLAYBACK_POSITION_FIELDS = (
-    "play_start_epoch",
-    "total_pause_seconds",
-    "pause_start_epoch",
+    StateField.PLAY_START_EPOCH,
+    StateField.TOTAL_PAUSE_SECONDS,
+    StateField.PAUSE_START_EPOCH,
 )
 
 
@@ -87,6 +102,16 @@ async def cache_set(
         await redis.set(key, orjson.dumps(value), ex=ttl)
     except Exception as e:
         log.warning(f"cache_set failed [{key}]: {e}")
+
+
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+    if redis is None:
+        return
+    try:
+        await redis.delete(key)
+    except Exception as e:
+        log.warning(f"cache_del failed [{key}]: {e}")
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────
@@ -170,29 +195,61 @@ class GuildRedisStore:
         pipe.expire(self.history_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
 
+    async def _exec_with_state_ttl(self, pipe) -> None:
+        """Append the state-key TTL refresh and execute the pipeline.
+
+        EXPIRE must come after the write commands already queued on the pipe —
+        an EXPIRE on a not-yet-created key is a no-op and would leave the key
+        persistent-until-eviction.
+        """
+        pipe.expire(self.state_key(), GUILD_TTL)
+        await pipe.execute()
+
     # Queue operations
 
-    async def push_queue(self, data: bytes) -> None:
-        """RPUSH one serialized item and refresh TTL on all guild keys."""
+    async def push_queue(self, entry: QueueEntry) -> None:
+        """RPUSH one queue entry and refresh TTL on all guild keys."""
         try:
             pipe = self.redis.pipeline()
-            pipe.rpush(self.queue_key(), data)
+            pipe.rpush(self.queue_key(), entry.to_redis())
             self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
 
-    async def push_queue_batch(self, items: list[bytes]) -> None:
-        """RPUSH all items in one pipeline round-trip and refresh TTL on all guild keys."""
-        if not items:
+    async def push_queue_batch(self, entries: Sequence[QueueEntry]) -> None:
+        """RPUSH all entries in one pipeline round-trip and refresh TTL on all guild keys."""
+        if not entries:
             return
         try:
             pipe = self.redis.pipeline()
-            pipe.rpush(self.queue_key(), *items)
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
+
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+        """LPUSH entries so entries[0] ends up at the queue head, and refresh
+        TTL on all guild keys — the -playnow front insert. LPUSH pushes each
+        successive argument to the head, so the batch is reversed first to
+        preserve the given order.
+
+        Failure note (store policy: log, never raise): a swallowed failure
+        here degrades WORSE than a tail-push failure. The in-memory legs end
+        up len(entries) ahead of Redis at the HEAD, so the next commit-time
+        LPOPs retire other songs' entries — a crash before the mismatch
+        drains restores a queue shifted by up to that many songs, not just
+        missing the entries that failed to push."""
+        if not entries:
+            return
+        try:
+            pipe = self.redis.pipeline()
+            pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
+            self._pipe_expire_all(pipe)
+            await pipe.execute()  # type: ignore[misc]
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] Redis push_queue_front failed: {e}")
 
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes the item immediately with no ack.
@@ -205,35 +262,33 @@ class GuildRedisStore:
             log.warning(f"[guild:{self.guild_id}] Redis pop_queue failed: {e}")
 
     def _now_playing_state_mapping(
-        self,
-        url: str,
-        title: str,
-        play_start_epoch: float,
-        duration: Optional[int],
-        uploader: Optional[str],
-        requester_id: Optional[int],
+        self, current: SongQueueEntry, play_start_epoch: float
     ) -> dict[str, str]:
+        """The current_song_* state fields ARE a parked queue entry — this one
+        signature enforces the identity that SongQueueEntry.from_song() /
+        from_crashed_state() rely on for crash recovery."""
         return {
-            "current_song_url": url,
-            "current_song_title": title,
-            "current_song_duration": str(duration) if duration else "",
-            "current_song_uploader": uploader or "",
-            "current_song_requester_id": str(requester_id) if requester_id else "",
-            "play_start_epoch": str(play_start_epoch),
-            "total_pause_seconds": "0",
+            StateField.CURRENT_SONG_URL: current.webpage_url,
+            StateField.CURRENT_SONG_TITLE: current.title,
+            StateField.CURRENT_SONG_DURATION: (
+                str(current.duration) if current.duration else ""
+            ),
+            StateField.CURRENT_SONG_UPLOADER: current.uploader or "",
+            StateField.CURRENT_SONG_REQUESTER_ID: (
+                str(current.requester_id) if current.requester_id else ""
+            ),
+            StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
+            StateField.PLAY_START_EPOCH: str(play_start_epoch),
+            StateField.TOTAL_PAUSE_SECONDS: "0",
         }
 
     async def pop_queue_and_start_song(
         self,
-        url: str,
-        title: str,
+        current: SongQueueEntry,
         play_start_epoch: float,
-        duration: Optional[int] = None,
-        uploader: Optional[str] = None,
-        requester_id: Optional[int] = None,
-        now_playing_fields: Optional[dict[str, str]] = None,
+        now_playing: Optional[NowPlayingData] = None,
     ) -> None:
-        """Atomically LPOP the queue and write all now-playing state fields.
+        """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
         Uses MULTI/EXEC so the song is always in one of two consistent states:
           (a) still in guild:{id}:queue, current_song_url empty  — transaction not executed
@@ -242,21 +297,22 @@ class GuildRedisStore:
         Eliminates the crash window where the song was absent from both the queue
         and current_song_url (the at-most-once gap from the prior pop_queue() pattern).
 
-        When now_playing_fields is given, the now_playing display snapshot is
+        When now_playing is given, the now_playing display snapshot is
         written inside the same transaction — a crash can never leave state
         pointing at song B while the snapshot still shows song A.
         """
         try:
-            mapping = self._now_playing_state_mapping(
-                url, title, play_start_epoch, duration, uploader, requester_id
-            )
+            mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.lpop(self.queue_key())
             pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
-            pipe.hdel(self.state_key(), "pause_start_epoch")
+            pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
-            if now_playing_fields:
-                pipe.hset(self.now_playing_key(), mapping=now_playing_fields)  # type: ignore[misc]
+            if now_playing is not None:
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
@@ -264,40 +320,29 @@ class GuildRedisStore:
 
     async def set_current_song_state(
         self,
-        url: str,
-        title: str,
+        current: SongQueueEntry,
         play_start_epoch: float,
-        duration: Optional[int] = None,
-        uploader: Optional[str] = None,
-        requester_id: Optional[int] = None,
-        now_playing_fields: Optional[dict[str, str]] = None,
+        now_playing: Optional[NowPlayingData] = None,
     ) -> None:
         """Same fields as pop_queue_and_start_song, in one transaction, but
         without the LPOP — for restarting a crash-recovered "current song" that
         was never RPUSHed to the Redis queue list in the first place.
         """
         try:
-            mapping = self._now_playing_state_mapping(
-                url, title, play_start_epoch, duration, uploader, requester_id
-            )
+            mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
-            pipe.hdel(self.state_key(), "pause_start_epoch")
+            pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
-            if now_playing_fields:
-                pipe.hset(self.now_playing_key(), mapping=now_playing_fields)  # type: ignore[misc]
+            if now_playing is not None:
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_current_song_state failed: {e}")
-
-    async def get_queue(self) -> list[bytes]:
-        """Return all queued items oldest-first."""
-        try:
-            return await self.redis.lrange(self.queue_key(), 0, -1)  # type: ignore[misc]
-        except Exception as e:
-            log.warning(f"[guild:{self.guild_id}] Redis get_queue failed: {e}")
-            return []
 
     async def delete_queue(self) -> None:
         """DELETE the queue key."""
@@ -306,12 +351,12 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis delete_queue failed: {e}")
 
-    async def rebuild_queue(self, items: list[bytes]) -> None:
-        """Atomically DELETE + RPUSH all items. Uses MULTI/EXEC to avoid empty-window race."""
+    async def rebuild_queue(self, entries: Sequence[QueueEntry]) -> None:
+        """Atomically DELETE + RPUSH all entries. Uses MULTI/EXEC to avoid empty-window race."""
         try:
             pipe = self.redis.pipeline(transaction=True)
             pipe.delete(self.queue_key())
-            pipe.rpush(self.queue_key(), *items)
+            pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             pipe.expire(self.queue_key(), GUILD_TTL)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
@@ -319,38 +364,48 @@ class GuildRedisStore:
 
     # History operations
 
-    async def push_history(self, data: bytes) -> None:
-        """LPUSH one serialized entry, trim list to 50, and refresh TTL."""
+    async def push_history(self, entry: str) -> None:
+        """LPUSH one entry, trim list to HISTORY_LIMIT, and refresh TTL."""
         try:
             pipe = self.redis.pipeline()
-            pipe.lpush(self.history_key(), data)
-            pipe.ltrim(self.history_key(), 0, 49)
+            pipe.lpush(self.history_key(), serialize_history_entry(entry))
+            pipe.ltrim(self.history_key(), 0, HISTORY_LIMIT - 1)
             pipe.expire(self.history_key(), GUILD_TTL)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")
 
-    async def get_history(self) -> list[bytes]:
-        """Return up to 50 history items newest-first."""
+    async def get_history(self) -> list[str]:
+        """Return up to HISTORY_LIMIT history entries newest-first. Corrupt
+        entries are dropped (parse_history_entry warns per entry)."""
         try:
-            return await self.redis.lrange(self.history_key(), 0, 49)  # type: ignore[misc]
+            raw: list[bytes] = await self.redis.lrange(  # type: ignore[misc]
+                self.history_key(), 0, HISTORY_LIMIT - 1
+            )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_history failed: {e}")
             return []
+        return [e for e in map(parse_history_entry, raw) if e is not None]
 
     # Now-playing operations
     # (Writes happen inside pop_queue_and_start_song()/set_current_song_state()
-    #  via now_playing_fields, atomically with the rest of the start state.)
+    #  via the now_playing value object, atomically with the rest of the start state.)
 
-    async def get_now_playing(self) -> dict[bytes, bytes]:
-        """HGETALL the now_playing hash. Returns empty dict on key miss or error."""
+    async def get_now_playing(self) -> Optional[NowPlayingData]:
+        """HGETALL the now_playing hash. Returns None on miss or error.
+
+        Miss and error collapse to None deliberately: the only caller uses this
+        to optionally restore a display embed, and "no embed" is the correct
+        degraded behavior in both cases.
+        """
         try:
-            return cast(
+            raw = cast(
                 dict[bytes, bytes], await self.redis.hgetall(self.now_playing_key())
             )
+            return NowPlayingData.from_redis(raw)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] get_now_playing failed: {e}")
-            return {}
+            return None
 
     # Playback position tracking
 
@@ -362,11 +417,10 @@ class GuildRedisStore:
         """
         try:
             pipe = self.redis.pipeline()
-            pipe.hset(self.state_key(), "play_start_epoch", str(epoch))
-            pipe.hset(self.state_key(), "total_pause_seconds", "0")
-            pipe.hdel(self.state_key(), "pause_start_epoch")
-            pipe.expire(self.state_key(), GUILD_TTL)
-            await pipe.execute()
+            pipe.hset(self.state_key(), StateField.PLAY_START_EPOCH, str(epoch))
+            pipe.hset(self.state_key(), StateField.TOTAL_PAUSE_SECONDS, "0")
+            pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
+            await self._exec_with_state_ttl(pipe)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_playback_start failed: {e}")
 
@@ -374,9 +428,8 @@ class GuildRedisStore:
         """Record the epoch when the voice client was paused."""
         try:
             pipe = self.redis.pipeline()
-            pipe.hset(self.state_key(), "pause_start_epoch", str(epoch))
-            pipe.expire(self.state_key(), GUILD_TTL)
-            await pipe.execute()
+            pipe.hset(self.state_key(), StateField.PAUSE_START_EPOCH, str(epoch))
+            await self._exec_with_state_ttl(pipe)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] on_pause failed: {e}")
 
@@ -390,7 +443,9 @@ class GuildRedisStore:
         """
         try:
             vals = await self.redis.hmget(
-                self.state_key(), "pause_start_epoch", "total_pause_seconds"
+                self.state_key(),
+                StateField.PAUSE_START_EPOCH,
+                StateField.TOTAL_PAUSE_SECONDS,
             )
             pause_start_raw = vals[0] or b""
             if not pause_start_raw:
@@ -399,10 +454,9 @@ class GuildRedisStore:
             elapsed_pause = max(0.0, resume_epoch - float(pause_start_raw))
             new_total = float(total_raw) + elapsed_pause
             pipe = self.redis.pipeline()
-            pipe.hset(self.state_key(), "total_pause_seconds", str(new_total))
-            pipe.hdel(self.state_key(), "pause_start_epoch")
-            pipe.expire(self.state_key(), GUILD_TTL)
-            await pipe.execute()
+            pipe.hset(self.state_key(), StateField.TOTAL_PAUSE_SECONDS, str(new_total))
+            pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
+            await self._exec_with_state_ttl(pipe)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] on_resume failed: {e}")
 
@@ -428,25 +482,101 @@ class GuildRedisStore:
 
     # State operations
 
-    async def set_state(self, field: str, value: str) -> None:
-        """HSET a single field and refresh TTL."""
+    async def get_guild_state(self) -> Optional[GuildStateData]:
+        """HGETALL the state hash and return a typed snapshot.
+
+        Returns GuildStateData() (zero values) when the hash is missing/empty
+        and None when the read itself failed — callers can distinguish "nothing
+        stored" from "Redis unavailable" (see _restore_guild).
+
+        Does NOT refresh TTL — pure read. TTL is refreshed by refresh_ttl() at
+        the end of _restore_state(), which covers the recovery window.
+        """
+        try:
+            raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
+            return GuildStateData.from_redis(raw)
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] get_guild_state failed: {e}")
+            return None
+
+    async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
+        """State hash + pending-queue *length* in one pipeline — the lightweight
+        connection/restorable gate for `_restore_guild`.
+
+        Deliberately does NOT transfer the queue contents, now-playing, or
+        history: a `-stop`ped guild keeps a possibly-long queue list by design,
+        and gating on LLEN keeps that payload off the wire on every `on_ready`.
+        `_restore_state` re-reads the full snapshot after a successful connect,
+        so the contents are fetched exactly once, only when they are used.
+
+        Same RTT count as get_playback_snapshot (one pipeline) but a fixed,
+        tiny payload. Returns None on read failure (same error-vs-empty
+        contract as get_guild_state).
+        """
         try:
             pipe = self.redis.pipeline()
-            pipe.hset(self.state_key(), field, value)
-            pipe.expire(self.state_key(), GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
-        except Exception as e:
-            log.warning(
-                f"[guild:{self.guild_id}] Redis set_state [{field}={value}] failed: {e}"
+            pipe.hgetall(self.state_key())
+            pipe.llen(self.queue_key())
+            raw_state, queue_len = await pipe.execute()
+            return GuildRecoveryGate(
+                state=GuildStateData.from_redis(raw_state),
+                pending_count=int(queue_len),
             )
-
-    async def get_state(self) -> dict:
-        """HGETALL the state hash. Returns empty dict on error."""
-        try:
-            return await self.redis.hgetall(self.state_key())  # type: ignore[misc]
         except Exception as e:
-            log.warning(f"[guild:{self.guild_id}] Redis get_state failed: {e}")
-            return {}
+            log.warning(f"[guild:{self.guild_id}] get_recovery_gate failed: {e}")
+            return None
+
+    async def get_playback_snapshot(self) -> Optional[GuildPlaybackSnapshot]:
+        """Read the complete playback aggregate — state hash, pending queue,
+        now-playing snapshot, and history — in one pipeline round-trip.
+
+        Returns None when the read failed (same error-vs-empty contract as
+        get_guild_state: an empty guild yields a snapshot with zero-value
+        state and empty queue/history, never None). Because all four reads
+        ride one pipeline, a failure aborts the whole snapshot — the caller
+        restores everything or nothing, rather than a partially-fabricated
+        state. Corrupt queue/history entries are dropped with a warning by
+        their parsers.
+
+        Not MULTI: the reads are not atomic relative to a concurrent writer,
+        which matches the previous back-to-back reads exactly — recovery
+        holds the guild recovery lock during the window that matters.
+        """
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hgetall(self.state_key())
+            pipe.lrange(self.queue_key(), 0, -1)
+            pipe.hgetall(self.now_playing_key())
+            pipe.lrange(self.history_key(), 0, HISTORY_LIMIT - 1)
+            raw_state, raw_queue, raw_np, raw_history = await pipe.execute()
+            entries = tuple(
+                entry
+                for entry in (parse_queue_entry(item) for item in raw_queue)
+                if entry is not None
+            )
+            history = tuple(
+                entry
+                for entry in (parse_history_entry(item) for item in raw_history)
+                if entry is not None
+            )
+            return GuildPlaybackSnapshot(
+                state=GuildStateData.from_redis(raw_state),
+                queue=entries,
+                now_playing=NowPlayingData.from_redis(raw_np),
+                history=history,
+            )
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] get_playback_snapshot failed: {e}")
+            return None
+
+    async def set_volume(self, volume: float) -> None:
+        """Persist the guild volume setting."""
+        try:
+            pipe = self.redis.pipeline()
+            pipe.hset(self.state_key(), StateField.VOLUME, str(volume))
+            await self._exec_with_state_ttl(pipe)
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] set_volume failed: {e}")
 
     # TTL management
 
@@ -471,25 +601,15 @@ class GuildRedisStore:
         """Persist active voice and text channel IDs into the state hash."""
         try:
             pipe = self.redis.pipeline()
-            pipe.hset(self.state_key(), "voice_channel_id", str(voice_channel_id))
-            pipe.hset(self.state_key(), "text_channel_id", str(text_channel_id))
-            pipe.expire(self.state_key(), GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            pipe.hset(
+                self.state_key(), StateField.VOICE_CHANNEL_ID, str(voice_channel_id)
+            )
+            pipe.hset(
+                self.state_key(), StateField.TEXT_CHANNEL_ID, str(text_channel_id)
+            )
+            await self._exec_with_state_ttl(pipe)
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] set_connection failed: {e}")
-
-    async def get_connection(self) -> tuple[Optional[int], Optional[int]]:
-        """Return (voice_channel_id, text_channel_id) or (None, None) if not stored."""
-        try:
-            state = await self.redis.hgetall(self.state_key())  # type: ignore[misc]
-            vc_raw = state.get(b"voice_channel_id")
-            tc_raw = state.get(b"text_channel_id")
-            vc_id = int(vc_raw) if vc_raw else None
-            tc_id = int(tc_raw) if tc_raw else None
-            return vc_id, tc_id
-        except Exception as e:
-            log.warning(f"[guild:{self.guild_id}] get_connection failed: {e}")
-            return None, None
 
     async def clear_connection(self) -> None:
         """Remove all transient state on intentional disconnect.
@@ -502,11 +622,13 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.hdel(
                 self.state_key(),
-                "voice_channel_id",
-                "text_channel_id",
+                StateField.VOICE_CHANNEL_ID,
+                StateField.TEXT_CHANNEL_ID,
                 *_TRANSIENT_SONG_FIELDS,
                 # last_author_id is no longer written; the HDEL scrubs hashes
-                # left by older builds and is removable after one release.
+                # left by older builds and is removable after one release. It
+                # is intentionally a literal, not a StateField — it is not part
+                # of the schema.
                 "last_author_id",
                 *_PLAYBACK_POSITION_FIELDS,
             )

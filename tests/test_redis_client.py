@@ -6,6 +6,13 @@ import orjson
 import pytest
 import redis.asyncio as aioredis
 
+from src.guild_state import (
+    GuildPlaybackSnapshot,
+    GuildRecoveryGate,
+    GuildStateData,
+    NowPlayingData,
+    SongQueueEntry,
+)
 from src.redis_client import (
     GuildRedisStore,
     cache_get,
@@ -143,14 +150,20 @@ class TestKeyHelpers:
 # ── Queue operations ──────────────────────────────────────────────────────────
 
 
+def _entry(n: int = 1) -> SongQueueEntry:
+    return SongQueueEntry(
+        webpage_url=f"https://yt.com/v={n}", title=f"Song {n}", requester_id=n
+    )
+
+
 class TestPushQueue:
-    async def test_rpush_adds_item(self, store, fake_redis):
-        await store.push_queue(b"item1")
+    async def test_rpush_adds_entry_bytes(self, store, fake_redis):
+        await store.push_queue(_entry(1))
         items = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert items == [b"item1"]
+        assert items == [_entry(1).to_redis()]
 
     async def test_sets_ttl_on_queue_key(self, store, fake_redis):
-        await store.push_queue(b"item1")
+        await store.push_queue(_entry(1))
         ttl = await fake_redis.ttl(store.queue_key())
         assert ttl > 0
 
@@ -158,12 +171,50 @@ class TestPushQueue:
         """_pipe_expire_all must refresh all four guild keys, including now_playing."""
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
         await fake_redis.expire(store.now_playing_key(), 5)
-        await store.push_queue(b"item1")
+        await store.push_queue(_entry(1))
         ttl = await fake_redis.ttl(store.now_playing_key())
         assert ttl > 5
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.push_queue(b"item")  # must not raise
+        await broken_store.push_queue(_entry(1))  # must not raise
+
+
+class TestPushQueueBatch:
+    async def test_rpush_all_entries_in_order(self, store, fake_redis):
+        await store.push_queue_batch([_entry(1), _entry(2)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(1).to_redis(), _entry(2).to_redis()]
+
+    async def test_noop_on_empty_sequence(self, store, fake_redis):
+        await store.push_queue_batch([])
+        assert await fake_redis.exists(store.queue_key()) == 0
+
+    async def test_swallows_redis_error(self, broken_store):
+        await broken_store.push_queue_batch([_entry(1)])  # must not raise
+
+
+class TestPushQueueFront:
+    async def test_entries_land_at_head_in_given_order(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), _entry(3).to_redis())
+        await store.push_queue_front([_entry(1), _entry(2)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [
+            _entry(1).to_redis(),
+            _entry(2).to_redis(),
+            _entry(3).to_redis(),
+        ]
+
+    async def test_sets_ttl_on_queue_key(self, store, fake_redis):
+        await store.push_queue_front([_entry(1)])
+        ttl = await fake_redis.ttl(store.queue_key())
+        assert ttl > 0
+
+    async def test_noop_on_empty_sequence(self, store, fake_redis):
+        await store.push_queue_front([])
+        assert await fake_redis.exists(store.queue_key()) == 0
+
+    async def test_swallows_redis_error(self, broken_store):
+        await broken_store.push_queue_front([_entry(1)])  # must not raise
 
 
 class TestPopQueue:
@@ -180,21 +231,6 @@ class TestPopQueue:
         await broken_store.pop_queue()  # must not raise
 
 
-class TestGetQueue:
-    async def test_returns_all_items_oldest_first(self, store, fake_redis):
-        await fake_redis.rpush(store.queue_key(), b"a", b"b", b"c")
-        items = await store.get_queue()
-        assert items == [b"a", b"b", b"c"]
-
-    async def test_returns_empty_list_when_key_missing(self, store):
-        items = await store.get_queue()
-        assert items == []
-
-    async def test_returns_empty_list_on_error(self, broken_store):
-        result = await broken_store.get_queue()
-        assert result == []
-
-
 class TestDeleteQueue:
     async def test_deletes_queue_key(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"x")
@@ -209,17 +245,17 @@ class TestDeleteQueue:
 class TestRebuildQueue:
     async def test_atomically_replaces_queue(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"old")
-        await store.rebuild_queue([b"new1", b"new2"])
+        await store.rebuild_queue([_entry(1), _entry(2)])
         items = await fake_redis.lrange(store.queue_key(), 0, -1)
-        assert items == [b"new1", b"new2"]
+        assert items == [_entry(1).to_redis(), _entry(2).to_redis()]
 
     async def test_sets_ttl_after_rebuild(self, store, fake_redis):
-        await store.rebuild_queue([b"item"])
+        await store.rebuild_queue([_entry(1)])
         ttl = await fake_redis.ttl(store.queue_key())
         assert ttl > 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.rebuild_queue([b"x"])  # must not raise
+        await broken_store.rebuild_queue([_entry(1)])  # must not raise
 
 
 # ── History operations ────────────────────────────────────────────────────────
@@ -227,32 +263,43 @@ class TestRebuildQueue:
 
 class TestPushHistory:
     async def test_prepends_item_newest_first(self, store, fake_redis):
-        await store.push_history(b"song1")
-        await store.push_history(b"song2")
+        await store.push_history("song1")
+        await store.push_history("song2")
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert items[0] == b"song2"  # newest first
+        assert items[0] == b'"song2"'  # newest first, JSON-string wire format
 
     async def test_trims_to_50(self, store, fake_redis):
         for i in range(55):
-            await store.push_history(orjson.dumps(f"song {i}"))
+            await store.push_history(f"song {i}")
         items = await fake_redis.lrange(store.history_key(), 0, -1)
         assert len(items) == 50
 
     async def test_sets_ttl(self, store, fake_redis):
-        await store.push_history(b"entry")
+        await store.push_history("entry")
         ttl = await fake_redis.ttl(store.history_key())
         assert ttl > 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.push_history(b"item")  # must not raise
+        await broken_store.push_history("item")  # must not raise
 
 
 class TestGetHistory:
     async def test_returns_up_to_50_items(self, store, fake_redis):
         for i in range(60):
-            await fake_redis.lpush(store.history_key(), f"song{i}".encode())
+            await fake_redis.lpush(store.history_key(), orjson.dumps(f"song{i}"))
         items = await store.get_history()
         assert len(items) == 50
+        assert all(isinstance(item, str) for item in items)
+
+    async def test_round_trips_push(self, store):
+        await store.push_history("Song Title - https://yt.com/v=1")
+        assert await store.get_history() == ["Song Title - https://yt.com/v=1"]
+
+    async def test_drops_corrupt_entries(self, store, fake_redis):
+        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), b"not json")
+        await fake_redis.lpush(store.history_key(), orjson.dumps({"not": "a string"}))
+        assert await store.get_history() == ["good"]
 
     async def test_returns_empty_list_when_missing(self, store):
         items = await store.get_history()
@@ -266,34 +313,189 @@ class TestGetHistory:
 # ── State operations ──────────────────────────────────────────────────────────
 
 
-class TestSetState:
-    async def test_writes_field_to_hash(self, store, fake_redis):
-        await store.set_state("volume", "0.75")
+class TestSetVolume:
+    async def test_writes_volume_to_hash(self, store, fake_redis):
+        await store.set_volume(0.75)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"volume"] == b"0.75"
 
     async def test_sets_ttl_on_state_key(self, store, fake_redis):
-        await store.set_state("volume", "1.0")
+        await store.set_volume(1.0)
         ttl = await fake_redis.ttl(store.state_key())
         assert ttl > 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.set_state("field", "val")  # must not raise
+        await broken_store.set_volume(0.5)  # must not raise
 
 
-class TestGetState:
-    async def test_returns_hash_fields(self, store, fake_redis):
+class TestGetGuildState:
+    async def test_returns_typed_snapshot(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"volume", b"0.5")
-        state = await store.get_state()
-        assert state[b"volume"] == b"0.5"
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        state = await store.get_guild_state()
+        assert state == GuildStateData(volume=0.5, current_song_url="https://x")
 
-    async def test_returns_empty_dict_when_missing(self, store):
-        state = await store.get_state()
-        assert state == {}
+    async def test_returns_zero_value_snapshot_when_missing(self, store):
+        state = await store.get_guild_state()
+        assert state == GuildStateData()
 
-    async def test_returns_empty_dict_on_error(self, broken_store):
-        result = await broken_store.get_state()
-        assert result == {}
+    async def test_returns_none_on_error_not_defaults(self, broken_store):
+        # None (read failed) must be distinguishable from GuildStateData()
+        # (nothing stored) — _restore_guild relies on this to avoid silently
+        # skipping recovery during a Redis outage.
+        result = await broken_store.get_guild_state()
+        assert result is None
+
+
+class TestGetPlaybackSnapshot:
+    async def test_returns_state_and_queue_together(self, store, fake_redis):
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.rpush(
+            store.queue_key(), _entry(1).to_redis(), _entry(2).to_redis()
+        )
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.state.current_song_url == "https://x"
+        assert snap.queue == (_entry(1), _entry(2))
+        assert snap.pending_count == 2
+        assert snap.has_restorable_playback
+
+    async def test_empty_guild_yields_empty_snapshot_not_none(self, store):
+        snap = await store.get_playback_snapshot()
+        assert snap == GuildPlaybackSnapshot(state=GuildStateData())
+        assert not snap.has_restorable_playback
+
+    async def test_corrupt_queue_entries_dropped(self, store, fake_redis):
+        await fake_redis.rpush(
+            store.queue_key(), b"not json", _entry(1).to_redis(), b"{}"
+        )
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.queue == (_entry(1),)
+
+    async def test_includes_now_playing_and_history(self, store, fake_redis):
+        await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
+        await store.push_history("old - url1")
+        await store.push_history("new - url2")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.now_playing is not None
+        assert snap.now_playing.title == "Song"
+        assert snap.history == ("new - url2", "old - url1")  # newest first
+
+    async def test_empty_guild_has_no_now_playing_and_empty_history(self, store):
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.now_playing is None
+        assert snap.history == ()
+
+    async def test_corrupt_history_entries_dropped(self, store, fake_redis):
+        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), b"not json")
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert snap.history == ("good",)
+
+    async def test_returns_none_on_error(self, broken_store):
+        assert await broken_store.get_playback_snapshot() is None
+
+    async def test_single_pipeline_round_trip(self, fake_redis):
+        """State HGETALL and queue LRANGE ride one pipeline execute()."""
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        real_pipeline = fake_redis.pipeline
+        execute_counts = []
+
+        def counting_pipeline(*args, **kwargs):
+            pipe = real_pipeline(*args, **kwargs)
+            original_execute = pipe.execute
+
+            async def counted_execute():
+                execute_counts.append(1)
+                return await original_execute()
+
+            pipe.execute = counted_execute
+            return pipe
+
+        fake_redis.pipeline = counting_pipeline
+        try:
+            snap = await store.get_playback_snapshot()
+        finally:
+            fake_redis.pipeline = real_pipeline
+        assert snap is not None
+        assert len(execute_counts) == 1
+
+
+class TestGetRecoveryGate:
+    async def test_returns_state_and_queue_length(self, store, fake_redis):
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        await fake_redis.rpush(
+            store.queue_key(), _entry(1).to_redis(), _entry(2).to_redis()
+        )
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.state.current_song_url == "https://x"
+        assert gate.pending_count == 2
+        assert gate.has_restorable_playback
+
+    async def test_empty_guild_yields_zero_gate_not_none(self, store):
+        gate = await store.get_recovery_gate()
+        assert gate == GuildRecoveryGate(state=GuildStateData())
+        assert gate.pending_count == 0
+        assert not gate.has_restorable_playback
+
+    async def test_does_not_transfer_queue_contents(self, store, fake_redis):
+        """The whole point of the gate: it reads LLEN, never LRANGE, so the
+        queue payload never rides the wire on the recovery path."""
+        real_lrange = fake_redis.lrange
+        lrange_keys = []
+
+        async def spy_lrange(key, *args, **kwargs):
+            lrange_keys.append(key)
+            return await real_lrange(key, *args, **kwargs)
+
+        await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
+        fake_redis.lrange = spy_lrange
+        try:
+            gate = await store.get_recovery_gate()
+        finally:
+            fake_redis.lrange = real_lrange
+        assert gate is not None and gate.pending_count == 1
+        assert store.queue_key() not in lrange_keys
+
+    async def test_crashed_song_makes_empty_queue_restorable(self, store, fake_redis):
+        await fake_redis.hset(store.state_key(), b"current_song_url", b"https://x")
+        gate = await store.get_recovery_gate()
+        assert gate is not None
+        assert gate.pending_count == 0
+        assert gate.has_restorable_playback  # crashed song, empty queue
+
+    async def test_returns_none_on_error(self, broken_store):
+        assert await broken_store.get_recovery_gate() is None
+
+    async def test_single_pipeline_round_trip(self, fake_redis):
+        """State HGETALL and queue LLEN ride one pipeline execute()."""
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        real_pipeline = fake_redis.pipeline
+        execute_counts = []
+
+        def counting_pipeline(*args, **kwargs):
+            pipe = real_pipeline(*args, **kwargs)
+            original_execute = pipe.execute
+
+            async def counted_execute():
+                execute_counts.append(1)
+                return await original_execute()
+
+            pipe.execute = counted_execute
+            return pipe
+
+        fake_redis.pipeline = counting_pipeline
+        try:
+            gate = await store.get_recovery_gate()
+        finally:
+            fake_redis.pipeline = real_pipeline
+        assert gate is not None
+        assert len(execute_counts) == 1
 
 
 # ── TTL management ────────────────────────────────────────────────────────────
@@ -338,23 +540,22 @@ class TestSetConnection:
         await broken_store.set_connection(1, 2)  # must not raise
 
 
-class TestGetConnection:
+class TestConnectionViaGuildState:
     async def test_returns_channel_ids_when_set(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"voice_channel_id", b"111")
         await fake_redis.hset(store.state_key(), b"text_channel_id", b"222")
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id == 111
-        assert tc_id == 222
+        state = await store.get_guild_state()
+        assert state is not None
+        assert state.voice_channel_id == 111
+        assert state.text_channel_id == 222
+        assert state.has_active_connection
 
-    async def test_returns_none_none_when_not_set(self, store):
-        vc_id, tc_id = await store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
-
-    async def test_returns_none_none_on_error(self, broken_store):
-        vc_id, tc_id = await broken_store.get_connection()
-        assert vc_id is None
-        assert tc_id is None
+    async def test_no_active_connection_when_not_set(self, store):
+        state = await store.get_guild_state()
+        assert state is not None
+        assert state.voice_channel_id is None
+        assert state.text_channel_id is None
+        assert not state.has_active_connection
 
 
 class TestClearConnection:
@@ -496,16 +697,29 @@ class TestSpotifyTokenCache:
 # ── pop_queue_and_start_song ──────────────────────────────────────────────────
 
 
+def _current(url: str = "url", title: str = "title", **kwargs) -> SongQueueEntry:
+    """The start-transaction carrier: the queue-entry view of the song that is
+    about to play (its fields get parked in the state hash as current_song_*)."""
+    return SongQueueEntry(
+        webpage_url=url,
+        title=title,
+        requester_id=kwargs.pop("requester_id", None),
+        **kwargs,
+    )
+
+
 class TestPopQueueAndStartSong:
     async def test_lpop_removes_first_item_only(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"second"]
 
     async def test_writes_now_playing_fields_atomically(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("https://yt.com/v=1", "Test Song", 1000.5)
+        await store.pop_queue_and_start_song(
+            _current("https://yt.com/v=1", "Test Song"), 1000.5
+        )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
         assert state[b"current_song_title"] == b"Test Song"
@@ -515,12 +729,8 @@ class TestPopQueueAndStartSong:
     async def test_writes_duration_uploader_and_requester_id(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(
-            "url",
-            "title",
+            _current(duration=210, uploader="Some Channel", requester_id=42),
             1000.0,
-            duration=210,
-            uploader="Some Channel",
-            requester_id=42,
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_duration"] == b"210"
@@ -531,7 +741,7 @@ class TestPopQueueAndStartSong:
         self, store, fake_redis
     ):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_duration"] == b""
         assert state[b"current_song_uploader"] == b""
@@ -540,13 +750,25 @@ class TestPopQueueAndStartSong:
     async def test_clears_pause_epoch_on_start(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"pause_start_epoch", b"999.0")
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert b"pause_start_epoch" not in state
 
+    async def test_writes_interjected_flag(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(interjected=True), 1000.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_interjected"] == b"1"
+
+    async def test_interjected_false_writes_empty(self, store, fake_redis):
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(), 1000.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_interjected"] == b""
+
     async def test_sets_ttl_on_state(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         ttl = await fake_redis.ttl(store.state_key())
         assert ttl > 0
 
@@ -555,7 +777,7 @@ class TestPopQueueAndStartSong:
     ):
         """LPOP on an empty list returns nil, but the HSET still runs atomically."""
         await store.pop_queue_and_start_song(
-            "https://yt.com/v=1", "No Queue Song", 500.0
+            _current("https://yt.com/v=1", "No Queue Song"), 500.0
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
@@ -569,10 +791,9 @@ class TestPopQueueAndStartSong:
     ):
         await fake_redis.rpush(store.queue_key(), b"song")
         await store.pop_queue_and_start_song(
-            "url",
-            "title",
+            _current(),
             1000.0,
-            now_playing_fields={"title": "Song", "uploader": "Channel"},
+            now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
         np_data = await fake_redis.hgetall(store.now_playing_key())
         assert np_data[b"title"] == b"Song"
@@ -582,12 +803,12 @@ class TestPopQueueAndStartSong:
 
     async def test_now_playing_untouched_when_fields_omitted(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"song")
-        await store.pop_queue_and_start_song("url", "title", 1000.0)
+        await store.pop_queue_and_start_song(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.pop_queue_and_start_song(
-            "url", "title", 1000.0
+            _current(), 1000.0
         )  # must not raise
 
 
@@ -597,12 +818,14 @@ class TestSetCurrentSongState:
 
     async def test_writes_now_playing_fields(self, store, fake_redis):
         await store.set_current_song_state(
-            "https://yt.com/v=1",
-            "Test Song",
+            _current(
+                "https://yt.com/v=1",
+                "Test Song",
+                duration=210,
+                uploader="Some Channel",
+                requester_id=42,
+            ),
             1000.5,
-            duration=210,
-            uploader="Some Channel",
-            requester_id=42,
         )
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_url"] == b"https://yt.com/v=1"
@@ -615,13 +838,13 @@ class TestSetCurrentSongState:
 
     async def test_does_not_touch_queue(self, store, fake_redis):
         await fake_redis.rpush(store.queue_key(), b"untouched")
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"untouched"]
 
     async def test_clears_pause_epoch(self, store, fake_redis):
         await fake_redis.hset(store.state_key(), b"pause_start_epoch", b"999.0")
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         state = await fake_redis.hgetall(store.state_key())
         assert b"pause_start_epoch" not in state
 
@@ -629,10 +852,9 @@ class TestSetCurrentSongState:
         self, store, fake_redis
     ):
         await store.set_current_song_state(
-            "url",
-            "title",
+            _current(),
             1000.0,
-            now_playing_fields={"title": "Song", "uploader": "Channel"},
+            now_playing=NowPlayingData(title="Song", uploader="Channel"),
         )
         np_data = await fake_redis.hgetall(store.now_playing_key())
         assert np_data[b"title"] == b"Song"
@@ -641,13 +863,11 @@ class TestSetCurrentSongState:
         assert ttl > 0
 
     async def test_now_playing_untouched_when_fields_omitted(self, store, fake_redis):
-        await store.set_current_song_state("url", "title", 1000.0)
+        await store.set_current_song_state(_current(), 1000.0)
         assert await fake_redis.exists(store.now_playing_key()) == 0
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.set_current_song_state(
-            "url", "title", 1000.0
-        )  # must not raise
+        await broken_store.set_current_song_state(_current(), 1000.0)  # must not raise
 
 
 # ── Now-playing operations ────────────────────────────────────────────────────
@@ -656,18 +876,19 @@ class TestSetCurrentSongState:
 
 
 class TestNowPlayingOperations:
-    async def test_get_now_playing_returns_fields(self, store, fake_redis):
+    async def test_get_now_playing_returns_typed_snapshot(self, store, fake_redis):
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
         data = await store.get_now_playing()
-        assert data[b"title"] == b"Song"
+        assert data is not None
+        assert data.title == "Song"
 
-    async def test_get_now_playing_returns_empty_dict_when_missing(self, store):
+    async def test_get_now_playing_returns_none_when_missing(self, store):
         data = await store.get_now_playing()
-        assert data == {}
+        assert data is None
 
-    async def test_get_returns_empty_dict_on_error(self, broken_store):
+    async def test_get_now_playing_returns_none_on_error(self, broken_store):
         result = await broken_store.get_now_playing()
-        assert result == {}
+        assert result is None
 
 
 # ── Playback position tracking ────────────────────────────────────────────────
@@ -750,6 +971,7 @@ class TestClearSongEndState:
                 b"current_song_duration": b"210",
                 b"current_song_uploader": b"Some Channel",
                 b"current_song_requester_id": b"42",
+                b"current_song_interjected": b"1",
             },
         )
         await store.clear_song_end_state()
@@ -759,6 +981,7 @@ class TestClearSongEndState:
         assert b"current_song_duration" not in state
         assert b"current_song_uploader" not in state
         assert b"current_song_requester_id" not in state
+        assert b"current_song_interjected" not in state
 
     async def test_deletes_now_playing_hash(self, store, fake_redis):
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")

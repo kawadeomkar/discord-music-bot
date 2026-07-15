@@ -1,18 +1,83 @@
 import asyncio
 import os
+from typing import TYPE_CHECKING, Any, Optional
 
 import discord
 from discord.ext import commands
 
 from src.config import ENVIRONMENT
+from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
+
+if TYPE_CHECKING:
+    from src.musicplayer import MusicPlayer
 
 log = get_logger(__name__)
 
 intents = discord.Intents.all()
 intents.message_content = True
 EXTENSIONS = ("src.musicbot",)
+
+
+class MusicContext(commands.Context):
+    """Context whose send() keeps the Now Playing embed block glued to the
+    bottom of the channel: while a song is live, every command response in the
+    player's channel leads with the NP block, followed by the response's own
+    embeds, and the message that previously hosted the block is retired
+    (deleted if it was a dedicated NP message, strip-edited otherwise).
+    Attaching at send time — rather than a post-send edit — makes the response
+    and the NP block one atomic message, so the bar is never even momentarily
+    buried. Full design: docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md §3."""
+
+    async def send(
+        self, content: Optional[str] = None, **kwargs: Any
+    ) -> discord.Message:
+        mp = self._np_player()
+        if mp is None:
+            return await super().send(content, **kwargs)
+        embeds_kwarg = kwargs.pop("embeds", None)
+        single = kwargs.pop("embed", None)
+        if single is not None and embeds_kwarg is not None:
+            # match discord.py's own send() contract instead of silently merging
+            raise TypeError("cannot pass both embed and embeds parameter to send()")
+        own: list[discord.Embed] = list(embeds_kwarg or [])
+        if single is not None:
+            own.append(single)
+        song = mp.current_song  # the song the block below is built for
+        block = mp.np_embed_block()
+        # ≤10 is Discord's per-message embed cap — defensive; never expected
+        # to trip with this bot's embed counts (worst case is 3).
+        attached = bool(block) and len(own) + len(block) <= 10
+        embeds = block + own if attached else own
+        if embeds:
+            message = await super().send(content, embeds=embeds, **kwargs)
+        else:
+            message = await super().send(content, **kwargs)
+        if attached:
+            # Gate on the song still being current — the send's await may have
+            # crossed a song boundary, making the attached block stale (the
+            # gate sheds it from the just-sent message instead of adopting).
+            mp._adopt_np_host_if_current(message, own, song)
+        return message
+
+    def _np_player(self) -> Optional["MusicPlayer"]:
+        """The guild's MusicPlayer, only when attaching is appropriate: guild
+        message, MusicBot cog loaded, player exists, a song is live, and this
+        channel is the player's home channel (the host never leaves it)."""
+        from src.musicbot import MusicBot
+
+        if self.guild is None:
+            return None
+        cog = self.bot.get_cog("MusicBot")
+        if not isinstance(cog, MusicBot):
+            return None
+        mp = cog.mps.get(self.guild.id)
+        if mp is None or mp.current_song is None:
+            return None
+        if self.channel.id != mp._channel.id:
+            return None
+        return mp
 
 
 # Issue #5: AutoShardedBot handles multi-shard within a single process.
@@ -26,8 +91,11 @@ class MusicBotApp(commands.AutoShardedBot):
         super().__init__(
             command_prefix="-",
             intents=intents,
-            description="music bot",
+            description="Plays YouTube, Spotify and SoundCloud audio in voice channels.",
             strip_after_prefix=True,
+            # Replaces discord.py's DefaultHelpCommand, whose plaintext codeblock
+            # output cannot show aliases and clashes with the all-embed responses.
+            help_command=MusicHelpCommand(),
         )
         self._redis_pool = None
         self.redis = None
@@ -37,6 +105,9 @@ class MusicBotApp(commands.AutoShardedBot):
         self.redis = get_redis(self._redis_pool)
         for extension in EXTENSIONS:
             await self.load_extension(extension)
+
+    async def get_context(self, origin, /, *, cls: Any = MusicContext):
+        return await super().get_context(origin, cls=cls)
 
     async def on_ready(self):
         activity = discord.Game(name="music", type=3)

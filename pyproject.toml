@@ -14,7 +14,14 @@ requests = "^2.31.0"
 ujson = "^5.13.0"
 pynacl = "1.6.2"
 davey = "^0.1.5"
-yt-dlp = "2026.6.9"
+# `default` brings yt-dlp-ejs (JS challenge solver scripts, exact-pinned by yt-dlp);
+# `deno` brings the Deno binary as a PyPI wheel, discovered via the venv scripts dir —
+# together they make web_safari a working fallback client behind android_vr
+# (docs/PO_TOKEN_SIDECAR_PLAN.md).
+yt-dlp = { version = "2026.7.4", extras = ["default", "deno"] }
+# Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in
+# docker-compose.yml are released in lockstep — bump both together.
+bgutil-ytdlp-pot-provider = "1.3.1"
 async-timeout = "^5.0.1"
 discord-py = "2.7.1"
 redis = ">=5.0.0"
