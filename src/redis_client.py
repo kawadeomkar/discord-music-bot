@@ -104,6 +104,16 @@ async def cache_set(
         log.warning(f"cache_set failed [{key}]: {e}")
 
 
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+    if redis is None:
+        return
+    try:
+        await redis.delete(key)
+    except Exception as e:
+        log.warning(f"cache_del failed [{key}]: {e}")
+
+
 # ── Spotify auth token cache ──────────────────────────────────────────────────
 # Intentionally does not use cache_get/cache_set: the token is a raw string
 # scalar, not JSON. Using orjson here would double-encode it as a JSON string.

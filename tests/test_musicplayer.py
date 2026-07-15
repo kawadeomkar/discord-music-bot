@@ -3556,6 +3556,160 @@ class TestLoop:
         assert len(music_player.history) == 1
         assert mock_song.title in music_player.history[0]
 
+    async def test_song_that_produced_no_audio_is_not_treated_as_played(
+        self, music_player, queue_obj, mock_song
+    ):
+        """Regression: a 403 kills ffmpeg instantly, which discord.py reports exactly
+        like a song that finished. The bot then advanced in silence, logged nothing, kept
+        the dead URL cached, and filed the song in history as if it had been heard."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False  # ffmpeg never delivered a frame
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        # A dead stream is zero frames PLUS the error discord.py hands the after
+        # callback when ffmpeg exits non-zero (FFmpegProcessError). Zero frames
+        # alone is a song parked or stopped deliberately — see the companion test.
+        vc.play = MagicMock(
+            side_effect=lambda song, after: after(
+                Exception("FFmpeg exited with code 1. Stderr: HTTP error 403")
+            )
+        )
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+
+        # The dead URL must not survive to be replayed by the next -play of this song.
+        mock_invalidate.assert_awaited_once()
+        await_args = mock_invalidate.await_args
+        assert await_args is not None
+        assert mock_song.webpage_url in await_args.args
+        # Nothing was heard, so nothing belongs in history, and the listener is told.
+        assert len(music_player.history) == 0
+        music_player._channel.send.assert_awaited_once()
+
+    async def test_song_stopped_before_first_frame_is_not_a_dead_stream(
+        self, music_player, queue_obj, mock_song
+    ):
+        """Zero frames WITHOUT an ffmpeg error is a deliberate stop — a -skip or
+        interject() landing inside ffmpeg's startup window, or a -playnow resume
+        entry parked at vc.pause() (vc.stop() reports error=None to the after
+        callback). The stream was never refused: the cached URL must survive, no
+        failure notice may be posted, and the song keeps its history entry exactly
+        like any other -skip."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False  # stopped before the first frame
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        # after fires with no error, exactly how discord.py reports a vc.stop().
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+
+        mock_invalidate.assert_not_awaited()
+        music_player._channel.send.assert_not_awaited()
+        assert len(music_player.history) == 1
+
+    async def test_dead_stream_retires_np_host_instead_of_finalizing_bar(
+        self, music_player, queue_obj, mock_song
+    ):
+        """A bar finalized to 100% directly above the red failure notice would be
+        a false record — the song delivered nothing. The host is disposed of like
+        retire_np_host_on_stop (dedicated NP message deleted), not finalized."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False
+        host = AsyncMock(spec=discord.Message)
+        music_player._np_host_message = host
+        music_player._np_host_dedicated = True
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(
+            side_effect=lambda song, after: after(
+                Exception("FFmpeg exited with code 1. Stderr: HTTP error 403")
+            )
+        )
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch("src.musicplayer.invalidate_stream_cache", new=AsyncMock()),
+            patch.object(MusicPlayer, "_fire_finalize_now_playing") as mock_finalize,
+        ):
+            await music_player.loop()
+            await asyncio.gather(*music_player._background_tasks)
+
+        mock_finalize.assert_not_called()
+        host.delete.assert_awaited_once()
+
     async def test_plays_song_writes_duration_uploader_requester_atomically(
         self, music_player, queue_obj, mock_song, mock_author
     ):
