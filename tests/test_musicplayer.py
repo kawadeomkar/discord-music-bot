@@ -3556,6 +3556,55 @@ class TestLoop:
         assert len(music_player.history) == 1
         assert mock_song.title in music_player.history[0]
 
+    async def test_song_that_produced_no_audio_is_not_treated_as_played(
+        self, music_player, queue_obj, mock_song
+    ):
+        """Regression: a 403 kills ffmpeg instantly, which discord.py reports exactly
+        like a song that finished. The bot then advanced in silence, logged nothing, kept
+        the dead URL cached, and filed the song in history as if it had been heard."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        music_player.bot.is_closed.side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False  # ffmpeg never delivered a frame
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        music_player._guild.voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+
+        # The dead URL must not survive to be replayed by the next -play of this song.
+        mock_invalidate.assert_awaited_once()
+        await_args = mock_invalidate.await_args
+        assert await_args is not None
+        assert mock_song.webpage_url in await_args.args
+        # Nothing was heard, so nothing belongs in history, and the listener is told.
+        assert len(music_player.history) == 0
+        music_player._channel.send.assert_awaited_once()
+
     async def test_plays_song_writes_duration_uploader_requester_atomically(
         self, music_player, queue_obj, mock_song, mock_author
     ):

@@ -26,7 +26,7 @@ from src.util import (
     trace_footer,
     get_logger,
 )
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, QueueObject, invalidate_stream_cache
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -1223,6 +1223,33 @@ class MusicPlayer:
             log.error(f"Error processing song: {type(e).__name__}: {e}", exc_info=True)
             return None
 
+    async def _handle_dead_stream(self, song: YTDL) -> None:
+        """Recover from a song whose stream never opened.
+
+        yt_stream() probes a URL before handing it to ffmpeg, so reaching here means the
+        URL was revoked in the seconds between that probe and the first read. Drop the
+        cached URL — otherwise the next -play of this song replays the dead one — and say
+        so in the channel, since a failure ffmpeg swallows is invisible to the listener,
+        who just sees the bot sit there having claimed to be playing.
+        """
+        log.error(
+            f"stream produced no audio, treating as failed playback: {song.webpage_url}"
+        )
+        if self.store is not None and song.webpage_url:
+            await invalidate_stream_cache(self.store.redis, song.webpage_url)
+        try:
+            await self._channel.send(
+                embed=notice_embed(
+                    f"Could not play **{song.title}** — YouTube refused the audio "
+                    "stream. Queue it again to retry.",
+                    discord.Color.red(),
+                )
+            )
+        except Exception as e:
+            log.warning(
+                f"Failed to send playback-failure notice in guild {self._guild.id}: {e}"
+            )
+
     async def _send_np_host_message(
         self, *, now_playing: Optional[discord.Embed] = None
     ) -> Optional[discord.Message]:
@@ -1556,12 +1583,18 @@ class MusicPlayer:
                     # the awaits below, and it keeps every write in this iteration
                     # referring to the same song even if current_song is reassigned.
                     song = self.current_song
-                    vc.play(
-                        song,
-                        after=lambda _: self.bot.loop.call_soon_threadsafe(
-                            self.play_next.set
-                        ),
-                    )
+
+                    def _after_play(
+                        error: Optional[Exception], _title: str = song.title or ""
+                    ) -> None:
+                        # discord.py hands ffmpeg's failure here and nowhere else; the
+                        # previous `lambda _:` dropped it, so a stream that never opened
+                        # was indistinguishable from a song that ended.
+                        if error is not None:
+                            log.error(f"playback error for {_title}: {error}")
+                        self.bot.loop.call_soon_threadsafe(self.play_next.set)
+
+                    vc.play(song, after=_after_play)
                     if song.start_paused:
                         # Park the player thread SYNCHRONOUSLY — before any
                         # await — so a song returning paused leaks at most a
@@ -1622,6 +1655,12 @@ class MusicPlayer:
 
                     await self.play_next.wait()
 
+                    # A song that ended without delivering a single frame never played:
+                    # ffmpeg failed to open the stream. Captured before the teardown
+                    # below so the cleanup path can distinguish it from a real finish.
+                    stream_failed = not song.produced_audio
+                    span.set_attribute("song.stream_failed", stream_failed)
+
                     # Must fully retire before the next iteration's _send_now_playing()
                     # sends a new message — otherwise an in-flight message.edit() for
                     # this song could still be resolving concurrently with the new
@@ -1666,7 +1705,10 @@ class MusicPlayer:
                         # song's entry.
                         skip_history = self._skip_history_for is self.current_song
                         self._skip_history_for = None
-                        if not skip_history:
+                        # A song that never produced audio was never played, so it
+                        # does not belong in history — -history is a record of what
+                        # was heard.
+                        if not skip_history and not stream_failed:
                             await self.history.add(
                                 f"{self.current_song.title} - {self.current_song.webpage_url}"
                             )
@@ -1679,6 +1721,12 @@ class MusicPlayer:
                     self.current_song = None
                     self.play_message = None  # -now must not serve the finished song
                     await self.update_activity(None)
+
+                    # Deliberately last: current_song is already cleared, so the notice
+                    # is sent on its own rather than re-hosting a Now Playing block for
+                    # a song that never played.
+                    if stream_failed:
+                        await self._handle_dead_stream(song)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
                     await self._cancel_progress_task()

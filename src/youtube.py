@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Union
 from urllib.parse import parse_qs, urlparse
 
+import aiohttp
 import discord
 import yt_dlp as youtube_dl
 
@@ -13,7 +14,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
-from src.redis_client import cache_get, cache_set
+from src.redis_client import cache_del, cache_get, cache_set
 from src.spotify import Spotify
 from src.telemetry import get_tracer
 from src.util import get_logger, notice_embed
@@ -31,21 +32,63 @@ def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     )
 
 
-# TODO: PO token may be required eventually
-PO_TOKEN = ""
+class _YtdlpLogger:
+    """Routes yt-dlp's own diagnostics into our logger instead of dropping them.
 
+    yt-dlp announces the things that *precede* an outage as warnings: formats skipped for a
+    missing GVS PO token, "YouTube may have enabled the SABR-only streaming experiment",
+    signature / n-challenge solving failures. Those were previously silenced (no_warnings),
+    so the first sign of YouTube changing the rules would have been users reporting that
+    songs no longer play. Per-video progress chatter still goes nowhere — only warnings and
+    errors are worth a log line.
+    """
+
+    def debug(self, msg: str) -> None:
+        # yt-dlp funnels both its [debug] lines and its ordinary per-video chatter
+        # ("Downloading android vr player API JSON") here. Neither earns a line per song.
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        log.warning(f"yt-dlp: {msg}")
+
+    def error(self, msg: str) -> None:
+        log.error(f"yt-dlp: {msg}")
+
+
+_YTDLP_LOGGER = _YtdlpLogger()
+
+# Playback rides entirely on `android_vr`. yt-dlp's `default` is (android_vr, web_safari), but
+# web_safari contributes nothing here: web-family clients need a JS runtime + yt-dlp-ejs to
+# solve the signature / n challenges (we ship neither), and even with those they only return
+# HLS video — the audio-only https formats stay withheld without a GVS PO Token. android_vr
+# needs neither, which is the only reason this works.
+#
+# A PO Token would NOT help android_vr: it is documented as "Not required" for that client
+# (yt-dlp wiki, PO-Token-Guide) and extraction emits no PO-token warning. The previous TODO
+# here proposed `po_token: mweb.player+<constant>`, which was wrong twice over — mweb needs a
+# *gvs* token, not player, and tokens are bound to the video ID, so a hardcoded constant can
+# never work; minting them per-video needs a provider plugin (e.g. bgutil-ytdlp-pot-provider).
+#
+# The real exposure is being single-homed on a client YouTube has been destabilising (yt-dlp
+# #16150: android_vr erratic since 2026-03, SABR-only experiment). Mitigation, when we want it,
+# is a genuine fallback — Deno + yt-dlp[default] + a PO-token provider sidecar — not a constant.
+# Until then, revoked URLs are handled by _resolve_playable_stream()'s probe-and-re-extract.
+#
+# `-tv_simply` is a no-op against today's defaults; kept as a guard in case it is added back.
 _EXTRACTOR_ARGS = {
     "youtube": {
         "player_client": ["default", "-tv_simply"],
-        # TODO: PO token — not yet required with the above client list.
-        # When needed: 'po_token': f'mweb.player+{PO_TOKEN}'
     }
 }
 
 # Shared base opts for both extraction paths.
 _YTDL_BASE_OPTS = {
-    "quiet": True,  # suppress yt-dlp debug/info chatter (was verbose+logtostderr)
-    "no_warnings": True,
+    "quiet": True,  # keep yt-dlp off stdout; diagnostics reach us via `logger` instead
+    "no_warnings": False,  # warnings are the early-warning system — see _YtdlpLogger
+    "logger": _YTDLP_LOGGER,
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
@@ -91,6 +134,16 @@ YTDL_OPTS = _YTDL_STREAM_OPTS
 # skip the 3-4s yt-dlp search on repeat plays of the same track.
 _YT_SOURCE_TTL = 3600  # 1 hour
 
+# Ceiling on how long a resolved stream URL may be cached. YouTube revokes these
+# well before the `expire` they carry (see _stream_url_ttl), so this — not `expire`
+# — is what keeps a dead URL from being replayed. Re-extracting costs a few seconds;
+# serving a revoked URL costs the song.
+_STREAM_URL_MAX_TTL = 1800  # 30 minutes
+
+# Cap on the pre-playback URL probe. Generous enough not to trip on a slow CDN,
+# short enough that it never adds a noticeable pause before a song starts.
+_STREAM_PROBE_TIMEOUT = 5.0  # seconds
+
 # Fields to persist in the stream URL cache — strips ephemeral/large fields.
 _STREAM_CACHE_FIELDS = frozenset(
     {
@@ -114,21 +167,74 @@ _STREAM_CACHE_FIELDS = frozenset(
 )
 
 
-def _stream_url_ttl(stream_url: str) -> Optional[int]:
-    """Returns seconds until stream URL expiry minus 30-min safety margin, or None if too short.
+def _stream_cache_key(webpage_url: str) -> str:
+    return f"ytdl:stream:{webpage_url}"
 
-    YouTube CDN URLs carry a 6-hour expiry window (empirically confirmed). The `ip` parameter
-    is included in `sparams` (HMAC-signed) so URLs are cryptographically bound to the IP that
-    extracted them — they cannot be reused from a different host. With a 300s margin, the minimum
-    URL lifetime on a cache hit is only ~5 minutes, which is shorter than many songs. 1800s (30
-    min) ensures cache hits remain valid for songs up to ~30 minutes.
+
+def _stream_url_ttl(stream_url: str) -> Optional[int]:
+    """Returns how long a stream URL may be cached, or None when it isn't worth caching.
+
+    The `expire` query param advertises a 6-hour window, but YouTube revokes URLs long before
+    it: a DRM-restricted track's URL was observed serving 403 within the hour while `expire`
+    still claimed five hours left. Trusting `expire` meant one revoked URL was replayed for
+    its whole TTL, so every -play of that song failed. The cap is therefore what bounds this
+    in practice — `expire` only ever shortens it further, near the end of a URL's life.
+
+    The `ip` parameter is inside `sparams` (HMAC-signed), so URLs are also bound to the IP that
+    extracted them and can never be reused from another host.
     """
     try:
         expire = int(parse_qs(urlparse(stream_url).query).get("expire", [0])[0])
-        ttl = expire - int(time.time()) - 1800
+        ttl = min(expire - int(time.time()) - 1800, _STREAM_URL_MAX_TTL)
         return ttl if ttl > 60 else None
     except ValueError, IndexError:
         return None
+
+
+async def _stream_url_playable(stream_url: str) -> bool:
+    """True when YouTube will actually serve this stream URL to ffmpeg right now.
+
+    ffmpeg reports a revoked URL by 403ing and exiting, which discord.py cannot distinguish
+    from a song that simply ended — so a dead URL plays as silence with no error anywhere.
+    Probing here is what makes that failure visible while we can still do something about it.
+
+    The probe must open the request exactly the way ffmpeg does — a plain GET with no Range
+    header — because that is the only question whose answer matches ffmpeg's. A revoked URL
+    still answers 206 to a *ranged* GET while refusing the open-ended one, so probing with a
+    Range header (or with HEAD, which googlevideo rejects outright) reports a dead URL as
+    healthy. The body is never read: aiohttp holds it until asked, so the status line is all
+    this costs.
+    """
+    if not stream_url:
+        return False
+    try:
+        timeout = aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(stream_url) as response:
+                return response.status < 400
+    except Exception as e:
+        # A probe that never completed is evidence about the network, not about the
+        # URL. Assume playable and let ffmpeg be the judge — a probe failure must
+        # never be the reason a song refuses to play.
+        log.warning(f"stream URL probe failed, assuming playable: {e}")
+        return True
+
+
+async def _cache_stream(
+    redis: Optional[aioredis.Redis], cache_key: str, data: dict
+) -> None:
+    """Persist a stream URL that has been probed and found playable."""
+    stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+    ttl = _stream_url_ttl(data.get("url", ""))
+    if ttl:
+        await cache_set(redis, cache_key, stripped, ttl)
+
+
+async def invalidate_stream_cache(
+    redis: Optional[aioredis.Redis], webpage_url: str
+) -> None:
+    """Drop a song's cached stream URL so the next play re-extracts a fresh one."""
+    await cache_del(redis, _stream_cache_key(webpage_url))
 
 
 @dataclass
@@ -248,6 +354,14 @@ class YTDL(discord.FFmpegOpusAudio):
         return data
 
     @property
+    def produced_audio(self) -> bool:
+        """False when ffmpeg exited without ever delivering a frame — the stream never
+        opened (typically a 403 on a revoked URL). discord.py hands that to the `after`
+        callback exactly like a song that finished, so the frame count is the only thing
+        that distinguishes a song that played from one that silently never started."""
+        return self._frames_read > 0
+
+    @property
     def elapsed_secs(self) -> float:
         """Seconds of audio actually delivered to the player so far. Frozen during
         any pause — explicit (`-pause`) or involuntary (voice reconnect stall) —
@@ -284,7 +398,7 @@ class YTDL(discord.FFmpegOpusAudio):
         if redis is None:
             trace.get_current_span().set_attribute("ytdl.skipped", True)
             return
-        cache_key = f"ytdl:stream:{qo.webpage_url}"
+        cache_key = _stream_cache_key(qo.webpage_url)
         cached = await cache_get(redis, cache_key)
         already_cached = cached is not None
         trace.get_current_span().set_attribute("ytdl.already_cached", already_cached)
@@ -312,11 +426,69 @@ class YTDL(discord.FFmpegOpusAudio):
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return
         if data is not None:
-            stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
-            ttl = _stream_url_ttl(data.get("url", ""))
-            if ttl:
-                await cache_set(redis, cache_key, stripped, ttl)
+            # Only a URL that has been proven playable earns a cache entry — caching an
+            # already-revoked one would hand yt_stream a dead URL it then has to discard.
+            if await _stream_url_playable(data.get("url", "")):
+                await _cache_stream(redis, cache_key, data)
             _enrich_queueobject(qo, data)
+
+    @classmethod
+    async def _resolve_playable_stream(
+        cls,
+        qo: QueueObject,
+        redis: Optional[aioredis.Redis],
+    ) -> dict:
+        """Resolve a song to stream data whose URL YouTube will actually serve.
+
+        Every URL is probed before it reaches ffmpeg, because a revoked one fails in the
+        worst possible way: ffmpeg 403s and exits, discord.py reports that as a completed
+        song, and the player advances in silence with nothing logged. Since the URL was
+        cached, every later -play of that song replayed it and failed the same way, which
+        is what pinned one song to a permanent failure for the life of its cache entry.
+
+        A revoked URL is dropped from the cache and re-extracted once. Once is enough:
+        re-extracting a video whose cached URL had died reliably produced a playable one.
+        """
+        span = trace.get_current_span()
+        loop = asyncio.get_running_loop()
+        cache_key = _stream_cache_key(qo.webpage_url)
+
+        data = await cache_get(redis, cache_key)
+        span.set_attribute("ytdl.cache_hit", data is not None)
+
+        for attempt in range(2):
+            extracted_fresh = False
+            if data is None:
+                data = await loop.run_in_executor(
+                    _YTDLP_POOL,
+                    _ytdlp_extract,
+                    qo.webpage_url,
+                    _YTDL_STREAM_OPTS,
+                    False,
+                    True,
+                )
+                span.set_attribute("ytdl.extracted_fresh", True)
+                if data is None:
+                    raise RuntimeError("Could not extract stream data")
+                extracted_fresh = True
+
+            if await _stream_url_playable(data.get("url", "")):
+                if extracted_fresh:
+                    await _cache_stream(redis, cache_key, data)
+                return data
+
+            span.set_attribute("ytdl.stream_url_revoked", True)
+            log.warning(
+                f"YouTube revoked the stream URL for {qo.webpage_url} "
+                f"(attempt {attempt + 1}/2, {'fresh' if extracted_fresh else 'cached'}) "
+                "— dropping it from the cache and re-extracting"
+            )
+            await cache_del(redis, cache_key)
+            data = None
+
+        raise RuntimeError(
+            f"YouTube refused the audio stream for {qo.webpage_url} even after re-extracting"
+        )
 
     @classmethod
     @_tracer.start_as_current_span("ytdl.yt_stream")
@@ -329,32 +501,8 @@ class YTDL(discord.FFmpegOpusAudio):
         redis: Optional[aioredis.Redis] = None,
     ):
         trace.get_current_span().set_attribute("ytdl.url", qo.webpage_url)
-        loop = asyncio.get_running_loop()
 
-        # ── Cache check ───────────────────────────────────────────────────────
-        cache_key = f"ytdl:stream:{qo.webpage_url}"
-        data = await cache_get(redis, cache_key)
-        trace.get_current_span().set_attribute("ytdl.cache_hit", data is not None)
-
-        # ── Extract (only if cache miss) ──────────────────────────────────────
-        if data is None:
-            data = await loop.run_in_executor(
-                _YTDLP_POOL,
-                _ytdlp_extract,
-                qo.webpage_url,
-                _YTDL_STREAM_OPTS,
-                False,
-                True,
-            )
-            trace.get_current_span().set_attribute("ytdl.extracted_fresh", True)
-            if data is not None:
-                stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
-                ttl = _stream_url_ttl(data.get("url", ""))
-                if ttl:
-                    await cache_set(redis, cache_key, stripped, ttl)
-
-        if data is None:
-            raise RuntimeError("Could not extract stream data")
+        data = await cls._resolve_playable_stream(qo, redis)
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
