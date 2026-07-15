@@ -12,8 +12,8 @@ from src.youtube import (
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
-    _YTDL_SOURCE_OPTS,
     _YTDL_STREAM_OPTS,
+    _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
     _stream_url_playable,
@@ -269,8 +269,9 @@ class TestYTDLOpts:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
     def test_default_search_is_auto(self):
-        # default_search belongs to the source (search) opts, not the stream opts
-        assert _YTDL_SOURCE_OPTS["default_search"] == "auto"
+        # default_search belongs to yt_source's unified search opts, not the stream opts
+        assert _YTDL_STREAM_SEARCH_OPTS["default_search"] == "auto"
+        assert "default_search" not in _YTDL_STREAM_OPTS
 
     def test_ytdlp_warnings_are_not_suppressed(self):
         """yt-dlp's warnings are the early-warning system for YouTube changing the rules
@@ -314,12 +315,16 @@ class TestYtdlpLogger:
     def test_stream_opts_have_format(self):
         assert _YTDL_STREAM_OPTS["format"] == "bestaudio/best[height<=360]/best"
 
-    def test_source_opts_no_format(self):
-        # yt_source only needs metadata; format resolution is deferred to yt_stream
-        assert "format" not in _YTDL_SOURCE_OPTS
+    def test_unified_search_opts_carry_stream_format(self):
+        """yt_source's single extraction must select a playable stream — the unified
+        play path (docs/PERFORMANCE_PLAN.md §2.1) populates the ytdl:stream cache from
+        the same call, which only works with the stream format ladder and its retry
+        budget. Dropping the format key would silently revert to double extraction."""
+        assert _YTDL_STREAM_SEARCH_OPTS["format"] == _YTDL_STREAM_OPTS["format"]
+        assert _YTDL_STREAM_SEARCH_OPTS["retries"] == _YTDL_STREAM_OPTS["retries"]
 
     def test_no_verbose_or_rm_cachedir(self):
-        for opts in (_YTDL_SOURCE_OPTS, _YTDL_STREAM_OPTS):
+        for opts in (_YTDL_STREAM_SEARCH_OPTS, _YTDL_STREAM_OPTS):
             assert not opts.get("verbose")
             assert not opts.get("rm_cachedir")
 
@@ -341,9 +346,7 @@ class TestYTSource:
 
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(
-                mock_ctx.author, "ytsearch:test song", process=True
-            )
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test song")
 
         assert isinstance(result, QueueObject)
         assert result.title == "Extracted Title"
@@ -358,16 +361,14 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(
-                mock_ctx.author, "ytsearch:test song", process=True
-            )
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test song")
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
 
     async def test_yt_source_raises_when_no_data(self, mock_ctx):
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
-                await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing", process=True)
+                await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing")
 
     async def test_yt_source_picks_first_entry_from_playlist(self, mock_ctx):
         fake_data = {
@@ -386,9 +387,7 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(
-                mock_ctx.author, "ytsearch:test", process=True
-            )
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
 
         assert result.title == "Entry One"
         assert "entry1" in result.webpage_url
@@ -410,9 +409,7 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(
-                mock_ctx.author, "ytsearch:test", process=True
-            )
+            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
 
         assert result.title == "Real Video"
 
@@ -424,9 +421,7 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(
-                mock_ctx.author, "my search query", process=True
-            )
+            result = await YTDL.yt_source(mock_ctx.author, "my search query")
         assert result.user_input == "my search query"
 
     async def test_yt_source_sets_user_input_cache_hit(self, mock_ctx, fake_redis):
@@ -443,7 +438,7 @@ class TestYTSource:
             "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
         )
         result = await YTDL.yt_source(
-            mock_ctx.author, "cached search", process=True, redis=fake_redis
+            mock_ctx.author, "cached search", redis=fake_redis
         )
         assert result.user_input == "cached search"
 
@@ -462,7 +457,7 @@ class TestYTSource:
             "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
         )
         result = await YTDL.yt_source(
-            mock_ctx.author, "cached search", process=True, redis=fake_redis
+            mock_ctx.author, "cached search", redis=fake_redis
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
 
@@ -477,13 +472,9 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            await YTDL.yt_source(
-                mock_ctx.author, "some search", process=True, redis=fake_redis
-            )
+            await YTDL.yt_source(mock_ctx.author, "some search", redis=fake_redis)
 
-        result = await YTDL.yt_source(
-            mock_ctx.author, "some search", process=True, redis=fake_redis
-        )
+        result = await YTDL.yt_source(mock_ctx.author, "some search", redis=fake_redis)
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
 
     async def test_yt_source_passes_timestamp(self, mock_ctx):
@@ -494,7 +485,7 @@ class TestYTSource:
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
             result = await YTDL.yt_source(
-                mock_ctx.author, "https://yt.com/watch?v=ts_test", process=False, ts=45
+                mock_ctx.author, "https://yt.com/watch?v=ts_test", ts=45
             )
 
         assert result.ts == 45
@@ -508,12 +499,120 @@ class TestYTSource:
             "src.youtube._ytdlp_extract", return_value=fake_data
         ) as mock_extract:
             result = await YTDL.yt_source(
-                mock_ctx.author, "https://yt.com/v=dl", process=True, download=True
+                mock_ctx.author, "https://yt.com/v=dl", download=True
             )
         # download=True is passed as the 3rd positional arg to _ytdlp_extract
         call_args = mock_extract.call_args[0]
         assert call_args[2] is True
         assert result.title == "Download Song"
+
+
+class TestYTSourceUnifiedExtraction:
+    """The unified single-extraction play path (docs/PERFORMANCE_PLAN.md §2.1):
+    one stream-opts yt-dlp call populates BOTH the ytdl:source and ytdl:stream
+    caches, making queue_put's prefetch_stream a cache-hit no-op instead of a
+    second YouTube extraction."""
+
+    async def test_always_extracts_with_process_true(self, mock_ctx):
+        """process=True is hardcoded — the §2.1 trap. Direct URLs used to flow with
+        process=False, and an unprocessed extract_info performs no format selection,
+        so data["url"] would be absent and the stream-cache write would silently
+        never happen for direct-URL plays."""
+        fake_data = _fake_ytdl_data()
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=fake_data
+        ) as mock_extract:
+            await YTDL.yt_source(mock_ctx.author, "https://yt.com/watch?v=direct")
+        opts, process = mock_extract.call_args[0][1], mock_extract.call_args[0][3]
+        assert opts is _YTDL_STREAM_SEARCH_OPTS
+        assert process is True
+
+    async def test_fresh_extraction_writes_both_caches(self, mock_ctx, fake_redis):
+        """One cold yt_source call must leave both a ytdl:source and a ytdl:stream
+        entry behind — the absence of the stream key means the second extraction
+        is back."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni1")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            await YTDL.yt_source(mock_ctx.author, "unified search", redis=fake_redis)
+
+        source_entry = await fake_redis.get("ytdl:source:unified search")
+        stream_entry = await fake_redis.get("ytdl:stream:https://yt.com/v=uni1")
+        assert source_entry is not None
+        assert stream_entry is not None
+        cached = orjson.loads(stream_entry)
+        assert cached["url"] == fake_data["url"]
+        assert cached["title"] == "Test Song"
+
+    async def test_stream_cache_hit_for_prefetch_after_yt_source(
+        self, mock_ctx, fake_redis
+    ):
+        """prefetch_stream must not re-extract a song yt_source just resolved —
+        the whole point of §2.1 is that the enqueue-time prefetch becomes one
+        Redis GET."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni2")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            qobj = await YTDL.yt_source(
+                mock_ctx.author, "prefetch noop search", redis=fake_redis
+            )
+        with patch("src.youtube._ytdlp_extract") as mock_extract:
+            await YTDL.prefetch_stream(qobj, redis=fake_redis)
+        mock_extract.assert_not_called()
+
+    async def test_dead_probe_skips_stream_cache_but_returns_qobj(
+        self, mock_ctx, fake_redis, playable_urls
+    ):
+        """A failed probe never fails yt_source: the song enqueues on identity
+        alone (source cache written), and dequeue-time re-extraction handles the
+        stream — exactly the pre-§2.1 behavior."""
+        playable_urls.return_value = False
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni3")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            result = await YTDL.yt_source(
+                mock_ctx.author, "dead probe search", redis=fake_redis
+            )
+
+        assert isinstance(result, QueueObject)
+        assert result.webpage_url == "https://yt.com/v=uni3"
+        assert await fake_redis.get("ytdl:source:dead probe search") is not None
+        assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni3") is None
+
+    async def test_uncacheable_url_skips_stream_cache(self, mock_ctx, fake_redis):
+        """A stream URL with no usable expiry (e.g. SoundCloud) probes fine but is
+        not worth caching — _cache_stream declines and yt_source degrades
+        gracefully, no special-casing."""
+        fake_data = _fake_ytdl_data(
+            url="https://cf-media.sndcdn.com/abc.128.mp3",
+            webpage_url="https://soundcloud.com/artist/track",
+        )
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "https://soundcloud.com/artist/track",
+                redis=fake_redis,
+            )
+        assert isinstance(result, QueueObject)
+        assert (
+            await fake_redis.get("ytdl:stream:https://soundcloud.com/artist/track")
+            is None
+        )
+
+    async def test_no_probe_without_redis(self, mock_ctx, playable_urls):
+        """Without Redis there is nothing to cache — the probe's network GET must
+        be skipped entirely."""
+        fake_data = _fake_ytdl_data()
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            await YTDL.yt_source(mock_ctx.author, "no redis search")
+        playable_urls.assert_not_awaited()
+
+    async def test_fresh_extraction_populates_full_metadata(self, mock_ctx):
+        """The unified extraction is a full one — duration/uploader/thumbnail come
+        back on the first call, no prefetch enrichment needed."""
+        fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni4")
+        with patch("src.youtube._ytdlp_extract", return_value=fake_data):
+            result = await YTDL.yt_source(mock_ctx.author, "metadata search")
+        assert result.duration == 180
+        assert result.uploader == "Test Channel"
+        assert result.thumbnail == "https://img.yt.com/test.jpg"
 
 
 class TestYTStreamRuntimeError:

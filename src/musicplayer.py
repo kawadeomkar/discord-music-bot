@@ -1206,7 +1206,6 @@ class MusicPlayer:
             return await YTDL.yt_source(
                 self._last_author,
                 source.ytsearch or "",
-                source.process or False,
                 redis=self.store.redis if self.store is not None else None,
             )
         return source
