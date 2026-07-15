@@ -252,7 +252,11 @@ class TestHelpFlagEndToEnd:
         from src.main import MusicBotApp, MusicContext
 
         app = MusicBotApp()
-        await app.add_cog(MusicBot(app))
+        # MusicBot types bot as commands.Bot, but production always hosts the
+        # cog on MusicBotApp — an AutoShardedBot, which shares BotBase with Bot
+        # but is not a subclass of it. The cog only touches BotBase/Client
+        # members, so this is the real runtime contract; pyright can't see it.
+        await app.add_cog(MusicBot(app))  # type: ignore[arg-type]
         message = MagicMock()
         message.content = "-play lofi hip hop --help"
         context = MusicContext(
