@@ -878,3 +878,74 @@ class TestPrefetchStream:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf5")
         assert cached is None
+
+
+class TestYTStreamPlaynowFlags:
+    async def test_flags_carried_onto_ytdl(self, mock_ctx):
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            ts=90,
+            is_resume=True,
+            start_paused=True,
+        )
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            result = await YTDL.yt_stream(qobj, channel)
+
+        assert result.is_resume is True
+        assert result.start_paused is True
+        assert result.interjected is False
+
+    async def test_resume_entry_suppresses_ts_notice_but_keeps_seek(self, mock_ctx):
+        """Prefetch constructs resume entries mid-interjection — the
+        construction-time notice would fire at the wrong moment, so the loop
+        announces the resume instead. The -ss seek itself must remain."""
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            ts=151,
+            is_resume=True,
+        )
+
+        captured_options = {}
+
+        def capture_init(self, url, *, executable, before_options, options):
+            noop_ffmpeg_init(self)
+            captured_options["options"] = options
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(qobj, channel)
+
+        channel.send.assert_not_awaited()
+        assert "-ss 151" in captured_options["options"]
+
+    async def test_plain_ts_entry_still_sends_notice(self, mock_ctx):
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
+        )
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            await YTDL.yt_stream(qobj, channel)
+
+        channel.send.assert_awaited_once()
