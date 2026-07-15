@@ -35,4 +35,4 @@ echo "Building docker image"
 docker build --build-arg ENVIRONMENT="$ENVIRONMENT" -t "discord-music-bot:latest" -t "$BUILD_TAG" -f Dockerfile .
 
 echo "Running docker with build tag $BUILD_TAG"
-docker compose up
+docker compose up -d
