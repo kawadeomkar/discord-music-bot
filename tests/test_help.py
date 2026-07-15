@@ -240,3 +240,32 @@ class TestErrors:
         embed = sent_embed(ctx)
         assert embed.color == discord.Color.red()
         assert "bogus" in (embed.description or "")
+
+
+class TestHelpFlagEndToEnd:
+    async def test_play_dash_dash_help_renders_the_play_man_page(self):
+        """`-play --help` through the real MusicBotApp.invoke lands on the same
+        embed as `-help play` — the flag diverts before argument parsing, so
+        the extra words never reach the play command."""
+        from discord.ext.commands.view import StringView
+
+        from src.main import MusicBotApp, MusicContext
+
+        app = MusicBotApp()
+        await app.add_cog(MusicBot(app))
+        message = MagicMock()
+        message.content = "-play lofi hip hop --help"
+        context = MusicContext(
+            prefix="-",
+            view=StringView(message.content),
+            bot=app,
+            message=message,
+            invoked_with="play",
+            command=app.all_commands["play"],
+        )
+        context.send = AsyncMock()
+
+        await app.invoke(context)
+
+        embed = context.send.call_args.kwargs["embed"]
+        assert embed.title == "-play(1)"
