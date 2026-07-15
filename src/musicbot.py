@@ -345,7 +345,34 @@ class MusicBot(commands.Cog):
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
-    @commands.command(name="play", aliases=["p", "sing"], help="play a youtube song")
+    @commands.command(
+        name="play",
+        aliases=["p", "sing"],
+        brief="queue a song and start playing",
+        usage="<url|search>",
+        help=(
+            "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
+            "playlist, a Spotify track or playlist link, a SoundCloud link, or "
+            "plain words to search YouTube with.\n\n"
+            "If the bot is not connected yet it joins your voice channel first. "
+            "If something is already playing, the song is appended to the queue "
+            "and you get an estimated start time. A YouTube link carrying a "
+            "`?t=` / `?ts=` timestamp starts the song at that offset."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": [
+                "-play never gonna give you up",
+                "-play https://youtu.be/dQw4w9WgXcQ?t=43",
+                "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                "-p https://soundcloud.com/artist/track",
+            ],
+            "note": (
+                "Spotify links are matched to YouTube audio one title at a time, "
+                "so a long playlist takes a few seconds to finish queueing."
+            ),
+        },
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url):
@@ -432,7 +459,31 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="playnow",
         aliases=["pn"],
-        help="play a song immediately; the current song resumes after",
+        brief="play a song immediately, resuming the current one after",
+        usage="<url|search>",
+        help=(
+            "Interrupts whatever is playing so your song starts right now. The "
+            "interrupted song is not lost — it comes back from the exact position "
+            "it left off at, and if it was paused it returns paused.\n\n"
+            "Takes the same input as `-play`. If nothing is playing there is "
+            "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
+            "A playlist can't be interjected — only its **first track** is played, "
+            "since queueing the whole thing would delay the interrupted song "
+            "indefinitely. Use `-play` for the full playlist."
+        ),
+        extras={
+            "category": "Playback",
+            "examples": [
+                "-playnow never gonna give you up",
+                "-pn https://youtu.be/dQw4w9WgXcQ",
+            ],
+            "note": (
+                "`-play` adds to the back of the queue; `-playnow` cuts the line and "
+                "hands the current song back afterwards. A song that was nearly over "
+                "will not return, and interjecting on top of another `-playnow` song "
+                "replaces it rather than stacking."
+            ),
+        },
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
@@ -529,7 +580,17 @@ class MusicBot(commands.Cog):
                 log.error(f"playnow failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to play song now")
 
-    @commands.command(name="skip", aliases=["sk"], help="skips current song")
+    @commands.command(
+        name="skip",
+        aliases=["sk"],
+        brief="skip to the next song in the queue",
+        help=(
+            "Stops the current song and immediately starts the next one in the "
+            "queue. If the queue is empty the bot stays connected and idles "
+            "until you queue something else."
+        ),
+        extras={"category": "Playback", "examples": ["-skip", "-sk"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.skip")
     async def skip(self, ctx: commands.Context):
@@ -543,7 +604,18 @@ class MusicBot(commands.Cog):
             log.error(f"skip failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="stop", aliases=["st"], help="stops current song")
+    @commands.command(
+        name="stop",
+        aliases=["st"],
+        brief="stop playback, drop the queue and disconnect",
+        help=(
+            "Stops the current song, discards the queue, removes the Now Playing "
+            "card and disconnects the bot from the voice channel.\n\n"
+            "This is the full teardown — use `-pause` if you only want to take a "
+            "break, or `-clear` if you want to empty the queue but keep playing."
+        ),
+        extras={"category": "Playback", "examples": ["-stop", "-st"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context):
@@ -561,7 +633,17 @@ class MusicBot(commands.Cog):
             log.error(f"stop failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="pause", aliases=["po"], help="pause the current song")
+    @commands.command(
+        name="pause",
+        aliases=["po"],
+        brief="pause the current song",
+        help=(
+            "Pauses playback and posts the exact position the song stopped at. "
+            "The queue and the bot's voice connection are kept — `-resume` picks "
+            "the song back up from that position."
+        ),
+        extras={"category": "Playback", "examples": ["-pause", "-po"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.pause")
     async def pause(self, ctx: commands.Context):
@@ -578,7 +660,17 @@ class MusicBot(commands.Cog):
             log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="resume", aliases=["r"], help="resume the current song")
+    @commands.command(
+        name="resume",
+        aliases=["r"],
+        brief="resume a paused song",
+        help=(
+            "Resumes a paused song from the position it stopped at, and re-pins "
+            "the Now Playing card — with its live progress bar — to the bottom "
+            "of the channel."
+        ),
+        extras={"category": "Playback", "examples": ["-resume", "-r"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.resume")
     async def resume(self, ctx: commands.Context):
@@ -600,7 +692,16 @@ class MusicBot(commands.Cog):
             log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="shuffle", help="shuffles the songs in the queue (3+ songs)")
+    @commands.command(
+        name="shuffle",
+        brief="randomly reorder the queue",
+        help=(
+            "Randomly reorders the songs waiting in the queue. Needs at least 3 "
+            "queued songs to have any effect. The song currently playing is left "
+            "alone — shuffling only touches what comes after it."
+        ),
+        extras={"category": "Queue", "examples": ["-shuffle"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.shuffle")
     async def shuffle(self, ctx: commands.Context):
@@ -617,7 +718,18 @@ class MusicBot(commands.Cog):
             log.error(f"shuffle failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="join", aliases=["summon"], help="join the channel")
+    @commands.command(
+        name="join",
+        aliases=["summon"],
+        brief="connect the bot to your voice channel",
+        help=(
+            "Connects the bot to the voice channel you are in and reports its "
+            "latency. You rarely need this — `-play` joins for you.\n\n"
+            "If the bot is already playing in a different voice channel it stays "
+            "there rather than abandoning that listener."
+        ),
+        extras={"category": "Utility", "examples": ["-join", "-summon"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.join")
     async def join(self, ctx: commands.Context):
@@ -650,7 +762,17 @@ class MusicBot(commands.Cog):
             log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
-    @commands.command(name="clear", aliases=["c"], help="clears the queue")
+    @commands.command(
+        name="clear",
+        aliases=["c"],
+        brief="empty the queue",
+        help=(
+            "Removes every song waiting in the queue and lists what was dropped. "
+            "The song currently playing keeps going — use `-skip` to move past it "
+            "or `-stop` to end the session entirely."
+        ),
+        extras={"category": "Queue", "examples": ["-clear", "-c"]},
+    )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.clear")
     async def clear(self, ctx: commands.Context):
@@ -681,7 +803,19 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="remove",
         aliases=["rm"],
-        help="remove all queued songs matching a YouTube URL",
+        brief="remove queued songs matching a URL",
+        usage="<url>",
+        help=(
+            "Removes every queued song matching a YouTube URL and reports the "
+            "queue positions that were dropped, followed by the updated queue.\n\n"
+            "The URL must match the YouTube link shown in the **Now Playing** "
+            "card — not the Spotify or search text you originally queued with. "
+            "Run it with no URL for a reminder of the format."
+        ),
+        extras={
+            "category": "Queue",
+            "examples": ["-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        },
     )
     @commands.before_invoke(validate_commands)
     async def remove(self, ctx: commands.Context, url: Optional[str] = None):
@@ -719,7 +853,17 @@ class MusicBot(commands.Cog):
         await ctx.message.add_reaction("🗑️")
 
     @commands.command(
-        name="now", aliases=["np", "rn", "nowplaying"], help="display current song"
+        name="now",
+        aliases=["np", "rn", "nowplaying"],
+        brief="show the song playing right now",
+        help=(
+            "Shows what is playing right now — title, who requested it, and a "
+            "live progress bar.\n\n"
+            "In the channel the bot is playing in, this re-pins the Now Playing "
+            "card to the bottom of the channel instead of posting a copy that "
+            "would immediately go stale. Anywhere else you get a static snapshot."
+        ),
+        extras={"category": "Queue", "examples": ["-now", "-np", "-nowplaying"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.now")
@@ -763,7 +907,14 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
-        name="history", aliases=["h"], help="display history of songs played"
+        name="history",
+        aliases=["h"],
+        brief="show recently played songs",
+        help=(
+            "Lists the songs already played in this server, most recent first "
+            "(up to 10). History is stored per server and survives a bot restart."
+        ),
+        extras={"category": "Queue", "examples": ["-history", "-h"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.history")
@@ -788,7 +939,16 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
-        name="jump", aliases=["j"], help="jumps to a specific position in queue"
+        name="jump",
+        aliases=["j"],
+        brief="jump to a queue position (in development)",
+        usage="<position>",
+        help=(
+            "Skips straight to a given position in the queue.\n\n"
+            "⚠️ Not implemented yet — the command replies that it is in "
+            "development. Use `-skip` to advance one song at a time."
+        ),
+        extras={"category": "Queue", "examples": ["-jump 3"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.jump")
@@ -808,7 +968,15 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
-        name="queue", aliases=["q"], help="displays current songs in queue"
+        name="queue",
+        aliases=["q"],
+        brief="list the songs waiting to play",
+        help=(
+            "Lists the songs waiting to play, in the order they will be played "
+            "(up to 10, newest queue additions last). The queue is stored per "
+            "server and is restored if the bot restarts."
+        ),
+        extras={"category": "Queue", "examples": ["-queue", "-q"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.queue")
@@ -823,7 +991,15 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="volume",
         aliases=["v", "vol", "sound"],
-        help="volume level between 0 and 100",
+        brief="set playback volume (0-100)",
+        usage="<0-100>",
+        help=(
+            "Sets playback volume as a percentage between 0 and 100.\n\n"
+            "The new level takes effect on the **next** song, not the one "
+            "currently playing. It is saved per server, so it still applies "
+            "after a restart."
+        ),
+        extras={"category": "Playback", "examples": ["-volume 50", "-vol 100"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.volume")
@@ -861,7 +1037,15 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     @commands.command(
-        name="ping", aliases=["latency", "l", "delay"], help="latency in milliseconds"
+        name="ping",
+        aliases=["latency", "l", "delay"],
+        brief="check the bot's latency to Discord",
+        help=(
+            "Reports the bot's WebSocket latency to Discord in milliseconds. The "
+            "embed is colour-coded — green is healthy, red means playback may "
+            "stutter."
+        ),
+        extras={"category": "Utility", "examples": ["-ping", "-latency"]},
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.ping")
