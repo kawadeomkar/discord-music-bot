@@ -1,6 +1,7 @@
 """Tests for src/musicbot.py — voice permission validation, queue source dispatch, and latency color."""
 
 import asyncio
+import contextlib
 import orjson
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,7 +10,7 @@ import fakeredis
 import pytest
 from discord.ext import commands
 
-from src.musicbot import MusicBot, _check_voice_permissions
+from src.musicbot import MusicBot, _check_voice_permissions, background_typing
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
@@ -72,6 +73,83 @@ class TestCheckVoicePermissions:
         member.voice = MagicMock()
         member.voice.channel = MagicMock()
         assert _check_voice_permissions(member, None, "skip") is None
+
+
+class TestBackgroundTyping:
+    """docs/PERFORMANCE_PLAN.md §2.2 — typing indicator must never delay the command body."""
+
+    async def test_body_runs_while_first_typing_post_is_in_flight(self, mock_ctx):
+        post_started = asyncio.Event()
+        release_post = asyncio.Event()
+
+        async def slow_post():
+            post_started.set()
+            await release_post.wait()
+
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=slow_post)
+
+        async with background_typing(mock_ctx):
+            # The body is executing while the POST is still blocked — the ~500ms
+            # first POST no longer serializes ahead of the work.
+            await asyncio.wait_for(post_started.wait(), timeout=1)
+            assert not release_post.is_set()
+
+    async def test_cancel_during_first_post_never_enters_typing_cm(self, mock_ctx):
+        """Exiting while the first POST is in flight must not leak the keepalive:
+        the CM never entered, so __aexit__ is never called (the AttributeError
+        hazard of driving __aenter__/__aexit__ manually cannot occur)."""
+        post_started = asyncio.Event()
+
+        async def hung_post():
+            post_started.set()
+            await asyncio.sleep(3600)
+
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=hung_post)
+
+        async with background_typing(mock_ctx):
+            await asyncio.wait_for(post_started.wait(), timeout=1)
+        await asyncio.sleep(0)  # let the cancelled keepalive task unwind
+        mock_ctx.typing.return_value.__aexit__.assert_not_awaited()
+
+    async def test_typing_cm_exited_after_body_completes(self, mock_ctx):
+        exited = asyncio.Event()
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            side_effect=lambda *a: exited.set()
+        )
+        entered = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            side_effect=lambda: entered.set()
+        )
+
+        async with background_typing(mock_ctx):
+            await asyncio.wait_for(entered.wait(), timeout=1)
+        # Cancellation unwinds through the async with → indicator dropped promptly.
+        await asyncio.wait_for(exited.wait(), timeout=1)
+        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+
+    async def test_typing_failure_never_surfaces_into_command_body(self, mock_ctx):
+        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
+
+        async with background_typing(mock_ctx):
+            await asyncio.sleep(0)  # let the keepalive task hit the failure
+            await asyncio.sleep(0)
+        # No exception propagates; the command body is unaffected.
+
+    async def test_body_exception_still_cancels_keepalive(self, mock_ctx):
+        entered = asyncio.Event()
+        exited = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            side_effect=lambda: entered.set()
+        )
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            side_effect=lambda *a: exited.set()
+        )
+
+        with pytest.raises(ValueError):
+            async with background_typing(mock_ctx):
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                raise ValueError("command body blew up")
+        await asyncio.wait_for(exited.wait(), timeout=1)
 
 
 class TestLatencyColor:
@@ -1152,6 +1230,19 @@ class TestClearCommand:
         assert "Song A" in embed.description
 
 
+def _no_typing():
+    """Stub play()'s background_typing wrapper with an inert async CM.
+
+    TestPlayCommand patches asyncio.create_task as a join-task spy; without this
+    stub the typing keepalive would also hit the patched create_task, polluting
+    call counts and receiving the fake join future. The wrapper itself is
+    covered by TestBackgroundTyping."""
+    return patch(
+        "src.musicbot.background_typing",
+        MagicMock(return_value=contextlib.nullcontext()),
+    )
+
+
 class TestPlayCommand:
     """Tests for the play() cold-join parallelism (Change A).
 
@@ -1180,7 +1271,10 @@ class TestPlayCommand:
             coro.close()
             return join_task
 
-        with patch("asyncio.create_task", side_effect=fake_create_task) as mock_create:
+        with (
+            _no_typing(),
+            patch("asyncio.create_task", side_effect=fake_create_task) as mock_create,
+        ):
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
 
         mock_create.assert_called_once()
@@ -1196,7 +1290,7 @@ class TestPlayCommand:
         music_bot._enqueue_single = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=MagicMock())
 
-        with patch("asyncio.create_task") as mock_create:
+        with _no_typing(), patch("asyncio.create_task") as mock_create:
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
 
         mock_create.assert_not_called()
@@ -1224,7 +1318,7 @@ class TestPlayCommand:
             coro.close()
             return join_task
 
-        with patch("asyncio.create_task", side_effect=fake_create_task):
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_called_once()
@@ -1254,7 +1348,7 @@ class TestPlayCommand:
             coro.close()
             return join_task
 
-        with patch("asyncio.create_task", side_effect=fake_create_task):
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_not_called()  # already done, nothing to cancel
@@ -1281,7 +1375,7 @@ class TestPlayCommand:
             coro.close()
             return join_task
 
-        with patch("asyncio.create_task", side_effect=fake_create_task):
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_called_once()
