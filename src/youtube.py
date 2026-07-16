@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import datetime
 import os
 import re
@@ -29,7 +30,10 @@ _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     """Dedicated thread-pool worker for yt-dlp extraction. Top-level so it's named in tracebacks."""
-    return youtube_dl.YoutubeDL(opts).extract_info(
+    # YoutubeDL.__init__ keeps the params dict by reference and writes into it
+    # (js_runtimes, http_headers, ...); the copy keeps the module-level opts
+    # profiles immutable across the 8 pool threads.
+    return youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
         url, download=download, process=process
     )
 
@@ -321,6 +325,10 @@ async def _probe_and_cache(
     would hand yt_stream a dead URL it then has to discard. Returns True when a cache
     entry was written."""
     _record_serving_format(data)
+    if _stream_url_ttl(data.get("url", "")) is None:
+        # Uncacheable URL (no usable expiry — e.g. SoundCloud): probing it would spend
+        # an awaited network round only for _cache_stream to decline the write anyway.
+        return False
     if await _stream_url_playable(data.get("url", "")):
         return await _cache_stream(redis, cache_key, data)
     return False

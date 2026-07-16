@@ -576,10 +576,13 @@ class TestYTSourceUnifiedExtraction:
         assert await fake_redis.get("ytdl:source:dead probe search") is not None
         assert await fake_redis.get("ytdl:stream:https://yt.com/v=uni3") is None
 
-    async def test_uncacheable_url_skips_stream_cache(self, mock_ctx, fake_redis):
-        """A stream URL with no usable expiry (e.g. SoundCloud) probes fine but is
-        not worth caching — _cache_stream declines and yt_source degrades
-        gracefully, no special-casing."""
+    async def test_uncacheable_url_skips_stream_cache(
+        self, mock_ctx, fake_redis, playable_urls
+    ):
+        """A stream URL with no usable expiry (e.g. SoundCloud) is not worth caching —
+        _probe_and_cache skips the playability probe entirely (it would be an awaited
+        network round on the -play path only for _cache_stream to decline the write)
+        and yt_source degrades gracefully, no special-casing."""
         fake_data = _fake_ytdl_data(
             url="https://cf-media.sndcdn.com/abc.128.mp3",
             webpage_url="https://soundcloud.com/artist/track",
@@ -595,6 +598,7 @@ class TestYTSourceUnifiedExtraction:
             await fake_redis.get("ytdl:stream:https://soundcloud.com/artist/track")
             is None
         )
+        playable_urls.assert_not_awaited()
 
     async def test_no_probe_without_redis(self, mock_ctx, playable_urls):
         """Without Redis there is nothing to cache — the probe's network GET must
