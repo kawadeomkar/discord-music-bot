@@ -86,7 +86,7 @@ poetry run bot
 
 ```bash
 # Using the build script (also runs black formatter)
-./build.sh
+./build_docker.sh
 
 # Or manually
 docker compose up --build
