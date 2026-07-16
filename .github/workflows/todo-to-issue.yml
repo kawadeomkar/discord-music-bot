@@ -1,0 +1,47 @@
+name: TODO to Issue
+
+# Opens a GitHub issue for every TODO/FIXME/ISSUE/HACK comment added to main.
+# The severity ladder these identifiers encode is documented in docs/CLAUDE.md.
+#
+# Diff-based: the action only sees trigger comments on ADDED lines in the push diff.
+# Comments already on main when this workflow landed are invisible to it forever — to
+# pick one up, edit the comment line itself (touching the file is not enough).
+#
+# Create-only by design: no CLOSE_ISSUES / INSERT_ISSUE_URLS. Closing issues accurately
+# requires INSERT_ISSUE_URLS, which rewrites source files and pushes a bot commit back
+# to main — that fights branch protection and the PR flow. Close issues by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  todo-to-issue:
+    # Skip forks: they cannot open issues on this repo and the run would just fail.
+    if: github.repository == 'kawadeomkar/discord-music-bot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Full history — the action diffs the push against its parent commit.
+          fetch-depth: 0
+
+      - name: Convert new trigger comments to issues
+        uses: alstr/todo-to-issue-action@v5
+        with:
+          # Labels map to the severity ladder. `bug` and `enhancement` are GitHub
+          # defaults; `technical-debt` must exist on the repo or the label is dropped.
+          IDENTIFIERS: |
+            [
+              {"name": "FIXME", "labels": ["bug"]},
+              {"name": "ISSUE", "labels": ["enhancement"]},
+              {"name": "HACK", "labels": ["technical-debt"]},
+              {"name": "TODO", "labels": []}
+            ]
+          # Docs describe the convention and quote these identifiers in examples;
+          # scanning them would open issues about the convention itself.
+          IGNORE: "docs/,.*\\.md"
+          AUTO_P: "true"
+          ESCAPE: "true"
