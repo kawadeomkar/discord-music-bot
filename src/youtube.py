@@ -24,6 +24,14 @@ from src.util import get_logger, notice_embed
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
+# ISSUE: Move yt-dlp extraction off threads and onto a ProcessPoolExecutor.
+# yt-dlp extraction is only half I/O — JSON parsing, signature decryption and format
+# selection are all GIL-bound Python, so the 8 threads here contend for the GIL rather
+# than running in parallel. Every extraction therefore steals time from the event loop
+# that is also serving voice heartbeats, and concurrent plays across guilds degrade one
+# another. The extract worker (_ytdlp_extract) is already a top-level, picklable
+# function, so the swap is mostly mechanical.
+# Design: docs/ARCHITECTURE_PLAN.md §3.1.
 _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 
@@ -665,17 +673,30 @@ class YTDL(discord.FFmpegOpusAudio):
             process,
         )
         if data is None:
-            # TODO: create custom YTDL exceptions
+            # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
+            # Every failure mode raises the same untyped Exception("Could not find
+            # song"), so callers cannot distinguish "no such video" from "extractor
+            # broken" from "network down". All three render the identical generic error
+            # embed to the user, and nothing upstream can retry selectively or degrade
+            # differently per cause.
+            # Pairs with the error-handling consolidation in docs/ARCHITECTURE_PLAN.md §3.3.
             raise Exception("Could not find song")
 
-        if "entries" in data:  # TOOD: narrow down to https urls and right bitrate
+        if "entries" in data:
+            # TODO: Validate search results have a usable audio format before accepting.
+            # An entry wins purely by being the first non-playlist result — nothing
+            # checks that it carries an https audio URL at a usable bitrate. A
+            # format-less or low-quality entry is therefore selected here and only
+            # blows up later, at stream time, where the failure looks unrelated.
             for entry in data["entries"]:
                 if entry and entry.get("_type", None) != "playlist":
                     data = entry
                     break
         if download:
-            # TODO: Handle downloading?
-            # ytdl.prepare_filename(data)
+            # TODO: Implement or remove yt_source's dead download=True parameter.
+            # The parameter is accepted by the signature but does nothing: the file is
+            # never named (prepare_filename) or handed back to the caller, so anyone
+            # passing download=True silently gets streaming behavior and no error.
             pass
 
         webpage_url = data["webpage_url"]
