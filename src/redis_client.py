@@ -38,6 +38,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_DURATION,
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
+    StateField.CURRENT_SONG_INTERJECTED,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
@@ -101,6 +102,16 @@ async def cache_set(
         await redis.set(key, orjson.dumps(value), ex=ttl)
     except Exception as e:
         log.warning(f"cache_set failed [{key}]: {e}")
+
+
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+    if redis is None:
+        return
+    try:
+        await redis.delete(key)
+    except Exception as e:
+        log.warning(f"cache_del failed [{key}]: {e}")
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────
@@ -218,6 +229,28 @@ class GuildRedisStore:
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
 
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+        """LPUSH entries so entries[0] ends up at the queue head, and refresh
+        TTL on all guild keys — the -playnow front insert. LPUSH pushes each
+        successive argument to the head, so the batch is reversed first to
+        preserve the given order.
+
+        Failure note (store policy: log, never raise): a swallowed failure
+        here degrades WORSE than a tail-push failure. The in-memory legs end
+        up len(entries) ahead of Redis at the HEAD, so the next commit-time
+        LPOPs retire other songs' entries — a crash before the mismatch
+        drains restores a queue shifted by up to that many songs, not just
+        missing the entries that failed to push."""
+        if not entries:
+            return
+        try:
+            pipe = self.redis.pipeline()
+            pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
+            self._pipe_expire_all(pipe)
+            await pipe.execute()  # type: ignore[misc]
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] Redis push_queue_front failed: {e}")
+
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes the item immediately with no ack.
         # If the bot crashes after this call, the song is lost from Redis.
@@ -244,6 +277,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_REQUESTER_ID: (
                 str(current.requester_id) if current.requester_id else ""
             ),
+            StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }
@@ -585,10 +619,14 @@ class GuildRedisStore:
                 StateField.VOICE_CHANNEL_ID,
                 StateField.TEXT_CHANNEL_ID,
                 *_TRANSIENT_SONG_FIELDS,
-                # last_author_id is no longer written; the HDEL scrubs hashes
-                # left by older builds and is removable after one release. It
-                # is intentionally a literal, not a StateField — it is not part
-                # of the schema.
+                # HACK: last_author_id is dead schema still scrubbed on every disconnect.
+                # Nothing writes this field any more; the HDEL exists only to clean up
+                # state hashes left behind by older builds that did, which is why it is
+                # a bare string literal rather than a StateField constant. Every guild
+                # disconnect now pays to delete a field that cannot exist on any hash
+                # written since that migration.
+                # Safe to delete once no pre-migration hash can still be live — guild
+                # keys carry a 24h TTL, so one release is already more than enough.
                 "last_author_id",
                 *_PLAYBACK_POSITION_FIELDS,
             )

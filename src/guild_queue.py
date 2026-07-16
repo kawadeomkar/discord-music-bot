@@ -17,13 +17,8 @@ finish_failed_dequeue) runs under one bulk-mutation mutex, so no two of them
 can interleave between a memory write and its mirror write. Bulk mutations
 carry a dequeued-but-uncommitted head through untouched (_in_flight_head),
 so a shuffle/remove during a multi-second resolve can't retire the wrong
-entry. One known residual window remains, by design: the playback loop's
-try_commit_dequeue() → pop_queue_and_start_song() handoff releases the mutex
-before the store's atomic LPOP+HSET transaction dispatches (the start
-transaction is a store-level atomicity boundary — see
-GUILD_QUEUE_SCHEMA_PLAN §4); a bulk mutation scheduled in that single
-event-loop tick can race the LPOP server-side. The class also owns the
-cleared-flag the playback loop consumes.
+entry. One residual window remains open — see the ISSUE below. The class also
+owns the cleared-flag the playback loop consumes.
 
 What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md §2.2):
 - stream prefetch (yt-dlp/FFmpeg) — MusicPlayer cancels its prefetch task
@@ -34,6 +29,18 @@ What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md 
 - the state hash — crash recovery hands this class ready-made queue entries
   (SongQueueEntry.from_crashed_state bridges the two schemas)
 """
+
+# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
+# The playback loop's try_commit_dequeue() → pop_queue_and_start_song() handoff releases
+# the bulk mutex before the store's atomic LPOP+HSET transaction dispatches (the start
+# transaction is a store-level atomicity boundary — see GUILD_QUEUE_SCHEMA_PLAN §4). A
+# bulk mutation scheduled in that single event-loop tick therefore races the LPOP
+# server-side: a -clear landing between commit and dispatch lets the transaction pop an
+# entry the clear already deleted, drifting memory and Redis by one entry until the next
+# rebuild — and a crash inside that drift restores the queue one song out of alignment.
+# Documented and accepted so far, never actually fixed.
+# Cheapest fix is to hold the mutex across the store dispatch, costing one ~1ms
+# localhost round-trip. Design: docs/ARCHITECTURE_PLAN.md §3.6.
 
 import asyncio
 import random
@@ -189,6 +196,60 @@ class GuildQueue:
                 for entry in entries:
                     await self._store.push_queue(entry)
 
+    async def put_front(self, items: Sequence[QueueItem]) -> None:
+        """Insert items at the FRONT of the line on all three legs — the
+        -playnow interjection path (docs/PLAYNOW_PROPOSAL.md §4.2).
+
+        Runs under the bulk-mutation mutex like every other multi-leg
+        mutation. An in-flight head (a dequeued-but-uncommitted item, e.g. a
+        completed prefetch awaiting its commit) keeps its position AHEAD of
+        the inserted items on the display leg, and forces the Redis mirror
+        down the rebuild path: the in-flight item's Redis entry is still at
+        the list head awaiting its commit-time LPOP, so a plain LPUSH in
+        front of it would make that LPOP eat the new head instead.
+
+        The in-flight branch is LOAD-BEARING, not defensive — do not remove
+        it as dead code. MusicPlayer.interject() neutralizes the prefetch
+        before calling this, but one interleaving still reaches here with a
+        real in-flight head: the current song ends naturally, the loop
+        synchronously claims a still-running prefetch task and awaits it (up
+        to yt-dlp's socket timeout), and interject() runs inside that await —
+        its neutralize sees no task to take, while the prefetch's dequeued
+        item sits uncommitted at the display head.
+        """
+        if not items:
+            return
+        new_items = list(items)
+        async with self._mutex:
+            drained: list[QueueItem] = []
+            for _ in range(self._pending.qsize()):
+                try:
+                    drained.append(self._pending.get_nowait())
+                    self._pending.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            in_flight = self._in_flight_head(drained_count=len(drained))
+            for item in new_items + drained:
+                self._pending.put_nowait(item)
+            self._display = deque(in_flight + new_items + drained)
+
+            if self._store is None:
+                return
+            if in_flight:
+                entries = [
+                    _to_entry(s)
+                    for s in in_flight + new_items + drained
+                    if is_persisted(s)
+                ]
+                if entries:
+                    await self._store.rebuild_queue(entries)
+                else:
+                    await self._store.delete_queue()
+            else:
+                entries = [_to_entry(s) for s in new_items if is_persisted(s)]
+                if entries:
+                    await self._store.push_queue_front(entries)
+
     # ── Bulk operations ───────────────────────────────────────────────────────
     # Callers with a prefetch task (MusicPlayer) must cancel it BEFORE any of
     # these — a still-running prefetch holds an item from get_nowait(), and
@@ -229,6 +290,13 @@ class GuildQueue:
         An in-flight dequeue (see _in_flight_head) keeps its display/Redis
         head position: shuffling only reorders items still in _pending.
         """
+        # FIXME: -shuffle requires 4 queued songs but tells the user it needs 3.
+        # The threshold here is 4, while MusicPlayer.queue_shuffle() phrases the refusal
+        # as "There must be at least 3 songs to shuffle the queue" and the -shuffle help
+        # text advertises "(3+ songs)". A user with exactly 3 songs queued is therefore
+        # refused by a message stating a requirement they have already met, with no way
+        # to tell what is actually wrong.
+        # Fix: either drop this check to < 3, or correct both user-facing strings to 4.
         if self._pending.qsize() < 4:
             return ShuffleOutcome.TOO_FEW_SONGS
 
@@ -489,4 +557,7 @@ class GuildQueue:
             uploader=entry.uploader,
             thumbnail=entry.thumbnail,
             persisted=entry.persisted,
+            interjected=entry.interjected,
+            is_resume=entry.is_resume,
+            start_paused=entry.start_paused,
         )
