@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 
 from src.config import ENVIRONMENT
+from src.healthz import start_healthz
 from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
@@ -103,6 +104,7 @@ class MusicBotApp(commands.AutoShardedBot):
     async def setup_hook(self) -> None:
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
+        await start_healthz(self)
         for extension in EXTENSIONS:
             await self.load_extension(extension)
 
