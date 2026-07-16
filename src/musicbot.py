@@ -930,7 +930,7 @@ class MusicBot(commands.Cog):
                 # Fix is [-10:] reversed, or the richer rework in
                 # docs/HISTORY_OVERHAUL_PLAN.md (designed, not implemented), which also
                 # adds the missing empty-history notice.
-                q_history = queue_message(list(mp.history)[:10])
+                q_history = queue_message(list(mp.history)[-10:])
                 await ctx.send(
                     embed=notice_embed(q_history, discord.Color.blue(), title="History")
                 )
