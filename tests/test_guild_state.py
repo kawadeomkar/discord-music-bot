@@ -324,9 +324,6 @@ _GOLDEN_QOBJ_UNPERSISTED = (
 )
 _GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
-_GOLDEN_LEGACY_NO_TYPE = (
-    b'{"webpage_url":"https://yt.com/v=3","title":"Legacy","requester_id":7,"ts":null}'
-)
 
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
@@ -363,13 +360,6 @@ class TestSongQueueEntryWire:
 
     def test_reader_parses_golden_bytes(self):
         assert parse_queue_entry(_GOLDEN_QOBJ_FULL) == _FULL_ENTRY
-
-    def test_reader_parses_legacy_entry_without_type_as_song(self):
-        entry = parse_queue_entry(_GOLDEN_LEGACY_NO_TYPE)
-        assert isinstance(entry, SongQueueEntry)
-        assert entry.webpage_url == "https://yt.com/v=3"
-        assert entry.requester_id == 7
-        assert entry.persisted is True  # default when field absent
 
     def test_reader_preserves_persisted_false(self):
         entry = parse_queue_entry(_GOLDEN_QOBJ_UNPERSISTED)
@@ -492,7 +482,7 @@ def _history_entry(**overrides) -> HistoryEntry:
 
 class TestHistoryEntryWire:
     def test_golden_bytes(self):
-        # v2 wire format pinned: rolling restarts mix writers, so the field
+        # Wire format pinned: rolling restarts mix writers, so the field
         # names and value encodings must not drift.
         assert serialize_history_entry(_history_entry()) == (
             b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
@@ -504,24 +494,6 @@ class TestHistoryEntryWire:
     def test_round_trip(self):
         entry = _history_entry()
         assert parse_history_entry(serialize_history_entry(entry)) == entry
-
-    def test_legacy_string_upgrades_to_entry(self):
-        # v1 entries are JSON strings "<title> - <webpage_url>"; the split is
-        # on the LAST " - " because titles may contain the separator.
-        raw = orjson.dumps("Song - With Dash - https://yt.com/v=1")
-        entry = parse_history_entry(raw)
-        assert entry == HistoryEntry(
-            title="Song - With Dash", webpage_url="https://yt.com/v=1"
-        )
-        assert entry.is_legacy
-
-    def test_legacy_string_without_url_becomes_title(self):
-        # A tail that is not a URL must not be mistaken for one.
-        entry = parse_history_entry(orjson.dumps("Artist - Song"))
-        assert entry == HistoryEntry(title="Artist - Song", webpage_url="")
-
-    def test_v2_entry_is_not_legacy(self):
-        assert not _history_entry().is_legacy
 
     def test_unknown_keys_ignored_and_missing_keys_default(self):
         # Forward/backward tolerance: a newer writer's extra field must not
@@ -536,6 +508,9 @@ class TestHistoryEntryWire:
             b"123",
             b"[1, 2]",
             b"",
+            # Pre-overhaul "<title> - <url>" strings: the deployment storage
+            # was recreated, so these no longer parse — they drop as corrupt.
+            b'"Old Song - https://yt.com/v=old"',
             b'{"title": "x", "duration_secs": "not a number"}',
             b'{"title": "x", "played_at": {"nested": true}}',
         ],

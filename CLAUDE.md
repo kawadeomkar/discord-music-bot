@@ -228,7 +228,7 @@ full play history is never lost to idle expiry. **The schema is defined in one p
 | `guild:{id}:state` | Hash | 12 fields: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_*` (url/title/duration/uploader/requester_id/interjected — a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` → `GuildStateData` |
 | `guild:{id}:now_playing` | Hash | 12 display fields for the recovered Now Playing embed → `NowPlayingData` |
 | `guild:{id}:queue` | List | JSON entries, `"type"`-discriminated → `SongQueueEntry` / `SearchQueueEntry` (RPUSH on enqueue, LPOP inside the atomic start transaction) |
-| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first; legacy `"title - url"` strings still parse) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
+| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
 | `lock:guild:{id}:recovery` | String | `"1"`, TTL 60s (SET NX — distributed lock) |
 | `ytdl:stream:{webpage_url}` | String | JSON stream data; TTL = `expire − now − 1800s` |
 | `ytdl:source:{normalized search}` | String | Search→`(webpage_url, title)` resolution; TTL 1h |

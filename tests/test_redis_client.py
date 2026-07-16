@@ -327,19 +327,11 @@ class TestGetHistory:
         await store.push_history(_hentry(1))
         assert await store.get_history() == [_hentry(1)]
 
-    async def test_parses_legacy_string_entries(self, store, fake_redis):
-        # Pre-migration lists hold JSON strings; they upgrade on read.
-        await fake_redis.lpush(
-            store.history_key(), orjson.dumps("Old Song - https://yt.com/v=old")
-        )
-        assert await store.get_history() == [
-            HistoryEntry(title="Old Song", webpage_url="https://yt.com/v=old")
-        ]
-
     async def test_drops_corrupt_entries(self, store, fake_redis):
         await fake_redis.lpush(store.history_key(), _hentry(1).to_redis())
         await fake_redis.lpush(store.history_key(), b"not json")
         await fake_redis.lpush(store.history_key(), orjson.dumps([1, 2]))
+        await fake_redis.lpush(store.history_key(), orjson.dumps("a bare string"))
         assert await store.get_history() == [_hentry(1)]
 
     async def test_returns_empty_list_when_missing(self, store):

@@ -156,18 +156,5 @@ class TestHistoryEmbeds:
         )
         assert "requested by SomeUser" in embed.description
 
-    def test_legacy_entry_degrades(self):
-        legacy = HistoryEntry(title="Old Song", webpage_url="https://yt.com/v=old")
-        [embed] = history_embeds([legacy])
-        assert embed.description.splitlines() == [
-            "https://yt.com/v=old",
-            "*played before the history upgrade*",
-        ]
-        assert embed.thumbnail.url is None
-
-    def test_legacy_entry_without_url(self):
-        [embed] = history_embeds([HistoryEntry(title="Old Song")])
-        assert embed.description == "*played before the history upgrade*"
-
     def test_empty_input(self):
         assert history_embeds([]) == []

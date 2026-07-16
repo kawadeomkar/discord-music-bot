@@ -503,11 +503,10 @@ QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 def parse_queue_entry(data: bytes) -> QueueEntry | None:
     """Deserialize one queue-list entry into a value object.
 
-    Entries without a "type" field are legacy writes from before the
-    discriminator existed and parse as songs. Corrupt entries (bad JSON,
-    missing required fields) return None with a warning — the entry is
-    dropped and the rest of the queue survives, matching the original
-    _deserialize_queue_item behavior.
+    The "type" field discriminates search entries from songs. Corrupt
+    entries (bad JSON, missing required fields) return None with a warning —
+    the entry is dropped and the rest of the queue survives, matching the
+    original _deserialize_queue_item behavior.
     """
     try:
         d = orjson.loads(data)
@@ -538,14 +537,7 @@ def parse_queue_entry(data: bytes) -> QueueEntry | None:
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
-# One JSON value per entry, newest-first. Two generations share the list, and
-# the JSON *type* is the discriminator (no version field):
-#   v1 (legacy): a JSON string "<title> - <webpage_url>" — written before
-#       HistoryEntry existed; upgraded on parse, never written anymore.
-#   v2: a JSON object of HistoryEntryField keys.
-# Compatibility is one-way by design: new readers accept both generations; an
-# old reader sees a v2 dict as "not a string" and drops it with a warning
-# (docs/HISTORY_OVERHAUL_PLAN.md §3).
+# One JSON object of HistoryEntryField keys per entry, newest-first.
 
 
 class HistoryEntryField:
@@ -564,9 +556,9 @@ class HistoryEntryField:
 class HistoryEntry:
     """One played song at rest — an element of guild:{id}:history.
 
-    Zero-values mean "unknown": legacy v1 entries upgrade with only
-    title/webpage_url populated, and the display layer degrades accordingly.
-    The field set deliberately matches the future Postgres play_history row
+    Zero-values mean "unknown": fields absent on the wire default on parse,
+    and the display layer degrades accordingly. The field set deliberately
+    matches the future Postgres play_history row
     (docs/HISTORY_OVERHAUL_PLAN.md §8).
     """
 
@@ -574,17 +566,11 @@ class HistoryEntry:
     webpage_url: str = ""  # YouTube link used
     duration_secs: int = 0  # full song length; 0 = unknown
     played_secs: int = 0  # audio position reached when the song ended
-    requester_id: int = 0  # 0 = unknown (legacy entries)
+    requester_id: int = 0  # 0 = unknown
     requester_name: str = ""  # display_name at play time; survives member departure
     thumbnail: str = ""
     uploader: str = ""
     played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
-
-    @property
-    def is_legacy(self) -> bool:
-        """True for a v1 entry upgraded on parse — played_at is never 0.0 on a
-        v2 write, so it doubles as the generation marker for display."""
-        return self.played_at == 0.0
 
     @classmethod
     def from_song(cls, song: YTDL, *, played_at: float) -> Self:
@@ -614,19 +600,8 @@ class HistoryEntry:
             played_at=played_at,
         )
 
-    @classmethod
-    def from_legacy(cls, entry: str) -> Self:
-        """Upgrade a v1 "<title> - <webpage_url>" string. Titles may themselves
-        contain " - ", so split on the LAST separator and only trust the tail
-        as a URL when it looks like one; otherwise the whole string is the
-        title. All other fields stay at zero-values (unknown)."""
-        title, sep, url = entry.rpartition(" - ")
-        if sep and url.startswith(("http://", "https://")):
-            return cls(title=title, webpage_url=url)
-        return cls(title=entry)
-
     def to_redis(self) -> bytes:
-        """Serialize to the v2 wire format. Field table spelled out (same
+        """Serialize to the wire format. Field table spelled out (same
         rationale as NowPlayingData.to_redis_mapping): the wire schema is
         pinned to HistoryEntryField, not to Python attribute names."""
         return orjson.dumps(
@@ -649,18 +624,16 @@ def serialize_history_entry(entry: HistoryEntry) -> bytes:
 
 
 def parse_history_entry(data: bytes) -> HistoryEntry | None:
-    """Deserialize one history-list entry, either generation. Corrupt entries
-    (bad JSON, wrong JSON type, malformed fields) return None with a warning —
-    the entry is dropped and the rest of the history survives, matching
-    parse_queue_entry. Unknown dict keys are ignored and missing keys default,
-    so mixed-build readers stay tolerant in both directions."""
+    """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong
+    JSON type, malformed fields) return None with a warning — the entry is
+    dropped and the rest of the history survives, matching parse_queue_entry.
+    Unknown dict keys are ignored and missing keys default, so mixed-build
+    readers stay tolerant in both directions."""
     try:
         entry = orjson.loads(data)
     except Exception as e:
         log.warning(f"guild_state: corrupt history entry dropped: {e}")
         return None
-    if isinstance(entry, str):
-        return HistoryEntry.from_legacy(entry)
     if not isinstance(entry, dict):
         log.warning(
             f"guild_state: corrupt history entry dropped: unexpected JSON type ({type(entry).__name__})"

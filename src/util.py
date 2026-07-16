@@ -95,27 +95,23 @@ def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
     Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
     webpage_url on its own line (Discord auto-links it), then one line with
     played/duration, requester, and the absolute played-at timestamp
-    (<t:…:f> — viewer-local absolute date/time). Legacy pre-upgrade entries
-    have no metadata and degrade to a marker line; nothing is fabricated.
+    (<t:…:f> — viewer-local absolute date/time).
     """
     embeds = []
     for i, entry in enumerate(entries, start=1):
         lines = []
         if entry.webpage_url:
             lines.append(entry.webpage_url)
-        if entry.is_legacy:
-            lines.append("*played before the history upgrade*")
-        else:
-            requested_by = (
-                f"<@{entry.requester_id}>"
-                if entry.requester_id
-                else (entry.requester_name or "unknown")
-            )
-            lines.append(
-                f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
-                f" · requested by {requested_by}"
-                f" · <t:{int(entry.played_at)}:f>"
-            )
+        requested_by = (
+            f"<@{entry.requester_id}>"
+            if entry.requester_id
+            else (entry.requester_name or "unknown")
+        )
+        lines.append(
+            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
+            f" · requested by {requested_by}"
+            f" · <t:{int(entry.played_at)}:f>"
+        )
         embed = discord.Embed(
             title=f"{i}. {entry.title}",
             description="\n".join(lines),
