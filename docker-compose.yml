@@ -33,12 +33,16 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
+    # Keep these flags in sync with the redis args in
+    # deploy/k8s/base/redis-statefulset.yaml (which carries the mirror of this
+    # comment) — EXCEPT --maxmemory, which the k8s production overlay
+    # deliberately raises (docs/K8S_DEPLOYMENT_PLAN.md §3.5).
     command: >
       redis-server
       --appendonly yes
       --appendfsync everysec
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
     ports:
       - "127.0.0.1:6379:6379"
     volumes:

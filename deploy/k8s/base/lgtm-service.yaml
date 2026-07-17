@@ -1,0 +1,23 @@
+# ClusterIP only — same localhost-only posture as compose (which binds
+# 127.0.0.1). Grafana UI access is via port-forward, matching compose's 3014:
+#   kubectl -n discord-music-bot port-forward svc/lgtm 3014:3000
+apiVersion: v1
+kind: Service
+metadata:
+  name: lgtm
+  labels:
+    app: lgtm
+spec:
+  type: ClusterIP
+  selector:
+    app: lgtm
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: grafana
+      port: 3000
+      targetPort: grafana

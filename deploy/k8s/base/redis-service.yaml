@@ -1,0 +1,17 @@
+# Plain ClusterIP (not headless): the bot only needs the stable DNS name
+# redis:6379 (ConfigMap REDIS_URL); per-pod identity DNS buys nothing for a
+# single replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

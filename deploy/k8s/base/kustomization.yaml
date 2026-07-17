@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Everything structural lives here with dev-friendly sizing defaults; the
+# production overlay patches on capacity (docs/K8S_DEPLOYMENT_PLAN.md §3.5).
+namespace: discord-music-bot
+
+resources:
+  - namespace.yaml
+  - priorityclass.yaml
+  - configmap.yaml
+  - bot-deployment.yaml
+  - redis-statefulset.yaml
+  - redis-service.yaml
+  - lgtm-deployment.yaml
+  - lgtm-service.yaml
+  - lgtm-pvc.yaml
+  - ytdlp-cache-pvc.yaml

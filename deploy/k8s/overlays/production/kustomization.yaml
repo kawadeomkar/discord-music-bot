@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# k3s server — where production-grade diverges from the dev-sized base:
+# ENVIRONMENT, the §3.5 capacity model, and Redis maxmemory. The bot's image
+# name/tag live in NO overlay — k8s_common.sh injects them per-deploy
+# (docs/K8S_DEPLOYMENT_PLAN.md §6.2); the base pins a never-existing sentinel
+# tag so a raw apply fails loud instead of running stale bytes.
+resources:
+  - ../../base
+
+patches:
+  - path: configmap-patch.yaml
+  - path: bot-resources-patch.yaml
+  - path: redis-patch.yaml
+  - path: lgtm-resources-patch.yaml
+  # Uncomment if the GHCR package is private (requires the ghcr-pull Secret —
+  # see deploy/k8s/README.md bootstrap):
+  # - path: pull-secret-patch.yaml

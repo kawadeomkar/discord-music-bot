@@ -642,6 +642,13 @@ class GuildRedisStore:
     def _recovery_lock_key(self) -> str:
         return f"lock:guild:{self.guild_id}:recovery"
 
+    # FIXME: Redis failures during lock acquisition masquerade as a held lock.
+    # A connection error returns False, which the caller logs as "recovery lock
+    # held by another instance" and skips crash recovery for that guild — seen
+    # for all 7 guilds during a bot-before-redis boot race (2026-07-17, k8s dev
+    # cluster). A genuinely crashed guild's playback would never be restored on
+    # that boot. Distinguish the failure (raise, or return a tri-state) so the
+    # caller can retry or at least warn accurately.
     async def acquire_recovery_lock(self) -> bool:
         """SET NX EX — True if this instance won the lock, False if another holds it."""
         try:

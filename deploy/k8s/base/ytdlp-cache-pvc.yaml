@@ -1,0 +1,13 @@
+# Player JS + EJS-solved sig/n challenges — small, and the count doesn't
+# scale with guilds. A real PVC (not emptyDir) so Recreate deploys don't
+# re-pay the player fetch + challenge solve on the first song (the same cost
+# the compose ytdlp-cache volume exists to avoid).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ytdlp-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi

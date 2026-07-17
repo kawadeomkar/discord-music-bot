@@ -3,6 +3,9 @@ pyproject.bak.toml
 pyrightconfig.json
 docs/
 
+# k8s_common.sh's transient per-deploy kustomization (image injection)
+deploy/k8s/.deploy/
+
 # Claude Code
 .claude/
 

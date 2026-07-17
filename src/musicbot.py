@@ -206,6 +206,15 @@ class MusicBot(commands.Cog):
             span.record_exception(error)
             span.set_status(StatusCode.ERROR, str(error))
 
+        # FIXME: Unhandled command errors vanish without a single log line.
+        # Defining cog_command_error suppresses discord.py's default
+        # on_command_error logging, and this handler only acts on
+        # MissingRequiredArgument — every other exception is recorded on the
+        # OTel span and then dropped. Observed 2026-07-17: Discord REST 500s
+        # made -play fail totally silently (no reply, no log); the cause was
+        # only recoverable from the Tempo trace. Log unhandled errors here
+        # before returning.
+
         # validate_commands already sends its own message before raising CommandError,
         # so only handle errors that produce no user-visible output.
         if isinstance(error, commands.MissingRequiredArgument):

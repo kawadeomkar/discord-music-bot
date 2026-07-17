@@ -1,0 +1,44 @@
+# Capacity-sized Redis (§3.5). --maxmemory 2gb is a deliberate, documented
+# divergence from compose's 256mb: the yt-dlp stream cache is the perf
+# backbone (evicting it early re-adds 3–4s to every song start), and once
+# task/history-overhaul merges, persistent history keys are not evictable at
+# all — thousands of guilds × unbounded history must fit UNDER maxmemory or
+# Redis starts refusing writes. The eviction *policy* must still mirror
+# docker-compose.yml (volatile-lru when that branch merges).
+#
+# args is a scalar list — a strategic-merge patch REPLACES it wholesale, so
+# the full flag set is restated here.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          # args is replaced wholesale, not merged — every flag from the base
+          # must be restated here or it is silently dropped. Only --maxmemory
+          # differs (2gb vs the base's 256mb); --maxmemory-policy must stay
+          # volatile-lru, since allkeys-* would make the TTL-less
+          # guild:{id}:history keys evictable (see base/redis-statefulset.yaml).
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 2gb
+            - --maxmemory-policy
+            - volatile-lru
+          # requests = limits on BOTH resources → Guaranteed QoS: last to be
+          # evicted. Memory = 2× maxmemory (AOF-rewrite fork COW can
+          # transiently double RSS).
+          resources:
+            requests:
+              memory: 4Gi
+              cpu: "1"
+            limits:
+              memory: 4Gi
+              cpu: "1"

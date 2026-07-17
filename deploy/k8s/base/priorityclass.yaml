@@ -1,0 +1,12 @@
+# Eviction ordering under node pressure (docs/K8S_DEPLOYMENT_PLAN.md §3.5):
+# this class on the bot pod, plus Redis's Guaranteed QoS, pins the order to
+# lgtm first, pot-provider second, bot/redis last. The bot pod stays Burstable
+# deliberately (its usage genuinely varies with concurrently-playing guilds);
+# priority is what protects it, not QoS class.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: discord-music-bot-critical
+value: 1000
+globalDefault: false
+description: "Bot pod outlives observability and sidecar pods under node-pressure eviction."

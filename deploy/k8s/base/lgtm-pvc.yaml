@@ -1,0 +1,33 @@
+# 20Gi each — sized WITH retention configured: Tempo/Loki defaults keep data
+# indefinitely; set the otel-lgtm retention env knobs (~7 days is plenty) —
+# see deploy/k8s/README.md. Dev warning: Docker Desktop's "Reset Kubernetes
+# Cluster" destroys all PVs — back up first (README backup procedure).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otel-grafana
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otel-tempo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: otel-loki
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi

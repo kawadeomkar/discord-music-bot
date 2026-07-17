@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discord-music-bot
+  labels:
+    app: discord-music-bot
+spec:
+  replicas: 1
+  # Singleton bot: RollingUpdate would run old+new concurrently — two gateway
+  # sessions, double audio on one token. Recreate guarantees the old pod is
+  # gone first; the recovery lock (lock:guild:{id}:recovery) is the backstop.
+  # replicas: 1 + Recreate is a correctness requirement, not a starting point
+  # (docs/K8S_DEPLOYMENT_PLAN.md §3.2, §3.9).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: discord-music-bot
+  template:
+    metadata:
+      labels:
+        app: discord-music-bot
+    spec:
+      # No SIGTERM handler by design: the kill leaves the voice/text channel
+      # pair in Redis, so the next pod's on_ready crash recovery reconnects
+      # and resumes playback mid-song (§3.6). A long drain buys nothing — the
+      # process does no useful work after SIGTERM.
+      terminationGracePeriodSeconds: 10
+      # Under node pressure, evict lgtm first, pot-provider second — never
+      # the bot (§3.5 eviction ordering; Redis is protected by Guaranteed QoS).
+      priorityClassName: discord-music-bot-critical
+      containers:
+        - name: bot
+          # Sentinel tag — deliberately never exists. k8s_common.sh's transient
+          # kustomization (plan §6.2) is the ONLY thing that sets the real
+          # image (repo + immutable SHA tag), so a raw `kubectl apply -k` of
+          # an overlay fails loud (ImagePullBackOff) instead of silently
+          # running stale bytes.
+          image: discord-music-bot:deploy-via-build-k8s-sh
+          # dev: the image lives in Docker Desktop's shared daemon store — the
+          # tag names no registry, so any pull attempt would fail; prod: sha-
+          # tags are immutable, re-pull buys nothing.
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: discord-music-bot-secrets
+            - configMapRef:
+                name: discord-music-bot-config
+          ports:
+            - name: healthz
+              containerPort: 8080
+          # Startup at thousands of guilds is legitimately slow: AutoShardedBot
+          # identifies shards serially (~5s each, Discord-enforced) and
+          # on_ready runs per-guild crash recovery. The startupProbe owns that
+          # window (up to 10 min) so liveness can stay tight without killing a
+          # booting pod. k8s_common.sh's rollout timeout (660s) must exceed
+          # this probe's budget.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            periodSeconds: 10
+            failureThreshold: 60
+          # Deliberately dumb — "is the event loop alive and serving?" — never
+          # gateway state: non-200 on not-ready would make the kubelet restart
+          # the pod during a Discord outage (§3.4). httpGet because the runtime
+          # image ships no curl/wget for an exec probe. No readiness probe at
+          # all: the pod receives no inbound traffic, so readiness gates
+          # nothing.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            periodSeconds: 30
+            failureThreshold: 4
+          volumeMounts:
+            # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges.
+            # A PVC, not emptyDir — Recreate replaces the pod on every deploy,
+            # and an emptyDir would re-pay the player fetch + challenge solve
+            # on the first song after each one. Path is root's cache dir (the
+            # runtime image has no USER directive).
+            - name: ytdlp-cache
+              mountPath: /root/.cache/yt-dlp
+          # Base = dev sizing (a test guild, not load). The production overlay
+          # patches on the §3.5 capacity model: 4Gi request / 16Gi limit, no
+          # CPU limit — transcode load is legitimate.
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 250m
+            limits:
+              memory: 2Gi
+        # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a
+        # fallback client (docs/PO_TOKEN_SIDECAR_PLAN.md). Same-pod loopback
+        # means the plugin's http://127.0.0.1:4416 default works unchanged —
+        # no Service, no DNS. A sidecar crash restarts only this container;
+        # the bot degrades gracefully meanwhile (sidecar plan §3.3).
+        #
+        # Version lockstep: this tag must match the bgutil-ytdlp-pot-provider
+        # pin in pyproject.toml — plugin and server are released together;
+        # bump both (same convention as docker-compose.yml).
+        - name: pot-provider
+          image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
+          ports:
+            - name: pot
+              containerPort: 4416
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: pot
+            periodSeconds: 30
+          # Token minting scales with cache-miss extractions, not playback.
+          # Production overlay: 256Mi/100m requests, 1Gi/1 limits (§3.5).
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 50m
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: ytdlp-cache
+          persistentVolumeClaim:
+            claimName: ytdlp-cache

@@ -1,0 +1,17 @@
+# Trace volume scales with command + playback rate. Capped (memory limit, no
+# priority) so an ingest burst is evicted before it can squeeze the bot.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lgtm
+spec:
+  template:
+    spec:
+      containers:
+        - name: lgtm
+          resources:
+            requests:
+              memory: 2Gi
+              cpu: 500m
+            limits:
+              memory: 6Gi

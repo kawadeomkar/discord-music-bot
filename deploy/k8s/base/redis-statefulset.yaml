@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # Keep these flags in sync with the redis `command:` in
+          # docker-compose.yml (which carries the mirror of this comment) —
+          # EXCEPT --maxmemory, which the production overlay deliberately
+          # raises to 2gb (docs/K8S_DEPLOYMENT_PLAN.md §3.5).
+          # volatile-lru, never allkeys-*: guild:{id}:history carries no TTL,
+          # so under allkeys-* it is an eviction candidate and memory pressure
+          # would silently delete unrecoverable play history (CLAUDE.md
+          # "Redis schema overview"). Only the TTL'd caches may be evicted.
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - volatile-lru
+          ports:
+            - name: redis
+              containerPort: 6379
+          # Mirrors the compose healthcheck (redis:7-alpine ships redis-cli).
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          # requests = limits (cpu AND memory) → Guaranteed QoS: the state
+          # store must be the last thing node-pressure eviction touches.
+          # Base = dev sizing with compose-parity maxmemory; the production
+          # overlay patches to 4Gi/1cpu (container memory = 2× maxmemory —
+          # AOF-rewrite fork COW can transiently double RSS).
+          resources:
+            requests:
+              memory: 384Mi
+              cpu: 250m
+            limits:
+              memory: 384Mi
+              cpu: 250m
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # AOF ≈ 2–3× data size plus rewrite headroom. Neither hostpath (dev)
+        # nor local-path (prod) enforces size — the number documents intent
+        # and ports unchanged to any enforcing provisioner.
+        # storageClassName is omitted throughout so each cluster's default
+        # binds (hostpath on Docker Desktop, local-path on k3s).
+        resources:
+          requests:
+            storage: 10Gi

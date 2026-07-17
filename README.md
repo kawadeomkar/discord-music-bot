@@ -101,6 +101,31 @@ docker build -t discord-music-bot .
 docker run --env-file .env --network host discord-music-bot
 ```
 
+## Kubernetes
+
+An additional deployment pipeline — Docker Compose above stays fully supported. Same
+image, same test gate, same secrets; the pipelines diverge only at the "run it" step.
+Two clusters deploy from one Kustomize base (`deploy/k8s/`):
+
+```bash
+./build_k8s_dev.sh    # Docker Desktop's built-in Kubernetes: local test gate +
+                      # local image build, no registry round-trip
+./build_k8s_prod.sh   # k3s server: deploy-only, provenance-gated — HEAD must be
+                      # on origin/main with its CI-built image already in GHCR
+
+./k8s_down.sh dev             # the `docker compose down` peer: workloads go, PVCs
+                              # and Secrets stay (--stop to just scale to zero)
+./k8s_down.sh dev --volumes   # also deletes PVCs — DESTROYS play history (confirms)
+```
+
+Teardown modes and the data they keep are documented in `deploy/k8s/README.md`.
+Note that `kubectl delete -k` is **not** a safe "down" here — it deletes the
+Namespace and cascades into every PVC and Secret; use the script.
+
+Only one environment runs the bot at a time (single Discord token). Setup, secret
+bootstrap, and the operational cheat-sheet (rollback, logs, Grafana port-forward,
+history backup) live in [deploy/k8s/README.md](deploy/k8s/README.md).
+
 ## Development
 
 **Install dev dependencies**

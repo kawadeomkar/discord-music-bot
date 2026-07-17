@@ -1,0 +1,37 @@
+# §3.5 capacity model, budgeted for S = 250 concurrently-playing guilds
+# (≈ 2,500–5,000 guilds' worth of peak playback; scale the bot row linearly
+# for a different S). Re-baseline after a week of Grafana data at real load —
+# within this model, not back down to hobby scale.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discord-music-bot
+spec:
+  template:
+    spec:
+      containers:
+        # ~400 MB base RSS (AutoShardedBot at thousands of guilds) + S × ~50 MB
+        # (one FFmpeg per playing guild) + yt-dlp pool. S=250 → ~13 GB worst
+        # case; 16Gi limit gives margin. Re-budget when the ProcessPool lands
+        # (ARCHITECTURE_PLAN §3.1): YTDLP_POOL_WORKERS × ~80–120 MB.
+        # No CPU limit — transcode load is legitimate; requests protect
+        # neighbors, the node absorbs peaks.
+        - name: bot
+          resources:
+            requests:
+              memory: 4Gi
+              cpu: "2"
+            limits:
+              memory: 16Gi
+        # Token minting scales with cache-miss extractions, not playback; the
+        # 25-entry token cache keeps steady-state light even at high S. Sized
+        # up from the single-guild numbers for burst headroom (mass playlist
+        # enqueues).
+        - name: pot-provider
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+              cpu: "1"

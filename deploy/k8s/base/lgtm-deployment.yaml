@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lgtm
+  labels:
+    app: lgtm
+spec:
+  replicas: 1
+  # Recreate: three RWO PVCs + Grafana's sqlite must never be double-mounted
+  # by a RollingUpdate's briefly-overlapping pods.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: lgtm
+  template:
+    metadata:
+      labels:
+        app: lgtm
+    spec:
+      containers:
+        - name: lgtm
+          image: grafana/otel-lgtm:latest
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            # From the dedicated grafana-admin Secret — deliberately NOT in
+            # discord-music-bot-secrets, which is envFrom-mounted into the bot
+            # (the bot has no business carrying Grafana's admin password).
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: GF_SECURITY_ADMIN_PASSWORD
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: grafana
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: grafana
+            periodSeconds: 10
+          # Four backends in a trench coat — cap it so an ingest burst can't
+          # squeeze the bot. Base = dev sizing; production overlay raises to
+          # 2Gi/500m requests, 6Gi limit (§3.5). Evicted first under node
+          # pressure (no PriorityClass, Burstable QoS) — by design.
+          resources:
+            requests:
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: grafana-data
+              mountPath: /var/lib/grafana
+            - name: tempo-data
+              mountPath: /tmp/tempo
+            - name: loki-data
+              mountPath: /tmp/loki
+      volumes:
+        - name: grafana-data
+          persistentVolumeClaim:
+            claimName: otel-grafana
+        - name: tempo-data
+          persistentVolumeClaim:
+            claimName: otel-tempo
+        - name: loki-data
+          persistentVolumeClaim:
+            claimName: otel-loki

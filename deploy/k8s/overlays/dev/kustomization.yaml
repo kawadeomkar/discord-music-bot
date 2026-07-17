@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Deliberately thin: dev's job is to validate the exact objects production
+# runs (Recreate semantics, probes, sidecar wiring, ConfigMap/Secret
+# plumbing). Only sizing, image source, and ENVIRONMENT legitimately differ,
+# and those are production's patches — the base's defaults ARE the dev
+# sizing. This overlay exists so both targets deploy the same way:
+#   ./build_k8s_dev.sh   (docker-desktop context)
+resources:
+  - ../../base
