@@ -15,8 +15,10 @@ def app():
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
-    # BotBase stores cogs in a name-mangled dict; initialize it so the property works.
-    instance._BotBase__cogs = {}
+    # BotBase stores cogs in a name-mangled private dict; initialize it so the
+    # property works. Set via setattr: the mangled name is deliberately not part
+    # of BotBase's declared surface, so it is invisible to the type checker.
+    setattr(instance, "_BotBase__cogs", {})
     # discord.Client properties (user, guilds, intents) read from _connection.
     conn = MagicMock()
     conn.user = None
@@ -24,8 +26,10 @@ def app():
     conn.intents = MagicMock()
     conn.intents.voice_states = True
     instance._connection = conn
-    # latency reads self.ws; None → returns float('nan'), which is fine for logging.
-    instance.ws = None
+    # latency reads self.ws and returns float('nan') for any falsy value, which
+    # is fine for logging. MISSING is discord.py's own "not connected yet"
+    # sentinel and is falsy, so it takes that same branch.
+    instance.ws = discord.utils.MISSING
     instance.change_presence = AsyncMock()
     return instance
 

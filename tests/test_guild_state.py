@@ -3,9 +3,13 @@
 import dataclasses
 import logging
 from types import SimpleNamespace
+from typing import cast
 
+import discord
 import pytest
 
+from src.sources import YTSource
+from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -197,43 +201,68 @@ class TestGuildStateDataImmutability:
     def test_frozen_assignment_raises(self):
         data = GuildStateData()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            data.volume = 0.5  # type: ignore[misc]
+            setattr(data, "volume", 0.5)
 
     def test_slots_reject_unknown_attributes(self):
         data = GuildStateData()
         with pytest.raises((AttributeError, TypeError)):
-            data.unknown_attr = 1  # type: ignore[attr-defined]
+            setattr(data, "unknown_attr", 1)
 
 
-def _full_song_stub() -> SimpleNamespace:
-    return SimpleNamespace(
-        title="Test Song",
-        webpage_url="https://youtu.be/abc",
-        uploader="Test Channel",
-        duration="4:00",
-        thumbnail="https://img/x.jpg",
-        views=1000,
-        likes=50,
-        abr=128,
-        asr=48000,
-        acodec="opus",
-        requester=SimpleNamespace(id=333, mention="<@333>"),
+def _requester_stub(user_id: int, mention: str | None = None) -> discord.Member:
+    """A stand-in for the requester Member.
+
+    from_song/from_queue_object only ever read .id and .mention off it, and a
+    real Member needs a live connection state to construct.
+    """
+    return cast(
+        discord.Member,
+        SimpleNamespace(id=user_id, mention=mention or f"<@{user_id}>"),
     )
 
 
-def _empty_song_stub() -> SimpleNamespace:
-    return SimpleNamespace(
-        title=None,
-        webpage_url=None,
-        uploader=None,
-        duration=None,
-        thumbnail=None,
-        views=None,
-        likes=None,
-        abr=None,
-        asr=None,
-        acodec=None,
-        requester=None,
+def _full_song_stub() -> YTDL:
+    """A stand-in for a streamed song.
+
+    YTDL subclasses FFmpegOpusAudio, so building a real one spawns an FFmpeg
+    subprocess. NowPlayingData.from_song only reads plain metadata attributes,
+    so a namespace carrying them is a faithful substitute.
+    """
+    return cast(
+        YTDL,
+        SimpleNamespace(
+            title="Test Song",
+            webpage_url="https://youtu.be/abc",
+            uploader="Test Channel",
+            duration="4:00",
+            thumbnail="https://img/x.jpg",
+            views=1000,
+            likes=50,
+            abr=128,
+            asr=48000,
+            acodec="opus",
+            requester=_requester_stub(333),
+        ),
+    )
+
+
+def _empty_song_stub() -> YTDL:
+    """As _full_song_stub, with every optional metadata field unset."""
+    return cast(
+        YTDL,
+        SimpleNamespace(
+            title=None,
+            webpage_url=None,
+            uploader=None,
+            duration=None,
+            thumbnail=None,
+            views=None,
+            likes=None,
+            abr=None,
+            asr=None,
+            acodec=None,
+            requester=None,
+        ),
     )
 
 
@@ -294,7 +323,7 @@ class TestNowPlayingDataImmutability:
     def test_frozen_assignment_raises(self):
         data = NowPlayingData()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            data.title = "x"  # type: ignore[misc]
+            setattr(data, "title", "x")
 
 
 # ── Queue-entry value objects ─────────────────────────────────────────────────
@@ -401,10 +430,10 @@ class TestSongQueueEntryWire:
         assert entry.requester_id == 222222222222222222  # no float path
 
     def test_from_queue_object(self):
-        item = SimpleNamespace(
+        item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
-            requester=SimpleNamespace(id=222222222222222222),
+            requester=_requester_stub(222222222222222222),
             ts=30,
             user_input="golden song",
             duration=240,
@@ -418,10 +447,10 @@ class TestSongQueueEntryWire:
         assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
 
     def test_from_queue_object_carries_playnow_flags(self):
-        item = SimpleNamespace(
+        item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
-            requester=SimpleNamespace(id=222222222222222222),
+            requester=_requester_stub(222222222222222222),
             ts=151,
             user_input=None,
             duration=240,
@@ -452,7 +481,7 @@ class TestSearchQueueEntryWire:
         assert parse_queue_entry(entry.to_redis()) == entry
 
     def test_from_ytsource(self):
-        source = SimpleNamespace(ytsearch="ytsearch:x", url=None, process=True, ts=None)
+        source = YTSource(ytsearch="ytsearch:x", url=None, process=True, ts=None)
         entry = SearchQueueEntry.from_ytsource(source)
         assert entry == SearchQueueEntry(ytsearch="ytsearch:x", process=True)
 
@@ -582,7 +611,7 @@ class TestGuildPlaybackSnapshot:
     def test_frozen(self):
         snap = GuildPlaybackSnapshot(state=GuildStateData())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            snap.queue = ()  # type: ignore[misc]
+            setattr(snap, "queue", ())
 
 
 class TestGuildRecoveryGate:
@@ -607,15 +636,15 @@ class TestGuildRecoveryGate:
     def test_frozen(self):
         gate = GuildRecoveryGate(state=GuildStateData())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            gate.pending_count = 5  # type: ignore[misc]
+            setattr(gate, "pending_count", 5)
 
 
 class TestQueueEntryImmutability:
     def test_song_entry_frozen(self):
         with pytest.raises(dataclasses.FrozenInstanceError):
-            _FULL_ENTRY.title = "x"  # type: ignore[misc]
+            setattr(_FULL_ENTRY, "title", "x")
 
     def test_search_entry_frozen(self):
         entry = SearchQueueEntry()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            entry.url = "x"  # type: ignore[misc]
+            setattr(entry, "url", "x")

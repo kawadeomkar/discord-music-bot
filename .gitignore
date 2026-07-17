@@ -1,6 +1,5 @@
 # Ignore
 pyproject.bak.toml
-pyrightconfig.json
 docs/
 
 # Claude Code

@@ -37,19 +37,29 @@ jobs:
         with:
           path: .venv
           # Key on poetry.lock — only invalidates when dependency versions change.
-          key: venv-lint-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-lint-${{ runner.os }}-py3.14-
+          # The installed group set is part of the key: keying on poetry.lock
+          # alone would restore a venv built from a different --only= list and
+          # never re-save it (actions/cache skips saving on an exact key hit),
+          # re-installing the difference on every run.
+          key: venv-lint-${{ runner.os }}-py3.14-main-lint-test-${{ hashFiles('poetry.lock') }}
+          restore-keys: venv-lint-${{ runner.os }}-py3.14-main-lint-test-
 
       - name: Install dependencies
         run: |
           poetry config virtualenvs.in-project true
-          poetry install --only=main,lint --no-root
+          # `test` is here for pyright, not to run tests: it type-checks tests/,
+          # which imports pytest and fakeredis. Without them every such import
+          # is an unresolved-import error.
+          poetry install --only=main,lint,test --no-root
 
       - name: black --check
         run: poetry run black --check src/ tests/
 
+      # No path argument: check src/ AND tests/, matching black above and the
+      # bare `pyright` developers run locally. Checking only src/ is what let
+      # tests/ accumulate 67 type errors unnoticed.
       - name: pyright
-        run: poetry run pyright src/
+        run: poetry run pyright
 
   test:
     name: Test Suite

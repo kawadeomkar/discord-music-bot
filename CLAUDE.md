@@ -14,19 +14,24 @@ poetry run pytest
 # Run a single test
 poetry run pytest tests/test_sources.py::TestParseUrlYouTube::test_youtube_watch_url
 
-# Type-check
-python -m pyright src/
+# Type-check (src/ AND tests/ — no path argument; this is what CI runs)
+poetry run pyright
 
 # Format
-poetry run black src/
+poetry run black src/ tests/
 ```
+
+Both must be clean to merge; CI runs exactly these. Pyright is configured in one
+place — `[tool.pyright]` in `pyproject.toml`. Never add a `pyrightconfig.json`:
+it silently takes precedence over that section, which is how editors and CI
+drifted onto different settings before.
 
 The bot requires a `.env` file in the project root with `DISCORD_TOKEN`, `SPOTIFY_CLIENT_ID`, and `SPOTIFY_CLIENT_SECRET`.
 
 ## Environment
 
 - **pyenv virtualenv**: `discord-music-bot-3.14` (Python 3.14.6) — set via `pyenv local` (`.python-version`); what bare `python` resolves to inside the repo. Has deps + an editable project install.
-- **In-project `.venv`**: a second Python 3.14.6 env (Homebrew-based, gitignored, also has deps) — used by `poetry run …` (`poetry.toml` sets `virtualenvs.create = true`, in-project) and by Pylance/pyright (`pyrightconfig.json`: `venvPath "."` / `venv ".venv"`; gitignored)
+- **In-project `.venv`**: a second Python 3.14.6 env (Homebrew-based, gitignored, also has deps) — used by `poetry run …` (`poetry.toml` sets `virtualenvs.create = true`, in-project) and by Pylance/pyright (`[tool.pyright]` in `pyproject.toml`: `venvPath "."` / `venv ".venv"`)
 - **Global pyenv**: `3.13.1` — a shell without the repo's pyenv env active cannot `poetry run` (requires-python is `>=3.14`; Poetry refuses under 3.13)
 - Stale 3.13-era envs may still exist (`~/.pyenv/versions/discord-music-bot`, Poetry's cached `py3.11`/`py3.13` envs) — ignore them
 - **Docker base image**: `python:3.14-slim` (multi-stage: base/builder/test/runtime)

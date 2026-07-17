@@ -13,7 +13,7 @@ from src.musicbot import MusicBot, _check_voice_permissions
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
-from tests.helpers import make_mock_task, stub_create_task
+from tests.helpers import command_callback, make_mock_task, stub_create_task
 
 
 @pytest.fixture
@@ -324,7 +324,7 @@ class TestJoinChannelPersistence:
             patch.object(mock_ctx, "invoke", new=AsyncMock()),
         ):
             music_bot_with_redis.get_mp = MagicMock(return_value=mp)
-            await MusicBot.join.callback(music_bot_with_redis, mock_ctx)
+            await command_callback(MusicBot.join)(music_bot_with_redis, mock_ctx)
 
         mp.store.set_connection.assert_awaited_once_with(
             voice_channel.id, text_channel.id
@@ -842,14 +842,14 @@ class TestStopCommand:
         vc = MagicMock(spec=discord.VoiceClient)
         mock_ctx.message.add_reaction = AsyncMock()
         with patch("discord.utils.get", return_value=vc):
-            await MusicBot.stop.callback(music_bot, mock_ctx)
+            await command_callback(MusicBot.stop)(music_bot, mock_ctx)
         mock_ctx.message.add_reaction.assert_awaited_once_with("👋")
 
     async def test_stop_calls_cleanup(self, music_bot, mock_ctx, mock_guild):
         music_bot.cleanup = AsyncMock()
         vc = MagicMock(spec=discord.VoiceClient)
         with patch("discord.utils.get", return_value=vc):
-            await MusicBot.stop.callback(music_bot, mock_ctx)
+            await command_callback(MusicBot.stop)(music_bot, mock_ctx)
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
 
     async def test_stop_does_not_call_skip(self, music_bot, mock_ctx, mock_guild):
@@ -860,7 +860,7 @@ class TestStopCommand:
         music_bot.skip = AsyncMock()
         vc = MagicMock(spec=discord.VoiceClient)
         with patch("discord.utils.get", return_value=vc):
-            await MusicBot.stop.callback(music_bot, mock_ctx)
+            await command_callback(MusicBot.stop)(music_bot, mock_ctx)
         music_bot.skip.assert_not_called()
 
     async def test_stop_noop_when_no_voice_client(
@@ -868,7 +868,7 @@ class TestStopCommand:
     ):
         music_bot.cleanup = AsyncMock()
         with patch("discord.utils.get", return_value=None):
-            await MusicBot.stop.callback(music_bot, mock_ctx)
+            await command_callback(MusicBot.stop)(music_bot, mock_ctx)
         music_bot.cleanup.assert_not_awaited()
 
 
@@ -984,7 +984,7 @@ class TestSkipCommand:
         mock_ctx.invoked_parents = []
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
-        await MusicBot.skip.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
@@ -992,7 +992,7 @@ class TestSkipCommand:
         vc.is_playing = MagicMock(return_value=False)
         vc.stop = MagicMock()
         mock_ctx.voice_client = vc
-        await MusicBot.skip.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
         vc.stop.assert_not_called()
 
 
@@ -1005,7 +1005,7 @@ class TestPauseCommand:
         mp = MagicMock()
         mp.pause = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.pause.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mp.pause.assert_awaited_once_with(vc)
 
     async def test_sends_confirmation_embed_when_paused(self, music_bot, mock_ctx):
@@ -1018,7 +1018,7 @@ class TestPauseCommand:
         embed = discord.Embed(title="⏸️ Paused")
         mp.build_pause_confirmation_embed = MagicMock(return_value=embed)
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.pause.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_once_with(embed=embed)
 
     async def test_no_confirmation_sent_when_embed_is_none(self, music_bot, mock_ctx):
@@ -1030,7 +1030,7 @@ class TestPauseCommand:
         mp.pause = AsyncMock()
         mp.build_pause_confirmation_embed = MagicMock(return_value=None)
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.pause.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mock_ctx.send.assert_not_awaited()
 
     async def test_noop_when_not_playing(self, music_bot, mock_ctx):
@@ -1040,7 +1040,7 @@ class TestPauseCommand:
         mp = MagicMock()
         mp.pause = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.pause.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.pause)(music_bot, mock_ctx)
         mp.pause.assert_not_awaited()
 
 
@@ -1055,7 +1055,7 @@ class TestResumeCommand:
         mp.resume = AsyncMock()
         mp.rehost_np_after_resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.resume.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.resume)(music_bot, mock_ctx)
         mp.resume.assert_awaited_once_with(vc)
 
     async def test_rehosts_np_block_after_resume(self, music_bot, mock_ctx):
@@ -1071,7 +1071,7 @@ class TestResumeCommand:
         mp.resume = AsyncMock()
         mp.rehost_np_after_resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.resume.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.resume)(music_bot, mock_ctx)
         mp.rehost_np_after_resume.assert_awaited_once()
 
     async def test_noop_when_not_paused(self, music_bot, mock_ctx):
@@ -1082,7 +1082,7 @@ class TestResumeCommand:
         mp = MagicMock()
         mp.resume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.resume.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.resume)(music_bot, mock_ctx)
         mp.resume.assert_not_awaited()
 
 
@@ -1091,7 +1091,7 @@ class TestVolumeCommand:
         mp = MagicMock()
         mp.store.set_volume = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.volume.callback(music_bot, mock_ctx, "50")
+        await command_callback(MusicBot.volume)(music_bot, mock_ctx, "50")
         assert mp.volume == 0.5
         mp.store.set_volume.assert_awaited_once_with(0.5)
         mock_ctx.send.assert_awaited()
@@ -1102,22 +1102,22 @@ class TestVolumeCommand:
         mp = MagicMock()
         mp.store = None
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.volume.callback(music_bot, mock_ctx, "50")
+        await command_callback(MusicBot.volume)(music_bot, mock_ctx, "50")
         assert mp.volume == 0.5
         mock_ctx.send.assert_awaited()
 
     async def test_rejects_non_numeric_string(self, music_bot, mock_ctx):
-        await MusicBot.volume.callback(music_bot, mock_ctx, "loud")
+        await command_callback(MusicBot.volume)(music_bot, mock_ctx, "loud")
         mock_ctx.send.assert_awaited()
 
     async def test_rejects_out_of_range(self, music_bot, mock_ctx):
-        await MusicBot.volume.callback(music_bot, mock_ctx, "150")
+        await command_callback(MusicBot.volume)(music_bot, mock_ctx, "150")
         mock_ctx.send.assert_awaited()
 
 
 class TestPingCommand:
     async def test_sends_embed_with_latency(self, music_bot, mock_ctx):
-        await MusicBot.ping.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_once()
         call_kwargs = mock_ctx.send.call_args[1]
         assert "embed" in call_kwargs
@@ -1130,7 +1130,7 @@ class TestClearCommand:
         mp = MagicMock()
         mp.queue_clear = AsyncMock(return_value=[])
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.clear.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.clear)(music_bot, mock_ctx)
         mp.queue_clear.assert_awaited_once()
         assert (
             mock_ctx.send.await_args.kwargs["embed"].description
@@ -1143,7 +1143,7 @@ class TestClearCommand:
         mp.queue_clear = AsyncMock(return_value=cleared)
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.message.add_reaction = AsyncMock()
-        await MusicBot.clear.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.clear)(music_bot, mock_ctx)
         mp.queue_clear.assert_awaited_once()
         mock_ctx.message.add_reaction.assert_awaited_once_with("🗑️")
         call_kwargs = mock_ctx.send.call_args[1]
@@ -1181,7 +1181,7 @@ class TestPlayCommand:
             return join_task
 
         with patch("asyncio.create_task", side_effect=fake_create_task) as mock_create:
-            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
 
         mock_create.assert_called_once()
         music_bot.queue_source.assert_awaited_once()
@@ -1197,7 +1197,7 @@ class TestPlayCommand:
         music_bot.get_mp = MagicMock(return_value=MagicMock())
 
         with patch("asyncio.create_task") as mock_create:
-            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
 
         mock_create.assert_not_called()
         music_bot.queue_source.assert_awaited_once()
@@ -1225,7 +1225,7 @@ class TestPlayCommand:
             return join_task
 
         with patch("asyncio.create_task", side_effect=fake_create_task):
-            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -1255,7 +1255,7 @@ class TestPlayCommand:
             return join_task
 
         with patch("asyncio.create_task", side_effect=fake_create_task):
-            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_not_called()  # already done, nothing to cancel
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -1282,7 +1282,7 @@ class TestPlayCommand:
             return join_task
 
         with patch("asyncio.create_task", side_effect=fake_create_task):
-            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
 
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -1393,7 +1393,7 @@ class TestNowCommand:
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mp.repin_now_playing.assert_awaited_once()
         mock_ctx.send.assert_not_awaited()
 
@@ -1413,7 +1413,7 @@ class TestNowCommand:
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mp.repin_now_playing.assert_awaited_once()
 
     async def test_cross_channel_sends_static_embed_where_invoked(
@@ -1437,7 +1437,7 @@ class TestNowCommand:
         mp.repin_now_playing = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mp.repin_now_playing.assert_not_awaited()
         mp._build_now_playing_embed.assert_called_once_with(mp.current_song)
         mock_ctx.send.assert_awaited_once_with(embed=static)
@@ -1461,7 +1461,7 @@ class TestNowCommand:
         mp.repin_now_playing = AsyncMock(return_value=False)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mp.repin_now_playing.assert_awaited_once()
         assert (
             mock_ctx.send.await_args.kwargs["embed"].description
@@ -1476,7 +1476,7 @@ class TestNowCommand:
         mp = MagicMock()
         mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         assert (
             mock_ctx.send.await_args.kwargs["embed"].description
             == "No songs are currently playing."
@@ -1497,7 +1497,7 @@ class TestNowCommand:
         mp.current_song = None
         mp.play_message = None
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         assert (
             mock_ctx.send.await_args.kwargs["embed"].description
             == "No songs are currently playing."
@@ -1514,7 +1514,7 @@ class TestNowCommand:
         mp.current_song = None
         mp.play_message = discord.Embed(title="Now Playing")
         music_bot.get_mp = MagicMock(return_value=mp)
-        await MusicBot.now.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.now)(music_bot, mock_ctx)
         mock_ctx.send.assert_awaited_once_with(embed=mp.play_message)
 
 
@@ -1892,7 +1892,7 @@ class TestQueueCommand:
         mp.queue_embed = MagicMock(return_value=embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.queue.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.queue)(music_bot, mock_ctx)
 
         mock_ctx.send.assert_awaited_once()
         call_kwargs = mock_ctx.send.call_args[1]
@@ -1908,7 +1908,7 @@ class TestQueueCommand:
         mp.song_queue = []
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.queue.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.queue)(music_bot, mock_ctx)
 
         mock_ctx.send.assert_awaited_once()
 
@@ -1917,7 +1917,7 @@ class TestQueueCommand:
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.queue.callback(music_bot, mock_ctx)
+        await command_callback(MusicBot.queue)(music_bot, mock_ctx)
 
         mp.queue_embed.assert_called_once()
 
@@ -1927,7 +1927,7 @@ class TestQueueCommand:
 
 class TestRemoveCommand:
     async def test_no_url_sends_usage_message(self, music_bot, mock_ctx):
-        await MusicBot.remove.callback(music_bot, mock_ctx, None)
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, None)
 
         mock_ctx.send.assert_awaited_once()
         msg = mock_ctx.send.call_args.kwargs["embed"].description
@@ -1938,7 +1938,7 @@ class TestRemoveCommand:
         mp.queue_remove = AsyncMock(return_value=[])
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=notfound"
         )
 
@@ -1952,7 +1952,7 @@ class TestRemoveCommand:
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=abc"
         )
 
@@ -1970,7 +1970,7 @@ class TestRemoveCommand:
         mp.queue_embed = MagicMock(return_value=queue_embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=abc"
         )
 
@@ -1986,7 +1986,7 @@ class TestRemoveCommand:
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=abc"
         )
 
@@ -1999,7 +1999,7 @@ class TestRemoveCommand:
         music_bot.get_mp = MagicMock(return_value=mp)
         url = "https://yt.com/watch?v=abc"
 
-        await MusicBot.remove.callback(music_bot, mock_ctx, url)
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, url)
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         field_names = [f.name for f in removal_embed.fields]
@@ -2011,7 +2011,7 @@ class TestRemoveCommand:
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=abc"
         )
 
@@ -2025,7 +2025,7 @@ class TestRemoveCommand:
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
-        await MusicBot.remove.callback(
+        await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, "https://yt.com/watch?v=abc"
         )
 
@@ -2067,7 +2067,7 @@ class TestPlaynow:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
 
@@ -2078,7 +2078,7 @@ class TestPlaynow:
         mock_ctx.voice_client = None
         mock_ctx.invoke = AsyncMock()
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
 
@@ -2089,7 +2089,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         assert qobj.interjected is True
         assert qobj.user_input == "test"
@@ -2118,7 +2118,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "return paused" in embed.description
@@ -2140,7 +2140,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Replaced" in embed.description
@@ -2162,7 +2162,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_not_awaited()
         live_mp.queue.put_front.assert_awaited_once_with([qobj])
@@ -2187,7 +2187,7 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
         ) as ys:
-            await MusicBot.playnow.callback(music_bot, mock_ctx, url)
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url)
 
         music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
         ys.assert_awaited_once()
@@ -2215,7 +2215,7 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[first, second])
         ):
-            await MusicBot.playnow.callback(music_bot, mock_ctx, url)
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url)
 
         live_mp.interject.assert_awaited_once()
         assert live_mp.interject.call_args.args[0] is first
@@ -2227,7 +2227,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
-        await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
@@ -2261,7 +2261,7 @@ class TestPlaynow:
         live_mp.interject = AsyncMock(side_effect=_interject_effect)
 
         with patch("src.musicbot.YTDL.prefetch_stream", new=prefetch):
-            await MusicBot.playnow.callback(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]

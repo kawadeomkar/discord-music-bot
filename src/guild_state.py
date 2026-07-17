@@ -547,10 +547,14 @@ def serialize_history_entry(entry: str) -> bytes:
     return orjson.dumps(entry)
 
 
-def parse_history_entry(data: bytes) -> str | None:
+def parse_history_entry(data: bytes | str) -> str | None:
     """Deserialize one history-list entry. Corrupt entries (bad JSON, or JSON
     that is not a string) return None with a warning — the entry is dropped
-    and the rest of the history survives, matching parse_queue_entry."""
+    and the rest of the history survives, matching parse_queue_entry.
+
+    Accepts str as well as bytes: redis-py's response type depends on the
+    pool's decode_responses setting, which is not visible to the type checker.
+    """
     try:
         entry = orjson.loads(data)
     except Exception as e:
