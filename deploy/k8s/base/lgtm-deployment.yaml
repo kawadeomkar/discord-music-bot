@@ -20,7 +20,17 @@ spec:
     spec:
       containers:
         - name: lgtm
-          image: grafana/otel-lgtm:latest
+          # Pinned, never :latest. This image moves its own data paths between
+          # releases (0.29.0 writes everything under /data; older tags used
+          # /tmp/loki, /tmp/tempo, /var/lib/grafana), and the volumeMounts below
+          # are written against THIS version's layout — a floating tag silently
+          # unmounts the PVCs by moving the paths out from under them. :latest
+          # also defaults imagePullPolicy to Always: an unreviewed observability
+          # upgrade on every redeploy, and ImagePullBackOff whenever Docker Hub
+          # rate-limits the server's anonymous pulls.
+          # Bumping: check `ls /data` in the new image against the mounts below.
+          image: grafana/otel-lgtm:0.29.0
+          imagePullPolicy: IfNotPresent
           env:
             - name: GF_SECURITY_ADMIN_USER
               value: admin
@@ -53,13 +63,35 @@ spec:
               memory: 512Mi
             limits:
               memory: 2Gi
+          # otel-lgtm 0.29.0 keeps ALL runtime state under /data (verified in
+          # the running pod: run-grafana.sh hard-exports GF_PATHS_DATA=
+          # /data/grafana/data, loki-config.yaml sets path_prefix /data/loki,
+          # tempo-config.yaml writes /data/tempo). These paths are the image's,
+          # not ours — mounting anywhere else provisions PVCs that bind, mount,
+          # and then sit empty while the real data lands on the container's
+          # ephemeral layer and dies with the pod.
+          # Only /data/grafana, /data/loki and /data/tempo are persisted;
+          # /data/prometheus and /data/pyroscope stay ephemeral (metrics and
+          # profiles are cheap to lose, and the plan specs three PVCs).
+          # Safe to mount over: /data/grafana holds only runtime state (data/ +
+          # downloaded plugins) — Grafana's binaries and dashboards live in
+          # /otel-lgtm/grafana, so an empty PVC here is just a cold start.
           volumeMounts:
             - name: grafana-data
-              mountPath: /var/lib/grafana
+              mountPath: /data/grafana
             - name: tempo-data
-              mountPath: /tmp/tempo
+              mountPath: /data/tempo
             - name: loki-data
-              mountPath: /tmp/loki
+              mountPath: /data/loki
+            # subPath: mount the one file, not over /otel-lgtm (which holds
+            # every binary and run script). Trade-off of subPath: this mount
+            # does NOT live-update when the ConfigMap changes — fine here, Loki
+            # only reads its config at startup and lgtm is strategy: Recreate.
+            # But a ConfigMap-only edit won't restart the pod: after changing
+            # loki-config.yaml, `kubectl rollout restart deployment/lgtm`.
+            - name: loki-config
+              mountPath: /otel-lgtm/loki-config.yaml
+              subPath: loki-config.yaml
       volumes:
         - name: grafana-data
           persistentVolumeClaim:
@@ -70,3 +102,6 @@ spec:
         - name: loki-data
           persistentVolumeClaim:
             claimName: otel-loki
+        - name: loki-config
+          configMap:
+            name: loki-config

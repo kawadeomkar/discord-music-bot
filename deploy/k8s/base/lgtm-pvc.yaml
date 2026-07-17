@@ -1,7 +1,13 @@
-# 20Gi each — sized WITH retention configured: Tempo/Loki defaults keep data
-# indefinitely; set the otel-lgtm retention env knobs (~7 days is plenty) —
-# see deploy/k8s/README.md. Dev warning: Docker Desktop's "Reset Kubernetes
-# Cluster" destroys all PVs — back up first (README backup procedure).
+# 20Gi each — a documented intent, NOT a bound: neither hostpath (dev) nor
+# local-path (prod) enforces a PVC's size, so retention is what actually keeps
+# these from eating the node's disk. All three are configured for it: Loki via
+# loki-config.yaml (168h — it defaults to keeping data forever), Tempo by its
+# own 336h block_retention default, Grafana because its data is dashboards and
+# a sqlite db, not a time series.
+# Mounted at /data/{grafana,tempo,loki} — the paths otel-lgtm:0.29.0 actually
+# writes to; see the mount comment in lgtm-deployment.yaml before changing them.
+# Dev warning: Docker Desktop's "Reset Kubernetes Cluster" destroys all PVs —
+# back up first (README backup procedure).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

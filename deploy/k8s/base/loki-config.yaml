@@ -1,0 +1,86 @@
+# Loki's config, mounted over the copy baked into grafana/otel-lgtm:0.29.0
+# (run-loki.sh runs `loki --config.file=./loki-config.yaml` from /otel-lgtm).
+#
+# WHY A WHOLE CONFIG FILE FOR TWO SETTINGS: Loki's retention lives in
+# limits_config/compactor, and neither is reachable any other way — the image
+# exposes no retention env var, and `loki -help` has no flag for
+# retention_period (only -compactor.retention-enabled, which does nothing
+# without a period). LOKI_EXTRA_ARGS can't help either: run-loki.sh already
+# passes --config.file, and Loki rejects it twice. So the file is the knob.
+#
+# Everything outside `limits_config` and `compactor` is a VERBATIM copy of
+# 0.29.0's own loki-config.yaml. Keep it that way: this is an override, not a
+# fork. On an image bump, re-diff against the new baked copy —
+#     kubectl -n discord-music-bot exec deploy/lgtm -- cat /otel-lgtm/loki-config.yaml
+# — and re-apply the two blocks below. This coupling is exactly why
+# lgtm-deployment.yaml pins the tag.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+data:
+  loki-config.yaml: |
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /data/loki
+      storage:
+        filesystem:
+          chunks_directory: /data/loki/chunks
+          rules_directory: /data/loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+
+    schema_config:
+      configs:
+        - from: 2020-10-24
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+
+    # ── Added: retention. Loki's default retention_period is 0 = keep forever.
+    # Nothing else here is bounded either: /data/loki is a PVC whose 20Gi is
+    # unenforced by both provisioners (hostpath on dev, local-path on prod), and
+    # on prod that PV shares a filesystem with Redis's AOF — so "Loki grows
+    # forever" ends as "the disk fills and guild:{id}:history dies", the one
+    # dataset with no TTL and no recreation path (CLAUDE.md, Redis schema).
+    # 7 days: long enough to debug last week's incident, short enough that the
+    # steady state is bounded. Tempo (336h) and Prometheus (15d) self-expire.
+    limits_config:
+      retention_period: 168h
+
+    # retention_enabled is what actually makes the compactor delete; without it
+    # retention_period is inert. delete_request_store is REQUIRED when it's on
+    # (Loki refuses to start otherwise) — filesystem, matching the storage above.
+    compactor:
+      working_directory: /data/loki/compactor
+      retention_enabled: true
+      retention_delete_delay: 2h
+      delete_request_store: filesystem
+
+    ruler:
+      alertmanager_url: http://127.0.0.1:9093
+
+    pattern_ingester:
+      lifecycler:
+        min_ready_duration: 1s
+
+    ingester:
+      lifecycler:
+        min_ready_duration: 1s
+
+    frontend:
+      scheduler_dns_lookup_period: 1s
+      address: 127.0.0.1
+
+    query_scheduler:
+      use_scheduler_ring: false

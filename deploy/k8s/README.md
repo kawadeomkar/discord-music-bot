@@ -124,8 +124,14 @@ before `down` read back intact after redeploy). A `down` also kills any
 
 ## Cheat-sheet
 
+**Set the context in the alias, not in your head.** `kubectl`'s current context is
+whichever you last used, and every command below is destructive or misleading against the
+wrong cluster — this is the exact hazard the scripts hard-block with `k8s_guard` and the
+one thing an ad-hoc `kubectl` bypasses. Pick one:
+
 ```bash
-NS="kubectl -n discord-music-bot"   # add --context docker-desktop|k3s-production
+NS="kubectl --context docker-desktop  -n discord-music-bot"   # dev
+NS="kubectl --context k3s-production  -n discord-music-bot"   # prod
 
 $NS get pods                                          # 2/2 = bot + pot-provider
 $NS logs deploy/discord-music-bot -c bot -f           # bot logs (-c pot-provider for the sidecar)
@@ -134,9 +140,15 @@ $NS rollout undo deployment/discord-music-bot         # roll back to the previou
 $NS rollout restart deployment/discord-music-bot      # force restart on the SAME image
                                                       # (re-running the script on an
                                                       # unchanged SHA is a no-op)
+$NS rollout restart deployment/lgtm                   # after editing loki-config.yaml —
+                                                      # a subPath ConfigMap mount doesn't
+                                                      # live-update, and apply alone won't
+                                                      # restart the pod
 $NS scale deployment/discord-music-bot --replicas=0   # stop the bot (e.g. before
                                                       # starting compose or the other
                                                       # cluster); --replicas=1 resumes
+$NS config view --minify -o jsonpath='{.contexts[0].name}'   # which cluster is $NS? (paranoia)
+
 kubectl --context <ctx> apply -k deploy/k8s/overlays/<dev|production> --dry-run=server
 ```
 
@@ -150,9 +162,24 @@ kubectl --context <ctx> apply -k deploy/k8s/overlays/<dev|production> --dry-run=
   running old code while the script reports success. (compose is immune; it compares
   resolved image IDs.) The hash is deterministic, so re-running without further edits is
   still a true no-op. Each distinct edit mints an image: `docker image prune` occasionally.
-- **otel-lgtm retention:** Tempo/Loki keep data indefinitely by default; set the
-  image's retention env vars on the lgtm Deployment (7 days is plenty) before the PVCs
-  fill.
+- **otel-lgtm is pinned (`0.29.0`) and the pin is load-bearing.** This image moves its
+  data paths between releases — 0.29.0 keeps everything under `/data`, older tags used
+  `/tmp/loki`, `/tmp/tempo`, `/var/lib/grafana` — and the Deployment's `volumeMounts` are
+  written against 0.29.0's layout. On a floating tag a pull can silently relocate the data
+  out from under the PVCs: they stay `Bound` and empty while the real data lands on the
+  pod's ephemeral layer and dies on the next redeploy. Nothing errors. **When bumping:**
+  diff `ls /data` in the new image against the mounts, and re-diff `loki-config.yaml`
+  (below) against the new baked copy.
+- **Loki retention lives in a ConfigMap, not an env var.** `base/loki-config.yaml` is
+  mounted (subPath) over the image's baked config, setting `retention_period: 168h` +
+  compactor `retention_enabled`. It has to be a whole config file: Loki exposes no
+  retention env var and no CLI flag for the period, and `LOKI_EXTRA_ARGS` can't pass
+  `--config.file` twice. Everything in it outside `limits_config`/`compactor` is a verbatim
+  copy of 0.29.0's own config — keep it that way. Retention is what actually bounds these
+  PVs (neither provisioner enforces the 20Gi), and on prod they share a filesystem with
+  Redis's AOF. Tempo (336h) and Prometheus (15d) self-expire; only Loki defaulted to
+  forever. A ConfigMap edit alone won't restart the pod — `kubectl rollout restart
+  deployment/lgtm` after changing it.
 
 ## History backup / restore (the §3.8 helper pod)
 

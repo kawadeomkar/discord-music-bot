@@ -15,4 +15,5 @@ resources:
   - lgtm-deployment.yaml
   - lgtm-service.yaml
   - lgtm-pvc.yaml
+  - loki-config.yaml
   - ytdlp-cache-pvc.yaml
