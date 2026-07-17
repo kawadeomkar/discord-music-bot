@@ -48,36 +48,58 @@ if [ "$have_bot" = "0" ] || [ "$have_grafana" = "0" ] || [ "$ROTATE_SECRETS" = "
         echo "ERROR: .env not found — needed to bootstrap the dev cluster's Secrets." >&2
         exit 1
     fi
-    # Subshell, deliberately: .env also defines ENVIRONMENT, and sourcing it
-    # into this shell would clobber the branch-derived value resolve_environment
-    # computes below — baking "development" into the image on exactly those runs
-    # that happened to bootstrap Secrets, and differing from what
-    # build_docker.sh bakes from the same commit. Nothing from .env escapes here.
-    (
-        set -a; . ./.env; set +a
-        missing=""
-        for var in DISCORD_TOKEN SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET; do
-            [ -n "${!var:-}" ] || missing="$missing $var"
-        done
-        if [ -n "$missing" ]; then
-            echo "ERROR: .env is missing (or has empty):$missing" >&2
-            exit 1
-        fi
-        if [ "$have_bot" = "0" ] || [ "$ROTATE_SECRETS" = "1" ]; then
-            echo "Bootstrapping Secret discord-music-bot-secrets from .env"
-            kubectl create secret generic discord-music-bot-secrets \
-                --from-literal=DISCORD_TOKEN="$DISCORD_TOKEN" \
-                --from-literal=SPOTIFY_CLIENT_ID="$SPOTIFY_CLIENT_ID" \
-                --from-literal=SPOTIFY_CLIENT_SECRET="$SPOTIFY_CLIENT_SECRET" \
-                --dry-run=client -o yaml | $KUBECTL apply -f - >/dev/null
-        fi
-        if [ "$have_grafana" = "0" ] || [ "$ROTATE_SECRETS" = "1" ]; then
-            echo "Bootstrapping Secret grafana-admin"
-            kubectl create secret generic grafana-admin \
-                --from-literal=GF_SECURITY_ADMIN_PASSWORD="${GF_SECURITY_ADMIN_PASSWORD:-admin}" \
-                --dry-run=client -o yaml | $KUBECTL apply -f - >/dev/null
-        fi
-    )
+
+    # .env is NEVER sourced. It is read as data: the raw `KEY=value` line is
+    # handed to kubectl's --from-env-file parser, which (verified against this
+    # kubectl and this docker) agrees byte-for-byte with the `env_file:` parser
+    # compose uses on the same file. That agreement is the point — both
+    # pipelines must derive the same secret from the same line.
+    #
+    # `set -a; . ./.env` did not: the shell is a THIRD parser and a live one.
+    # It strips quotes ("a b" → a b), expands $VARS, and executes `backticks` —
+    # so any token containing $, ", or ` would silently reach k8s different
+    # from the one compose uses, or run code. It also clobbered ENVIRONMENT
+    # (.env sets it), which needed a subshell to contain; reading data instead
+    # removes the whole class, subshell included.
+    #
+    # tail -1: on a duplicate key, shell and docker both take last-wins, so we
+    # do too. (kubectl itself hard-errors on dupes, hence one line per key.)
+    env_line() { grep -E "^$1=" .env | tail -1; }
+
+    missing=""
+    for var in DISCORD_TOKEN SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET; do
+        line="$(env_line "$var")"
+        # Non-empty line AND non-empty value after the '='.
+        { [ -n "$line" ] && [ -n "${line#*=}" ]; } || missing="$missing $var"
+    done
+    if [ -n "$missing" ]; then
+        echo "ERROR: .env is missing (or has empty):$missing" >&2
+        exit 1
+    fi
+
+    # Piped, never --from-literal: a literal puts the Discord token in this
+    # process's argv, i.e. in `ps` output for every user on the box.
+    if [ "$have_bot" = "0" ] || [ "$ROTATE_SECRETS" = "1" ]; then
+        echo "Bootstrapping Secret discord-music-bot-secrets from .env"
+        {
+            env_line DISCORD_TOKEN
+            env_line SPOTIFY_CLIENT_ID
+            env_line SPOTIFY_CLIENT_SECRET
+        } | kubectl create secret generic discord-music-bot-secrets \
+                --from-env-file=/dev/stdin --dry-run=client -o yaml \
+          | $KUBECTL apply -f - >/dev/null
+    fi
+
+    if [ "$have_grafana" = "0" ] || [ "$ROTATE_SECRETS" = "1" ]; then
+        echo "Bootstrapping Secret grafana-admin"
+        # Optional in .env; dev default is the same inline 'admin' compose uses.
+        gf_line="$(env_line GF_SECURITY_ADMIN_PASSWORD)"
+        [ -n "$gf_line" ] || gf_line="GF_SECURITY_ADMIN_PASSWORD=admin"
+        printf '%s\n' "$gf_line" \
+          | kubectl create secret generic grafana-admin \
+                --from-env-file=/dev/stdin --dry-run=client -o yaml \
+          | $KUBECTL apply -f - >/dev/null
+    fi
 fi
 
 # ── Test gate + image, shared with build_docker.sh ───────────────────────────
@@ -122,7 +144,10 @@ fi
 echo "Building runtime image $IMAGE"
 build_runtime_image "$IMAGE"
 
-# ── Coexistence guard (one token, one live bot process per machine) ───────────
+# ── Coexistence warning (one token, one live bot process per machine) ─────────
+# Advisory, not a guard: it warns and deploys anyway. Deliberate — the operator
+# may be mid-migration, and only they know. Peer of the k8s check in
+# build_docker.sh, pointing the other way.
 if docker compose ps --status running discord-music-bot 2>/dev/null | grep -q discord-music-bot; then
     echo "WARNING: compose bot is running — stop it before deploying to k8s:" >&2
     echo "  docker compose stop discord-music-bot" >&2

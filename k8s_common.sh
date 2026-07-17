@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared logic for build_k8s_dev.sh, build_k8s_prod.sh and k8s_down.sh —
 # sourced, never run.
-# Ops: deploy/k8s/README.md; design: docs/K8S_DEPLOYMENT_PLAN.md §6.2.
+# Ops: deploy/k8s/README.md; design: docs/K8S_DEPLOYMENT_PLAN.md §6.
 #
 # Everything here is target-agnostic on purpose. The build entry scripts differ
 # only in how they obtain an image (build it vs. verify CI built it) and in
@@ -33,7 +33,14 @@ k8s_guard() {
     fi
     # Fail fast: a dead cluster must not surface as a failed apply minutes into
     # a test gate. Docker Desktop's kind cluster reports "running" while gone.
-    if ! kubectl --context "$EXPECTED_CONTEXT" get --raw /readyz >/dev/null 2>&1; then
+    #
+    # --request-timeout is what makes "fast" true. Without it this guard waits
+    # on kubectl's default dial timeout (~30s measured against a routable host
+    # that drops packets) — which is precisely the prod case: the operator off
+    # the VPN, k3s reachable-in-principle. A guard whose failure mode is a
+    # half-minute stall is one people learn to skip.
+    if ! kubectl --context "$EXPECTED_CONTEXT" --request-timeout=5s \
+            get --raw /readyz >/dev/null 2>&1; then
         echo "ERROR: cluster '$EXPECTED_CONTEXT' is not reachable." >&2
         echo "Docker Desktop: is Kubernetes green? (docker desktop kubernetes status; a" >&2
         echo "Docker Desktop restart re-provisions the kind cluster — see deploy/k8s/README.md)" >&2

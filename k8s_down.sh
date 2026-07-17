@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Kubernetes teardown — peer of build_k8s_dev.sh / build_k8s_prod.sh; the k8s
 # answer to `docker compose down`. Shared guards: k8s_common.sh.
-# Ops: deploy/k8s/README.md; design: docs/K8S_DEPLOYMENT_PLAN.md §6.3.
+# Ops: deploy/k8s/README.md; design: docs/K8S_DEPLOYMENT_PLAN.md §6.4.
 #
 #   ./k8s_down.sh dev             delete workloads, KEEP data + secrets   (~ compose down)
 #   ./k8s_down.sh dev --stop      scale to zero, keep everything          (~ compose stop)
@@ -31,14 +31,33 @@ TARGET="${1:-}"
 [ $# -gt 0 ] && shift
 
 MODE="down"
+MODE_FLAG=""      # which flag set MODE, for the conflict message
 ASSUME_YES=0
+
+# Modes are mutually exclusive and REJECTED when they conflict, never resolved.
+# Last-wins would make `--stop --volumes` silently delete every PVC while the
+# operator read "--stop" — a scale-to-zero typo'd into permanent history loss.
+# There is no sane precedence to pick between "keep everything" and "destroy the
+# data", so pick neither.
+set_mode() {
+    if [ -n "$MODE_FLAG" ] && [ "$MODE_FLAG" != "$2" ]; then
+        echo "ERROR: $MODE_FLAG and $2 are different teardown modes — pick one." >&2
+        exit 64
+    fi
+    MODE="$1"; MODE_FLAG="$2"
+}
+
 for arg in "$@"; do
   case "$arg" in
-    --stop)    MODE="stop" ;;
-    --volumes|-v) MODE="volumes" ;;
-    --all)     MODE="all" ;;
-    --yes|-y)  ASSUME_YES=1 ;;
-    *)         echo "unknown option: $arg" >&2; exit 64 ;;
+    --stop)     set_mode stop    --stop ;;
+    # No -v alias: conventionally that's --verbose/--version, and guessing wrong
+    # here deletes the play history.
+    --volumes)  set_mode volumes --volumes ;;
+    --all)      set_mode all     --all ;;
+    --yes|-y)   ASSUME_YES=1 ;;
+    *)          echo "unknown option: $arg" >&2
+                echo "usage: $0 [dev|prod] [--stop|--volumes|--all] [--yes]" >&2
+                exit 64 ;;
   esac
 done
 
@@ -74,8 +93,12 @@ fi
 case "$MODE" in
   # ── compose `stop` parity: reversible in seconds, state fully intact ────────
   stop)
-    echo "Scaling workloads to zero (data, secrets, and manifests all kept)"
+    # Only the bot: redis and lgtm stay up deliberately. Scaling redis down would
+    # make this "stop" a data-availability event, and the point of --stop is that
+    # it's reversible in seconds. The bot is the thing on the Discord token.
+    echo "Scaling the bot to zero (redis + lgtm stay up; data, secrets, manifests all kept)"
     $KUBECTL scale deployment discord-music-bot --replicas=0 2>/dev/null || true
+    echo "Done. '$KUBECTL scale deployment discord-music-bot --replicas=1' resumes."
     ;;
 
   # ── compose `down` parity: workloads gone, PVCs + Secrets + namespace kept ──
@@ -86,7 +109,10 @@ case "$MODE" in
     $KUBECTL delete statefulset redis --ignore-not-found
     $KUBECTL delete deployment lgtm --ignore-not-found
     $KUBECTL delete service redis lgtm --ignore-not-found
-    $KUBECTL delete configmap discord-music-bot-config --ignore-not-found
+    # Both ConfigMaps: loki-config is lgtm's (base/loki-config.yaml). Every
+    # ConfigMap in the base belongs here — they are workload config, not data,
+    # and the next build re-applies them.
+    $KUBECTL delete configmap discord-music-bot-config loki-config --ignore-not-found
     echo "Done. './build_k8s_$TARGET.sh' brings it all back; PVC data is reattached."
     ;;
 
@@ -100,7 +126,10 @@ first if you care: see 'History backup / restore' in deploy/k8s/README.md." "del
     $KUBECTL delete statefulset redis --ignore-not-found
     $KUBECTL delete deployment lgtm --ignore-not-found
     $KUBECTL delete service redis lgtm --ignore-not-found
-    $KUBECTL delete configmap discord-music-bot-config --ignore-not-found
+    # Both ConfigMaps: loki-config is lgtm's (base/loki-config.yaml). Every
+    # ConfigMap in the base belongs here — they are workload config, not data,
+    # and the next build re-applies them.
+    $KUBECTL delete configmap discord-music-bot-config loki-config --ignore-not-found
     # After the workloads, or the PVCs hang in Terminating on the mounts.
     # --all also catches redis-data-redis-0, which the StatefulSet's
     # volumeClaimTemplate creates and which no manifest deletion would reach.

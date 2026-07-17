@@ -49,12 +49,23 @@ spec:
           ports:
             - name: healthz
               containerPort: 8080
-          # Startup at thousands of guilds is legitimately slow: AutoShardedBot
-          # identifies shards serially (~5s each, Discord-enforced) and
-          # on_ready runs per-guild crash recovery. The startupProbe owns that
-          # window (up to 10 min) so liveness can stay tight without killing a
-          # booting pod. k8s_common.sh's rollout timeout (660s) must exceed
-          # this probe's budget.
+          # What this probe actually covers: the window before the healthz
+          # socket binds. start_healthz runs early in setup_hook (main.py) —
+          # before extensions load, before shards identify — and /healthz is
+          # deliberately dumb (200 as soon as it's serving), so in practice this
+          # succeeds on the first check ~1s in and the 600s budget goes unused.
+          #
+          # It is NOT what lets a slow many-shard boot survive: /healthz answers
+          # 200 throughout identify, so liveness would never kill a booting pod
+          # regardless. (An earlier comment here claimed the opposite.) What the
+          # 600s does buy is the pre-bind window — if create_redis_pool or the
+          # aiohttp setup ever hangs, this grants 10 min before liveness starts,
+          # instead of liveness's own 4 × 30s.
+          #
+          # Consequence worth knowing: `rollout status` reports success while
+          # shards are still identifying. The deploy is "done" before the bot is
+          # fully on Discord. k8s_common.sh's rollout timeout (660s) must still
+          # exceed this probe's budget for the pathological pre-bind hang.
           startupProbe:
             httpGet:
               path: /healthz
@@ -99,6 +110,14 @@ spec:
         # Version lockstep: this tag must match the bgutil-ytdlp-pot-provider
         # pin in pyproject.toml — plugin and server are released together;
         # bump both (same convention as docker-compose.yml).
+        #
+        # No equivalent of compose's `init: true` (K8s has no such field), and
+        # that's fine rather than an oversight: node runs as PID 1 here with no
+        # reaper, but the server never forks — its whole app is four files that
+        # contain no child_process/spawn/fork, so there is nothing to orphan and
+        # no zombies to reap. compose's `init:` is belt-and-braces there, not
+        # load-bearing. If a future version shells out, this needs a real answer
+        # (the image ships no tini, so it'd mean a command: wrapper).
         - name: pot-provider
           image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
           ports:
