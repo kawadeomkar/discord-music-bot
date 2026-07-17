@@ -1157,6 +1157,39 @@ class TestUpdateActivity:
         await music_player.update_activity(None)
         music_player.bot.change_presence.assert_awaited_once()
 
+    async def test_resets_while_own_client_is_still_playing(self, music_player):
+        """-stop reached here with the presence stuck on the stopped song:
+        cleanup() cancels the playback loop *before* it disconnects, so the
+        loop's CancelledError handler calls update_activity(None) while this
+        guild's own client is still connected and playing. The "another guild is
+        playing" gate must not count our own client, or the reset never fires.
+        """
+        music_player.bot.change_presence = AsyncMock()
+        own_vc = MagicMock(spec=discord.VoiceClient)
+        own_vc.is_playing.return_value = True
+        own_vc.guild = music_player._guild
+        music_player.bot.voice_clients = [own_vc]
+        await music_player.update_activity(None)
+        music_player.bot.change_presence.assert_awaited_once()
+        activity = music_player.bot.change_presence.call_args.kwargs["activity"]
+        assert isinstance(activity, discord.Game)
+
+    async def test_skips_reset_when_own_client_stops_but_another_guild_plays(
+        self, music_player
+    ):
+        """The own-guild exclusion must not go so far as to reset the presence
+        out from under a different guild that is still playing.
+        """
+        music_player.bot.change_presence = AsyncMock()
+        own_vc = MagicMock(spec=discord.VoiceClient)
+        own_vc.is_playing.return_value = True
+        own_vc.guild = music_player._guild
+        other_vc = MagicMock(spec=discord.VoiceClient)
+        other_vc.is_playing.return_value = True
+        music_player.bot.voice_clients = [own_vc, other_vc]
+        await music_player.update_activity(None)
+        music_player.bot.change_presence.assert_not_awaited()
+
     async def test_falls_back_to_a_song_when_title_is_none(
         self, music_player, mock_song
     ):

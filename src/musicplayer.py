@@ -963,11 +963,15 @@ class MusicPlayer:
                 timestamps=timestamps,
             )
         else:
-            # Only reset when no other guild is still playing.
+            # Only reset when no *other* guild is still playing. This guild's own
+            # client must be excluded: cleanup() cancels the playback loop before
+            # it disconnects, so the loop's CancelledError handler reaches here
+            # while our own client is still connected and playing — counting it
+            # would leave the presence stuck on the stopped song.
             active = any(
                 vc.is_playing()
                 for vc in self.bot.voice_clients
-                if isinstance(vc, discord.VoiceClient)
+                if isinstance(vc, discord.VoiceClient) and vc.guild.id != self._guild.id
             )
             if active:
                 return

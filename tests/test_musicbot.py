@@ -676,6 +676,7 @@ class TestCleanup:
         mp._progress_task = None
         mp._pause_debounce_task = None
         mp.retire_np_host_on_stop = AsyncMock()
+        mp.update_activity = AsyncMock()
         for attr, val in overrides.items():
             setattr(mp, attr, val)
         music_bot.mps[mock_guild.id] = mp
@@ -764,6 +765,26 @@ class TestCleanup:
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)
         assert call_order == ["cancel", "retire"]
+
+    async def test_resets_activity_after_disconnecting(self, music_bot, mock_guild):
+        """A stopped bot must not keep advertising the song it stopped. The
+        reset runs after the disconnect: until the voice client is gone it can
+        still register as playing, which is what made update_activity() bail out
+        and leave a stale "Listening to <song>" presence behind.
+        """
+        call_order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.update_activity = AsyncMock(
+            side_effect=lambda song: call_order.append("activity")
+        )
+        mock_guild.voice_client.disconnect = AsyncMock(
+            side_effect=lambda force: call_order.append("disconnect")
+        )
+
+        await music_bot.cleanup(mock_guild)
+
+        assert call_order == ["disconnect", "activity"]
+        mp.update_activity.assert_awaited_once_with(None)
 
     async def test_cancels_running_alone_timer(self, music_bot, mock_guild):
         timer = make_mock_task()
