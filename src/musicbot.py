@@ -42,6 +42,40 @@ _tracer = get_tracer(__name__)
 from src.youtube import YTDL, QueueObject
 
 
+@contextlib.asynccontextmanager
+async def _optional_typing(ctx: commands.Context):
+    """`ctx.typing()` downgraded to best-effort.
+
+    The typing indicator is decoration, but entering it POSTs
+    /channels/{id}/typing, so it fails like any REST call: 403 when the bot
+    lacks Send Messages in the channel, or a transient 5xx. Neither is a reason
+    to abandon the command the user actually asked for. Observed 2026-07-17 —
+    a 403 here aborted -play before it had even parsed the URL, and (because
+    `async with ctx.typing():` sat outside the command's own try) the failure
+    escaped to cog_command_error, which logged nothing at the time.
+
+    Only __aenter__ can raise into us: discord.py's Typing swallows errors from
+    the 5-second refresh loop (_typing_done_callback), and __aexit__ just
+    cancels that task. It must NOT be called if __aenter__ failed — `self.task`
+    would not exist yet — hence the `entered` flag.
+    """
+    typing_cm = ctx.typing()
+    entered = False
+    try:
+        await typing_cm.__aenter__()
+        entered = True
+    except discord.HTTPException as e:
+        # Not error: the command carries on, and if it later needs the channel
+        # it will fail there with a better message than "typing failed".
+        log.warning(f"typing indicator unavailable: {type(e).__name__}: {e}")
+    try:
+        yield
+    finally:
+        if entered:
+            with contextlib.suppress(discord.HTTPException):
+                await typing_cm.__aexit__(None, None, None)
+
+
 def _check_voice_permissions(
     author: Union[discord.Member, discord.User],
     voice_client: Optional[discord.VoiceClient],
@@ -194,38 +228,90 @@ class MusicBot(commands.Cog):
         pair = self._active_spans.pop(id(ctx), None)
         if pair:
             span, token = pair
+            # This hook — not cog_command_error — is where a failed command gets
+            # marked on its span. discord.py runs after_invoke from
+            # hooked_wrapped_callback's `finally`, which fires BEFORE the
+            # exception reaches dispatch_error, so by the time cog_command_error
+            # runs this span is popped and ended and can no longer be mutated.
+            # command_failed is already set by then (the raise and this call
+            # share that try/finally), so this is the last point that both knows
+            # the command failed and still owns an open span.
+            #
+            # Status only, no exception: we don't have it here. The exception is
+            # recorded on the inner bot.* span by its start_as_current_span
+            # decorator, and logged by cog_command_error.
+            if ctx.command_failed:
+                span.set_status(StatusCode.ERROR)
             span.end()
             otel_context.detach(token)
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception):
-        # Peek (don't pop) — cog_after_invoke runs in the finally block after this
-        # and is responsible for ending the span.
-        pair = self._active_spans.get(id(ctx))
-        if pair:
-            span, _ = pair
-            span.record_exception(error)
-            span.set_status(StatusCode.ERROR, str(error))
+        # Defining this hook suppresses discord.py's default on_command_error
+        # logging, so anything not handled here is gone for good. Every branch
+        # below therefore ends in a reply, a log line, or a documented reason
+        # why the error is not worth either.
+        #
+        # Do NOT try to touch the command.* span here — it is already ended.
+        # after_invoke runs in hooked_wrapped_callback's `finally`, before the
+        # exception reaches dispatch_error, so _active_spans is empty by now and
+        # an ended span silently ignores mutation. cog_after_invoke marks the
+        # status instead. (Errors raised before cog_before_invoke ran — argument
+        # parsing, validate_commands — never had a span at all.)
+        #
+        # Likewise the structlog contextvars (guild_id/user_id/command) bound in
+        # cog_before_invoke: cog_after_invoke clears them before we run, so
+        # every log below must pass its context explicitly.
+        def _ctx_fields() -> dict:
+            return {
+                "guild_id": str(ctx.guild.id) if ctx.guild else "none",
+                "user_id": str(ctx.author.id),
+                "command": ctx.command.name if ctx.command else "unknown",
+            }
 
-        # FIXME: Unhandled command errors vanish without a single log line.
-        # Defining cog_command_error suppresses discord.py's default
-        # on_command_error logging, and this handler only acts on
-        # MissingRequiredArgument — every other exception is recorded on the
-        # OTel span and then dropped. Observed 2026-07-17: Discord REST 500s
-        # made -play fail totally silently (no reply, no log); the cause was
-        # only recoverable from the Tempo trace. Log unhandled errors here
-        # before returning.
+        # An unknown command is a typo, not a fault. Logging these would let
+        # anyone fill the log by typing `-asdf`.
+        if isinstance(error, commands.CommandNotFound):
+            return
 
-        # validate_commands already sends its own message before raising CommandError,
-        # so only handle errors that produce no user-visible output.
         if isinstance(error, commands.MissingRequiredArgument):
             cmd = ctx.command
             usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
-            await ctx.send(
-                embed=notice_embed(
-                    f"Missing argument: `{error.param.name}`."
-                    + (f" Usage: {usage}" if usage else ""),
-                    discord.Color.red(),
+            with contextlib.suppress(discord.HTTPException):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Missing argument: `{error.param.name}`."
+                        + (f" Usage: {usage}" if usage else ""),
+                        discord.Color.red(),
+                    )
                 )
+            return
+
+        # validate_commands is the only place that raises a bare CommandError,
+        # and it always replies first — so the user is already informed and
+        # "you're not in a voice channel" is not an operational event.
+        if type(error) is commands.CommandError:
+            return
+
+        # Everything else is unhandled. CommandInvokeError wraps whatever the
+        # command body raised; the wrapper's own repr says nothing, so unwrap it.
+        original = getattr(error, "original", error)
+        log.error(
+            f"unhandled command error: {type(original).__name__}: {original}",
+            exc_info=original,
+            **_ctx_fields(),
+        )
+
+        # Tell the user, best-effort. A Forbidden here means we cannot post in
+        # the channel at all — which is frequently the very cause of the error
+        # being reported — so a failed apology must not raise back into
+        # discord.py and mask the log line above.
+        with contextlib.suppress(discord.HTTPException):
+            await send_embed(
+                ctx,
+                "Command failed",
+                f"**{type(original).__name__}:** {original}",
+                discord.Color.red(),
+                footer=trace_footer(trace.get_current_span()),
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
@@ -243,15 +329,30 @@ class MusicBot(commands.Cog):
         e: Exception,
         title: str = "Command failed",
     ) -> None:
+        """Report a *handled* command failure: span, log, and reply.
+
+        The counterpart to cog_command_error's unhandled path. Both must log:
+        telling the user and recording a span is not the same as telling the
+        operator, and "check the traces" only works if someone is looking —
+        on 2026-07-17 a failure sat in Tempo for hours precisely because
+        nothing in the log pointed at it.
+        """
         span = trace.get_current_span()
         record_span_error(span, e)
-        await send_embed(
-            ctx,
-            title,
-            f"**{type(e).__name__}:** {e}",
-            discord.Color.red(),
-            footer=trace_footer(span),
-        )
+        log.error(f"{title}: {type(e).__name__}: {e}", exc_info=e)
+        # Best-effort reply. A Forbidden here (no Send Messages in the channel)
+        # must not propagate: it would replace `e` — the error we are trying to
+        # report — with the failure to report it, and the log line above would
+        # then name the wrong cause. The log is the durable record; the embed is
+        # a courtesy.
+        with contextlib.suppress(discord.HTTPException):
+            await send_embed(
+                ctx,
+                title,
+                f"**{type(e).__name__}:** {e}",
+                discord.Color.red(),
+                footer=trace_footer(span),
+            )
 
     @_tracer.start_as_current_span("bot.queue_source")
     async def queue_source(
@@ -385,7 +486,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with _optional_typing(ctx):
             try:
                 source = parse_input(url, ctx.message.content)
 
@@ -497,7 +598,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with _optional_typing(ctx):
             try:
                 mp = self.get_mp(ctx)
                 vc = ctx.voice_client

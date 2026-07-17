@@ -8,8 +8,9 @@ import discord
 import fakeredis
 import pytest
 from discord.ext import commands
+from opentelemetry.trace import StatusCode
 
-from src.musicbot import MusicBot, _check_voice_permissions
+from src.musicbot import MusicBot, _check_voice_permissions, _optional_typing
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
@@ -2265,3 +2266,304 @@ class TestPlaynow:
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]
+
+
+class TestCogCommandError:
+    """Unhandled command errors must reach the log.
+
+    Defining cog_command_error suppresses discord.py's own on_command_error
+    logging, so a gap here is silent in production. Regression: a 403 from
+    ctx.typing() made -play fail with no reply and no log line; the cause was
+    only recoverable from a Tempo trace.
+    """
+
+    async def test_unhandled_error_is_logged(self, music_bot, mock_ctx):
+        err = commands.CommandInvokeError(discord.HTTPException(MagicMock(), "boom"))
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(mock_ctx, err)
+        mock_log.error.assert_called_once()
+
+    async def test_log_unwraps_commandinvokeerror(self, music_bot, mock_ctx):
+        """The message names the real cause, not the CommandInvokeError wrapper."""
+        original = RuntimeError("the actual cause")
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(
+                mock_ctx, commands.CommandInvokeError(original)
+            )
+        msg = mock_log.error.call_args.args[0]
+        assert "RuntimeError" in msg and "the actual cause" in msg
+        assert mock_log.error.call_args.kwargs["exc_info"] is original
+
+    async def test_log_carries_context_explicitly(self, music_bot, mock_ctx):
+        """cog_after_invoke clears the structlog contextvars before we run, so
+        guild/user/command must be passed on the call itself."""
+        mock_ctx.command.name = "play"
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(
+                mock_ctx, commands.CommandInvokeError(RuntimeError("x"))
+            )
+        kwargs = mock_log.error.call_args.kwargs
+        assert kwargs["guild_id"] == str(mock_ctx.guild.id)
+        assert kwargs["user_id"] == str(mock_ctx.author.id)
+        assert kwargs["command"] == "play"
+
+    async def test_command_not_found_is_not_logged(self, music_bot, mock_ctx):
+        """`-asdf` is a typo; logging it would let anyone flood the log."""
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(mock_ctx, commands.CommandNotFound())
+        mock_log.error.assert_not_called()
+
+    async def test_validate_commands_error_is_not_logged(self, music_bot, mock_ctx):
+        """validate_commands replies first, then raises a bare CommandError."""
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(
+                mock_ctx, commands.CommandError("not in a voice channel")
+            )
+        mock_log.error.assert_not_called()
+
+    async def test_missing_required_argument_still_replies(self, music_bot, mock_ctx):
+        param = MagicMock()
+        param.name = "url"
+        with patch("src.musicbot.log") as mock_log:
+            await music_bot.cog_command_error(
+                mock_ctx, commands.MissingRequiredArgument(param)
+            )
+        mock_ctx.send.assert_awaited_once()
+        mock_log.error.assert_not_called()
+
+    async def test_reply_failure_does_not_mask_the_log(self, music_bot, mock_ctx):
+        """A Forbidden on the apology must not raise back into discord.py.
+
+        This is the exact 403 case: we cannot post in the channel, which is why
+        the command failed — the log line is the only record and must survive.
+        """
+        forbidden = discord.Forbidden(MagicMock(status=403), "Missing Access")
+        with (
+            patch("src.musicbot.send_embed", AsyncMock(side_effect=forbidden)),
+            patch("src.musicbot.log") as mock_log,
+        ):
+            await music_bot.cog_command_error(
+                mock_ctx, commands.CommandInvokeError(forbidden)
+            )
+        mock_log.error.assert_called_once()
+
+    async def test_missing_argument_reply_failure_is_suppressed(
+        self, music_bot, mock_ctx
+    ):
+        param = MagicMock()
+        param.name = "url"
+        mock_ctx.send = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "Missing Access")
+        )
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MissingRequiredArgument(param)
+        )
+
+
+class TestCogAfterInvokeSpanStatus:
+    """cog_after_invoke is the only hook that can mark a failed command's span.
+
+    discord.py runs after_invoke from hooked_wrapped_callback's `finally`, which
+    fires BEFORE the exception reaches dispatch_error — so cog_command_error
+    sees an already-ended span and cannot record on it.
+    """
+
+    def _span_pair(self, music_bot, ctx):
+        span = MagicMock()
+        music_bot._active_spans[id(ctx)] = (span, MagicMock())
+        return span
+
+    async def test_failed_command_marks_span_error(self, music_bot, mock_ctx):
+        span = self._span_pair(music_bot, mock_ctx)
+        mock_ctx.command_failed = True
+        with patch("src.musicbot.otel_context.detach"):
+            await music_bot.cog_after_invoke(mock_ctx)
+        span.set_status.assert_called_once_with(StatusCode.ERROR)
+        span.end.assert_called_once()
+
+    async def test_successful_command_leaves_status_unset(self, music_bot, mock_ctx):
+        span = self._span_pair(music_bot, mock_ctx)
+        mock_ctx.command_failed = False
+        with patch("src.musicbot.otel_context.detach"):
+            await music_bot.cog_after_invoke(mock_ctx)
+        span.set_status.assert_not_called()
+        span.end.assert_called_once()
+
+    async def test_span_is_popped(self, music_bot, mock_ctx):
+        self._span_pair(music_bot, mock_ctx)
+        mock_ctx.command_failed = False
+        with patch("src.musicbot.otel_context.detach"):
+            await music_bot.cog_after_invoke(mock_ctx)
+        assert id(mock_ctx) not in music_bot._active_spans
+
+
+class TestDiscordPyHookOrdering:
+    """Pins the discord.py behaviour this module's error handling depends on.
+
+    If a future discord.py runs after_invoke AFTER dispatch_error, the span
+    status would move to the wrong hook and cog_command_error's "the span is
+    already ended" comment becomes a lie. Fail loudly here rather than silently
+    losing error status on every command span.
+    """
+
+    async def test_after_invoke_runs_before_command_error(self):
+        calls: list[str] = []
+        active: dict = {}
+
+        class Probe(commands.Cog):
+            async def cog_before_invoke(self, ctx):
+                active[id(ctx)] = "span"
+
+            async def cog_after_invoke(self, ctx):
+                calls.append("after_invoke")
+                active.pop(id(ctx), None)
+
+            async def cog_command_error(self, ctx, error):
+                calls.append("command_error")
+                # The whole reason cog_command_error must not touch the span:
+                assert active.get(id(ctx)) is None
+
+            @commands.command(name="boom2")
+            async def boom2(self, ctx):
+                raise RuntimeError("simulated failure")
+
+        bot = commands.Bot(command_prefix="-", intents=discord.Intents.none())
+        cog = Probe()
+        await bot.add_cog(cog)
+        cmd = bot.get_command("boom2")
+        assert cmd is not None
+
+        ctx = MagicMock(spec=commands.Context)
+        ctx.bot, ctx.command, ctx.cog = bot, cmd, cog
+        ctx.args, ctx.kwargs = [cog, ctx], {}
+        ctx.command_failed = False
+        ctx.invoked_subcommand = ctx.subcommand_passed = None
+
+        async def noop(*a, **k):
+            return True
+
+        # Bypass checks/arg-parsing/concurrency: this test is about hook order,
+        # not command plumbing.
+        cmd.can_run = noop  # type: ignore[method-assign]
+        cmd._parse_arguments = noop  # type: ignore[method-assign]
+        cmd._max_concurrency = None
+
+        with pytest.raises(commands.CommandInvokeError):
+            await cmd.invoke(ctx)
+
+        # command_failed is set before after_invoke — this is what lets
+        # cog_after_invoke mark the span.
+        assert ctx.command_failed is True
+        assert calls == ["after_invoke"]
+        await cog.cog_command_error(ctx, commands.CommandInvokeError(RuntimeError()))
+        assert calls == ["after_invoke", "command_error"]
+
+
+class TestOptionalTyping:
+    """The typing indicator is decoration and must never fail a command.
+
+    Regression: a 403 from ctx.typing()'s POST aborted -play before it parsed
+    the URL, because `async with ctx.typing():` sat outside the command's try.
+    """
+
+    def _ctx_with_typing(self, aenter_exc=None):
+        ctx = MagicMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(side_effect=aenter_exc)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        ctx.typing = MagicMock(return_value=cm)
+        return ctx, cm
+
+    async def test_body_runs_when_typing_forbidden(self):
+        forbidden = discord.Forbidden(MagicMock(status=403), "Missing Access")
+        ctx, cm = self._ctx_with_typing(aenter_exc=forbidden)
+        ran = False
+        async with _optional_typing(ctx):
+            ran = True
+        assert ran, "command body must still run when typing 403s"
+
+    async def test_body_runs_when_typing_5xx(self):
+        ctx, cm = self._ctx_with_typing(
+            aenter_exc=discord.HTTPException(MagicMock(status=500), "server error")
+        )
+        ran = False
+        async with _optional_typing(ctx):
+            ran = True
+        assert ran
+
+    async def test_aexit_not_called_when_aenter_failed(self):
+        """discord.py's Typing.__aexit__ touches self.task, which __aenter__
+        never created — calling it would raise AttributeError."""
+        ctx, cm = self._ctx_with_typing(
+            aenter_exc=discord.Forbidden(MagicMock(status=403), "Missing Access")
+        )
+        async with _optional_typing(ctx):
+            pass
+        cm.__aexit__.assert_not_awaited()
+
+    async def test_typing_failure_is_logged_as_warning(self):
+        ctx, _ = self._ctx_with_typing(
+            aenter_exc=discord.Forbidden(MagicMock(status=403), "Missing Access")
+        )
+        with patch("src.musicbot.log") as mock_log:
+            async with _optional_typing(ctx):
+                pass
+        mock_log.warning.assert_called_once()
+        mock_log.error.assert_not_called()
+
+    async def test_happy_path_enters_and_exits(self):
+        ctx, cm = self._ctx_with_typing()
+        async with _optional_typing(ctx):
+            pass
+        cm.__aenter__.assert_awaited_once()
+        cm.__aexit__.assert_awaited_once()
+
+    async def test_body_exception_still_exits_typing(self):
+        """A failing command must not leak the 5s typing refresh task."""
+        ctx, cm = self._ctx_with_typing()
+        with pytest.raises(RuntimeError):
+            async with _optional_typing(ctx):
+                raise RuntimeError("body blew up")
+        cm.__aexit__.assert_awaited_once()
+
+    async def test_body_exception_propagates(self):
+        """The helper must not swallow the command's own errors."""
+        ctx, _ = self._ctx_with_typing()
+        with pytest.raises(ValueError, match="real failure"):
+            async with _optional_typing(ctx):
+                raise ValueError("real failure")
+
+
+class TestCommandErrorHelper:
+    """_command_error is the handled path (17 call sites) — it must log too."""
+
+    async def test_logs_the_failure(self, music_bot, mock_ctx):
+        err = ValueError("yt-dlp exploded")
+        with (
+            patch("src.musicbot.send_embed", AsyncMock()),
+            patch("src.musicbot.log") as mock_log,
+        ):
+            await music_bot._command_error(mock_ctx, err, title="Failed to queue song")
+        mock_log.error.assert_called_once()
+        assert "Failed to queue song" in mock_log.error.call_args.args[0]
+        assert mock_log.error.call_args.kwargs["exc_info"] is err
+
+    async def test_reply_failure_does_not_mask_original(self, music_bot, mock_ctx):
+        """A 403 on the reply must not replace the error being reported."""
+        original = ValueError("the real cause")
+        forbidden = discord.Forbidden(MagicMock(status=403), "Missing Access")
+        with (
+            patch("src.musicbot.send_embed", AsyncMock(side_effect=forbidden)),
+            patch("src.musicbot.log") as mock_log,
+        ):
+            # Must not raise: the Forbidden is swallowed, not propagated.
+            await music_bot._command_error(mock_ctx, original)
+        assert "the real cause" in mock_log.error.call_args.args[0]
+
+    async def test_still_replies_on_the_happy_path(self, music_bot, mock_ctx):
+        with (
+            patch("src.musicbot.send_embed", AsyncMock()) as send,
+            patch("src.musicbot.log"),
+        ):
+            await music_bot._command_error(mock_ctx, ValueError("x"))
+        send.assert_awaited_once()
