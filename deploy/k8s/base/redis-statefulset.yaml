@@ -48,14 +48,20 @@ spec:
           # requests = limits (cpu AND memory) → Guaranteed QoS: the state
           # store must be the last thing node-pressure eviction touches.
           # Base = dev sizing with compose-parity maxmemory; the production
-          # overlay patches to 4Gi/1cpu (container memory = 2× maxmemory —
-          # AOF-rewrite fork COW can transiently double RSS).
+          # overlay patches to 4Gi/1cpu.
+          #
+          # Memory limit = 2× maxmemory (512Mi vs 256mb), the same rule the
+          # production overlay follows. AOF rewrite forks, and COW can
+          # transiently double RSS: at a 1.5× limit a rewrite firing near
+          # maxmemory pushes RSS past the cgroup and Redis is OOMKilled
+          # mid-playback. Guaranteed QoS does NOT protect against this — it
+          # only orders node-pressure eviction; nothing softens your own limit.
           resources:
             requests:
-              memory: 384Mi
+              memory: 512Mi
               cpu: 250m
             limits:
-              memory: 384Mi
+              memory: 512Mi
               cpu: 250m
           volumeMounts:
             - name: redis-data
