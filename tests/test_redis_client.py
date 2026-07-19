@@ -15,7 +15,6 @@ from src.guild_state import (
     SongQueueEntry,
 )
 from src.redis_client import (
-    GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
     cache_get,

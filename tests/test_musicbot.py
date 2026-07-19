@@ -916,9 +916,9 @@ class TestCleanup:
 
         await music_bot.cleanup(mock_guild)
 
-        assert call_order.index("cancel") < call_order.index(
-            "disconnect"
-        ), "player task must be cancelled before voice disconnect"
+        assert call_order.index("cancel") < call_order.index("disconnect"), (
+            "player task must be cancelled before voice disconnect"
+        )
 
 
 class TestStopCommand:
@@ -1270,7 +1270,7 @@ class TestHistoryCommand:
 
     @pytest.mark.parametrize("bad_limit", [0, -3, 51])
     async def test_out_of_range_limit_rejected(self, music_bot, mock_ctx, bad_limit):
-        mp = self._mp_with_history(music_bot, _history_entries(5))
+        self._mp_with_history(music_bot, _history_entries(5))
         await MusicBot.history.callback(
             music_bot, mock_ctx, flags=_flags(limit=bad_limit)
         )

@@ -227,9 +227,9 @@ class TestCommandHelp:
             category = (command.extras or {}).get("category")
             assert category in CATEGORY_ORDER, f"{command.name} category={category!r}"
             # …and must be placed in its category's importance ranking.
-            assert (
-                command.name in CATEGORY_COMMANDS[category]
-            ), f"{command.name} missing from CATEGORY_COMMANDS[{category!r}]"
+            assert command.name in CATEGORY_COMMANDS[category], (
+                f"{command.name} missing from CATEGORY_COMMANDS[{category!r}]"
+            )
             note = (command.extras or {}).get("note")
             assert note is None or len(note) <= FIELD_LIMIT
 
