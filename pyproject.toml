@@ -8,6 +8,7 @@ packages = [
 
 [tool.poetry.scripts]
 bot = "src.main:main"
+backfill-history = "src.backfill_history:main"
 
 [tool.poetry.dependencies]
 requests = "^2.31.0"
@@ -35,6 +36,7 @@ opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
 asyncpg = ">=0.30"
 opentelemetry-instrumentation-asyncpg = ">=0.48b0"
+python-dotenv = ">=1.0"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"

@@ -38,6 +38,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
     poetry install --only=main,test,lint --no-root
 
+# Migrations ship with the code: src/db.py applies db/migrations/*.sql on
+# first pool use, and the test suite pins the baseline file's presence.
+COPY db/ ./db/
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY pyproject.toml ./
@@ -63,6 +66,11 @@ WORKDIR /app
 
 # Copy the virtualenv from builder — no Poetry in the runtime image.
 COPY --from=builder /app/.venv /app/.venv
+
+# Migrations before source: db/ changes rarely, so its layer stays cached.
+# Without it the runtime bot would apply zero migrations and every history
+# drain would fail (src/db.py resolves db/migrations relative to the repo root).
+COPY db/ ./db/
 
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/

@@ -16,10 +16,11 @@ import os
 
 import pytest
 
+from src.backfill_history import run as backfill_run
 from src.db import Database, MigrationError
 from src.guild_state import HistoryEntry
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
-from src.redis_client import HISTORY_OUTBOX_KEY, GuildRedisStore
+from src.redis_client import HISTORY_CACHE_LIMIT, HISTORY_OUTBOX_KEY, GuildRedisStore
 
 pytestmark = [
     pytest.mark.pg,
@@ -200,6 +201,38 @@ class TestArchiveAgainstRealPG:
     async def test_limit_applies(self, archive):
         await archive.insert_batch([_entry(n) for n in range(5)])
         assert len(await archive.recent(42, 3)) == 3
+
+
+class TestBackfillAgainstRealPG:
+    async def test_count(self, archive):
+        assert await archive.count(42) == 0
+        await archive.insert_batch([_entry(1), _entry(2), _entry(3, guild_id=7)])
+        assert await archive.count(42) == 2
+        assert await archive.count(7) == 1
+
+    async def test_full_backfill_verify_demote_flow(self, fake_redis, archive):
+        # Runbook §6 steps 2–5 in miniature: seed two guilds' Redis lists
+        # (one oversized), backfill + verify + demote in one invocation.
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await fake_redis.lpush("guild:1:history", _entry(n, guild_id=1).to_redis())
+        await fake_redis.lpush("guild:2:history", _entry(1, guild_id=2).to_redis())
+        await fake_redis.lpush("guild:2:history", b"corrupt bytes")
+        lines: list[str] = []
+        assert (
+            await backfill_run(
+                fake_redis, archive, verify=True, demote=True, out=lines.append
+            )
+            == 0
+        )
+        assert await archive.count(1) == HISTORY_CACHE_LIMIT + 5
+        assert await archive.count(2) == 1
+        assert "verification passed" in lines
+        # Demotion trimmed + TTL'd the at-rest lists.
+        assert await fake_redis.llen("guild:1:history") == HISTORY_CACHE_LIMIT
+        assert await fake_redis.ttl("guild:1:history") > 0
+        # Idempotent: a second full run inserts nothing and still passes.
+        assert await backfill_run(fake_redis, archive, verify=True) == 0
+        assert await archive.count(1) == HISTORY_CACHE_LIMIT + 5
 
 
 class TestDrainerAgainstRealPG:

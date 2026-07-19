@@ -182,11 +182,12 @@ class TestPushQueue:
         ttl = await fake_redis.ttl(store.now_playing_key())
         assert ttl > 5
 
-    async def test_does_not_rearm_history_expiry(self, store, fake_redis):
-        """The history key is persistent — _pipe_expire_all must leave it alone."""
+    async def test_refreshes_ttl_on_history_key(self, store, fake_redis):
+        """Post-cutover the history key is a TTL'd display cache like the
+        rest of the guild keys — _pipe_expire_all refreshes it too."""
         await fake_redis.lpush(store.history_key(), b'"entry"')
         await store.push_queue(_entry(1))
-        assert await fake_redis.ttl(store.history_key()) == -1
+        assert await fake_redis.ttl(store.history_key()) > 0
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.push_queue(_entry(1))  # must not raise
@@ -293,25 +294,28 @@ class TestPushHistory:
         items = await fake_redis.lrange(store.history_key(), 0, -1)
         assert items[0] == _hentry(2).to_redis()  # newest first
 
-    async def test_no_trim_history_is_unbounded(self, store, fake_redis):
-        # The Redis list is the source of truth for ALL played songs — a trim
-        # here would silently discard history (docs/HISTORY_OVERHAUL_PLAN.md §4).
+    async def test_trims_to_display_window(self, store, fake_redis):
+        # Post-cutover the list is a display cache — full history lives in
+        # Postgres (docs/POSTGRES_HISTORY_PLAN.md §5.3), so pushes trim.
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await store.push_history(_hentry(i))
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert len(items) == HISTORY_CACHE_LIMIT + 5
+        assert len(items) == HISTORY_CACHE_LIMIT
+        assert items[0] == _hentry(HISTORY_CACHE_LIMIT + 4).to_redis()  # newest kept
 
-    async def test_history_key_is_persistent(self, store, fake_redis):
+    async def test_history_key_gets_idle_expiry(self, store, fake_redis):
         await store.push_history(_hentry(1))
-        assert await fake_redis.ttl(store.history_key()) == -1  # no expiry
+        assert await fake_redis.ttl(store.history_key()) > 0
 
-    async def test_persist_heals_pre_migration_ttl(self, store, fake_redis):
-        # A key written by an old build carries the 24h idle expiry; the first
-        # new-build push must remove it, not let history evaporate.
-        await fake_redis.lpush(store.history_key(), orjson.dumps("old entry"))
-        await fake_redis.expire(store.history_key(), 3600)
-        await store.push_history(_hentry(1))
-        assert await fake_redis.ttl(store.history_key()) == -1
+    async def test_lazily_demotes_pre_cutover_key(self, store, fake_redis):
+        # A key written by the pre-cutover build is PERSISTed and possibly
+        # oversized; the first new-build push trims it and arms the TTL.
+        for i in range(HISTORY_CACHE_LIMIT + 10):
+            await fake_redis.lpush(store.history_key(), _hentry(i).to_redis())
+        await fake_redis.persist(store.history_key())
+        await store.push_history(_hentry(999))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert await fake_redis.ttl(store.history_key()) > 0
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.push_history(_hentry(1))  # must not raise
@@ -331,12 +335,13 @@ class TestPushHistoryOutbox:
         ]
 
     async def test_display_leg_unchanged_by_outbox_flag(self, store, fake_redis):
-        # Phase A: the display list still gets the entry, untrimmed, PERSISTed.
+        # The display list gets the entry (trimmed, TTL'd) regardless of the
+        # outbox flag.
         await store.push_history(_hentry(1), outbox=True)
         assert await fake_redis.lrange(store.history_key(), 0, -1) == [
             _hentry(1).to_redis()
         ]
-        assert await fake_redis.ttl(store.history_key()) == -1
+        assert await fake_redis.ttl(store.history_key()) > 0
 
     async def test_outbox_is_global_and_interleaves_guilds(self, fake_redis):
         # One outbox for all guilds — entries carry guild_id on the wire.

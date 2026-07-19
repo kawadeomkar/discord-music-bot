@@ -35,11 +35,12 @@ GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 # seconds), it only grows while Postgres is unreachable.
 # See docs/POSTGRES_HISTORY_PLAN.md §3.
 HISTORY_OUTBOX_KEY = "history:outbox"
-GUILD_TTL = 86400  # 24h idle expiry (never applied to the history key — see below)
-# In-memory/display cap only — NOT a retention cap. The Redis history list is
-# unbounded (source of truth for all played songs; Postgres eventually — see
-# docs/HISTORY_OVERHAUL_PLAN.md §4/§8); this bounds the GuildHistory deque and
-# every history read so startup stays O(50) against an unbounded list.
+GUILD_TTL = 86400  # 24h idle expiry, applied to every guild:{id}:* key
+# Display-cache depth, in triplicate: the GuildHistory deque cap, the trim
+# depth of the guild:{id}:history Redis list (a TTL'd display-cache seed since
+# the Phase C cutover — retention lives in Postgres, docs/POSTGRES_HISTORY_PLAN.md),
+# and the -history --limit ceiling. Fine while all three are 50; split the
+# constants only when one needs to move.
 HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields cleared together on song end / disconnect, and the
@@ -242,13 +243,14 @@ class GuildRedisStore:
         return GUILD_NOW_PLAYING_KEY.format(guild_id=self.guild_id)
 
     def _pipe_expire_all(self, pipe) -> None:
-        """Queue expire commands for the TTL-managed guild keys onto an existing
-        pipeline. The history key is deliberately absent: full history is
-        retained indefinitely (PERSISTed by push_history), so it must never be
-        re-armed with an idle expiry."""
+        """Queue expire commands for the TTL-managed guild keys onto an
+        existing pipeline. Since the Phase C cutover the history key rides
+        idle expiry like the rest: it is a display-cache seed, and Postgres
+        holds full history (docs/POSTGRES_HISTORY_PLAN.md §5.3)."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
+        pipe.expire(self.history_key(), GUILD_TTL)
 
     async def _exec_with_state_ttl(self, pipe) -> None:
         """Append the state-key TTL refresh and execute the pipeline.
@@ -418,36 +420,31 @@ class GuildRedisStore:
             log.warning(f"[guild:{self.guild_id}] Redis rebuild_queue failed: {e}")
 
     # History operations
+    #
+    # (Resolved 2026-07-19, Phase C cutover: the pre-cutover design kept the
+    # history list unbounded and non-evictable, which could eventually fill
+    # maxmemory and stall every Redis write with OOM — tracked as a GitHub
+    # issue from an ISSUE comment here. Full history now lives in Postgres via
+    # the history:outbox drain, and this list is a bounded, TTL'd display
+    # cache; the OOM path is gone. docs/POSTGRES_HISTORY_PLAN.md.)
 
-    # ISSUE: Unbounded, non-evictable history can exhaust Redis and stall all writes.
-    # History keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
-    # eviction candidates. Once history fills the 256mb maxmemory and no TTL-bearing key
-    # is left to evict, Redis rejects EVERY write with OOM — not just history: state,
-    # queue, and cache writes all start failing (each store method swallows the error and
-    # logs, so persistence silently degrades rather than crashing). Small entries make
-    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The planned
-    # fix is migrating full history to Postgres and demoting the Redis list to a bounded
-    # cache (docs/HISTORY_OVERHAUL_PLAN.md §8, architecture plan §3.11); until then this
-    # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
-    # workaround — that would make history itself an eviction candidate and defeat the
-    # whole persistent-history design (see docker-compose.yml redis command).
     async def push_history(self, entry: HistoryEntry, *, outbox: bool = False) -> None:
-        """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
-        the unbounded source of truth for all played songs (write-per-song-end
-        is the durability boundary; cadence analysis in
-        docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
-        pre-migration keys still carrying the old 24h idle expiry.
-        (The Phase C cutover of docs/POSTGRES_HISTORY_PLAN.md replaces PERSIST
-        with LTRIM+EXPIRE once Postgres is the source of truth.)
+        """LPUSH one entry, trim to the display window, arm idle expiry — the
+        list is a display-cache seed for restore, not retention: full history
+        lives in Postgres, fed via the outbox (docs/POSTGRES_HISTORY_PLAN.md
+        §5.3). The LTRIM+EXPIRE also lazily demotes keys written by the
+        pre-cutover build (which PERSISTed and never trimmed).
 
         outbox=True additionally LPUSHes the same wire bytes onto
         HISTORY_OUTBOX_KEY in the same pipeline — set when a Postgres archive
         is configured (GuildHistory gates it), never otherwise: without a
-        drainer the outbox would grow unbounded."""
+        drainer the outbox would grow unbounded. The outbox key deliberately
+        gets NO trim and NO TTL here — it holds not-yet-durable entries."""
         try:
             pipe = self.redis.pipeline()
             pipe.lpush(self.history_key(), serialize_history_entry(entry))
-            pipe.persist(self.history_key())
+            pipe.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            pipe.expire(self.history_key(), GUILD_TTL)
             if outbox:
                 pipe.lpush(HISTORY_OUTBOX_KEY, serialize_history_entry(entry))
             await pipe.execute()  # type: ignore[misc]

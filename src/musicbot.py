@@ -42,8 +42,11 @@ log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
 HISTORY_MIN_LIMIT = 1
-# The ceiling is the display cache depth — -history reads the in-memory cache,
-# or the Redis list when the cache is cold. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+# Postgres can serve any depth, but the ceiling stays at the display-cache
+# constant: the embed-chunking UX was sized for it, and the degraded fallback
+# paths (Redis cache / deque) can't see past it anyway. Raising it is a
+# Phase-D-era UX decision (docs/POSTGRES_HISTORY_PLAN.md §7.3), not a data
+# constraint.
 HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
 # Discord's per-message cap — so the block always fits and is never shed.

@@ -47,16 +47,16 @@ class TestAdd:
         await h.add(_entry(1))
         assert list(h) == [_entry(1)]
 
-    async def test_cache_capped_redis_leg_unbounded(self, store, fake_redis):
+    async def test_both_cache_legs_capped(self, store, fake_redis):
+        # Post-cutover both legs are display caches — retention is Postgres's
+        # job (docs/POSTGRES_HISTORY_PLAN.md §5.3).
         h = GuildHistory(store)
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await h.add(_entry(i))
-        # The cache holds only the newest window…
         assert len(h) == HISTORY_CACHE_LIMIT
         assert h[0] == _entry(5)  # oldest cached = first evicted survivor
-        # …while every entry landed in Redis.
         raw = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert len(raw) == HISTORY_CACHE_LIMIT + 5
+        assert len(raw) == HISTORY_CACHE_LIMIT
 
     async def test_cache_matches_newest_slice_of_redis(self, store):
         h = GuildHistory(store)
@@ -159,6 +159,92 @@ class TestRecent:
         h = GuildHistory(None)
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
+
+
+class _FakeArchive:
+    """recent()-only archive fake: serves a canned newest-first list, records
+    calls, raises on demand."""
+
+    def __init__(self, entries=None, fail=False):
+        self.entries = entries or []  # newest-first, as the real one returns
+        self.fail = fail
+        self.calls: list[tuple[int, int]] = []
+
+    async def insert_batch(self, entries):  # protocol completeness
+        raise AssertionError("recent()-path tests must not insert")
+
+    async def recent(self, guild_id, limit):
+        self.calls.append((guild_id, limit))
+        if self.fail:
+            raise RuntimeError("pg down")
+        return self.entries[:limit]
+
+
+class TestRecentArchivePrimary:
+    """Phase C read flip (docs/POSTGRES_HISTORY_PLAN.md §5.4): the archive is
+    authoritative, freshness-merged with the deque; the pre-cutover chain
+    survives only as the degraded fallback."""
+
+    async def test_archive_serves_reads_with_guild_id(self, store):
+        archive = _FakeArchive(entries=[_entry(3), _entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        assert await h.recent(2) == [_entry(3), _entry(2)]
+        assert archive.calls == [(42, 2)]
+
+    async def test_archive_beats_redis_cache(self, store):
+        # The Redis list may be a partial cache post-cutover — a non-empty
+        # list must NOT shadow the archive (the original v1-review bug).
+        h_seed = GuildHistory(store)
+        await h_seed.add(_entry(9))  # Redis list now holds only entry 9
+        archive = _FakeArchive(entries=[_entry(3), _entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        assert await h.recent(10) == [_entry(3), _entry(2), _entry(1)]
+
+    async def test_merge_prepends_undrained_deque_entries(self, store):
+        # Drain lag: the song that just ended is in the deque but not yet in
+        # PG — it must still show, newest first.
+        archive = _FakeArchive(entries=[_entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([_entry(3)])  # deque holds the undrained newest entry
+        assert await h.recent(10) == [_entry(3), _entry(2), _entry(1)]
+
+    async def test_merge_dedups_by_identity(self, store):
+        archive = _FakeArchive(entries=[_entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([_entry(2), _entry(1)])  # fully drained — all dupes
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+
+    async def test_merge_respects_limit(self, store):
+        archive = _FakeArchive(entries=[_entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([_entry(3)])
+        assert await h.recent(2) == [_entry(3), _entry(2)]
+
+    async def test_empty_archive_serves_deque_via_merge(self, store):
+        # Fresh PG + undrained entries: the merge alone carries the answer.
+        archive = _FakeArchive(entries=[])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+
+    async def test_archive_error_falls_back_to_redis(self, store, caplog):
+        seed = GuildHistory(store)
+        await seed.add(_entry(1))
+        await seed.add(_entry(2))
+        h = GuildHistory(store, archive=_FakeArchive(fail=True), guild_id=42)
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+        assert "archive read failed" in caplog.text
+
+    async def test_archive_error_without_store_falls_back_to_deque(self):
+        h = GuildHistory(None, archive=_FakeArchive(fail=True), guild_id=42)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+
+    async def test_nonpositive_limit_short_circuits_archive(self, store):
+        archive = _FakeArchive(entries=[_entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        assert await h.recent(0) == []
+        assert archive.calls == []
 
 
 class TestSequenceProtocol:

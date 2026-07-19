@@ -115,7 +115,7 @@ The full architecture document is at `docs/ARCHITECTURE.md`.
 | `src/musicbot.py` | `MusicBot` Cog. All Discord commands. Owns `mps: dict[guild_id → MusicPlayer]`. `on_ready` triggers crash recovery per guild. |
 | `src/musicplayer.py` | Per-guild playback orchestration. `loop()` task, prefetch task, embeds/ETA, presence. Delegates every queue operation to `self.queue: GuildQueue`. |
 | `src/guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns all three queue representations plus the bulk-mutation mutex and cleared-flag; every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. |
-| `src/guild_history.py` | `GuildHistory` — played-song history domain class. Privately owns the pair of legs: the unbounded Redis list (source of truth for all played songs) and a HISTORY_CACHE_LIMIT-capped in-memory display cache. When a Postgres archive is configured, `add()` also LPUSHes the global `history:outbox` (same pipeline) and nudges the drainer — Postgres is never awaited in the playback path. |
+| `src/guild_history.py` | `GuildHistory` — played-song history domain class. Postgres (`play_history`) is the source of truth; the class privately owns two HISTORY_CACHE_LIMIT-capped cache legs (TTL'd Redis list = restore-time seed, in-memory deque = freshness patch + fallback). `add()` feeds deque + Redis list + `history:outbox` in one step and nudges the drainer; `recent()` reads Postgres first with a freshness merge — Postgres is never awaited in the playback path. |
 | `src/db.py` | Durable-tier substrate (`docs/POSTGRES_HISTORY_PLAN.md` §5.7): `Database` owns the process's one asyncpg pool (lazy — no connection until first `acquire()`, so startup never blocks on Postgres) and the migration runner: forward-only SQL files in `db/migrations/`, `schema_migrations` ledger with sha256 checksums (a file edited after apply is a `MigrationError`, never a re-run), whole run under `pg_advisory_lock`. Repositories depend on `Database`, never on asyncpg pools directly. |
 | `src/history_archive.py` | Postgres play-history repository + drainer (`docs/POSTGRES_HISTORY_PLAN.md`): `HistoryArchive` protocol, `PostgresHistoryArchive` (SQL + `HistoryEntry`↔row mapping over `Database`), `HistoryOutboxDrainer` (one background task per process: peek oldest outbox batch → `INSERT … ON CONFLICT DO NOTHING` → retire; at-least-once, deduped by the `play_history_dedup` unique index). Everything is off unless `POSTGRES_URL` is set. |
 | `src/guild_state.py` | Schema module: every byte persisted to Redis is defined here. Frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`) + field-name constants. Pure data — no domain logic, no project runtime imports. |
@@ -174,7 +174,7 @@ requester rehydration happen inside `GuildQueue`.
 | `current_song` | `Optional[YTDL]` | Currently playing `FFmpegOpusAudio` object |
 | `play_next` | `asyncio.Event` | Set by `after=` callback (thread-safe via `call_soon_threadsafe`); cleared at start of each loop iteration |
 | `queue` | `GuildQueue` | All queue state and operations (see above) |
-| `history` | `GuildHistory` | All played songs (unbounded Redis list + 50-entry in-memory display cache — see `guild_history.py`) |
+| `history` | `GuildHistory` | Played songs: Postgres is the source of truth (via the outbox drain); Redis list + in-memory deque are 50-entry display caches — see `guild_history.py` |
 | `volume` | `float` | 0.0–1.0; applied via FFmpeg `-filter:a volume=` on next song |
 | `_player` | `asyncio.Task` | Long-lived `loop()` task |
 | `_prefetch_task` | `asyncio.Task` | Active `_prefetch_next_song()` task |
@@ -223,18 +223,20 @@ All commands use `@commands.before_invoke(validate_commands)`. `cog_before_invok
 ### Redis schema overview
 
 All guild keys are prefixed `guild:{guild_id}:`. TTL is 24h idle expiry (`GUILD_TTL`),
-refreshed on writes, restore, and clean shutdown — **except `guild:{id}:history`,
-which is persistent** (PERSISTed on every push, excluded from every TTL refresh) so
-full play history is never lost to idle expiry. **The schema is defined in one place:
-`src/guild_state.py`** — field constants + frozen value objects with `from_redis`/
-`to_redis` converters; no other module touches raw wire bytes.
+refreshed on writes, restore, and clean shutdown — the history key included since the
+Phase C cutover: full play history lives in Postgres (`play_history`, fed via
+`history:outbox`), and the Redis list is only a trimmed display-cache seed. The one
+deliberately persistent key is the global `history:outbox` (holds not-yet-durable
+entries). **The schema is defined in one place: `src/guild_state.py`** — field
+constants + frozen value objects with `from_redis`/`to_redis` converters; no other
+module touches raw wire bytes.
 
 | Key | Type | Contents (value object) |
 |---|---|---|
 | `guild:{id}:state` | Hash | 12 fields: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_*` (url/title/duration/uploader/requester_id/interjected — a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` → `GuildStateData` |
 | `guild:{id}:now_playing` | Hash | 12 display fields for the recovered Now Playing embed → `NowPlayingData` |
 | `guild:{id}:queue` | List | JSON entries, `"type"`-discriminated → `SongQueueEntry` / `SearchQueueEntry` (RPUSH on enqueue, LPOP inside the atomic start transaction) |
-| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
+| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first) → `serialize_history_entry`/`parse_history_entry`. Trimmed to 50 + `GUILD_TTL` on every push — a display-cache seed for restore; full history lives in Postgres `play_history` (see `docs/POSTGRES_HISTORY_PLAN.md`) |
 | `history:outbox` | List | Global (all guilds) write-ahead buffer for the Postgres archive — same `HistoryEntry` wire bytes, each carrying `guild_id`. **No TTL, deliberately non-evictable** (holds not-yet-durable entries); near-empty in steady state, grows only while Postgres is down. Written only when `POSTGRES_URL` is configured |
 | `lock:guild:{id}:recovery` | String | `"1"`, TTL 60s (SET NX — distributed lock) |
 | `ytdl:stream:{webpage_url}` | String | JSON stream data; TTL = `expire − now − 1800s` |
@@ -242,7 +244,7 @@ full play history is never lost to idle expiry. **The schema is defined in one p
 | `spotify:track:{id}` | String | `"Title Artist"` search string; TTL 24h |
 | `spotify:playlist:{id}` | String | JSON array of track titles; TTL 1h (user-editable) |
 
-Redis uses `maxmemory-policy volatile-lru` at 256 MB: only TTL-carrying keys (yt-dlp/Spotify caches, the TTL-managed guild keys) are eviction candidates — the persistent history keys and `history:outbox` never are. Do not switch back to `allkeys-*`; that would let memory pressure silently destroy full play history (and, with a Postgres archive configured, not-yet-durable outbox entries).
+Redis uses `maxmemory-policy volatile-lru` at 256 MB: only TTL-carrying keys (yt-dlp/Spotify caches, all `guild:*` keys — history included since the Phase C cutover) are eviction candidates — the persistent `history:outbox` never is. Do not switch back to `allkeys-*`; that would let memory pressure silently destroy not-yet-durable outbox entries. Everything evictable is reconstructible (caches) or re-creatable (guild runtime state); durable history lives in Postgres.
 
 ### Crash recovery
 

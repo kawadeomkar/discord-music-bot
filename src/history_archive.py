@@ -118,6 +118,14 @@ class PostgresHistoryArchive:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
 
+    async def count(self, guild_id: int) -> int:
+        """Rows stored for one guild — the backfill's inserted/dup accounting
+        and --verify comparison (docs/POSTGRES_HISTORY_PLAN.md §5.6)."""
+        async with self._db.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT count(*) FROM play_history WHERE guild_id = $1", guild_id
+            )
+
 
 class HistoryOutboxDrainer:
     """The one task per process that drains the Redis outbox into the archive.

@@ -1278,15 +1278,17 @@ class TestMusicPlayerInitialState:
 
 
 class TestRedisHelpers:
-    async def test_redis_push_history_unbounded(self, music_player, fake_redis):
-        # Full history retention: the Redis list must never be trimmed
-        # (docs/HISTORY_OVERHAUL_PLAN.md §4).
+    async def test_redis_push_history_trims_to_display_window(
+        self, music_player, fake_redis
+    ):
+        # Post-cutover the Redis list is a display cache; full retention is
+        # Postgres's job (docs/POSTGRES_HISTORY_PLAN.md §5.3).
         for i in range(55):
             await music_player.store.push_history(
                 HistoryEntry(title=f"Song {i}", webpage_url=f"url{i}")
             )
         items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
-        assert len(items) == 55
+        assert len(items) == 50
 
     async def test_store_set_volume_updates_volume(self, music_player, fake_redis):
         await music_player.store.set_volume(0.75)

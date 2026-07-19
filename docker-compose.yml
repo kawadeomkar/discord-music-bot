@@ -33,11 +33,12 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru: guild:{id}:history keys are persistent
-    # (no TTL — unbounded full-history retention, docs/HISTORY_OVERHAUL_PLAN.md
-    # §4) and must never be eviction candidates. Every cache key (ytdl:*,
-    # spotify:*) and the other guild:* keys carry TTLs, so volatile-lru
-    # preserves the existing cache-eviction behavior for them.
+    # volatile-lru, NOT allkeys-lru: the history:outbox list is persistent
+    # (no TTL — it buffers played-song entries not yet drained to Postgres,
+    # docs/POSTGRES_HISTORY_PLAN.md §3) and must never be an eviction
+    # candidate. Every cache key (ytdl:*, spotify:*) and all guild:* keys —
+    # including guild:{id}:history, a TTL'd display cache since the Phase C
+    # cutover — carry TTLs, so volatile-lru evicts only reconstructible data.
     command: >
       redis-server
       --appendonly yes
@@ -75,6 +76,11 @@ services:
       # (PGDATA is version-specific beneath it). Mounting the old .../data
       # path would silently store the cluster OUTSIDE the volume.
       - postgres-data:/var/lib/postgresql
+      # Backup buffer (docs/POSTGRES_HISTORY_PLAN.md §8.1): pg_backup.sh dumps
+      # here (write-then-rename, prune keep-7); an external process pulls
+      # completed musicbot-*.dump files to long-term storage and must never
+      # delete from it.
+      - postgres-backups:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U musicbot -d musicbot"]
       interval: 5s
@@ -126,6 +132,7 @@ services:
 volumes:
   redis-data:
   postgres-data:
+  postgres-backups:
   ytdlp-cache:
   otel-grafana:
   otel-tempo:
