@@ -184,6 +184,12 @@ def _setup_logs() -> None:
 def _setup_auto_instrumentation() -> None:
     from opentelemetry.instrumentation.redis import RedisInstrumentor
     from opentelemetry.instrumentation.aiohttp_client import AioHttpClientInstrumentor
+    from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 
     RedisInstrumentor().instrument()
     AioHttpClientInstrumentor().instrument()
+    # Postgres spans for the durable tier (drainer inserts, -history/-stats
+    # reads). Safe with our usage: no async cursors (the instrumentor's
+    # span-per-row trap) and no explicit PreparedStatement objects (which it
+    # can't see) — plan §2.7.
+    AsyncPGInstrumentor().instrument()

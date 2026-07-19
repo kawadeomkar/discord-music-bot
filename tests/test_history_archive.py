@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from src.db import Database
 from src.guild_state import HistoryEntry
 from src.history_archive import (
     HistoryOutboxDrainer,
@@ -252,15 +253,12 @@ class TestRowMapping:
 
 class TestPostgresArchiveWithoutServer:
     async def test_empty_insert_never_connects(self):
-        # insert_batch([]) early-outs before _ensure() — a bogus DSN proves
+        # insert_batch([]) early-outs before any acquire — a bogus DSN proves
         # no connection was attempted.
-        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        archive = PostgresHistoryArchive(Database("postgresql://nope:1/nope"))
         await archive.insert_batch([])
 
     async def test_nonpositive_recent_never_connects(self):
-        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        archive = PostgresHistoryArchive(Database("postgresql://nope:1/nope"))
         assert await archive.recent(42, 0) == []
         assert await archive.recent(42, -1) == []
-
-    async def test_close_before_connect_is_safe(self):
-        await PostgresHistoryArchive("postgresql://nope:1/nope").close()

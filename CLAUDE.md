@@ -14,6 +14,9 @@ poetry run pytest
 # Run a single test
 poetry run pytest tests/test_sources.py::TestParseUrlYouTube::test_youtube_watch_url
 
+# Opt-in Postgres integration tier (needs Docker; excluded from the default run)
+RUN_PG_TESTS=1 poetry run pytest -m pg --no-cov
+
 # Type-check
 python -m pyright src/
 
@@ -113,7 +116,8 @@ The full architecture document is at `docs/ARCHITECTURE.md`.
 | `src/musicplayer.py` | Per-guild playback orchestration. `loop()` task, prefetch task, embeds/ETA, presence. Delegates every queue operation to `self.queue: GuildQueue`. |
 | `src/guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns all three queue representations plus the bulk-mutation mutex and cleared-flag; every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. |
 | `src/guild_history.py` | `GuildHistory` — played-song history domain class. Privately owns the pair of legs: the unbounded Redis list (source of truth for all played songs) and a HISTORY_CACHE_LIMIT-capped in-memory display cache. When a Postgres archive is configured, `add()` also LPUSHes the global `history:outbox` (same pipeline) and nudges the drainer — Postgres is never awaited in the playback path. |
-| `src/history_archive.py` | Postgres play-history archive (Phase A of `docs/POSTGRES_HISTORY_PLAN.md`): `HistoryArchive` protocol, `PostgresHistoryArchive` (asyncpg; lazy pool + idempotent DDL on first use), `HistoryOutboxDrainer` (one background task per process: peek oldest outbox batch → `INSERT … ON CONFLICT DO NOTHING` → retire; at-least-once, deduped by the `play_history_dedup` unique index). Everything is off unless `POSTGRES_URL` is set. |
+| `src/db.py` | Durable-tier substrate (`docs/POSTGRES_HISTORY_PLAN.md` §5.7): `Database` owns the process's one asyncpg pool (lazy — no connection until first `acquire()`, so startup never blocks on Postgres) and the migration runner: forward-only SQL files in `db/migrations/`, `schema_migrations` ledger with sha256 checksums (a file edited after apply is a `MigrationError`, never a re-run), whole run under `pg_advisory_lock`. Repositories depend on `Database`, never on asyncpg pools directly. |
+| `src/history_archive.py` | Postgres play-history repository + drainer (`docs/POSTGRES_HISTORY_PLAN.md`): `HistoryArchive` protocol, `PostgresHistoryArchive` (SQL + `HistoryEntry`↔row mapping over `Database`), `HistoryOutboxDrainer` (one background task per process: peek oldest outbox batch → `INSERT … ON CONFLICT DO NOTHING` → retire; at-least-once, deduped by the `play_history_dedup` unique index). Everything is off unless `POSTGRES_URL` is set. |
 | `src/guild_state.py` | Schema module: every byte persisted to Redis is defined here. Frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`) + field-name constants. Pure data — no domain logic, no project runtime imports. |
 | `src/youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)`. `yt_source`, `yt_stream`, `prefetch_stream` classmethods. |
 | `src/sources.py` | Input parsing. `parse_input` classifies a string into `YTSource`, `SpotifySource`, or `SoundcloudSource`. |

@@ -6,8 +6,9 @@ Three pieces:
 
 - HistoryArchive — the protocol GuildHistory and the drainer program against;
   unit tests substitute an in-memory fake.
-- PostgresHistoryArchive — the asyncpg implementation. Lazily connects and
-  applies the schema on first use so bot startup never blocks on Postgres
+- PostgresHistoryArchive — the SQL + row-mapping repository. Connection
+  lifecycle and schema live in src/db.py (`Database`): the pool is lazy and
+  migrations run on first acquire, so bot startup never blocks on Postgres
   being reachable (the drainer's backoff loop absorbs failures instead).
 - HistoryOutboxDrainer — the single background task that moves entries from
   the Redis outbox list to Postgres: peek oldest batch → INSERT ... ON
@@ -18,7 +19,8 @@ Three pieces:
 
 Row mapping (HistoryEntry ↔ play_history row) lives here, not in
 guild_state.py — that module's contract is pure wire schema with no runtime
-imports, and asyncpg is very much a runtime import.
+imports, and the database layer is very much a runtime import. The schema
+itself lives in db/migrations/ (docs/POSTGRES_HISTORY_PLAN.md §4).
 """
 
 import asyncio
@@ -26,38 +28,12 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
-import asyncpg
-
+from src.db import Database
 from src.guild_state import HistoryEntry, parse_history_entry
 from src.redis_client import outbox_depth, peek_outbox_oldest, retire_outbox
 from src.util import get_logger
 
 log = get_logger(__name__)
-
-# The zero-value convention ("0 / empty string = unknown") carries over from
-# the wire format — no NULLs. Deliberate: standard unique indexes treat NULLs
-# as distinct, which would break dedup exactly on the unknown-played_at rows
-# that need it most. played_at epoch 0 = unknown, same sentinel as the wire.
-# The dedup index doubles as the -history read index: its leading
-# (guild_id, played_at) columns serve ORDER BY played_at DESC via backward
-# scan. Full rationale: docs/POSTGRES_HISTORY_PLAN.md §4.
-_SCHEMA_DDL = """
-CREATE TABLE IF NOT EXISTS play_history (
-    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    guild_id       bigint      NOT NULL,
-    title          text        NOT NULL DEFAULT '',
-    webpage_url    text        NOT NULL DEFAULT '',
-    duration_secs  integer     NOT NULL DEFAULT 0,
-    played_secs    integer     NOT NULL DEFAULT 0,
-    requester_id   bigint      NOT NULL DEFAULT 0,
-    requester_name text        NOT NULL DEFAULT '',
-    thumbnail      text        NOT NULL DEFAULT '',
-    uploader       text        NOT NULL DEFAULT '',
-    played_at      timestamptz NOT NULL DEFAULT to_timestamp(0)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS play_history_dedup
-    ON play_history (guild_id, played_at, webpage_url);
-"""
 
 _INSERT_SQL = """
 INSERT INTO play_history (guild_id, title, webpage_url, duration_secs,
@@ -117,42 +93,20 @@ class HistoryArchive(Protocol):
 
 
 class PostgresHistoryArchive:
-    """asyncpg-backed archive. All methods raise on failure — callers own the
-    error policy (the drainer backs off; Phase B's recent() falls back)."""
+    """SQL + row-mapping repository over `Database`. All methods raise on
+    failure — callers own the error policy (the drainer backs off; Phase C's
+    recent() falls back). Lifecycle (pool, migrations, close) belongs to the
+    Database, which the app owns."""
 
-    def __init__(self, url: str) -> None:
-        self._url = url
-        self._pool: Optional[asyncpg.Pool] = None
-        self._init_lock = asyncio.Lock()
-
-    async def _ensure(self) -> asyncpg.Pool:
-        """Lazy pool + idempotent DDL, double-checked under the lock. First
-        successful call wins; a failed attempt leaves no half-open pool."""
-        if self._pool is not None:
-            return self._pool
-        async with self._init_lock:
-            if self._pool is None:
-                # timeout=10: a fast connect failure keeps the drainer's
-                # backoff loop responsive (default is 60s).
-                pool = await asyncpg.create_pool(
-                    self._url, min_size=1, max_size=4, timeout=10
-                )
-                try:
-                    async with pool.acquire() as conn:
-                        await conn.execute(_SCHEMA_DDL)
-                except BaseException:
-                    await pool.close()
-                    raise
-                self._pool = pool
-        return self._pool
+    def __init__(self, db: Database) -> None:
+        self._db = db
 
     async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None:
         """Insert oldest-first; replays and backfill overlap dedup via the
         play_history_dedup unique index (ON CONFLICT DO NOTHING)."""
         if not entries:
             return
-        pool = await self._ensure()
-        async with pool.acquire() as conn:
+        async with self._db.acquire() as conn:
             await conn.executemany(_INSERT_SQL, [_entry_to_row(e) for e in entries])
 
     async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
@@ -160,16 +114,9 @@ class PostgresHistoryArchive:
         the tie-break so epoch-0 (unknown-time) entries order stably."""
         if limit <= 0:
             return []
-        pool = await self._ensure()
-        async with pool.acquire() as conn:
+        async with self._db.acquire() as conn:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
-
-    async def close(self) -> None:
-        pool = self._pool
-        self._pool = None
-        if pool is not None:
-            await pool.close()
 
 
 class HistoryOutboxDrainer:

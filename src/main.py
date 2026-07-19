@@ -6,6 +6,7 @@ import discord
 from discord.ext import commands
 
 from src.config import ENVIRONMENT
+from src.db import Database
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
@@ -100,10 +101,12 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
-        # Postgres play-history archive + its outbox drainer — both None when
+        # The durable tier (docs/POSTGRES_HISTORY_PLAN.md): Database owns the
+        # asyncpg pool + migrations; the archive is the repository over it;
+        # the drainer moves the Redis outbox into it. All three are None when
         # POSTGRES_URL is unset, and every consumer treats that as "feature
-        # off" (docs/POSTGRES_HISTORY_PLAN.md; None → bot behaves exactly as
-        # before the archive existed).
+        # off" (None → bot behaves exactly as before the tier existed).
+        self.database: Optional[Database] = None
         self.history_archive: Optional[PostgresHistoryArchive] = None
         self.history_drainer: Optional[HistoryOutboxDrainer] = None
 
@@ -113,9 +116,11 @@ class MusicBotApp(commands.AutoShardedBot):
         postgres_url = os.getenv("POSTGRES_URL")
         if postgres_url:
             # Lazy inside: no connection is made here, so startup never
-            # blocks on Postgres — the drainer's backoff loop absorbs an
+            # blocks on Postgres — first acquire creates the pool and runs
+            # migrations, and the drainer's backoff loop absorbs an
             # unreachable database.
-            self.history_archive = PostgresHistoryArchive(postgres_url)
+            self.database = Database(postgres_url)
+            self.history_archive = PostgresHistoryArchive(self.database)
             drainer = HistoryOutboxDrainer(self.redis, self.history_archive)
             drainer.start()
             self.history_drainer = drainer
@@ -147,12 +152,12 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
-        # Drainer first (its final drain still needs Redis and the archive),
-        # then the archive pool, then the Redis pool they both sat on.
+        # Drainer first (its final drain still needs Redis and the database),
+        # then the database pool, then the Redis pool they both sat on.
         if self.history_drainer is not None:
             await self.history_drainer.stop()
-        if self.history_archive is not None:
-            await self.history_archive.close()
+        if self.database is not None:
+            await self.database.close()
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()

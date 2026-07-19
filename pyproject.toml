@@ -34,12 +34,14 @@ opentelemetry-instrumentation-redis = ">=0.48b0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
 asyncpg = ">=0.30"
+opentelemetry-instrumentation-asyncpg = ">=0.48b0"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
 fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
+testcontainers = ">=4.8"
 
 [tool.poetry.group.lint.dependencies]
 pyright = "^1.1.409"
@@ -60,6 +62,13 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing"
+markers = [
+    # Opt-in integration tier against a real Postgres (testcontainers).
+    # Auto-skipped unless RUN_PG_TESTS=1; run with:
+    #   RUN_PG_TESTS=1 poetry run pytest -m pg --no-cov
+    # (docs/POSTGRES_HISTORY_PLAN.md §9.2)
+    "pg: integration tests requiring Docker + a throwaway Postgres container",
+]
 filterwarnings = [
     "error",
     # audioop was removed in Python 3.13 but discord.py's Ogg/Opus parser still
