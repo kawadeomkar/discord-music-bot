@@ -5,7 +5,6 @@ import contextlib
 import dataclasses
 import re
 import time
-from collections import deque
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -13,7 +12,7 @@ import discord
 import orjson
 import pytest
 
-from src.guild_state import NowPlayingData, SongQueueEntry
+from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.musicplayer import (
     MusicPlayer,
     _build_progress_bar,
@@ -49,6 +48,8 @@ def mock_song():
     song.title = "Test Song Title"
     song.requester = MagicMock()
     song.requester.mention = "<@123456>"
+    song.requester.id = 123456
+    song.requester.display_name = "TestUser"
     song.webpage_url = "https://www.youtube.com/watch?v=testid"
     song.duration = "0:03:30"
     song.uploader = "Test Channel"
@@ -688,7 +689,7 @@ class TestGetQueue:
         # First song: no preceding unknown → no ~
         # Second song: preceding song had unknown duration → ~
         lines = embed.description.split("\n")
-        est_lines = [l for l in lines if "Est. playing at" in l]
+        est_lines = [line for line in lines if "Est. playing at" in line]
         assert not est_lines[0].startswith("~") or "~**" not in est_lines[0]
         assert "~**" in est_lines[1]
 
@@ -1278,11 +1279,15 @@ class TestMusicPlayerInitialState:
 
 
 class TestRedisHelpers:
-    async def test_redis_push_history_capped_at_50(self, music_player, fake_redis):
+    async def test_redis_push_history_unbounded(self, music_player, fake_redis):
+        # Full history retention: the Redis list must never be trimmed
+        # (docs/HISTORY_OVERHAUL_PLAN.md §4).
         for i in range(55):
-            await music_player.store.push_history(f"Song {i} - url{i}")
+            await music_player.store.push_history(
+                HistoryEntry(title=f"Song {i}", webpage_url=f"url{i}")
+            )
         items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
-        assert len(items) == 50
+        assert len(items) == 55
 
     async def test_store_set_volume_updates_volume(self, music_player, fake_redis):
         await music_player.store.set_volume(0.75)
@@ -1360,10 +1365,12 @@ class TestStateRestore:
     async def test_restore_populates_history_from_snapshot(
         self, music_player, fake_redis
     ):
-        await music_player.store.push_history("Old Song - url1")
-        await music_player.store.push_history("New Song - url2")
+        old = HistoryEntry(title="Old Song", webpage_url="url1", played_at=1.0)
+        new = HistoryEntry(title="New Song", webpage_url="url2", played_at=2.0)
+        await music_player.store.push_history(old)
+        await music_player.store.push_history(new)
         await music_player._restore_state()
-        assert list(music_player.history) == ["Old Song - url1", "New Song - url2"]
+        assert list(music_player.history) == [old, new]  # oldest first
 
     async def test_restore_populates_play_message_from_snapshot(
         self, music_player, fake_redis
@@ -3405,6 +3412,9 @@ class TestLoop:
         song.acodec = ""
         song.requester = None
         song.start_offset = 0
+        # Real number: loop()'s history step feeds this through
+        # HistoryEntry.from_song, and round(MagicMock) raises.
+        song.position_secs = 195.0
         # -playnow flags a real YTDL always carries — truthy MagicMock
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
@@ -3555,7 +3565,8 @@ class TestLoop:
             await music_player.loop()
 
         assert len(music_player.history) == 1
-        assert mock_song.title in music_player.history[0]
+        assert music_player.history[0].title == mock_song.title
+        assert music_player.history[0].webpage_url == mock_song.webpage_url
 
     async def test_song_that_produced_no_audio_is_not_treated_as_played(
         self, music_player, queue_obj, mock_song
@@ -4175,6 +4186,9 @@ class TestLoopAdditional:
         song.acodec = ""
         song.requester = None
         song.start_offset = 0
+        # Real number: loop()'s history step feeds this through
+        # HistoryEntry.from_song, and round(MagicMock) raises.
+        song.position_secs = 195.0
         # -playnow flags a real YTDL always carries — truthy MagicMock
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
@@ -4772,7 +4786,7 @@ class TestHistorySkipMarker:
         music_player._skip_history_for = MagicMock()  # some other, ended song
         await self._run_one_song(music_player, queue_obj, mock_song)
         assert len(music_player.history) == 1
-        assert mock_song.title in music_player.history[0]
+        assert music_player.history[0].title == mock_song.title
         assert music_player._skip_history_for is None
 
 

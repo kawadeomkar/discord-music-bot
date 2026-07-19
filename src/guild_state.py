@@ -503,11 +503,10 @@ QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 def parse_queue_entry(data: bytes) -> QueueEntry | None:
     """Deserialize one queue-list entry into a value object.
 
-    Entries without a "type" field are legacy writes from before the
-    discriminator existed and parse as songs. Corrupt entries (bad JSON,
-    missing required fields) return None with a warning — the entry is
-    dropped and the rest of the queue survives, matching the original
-    _deserialize_queue_item behavior.
+    The "type" field discriminates search entries from songs. Corrupt
+    entries (bad JSON, missing required fields) return None with a warning —
+    the entry is dropped and the rest of the queue survives, matching the
+    original _deserialize_queue_item behavior.
     """
     try:
         d = orjson.loads(data)
@@ -538,34 +537,123 @@ def parse_queue_entry(data: bytes) -> QueueEntry | None:
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
-# One JSON-encoded string per entry ("<title> - <webpage_url>"). JSON rather
-# than raw UTF-8 because entries written before this module existed are JSON
-# strings — the encoding is pinned for rolling-restart compatibility.
+# One JSON object of HistoryEntryField keys per entry, newest-first.
 
 
-def serialize_history_entry(entry: str) -> bytes:
-    return orjson.dumps(entry)
+class HistoryEntryField:
+    TITLE: Final[str] = "title"
+    WEBPAGE_URL: Final[str] = "webpage_url"
+    DURATION_SECS: Final[str] = "duration_secs"
+    PLAYED_SECS: Final[str] = "played_secs"
+    REQUESTER_ID: Final[str] = "requester_id"
+    REQUESTER_NAME: Final[str] = "requester_name"
+    THUMBNAIL: Final[str] = "thumbnail"
+    UPLOADER: Final[str] = "uploader"
+    PLAYED_AT: Final[str] = "played_at"
 
 
-def parse_history_entry(data: bytes | str) -> str | None:
-    """Deserialize one history-list entry. Corrupt entries (bad JSON, or JSON
-    that is not a string) return None with a warning — the entry is dropped
-    and the rest of the history survives, matching parse_queue_entry.
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HistoryEntry:
+    """One played song at rest — an element of guild:{id}:history.
 
-    Accepts str as well as bytes: redis-py's response type depends on the
-    pool's decode_responses setting, which is not visible to the type checker.
+    Zero-values mean "unknown": fields absent on the wire default on parse,
+    and the display layer degrades accordingly. The field set deliberately
+    matches the future Postgres play_history row
+    (docs/HISTORY_OVERHAUL_PLAN.md §8).
     """
+
+    title: str = ""
+    webpage_url: str = ""  # YouTube link used
+    duration_secs: int = 0  # full song length; 0 = unknown
+    played_secs: int = 0  # audio position reached when the song ended
+    requester_id: int = 0  # 0 = unknown
+    requester_name: str = ""  # display_name at play time; survives member departure
+    thumbnail: str = ""
+    uploader: str = ""
+    played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
+
+    @classmethod
+    def from_song(cls, song: YTDL, *, played_at: float) -> Self:
+        """Canonical extraction from a finished song. played_at is a
+        caller-supplied clock (same pattern as crashed_position_at) so this
+        stays a pure field mapping.
+
+        played_secs is position reached (start_offset + audio delivered),
+        capped at the song's duration when known: for a -playnow-interrupted
+        song recorded once at its resume tail's end, the tail's position spans
+        the full listened range — the desirable answer. A ?t=-started song
+        reports position including the skip; accepted (plan §3).
+        """
+        played = round(song.position_secs)
+        duration = song.duration_secs or 0
+        if duration:
+            played = min(played, duration)
+        return cls(
+            title=song.title or "",
+            webpage_url=song.webpage_url or "",
+            duration_secs=duration,
+            played_secs=played,
+            requester_id=song.requester.id if song.requester else 0,
+            requester_name=song.requester.display_name if song.requester else "",
+            thumbnail=song.thumbnail or "",
+            uploader=song.uploader or "",
+            played_at=played_at,
+        )
+
+    def to_redis(self) -> bytes:
+        """Serialize to the wire format. Field table spelled out (same
+        rationale as NowPlayingData.to_redis_mapping): the wire schema is
+        pinned to HistoryEntryField, not to Python attribute names."""
+        return orjson.dumps(
+            {
+                HistoryEntryField.TITLE: self.title,
+                HistoryEntryField.WEBPAGE_URL: self.webpage_url,
+                HistoryEntryField.DURATION_SECS: self.duration_secs,
+                HistoryEntryField.PLAYED_SECS: self.played_secs,
+                HistoryEntryField.REQUESTER_ID: self.requester_id,
+                HistoryEntryField.REQUESTER_NAME: self.requester_name,
+                HistoryEntryField.THUMBNAIL: self.thumbnail,
+                HistoryEntryField.UPLOADER: self.uploader,
+                HistoryEntryField.PLAYED_AT: self.played_at,
+            }
+        )
+
+
+def serialize_history_entry(entry: HistoryEntry) -> bytes:
+    return entry.to_redis()
+
+
+def parse_history_entry(data: bytes) -> HistoryEntry | None:
+    """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong
+    JSON type, malformed fields) return None with a warning — the entry is
+    dropped and the rest of the history survives, matching parse_queue_entry.
+    Unknown dict keys are ignored and missing keys default, so mixed-build
+    readers stay tolerant in both directions."""
     try:
         entry = orjson.loads(data)
     except Exception as e:
         log.warning(f"guild_state: corrupt history entry dropped: {e}")
         return None
-    if not isinstance(entry, str):
+    if not isinstance(entry, dict):
         log.warning(
-            f"guild_state: corrupt history entry dropped: not a string ({type(entry).__name__})"
+            f"guild_state: corrupt history entry dropped: unexpected JSON type ({type(entry).__name__})"
         )
         return None
-    return entry
+    try:
+        return HistoryEntry(
+            title=str(entry.get(HistoryEntryField.TITLE) or ""),
+            webpage_url=str(entry.get(HistoryEntryField.WEBPAGE_URL) or ""),
+            duration_secs=int(entry.get(HistoryEntryField.DURATION_SECS) or 0),
+            played_secs=int(entry.get(HistoryEntryField.PLAYED_SECS) or 0),
+            requester_id=int(entry.get(HistoryEntryField.REQUESTER_ID) or 0),
+            requester_name=str(entry.get(HistoryEntryField.REQUESTER_NAME) or ""),
+            thumbnail=str(entry.get(HistoryEntryField.THUMBNAIL) or ""),
+            uploader=str(entry.get(HistoryEntryField.UPLOADER) or ""),
+            played_at=float(entry.get(HistoryEntryField.PLAYED_AT) or 0.0),
+        )
+    except Exception as e:
+        log.warning(f"guild_state: corrupt history entry dropped: {e}")
+        return None
 
 
 # ── The aggregate — a guild's persisted playback state, read as one unit ─────
@@ -589,7 +677,7 @@ class GuildPlaybackSnapshot:
     # end, so empty == no song — same contract as NowPlayingData.from_redis).
     now_playing: NowPlayingData | None = None
     # Newest-first, as stored (GuildHistory.restore() handles the reversal).
-    history: tuple[str, ...] = ()
+    history: tuple[HistoryEntry, ...] = ()
 
     @property
     def pending_count(self) -> int:

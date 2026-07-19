@@ -1,7 +1,16 @@
 import asyncio
 import contextlib
 from itertools import islice
-from typing import Any, Coroutine, List, Optional, Union, assert_never, cast
+from typing import (
+    Any,
+    AsyncGenerator,
+    Coroutine,
+    List,
+    Optional,
+    Union,
+    assert_never,
+    cast,
+)
 
 import discord
 from discord.ext import commands
@@ -9,7 +18,7 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from src.musicplayer import MusicPlayer
-from src.redis_client import GuildRedisStore
+from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -20,6 +29,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
+from src.youtube import YTDL, QueueObject
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
@@ -27,6 +37,7 @@ from opentelemetry.trace import StatusCode
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    history_embeds,
     latency_color,
     notice_embed,
     queue_message,
@@ -39,7 +50,17 @@ from src.util import (
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-from src.youtube import YTDL, QueueObject
+HISTORY_MIN_LIMIT = 1
+# The ceiling is the display cache depth — -history reads the in-memory cache,
+# or the Redis list when the cache is cold. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
+# 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
+# Discord's per-message cap — so the block always fits and is never shed.
+HISTORY_EMBEDS_PER_MESSAGE = 8
+
+
+class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
+    limit: int = 10
 
 
 def _check_voice_permissions(
@@ -59,6 +80,27 @@ def _check_voice_permissions(
     ):
         return f"Bot is already being used in channel {voice_client.channel}"
     return None
+
+
+async def _typing_keepalive(ctx: commands.Context) -> None:
+    try:
+        async with ctx.typing():
+            await asyncio.sleep(3600)  # held open until cancelled
+    except asyncio.CancelledError, Exception:
+        pass  # cosmetic — never let typing failures surface
+
+
+@contextlib.asynccontextmanager
+async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background
+    task so the command body starts immediately; the keepalive is held open until the
+    body finishes, then cancelled. The whole CM lives inside the task — never enter/exit
+    Typing manually across tasks (see docs/PERFORMANCE_PLAN.md §2.2)."""
+    task = asyncio.create_task(_typing_keepalive(ctx))
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 class MusicBot(commands.Cog):
@@ -218,6 +260,12 @@ class MusicBot(commands.Cog):
                     discord.Color.red(),
                 )
             )
+        elif isinstance(error, commands.FlagError):
+            # Flag parsing fails before the command body runs, so its
+            # try/except never sees it — e.g. `-history --limit abc`.
+            await ctx.send(
+                embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         vc = ctx.voice_client
@@ -271,9 +319,7 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(
-                ctx.author, search, source.process or False, ts=ts, redis=self.redis
-            )
+            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -382,7 +428,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with background_typing(ctx):
             try:
                 source = parse_input(url, ctx.message.content)
 
@@ -447,7 +493,7 @@ class MusicBot(commands.Cog):
             await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(titles[:1])[0]
             return await YTDL.yt_source(
-                ctx.author, yts.ytsearch or "", yts.process or False, redis=self.redis
+                ctx.author, yts.ytsearch or "", redis=self.redis
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             playlist_url = (
@@ -494,7 +540,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with background_typing(ctx):
             try:
                 mp = self.get_mp(ctx)
                 vc = ctx.voice_client
@@ -713,7 +759,7 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            async with ctx.typing():
+            async with background_typing(ctx):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
                 )
@@ -916,29 +962,47 @@ class MusicBot(commands.Cog):
         name="history",
         aliases=["h"],
         brief="show recently played songs",
+        usage="[--limit N]",
         help=(
-            "Lists the songs already played in this server, most recent first "
-            "(up to 10). History is stored per server and survives a bot restart."
+            "Lists the songs already played in this server, most recent first.\n\n"
+            "`--limit N` controls how many are shown (1-50, default 10). History "
+            "is stored per server and survives a bot restart."
         ),
-        extras={"category": "Queue", "examples": ["-history", "-h"]},
+        extras={
+            "category": "Queue",
+            "examples": ["-history", "-h", "-history --limit 25"],
+        },
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.history")
-    async def history(self, ctx: commands.Context):
+    async def history(self, ctx: commands.Context, *, flags: HistoryFlags):
         try:
-            mp = self.get_mp(ctx)
-            if mp and mp.history:
-                # FIXME: -history shows the 10 oldest songs instead of the 10 newest.
-                # GuildHistory is an oldest-first ring, so [:10] takes the front of it.
-                # Once a guild has played more than 10 songs the command stops surfacing
-                # anything recent — it keeps replaying the same stale list until the
-                # 50-entry cap finally rotates those entries out.
-                # Fix is [-10:] reversed, or the richer rework in
-                # docs/HISTORY_OVERHAUL_PLAN.md (designed, not implemented), which also
-                # adds the missing empty-history notice.
-                q_history = queue_message(list(mp.history)[:10])
+            if not (HISTORY_MIN_LIMIT <= flags.limit <= HISTORY_MAX_LIMIT):
                 await ctx.send(
-                    embed=notice_embed(q_history, discord.Color.blue(), title="History")
+                    embed=notice_embed(
+                        f"--limit must be between {HISTORY_MIN_LIMIT} and {HISTORY_MAX_LIMIT}",
+                        discord.Color.red(),
+                    )
+                )
+                return
+            mp = self.get_mp(ctx)
+            entries = await mp.history.recent(flags.limit)
+            if not entries:
+                await ctx.send(
+                    embed=notice_embed(
+                        "No songs have been played yet.", discord.Color.orange()
+                    )
+                )
+                return
+            embeds = history_embeds(entries)
+            # 8 per message: with the NP block (≤2 embeds) MusicContext.send
+            # prepends while a song is live, every chunk stays within Discord's
+            # 10-embed cap. Every chunk goes through ctx.send (key invariant #8
+            # — never bare channel.send in the player's channel), so the
+            # adopt/retire machinery walks the NP block down to the last chunk.
+            for start in range(0, len(embeds), HISTORY_EMBEDS_PER_MESSAGE):
+                await ctx.send(
+                    embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
                 )
         except Exception as e:
             log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)

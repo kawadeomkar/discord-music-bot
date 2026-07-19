@@ -33,12 +33,17 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
+    # volatile-lru, NOT allkeys-lru: guild:{id}:history keys are persistent
+    # (no TTL — unbounded full-history retention, docs/HISTORY_OVERHAUL_PLAN.md
+    # §4) and must never be eviction candidates. Every cache key (ytdl:*,
+    # spotify:*) and the other guild:* keys carry TTLs, so volatile-lru
+    # preserves the existing cache-eviction behavior for them.
     command: >
       redis-server
       --appendonly yes
       --appendfsync everysec
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy volatile-lru
     ports:
       - "127.0.0.1:6379:6379"
     volumes:

@@ -14,7 +14,7 @@ from opentelemetry import trace
 from src import config
 from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
-from src.guild_state import NowPlayingData, SongQueueEntry
+from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -1212,7 +1212,6 @@ class MusicPlayer:
             return await YTDL.yt_source(
                 self._last_author,
                 source.ytsearch or "",
-                source.process or False,
                 redis=self.store.redis if self.store is not None else None,
             )
         return source
@@ -1582,6 +1581,17 @@ class MusicPlayer:
                         self.current_song = None
                         continue
 
+                    # FIXME: loop() can call vc.play() before the voice handshake completes.
+                    # guild.voice_client exists as soon as connect() starts, but vc.play()
+                    # raises ClientException("Not connected to voice.") until the handshake
+                    # finishes. Hit in practice when -play creates the MusicPlayer and
+                    # leftover Redis queue entries are restored at creation: loop() dequeues
+                    # and resolves the head faster than play's concurrent join task connects,
+                    # so the restored song is dropped ("Playback error — skipping song";
+                    # observed live 2026-07-16 during the §2.2 typing smoke test). Fix is to
+                    # gate playback on voice readiness — await an event set once join
+                    # completes, or poll vc.is_connected() with a short timeout — instead of
+                    # asserting on the client object alone.
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
                     assert self.current_song is not None
@@ -1742,7 +1752,9 @@ class MusicPlayer:
                         self._skip_history_for = None
                         if not skip_history and not stream_failed:
                             await self.history.add(
-                                f"{self.current_song.title} - {self.current_song.webpage_url}"
+                                HistoryEntry.from_song(
+                                    self.current_song, played_at=time.time()
+                                )
                             )
 
                     if self.store is not None:

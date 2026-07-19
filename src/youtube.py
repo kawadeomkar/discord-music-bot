@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import datetime
 import os
 import re
@@ -17,7 +18,6 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_del, cache_get, cache_set
-from src.spotify import Spotify
 from src.telemetry import get_tracer
 from src.util import get_logger, notice_embed
 
@@ -37,7 +37,10 @@ _YTDLP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ytdlp")
 
 def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     """Dedicated thread-pool worker for yt-dlp extraction. Top-level so it's named in tracebacks."""
-    return youtube_dl.YoutubeDL(opts).extract_info(
+    # YoutubeDL.__init__ keeps the params dict by reference and writes into it
+    # (js_runtimes, http_headers, ...); the copy keeps the module-level opts
+    # profiles immutable across the 8 pool threads.
+    return youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
         url, download=download, process=process
     )
 
@@ -122,14 +125,6 @@ _YTDL_BASE_OPTS = {
     # a new player version, not on every extraction.
 }
 
-# Used by yt_source: resolves a search query to (webpage_url, title).
-# No format selection needed — we only need metadata, not a CDN stream URL.
-_YTDL_SOURCE_OPTS = {
-    **_YTDL_BASE_OPTS,
-    "default_search": "auto",
-    "retries": 3,
-}
-
 # Used by yt_stream / prefetch_stream: resolves a webpage_url to a CDN stream URL.
 # check_formats=False skips HEAD requests that probe format URL availability.
 #
@@ -143,6 +138,20 @@ _YTDL_STREAM_OPTS = {
     "format": "bestaudio/best[height<=360]/best",
     "check_formats": False,
     "retries": 10,
+}
+
+# Used by yt_source: the unified single-extraction play path
+# (docs/PERFORMANCE_PLAN.md §2.1). One stream-opts extraction returns the video's
+# identity (webpage_url/title/duration/…) AND a selected, playable stream URL, so a
+# single yt-dlp call populates both the ytdl:source and ytdl:stream caches — the
+# previous source-opts search performed a full extraction anyway (including format
+# selection) and then discarded the stream data, forcing prefetch_stream to hit
+# YouTube a second time for every cold play. default_search is what the stream opts
+# lack for resolving bare search queries; retries stays at the stream value (10)
+# because this call now serves playback, not just metadata.
+_YTDL_STREAM_SEARCH_OPTS = {
+    **_YTDL_STREAM_OPTS,
+    "default_search": "auto",
 }
 
 # Used by yt_playlist: fetches entry metadata for all videos in a playlist without
@@ -298,12 +307,38 @@ async def _stream_url_playable(stream_url: str) -> bool:
 
 async def _cache_stream(
     redis: Optional[aioredis.Redis], cache_key: str, data: dict
-) -> None:
-    """Persist a stream URL that has been probed and found playable."""
+) -> bool:
+    """Persist a stream URL that has been probed and found playable.
+
+    Returns True when an entry was written; False when the URL isn't worth caching
+    (no usable expiry — see _stream_url_ttl)."""
     stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
     ttl = _stream_url_ttl(data.get("url", ""))
     if ttl:
         await cache_set(redis, cache_key, stripped, ttl)
+        return True
+    return False
+
+
+async def _probe_and_cache(
+    redis: Optional[aioredis.Redis], cache_key: str, data: dict
+) -> bool:
+    """Success-path post-processing for a full stream extraction: record the serving
+    format, probe the stream URL, and cache it when playable.
+
+    Shared by prefetch_stream and yt_source's unified extraction
+    (docs/PERFORMANCE_PLAN.md §2.1) so both write identical cache entries. Only a URL
+    that has been proven playable earns a cache entry — caching an already-revoked one
+    would hand yt_stream a dead URL it then has to discard. Returns True when a cache
+    entry was written."""
+    _record_serving_format(data)
+    if _stream_url_ttl(data.get("url", "")) is None:
+        # Uncacheable URL (no usable expiry — e.g. SoundCloud): probing it would spend
+        # an awaited network round only for _cache_stream to decline the write anyway.
+        return False
+    if await _stream_url_playable(data.get("url", "")):
+        return await _cache_stream(redis, cache_key, data)
+    return False
 
 
 async def invalidate_stream_cache(
@@ -346,13 +381,14 @@ class QueueObject:
 
 
 def _enrich_queueobject(qo: QueueObject, data: dict) -> None:
-    """Back-fill QueueObject fields that yt_source() couldn't populate.
+    """Back-fill QueueObject fields that couldn't be populated at enqueue time.
 
-    yt_source() uses _YTDL_SOURCE_OPTS (no format selection), which often
-    returns None for duration/uploader on search-term queries because
-    YouTube's search results page doesn't include all metadata fields.
-    prefetch_stream() uses _YTDL_STREAM_OPTS (full extraction) and has
-    the complete data — this helper writes it back onto the same QueueObject
+    yt_source()'s unified extraction returns complete metadata, but other
+    enqueue paths still produce sparse QueueObjects: yt_playlist()'s flat
+    entries carry no duration/uploader/thumbnail, and ytdl:source cache
+    entries written by pre-unified code may hold None for those fields until
+    their TTL lapses. prefetch_stream() has the complete data from full
+    extraction — this helper writes it back onto the same QueueObject
     instance so queue_embed() sees the enriched values.
     """
     if qo.duration is None and data.get("duration") is not None:
@@ -502,11 +538,7 @@ class YTDL(discord.FFmpegOpusAudio):
             log.warning(f"prefetch_stream failed for {qo.webpage_url}: {e}")
             return
         if data is not None:
-            _record_serving_format(data)
-            # Only a URL that has been proven playable earns a cache entry — caching an
-            # already-revoked one would hand yt_stream a dead URL it then has to discard.
-            if await _stream_url_playable(data.get("url", "")):
-                await _cache_stream(redis, cache_key, data)
+            await _probe_and_cache(redis, cache_key, data)
             _enrich_queueobject(qo, data)
 
     @classmethod
@@ -629,14 +661,12 @@ class YTDL(discord.FFmpegOpusAudio):
         cls,
         requester: Union[discord.User, discord.Member],
         search: str,
-        process: bool,
         *,
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
         trace.get_current_span().set_attribute("ytdl.search", search)
-        trace.get_current_span().set_attribute("ytdl.process", process)
         # Cache key: normalise search so "Destiny" and "destiny " both hit.
         # ts is intentionally excluded — it is a per-request playback offset,
         # not part of the video identity.
@@ -663,14 +693,22 @@ class YTDL(discord.FFmpegOpusAudio):
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
         loop = asyncio.get_running_loop()
 
-        # process=True to resolve all unresolved references (urls), need for ytsearch
+        # Unified single extraction (docs/PERFORMANCE_PLAN.md §2.1): one stream-opts
+        # call yields identity AND a playable stream URL, so both the ytdl:source and
+        # ytdl:stream caches are populated from this single network round.
+        # process=True is hardcoded — an unprocessed extract_info performs NO format
+        # selection, so data["url"] would be absent and the stream-cache write below
+        # would silently never happen for direct-URL plays (which used to arrive here
+        # with process=False). For a single watch URL the page + player fetch is paid
+        # either way; processing adds only format-selection CPU (~tens of ms), no
+        # extra network, and it eliminates prefetch_stream's second extraction.
         data = await loop.run_in_executor(
             _YTDLP_POOL,
             _ytdlp_extract,
             search,
-            _YTDL_SOURCE_OPTS,
+            _YTDL_STREAM_SEARCH_OPTS,
             download,
-            process,
+            True,
         )
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
@@ -720,6 +758,16 @@ class YTDL(discord.FFmpegOpusAudio):
                 },
                 _YT_SOURCE_TTL,
             )
+            # Warm the stream cache from the same extraction — this is what makes
+            # queue_put's prefetch_stream a cache-hit no-op instead of a second
+            # YouTube extraction. Awaited (not spawned) so the write has landed
+            # before prefetch_stream's cache_get can race it. A failed probe never
+            # fails yt_source: the song enqueues on identity alone and dequeue-time
+            # _resolve_playable_stream re-extracts, exactly the pre-§2.1 behavior.
+            stream_cached = await _probe_and_cache(
+                redis, _stream_cache_key(webpage_url), data
+            )
+            trace.get_current_span().set_attribute("ytdl.stream_cached", stream_cached)
 
         return QueueObject(
             webpage_url,

@@ -59,6 +59,8 @@ SOURCES = (
 )
 
 TIPS = (
+    "• Add `--help` to any command — `-play --help` — for its manual, the "
+    "same as `-help play`.\n"
     "• `play` pulls the bot into your voice channel — no need to `join` first.\n"
     "• The bot disconnects on its own 10 seconds after the last person leaves.\n"
     "• The **Now Playing** card re-anchors itself to the bottom of the channel "
@@ -81,12 +83,14 @@ class MusicHelpCommand(commands.HelpCommand):
                 "help": (
                     "Shows the full command list, or detailed help for a single "
                     "command — its description, usage, aliases and examples. "
-                    "Aliases work here too, so `-help np` is the same as `-help now`."
+                    "Aliases work here too, so `-help np` is the same as `-help now`. "
+                    "Adding `--help` to any command does the same thing: "
+                    "`-play --help` is `-help play`."
                 ),
                 "usage": "[command]",
                 "extras": {
                     "category": "Utility",
-                    "examples": ["-help", "-help play", "-help np"],
+                    "examples": ["-help", "-help play", "-help np", "-play --help"],
                 },
             },
             **options,
