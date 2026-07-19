@@ -109,6 +109,17 @@ class MusicBotApp(commands.AutoShardedBot):
     async def get_context(self, origin, /, *, cls: Any = MusicContext):
         return await super().get_context(origin, cls=cls)
 
+    async def invoke(self, ctx: commands.Context, /) -> None:
+        # `--help` anywhere in a command message short-circuits straight to
+        # that command's help embed, before any other step runs — global
+        # checks, the cog's voice-channel gate (validate_commands), argument
+        # parsing. So `-play --help` answers from outside a voice channel
+        # instead of searching YouTube for the string "--help".
+        if ctx.command is not None and "--help" in ctx.message.content:
+            await ctx.send_help(ctx.command)
+            return
+        await super().invoke(ctx)
+
     async def on_ready(self):
         activity = discord.Game(name="music", type=3)
         await self.change_presence(status=discord.Status.online, activity=activity)

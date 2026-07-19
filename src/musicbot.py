@@ -20,6 +20,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
+from src.youtube import YTDL, QueueObject
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
@@ -38,8 +39,6 @@ from src.util import (
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
-
-from src.youtube import YTDL, QueueObject
 
 
 def _check_voice_permissions(
