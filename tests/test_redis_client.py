@@ -10,10 +10,12 @@ from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
+    HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
 )
 from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
     GuildRedisStore,
     cache_get,
     cache_set,
@@ -168,12 +170,19 @@ class TestPushQueue:
         assert ttl > 0
 
     async def test_refreshes_ttl_on_now_playing_key(self, store, fake_redis):
-        """_pipe_expire_all must refresh all four guild keys, including now_playing."""
+        """_pipe_expire_all must refresh the TTL-managed guild keys, including
+        now_playing."""
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
         await fake_redis.expire(store.now_playing_key(), 5)
         await store.push_queue(_entry(1))
         ttl = await fake_redis.ttl(store.now_playing_key())
         assert ttl > 5
+
+    async def test_does_not_rearm_history_expiry(self, store, fake_redis):
+        """The history key is persistent — _pipe_expire_all must leave it alone."""
+        await fake_redis.lpush(store.history_key(), b'"entry"')
+        await store.push_queue(_entry(1))
+        assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.push_queue(_entry(1))  # must not raise
@@ -261,45 +270,68 @@ class TestRebuildQueue:
 # ── History operations ────────────────────────────────────────────────────────
 
 
+def _hentry(n: int = 1) -> HistoryEntry:
+    return HistoryEntry(
+        title=f"Song {n}",
+        webpage_url=f"https://yt.com/v={n}",
+        duration_secs=200 + n,
+        played_secs=100 + n,
+        requester_id=n,
+        requester_name=f"user{n}",
+        played_at=1000.0 + n,
+    )
+
+
 class TestPushHistory:
     async def test_prepends_item_newest_first(self, store, fake_redis):
-        await store.push_history("song1")
-        await store.push_history("song2")
+        await store.push_history(_hentry(1))
+        await store.push_history(_hentry(2))
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert items[0] == b'"song2"'  # newest first, JSON-string wire format
+        assert items[0] == _hentry(2).to_redis()  # newest first
 
-    async def test_trims_to_50(self, store, fake_redis):
-        for i in range(55):
-            await store.push_history(f"song {i}")
+    async def test_no_trim_history_is_unbounded(self, store, fake_redis):
+        # The Redis list is the source of truth for ALL played songs — a trim
+        # here would silently discard history (docs/HISTORY_OVERHAUL_PLAN.md §4).
+        for i in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(i))
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert len(items) == 50
+        assert len(items) == HISTORY_CACHE_LIMIT + 5
 
-    async def test_sets_ttl(self, store, fake_redis):
-        await store.push_history("entry")
-        ttl = await fake_redis.ttl(store.history_key())
-        assert ttl > 0
+    async def test_history_key_is_persistent(self, store, fake_redis):
+        await store.push_history(_hentry(1))
+        assert await fake_redis.ttl(store.history_key()) == -1  # no expiry
+
+    async def test_persist_heals_pre_migration_ttl(self, store, fake_redis):
+        # A key written by an old build carries the 24h idle expiry; the first
+        # new-build push must remove it, not let history evaporate.
+        await fake_redis.lpush(store.history_key(), orjson.dumps("old entry"))
+        await fake_redis.expire(store.history_key(), 3600)
+        await store.push_history(_hentry(1))
+        assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_swallows_redis_error(self, broken_store):
-        await broken_store.push_history("item")  # must not raise
+        await broken_store.push_history(_hentry(1))  # must not raise
 
 
 class TestGetHistory:
-    async def test_returns_up_to_50_items(self, store, fake_redis):
-        for i in range(60):
-            await fake_redis.lpush(store.history_key(), orjson.dumps(f"song{i}"))
+    async def test_returns_up_to_cache_limit_items(self, store, fake_redis):
+        # The read stays bounded even though the list is unbounded.
+        for i in range(HISTORY_CACHE_LIMIT + 10):
+            await fake_redis.lpush(store.history_key(), _hentry(i).to_redis())
         items = await store.get_history()
-        assert len(items) == 50
-        assert all(isinstance(item, str) for item in items)
+        assert len(items) == HISTORY_CACHE_LIMIT
+        assert all(isinstance(item, HistoryEntry) for item in items)
 
     async def test_round_trips_push(self, store):
-        await store.push_history("Song Title - https://yt.com/v=1")
-        assert await store.get_history() == ["Song Title - https://yt.com/v=1"]
+        await store.push_history(_hentry(1))
+        assert await store.get_history() == [_hentry(1)]
 
     async def test_drops_corrupt_entries(self, store, fake_redis):
-        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), _hentry(1).to_redis())
         await fake_redis.lpush(store.history_key(), b"not json")
-        await fake_redis.lpush(store.history_key(), orjson.dumps({"not": "a string"}))
-        assert await store.get_history() == ["good"]
+        await fake_redis.lpush(store.history_key(), orjson.dumps([1, 2]))
+        await fake_redis.lpush(store.history_key(), orjson.dumps("a bare string"))
+        assert await store.get_history() == [_hentry(1)]
 
     async def test_returns_empty_list_when_missing(self, store):
         items = await store.get_history()
@@ -375,13 +407,21 @@ class TestGetPlaybackSnapshot:
 
     async def test_includes_now_playing_and_history(self, store, fake_redis):
         await fake_redis.hset(store.now_playing_key(), b"title", b"Song")
-        await store.push_history("old - url1")
-        await store.push_history("new - url2")
+        await store.push_history(_hentry(1))
+        await store.push_history(_hentry(2))
         snap = await store.get_playback_snapshot()
         assert snap is not None
         assert snap.now_playing is not None
         assert snap.now_playing.title == "Song"
-        assert snap.history == ("new - url2", "old - url1")  # newest first
+        assert snap.history == (_hentry(2), _hentry(1))  # newest first
+
+    async def test_history_read_bounded_at_cache_limit(self, store, fake_redis):
+        # The list is unbounded; the snapshot read must stay O(cache limit).
+        for i in range(HISTORY_CACHE_LIMIT + 10):
+            await store.push_history(_hentry(i))
+        snap = await store.get_playback_snapshot()
+        assert snap is not None
+        assert len(snap.history) == HISTORY_CACHE_LIMIT
 
     async def test_empty_guild_has_no_now_playing_and_empty_history(self, store):
         snap = await store.get_playback_snapshot()
@@ -390,11 +430,11 @@ class TestGetPlaybackSnapshot:
         assert snap.history == ()
 
     async def test_corrupt_history_entries_dropped(self, store, fake_redis):
-        await fake_redis.lpush(store.history_key(), orjson.dumps("good"))
+        await fake_redis.lpush(store.history_key(), _hentry(1).to_redis())
         await fake_redis.lpush(store.history_key(), b"not json")
         snap = await store.get_playback_snapshot()
         assert snap is not None
-        assert snap.history == ("good",)
+        assert snap.history == (_hentry(1),)
 
     async def test_returns_none_on_error(self, broken_store):
         assert await broken_store.get_playback_snapshot() is None
@@ -502,20 +542,26 @@ class TestGetRecoveryGate:
 
 
 class TestRefreshTtl:
-    async def test_refreshes_all_guild_keys(self, store, fake_redis):
-        all_keys = [
+    async def test_refreshes_ttl_managed_guild_keys(self, store, fake_redis):
+        managed_keys = [
             store.queue_key(),
             store.state_key(),
-            store.history_key(),
             store.now_playing_key(),
         ]
-        for key in all_keys:
+        for key in managed_keys:
             await fake_redis.set(key, b"x")
             await fake_redis.expire(key, 10)  # short initial TTL
         await store.refresh_ttl()
-        for key in all_keys:
+        for key in managed_keys:
             ttl = await fake_redis.ttl(key)
             assert ttl > 1000  # refreshed to GUILD_TTL
+
+    async def test_never_rearms_history_expiry(self, store, fake_redis):
+        # The history key is persistent (unbounded retention) — refresh_ttl
+        # re-arming an idle expiry on it would silently destroy full history.
+        await fake_redis.lpush(store.history_key(), b'"entry"')
+        await store.refresh_ttl()
+        assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.refresh_ttl()  # must not raise

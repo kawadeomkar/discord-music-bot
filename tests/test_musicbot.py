@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import orjson
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -10,7 +11,14 @@ import fakeredis
 import pytest
 from discord.ext import commands
 
-from src.musicbot import MusicBot, _check_voice_permissions, background_typing
+from src.guild_history import GuildHistory
+from src.guild_state import HistoryEntry
+from src.musicbot import (
+    HistoryFlags,
+    MusicBot,
+    _check_voice_permissions,
+    background_typing,
+)
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.youtube import QueueObject
@@ -1190,6 +1198,109 @@ class TestVolumeCommand:
     async def test_rejects_out_of_range(self, music_bot, mock_ctx):
         await MusicBot.volume.callback(music_bot, mock_ctx, "150")
         mock_ctx.send.assert_awaited()
+
+
+def _history_entries(n: int) -> list[HistoryEntry]:
+    """n entries, oldest-first (the order GuildHistory stores them)."""
+    return [
+        HistoryEntry(
+            title=f"Song {i}",
+            webpage_url=f"https://yt.com/v={i}",
+            duration_secs=200,
+            played_secs=200,
+            requester_id=i + 1,
+            requester_name=f"user{i}",
+            played_at=1000.0 + i,
+        )
+        for i in range(n)
+    ]
+
+
+def _flags(limit: int = 10):
+    """Stand-in for a parsed HistoryFlags (FlagConverter can't be constructed
+    directly; the command body only reads .limit)."""
+    return SimpleNamespace(limit=limit)
+
+
+class TestHistoryCommand:
+    def _mp_with_history(self, music_bot, entries):
+        mp = MagicMock()
+        history = GuildHistory(None)
+        history.restore(list(reversed(entries)))  # restore takes newest-first
+        mp.history = history
+        music_bot.get_mp = MagicMock(return_value=mp)
+        return mp
+
+    async def test_empty_history_sends_notice(self, music_bot, mock_ctx):
+        self._mp_with_history(music_bot, [])
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags())
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "No songs have been played yet" in embed.description
+
+    async def test_shows_most_recent_newest_first(self, music_bot, mock_ctx):
+        self._mp_with_history(music_bot, _history_entries(15))
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags(limit=3))
+        mock_ctx.send.assert_awaited_once()
+        embeds = mock_ctx.send.call_args[1]["embeds"]
+        # Most recent 3 of 15, newest first — not the oldest 3.
+        assert [e.title for e in embeds] == [
+            "1. Song 14",
+            "2. Song 13",
+            "3. Song 12",
+        ]
+
+    async def test_default_limit_chunks_at_eight_embeds(self, music_bot, mock_ctx):
+        # 10 embeds + the ≤2-embed NP block must stay under Discord's 10-embed
+        # cap, so the response is chunked 8 + 2, every chunk via ctx.send.
+        self._mp_with_history(music_bot, _history_entries(12))
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags())
+        assert mock_ctx.send.await_count == 2
+        first, second = mock_ctx.send.await_args_list
+        assert len(first.kwargs["embeds"]) == 8
+        assert len(second.kwargs["embeds"]) == 2
+
+    async def test_limit_smaller_than_history_returns_that_many(
+        self, music_bot, mock_ctx
+    ):
+        self._mp_with_history(music_bot, _history_entries(5))
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags(limit=50))
+        embeds = mock_ctx.send.call_args[1]["embeds"]
+        assert len(embeds) == 5
+
+    @pytest.mark.parametrize("bad_limit", [0, -3, 51])
+    async def test_out_of_range_limit_rejected(self, music_bot, mock_ctx, bad_limit):
+        self._mp_with_history(music_bot, _history_entries(5))
+        await MusicBot.history.callback(
+            music_bot, mock_ctx, flags=_flags(limit=bad_limit)
+        )
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "--limit must be between 1 and 50" in embed.description
+        music_bot.get_mp.assert_not_called()
+
+    async def test_song_embeds_carry_thumbnail_and_metadata(self, music_bot, mock_ctx):
+        entry = HistoryEntry(
+            title="Rich Song",
+            webpage_url="https://yt.com/v=rich",
+            duration_secs=242,
+            played_secs=225,
+            requester_id=42,
+            requester_name="Omkar",
+            thumbnail="https://i.ytimg.com/t.jpg",
+            played_at=1752530000.0,
+        )
+        self._mp_with_history(music_bot, [entry])
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags())
+        embed = mock_ctx.send.call_args[1]["embeds"][0]
+        assert embed.thumbnail.url == "https://i.ytimg.com/t.jpg"
+        lines = embed.description.splitlines()
+        assert lines[0] == "https://yt.com/v=rich"
+        assert lines[1] == "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>"
+
+    def test_flag_defaults(self):
+        # -h with no flags must parse to limit=10.
+        assert HistoryFlags.get_flags()["limit"].default == 10
 
 
 class TestPingCommand:

@@ -6,6 +6,8 @@ import discord
 import structlog
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import HistoryEntry
+
 
 def queue_message(songs: List[str]) -> str:
     capped = songs[:10]
@@ -78,6 +80,59 @@ async def send_embed(
     for name, value, inline in fields or []:
         embed.add_field(name=name, value=value, inline=inline)
     return await destination.send(embed=embed)
+
+
+def fmt_duration(secs: int) -> str:
+    """Compact clock rendering: 225 → "3:45", 3725 → "1:02:05"."""
+    m, s = divmod(max(0, secs), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+# Discord's hard limit on an embed title is 256 characters; an over-length
+# title makes the whole send() 400 and the -history command silently no-op.
+_EMBED_TITLE_LIMIT = 256
+
+
+def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
+    """One embed per played song, in the given (newest-first) order.
+
+    Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
+    webpage_url on its own line (Discord auto-links it), then one line with
+    played/duration, requester, and — when known — the absolute played-at
+    timestamp (<t:…:f> — viewer-local absolute date/time).
+    """
+    embeds = []
+    for i, entry in enumerate(entries, start=1):
+        lines = []
+        if entry.webpage_url:
+            lines.append(entry.webpage_url)
+        requested_by = (
+            f"<@{entry.requester_id}>"
+            if entry.requester_id
+            else (entry.requester_name or "unknown")
+        )
+        meta = (
+            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
+            f" · requested by {requested_by}"
+        )
+        # played_at == 0 means "unknown" (absent on the wire); rendering
+        # <t:0:f> would show "1 January 1970", so omit the timestamp instead.
+        if entry.played_at:
+            meta += f" · <t:{int(entry.played_at)}:f>"
+        lines.append(meta)
+        title = f"{i}. {entry.title}"
+        if len(title) > _EMBED_TITLE_LIMIT:
+            title = title[: _EMBED_TITLE_LIMIT - 1] + "…"
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        if entry.thumbnail:
+            embed.set_thumbnail(url=entry.thumbnail)
+        embeds.append(embed)
+    return embeds
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
