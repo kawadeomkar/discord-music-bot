@@ -51,11 +51,27 @@ class GuildHistory:
         the cache appends oldest-first, hence the reversal."""
         self._entries.extend(reversed(newest_first))
 
-    def recent(self, limit: int) -> list[HistoryEntry]:
+    async def recent(self, limit: int) -> list[HistoryEntry]:
         """The `limit` most recently played songs, newest first — the
-        -history command's read surface."""
+        -history command's read surface.
+
+        Reads the Redis list directly when a store is configured, so the
+        command reflects persisted history even when the in-memory cache is
+        cold. That happens after a clean -stop and restart: recovery is
+        skipped for a stopped guild, so its next MusicPlayer starts with an
+        empty cache while the (unbounded, PERSISTed) Redis list still holds
+        every played song. get_history() already returns the newest
+        HISTORY_CACHE_LIMIT entries newest-first — the display ceiling — so a
+        slice to `limit` is authoritative. The in-memory cache is the fallback
+        when there is no store or the read fails/returns empty (the cache can
+        only hold entries that also reached the store, so falling back never
+        invents history)."""
         if limit <= 0:
             return []
+        if self._store is not None:
+            persisted = await self._store.get_history()
+            if persisted:
+                return persisted[:limit]
         return list(self._entries)[-limit:][::-1]
 
     def __len__(self) -> int:

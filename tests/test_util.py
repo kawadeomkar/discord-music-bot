@@ -156,5 +156,26 @@ class TestHistoryEmbeds:
         )
         assert "requested by SomeUser" in embed.description
 
+    def test_timestamp_omitted_when_played_at_unknown(self):
+        # played_at == 0 means unknown; <t:0:f> would render "1 January 1970".
+        [embed] = history_embeds([_rich_entry(played_at=0.0)])
+        assert "<t:" not in embed.description
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42>",
+        ]
+
+    def test_over_length_title_truncated_to_discord_limit(self):
+        # Discord rejects any embed title > 256 chars, failing the whole send.
+        [embed] = history_embeds([_rich_entry(title="x" * 300)])
+        assert len(embed.title) == 256
+        assert embed.title.endswith("…")
+
+    def test_title_at_limit_not_truncated(self):
+        # "1. " (3) + 253 = 256 exactly — must pass through untouched.
+        [embed] = history_embeds([_rich_entry(title="y" * 253)])
+        assert embed.title == "1. " + "y" * 253
+        assert "…" not in embed.title
+
     def test_empty_input(self):
         assert history_embeds([]) == []

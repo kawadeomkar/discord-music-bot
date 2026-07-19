@@ -76,24 +76,39 @@ class TestRestore:
 
 
 class TestRecent:
-    def test_newest_first_selection(self):
+    async def test_newest_first_selection(self):
         h = GuildHistory(None)
         h.restore([_entry(3), _entry(2), _entry(1)])  # newest-first input
-        assert h.recent(2) == [_entry(3), _entry(2)]
+        assert await h.recent(2) == [_entry(3), _entry(2)]
 
-    def test_limit_larger_than_history_returns_all(self):
+    async def test_limit_larger_than_history_returns_all(self):
         h = GuildHistory(None)
         h.restore([_entry(2), _entry(1)])
-        assert h.recent(10) == [_entry(2), _entry(1)]
+        assert await h.recent(10) == [_entry(2), _entry(1)]
 
-    def test_nonpositive_limit_returns_nothing(self):
+    async def test_nonpositive_limit_returns_nothing(self):
         h = GuildHistory(None)
         h.restore([_entry(1)])
-        assert h.recent(0) == []
-        assert h.recent(-1) == []
+        assert await h.recent(0) == []
+        assert await h.recent(-1) == []
 
-    def test_empty_history(self):
-        assert GuildHistory(None).recent(10) == []
+    async def test_empty_history(self):
+        assert await GuildHistory(None).recent(10) == []
+
+    async def test_reads_persisted_when_cache_cold(self, store):
+        """After a clean stop+restart the cache is empty but Redis still holds
+        history — recent() must surface it from the store."""
+        seed = GuildHistory(store)
+        for i in range(3):
+            await seed.add(_entry(i))
+        cold = GuildHistory(store)  # fresh player: empty in-memory cache
+        assert len(cold) == 0
+        assert await cold.recent(10) == [_entry(2), _entry(1), _entry(0)]
+
+    async def test_falls_back_to_cache_without_store(self):
+        h = GuildHistory(None)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(10) == [_entry(2), _entry(1)]
 
 
 class TestSequenceProtocol:

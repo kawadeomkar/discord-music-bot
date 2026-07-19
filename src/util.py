@@ -89,13 +89,18 @@ def fmt_duration(secs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# Discord's hard limit on an embed title is 256 characters; an over-length
+# title makes the whole send() 400 and the -history command silently no-op.
+_EMBED_TITLE_LIMIT = 256
+
+
 def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
     """One embed per played song, in the given (newest-first) order.
 
     Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
     webpage_url on its own line (Discord auto-links it), then one line with
-    played/duration, requester, and the absolute played-at timestamp
-    (<t:…:f> — viewer-local absolute date/time).
+    played/duration, requester, and — when known — the absolute played-at
+    timestamp (<t:…:f> — viewer-local absolute date/time).
     """
     embeds = []
     for i, entry in enumerate(entries, start=1):
@@ -107,13 +112,20 @@ def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
             if entry.requester_id
             else (entry.requester_name or "unknown")
         )
-        lines.append(
+        meta = (
             f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
             f" · requested by {requested_by}"
-            f" · <t:{int(entry.played_at)}:f>"
         )
+        # played_at == 0 means "unknown" (absent on the wire); rendering
+        # <t:0:f> would show "1 January 1970", so omit the timestamp instead.
+        if entry.played_at:
+            meta += f" · <t:{int(entry.played_at)}:f>"
+        lines.append(meta)
+        title = f"{i}. {entry.title}"
+        if len(title) > _EMBED_TITLE_LIMIT:
+            title = title[: _EMBED_TITLE_LIMIT - 1] + "…"
         embed = discord.Embed(
-            title=f"{i}. {entry.title}",
+            title=title,
             description="\n".join(lines),
             color=discord.Color.blue(),
         )

@@ -953,7 +953,7 @@ class MusicBot(commands.Cog):
                 )
                 return
             mp = self.get_mp(ctx)
-            entries = mp.history.recent(flags.limit)
+            entries = await mp.history.recent(flags.limit)
             if not entries:
                 await ctx.send(
                     embed=notice_embed(

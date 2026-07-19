@@ -365,6 +365,18 @@ class GuildRedisStore:
 
     # History operations
 
+    # ISSUE: Unbounded, non-evictable history can exhaust Redis and stall all writes.
+    # History keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
+    # eviction candidates. Once history fills the 256mb maxmemory and no TTL-bearing key
+    # is left to evict, Redis rejects EVERY write with OOM — not just history: state,
+    # queue, and cache writes all start failing (each store method swallows the error and
+    # logs, so persistence silently degrades rather than crashing). Small entries make
+    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The planned
+    # fix is migrating full history to Postgres and demoting the Redis list to a bounded
+    # cache (docs/HISTORY_OVERHAUL_PLAN.md §8, architecture plan §3.11); until then this
+    # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
+    # workaround — that would make history itself an eviction candidate and defeat the
+    # whole persistent-history design (see docker-compose.yml redis command).
     async def push_history(self, entry: HistoryEntry) -> None:
         """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
         the unbounded source of truth for all played songs (write-per-song-end
