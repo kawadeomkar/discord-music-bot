@@ -1212,7 +1212,6 @@ class MusicPlayer:
             return await YTDL.yt_source(
                 self._last_author,
                 source.ytsearch or "",
-                source.process or False,
                 redis=self.store.redis if self.store is not None else None,
             )
         return source
@@ -1582,6 +1581,17 @@ class MusicPlayer:
                         self.current_song = None
                         continue
 
+                    # FIXME: loop() can call vc.play() before the voice handshake completes.
+                    # guild.voice_client exists as soon as connect() starts, but vc.play()
+                    # raises ClientException("Not connected to voice.") until the handshake
+                    # finishes. Hit in practice when -play creates the MusicPlayer and
+                    # leftover Redis queue entries are restored at creation: loop() dequeues
+                    # and resolves the head faster than play's concurrent join task connects,
+                    # so the restored song is dropped ("Playback error — skipping song";
+                    # observed live 2026-07-16 during the §2.2 typing smoke test). Fix is to
+                    # gate playback on voice readiness — await an event set once join
+                    # completes, or poll vc.is_connected() with a short timeout — instead of
+                    # asserting on the client object alone.
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
                     assert self.current_song is not None

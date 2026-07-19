@@ -9,18 +9,18 @@ if [ -z "${ENVIRONMENT:-}" ]; then
 fi
 export ENVIRONMENT
 
-# One image carries both black and pytest. Both runs bind-mount src/ and tests/
-# over the image's baked-in copy, so pytest sees exactly what black just wrote.
+# One image carries both ruff and pytest. Both runs bind-mount src/ and tests/
+# over the image's baked-in copy, so pytest sees exactly what ruff just wrote.
 echo "Building test image"
 docker build --build-arg ENVIRONMENT="$ENVIRONMENT" -t "discord-music-bot:test" --target test -f Dockerfile .
 
-echo "Formatting src/ and tests/ with black"
+echo "Formatting and linting src/ and tests/ with ruff"
 docker run --rm \
     --user "$(id -u):$(id -g)" \
     -v "$PWD/src:/app/src" \
     -v "$PWD/tests:/app/tests" \
     "discord-music-bot:test" \
-    black src/ tests/
+    sh -c "python -m compileall src/ && ruff format src/ tests/ && ruff check src/ tests/"
 
 echo "Running tests"
 docker run --rm \

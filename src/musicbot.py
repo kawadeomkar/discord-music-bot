@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 from itertools import islice
-from typing import Any, Coroutine, List, Optional, Union, assert_never
+from typing import Any, AsyncGenerator, Coroutine, List, Optional, Union, assert_never
 
 import discord
 from discord.ext import commands
@@ -20,6 +20,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
+from src.youtube import YTDL, QueueObject
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
@@ -40,11 +41,9 @@ from src.util import (
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-from src.youtube import YTDL, QueueObject
-
 HISTORY_MIN_LIMIT = 1
-# The ceiling is the display cache depth — -history reads only the in-memory
-# cache, never the (unbounded) Redis list. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+# The ceiling is the display cache depth — -history reads the in-memory cache,
+# or the Redis list when the cache is cold. See docs/HISTORY_OVERHAUL_PLAN.md §5.
 HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
 # Discord's per-message cap — so the block always fits and is never shed.
@@ -72,6 +71,27 @@ def _check_voice_permissions(
     ):
         return f"Bot is already being used in channel {voice_client.channel}"
     return None
+
+
+async def _typing_keepalive(ctx: commands.Context) -> None:
+    try:
+        async with ctx.typing():
+            await asyncio.sleep(3600)  # held open until cancelled
+    except asyncio.CancelledError, Exception:
+        pass  # cosmetic — never let typing failures surface
+
+
+@contextlib.asynccontextmanager
+async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background
+    task so the command body starts immediately; the keepalive is held open until the
+    body finishes, then cancelled. The whole CM lives inside the task — never enter/exit
+    Typing manually across tasks (see docs/PERFORMANCE_PLAN.md §2.2)."""
+    task = asyncio.create_task(_typing_keepalive(ctx))
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 class MusicBot(commands.Cog):
@@ -290,9 +310,7 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(
-                ctx.author, search, source.process or False, ts=ts, redis=self.redis
-            )
+            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -395,7 +413,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with background_typing(ctx):
             try:
                 source = parse_input(url, ctx.message.content)
 
@@ -460,7 +478,7 @@ class MusicBot(commands.Cog):
             await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(titles[:1])[0]
             return await YTDL.yt_source(
-                ctx.author, yts.ytsearch or "", yts.process or False, redis=self.redis
+                ctx.author, yts.ytsearch or "", redis=self.redis
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             playlist_url = (
@@ -507,7 +525,7 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, url):
-        async with ctx.typing():
+        async with background_typing(ctx):
             try:
                 mp = self.get_mp(ctx)
                 vc = ctx.voice_client
@@ -726,7 +744,7 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context):
         try:
             mp = self.get_mp(ctx)
-            async with ctx.typing():
+            async with background_typing(ctx):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
                 )

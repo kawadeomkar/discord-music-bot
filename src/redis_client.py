@@ -316,7 +316,10 @@ class GuildRedisStore:
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
-                pipe.hset(self.now_playing_key(), mapping=now_playing.to_redis_mapping())  # type: ignore[misc]
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
@@ -339,7 +342,10 @@ class GuildRedisStore:
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
-                pipe.hset(self.now_playing_key(), mapping=now_playing.to_redis_mapping())  # type: ignore[misc]
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
