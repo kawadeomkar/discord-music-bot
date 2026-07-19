@@ -17,8 +17,9 @@ poetry run pytest tests/test_sources.py::TestParseUrlYouTube::test_youtube_watch
 # Type-check
 python -m pyright src/
 
-# Format
-poetry run black src/
+# Format + lint
+poetry run ruff format src/ tests/
+poetry run ruff check src/ tests/
 ```
 
 The bot requires a `.env` file in the project root with `DISCORD_TOKEN`, `SPOTIFY_CLIENT_ID`, and `SPOTIFY_CLIENT_SECRET`.

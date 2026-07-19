@@ -85,7 +85,7 @@ poetry run bot
 **Build and run with Docker Compose**
 
 ```bash
-# Using the build script (also runs black formatter)
+# Using the build script (also runs ruff format + lint)
 ./build.sh
 
 # Or manually
@@ -115,10 +115,11 @@ poetry install --with test,lint
 poetry run pytest
 ```
 
-**Format code**
+**Format and lint code**
 
 ```bash
-poetry run black src/
+poetry run ruff format src/ tests/
+poetry run ruff check src/ tests/
 ```
 
 ## Project structure

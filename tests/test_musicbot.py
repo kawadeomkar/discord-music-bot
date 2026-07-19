@@ -98,7 +98,6 @@ class TestLatencyColor:
 
 
 class TestQueueSource:
-
     async def test_spotify_playlist_returns_list(self, music_bot, mock_ctx):
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
@@ -831,9 +830,9 @@ class TestCleanup:
 
         await music_bot.cleanup(mock_guild)
 
-        assert call_order.index("cancel") < call_order.index(
-            "disconnect"
-        ), "player task must be cancelled before voice disconnect"
+        assert call_order.index("cancel") < call_order.index("disconnect"), (
+            "player task must be cancelled before voice disconnect"
+        )
 
 
 class TestStopCommand:
