@@ -291,9 +291,7 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(
-                ctx.author, search, source.process or False, ts=ts, redis=self.redis
-            )
+            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -461,7 +459,7 @@ class MusicBot(commands.Cog):
             await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(titles[:1])[0]
             return await YTDL.yt_source(
-                ctx.author, yts.ytsearch or "", yts.process or False, redis=self.redis
+                ctx.author, yts.ytsearch or "", redis=self.redis
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             playlist_url = (
