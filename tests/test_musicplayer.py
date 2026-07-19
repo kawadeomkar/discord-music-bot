@@ -5,7 +5,6 @@ import contextlib
 import dataclasses
 import re
 import time
-from collections import deque
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -687,7 +686,7 @@ class TestGetQueue:
         # First song: no preceding unknown → no ~
         # Second song: preceding song had unknown duration → ~
         lines = embed.description.split("\n")
-        est_lines = [l for l in lines if "Est. playing at" in l]
+        est_lines = [line for line in lines if "Est. playing at" in line]
         assert not est_lines[0].startswith("~") or "~**" not in est_lines[0]
         assert "~**" in est_lines[1]
 

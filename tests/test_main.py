@@ -94,6 +94,57 @@ class TestClose:
         mock_super.assert_awaited_once()
 
 
+class TestHelpFlag:
+    """`--help` anywhere in a command message diverts to that command's help
+    embed before any other logic runs — global checks, the cog's voice-channel
+    gate, argument parsing."""
+
+    def _ctx(self, content: str, *, command_found: bool = True) -> MagicMock:
+        ctx = MagicMock()
+        ctx.command = MagicMock() if command_found else None
+        ctx.message.content = content
+        ctx.send_help = AsyncMock()
+        return ctx
+
+    async def test_help_flag_diverts_to_command_help(self, app):
+        ctx = self._ctx("-play --help")
+        with patch.object(
+            commands.AutoShardedBot, "invoke", new=AsyncMock()
+        ) as mock_super:
+            await app.invoke(ctx)
+        ctx.send_help.assert_awaited_once_with(ctx.command)
+        mock_super.assert_not_awaited()
+
+    async def test_help_flag_matches_anywhere_in_the_message(self, app):
+        ctx = self._ctx("-play lofi hip hop --help radio")
+        with patch.object(
+            commands.AutoShardedBot, "invoke", new=AsyncMock()
+        ) as mock_super:
+            await app.invoke(ctx)
+        ctx.send_help.assert_awaited_once_with(ctx.command)
+        mock_super.assert_not_awaited()
+
+    async def test_without_flag_invokes_normally(self, app):
+        ctx = self._ctx("-play lofi hip hop")
+        with patch.object(
+            commands.AutoShardedBot, "invoke", new=AsyncMock()
+        ) as mock_super:
+            await app.invoke(ctx)
+        mock_super.assert_awaited_once_with(ctx)
+        ctx.send_help.assert_not_awaited()
+
+    async def test_unknown_command_falls_through(self, app):
+        """`-bogus --help` must keep raising CommandNotFound downstream, not
+        try to render help for a command that doesn't exist."""
+        ctx = self._ctx("-bogus --help", command_found=False)
+        with patch.object(
+            commands.AutoShardedBot, "invoke", new=AsyncMock()
+        ) as mock_super:
+            await app.invoke(ctx)
+        mock_super.assert_awaited_once_with(ctx)
+        ctx.send_help.assert_not_awaited()
+
+
 class TestOnReady:
     @pytest.fixture(autouse=True)
     def _patch_latency(self):
