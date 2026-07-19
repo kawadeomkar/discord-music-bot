@@ -466,6 +466,9 @@ class TestParseQueueEntryCorrupt:
 
 def _history_entry(**overrides) -> HistoryEntry:
     fields: dict = dict(
+        # Real snowflake magnitude: must survive int() parsing without float
+        # precision loss (same hazard as requester_id snowflakes).
+        guild_id=111111111111111111,
         title="Song Title",
         webpage_url="https://yt.com/v=1",
         duration_secs=242,
@@ -485,7 +488,8 @@ class TestHistoryEntryWire:
         # Wire format pinned: rolling restarts mix writers, so the field
         # names and value encodings must not drift.
         assert serialize_history_entry(_history_entry()) == (
-            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'{"guild_id":111111111111111111,"title":"Song Title",'
+            b'"webpage_url":"https://yt.com/v=1",'
             b'"duration_secs":242,"played_secs":225,"requester_id":42,'
             b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
             b'"uploader":"Chan","played_at":1752530000.0}'
@@ -494,6 +498,25 @@ class TestHistoryEntryWire:
     def test_round_trip(self):
         entry = _history_entry()
         assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+    def test_pre_postgres_entry_parses_with_guild_id_zero(self):
+        # Golden bytes from the pre-guild_id writer (history overhaul era) —
+        # at-rest entries mix writers, so these must stay readable, with the
+        # absent field defaulting to 0 (backfill stamps the real id from the
+        # key — docs/POSTGRES_HISTORY_PLAN.md §5.6).
+        pre_postgres = (
+            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0}'
+        )
+        assert parse_history_entry(pre_postgres) == _history_entry(guild_id=0)
+
+    def test_snowflake_guild_id_survives_round_trip(self):
+        entry = _history_entry(guild_id=222222222222222222)
+        parsed = parse_history_entry(serialize_history_entry(entry))
+        assert parsed is not None
+        assert parsed.guild_id == 222222222222222222
 
     def test_unknown_keys_ignored_and_missing_keys_default(self):
         # Forward/backward tolerance: a newer writer's extra field must not
@@ -537,8 +560,11 @@ def _history_song_stub(**overrides) -> SimpleNamespace:
 
 class TestHistoryEntryFromSong:
     def test_maps_song_fields(self):
-        entry = HistoryEntry.from_song(_history_song_stub(), played_at=1752530000.0)
+        entry = HistoryEntry.from_song(
+            _history_song_stub(), guild_id=111, played_at=1752530000.0
+        )
         assert entry == HistoryEntry(
+            guild_id=111,
             title="Test Song",
             webpage_url="https://youtu.be/abc",
             duration_secs=242,
@@ -552,22 +578,26 @@ class TestHistoryEntryFromSong:
 
     def test_played_secs_is_position_reached(self):
         song = _history_song_stub(position_secs=100.4)
-        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 100
+        assert (
+            HistoryEntry.from_song(song, guild_id=111, played_at=1.0).played_secs == 100
+        )
 
     def test_played_secs_capped_at_duration(self):
         # position can exceed duration by fractions of a frame at natural end.
         song = _history_song_stub(position_secs=243.02)
-        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 242
+        assert (
+            HistoryEntry.from_song(song, guild_id=111, played_at=1.0).played_secs == 242
+        )
 
     def test_unknown_duration_leaves_position_uncapped(self):
         song = _history_song_stub(duration_secs=0, position_secs=99.6)
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0)
         assert entry.duration_secs == 0
         assert entry.played_secs == 100
 
     def test_no_requester_degrades_to_zero_values(self):
         song = _history_song_stub(requester=None)
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0)
         assert entry.requester_id == 0
         assert entry.requester_name == ""
 
@@ -576,7 +606,7 @@ class TestHistoryEntryFromSong:
         song = _history_song_stub(
             title=None, webpage_url=None, uploader=None, thumbnail=None
         )
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0)
         assert entry.title == ""
         assert entry.webpage_url == ""
         assert entry.uploader == ""

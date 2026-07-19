@@ -112,7 +112,8 @@ The full architecture document is at `docs/ARCHITECTURE.md`.
 | `src/musicbot.py` | `MusicBot` Cog. All Discord commands. Owns `mps: dict[guild_id → MusicPlayer]`. `on_ready` triggers crash recovery per guild. |
 | `src/musicplayer.py` | Per-guild playback orchestration. `loop()` task, prefetch task, embeds/ETA, presence. Delegates every queue operation to `self.queue: GuildQueue`. |
 | `src/guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns all three queue representations plus the bulk-mutation mutex and cleared-flag; every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. |
-| `src/guild_history.py` | `GuildHistory` — played-song history domain class. Privately owns the pair of legs: the unbounded Redis list (source of truth for all played songs) and a HISTORY_CACHE_LIMIT-capped in-memory display cache. |
+| `src/guild_history.py` | `GuildHistory` — played-song history domain class. Privately owns the pair of legs: the unbounded Redis list (source of truth for all played songs) and a HISTORY_CACHE_LIMIT-capped in-memory display cache. When a Postgres archive is configured, `add()` also LPUSHes the global `history:outbox` (same pipeline) and nudges the drainer — Postgres is never awaited in the playback path. |
+| `src/history_archive.py` | Postgres play-history archive (Phase A of `docs/POSTGRES_HISTORY_PLAN.md`): `HistoryArchive` protocol, `PostgresHistoryArchive` (asyncpg; lazy pool + idempotent DDL on first use), `HistoryOutboxDrainer` (one background task per process: peek oldest outbox batch → `INSERT … ON CONFLICT DO NOTHING` → retire; at-least-once, deduped by the `play_history_dedup` unique index). Everything is off unless `POSTGRES_URL` is set. |
 | `src/guild_state.py` | Schema module: every byte persisted to Redis is defined here. Frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`) + field-name constants. Pure data — no domain logic, no project runtime imports. |
 | `src/youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)`. `yt_source`, `yt_stream`, `prefetch_stream` classmethods. |
 | `src/sources.py` | Input parsing. `parse_input` classifies a string into `YTSource`, `SpotifySource`, or `SoundcloudSource`. |
@@ -230,13 +231,14 @@ full play history is never lost to idle expiry. **The schema is defined in one p
 | `guild:{id}:now_playing` | Hash | 12 display fields for the recovered Now Playing embed → `NowPlayingData` |
 | `guild:{id}:queue` | List | JSON entries, `"type"`-discriminated → `SongQueueEntry` / `SearchQueueEntry` (RPUSH on enqueue, LPOP inside the atomic start transaction) |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
+| `history:outbox` | List | Global (all guilds) write-ahead buffer for the Postgres archive — same `HistoryEntry` wire bytes, each carrying `guild_id`. **No TTL, deliberately non-evictable** (holds not-yet-durable entries); near-empty in steady state, grows only while Postgres is down. Written only when `POSTGRES_URL` is configured |
 | `lock:guild:{id}:recovery` | String | `"1"`, TTL 60s (SET NX — distributed lock) |
 | `ytdl:stream:{webpage_url}` | String | JSON stream data; TTL = `expire − now − 1800s` |
 | `ytdl:source:{normalized search}` | String | Search→`(webpage_url, title)` resolution; TTL 1h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string; TTL 24h |
 | `spotify:playlist:{id}` | String | JSON array of track titles; TTL 1h (user-editable) |
 
-Redis uses `maxmemory-policy volatile-lru` at 256 MB: only TTL-carrying keys (yt-dlp/Spotify caches, the TTL-managed guild keys) are eviction candidates — the persistent history keys never are. Do not switch back to `allkeys-*`; that would let memory pressure silently destroy full play history.
+Redis uses `maxmemory-policy volatile-lru` at 256 MB: only TTL-carrying keys (yt-dlp/Spotify caches, the TTL-managed guild keys) are eviction candidates — the persistent history keys and `history:outbox` never are. Do not switch back to `allkeys-*`; that would let memory pressure silently destroy full play history (and, with a Postgres archive configured, not-yet-durable outbox entries).
 
 ### Crash recovery
 

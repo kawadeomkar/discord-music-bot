@@ -10,7 +10,11 @@ import pytest
 
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
-from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
+from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
+    HISTORY_OUTBOX_KEY,
+    GuildRedisStore,
+)
 
 
 def _entry(n: int) -> HistoryEntry:
@@ -60,6 +64,52 @@ class TestAdd:
             await h.add(_entry(i))
         mirrored = await store.get_history()  # newest-first, bounded read
         assert list(h) == list(reversed(mirrored))
+
+
+class TestAddOutboxGating:
+    """Postgres archive wiring (docs/POSTGRES_HISTORY_PLAN.md §5.4): the
+    outbox push and drainer notify happen exactly when an archive is
+    configured. Write path only — recent() is untouched until the Phase C
+    read flip."""
+
+    async def test_no_archive_means_no_outbox(self, store, fake_redis):
+        h = GuildHistory(store)
+        await h.add(_entry(1))
+        assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
+
+    async def test_archive_routes_entry_to_outbox_too(self, store, fake_redis):
+        h = GuildHistory(store, archive=object(), guild_id=42)
+        await h.add(_entry(1))
+        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
+            _entry(1).to_redis()
+        ]
+        # Display legs behave exactly as without an archive.
+        assert list(h) == [_entry(1)]
+        assert await store.get_history() == [_entry(1)]
+
+    async def test_notify_fires_once_per_add_with_archive(self, store):
+        calls = []
+        h = GuildHistory(
+            store, archive=object(), guild_id=42, on_outbox_push=lambda: calls.append(1)
+        )
+        await h.add(_entry(1))
+        await h.add(_entry(2))
+        assert len(calls) == 2
+
+    async def test_notify_not_fired_without_archive(self, store):
+        calls = []
+        h = GuildHistory(store, on_outbox_push=lambda: calls.append(1))
+        await h.add(_entry(1))
+        assert calls == []
+
+    async def test_no_store_skips_outbox_and_notify(self):
+        # Without Redis there is nowhere to buffer — degrade to memory-only
+        # exactly as before the archive existed.
+        calls = []
+        h = GuildHistory(None, archive=object(), on_outbox_push=lambda: calls.append(1))
+        await h.add(_entry(1))
+        assert list(h) == [_entry(1)]
+        assert calls == []
 
 
 class TestRestore:

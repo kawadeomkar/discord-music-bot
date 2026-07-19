@@ -270,8 +270,18 @@ class MusicPlayer:
         # All queue state (asyncio queue, display order, Redis mirror, bulk
         # mutex, cleared-flag) lives behind this one object — see guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
-        # Played-song history (in-memory ring + Redis mirror) — see guild_history.py.
-        self.history = GuildHistory(self.store)
+        # Played-song history (in-memory ring + Redis mirror) — see
+        # guild_history.py. The Postgres archive + drainer live on the app
+        # (one pair per process, None when POSTGRES_URL is unset); getattr
+        # because `bot` is typed as the plain commands.Bot base.
+        _archive = getattr(bot, "history_archive", None)
+        _drainer = getattr(bot, "history_drainer", None)
+        self.history = GuildHistory(
+            self.store,
+            archive=_archive,
+            guild_id=guild.id,
+            on_outbox_push=_drainer.notify if _drainer is not None else None,
+        )
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
@@ -1753,7 +1763,9 @@ class MusicPlayer:
                         if not skip_history and not stream_failed:
                             await self.history.add(
                                 HistoryEntry.from_song(
-                                    self.current_song, played_at=time.time()
+                                    self.current_song,
+                                    guild_id=self._guild.id,
+                                    played_at=time.time(),
                                 )
                             )
 

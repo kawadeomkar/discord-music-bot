@@ -541,6 +541,7 @@ def parse_queue_entry(data: bytes) -> QueueEntry | None:
 
 
 class HistoryEntryField:
+    GUILD_ID: Final[str] = "guild_id"
     TITLE: Final[str] = "title"
     WEBPAGE_URL: Final[str] = "webpage_url"
     DURATION_SECS: Final[str] = "duration_secs"
@@ -558,10 +559,16 @@ class HistoryEntry:
 
     Zero-values mean "unknown": fields absent on the wire default on parse,
     and the display layer degrades accordingly. The field set deliberately
-    matches the future Postgres play_history row
-    (docs/HISTORY_OVERHAUL_PLAN.md §8).
+    matches the Postgres play_history row (docs/POSTGRES_HISTORY_PLAN.md §4).
+
+    guild_id is redundant on the per-guild display list (the key carries it)
+    but load-bearing on the global history:outbox list, where entries from all
+    guilds interleave and the drainer maps each to a Postgres row. Entries
+    written before the field existed parse as guild_id=0 (the backfill stamps
+    those from their key instead — plan §5.6).
     """
 
+    guild_id: int = 0
     title: str = ""
     webpage_url: str = ""  # YouTube link used
     duration_secs: int = 0  # full song length; 0 = unknown
@@ -573,10 +580,12 @@ class HistoryEntry:
     played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
 
     @classmethod
-    def from_song(cls, song: YTDL, *, played_at: float) -> Self:
+    def from_song(cls, song: YTDL, *, guild_id: int, played_at: float) -> Self:
         """Canonical extraction from a finished song. played_at is a
         caller-supplied clock (same pattern as crashed_position_at) so this
-        stays a pure field mapping.
+        stays a pure field mapping. guild_id is required (keyword) because the
+        song object doesn't carry it and a forgotten stamp would silently
+        write unattributable outbox entries.
 
         played_secs is position reached (start_offset + audio delivered),
         capped at the song's duration when known: for a -playnow-interrupted
@@ -589,6 +598,7 @@ class HistoryEntry:
         if duration:
             played = min(played, duration)
         return cls(
+            guild_id=guild_id,
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             duration_secs=duration,
@@ -606,6 +616,7 @@ class HistoryEntry:
         pinned to HistoryEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
+                HistoryEntryField.GUILD_ID: self.guild_id,
                 HistoryEntryField.TITLE: self.title,
                 HistoryEntryField.WEBPAGE_URL: self.webpage_url,
                 HistoryEntryField.DURATION_SECS: self.duration_secs,
@@ -641,6 +652,7 @@ def parse_history_entry(data: bytes) -> HistoryEntry | None:
         return None
     try:
         return HistoryEntry(
+            guild_id=int(entry.get(HistoryEntryField.GUILD_ID) or 0),
             title=str(entry.get(HistoryEntryField.TITLE) or ""),
             webpage_url=str(entry.get(HistoryEntryField.WEBPAGE_URL) or ""),
             duration_secs=int(entry.get(HistoryEntryField.DURATION_SECS) or 0),

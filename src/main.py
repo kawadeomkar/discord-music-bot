@@ -7,6 +7,7 @@ from discord.ext import commands
 
 from src.config import ENVIRONMENT
 from src.help import MusicHelpCommand
+from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
 
@@ -99,10 +100,25 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
+        # Postgres play-history archive + its outbox drainer — both None when
+        # POSTGRES_URL is unset, and every consumer treats that as "feature
+        # off" (docs/POSTGRES_HISTORY_PLAN.md; None → bot behaves exactly as
+        # before the archive existed).
+        self.history_archive: Optional[PostgresHistoryArchive] = None
+        self.history_drainer: Optional[HistoryOutboxDrainer] = None
 
     async def setup_hook(self) -> None:
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
+        postgres_url = os.getenv("POSTGRES_URL")
+        if postgres_url:
+            # Lazy inside: no connection is made here, so startup never
+            # blocks on Postgres — the drainer's backoff loop absorbs an
+            # unreachable database.
+            self.history_archive = PostgresHistoryArchive(postgres_url)
+            drainer = HistoryOutboxDrainer(self.redis, self.history_archive)
+            drainer.start()
+            self.history_drainer = drainer
         for extension in EXTENSIONS:
             await self.load_extension(extension)
 
@@ -131,6 +147,12 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
+        # Drainer first (its final drain still needs Redis and the archive),
+        # then the archive pool, then the Redis pool they both sat on.
+        if self.history_drainer is not None:
+            await self.history_drainer.stop()
+        if self.history_archive is not None:
+            await self.history_archive.close()
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()

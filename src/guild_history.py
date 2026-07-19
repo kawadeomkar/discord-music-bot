@@ -13,14 +13,22 @@ and restore() refills the cache from the newest slice of the list.
 The at-rest wire format is owned by guild_state.py (HistoryEntry +
 serialize_history_entry/parse_history_entry); the store surface is
 push_history/get_history. This class never sees wire bytes.
+
+When a Postgres archive is configured (docs/POSTGRES_HISTORY_PLAN.md), add()
+also LPUSHes the entry onto the global outbox — in the same pipeline as the
+display-list push — and nudges the drainer. Postgres itself is never awaited
+here: the outbox/drainer split keeps the playback loop on Redis-only latency.
 """
 
 from collections import deque
-from collections.abc import Iterator, Sequence
-from typing import Optional
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Optional
 
 from src.guild_state import HistoryEntry
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
+
+if TYPE_CHECKING:
+    from src.history_archive import HistoryArchive
 
 
 class GuildHistory:
@@ -32,18 +40,36 @@ class GuildHistory:
     restore() only, so the Redis mirror can't be skipped.
     """
 
-    __slots__ = ("_store", "_entries")
+    __slots__ = ("_store", "_entries", "_archive", "_guild_id", "_on_outbox_push")
 
-    def __init__(self, store: Optional[GuildRedisStore]) -> None:
+    def __init__(
+        self,
+        store: Optional[GuildRedisStore],
+        *,
+        archive: Optional["HistoryArchive"] = None,
+        guild_id: int = 0,
+        on_outbox_push: Optional[Callable[[], None]] = None,
+    ) -> None:
+        # archive gates the outbox push (without a drainer the outbox would
+        # grow unbounded) and becomes recent()'s primary read in Phase B;
+        # guild_id is held for that same read. on_outbox_push is the
+        # drainer's notify — a sync callable so add() stays Redis-only.
         self._store = store
         self._entries: deque[HistoryEntry] = deque(maxlen=HISTORY_CACHE_LIMIT)
+        self._archive = archive
+        self._guild_id = guild_id
+        self._on_outbox_push = on_outbox_push
 
     async def add(self, entry: HistoryEntry) -> None:
-        """Record one played song on both legs. Degrades gracefully when the
-        store is None or the push fails (GuildRedisStore logs, never raises)."""
+        """Record one played song on both legs — plus the Postgres outbox
+        when an archive is configured. Degrades gracefully when the store is
+        None or the push fails (GuildRedisStore logs, never raises; a notify
+        after a failed push just drains an empty outbox)."""
         self._entries.append(entry)
         if self._store is not None:
-            await self._store.push_history(entry)
+            await self._store.push_history(entry, outbox=self._archive is not None)
+            if self._archive is not None and self._on_outbox_push is not None:
+                self._on_outbox_push()
 
     def restore(self, newest_first: Sequence[HistoryEntry]) -> None:
         """Populate from persisted history after a restart. In-memory leg

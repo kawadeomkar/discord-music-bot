@@ -33,6 +33,7 @@ opentelemetry-exporter-otlp-proto-grpc = ">=1.27.0"
 opentelemetry-instrumentation-redis = ">=0.48b0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
+asyncpg = ">=0.30"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"

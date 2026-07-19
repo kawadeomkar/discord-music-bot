@@ -26,6 +26,15 @@ GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
+# Global (not per-guild) write-ahead buffer for the Postgres history archive:
+# entries from all guilds interleave (each carries its guild_id on the wire),
+# LPUSHed alongside the display list and drained oldest-first by the single
+# HistoryOutboxDrainer task (history_archive.py). Deliberately NO TTL — it
+# holds not-yet-durable entries, so under maxmemory-policy volatile-lru it
+# must never be an eviction candidate; normally near-empty (drained within
+# seconds), it only grows while Postgres is unreachable.
+# See docs/POSTGRES_HISTORY_PLAN.md §3.
+HISTORY_OUTBOX_KEY = "history:outbox"
 GUILD_TTL = 86400  # 24h idle expiry (never applied to the history key — see below)
 # In-memory/display cap only — NOT a retention cap. The Redis history list is
 # unbounded (source of truth for all played songs; Postgres eventually — see
@@ -167,6 +176,45 @@ async def spotify_token_get_with_ttl(
     except Exception as e:
         log.warning(f"spotify_token_get_with_ttl failed: {e}")
         return None
+
+
+# ── History outbox (drain side) ───────────────────────────────────────────────
+# Consumed only by HistoryOutboxDrainer (history_archive.py). Unlike the cache
+# helpers above, these deliberately DO raise on Redis failure — the drainer's
+# backoff loop is the error handler, and a swallowed error here would look
+# like an empty outbox and silently stall the drain. Raw bytes in/out: wire
+# parsing stays in guild_state.py (parse_history_entry), per the schema rule.
+#
+# Single-consumer assumption: peek → INSERT → retire is only safe with one
+# drainer per outbox (two would both peek the same tail, then the second
+# retire would pop *unprocessed* entries). One bot process per Redis is
+# already the deployment's operating rule (see the recovery lock and
+# docs/K8S_DEPLOYMENT_PLAN.md) — this shares that assumption, it does not
+# add a new one.
+
+
+async def peek_outbox_oldest(redis: aioredis.Redis, count: int) -> list[bytes]:
+    """The oldest ≤count outbox entries, oldest first, left in place.
+    LPUSH writes at the head, so the tail slice LRANGE -count..-1 is the
+    oldest run; Redis returns it in list order (newer→older), hence the
+    reversal."""
+    raw: list[bytes] = await redis.lrange(HISTORY_OUTBOX_KEY, -count, -1)  # type: ignore[misc]
+    raw.reverse()
+    return raw
+
+
+async def retire_outbox(redis: aioredis.Redis, count: int) -> None:
+    """Drop the oldest `count` entries — call only after their Postgres
+    INSERT committed (crash between insert and retire redelivers; the
+    archive's unique index dedups). RPOP pops from the tail (oldest), so
+    concurrent LPUSHes at the head are never touched."""
+    if count > 0:
+        await redis.rpop(HISTORY_OUTBOX_KEY, count)  # type: ignore[misc]
+
+
+async def outbox_depth(redis: aioredis.Redis) -> int:
+    """Current outbox length — the drainer's backlog watchdog metric."""
+    return await redis.llen(HISTORY_OUTBOX_KEY)  # type: ignore[misc]
 
 
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
@@ -383,16 +431,25 @@ class GuildRedisStore:
     # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
     # workaround — that would make history itself an eviction candidate and defeat the
     # whole persistent-history design (see docker-compose.yml redis command).
-    async def push_history(self, entry: HistoryEntry) -> None:
+    async def push_history(self, entry: HistoryEntry, *, outbox: bool = False) -> None:
         """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
         the unbounded source of truth for all played songs (write-per-song-end
         is the durability boundary; cadence analysis in
         docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
-        pre-migration keys still carrying the old 24h idle expiry."""
+        pre-migration keys still carrying the old 24h idle expiry.
+        (The Phase C cutover of docs/POSTGRES_HISTORY_PLAN.md replaces PERSIST
+        with LTRIM+EXPIRE once Postgres is the source of truth.)
+
+        outbox=True additionally LPUSHes the same wire bytes onto
+        HISTORY_OUTBOX_KEY in the same pipeline — set when a Postgres archive
+        is configured (GuildHistory gates it), never otherwise: without a
+        drainer the outbox would grow unbounded."""
         try:
             pipe = self.redis.pipeline()
             pipe.lpush(self.history_key(), serialize_history_entry(entry))
             pipe.persist(self.history_key())
+            if outbox:
+                pipe.lpush(HISTORY_OUTBOX_KEY, serialize_history_entry(entry))
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")

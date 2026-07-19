@@ -54,6 +54,33 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    # Play-history archive (docs/POSTGRES_HISTORY_PLAN.md). The bot only uses
+    # it when POSTGRES_URL is set in .env, e.g.
+    #   POSTGRES_URL=postgresql://musicbot:musicbot@127.0.0.1:5432/musicbot
+    # Intentionally NOT in the bot's depends_on: the bot is fully functional
+    # without Postgres (the outbox buffers in Redis until it comes up), and a
+    # hard dependency would break `docker compose up discord-music-bot redis`.
+    image: postgres:18-alpine
+    container_name: discord-postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=musicbot
+      - POSTGRES_PASSWORD=musicbot
+      - POSTGRES_DB=musicbot
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # 18+ image layout: the declared volume moved to /var/lib/postgresql
+      # (PGDATA is version-specific beneath it). Mounting the old .../data
+      # path would silently store the cluster OUTSIDE the volume.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U musicbot -d musicbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   bgutil-pot-provider:
     # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
     # client (docs/PO_TOKEN_SIDECAR_PLAN.md). Version must match the
@@ -98,6 +125,7 @@ services:
 
 volumes:
   redis-data:
+  postgres-data:
   ytdlp-cache:
   otel-grafana:
   otel-tempo:

@@ -15,6 +15,8 @@ def app():
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
+    instance.history_archive = None
+    instance.history_drainer = None
     # BotBase stores cogs in a name-mangled dict; initialize it so the property works.
     instance._BotBase__cogs = {}
     # discord.Client properties (user, guilds, intents) read from _connection.
@@ -64,6 +66,39 @@ class TestSetupHook:
         for ext in EXTENSIONS:
             mock_load.assert_any_await(ext)
 
+    async def test_no_postgres_url_leaves_archive_off(self, app, monkeypatch):
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert app.history_archive is None
+        assert app.history_drainer is None
+
+    async def test_postgres_url_starts_archive_and_drainer(self, app, monkeypatch):
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
+        mock_archive = MagicMock()
+        mock_drainer = MagicMock()
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch.object(app, "load_extension", new=AsyncMock()),
+            patch(
+                "src.main.PostgresHistoryArchive", return_value=mock_archive
+            ) as mock_pg,
+            patch(
+                "src.main.HistoryOutboxDrainer", return_value=mock_drainer
+            ) as mock_dr,
+        ):
+            await app.setup_hook()
+        mock_pg.assert_called_once_with("postgresql://x")
+        mock_dr.assert_called_once_with(app.redis, mock_archive)
+        mock_drainer.start.assert_called_once()
+        assert app.history_archive is mock_archive
+        assert app.history_drainer is mock_drainer
+
 
 class TestClose:
     async def test_closes_redis_pool_when_set(self, app):
@@ -92,6 +127,26 @@ class TestClose:
         ) as mock_super:
             await app.close()
         mock_super.assert_awaited_once()
+
+    async def test_stops_drainer_then_archive_then_pool(self, app):
+        # Teardown order matters: the drainer's final drain still needs both
+        # the archive and Redis, and the archive pool must go before the
+        # Redis pool it never depended on but shuts down alongside.
+        order = []
+        app.history_drainer = MagicMock(
+            stop=AsyncMock(side_effect=lambda: order.append("drainer"))
+        )
+        app.history_archive = MagicMock(
+            close=AsyncMock(side_effect=lambda: order.append("archive"))
+        )
+        app._redis_pool = MagicMock()
+        mock_pool_close = AsyncMock(side_effect=lambda _p: order.append("pool"))
+        with (
+            patch("src.main.close_redis_pool", new=mock_pool_close),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()
+        assert order == ["drainer", "archive", "pool"]
 
 
 class TestHelpFlag:

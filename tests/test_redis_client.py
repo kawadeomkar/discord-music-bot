@@ -16,12 +16,16 @@ from src.guild_state import (
 )
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
+    HISTORY_OUTBOX_KEY,
     GuildRedisStore,
     cache_get,
     cache_set,
     close_redis_pool,
     create_redis_pool,
     get_redis,
+    outbox_depth,
+    peek_outbox_oldest,
+    retire_outbox,
     spotify_token_get_with_ttl,
     spotify_token_set,
 )
@@ -311,6 +315,109 @@ class TestPushHistory:
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.push_history(_hentry(1))  # must not raise
+
+
+class TestPushHistoryOutbox:
+    async def test_default_does_not_touch_outbox(self, store, fake_redis):
+        # No archive configured → no outbox writes, or the (undrained) outbox
+        # would grow without bound.
+        await store.push_history(_hentry(1))
+        assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
+
+    async def test_outbox_gets_same_wire_bytes(self, store, fake_redis):
+        await store.push_history(_hentry(1), outbox=True)
+        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
+            _hentry(1).to_redis()
+        ]
+
+    async def test_display_leg_unchanged_by_outbox_flag(self, store, fake_redis):
+        # Phase A: the display list still gets the entry, untrimmed, PERSISTed.
+        await store.push_history(_hentry(1), outbox=True)
+        assert await fake_redis.lrange(store.history_key(), 0, -1) == [
+            _hentry(1).to_redis()
+        ]
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_outbox_is_global_and_interleaves_guilds(self, fake_redis):
+        # One outbox for all guilds — entries carry guild_id on the wire.
+        a = GuildRedisStore(fake_redis, guild_id=1)
+        b = GuildRedisStore(fake_redis, guild_id=2)
+        await a.push_history(_hentry(1), outbox=True)
+        await b.push_history(_hentry(2), outbox=True)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+
+    async def test_outbox_key_has_no_ttl(self, store, fake_redis):
+        # Not-yet-durable entries must never be eviction candidates under
+        # volatile-lru — the same property that protects history today.
+        await store.push_history(_hentry(1), outbox=True)
+        assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
+
+    async def test_swallows_redis_error(self, broken_store):
+        await broken_store.push_history(_hentry(1), outbox=True)  # must not raise
+
+
+class TestOutboxDrainHelpers:
+    async def _push(self, fake_redis, *ns: int) -> None:
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in ns:
+            await store.push_history(_hentry(n), outbox=True)
+
+    async def test_peek_returns_oldest_first(self, fake_redis):
+        await self._push(fake_redis, 1, 2, 3)
+        raw = await peek_outbox_oldest(fake_redis, 10)
+        assert raw == [
+            _hentry(1).to_redis(),
+            _hentry(2).to_redis(),
+            _hentry(3).to_redis(),
+        ]
+
+    async def test_peek_caps_at_count_and_leaves_entries_in_place(self, fake_redis):
+        await self._push(fake_redis, 1, 2, 3)
+        raw = await peek_outbox_oldest(fake_redis, 2)
+        assert raw == [_hentry(1).to_redis(), _hentry(2).to_redis()]
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3  # non-destructive
+
+    async def test_peek_empty_outbox(self, fake_redis):
+        assert await peek_outbox_oldest(fake_redis, 10) == []
+
+    async def test_retire_drops_oldest_only(self, fake_redis):
+        await self._push(fake_redis, 1, 2, 3)
+        await retire_outbox(fake_redis, 2)
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_retire_zero_is_noop(self, fake_redis):
+        await self._push(fake_redis, 1)
+        await retire_outbox(fake_redis, 0)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_retire_never_touches_concurrent_head_pushes(self, fake_redis):
+        # A push landing between peek and retire goes to the HEAD; RPOP from
+        # the tail must retire only what was peeked.
+        await self._push(fake_redis, 1, 2)
+        peeked = await peek_outbox_oldest(fake_redis, 10)
+        await self._push(fake_redis, 3)  # concurrent new entry
+        await retire_outbox(fake_redis, len(peeked))
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_depth(self, fake_redis):
+        assert await outbox_depth(fake_redis) == 0
+        await self._push(fake_redis, 1, 2)
+        assert await outbox_depth(fake_redis) == 2
+
+    async def test_helpers_raise_on_redis_error(self):
+        # Unlike the cache helpers, errors must PROPAGATE — the drainer's
+        # backoff loop is the handler, and a swallowed error would read as an
+        # empty outbox and silently stall the drain.
+        dead = MagicMock()
+        dead.lrange = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        dead.rpop = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        dead.llen = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        with pytest.raises(aioredis.ConnectionError):
+            await peek_outbox_oldest(dead, 10)
+        with pytest.raises(aioredis.ConnectionError):
+            await retire_outbox(dead, 1)
+        with pytest.raises(aioredis.ConnectionError):
+            await outbox_depth(dead)
 
 
 class TestGetHistory:
