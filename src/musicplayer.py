@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import time
 from dataclasses import dataclass
@@ -99,6 +100,12 @@ _MIN_RESUME_REMAINING_SECS = 5
 # EOF guard for the resume seek (duration metadata is imprecise), matching the
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
+
+# ── Playback gate (docs/PLAYBACK_GATE_PLAN.md) ────────────────────────────────
+# How long loop() waits for a voice connection before tearing the player down.
+# Matches the idle queue_get() timeout so a player that never connects and one
+# that connects but is never given a song disconnect on the same schedule.
+_PLAYBACK_GATE_TIMEOUT = 300
 
 
 @dataclass(frozen=True)
@@ -208,6 +215,8 @@ class MusicPlayer:
         "store",
         "_restore_task",
         "_restore_complete",
+        "_playback_gate",
+        "_playback_holds",
         "_background_tasks",
         "_progress_task",
         "_np_host_message",
@@ -234,6 +243,8 @@ class MusicPlayer:
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
+    _playback_gate: asyncio.Event
+    _playback_holds: int
     _background_tasks: set
     _progress_task: Optional[asyncio.Task]
     _np_host_message: Optional[discord.Message]
@@ -276,6 +287,17 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
+        # Playback gate: restoring the persisted queue and *playing* it are
+        # separate concerns. The gate stays closed until a command actually
+        # establishes a voice connection, so a player built by a command that
+        # never connects (cog_before_invoke runs before validate_commands, so
+        # even a rejected command builds one) cannot walk the persisted queue
+        # and discard it. See docs/PLAYBACK_GATE_PLAN.md.
+        self._playback_gate = asyncio.Event()
+        # >0 while an in-flight command owns the opening — -play holds the gate
+        # across the join it triggers so the restored head cannot start before
+        # the requested song is inserted in front of it.
+        self._playback_holds = 0
         self._background_tasks: set = set()
         self._progress_task: Optional[asyncio.Task] = None
         # Now-playing host state: the one message currently carrying the NP
@@ -316,7 +338,14 @@ class MusicPlayer:
         loop() blocks on self._restore_complete before consuming from self.queue —
         see _restore_state() for why. When there's no store, restore is a no-op, so
         the event is set immediately rather than left for _restore_state() to set.
+
+        loop() then blocks on the playback gate. It is opened here when the guild
+        already has a voice client — the crash-recovery path (_restore_guild)
+        connects before calling start(), so recovery keeps resuming from the head
+        with no extra call site. Otherwise -join / -play open it once connected.
         """
+        if self._guild.voice_client is not None:
+            self.open_playback_gate()
         if self.store is not None:
             self._restore_task = self.bot.loop.create_task(self._restore_state())
         else:
@@ -324,6 +353,46 @@ class MusicPlayer:
             # gate in loop() never waits.
             self._restore_complete.set()
         self._player = self.bot.loop.create_task(self.loop())
+
+    # ── Playback gate ─────────────────────────────────────────────────────────
+
+    def open_playback_gate(self) -> None:
+        """Let loop() start consuming the queue. No-op while a hold is
+        outstanding — the holder is responsible for the opening."""
+        if self._playback_holds == 0:
+            self._playback_gate.set()
+
+    @contextlib.asynccontextmanager
+    async def defer_playback(self):
+        """Hold the playback gate shut for the duration of the block.
+
+        -play calls -join, which opens the gate as soon as the voice handshake
+        completes — while -play is still resolving its input (a 1-4s yt-dlp
+        extraction). Without this hold the restored head would start playing in
+        that window, which is the whole bug this exists to prevent.
+
+        The gate opens on the way out even when the block raised: -play's error
+        path calls cleanup(), which cancels loop() and makes the gate moot, but
+        if that is ever skipped the safe fallback is resuming the persisted
+        queue rather than stranding it behind a closed gate.
+        """
+        self._playback_holds += 1
+        try:
+            yield
+        finally:
+            self._playback_holds -= 1
+            if self._playback_holds == 0:
+                self.open_playback_gate()
+
+    async def wait_for_restore(self) -> None:
+        """Block until _restore_state() has finished (or failed).
+
+        Callers inserting into the queue before restore has read its snapshot
+        would be double-queued: put_front() LPUSHes to the Redis mirror, while
+        restore_entries() is in-memory only precisely because its entries are
+        already on that list. See docs/PLAYBACK_GATE_PLAN.md §3.4.
+        """
+        await self._restore_complete.wait()
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -611,6 +680,37 @@ class MusicPlayer:
         else:
             items = [obj]
         await self.queue.put(items, batch=not prefetch)
+        if prefetch and self.store is not None:
+            for item in items:
+                if isinstance(item, QueueObject):
+                    self._spawn_background(
+                        YTDL.prefetch_stream(item, redis=self.store.redis)
+                    )
+
+    async def queue_put_front(
+        self,
+        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        *,
+        prefetch: bool = True,
+    ):
+        """Insert at the FRONT of the queue, then (optionally) pre-fetch.
+
+        Same contract as queue_put() but for the head of the line — used when
+        -play runs on a disconnected bot with a persisted queue: the requested
+        song plays now and the persisted entries resume behind it.
+
+        Playlists are inserted in full, in order (put_front preserves the
+        order of the sequence it is handed), and with prefetch=False for the
+        same reason queue_put() does: N concurrent prefetches saturate the
+        thread pool and mint stream URLs that expire before playback reaches
+        them.
+        """
+        items: list[Union[QueueObject, YTSource]]
+        if isinstance(obj, list):
+            items = list(obj)  # type: ignore[arg-type]
+        else:
+            items = [obj]
+        await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -1485,6 +1585,21 @@ class MusicPlayer:
         # this prevents (an erroneous Redis pop_queue() for a crash-recovered
         # song that was never on the Redis queue list in the first place).
         await self._restore_complete.wait()
+        # Restore has populated the queue; wait for a voice connection before
+        # playing any of it. The timeout is not optional: a player blocked here
+        # is NOT blocked in queue_get(), so the 300s idle-disconnect below can
+        # never fire for it, and a player built by a command that never
+        # connects would leak its mps entry and task forever.
+        try:
+            async with async_timeout.timeout(_PLAYBACK_GATE_TIMEOUT):
+                await self._playback_gate.wait()
+        except asyncio.TimeoutError:
+            log.info(
+                f"Playback gate timed out for guild {self._guild.id} "
+                f"(never connected to voice), tearing down player"
+            )
+            asyncio.create_task(self.stop())
+            return
         prefetched_song: Optional[YTDL] = None
 
         while not self.bot.is_closed():
@@ -1581,17 +1696,12 @@ class MusicPlayer:
                         self.current_song = None
                         continue
 
-                    # FIXME: loop() can call vc.play() before the voice handshake completes.
-                    # guild.voice_client exists as soon as connect() starts, but vc.play()
-                    # raises ClientException("Not connected to voice.") until the handshake
-                    # finishes. Hit in practice when -play creates the MusicPlayer and
-                    # leftover Redis queue entries are restored at creation: loop() dequeues
-                    # and resolves the head faster than play's concurrent join task connects,
-                    # so the restored song is dropped ("Playback error — skipping song";
-                    # observed live 2026-07-16 during the §2.2 typing smoke test). Fix is to
-                    # gate playback on voice readiness — await an event set once join
-                    # completes, or poll vc.is_connected() with a short timeout — instead of
-                    # asserting on the client object alone.
+                    # Safe to assert rather than await readiness: the playback
+                    # gate above is only opened once a voice connection is
+                    # established (channel.connect() awaits the full handshake),
+                    # so loop() cannot reach vc.play() mid-handshake — the race
+                    # that used to drop the restored head with "Playback error —
+                    # skipping song". See docs/PLAYBACK_GATE_PLAN.md.
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
                     assert self.current_song is not None

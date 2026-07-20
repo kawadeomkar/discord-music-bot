@@ -1308,6 +1308,115 @@ class TestRedisHelpers:
         assert mp.store is None
 
 
+# ── PlaybackGate ──────────────────────────────────────────────────────────────
+
+
+class TestPlaybackGate:
+    """Restoring the persisted queue and playing it are separate concerns —
+    docs/PLAYBACK_GATE_PLAN.md."""
+
+    async def test_gate_closed_at_construction(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        assert not mp._playback_gate.is_set()
+
+    async def test_start_opens_gate_when_already_connected(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        """Crash recovery connects to voice BEFORE start() — that path must keep
+        resuming from the head with no extra call site."""
+        mock_guild.voice_client = MagicMock(spec=discord.VoiceClient)
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        # Stub loop() at the class: a real coroutine handed to a MagicMock
+        # create_task is never awaited, and the "coroutine was never awaited"
+        # finalizer surfaces as an unraisable warning in a later test.
+        with (
+            patch.object(mock_bot, "loop", MagicMock()),
+            patch.object(MusicPlayer, "loop", MagicMock()),
+        ):
+            mp.start()
+        assert mp._playback_gate.is_set()
+
+    async def test_start_leaves_gate_closed_when_disconnected(
+        self, mock_bot, mock_guild, mock_channel, mock_ctx
+    ):
+        mock_guild.voice_client = None
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        with (
+            patch.object(mock_bot, "loop", MagicMock()),
+            patch.object(MusicPlayer, "loop", MagicMock()),
+        ):
+            mp.start()
+        assert not mp._playback_gate.is_set()
+
+    async def test_hold_suppresses_open(self, music_player):
+        """-join opens the gate the moment the handshake lands; -play holds it
+        shut across that join so the restored head cannot start before the
+        requested song is inserted in front of it."""
+        music_player._playback_gate.clear()
+        async with music_player.defer_playback():
+            music_player.open_playback_gate()  # join's call, while play holds
+            assert not music_player._playback_gate.is_set()
+        assert music_player._playback_gate.is_set()
+
+    async def test_hold_opens_gate_even_when_block_raises(self, music_player):
+        """Fallback: resume the persisted queue rather than strand it behind a
+        closed gate if play's error path ever skips cleanup()."""
+        music_player._playback_gate.clear()
+        with pytest.raises(ValueError):
+            async with music_player.defer_playback():
+                raise ValueError("boom")
+        assert music_player._playback_gate.is_set()
+
+    async def test_nested_holds_open_only_on_last_release(self, music_player):
+        music_player._playback_gate.clear()
+        async with music_player.defer_playback():
+            async with music_player.defer_playback():
+                pass
+            assert not music_player._playback_gate.is_set()
+        assert music_player._playback_gate.is_set()
+
+    async def test_loop_does_not_dequeue_while_gate_closed(
+        self, music_player, fake_redis, mock_author
+    ):
+        """The bug this exists to prevent: cog_before_invoke builds a player for
+        every command — including ones validate_commands is about to reject — and
+        that player used to walk the persisted queue and discard it entry by
+        entry against a nonexistent voice client."""
+        music_player._playback_gate.clear()
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=1", "Persisted Song", mock_author)]
+        )
+
+        task = asyncio.create_task(music_player.loop())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not task.done()
+        assert music_player.queue.qsize() == 1
+        assert music_player.current_song is None
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_gate_timeout_tears_down_player(self, music_player):
+        """A player blocked on the gate is NOT blocked in queue_get(), so the
+        idle-disconnect never fires for it — the gate needs its own timeout or
+        the mps entry and task leak forever."""
+        music_player._playback_gate.clear()
+        # stop() itself is a slot-less method on a __slots__ class — patch what
+        # it delegates to (cleanup cancels the tasks and drops the mps entry).
+        music_player._cog.cleanup = AsyncMock()
+
+        with patch("src.musicplayer._PLAYBACK_GATE_TIMEOUT", 0.01):
+            await music_player.loop()
+
+        await asyncio.sleep(0.05)
+        music_player._cog.cleanup.assert_awaited_once_with(music_player._guild)
+
+
 # ── StateRestore ──────────────────────────────────────────────────────────────
 
 

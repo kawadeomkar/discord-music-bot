@@ -414,6 +414,8 @@ class TestJoinChannelPersistence:
         mp.store.set_connection.assert_awaited_once_with(
             voice_channel.id, text_channel.id
         )
+        # Voice is up — a queue persisted by a previous -stop resumes.
+        mp.open_playback_gate.assert_called_once()
 
 
 class TestEagerRestore:
@@ -1353,6 +1355,19 @@ def _no_typing():
     )
 
 
+def _mock_mp(qsize: int = 0) -> MagicMock:
+    """MusicPlayer stand-in for the -play cold path, with the playback-gate
+    hooks awaitable: play() takes defer_playback() as an async context manager
+    and awaits wait_for_restore() before front-inserting."""
+    mp = MagicMock()
+    mp.defer_playback = MagicMock(return_value=contextlib.nullcontext())
+    mp.wait_for_restore = AsyncMock()
+    mp.queue_put_front = AsyncMock()
+    mp.queue_put = AsyncMock()
+    mp.queue.qsize = MagicMock(return_value=qsize)
+    return mp
+
+
 class TestPlayCommand:
     """Tests for the play() cold-join parallelism (Change A).
 
@@ -1375,7 +1390,7 @@ class TestPlayCommand:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
 
         def fake_create_task(coro):
             coro.close()
@@ -1398,7 +1413,7 @@ class TestPlayCommand:
 
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock()
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
 
         with _no_typing(), patch("asyncio.create_task") as mock_create:
             await MusicBot.play.callback(music_bot, mock_ctx, "test")
@@ -1491,6 +1506,194 @@ class TestPlayCommand:
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
         mock_ctx.send.assert_awaited()
+
+
+class TestPlayFrontInsertion:
+    """-play on a disconnected bot means "play this", not "play whatever was
+    left over": the requested song jumps ahead of the queue persisted by a
+    previous -stop, which resumes behind it. docs/PLAYBACK_GATE_PLAN.md."""
+
+    async def test_cold_path_enqueues_at_front(self, music_bot, mock_ctx):
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        assert music_bot._enqueue_single.await_args.kwargs["front"] is True
+
+    async def test_warm_path_enqueues_at_back(self, music_bot, mock_ctx):
+        """Regression guard: a -play on a connected bot keeps append semantics."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        mp = _mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing(), patch("asyncio.create_task"):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        assert music_bot._enqueue_single.await_args.kwargs["front"] is False
+        # No hold and no restore wait on the warm path — the gate is already open.
+        mp.wait_for_restore.assert_not_awaited()
+
+    async def test_cold_path_waits_for_restore_before_enqueueing(
+        self, music_bot, mock_ctx
+    ):
+        """Load-bearing ordering: put_front LPUSHes the Redis mirror while
+        restore_entries replays already-listed entries in memory only, so
+        inserting before restore reads its snapshot double-queues the song."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        calls: list[str] = []
+        mp = _mock_mp()
+        mp.wait_for_restore = AsyncMock(side_effect=lambda: calls.append("restore"))
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock(
+            side_effect=lambda *a, **kw: calls.append("enqueue")
+        )
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        assert calls == ["restore", "enqueue"]
+
+    async def test_cold_path_holds_playback_gate_across_join(self, music_bot, mock_ctx):
+        """join opens the gate as soon as the handshake lands — the hold is what
+        stops the restored head from starting while queue_source is still
+        extracting."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        mp = _mock_mp()
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro):
+            coro.close()
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await MusicBot.play.callback(music_bot, mock_ctx, "test")
+
+        mp.defer_playback.assert_called_once()
+
+    async def test_front_single_uses_queue_put_front_and_announces_resume(
+        self, music_bot, mock_ctx
+    ):
+        qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
+        mp = _mock_mp(qsize=3)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+
+        mp.queue_put_front.assert_awaited_once_with(qobj)
+        mp.queue_put.assert_not_awaited()
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Playing now" in embed.title
+        assert "3 songs from the previous queue" in embed.description
+
+    async def test_front_single_omits_resume_line_when_nothing_persisted(
+        self, music_bot, mock_ctx
+    ):
+        qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
+        mp = _mock_mp(qsize=0)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "resume after" not in embed.description
+
+    async def test_front_playlist_inserts_all_tracks_in_order(
+        self, music_bot, mock_ctx
+    ):
+        """Unlike -playnow (first track only), -play front-inserts a playlist in
+        full — nothing is playing here to delay the return of."""
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
+        mp = _mock_mp()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_playlist(mock_ctx, source, tracks, mp, front=True)
+
+        mp.queue_put_front.assert_awaited_once_with(tracks, prefetch=False)
+        mp.queue_put.assert_not_awaited()
+
+    async def test_front_insert_after_restore_orders_both_legs(
+        self, music_bot, mock_ctx, music_player, fake_redis, mock_author
+    ):
+        """End to end against a real GuildQueue and fake Redis: the requested
+        song leads, the persisted entries follow in their original order, and
+        the in-memory and Redis legs agree.
+
+        Also the double-queue regression (docs/PLAYBACK_GATE_PLAN.md §5.8): the
+        new song must appear exactly ONCE. put_front LPUSHes it onto the same
+        Redis list restore_entries replays from, so an insert sequenced before
+        the snapshot read lands in both legs and gets queued twice.
+        """
+        for title in ("Persisted One", "Persisted Two"):
+            await fake_redis.rpush(
+                music_player.store.queue_key(),
+                orjson.dumps(
+                    {
+                        "webpage_url": f"https://yt.com/v={title}",
+                        "title": title,
+                        "requester_id": mock_author.id,
+                        "ts": None,
+                    }
+                ),
+            )
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        await music_player._restore_state()
+        assert music_player.queue.qsize() == 2
+
+        qobj = QueueObject("https://yt.com/v=new", "New Song", mock_author)
+        mock_ctx.message.add_reaction = AsyncMock()
+        with patch("src.youtube.YTDL.prefetch_stream", new=AsyncMock()):
+            await music_bot._enqueue_single(mock_ctx, qobj, music_player, front=True)
+
+        titles = [item.title for item in music_player.queue.display_items()]
+        assert titles == ["New Song", "Persisted One", "Persisted Two"]
+        assert titles.count("New Song") == 1
+
+        stored = [
+            orjson.loads(raw)["title"]
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert stored == ["New Song", "Persisted One", "Persisted Two"]
 
 
 class TestEnqueueSingle:

@@ -319,7 +319,14 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         qobj: Union[List[str], List[QueueObject]],
         mp: MusicPlayer,
+        *,
+        front: bool = False,
     ) -> None:
+        # A playlist front-inserts in FULL, in order — unlike -playnow, which
+        # collapses a playlist to its first track. That restriction exists to
+        # bound how long an interrupted song waits to return; on this path
+        # nothing is playing to interrupt.
+        enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(source, SpotifySource):
             titles: List[str] = qobj  # type: ignore[assignment]
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
@@ -331,7 +338,7 @@ class MusicBot(commands.Cog):
                     f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
                     discord.Color.blue(),
                 ),
-                mp.queue_put(qobjs_yt, prefetch=False),
+                enqueue(qobjs_yt, prefetch=False),
                 ctx.message.add_reaction("👍"),
             )
         else:
@@ -349,15 +356,46 @@ class MusicBot(commands.Cog):
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
-                mp.queue_put(tracks, prefetch=False),  # type: ignore[arg-type]
+                enqueue(tracks, prefetch=False),  # type: ignore[arg-type]
                 ctx.message.add_reaction("👍"),
             )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
-        self, ctx: commands.Context, qobj: QueueObject, mp: MusicPlayer
+        self,
+        ctx: commands.Context,
+        qobj: QueueObject,
+        mp: MusicPlayer,
+        *,
+        front: bool = False,
     ) -> None:
         vc = ctx.voice_client
+        if front:
+            # The song is about to play, so the "Queued song / Est. playing at"
+            # embed below would be wrong — qsize() is non-zero here whenever a
+            # persisted queue was restored, but those entries are BEHIND this
+            # song, not ahead of it.
+            resuming = mp.queue.qsize()
+            desc = f"Requested by: [{ctx.author.mention}]\n{qobj.title} - ({qobj.webpage_url})"
+            if resuming:
+                desc += (
+                    f"\n\n{resuming} song{'s' if resuming != 1 else ''} from the "
+                    f"previous queue will resume after this one."
+                )
+            await asyncio.gather(
+                mp.queue_put_front(qobj),
+                ctx.message.add_reaction("👍"),
+                send_embed(
+                    ctx,
+                    f"▶️ Playing now: {qobj.title}",
+                    desc,
+                    discord.Color.blue(),
+                    thumbnail=qobj.thumbnail,
+                ),
+            )
+            log.info(f"play (front) qsize: {mp.queue.qsize()}")
+            return
+
         should_show_queued = mp.queue.qsize() > 0 or (
             isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
@@ -418,41 +456,65 @@ class MusicBot(commands.Cog):
                 source = parse_input(url, ctx.message.content)
 
                 qobj: Union[QueueObject, List[str], List[QueueObject]]
-                if not ctx.voice_client:
-                    # Launch join concurrently with queue_source — both are pure I/O
-                    # (Discord WebSocket handshake vs yt-dlp extraction) with no data
-                    # dependency between them. await join_task after queue_source
-                    # guarantees the voice client is ready before queue_put fires.
-                    join_task = asyncio.create_task(ctx.invoke(self.join))
-                    try:
+                async with contextlib.AsyncExitStack() as stack:
+                    # front: the bot was not connected, so this song jumps ahead
+                    # of any queue restored from Redis (a -stop leaves its queue
+                    # persisted). -play on a disconnected bot means "play this",
+                    # not "play whatever was left over"; the persisted entries
+                    # resume behind it. docs/PLAYBACK_GATE_PLAN.md.
+                    front = not ctx.voice_client
+                    if front:
+                        # Hold the playback gate across the join below — join
+                        # opens it the moment the handshake lands, which would
+                        # start the restored head while queue_source is still
+                        # extracting. The hold releases on exiting the stack,
+                        # after the front insertion.
+                        await stack.enter_async_context(
+                            self.get_mp(ctx).defer_playback()
+                        )
+                        # Launch join concurrently with queue_source — both are pure I/O
+                        # (Discord WebSocket handshake vs yt-dlp extraction) with no data
+                        # dependency between them. await join_task after queue_source
+                        # guarantees the voice client is ready before queue_put fires.
+                        join_task = asyncio.create_task(ctx.invoke(self.join))
+                        try:
+                            qobj = await self.queue_source(ctx, source)
+                            await join_task
+                        except BaseException:
+                            if not join_task.done():
+                                join_task.cancel()
+                                with contextlib.suppress(
+                                    asyncio.CancelledError, Exception
+                                ):
+                                    await join_task
+                            # Full cleanup (not just disconnect) — cog_before_invoke already
+                            # created a MusicPlayer and started its loop() task. Without
+                            # cleanup() that task runs as a zombie for up to 300s waiting on
+                            # queue.get(), and store.clear_connection() is never called,
+                            # which would trigger spurious crash recovery on restart.
+                            if ctx.guild is not None:
+                                with contextlib.suppress(Exception):
+                                    await self.cleanup(ctx.guild)
+                            raise
+                    else:
                         qobj = await self.queue_source(ctx, source)
-                        await join_task
-                    except BaseException:
-                        if not join_task.done():
-                            join_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError, Exception):
-                                await join_task
-                        # Full cleanup (not just disconnect) — cog_before_invoke already
-                        # created a MusicPlayer and started its loop() task. Without
-                        # cleanup() that task runs as a zombie for up to 300s waiting on
-                        # queue.get(), and store.clear_connection() is never called,
-                        # which would trigger spurious crash recovery on restart.
-                        if ctx.guild is not None:
-                            with contextlib.suppress(Exception):
-                                await self.cleanup(ctx.guild)
-                        raise
-                else:
-                    qobj = await self.queue_source(ctx, source)
 
-                mp = self.get_mp(ctx)
-                log.info(f"Voice client: {ctx.voice_client}")
+                    mp = self.get_mp(ctx)
+                    log.info(f"Voice client: {ctx.voice_client}")
 
-                if isinstance(qobj, list):
-                    await self._enqueue_playlist(ctx, source, qobj, mp)
-                else:
-                    assert isinstance(qobj, QueueObject)
-                    qobj.user_input = url
-                    await self._enqueue_single(ctx, qobj, mp)
+                    if front:
+                        # Ordering is load-bearing: put_front LPUSHes the Redis
+                        # mirror, while restore_entries replays entries that are
+                        # already on that list in memory only. Inserting before
+                        # restore has read its snapshot double-queues this song.
+                        await mp.wait_for_restore()
+
+                    if isinstance(qobj, list):
+                        await self._enqueue_playlist(ctx, source, qobj, mp, front=front)
+                    else:
+                        assert isinstance(qobj, QueueObject)
+                        qobj.user_input = url
+                        await self._enqueue_single(ctx, qobj, mp, front=front)
 
             except Exception as e:
                 log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
@@ -790,6 +852,11 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):
                 await mp.store.set_connection(channel.id, ctx.channel.id)
+
+            # Voice is up — release the playback loop so a persisted queue
+            # resumes. No-op while -play holds the gate: it inserts its song at
+            # the front first, then opens (docs/PLAYBACK_GATE_PLAN.md §3.3).
+            mp.open_playback_gate()
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
