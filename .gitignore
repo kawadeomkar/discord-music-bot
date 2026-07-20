@@ -4,6 +4,7 @@ docs/
 
 # Claude Code
 .claude/
+CLAUDE.md
 /CLAUDE.md
 
 # PyCharm and misc
