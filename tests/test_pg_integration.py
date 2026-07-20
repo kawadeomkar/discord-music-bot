@@ -13,6 +13,7 @@ recent() ordering with tie-breaks, and the drainer's redelivery dedup.
 import asyncio
 import itertools
 import os
+import time
 
 import pytest
 
@@ -104,15 +105,24 @@ class TestMigrations:
                     "SELECT version FROM schema_migrations ORDER BY version"
                 )
             ]
-            assert versions[0] == "0001_play_history"
-            # And the baseline objects exist.
+            assert versions == [
+                "0001_play_history",
+                "0002_stats_indexes",
+                "0003_user_history_index",
+            ]
+            # And the migrated objects exist.
             assert await conn.fetchval("SELECT count(*) FROM play_history") == 0
-            assert (
-                await conn.fetchval(
-                    "SELECT count(*) FROM pg_indexes WHERE indexname = 'play_history_dedup'"
+            index_names = {
+                r["indexname"]
+                for r in await conn.fetch(
+                    "SELECT indexname FROM pg_indexes WHERE tablename = 'play_history'"
                 )
-                == 1
-            )
+            }
+            assert {
+                "play_history_dedup",
+                "play_history_by_song",
+                "play_history_by_requester",
+            } <= index_names
 
     async def test_second_database_same_dsn_is_noop(self, pg_dsn, db):
         async with db.acquire():
@@ -123,7 +133,7 @@ class TestMigrations:
                 count = await conn.fetchval("SELECT count(*) FROM schema_migrations")
         finally:
             await second.close()
-        assert count == 1  # ledger unchanged — no re-apply
+        assert count == 3  # ledger unchanged — no re-apply
 
     async def test_tampered_migration_fails_closed(self, pg_dsn, tmp_path):
         d = tmp_path / "m"
@@ -201,6 +211,120 @@ class TestArchiveAgainstRealPG:
     async def test_limit_applies(self, archive):
         await archive.insert_batch([_entry(n) for n in range(5)])
         assert len(await archive.recent(42, 3)) == 3
+
+
+class TestAnalyticsAgainstRealPG:
+    """Phase D SQL (plan §7): the aggregates, window, and exclusions the
+    fakes can't prove."""
+
+    async def _seed(self, archive):
+        # Requester 1: songs A(×2 plays), B(×1). Requester 2: B(×1).
+        # Unknown requester (0): C(×1) — counted in totals, not the board.
+        entries = [
+            HistoryEntry(
+                guild_id=42,
+                title="Song 1",
+                webpage_url="https://yt.com/v=1",
+                played_secs=190,
+                requester_id=1,
+                requester_name="user1",
+                played_at=1000.0,
+            ),
+            HistoryEntry(
+                guild_id=42,
+                title="Song 1",
+                webpage_url="https://yt.com/v=1",
+                played_secs=100,
+                requester_id=1,
+                requester_name="user1",
+                played_at=2000.0,
+            ),
+            HistoryEntry(
+                guild_id=42,
+                title="Song B",
+                webpage_url="https://yt.com/v=B",
+                played_secs=50,
+                requester_id=1,
+                requester_name="user1",
+                played_at=3000.0,
+            ),
+            HistoryEntry(
+                guild_id=42,
+                title="Song B",
+                webpage_url="https://yt.com/v=B",
+                played_secs=50,
+                requester_id=2,
+                requester_name="user2",
+                played_at=4000.0,
+            ),
+            HistoryEntry(
+                guild_id=42,
+                title="Song C",
+                webpage_url="https://yt.com/v=C",
+                played_secs=25,
+                requester_id=0,
+                played_at=5000.0,
+            ),
+        ]
+        await archive.insert_batch(entries)
+
+    async def test_totals_include_unknown_requester(self, archive):
+        await self._seed(archive)
+        stats = await archive.stats(42)
+        assert stats.plays == 5
+        assert stats.distinct_songs == 3
+        assert stats.seconds_listened == 190 + 100 + 50 + 50 + 25
+
+    async def test_top_songs_ordered_by_plays(self, archive):
+        await self._seed(archive)
+        stats = await archive.stats(42)
+        assert [(s.webpage_url, s.plays) for s in stats.top_songs] == [
+            ("https://yt.com/v=B", 2),
+            ("https://yt.com/v=1", 2),
+            ("https://yt.com/v=C", 1),
+        ]
+
+    async def test_top_requesters_exclude_unknown(self, archive):
+        await self._seed(archive)
+        stats = await archive.stats(42)
+        assert [(r.requester_id, r.plays) for r in stats.top_requesters] == [
+            (1, 3),
+            (2, 1),
+        ]
+
+    async def test_days_window_filters_old_plays(self, archive):
+        # All seeded entries have 1970s-era played_at — far outside any
+        # window — plus one "now" entry that stays inside it.
+        await self._seed(archive)
+        now_entry = HistoryEntry(
+            guild_id=42,
+            title="Now",
+            webpage_url="https://yt.com/v=now",
+            played_secs=10,
+            requester_id=1,
+            requester_name="user1",
+            played_at=time.time(),
+        )
+        await archive.insert_batch([now_entry])
+        stats = await archive.stats(42, days=7)
+        assert stats.plays == 1
+        assert stats.top_songs[0].webpage_url == "https://yt.com/v=now"
+        all_time = await archive.stats(42)
+        assert all_time.plays == 6
+
+    async def test_empty_guild_stats_are_zero(self, archive):
+        stats = await archive.stats(31337)
+        assert stats.plays == 0
+        assert stats.seconds_listened == 0  # coalesce, not NULL
+        assert stats.top_songs == ()
+        assert stats.top_requesters == ()
+
+    async def test_recent_by_user_filters_and_orders(self, archive):
+        await self._seed(archive)
+        got = await archive.recent_by_user(42, 1, 10)
+        assert [e.played_at for e in got] == [3000.0, 2000.0, 1000.0]
+        assert all(e.requester_id == 1 for e in got)
+        assert await archive.recent_by_user(42, 99, 10) == []
 
 
 class TestBackfillAgainstRealPG:

@@ -10,6 +10,7 @@ import pytest
 
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
+from src.history_archive import GuildStats
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_KEY,
@@ -161,14 +162,21 @@ class TestRecent:
         assert await h.recent(10) == [_entry(2), _entry(1)]
 
 
+_STATS_SENTINEL = GuildStats(
+    plays=1, distinct_songs=1, seconds_listened=1, top_songs=(), top_requesters=()
+)
+
+
 class _FakeArchive:
-    """recent()-only archive fake: serves a canned newest-first list, records
+    """Read-path archive fake: serves a canned newest-first list, records
     calls, raises on demand."""
 
     def __init__(self, entries=None, fail=False):
         self.entries = entries or []  # newest-first, as the real one returns
         self.fail = fail
         self.calls: list[tuple[int, int]] = []
+        self.user_calls: list[tuple[int, int, int]] = []
+        self.stats_calls: list[tuple[int, object]] = []
 
     async def insert_batch(self, entries):  # protocol completeness
         raise AssertionError("recent()-path tests must not insert")
@@ -178,6 +186,16 @@ class _FakeArchive:
         if self.fail:
             raise RuntimeError("pg down")
         return self.entries[:limit]
+
+    async def recent_by_user(self, guild_id, requester_id, limit):
+        self.user_calls.append((guild_id, requester_id, limit))
+        if self.fail:
+            raise RuntimeError("pg down")
+        return [e for e in self.entries if e.requester_id == requester_id][:limit]
+
+    async def stats(self, guild_id, *, days=None):
+        self.stats_calls.append((guild_id, days))
+        return _STATS_SENTINEL
 
 
 class TestRecentArchivePrimary:
@@ -245,6 +263,76 @@ class TestRecentArchivePrimary:
         h = GuildHistory(store, archive=archive, guild_id=42)
         assert await h.recent(0) == []
         assert archive.calls == []
+
+
+class TestRecentUserFilter:
+    """-history --user (docs/POSTGRES_HISTORY_PLAN.md §7.2): the requester
+    filter applies on the archive path, the freshness merge, AND every
+    degraded fallback."""
+
+    async def test_archive_path_uses_recent_by_user(self, store):
+        # _entry(n) stamps requester_id=n.
+        archive = _FakeArchive(entries=[_entry(2), _entry(1)])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        assert await h.recent(10, requester_id=1) == [_entry(1)]
+        assert archive.user_calls == [(42, 1, 10)]
+        assert archive.calls == []  # unfiltered read not used
+
+    async def test_merge_filters_fresh_leg_too(self, store):
+        # Undrained deque entries from OTHER requesters must not leak into a
+        # filtered view — and same-requester fresh entries still merge in.
+        drained = _entry(2)  # requester 2, already in the archive
+        fresh_same_user = HistoryEntry(
+            title="Fresh",
+            webpage_url="https://yt.com/v=fresh",
+            requester_id=2,
+            requester_name="user2",
+            played_at=1010.0,
+        )
+        archive = _FakeArchive(entries=[drained])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([fresh_same_user, _entry(3)])  # newest-first: 2's + 3's
+        assert await h.recent(10, requester_id=2) == [fresh_same_user, drained]
+        # Requester 3's view: only their fresh entry, nothing from the archive.
+        assert await h.recent(10, requester_id=3) == [_entry(3)]
+
+    async def test_redis_fallback_filters(self, store):
+        seed = GuildHistory(store)
+        for n in (1, 2, 3):
+            await seed.add(_entry(n))
+        h = GuildHistory(store, archive=_FakeArchive(fail=True), guild_id=42)
+        assert await h.recent(10, requester_id=2) == [_entry(2)]
+
+    async def test_deque_fallback_filters(self):
+        h = GuildHistory(None)
+        h.restore([_entry(3), _entry(2), _entry(1)])
+        assert await h.recent(10, requester_id=3) == [_entry(3)]
+
+    async def test_filtered_empty_redis_falls_through_to_deque(self, store):
+        # A Redis list that has entries — but none for this requester — must
+        # not mask a deque that (somehow) does; both filter to empty here.
+        seed = GuildHistory(store)
+        await seed.add(_entry(1))
+        h = GuildHistory(store)
+        assert await h.recent(10, requester_id=99) == []
+
+
+class TestStats:
+    async def test_none_without_archive(self):
+        assert await GuildHistory(None).stats() is None
+        assert await GuildHistory(None).stats(days=7) is None
+
+    async def test_delegates_guild_id_and_days(self, store):
+        archive = _FakeArchive()
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        assert await h.stats(days=30) is _STATS_SENTINEL
+        assert archive.stats_calls == [(42, 30)]
+
+    async def test_days_defaults_to_none(self, store):
+        archive = _FakeArchive()
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        await h.stats()
+        assert archive.stats_calls == [(42, None)]
 
 
 class TestSequenceProtocol:

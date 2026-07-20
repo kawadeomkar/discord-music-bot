@@ -31,9 +31,18 @@ from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import get_logger
 
 if TYPE_CHECKING:
-    from src.history_archive import HistoryArchive
+    from src.history_archive import GuildStats, HistoryArchive
 
 log = get_logger(__name__)
+
+
+def _filtered(
+    entries: list[HistoryEntry], requester_id: Optional[int]
+) -> list[HistoryEntry]:
+    """Narrow to one requester when asked; passthrough otherwise."""
+    if requester_id is None:
+        return entries
+    return [e for e in entries if e.requester_id == requester_id]
 
 
 class GuildHistory:
@@ -82,9 +91,12 @@ class GuildHistory:
         the cache appends oldest-first, hence the reversal."""
         self._entries.extend(reversed(newest_first))
 
-    async def recent(self, limit: int) -> list[HistoryEntry]:
+    async def recent(
+        self, limit: int, *, requester_id: Optional[int] = None
+    ) -> list[HistoryEntry]:
         """The `limit` most recently played songs, newest first — the
-        -history command's read surface.
+        -history command's read surface. requester_id narrows every path to
+        one member's requests (`-history --user`, plan §7.2).
 
         Postgres-primary (docs/POSTGRES_HISTORY_PLAN.md §5.4): the archive
         holds every played song, so its answer is authoritative — after a
@@ -104,29 +116,52 @@ class GuildHistory:
             return []
         if self._archive is not None:
             try:
-                persisted = await self._archive.recent(self._guild_id, limit)
+                if requester_id is not None:
+                    persisted = await self._archive.recent_by_user(
+                        self._guild_id, requester_id, limit
+                    )
+                else:
+                    persisted = await self._archive.recent(self._guild_id, limit)
             except Exception as e:
                 log.warning(
                     f"[guild:{self._guild_id}] history archive read failed, "
                     f"serving degraded fallback: {type(e).__name__}: {e}"
                 )
             else:
-                return self._merge_fresh(persisted, limit)
+                return self._merge_fresh(persisted, limit, requester_id)
         if self._store is not None:
             persisted = await self._store.get_history()
+            persisted = _filtered(persisted, requester_id)
             if persisted:
                 return persisted[:limit]
-        return list(self._entries)[-limit:][::-1]
+        return _filtered(list(self._entries)[::-1], requester_id)[:limit]
+
+    async def stats(self, *, days: Optional[int] = None) -> Optional["GuildStats"]:
+        """Aggregate playback stats (-stats, plan §7.1). None when no archive
+        is configured — the caches can't answer aggregate questions, so there
+        is deliberately no degraded fallback; archive errors propagate to the
+        command's error handler."""
+        if self._archive is None:
+            return None
+        return await self._archive.stats(self._guild_id, days=days)
 
     def _merge_fresh(
-        self, persisted: list[HistoryEntry], limit: int
+        self,
+        persisted: list[HistoryEntry],
+        limit: int,
+        requester_id: Optional[int] = None,
     ) -> list[HistoryEntry]:
         """Prepend deque entries the archive doesn't have yet (newest first),
         then the archive's newest-first result, capped at limit. Fresh
         entries are by construction newer than anything already drained, so
-        prepending preserves global newest-first order."""
+        prepending preserves global newest-first order. The requester filter
+        applies to the fresh leg too — the archive result is pre-filtered."""
         seen = {(e.played_at, e.webpage_url) for e in persisted}
-        fresh = [e for e in self._entries if (e.played_at, e.webpage_url) not in seen]
+        fresh = [
+            e
+            for e in _filtered(list(self._entries), requester_id)
+            if (e.played_at, e.webpage_url) not in seen
+        ]
         fresh.reverse()  # deque is oldest-first
         return (fresh + persisted)[:limit]
 

@@ -13,11 +13,13 @@ from discord.ext import commands
 
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
+from src.history_archive import GuildStats, TopRequester, TopSong
 from src.musicbot import (
     HistoryFlags,
     MusicBot,
     _check_voice_permissions,
     background_typing,
+    stats_embed,
 )
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
@@ -1216,10 +1218,15 @@ def _history_entries(n: int) -> list[HistoryEntry]:
     ]
 
 
-def _flags(limit: int = 10):
+def _flags(limit: int = 10, user=None):
     """Stand-in for a parsed HistoryFlags (FlagConverter can't be constructed
-    directly; the command body only reads .limit)."""
-    return SimpleNamespace(limit=limit)
+    directly; the command body only reads .limit/.user)."""
+    return SimpleNamespace(limit=limit, user=user)
+
+
+def _stats_flags(days=None):
+    """Stand-in for a parsed StatsFlags (same rationale as _flags)."""
+    return SimpleNamespace(days=days)
 
 
 class TestHistoryCommand:
@@ -1299,8 +1306,160 @@ class TestHistoryCommand:
         assert lines[1] == "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>"
 
     def test_flag_defaults(self):
-        # -h with no flags must parse to limit=10.
+        # -h with no flags must parse to limit=10, user unset.
         assert HistoryFlags.get_flags()["limit"].default == 10
+        assert HistoryFlags.get_flags()["user"].default is None
+
+    async def test_user_flag_filters_to_requester(self, music_bot, mock_ctx):
+        # _history_entries stamps requester_id = i+1 — filter to member 2.
+        self._mp_with_history(music_bot, _history_entries(5))
+        member = SimpleNamespace(id=2, display_name="user1")
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags(user=member))
+        embeds = mock_ctx.send.call_args[1]["embeds"]
+        assert [e.title for e in embeds] == ["1. Song 1"]
+
+    async def test_user_flag_empty_result_names_the_member(self, music_bot, mock_ctx):
+        self._mp_with_history(music_bot, _history_entries(3))
+        member = SimpleNamespace(id=999, display_name="Quiet Person")
+        await MusicBot.history.callback(music_bot, mock_ctx, flags=_flags(user=member))
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "No songs requested by Quiet Person" in embed.description
+
+
+class TestStatsCommand:
+    def _mp_with_stats(self, music_bot, stats):
+        mp = MagicMock()
+        mp.history.stats = AsyncMock(return_value=stats)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        return mp
+
+    def _stats(self, **overrides):
+        fields: dict = dict(
+            plays=12,
+            distinct_songs=7,
+            seconds_listened=3725,
+            top_songs=(
+                TopSong(title="Hit Song", webpage_url="https://yt.com/v=1", plays=4),
+                TopSong(title="Other Song", webpage_url="https://yt.com/v=2", plays=2),
+            ),
+            top_requesters=(
+                TopRequester(requester_id=42, requester_name="Omkar", plays=9),
+            ),
+        )
+        fields.update(overrides)
+        return GuildStats(**fields)
+
+    async def test_unconfigured_archive_sends_notice(self, music_bot, mock_ctx):
+        # A real GuildHistory without an archive returns None from stats().
+        mp = MagicMock()
+        mp.history = GuildHistory(None)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await MusicBot.stats.callback(music_bot, mock_ctx, flags=_stats_flags())
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "require the Postgres archive" in embed.description
+
+    async def test_zero_plays_sends_empty_notice(self, music_bot, mock_ctx):
+        self._mp_with_stats(
+            music_bot,
+            self._stats(
+                plays=0,
+                distinct_songs=0,
+                seconds_listened=0,
+                top_songs=(),
+                top_requesters=(),
+            ),
+        )
+        await MusicBot.stats.callback(music_bot, mock_ctx, flags=_stats_flags())
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "No songs have been played." in embed.description
+
+    async def test_zero_plays_with_window_names_the_window(self, music_bot, mock_ctx):
+        self._mp_with_stats(
+            music_bot,
+            self._stats(
+                plays=0,
+                distinct_songs=0,
+                seconds_listened=0,
+                top_songs=(),
+                top_requesters=(),
+            ),
+        )
+        await MusicBot.stats.callback(music_bot, mock_ctx, flags=_stats_flags(days=7))
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "in the last 7 days" in embed.description
+
+    @pytest.mark.parametrize("days", [0, -1, 3651])
+    async def test_days_out_of_bounds_rejected(self, music_bot, mock_ctx, days):
+        mp = self._mp_with_stats(music_bot, self._stats())
+        await MusicBot.stats.callback(
+            music_bot, mock_ctx, flags=_stats_flags(days=days)
+        )
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "--days must be between" in embed.description
+        mp.history.stats.assert_not_awaited()
+
+    async def test_days_window_passed_to_history(self, music_bot, mock_ctx):
+        mp = self._mp_with_stats(music_bot, self._stats())
+        await MusicBot.stats.callback(music_bot, mock_ctx, flags=_stats_flags(days=30))
+        mp.history.stats.assert_awaited_once_with(days=30)
+
+    async def test_happy_path_embed(self, music_bot, mock_ctx):
+        self._mp_with_stats(music_bot, self._stats())
+        await MusicBot.stats.callback(music_bot, mock_ctx, flags=_stats_flags())
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "**12** plays" in embed.description
+        assert "**7** unique songs" in embed.description
+        assert "**1:02:05** listened" in embed.description  # 3725s via fmt_duration
+        assert "all time" in embed.description
+        songs_field, requesters_field = embed.fields
+        assert songs_field.name == "Most played"
+        assert "[Hit Song](https://yt.com/v=1) — 4 plays" in songs_field.value
+        assert requesters_field.name == "Top requesters"
+        assert "<@42> — 9 plays" in requesters_field.value
+
+
+class TestStatsEmbed:
+    def test_single_play_not_pluralized(self):
+        stats = GuildStats(
+            plays=1,
+            distinct_songs=1,
+            seconds_listened=100,
+            top_songs=(TopSong(title="One", webpage_url="https://u", plays=1),),
+            top_requesters=(TopRequester(requester_id=1, requester_name="a", plays=1),),
+        )
+        embed = stats_embed(stats, None)
+        assert "— 1 play" in embed.fields[0].value
+        assert "— 1 plays" not in embed.fields[0].value
+
+    def test_windowed_title_line(self):
+        stats = GuildStats(
+            plays=2,
+            distinct_songs=2,
+            seconds_listened=10,
+            top_songs=(),
+            top_requesters=(),
+        )
+        assert "last 30 days" in stats_embed(stats, 30).description
+        assert stats_embed(stats, 30).fields == []  # empty boards omitted
+
+    def test_markdown_brackets_escaped_and_title_truncated(self):
+        stats = GuildStats(
+            plays=1,
+            distinct_songs=1,
+            seconds_listened=1,
+            top_songs=(
+                TopSong(
+                    title="[EVIL](x) " + "a" * 100,
+                    webpage_url="https://real",
+                    plays=1,
+                ),
+            ),
+            top_requesters=(),
+        )
+        value = stats_embed(stats, None).fields[0].value
+        assert "[(EVIL)(x)" in value  # brackets neutralized, link target intact
+        assert "](https://real)" in value
+        assert "…" in value  # truncated
 
 
 class TestPingCommand:

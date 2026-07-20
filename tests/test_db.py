@@ -74,11 +74,15 @@ class TestDiscover:
         with pytest.raises(MigrationError, match="duplicate migration prefix 0002"):
             _discover(migrations)
 
-    def test_real_repo_baseline_present(self):
-        # Guard the DDL's move out of code: the shipped migrations dir must
-        # hold the 0001 baseline with the table + dedup index.
+    def test_real_repo_migrations_present(self):
+        # Guard the shipped migration set: the baseline DDL plus the Phase D
+        # analytics indexes, in order. A new migration extends this list.
         files = _discover(MIGRATIONS_DIR)
-        assert files and files[0].name == "0001_play_history.sql"
+        assert [p.name for p in files] == [
+            "0001_play_history.sql",
+            "0002_stats_indexes.sql",
+            "0003_user_history_index.sql",
+        ]
         sql = files[0].read_text()
         assert "CREATE TABLE IF NOT EXISTS play_history" in sql
         assert "play_history_dedup" in sql

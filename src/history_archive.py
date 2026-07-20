@@ -25,6 +25,7 @@ itself lives in db/migrations/ (docs/POSTGRES_HISTORY_PLAN.md §4).
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Protocol
 
@@ -34,6 +35,37 @@ from src.redis_client import outbox_depth, peek_outbox_oldest, retire_outbox
 from src.util import get_logger
 
 log = get_logger(__name__)
+
+
+# ── -stats query result shapes (docs/POSTGRES_HISTORY_PLAN.md §7.1) ──────────
+# Not wire schema (nothing here is persisted), so they live with the queries
+# that produce them, not in guild_state.py.
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopSong:
+    title: str
+    webpage_url: str
+    plays: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TopRequester:
+    requester_id: int
+    requester_name: str
+    plays: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuildStats:
+    """One guild's aggregate playback statistics, optionally windowed."""
+
+    plays: int
+    distinct_songs: int
+    seconds_listened: int
+    top_songs: tuple[TopSong, ...]
+    top_requesters: tuple[TopRequester, ...]
+
 
 _INSERT_SQL = """
 INSERT INTO play_history (guild_id, title, webpage_url, duration_secs,
@@ -51,6 +83,51 @@ WHERE guild_id = $1
 ORDER BY played_at DESC, id DESC
 LIMIT $2
 """
+
+_RECENT_BY_USER_SQL = """
+SELECT guild_id, title, webpage_url, duration_secs, played_secs,
+       requester_id, requester_name, thumbnail, uploader, played_at
+FROM play_history
+WHERE guild_id = $1 AND requester_id = $2
+ORDER BY played_at DESC, id DESC
+LIMIT $3
+"""
+
+# The optional --days window is one nullable parameter, not a second SQL
+# variant: $2 NULL disables the clause. guild_id equality leads every index
+# here, so the residual filter cost is negligible at this table's scale.
+_STATS_TOTALS_SQL = """
+SELECT count(*)                       AS plays,
+       count(DISTINCT webpage_url)    AS distinct_songs,
+       coalesce(sum(played_secs), 0)  AS seconds_listened
+FROM play_history
+WHERE guild_id = $1
+  AND ($2::int IS NULL OR played_at > now() - make_interval(days => $2::int))
+"""
+
+_STATS_TOP_SONGS_SQL = """
+SELECT webpage_url, max(title) AS title, count(*) AS plays
+FROM play_history
+WHERE guild_id = $1
+  AND ($2::int IS NULL OR played_at > now() - make_interval(days => $2::int))
+GROUP BY webpage_url
+ORDER BY plays DESC, max(played_at) DESC
+LIMIT $3
+"""
+
+# requester_id = 0 rows (unknown requester) are excluded from the leaderboard
+# but deliberately included in the totals above — plan §7.1.
+_STATS_TOP_REQUESTERS_SQL = """
+SELECT requester_id, max(requester_name) AS requester_name, count(*) AS plays
+FROM play_history
+WHERE guild_id = $1 AND requester_id <> 0
+  AND ($2::int IS NULL OR played_at > now() - make_interval(days => $2::int))
+GROUP BY requester_id
+ORDER BY plays DESC, max(played_at) DESC
+LIMIT $3
+"""
+
+_STATS_TOP_N = 5
 
 
 def _entry_to_row(entry: HistoryEntry) -> tuple:
@@ -84,12 +161,20 @@ def _row_to_entry(row) -> HistoryEntry:
 
 
 class HistoryArchive(Protocol):
-    """What GuildHistory (Phase B reads) and the drainer (writes) need from
-    the archive — faked in unit tests, implemented by asyncpg below."""
+    """What GuildHistory (reads) and the drainer (writes) need from the
+    archive — faked in unit tests, implemented by asyncpg below."""
 
     async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None: ...
 
     async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]: ...
+
+    async def recent_by_user(
+        self, guild_id: int, requester_id: int, limit: int
+    ) -> list[HistoryEntry]: ...
+
+    async def stats(
+        self, guild_id: int, *, days: Optional[int] = None
+    ) -> GuildStats: ...
 
 
 class PostgresHistoryArchive:
@@ -117,6 +202,46 @@ class PostgresHistoryArchive:
         async with self._db.acquire() as conn:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
+
+    async def recent_by_user(
+        self, guild_id: int, requester_id: int, limit: int
+    ) -> list[HistoryEntry]:
+        """recent(), filtered to one requester (plan §7.2; 0003 index)."""
+        if limit <= 0:
+            return []
+        async with self._db.acquire() as conn:
+            rows = await conn.fetch(_RECENT_BY_USER_SQL, guild_id, requester_id, limit)
+        return [_row_to_entry(r) for r in rows]
+
+    async def stats(self, guild_id: int, *, days: Optional[int] = None) -> GuildStats:
+        """Aggregate playback stats, optionally windowed to the last `days`
+        days (plan §7.1). Three single-table aggregates on one connection."""
+        async with self._db.acquire() as conn:
+            totals = await conn.fetchrow(_STATS_TOTALS_SQL, guild_id, days)
+            songs = await conn.fetch(_STATS_TOP_SONGS_SQL, guild_id, days, _STATS_TOP_N)
+            requesters = await conn.fetch(
+                _STATS_TOP_REQUESTERS_SQL, guild_id, days, _STATS_TOP_N
+            )
+        assert totals is not None  # aggregates always return one row
+        return GuildStats(
+            plays=totals["plays"],
+            distinct_songs=totals["distinct_songs"],
+            seconds_listened=totals["seconds_listened"],
+            top_songs=tuple(
+                TopSong(
+                    title=r["title"], webpage_url=r["webpage_url"], plays=r["plays"]
+                )
+                for r in songs
+            ),
+            top_requesters=tuple(
+                TopRequester(
+                    requester_id=r["requester_id"],
+                    requester_name=r["requester_name"],
+                    plays=r["plays"],
+                )
+                for r in requesters
+            ),
+        )
 
     async def count(self, guild_id: int) -> int:
         """Rows stored for one guild — the backfill's inserted/dup accounting

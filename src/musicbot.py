@@ -1,7 +1,19 @@
 import asyncio
 import contextlib
 from itertools import islice
-from typing import Any, AsyncGenerator, Coroutine, List, Optional, Union, assert_never
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Coroutine,
+    List,
+    Optional,
+    Union,
+    assert_never,
+)
+
+if TYPE_CHECKING:
+    from src.history_archive import GuildStats
 
 import discord
 from discord.ext import commands
@@ -28,6 +40,7 @@ from opentelemetry.trace import StatusCode
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    fmt_duration,
     history_embeds,
     latency_color,
     notice_embed,
@@ -55,6 +68,59 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+    # FlagConverter resolves the mention/name/id to a Member; the command
+    # filters by its snowflake (docs/POSTGRES_HISTORY_PLAN.md §7.2).
+    user: Optional[discord.Member] = None
+
+
+class StatsFlags(commands.FlagConverter, prefix="--", delimiter=" "):
+    days: Optional[int] = None
+
+
+# --days sanity bounds: 0/negative windows are meaningless, and ~10 years is
+# effectively "all time" — send that as no window at all.
+STATS_MIN_DAYS = 1
+STATS_MAX_DAYS = 3650
+# Leaderboard lines cap their song titles so five entries plus URLs always fit
+# an embed field's 1024-char limit.
+_STATS_TITLE_LIMIT = 80
+
+
+def _plays(n: int) -> str:
+    return f"{n} play" if n == 1 else f"{n} plays"
+
+
+def stats_embed(stats: "GuildStats", days: Optional[int]) -> discord.Embed:
+    """One embed for -stats (docs/POSTGRES_HISTORY_PLAN.md §7.1): headline
+    totals in the description, two leaderboard fields below."""
+    window = f"last {days} days" if days is not None else "all time"
+    embed = discord.Embed(
+        title="Playback stats",
+        description=(
+            f"**{stats.plays:,}** plays · **{stats.distinct_songs:,}** unique songs"
+            f" · **{fmt_duration(stats.seconds_listened)}** listened · {window}"
+        ),
+        color=discord.Color.blurple(),
+    )
+    if stats.top_songs:
+        lines = []
+        for i, song in enumerate(stats.top_songs, start=1):
+            # Square brackets would break out of the markdown link syntax.
+            title = (song.title or "Unknown").replace("[", "(").replace("]", ")")
+            if len(title) > _STATS_TITLE_LIMIT:
+                title = title[: _STATS_TITLE_LIMIT - 1] + "…"
+            label = f"[{title}]({song.webpage_url})" if song.webpage_url else title
+            lines.append(f"{i}. {label} — {_plays(song.plays)}")
+        embed.add_field(name="Most played", value="\n".join(lines), inline=False)
+    if stats.top_requesters:
+        lines = [
+            # Mention renders the live display name; survives via the stored
+            # requester_name only in copy-paste contexts (embeds don't ping).
+            f"{i}. <@{r.requester_id}> — {_plays(r.plays)}"
+            for i, r in enumerate(stats.top_requesters, start=1)
+        ]
+        embed.add_field(name="Top requesters", value="\n".join(lines), inline=False)
+    return embed
 
 
 def _check_voice_permissions(
@@ -950,15 +1016,21 @@ class MusicBot(commands.Cog):
         name="history",
         aliases=["h"],
         brief="show recently played songs",
-        usage="[--limit N]",
+        usage="[--limit N] [--user @member]",
         help=(
             "Lists the songs already played in this server, most recent first.\n\n"
-            "`--limit N` controls how many are shown (1-50, default 10). History "
-            "is stored per server and survives a bot restart."
+            "`--limit N` controls how many are shown (1-50, default 10). "
+            "`--user @member` narrows the list to songs that member requested. "
+            "History is stored per server and survives a bot restart."
         ),
         extras={
             "category": "Queue",
-            "examples": ["-history", "-h", "-history --limit 25"],
+            "examples": [
+                "-history",
+                "-h",
+                "-history --limit 25",
+                "-history --user @omkar",
+            ],
         },
     )
     @commands.before_invoke(validate_commands)
@@ -974,13 +1046,17 @@ class MusicBot(commands.Cog):
                 )
                 return
             mp = self.get_mp(ctx)
-            entries = await mp.history.recent(flags.limit)
+            entries = await mp.history.recent(
+                flags.limit,
+                requester_id=flags.user.id if flags.user is not None else None,
+            )
             if not entries:
-                await ctx.send(
-                    embed=notice_embed(
-                        "No songs have been played yet.", discord.Color.orange()
-                    )
+                empty_msg = (
+                    f"No songs requested by {flags.user.display_name} in the history."
+                    if flags.user is not None
+                    else "No songs have been played yet."
                 )
+                await ctx.send(embed=notice_embed(empty_msg, discord.Color.orange()))
                 return
             embeds = history_embeds(entries)
             # 8 per message: with the NP block (≤2 embeds) MusicContext.send
@@ -994,6 +1070,63 @@ class MusicBot(commands.Cog):
                 )
         except Exception as e:
             log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
+
+    @commands.command(
+        name="stats",
+        brief="server playback statistics",
+        usage="[--days N]",
+        help=(
+            "Aggregate playback statistics for this server: total plays, unique "
+            "songs, time listened, the most-played songs, and the top requesters.\n\n"
+            "`--days N` limits the window to the last N days (default: all time). "
+            "Backed by the full play history in Postgres."
+        ),
+        extras={
+            "category": "Queue",
+            "examples": ["-stats", "-stats --days 30"],
+        },
+    )
+    @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.stats")
+    async def stats(self, ctx: commands.Context, *, flags: StatsFlags):
+        try:
+            if flags.days is not None and not (
+                STATS_MIN_DAYS <= flags.days <= STATS_MAX_DAYS
+            ):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"--days must be between {STATS_MIN_DAYS} and {STATS_MAX_DAYS}",
+                        discord.Color.red(),
+                    )
+                )
+                return
+            mp = self.get_mp(ctx)
+            stats = await mp.history.stats(days=flags.days)
+            if stats is None:
+                # Aggregates need the durable tier; the 50-deep caches can't
+                # answer them, so there's no degraded mode to offer.
+                await ctx.send(
+                    embed=notice_embed(
+                        "Statistics require the Postgres archive, which is not "
+                        "configured for this deployment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if stats.plays == 0:
+                window = (
+                    f" in the last {flags.days} days" if flags.days is not None else ""
+                )
+                await ctx.send(
+                    embed=notice_embed(
+                        f"No songs have been played{window}.", discord.Color.orange()
+                    )
+                )
+                return
+            await ctx.send(embed=stats_embed(stats, flags.days))
+        except Exception as e:
+            log.error(f"stats failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
