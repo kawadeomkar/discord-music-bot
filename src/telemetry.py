@@ -4,7 +4,7 @@ import sys
 from typing import Optional
 
 import structlog
-from opentelemetry import trace
+from opentelemetry import metrics, trace
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
@@ -21,6 +21,7 @@ _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317
 
 _tracer_provider: Optional[object] = None
 _log_provider: Optional[object] = None
+_meter_provider: Optional[object] = None
 
 # discord.py makes these HTTP calls during startup with no user-visible parent.
 # Suppress them to avoid cluttering Tempo with orphaned root spans.
@@ -76,6 +77,7 @@ def setup_telemetry() -> None:
         return
     _setup_traces()
     _setup_logs()
+    _setup_metrics()
     _setup_auto_instrumentation()
 
 
@@ -87,10 +89,19 @@ def shutdown_telemetry() -> None:
     if _log_provider is not None:
         _log_provider.force_flush()  # type: ignore[union-attr]
         _log_provider.shutdown()  # type: ignore[union-attr]
+    if _meter_provider is not None:
+        _meter_provider.force_flush()  # type: ignore[union-attr]
+        _meter_provider.shutdown()  # type: ignore[union-attr]
 
 
 def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
+
+
+def get_meter(name: str) -> metrics.Meter:
+    """No-op until setup_telemetry() runs (or forever when OTel is disabled) —
+    the API-level proxy meter makes instruments safe to create at any time."""
+    return metrics.get_meter(name)
 
 
 # ── Internal setup ────────────────────────────────────────────────────────────
@@ -179,6 +190,29 @@ def _setup_logs() -> None:
     # structlog routes through stdlib via LoggerFactory, so this captures everything.
     handler = LoggingHandler(level=logging.INFO, logger_provider=provider)
     logging.root.addHandler(handler)
+
+
+def _setup_metrics() -> None:
+    global _meter_provider
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+        OTLPMetricExporter,
+    )
+
+    resource = Resource.create(
+        {
+            SERVICE_NAME: _SERVICE_NAME,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
+        }
+    )
+    exporter = OTLPMetricExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
+    provider = MeterProvider(
+        resource=resource,
+        metric_readers=[PeriodicExportingMetricReader(exporter)],
+    )
+    metrics.set_meter_provider(provider)
+    _meter_provider = provider
 
 
 def _setup_auto_instrumentation() -> None:

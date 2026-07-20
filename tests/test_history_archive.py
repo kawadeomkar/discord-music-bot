@@ -208,6 +208,72 @@ class TestDrainerLoop:
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
 
 
+class _FakeCounter:
+    def __init__(self):
+        self.added: list[int] = []
+
+    def add(self, amount, attributes=None):
+        self.added.append(amount)
+
+
+class _FakeGauge:
+    def __init__(self):
+        self.values: list[int] = []
+
+    def set(self, value, attributes=None):
+        self.values.append(value)
+
+
+class TestMetrics:
+    """The §8.3 instruments: drained-count and outbox depth. The real
+    instruments are proxy no-ops in tests, so recorder fakes are swapped in
+    per instance."""
+
+    @pytest.fixture(autouse=True)
+    def instruments(self, drainer):
+        drainer._drained_counter = _FakeCounter()
+        drainer._depth_gauge = _FakeGauge()
+
+    async def test_drained_counter_counts_retired(self, fake_redis, drainer):
+        # Corrupt entries are retired too — the counter tracks outbox
+        # consumption, not archive inserts.
+        await _push(fake_redis, 1, 2)
+        await fake_redis.lpush(HISTORY_OUTBOX_KEY, b"not json")
+        await drainer._drain_once()
+        assert drainer._drained_counter.added == [3]
+
+    async def test_empty_drain_sets_depth_zero(self, drainer):
+        await drainer._drain_once()
+        assert drainer._depth_gauge.values == [0]
+
+    async def test_failed_drain_records_nothing(self, fake_redis, archive, drainer):
+        # Nothing was retired, so the counter must not move; depth during an
+        # outage is _log_retry's job, not _drain_once's.
+        await _push(fake_redis, 1)
+        archive.fail = True
+        with pytest.raises(RuntimeError):
+            await drainer._drain_once()
+        assert drainer._drained_counter.added == []
+        assert drainer._depth_gauge.values == []
+
+    async def test_retry_records_backlog_depth(self, fake_redis, drainer):
+        await _push(fake_redis, 1, 2, 3)
+        await drainer._log_retry(RuntimeError("pg down"), backoff=1.0)
+        assert drainer._depth_gauge.values == [3]
+
+    async def test_unknowable_depth_keeps_last_reading(self, archive):
+        # Redis down: depth is -1 internally; recording that sentinel would
+        # corrupt the depth-growth alert, so the gauge is left alone.
+        class _DownRedis:
+            async def llen(self, key):
+                raise ConnectionError("redis down")
+
+        drainer = HistoryOutboxDrainer(_DownRedis(), archive)
+        drainer._depth_gauge = _FakeGauge()
+        await drainer._log_retry(RuntimeError("pg down"), backoff=1.0)
+        assert drainer._depth_gauge.values == []
+
+
 class TestRowMapping:
     def test_round_trip(self):
         entry = _entry(1, guild_id=222222222222222222)

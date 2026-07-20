@@ -14,6 +14,15 @@
 #     (rename within one volume is atomic)
 #   - this script's prune is the ONLY deleter in /backups (keeps newest 7 as
 #     a local buffer); the puller must never delete
+
+# TODO: Build the external puller that ships these dumps off this host.
+# Until it exists, every dump lives on the same disk as the live database —
+# a host loss takes both the cluster and all 7 buffered restore points.
+# The puller (a separate project, not this repo) consumes /backups per the
+# contract above, owns long-term retention (suggested: 14 daily +
+# first-of-month) and backup-freshness alerting (age of newest pulled dump),
+# and must never delete from /backups.
+# See: docs/POSTGRES_HISTORY_PLAN.md §8.1.
 set -eu
 
 CONTAINER="${CONTAINER:-discord-postgres}"

@@ -62,6 +62,15 @@ services:
     # Intentionally NOT in the bot's depends_on: the bot is fully functional
     # without Postgres (the outbox buffers in Redis until it comes up), and a
     # hard dependency would break `docker compose up discord-music-bot redis`.
+    # TODO: Add the Postgres StatefulSet + backup-CronJob variant to the K8s pipeline.
+    # The K8s manifests deploy the bot with no Postgres, so a k3s deployment
+    # would run with the durable tier off (POSTGRES_URL unset) while compose
+    # keeps accruing history — a split between the two pipelines. Variant:
+    # single-replica StatefulSet on a local-path PVC (same Guaranteed-QoS
+    # reasoning as Redis), POSTGRES_URL from the per-cluster Secret, and a
+    # CronJob dumping to a backup PVC with the same /backups file contract
+    # pg_backup.sh writes. Lands with the K8S plan's prod bring-up.
+    # See: docs/POSTGRES_HISTORY_PLAN.md §8.2, docs/K8S_DEPLOYMENT_PLAN.md.
     image: postgres:18-alpine
     container_name: discord-postgres
     restart: always

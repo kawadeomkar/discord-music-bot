@@ -32,6 +32,7 @@ from typing import Optional, Protocol
 from src.db import Database
 from src.guild_state import HistoryEntry, parse_history_entry
 from src.redis_client import outbox_depth, peek_outbox_oldest, retire_outbox
+from src.telemetry import get_meter
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -275,6 +276,32 @@ class HistoryOutboxDrainer:
         self._archive = archive
         self._wake = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
+        # §8.3 monitoring: the alert line is the depth gauge growing across
+        # two scrapes (Postgres down longer than the backoff ceiling). Both
+        # instruments are no-ops until setup_telemetry() configures a meter
+        # provider, so tests and OTEL_SDK_DISABLED runs pay nothing.
+        meter = get_meter(__name__)
+        self._drained_counter = meter.create_counter(
+            "musicbot.history.outbox.drained",
+            unit="{entry}",
+            description="Outbox entries retired to the archive "
+            "(corrupt-dropped entries included)",
+        )
+        # TODO: Add the Grafana alert rule for the outbox depth gauge.
+        # The metric exports, but nothing consumes it yet: a Postgres outage
+        # longer than the drainer's backoff ceiling is visible only in logs
+        # until the rule exists. Rule shape: alert when this gauge grows
+        # across two consecutive scrapes (the 60s retry-cadence cap refreshes
+        # it inside every scrape interval, so growth means Postgres is still
+        # down). Dashboard config in the otel-lgtm Grafana, not repo code —
+        # this comment is the tracking anchor.
+        # See: docs/POSTGRES_HISTORY_PLAN.md §8.3.
+        self._depth_gauge = meter.create_gauge(
+            "musicbot.history.outbox.depth",
+            unit="{entry}",
+            description="history:outbox backlog depth "
+            "(0 on every drain to empty; refreshed on each failed-drain retry)",
+        )
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="history-outbox-drainer")
@@ -333,11 +360,16 @@ class HistoryOutboxDrainer:
         still retired — leaving them would wedge the queue head forever."""
         raw = await peek_outbox_oldest(self._redis, self.BATCH_SIZE)
         if not raw:
+            # An empty peek is an exact depth reading — no extra LLEN needed.
+            # During an outage the gauge is refreshed by _log_retry instead,
+            # so "growing across two scrapes" is the §8.3 alert line.
+            self._depth_gauge.set(0)
             return 0
         entries = [e for e in map(parse_history_entry, raw) if e is not None]
         if entries:
             await self._archive.insert_batch(entries)
         await retire_outbox(self._redis, len(raw))
+        self._drained_counter.add(len(raw))
         return len(raw)
 
     async def _log_retry(self, error: Exception, backoff: float) -> None:
@@ -345,6 +377,10 @@ class HistoryOutboxDrainer:
             depth = await outbox_depth(self._redis)
         except Exception:
             depth = -1  # Redis itself is down; depth unknowable
+        if depth >= 0:
+            # Unknowable depth (-1) keeps the last known reading rather than
+            # recording a sentinel that would corrupt the growth alert.
+            self._depth_gauge.set(depth)
         emit = log.error if depth >= self.DEPTH_ALARM else log.warning
         emit(
             f"history outbox drain failed (backlog={depth}): "
