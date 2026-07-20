@@ -227,9 +227,9 @@ class TestCommandHelp:
             category = (command.extras or {}).get("category")
             assert category in CATEGORY_ORDER, f"{command.name} category={category!r}"
             # …and must be placed in its category's importance ranking.
-            assert (
-                command.name in CATEGORY_COMMANDS[category]
-            ), f"{command.name} missing from CATEGORY_COMMANDS[{category!r}]"
+            assert command.name in CATEGORY_COMMANDS[category], (
+                f"{command.name} missing from CATEGORY_COMMANDS[{category!r}]"
+            )
             note = (command.extras or {}).get("note")
             assert note is None or len(note) <= FIELD_LIMIT
 
@@ -240,3 +240,36 @@ class TestErrors:
         embed = sent_embed(ctx)
         assert embed.color == discord.Color.red()
         assert "bogus" in (embed.description or "")
+
+
+class TestHelpFlagEndToEnd:
+    async def test_play_dash_dash_help_renders_the_play_man_page(self):
+        """`-play --help` through the real MusicBotApp.invoke lands on the same
+        embed as `-help play` — the flag diverts before argument parsing, so
+        the extra words never reach the play command."""
+        from discord.ext.commands.view import StringView
+
+        from src.main import MusicBotApp, MusicContext
+
+        app = MusicBotApp()
+        # MusicBot types bot as commands.Bot, but production always hosts the
+        # cog on MusicBotApp — an AutoShardedBot, which shares BotBase with Bot
+        # but is not a subclass of it. The cog only touches BotBase/Client
+        # members, so this is the real runtime contract; pyright can't see it.
+        await app.add_cog(MusicBot(app))  # type: ignore[arg-type]
+        message = MagicMock()
+        message.content = "-play lofi hip hop --help"
+        context = MusicContext(
+            prefix="-",
+            view=StringView(message.content),
+            bot=app,
+            message=message,
+            invoked_with="play",
+            command=app.all_commands["play"],
+        )
+        context.send = AsyncMock()
+
+        await app.invoke(context)
+
+        embed = context.send.call_args.kwargs["embed"]
+        assert embed.title == "-play(1)"

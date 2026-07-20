@@ -238,13 +238,14 @@ poetry run pytest tests/test_sources.py::TestParseUrlYouTube::test_youtube_watch
 # Type-check
 poetry run pyright src/
 
-# Format
-poetry run black src/ tests/
+# Format and lint
+poetry run ruff format src/ tests/
+poetry run ruff check src/ tests/
 ```
 
-`./build.sh` reproduces CI locally: it builds the test image, formats with black,
+`./build.sh` reproduces CI locally: it builds the test image, formats with ruff,
 runs the tests in a container, then builds the runtime image and starts the Compose
-stack. GitHub Actions runs black/pyright, the test suite with coverage, a containerized
+stack. GitHub Actions runs ruff/pyright, the test suite with coverage, a containerized
 test pass, and a dependency security audit on every push; green CI on `main` publishes
 the runtime image to GHCR.
 

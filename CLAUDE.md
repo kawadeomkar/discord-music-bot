@@ -17,8 +17,9 @@ poetry run pytest tests/test_sources.py::TestParseUrlYouTube::test_youtube_watch
 # Type-check
 python -m pyright src/
 
-# Format
-poetry run black src/
+# Format + lint
+poetry run ruff format src/ tests/
+poetry run ruff check src/ tests/
 ```
 
 The bot requires a `.env` file in the project root with `DISCORD_TOKEN`, `SPOTIFY_CLIENT_ID`, and `SPOTIFY_CLIENT_SECRET`.
@@ -26,7 +27,7 @@ The bot requires a `.env` file in the project root with `DISCORD_TOKEN`, `SPOTIF
 ## Environment
 
 - **pyenv virtualenv**: `discord-music-bot-3.14` (Python 3.14.6) — set via `pyenv local` (`.python-version`); what bare `python` resolves to inside the repo. Has deps + an editable project install.
-- **In-project `.venv`**: a second Python 3.14.6 env (Homebrew-based, gitignored, also has deps) — used by `poetry run …` (`poetry.toml` sets `virtualenvs.create = true`, in-project) and by Pylance/pyright (`pyrightconfig.json`: `venvPath "."` / `venv ".venv"`; gitignored)
+- **In-project `.venv`**: a second Python 3.14.6 env (Homebrew-based, gitignored, also has deps) — used by Pylance/pyright (`pyrightconfig.json`: `venvPath "."` / `venv ".venv"`). **Not what `poetry run` uses in a repo shell**: poetry prefers the activated pyenv env over its in-project setting (`poetry env info -p` → the pyenv env), so `poetry install` does not sync `.venv` — install into it via `.venv/bin/pip` when parity matters (see docs/PERFORMANCE_PLAN.md §2.9)
 - **Global pyenv**: `3.13.1` — a shell without the repo's pyenv env active cannot `poetry run` (requires-python is `>=3.14`; Poetry refuses under 3.13)
 - Stale 3.13-era envs may still exist (`~/.pyenv/versions/discord-music-bot`, Poetry's cached `py3.11`/`py3.13` envs) — ignore them
 - **Docker base image**: `python:3.14-slim` (multi-stage: base/builder/test/runtime)
@@ -123,16 +124,16 @@ The full architecture document is at `docs/ARCHITECTURE.md`.
 
 Every `-play` command goes through three phases:
 
-**Phase 1 — resolve to `QueueObject`** (`YTDL.yt_source`, called from `musicbot.py`):
+**Phase 1 — unified single extraction to `QueueObject`** (`YTDL.yt_source`, called from `musicbot.py`; docs/PERFORMANCE_PLAN.md §2.1):
 - Search strings check the `ytdl:source:{normalized query}` Redis cache (TTL 1h) before running yt-dlp — repeat plays skip the 3–4s search.
-- Runs yt-dlp with `process=False` for direct YouTube URLs (fast — no stream extraction), `process=True` for search strings.
-- Returns `QueueObject(webpage_url, title, requester, ts, duration?, uploader?, thumbnail?)`. No audio data yet. Missing metadata fields are back-filled by prefetch (`_enrich_queueobject`) when full extraction lands.
+- On a cache miss, one yt-dlp call with `_YTDL_STREAM_SEARCH_OPTS` (stream opts + `default_search`) and **hardcoded `process=True`** resolves searches *and* direct URLs to identity **plus** a selected stream URL, and populates **both** the `ytdl:source` and `ytdl:stream` caches from that single network round (`_probe_and_cache`). `process=True` is mandatory: unprocessed extraction does no format selection, so the stream-cache write would silently never happen. A failed probe never fails `yt_source` — the song enqueues on identity alone and Phase 2 re-extracts.
+- Returns `QueueObject(webpage_url, title, requester, ts, duration?, uploader?, thumbnail?)` — full metadata on fresh extractions; sparse entries (playlist items, pre-unified cache hits) are back-filled by prefetch (`_enrich_queueobject`).
 - Spotify tracks are resolved to `"Title Artist"` search strings by `Spotify.track()` before this call.
 - YouTube **playlist** URLs bypass this: `YTDL.yt_playlist` (flat extraction) returns `List[QueueObject]` in one call, enqueued with `prefetch=False`.
 
 **Phase 1b — eager prefetch** (`YTDL.prefetch_stream`, spawned in `MusicPlayer.queue_put`):
 - Immediately after enqueue, `asyncio.create_task(YTDL.prefetch_stream(item, redis=...))` is spawned as a fire-and-forget background task.
-- Runs yt-dlp with full extraction and writes the result to Redis under key `ytdl:stream:{webpage_url}` with TTL ~19,800s (~5h30m).
+- For songs Phase 1 just resolved this is a **cache-hit no-op** (one Redis GET) — its real work is the warm path for bare `QueueObject`s that skipped the unified extraction (playlist entries, requeues), where it runs full extraction and writes `ytdl:stream:{webpage_url}` (TTL capped at 1800s — see `_STREAM_URL_MAX_TTL`).
 - Only runs for `QueueObject` items — `YTSource` items (Spotify playlist tracks) have no stable `webpage_url` at enqueue time.
 - Errors are logged and swallowed; Phase 2 recovers by extracting fresh.
 
@@ -200,7 +201,7 @@ loop() start
 ### Source types
 
 `parse_input` in `sources.py` returns one of three frozen dataclasses:
-- `YTSource` — direct YouTube URL (`process=False`), search (`process=True`, `ytsearch="ytsearch:..."`), or playlist (`type=YTType.PLAYLIST`, `list_id=...` → `YTDL.yt_playlist` flat extraction)
+- `YTSource` — direct YouTube URL (`process=False`), search (`process=True`, `ytsearch="ytsearch:..."`), or playlist (`type=YTType.PLAYLIST`, `list_id=...` → `YTDL.yt_playlist` flat extraction). The `process` field survives only as parse metadata / persisted wire format — `yt_source` ignores it and always extracts with `process=True`
 - `SpotifySource` — `type=SpotifyType.TRACK` or `.PLAYLIST`; resolved via `Spotify.track()` / `Spotify.playlist()` to YouTube search strings
 - `SoundcloudSource` — `url` passed directly to yt-dlp
 
@@ -228,7 +229,7 @@ full play history is never lost to idle expiry. **The schema is defined in one p
 | `guild:{id}:state` | Hash | 12 fields: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_*` (url/title/duration/uploader/requester_id/interjected — a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` → `GuildStateData` |
 | `guild:{id}:now_playing` | Hash | 12 display fields for the recovered Now Playing embed → `NowPlayingData` |
 | `guild:{id}:queue` | List | JSON entries, `"type"`-discriminated → `SongQueueEntry` / `SearchQueueEntry` (RPUSH on enqueue, LPOP inside the atomic start transaction) |
-| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first; legacy `"title - url"` strings still parse) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
+| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first) → `serialize_history_entry`/`parse_history_entry`. **No TTL, no trim** — unbounded full-history retention (Postgres eventually; see `docs/HISTORY_OVERHAUL_PLAN.md`) |
 | `lock:guild:{id}:recovery` | String | `"1"`, TTL 60s (SET NX — distributed lock) |
 | `ytdl:stream:{webpage_url}` | String | JSON stream data; TTL = `expire − now − 1800s` |
 | `ytdl:source:{normalized search}` | String | Search→`(webpage_url, title)` resolution; TTL 1h |
