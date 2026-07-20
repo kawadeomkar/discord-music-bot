@@ -15,6 +15,10 @@ services:
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      # Built from the same POSTGRES_* vars as the postgres service below, so the
+      # password lives in exactly one place (.env). Overrides any POSTGRES_URL in
+      # the env_file. Comment this out to disable the archive (see main.py:113).
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-musicbot}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
@@ -65,9 +69,12 @@ services:
     container_name: discord-postgres
     restart: always
     environment:
-      - POSTGRES_USER=musicbot
-      - POSTGRES_PASSWORD=musicbot
-      - POSTGRES_DB=musicbot
+      # Interpolated from the project .env at compose parse time (NOT env_file —
+      # that would spray the bot's other secrets into this container). The
+      # bot's POSTGRES_URL above is built from these same three values.
+      - POSTGRES_USER=${POSTGRES_USER:-musicbot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      - POSTGRES_DB=${POSTGRES_DB:-musicbot}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -76,7 +83,9 @@ services:
       # path would silently store the cluster OUTSIDE the volume.
       - postgres-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U musicbot -d musicbot"]
+      # $$ escapes compose interpolation so the container's own env expands at
+      # runtime — keeps the check correct if the user/db are customized in .env.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 5

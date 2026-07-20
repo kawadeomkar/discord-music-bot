@@ -2,6 +2,31 @@
 
 set -euo pipefail
 
+# Preflight: compose interpolates POSTGRES_PASSWORD from .env into both the
+# postgres service and the bot's POSTGRES_URL (docker-compose.yml). Its `:?`
+# guard would only fail at `docker compose up` — after the whole build. Fail
+# here instead so we don't build an image just to trip over a missing secret.
+ENV_FILE=".env"
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: $ENV_FILE not found — copy .env.example and fill it in." >&2
+    exit 1
+fi
+# Take the last uncommented assignment (compose uses last-wins), strip an
+# optional `export`, surrounding quotes, and trailing whitespace, then require
+# a non-empty result.
+pg_password=$(
+    grep -E '^[[:space:]]*(export[[:space:]]+)?POSTGRES_PASSWORD=' "$ENV_FILE" \
+        | tail -n1 \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?POSTGRES_PASSWORD=//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' \
+        || true
+)
+if [ -z "$pg_password" ]; then
+    echo "Error: POSTGRES_PASSWORD is not set in $ENV_FILE." >&2
+    echo "       Set it (see .env.example) — the postgres service and the bot's" >&2
+    echo "       POSTGRES_URL are both built from it." >&2
+    exit 1
+fi
+
 if [ -z "${ENVIRONMENT:-}" ]; then
     BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "development")
     [ "$BRANCH" = "HEAD" ] && BRANCH="development"
