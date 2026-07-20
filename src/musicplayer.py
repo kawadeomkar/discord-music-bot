@@ -101,6 +101,14 @@ _MIN_RESUME_REMAINING_SECS = 5
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
 
+# ── Progress-bar finalize (docs/PLAY_WHILE_PAUSED_PLAN.md §5) ─────────────────
+# Tolerance for "this song reached its end". Absorbs the drift between yt-dlp's
+# duration metadata and the real stream length, so a song that played out fully
+# still renders a complete bar. Songs that stopped short of this — skipped,
+# interjected, or killed by a mid-song stream death — keep the bar at the
+# position they actually reached instead of being finalized to 100%.
+_SONG_COMPLETE_MARGIN_SECS = 5
+
 # ── Playback gate (docs/PLAYBACK_GATE_PLAN.md) ────────────────────────────────
 # How long loop() waits for a voice connection before tearing the player down.
 # Matches the idle queue_get() timeout so a player that never connects and one
@@ -117,12 +125,35 @@ class InterjectOutcome:
     # None → no resume entry was created (the interrupted song was itself an
     # interjection, was nearly finished, or had no webpage_url to rebuild from).
     resume_position: Optional[int]
-    was_paused: bool
+    was_paused: bool  # the OBSERVED state of the song when it was interrupted
     replaced: bool  # the interrupted song was itself a -playnow interjection
+    # Whether the resume entry will come back PAUSED. Distinct from was_paused:
+    # -playnow restores exactly what it interrupted (paused in → paused out),
+    # while -play on a paused song means "stop being paused, play this" and
+    # brings it back playing. Command wording must key off this, not
+    # was_paused, or a -play interjection would announce "will return paused"
+    # for a song that returns playing (docs/PLAY_WHILE_PAUSED_PLAN.md §4.1).
+    returns_paused: bool = False
 
     @property
     def resume_position_str(self) -> str:
         return _fmt_duration(self.resume_position or 0)
+
+
+def _reached_end(song: YTDL) -> bool:
+    """Did this song play through to its end?
+
+    The bar is finalized to 100% only when this is True. Answering by position
+    rather than by cause covers every early-termination path at once — -skip,
+    -playnow/-play interjection, and a mid-song stream death that produced
+    audio (which `stream_failed` deliberately does NOT classify as a failure).
+
+    Songs with no known duration return False: there is no bar to complete,
+    and _finalize_now_playing skips them anyway.
+    """
+    if song.duration_secs <= 0:
+        return False
+    return song.position_secs >= song.duration_secs - _SONG_COMPLETE_MARGIN_SECS
 
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
@@ -1131,7 +1162,11 @@ class MusicPlayer:
 
     @_tracer.start_as_current_span("player.interject")
     async def interject(
-        self, qobj: QueueObject, vc: discord.VoiceClient
+        self,
+        qobj: QueueObject,
+        vc: discord.VoiceClient,
+        *,
+        resume_paused: bool = True,
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
 
@@ -1145,6 +1180,12 @@ class MusicPlayer:
         Replace semantics: when the interrupted song is itself an interjection
         (current.interjected), no resume entry is built for it — the ORIGINAL
         song's resume entry, still at the queue front, is untouched.
+
+        resume_paused controls whether a song interrupted WHILE PAUSED comes
+        back paused. True (-playnow) restores exactly what it interrupted;
+        False (-play on a paused song) brings it back playing, because -play
+        is an explicit instruction to have audio playing. It has no effect on
+        a song that was not paused. See docs/PLAY_WHILE_PAUSED_PLAN.md §3.1.
 
         Returns None when there is no current song (or it ended during the
         prefetch neutralization) — the command falls back to a plain
@@ -1204,7 +1245,7 @@ class MusicPlayer:
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
-                    start_paused=was_paused,
+                    start_paused=was_paused and resume_paused,
                 )
 
         items = [qobj] if resume is None else [qobj, resume]
@@ -1228,6 +1269,7 @@ class MusicPlayer:
             resume_position=position if resume is not None else None,
             was_paused=was_paused,
             replaced=replaced,
+            returns_paused=resume is not None and resume.start_paused,
         )
 
     async def _neutralize_prefetch(self) -> None:
@@ -1465,10 +1507,20 @@ class MusicPlayer:
         song: YTDL,
         message: discord.Message,
         own_embeds: list[discord.Embed],
+        *,
+        completed: bool = True,
     ) -> None:
-        """One last embed edit once a song has actually ended, showing the bar
-        fully completed (position == duration) rather than left frozen wherever
-        the last periodic tick happened to land. song/message/own_embeds are
+        """One last embed edit once a song has stopped, so the bar lands on its
+        true final state rather than wherever the last periodic tick happened
+        to fall (up to NOW_PLAYING_UPDATE_INTERVAL_SECS stale).
+
+        completed=True renders the bar full (the song reached its end).
+        completed=False renders the position it actually stopped at — a
+        skipped or interjected song did not finish, and a 100% bar would be a
+        false record. The edit fires in both cases; only the override differs.
+        See docs/PLAY_WHILE_PAUSED_PLAN.md §5.
+
+        song/message/own_embeds are
         captured by the caller rather than read off self.current_song/
         self._np_host_message at run time, since both may already point at the
         next song by the time this (fire-and-forget) task actually runs. The
@@ -1483,7 +1535,13 @@ class MusicPlayer:
             return  # no bar was ever shown for this song — nothing to finalize
         async with self._np_edit_lock:
             await self._push_np_edit(
-                song, message, own_embeds, position_override=song.duration_secs
+                song,
+                message,
+                own_embeds,
+                # None → _build_now_playing_embed falls back to the live
+                # position_secs, which is frozen at the stop point (and, for a
+                # paused song, at the pause point).
+                position_override=song.duration_secs if completed else None,
             )
 
     def _spawn_background(self, coro: Any) -> asyncio.Task:
@@ -1494,9 +1552,16 @@ class MusicPlayer:
         return task
 
     def _fire_finalize_now_playing(
-        self, song: YTDL, message: discord.Message, own_embeds: list[discord.Embed]
+        self,
+        song: YTDL,
+        message: discord.Message,
+        own_embeds: list[discord.Embed],
+        *,
+        completed: bool = True,
     ) -> None:
-        self._spawn_background(self._finalize_now_playing(song, message, own_embeds))
+        self._spawn_background(
+            self._finalize_now_playing(song, message, own_embeds, completed=completed)
+        )
 
     async def _progress_updater(self, song: YTDL) -> None:
         interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
@@ -1831,8 +1896,22 @@ class MusicPlayer:
                                 )
                             )
                         elif self.current_song is not None:
+                            # Complete the bar only for a song that actually
+                            # reached its end. A skipped, interjected, or
+                            # mid-stream-death song stopped short and is
+                            # finalized at its true position instead — a 100%
+                            # bar would claim it finished. Decided by position
+                            # rather than by marking each early-stop call site:
+                            # that answers the real question, and covers causes
+                            # nobody enumerated (docs/PLAY_WHILE_PAUSED_PLAN.md
+                            # §5). The edit still fires either way — the 3s
+                            # progress tick would otherwise leave the bar
+                            # frozen up to a tick BEFORE the interruption.
                             self._fire_finalize_now_playing(
-                                self.current_song, finished_host, finished_own
+                                self.current_song,
+                                finished_host,
+                                finished_own,
+                                completed=_reached_end(self.current_song),
                             )
 
                     # Claim-then-await: interject() may have neutralized (and
