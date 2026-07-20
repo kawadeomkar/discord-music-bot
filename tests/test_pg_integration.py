@@ -20,7 +20,11 @@ import pytest
 from src.backfill_history import run as backfill_run
 from src.db import Database, MigrationError
 from src.guild_state import HistoryEntry
-from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
+from src.history_archive import (
+    HistoryOutboxDrainer,
+    PostgresHistoryArchive,
+    quantized_played_at,
+)
 from src.redis_client import HISTORY_CACHE_LIMIT, HISTORY_OUTBOX_KEY, GuildRedisStore
 
 pytestmark = [
@@ -179,6 +183,17 @@ class TestArchiveAgainstRealPG:
     async def test_round_trip_preserves_every_field(self, archive):
         await archive.insert_batch([_entry(1)])
         assert await archive.recent(42, 10) == [_entry(1)]
+
+    async def test_sub_microsecond_played_at_round_trips_quantized(self, archive):
+        # timestamptz stores microseconds: a sub-µs played_at (a Linux
+        # time.time(), essentially always) comes back rounded, and every
+        # Python-side identity comparison must reproduce that exact rounding
+        # via quantized_played_at (H1 regression).
+        e = _entry(1, played_at=1752969600.1234567)
+        await archive.insert_batch([e])
+        got = (await archive.recent(42, 1))[0]
+        assert got.played_at != e.played_at  # the drift the merge must absorb
+        assert got.played_at == quantized_played_at(e.played_at)
 
     async def test_epoch_zero_unknown_survives(self, archive):
         e = _entry(1, played_at=0.0)

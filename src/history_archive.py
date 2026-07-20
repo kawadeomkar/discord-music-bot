@@ -161,6 +161,19 @@ def _row_to_entry(row) -> HistoryEntry:
     )
 
 
+def quantized_played_at(played_at: float) -> float:
+    """played_at as it reads back after a Postgres round trip.
+
+    timestamptz is microsecond-granular, and a raw time.time() carries sub-µs
+    precision (effectively always on Linux), so an entry never compares equal
+    to its own round-tripped copy. Every Python-side identity comparison
+    against archive rows (the freshness merge, backfill --verify) must pass
+    the non-archive side through this conversion — the same
+    fromtimestamp/timestamp pair as _entry_to_row/_row_to_entry, so equality
+    holds by construction (the round trip is idempotent at µs precision)."""
+    return datetime.fromtimestamp(played_at, tz=timezone.utc).timestamp()
+
+
 class HistoryArchive(Protocol):
     """What GuildHistory (reads) and the drainer (writes) need from the
     archive — faked in unit tests, implemented by asyncpg below."""
@@ -305,6 +318,23 @@ class HistoryOutboxDrainer:
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="history-outbox-drainer")
+        self._task.add_done_callback(self._on_task_done)
+
+    @staticmethod
+    def _on_task_done(task: "asyncio.Task[None]") -> None:
+        """Last-resort supervision: _run only ever exits via cancellation, so
+        any exception surfacing here is a bug — log it loudly the moment it
+        happens (not at shutdown), because a dead drainer means the outbox
+        grows silently until restart."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                f"history outbox drainer died unexpectedly "
+                f"({type(exc).__name__}: {exc}); entries will accumulate in "
+                f"the Redis outbox until the next start"
+            )
 
     def notify(self) -> None:
         """Signal a fresh outbox push — cheap, sync, callable from anywhere."""
@@ -322,6 +352,11 @@ class HistoryOutboxDrainer:
                 await task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Already-crashed task: its stored exception re-raises here.
+                # _on_task_done logged it when it died; swallowing keeps the
+                # "never raises" contract so MusicBotApp.close() completes.
+                pass
         try:
             async with asyncio.timeout(timeout):
                 while await self._drain_once():
@@ -330,29 +365,31 @@ class HistoryOutboxDrainer:
             log.warning(f"history outbox final drain incomplete: {e}")
 
     async def _run(self) -> None:
+        # The except Exception below must cover the WHOLE loop body, not just
+        # _drain_once(): an exception anywhere else (a gauge write, the wait
+        # plumbing) would otherwise kill the task and silently halt draining.
         backoff = self._BACKOFF_START
         while True:
             try:
                 drained = await self._drain_once()
+                backoff = self._BACKOFF_START
+                if drained:
+                    continue  # backlog: keep draining without waiting
+                # Idle. clear() only ever runs after wait() returns, so a push
+                # racing this window re-sets the event and is never lost —
+                # worst case is one spurious extra drain of an empty outbox.
+                try:
+                    async with asyncio.timeout(self.TICK_SECS):
+                        await self._wake.wait()
+                except TimeoutError:
+                    pass
+                self._wake.clear()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 await self._log_retry(e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._BACKOFF_MAX)
-                continue
-            backoff = self._BACKOFF_START
-            if drained:
-                continue  # backlog: keep draining without waiting
-            # Idle. clear() only ever runs after wait() returns, so a push
-            # racing this window re-sets the event and is never lost — worst
-            # case is one spurious extra drain of an empty outbox.
-            try:
-                async with asyncio.timeout(self.TICK_SECS):
-                    await self._wake.wait()
-            except TimeoutError:
-                pass
-            self._wake.clear()
 
     async def _drain_once(self) -> int:
         """One batch: peek oldest, insert, retire. Returns entries retired.
@@ -378,9 +415,15 @@ class HistoryOutboxDrainer:
         except Exception:
             depth = -1  # Redis itself is down; depth unknowable
         if depth >= 0:
-            # Unknowable depth (-1) keeps the last known reading rather than
-            # recording a sentinel that would corrupt the growth alert.
-            self._depth_gauge.set(depth)
+            try:
+                # Unknowable depth (-1) keeps the last known reading rather
+                # than recording a sentinel that would corrupt the growth
+                # alert.
+                self._depth_gauge.set(depth)
+            except Exception:
+                # _log_retry runs inside _run's except handler — an exception
+                # escaping here is the one path the loop's guard can't catch.
+                log.warning("history outbox depth gauge write failed", exc_info=True)
         emit = log.error if depth >= self.DEPTH_ALARM else log.warning
         emit(
             f"history outbox drain failed (backlog={depth}): "

@@ -74,6 +74,14 @@ class TestDiscover:
         with pytest.raises(MigrationError, match="duplicate migration prefix 0002"):
             _discover(migrations)
 
+    def test_digit_led_misnamed_file_errors(self, migrations):
+        # A digit-led name that isn't exactly NNNN_ (say a 5-digit prefix)
+        # must fail loudly — silently skipping it or prefix-matching it into
+        # a misleading "duplicate" error would both hide the mistake.
+        (migrations / "00010_fifth_digit.sql").write_text("SELECT 1;")
+        with pytest.raises(MigrationError, match="NNNN_description.sql"):
+            _discover(migrations)
+
     def test_real_repo_migrations_present(self):
         # Guard the shipped migration set: the baseline DDL plus the Phase D
         # analytics indexes, in order. A new migration extends this list.

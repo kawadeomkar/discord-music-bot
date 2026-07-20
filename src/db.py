@@ -18,6 +18,7 @@ the rollback story (§8.1), by design.
 
 import asyncio
 import hashlib
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -50,18 +51,32 @@ class MigrationError(Exception):
     files against the ledger, not code guessing."""
 
 
+_MIGRATION_NAME_RE = re.compile(r"^(\d{4})_.")
+
+
 def _discover(migrations_dir: Path) -> list[Path]:
-    """Migration files in apply order. Filenames are NNNN_description.sql;
-    a duplicated numeric prefix is ambiguous ordering → error."""
-    files = sorted(p for p in migrations_dir.glob("*.sql") if p.stem[:4].isdigit())
+    """Migration files in apply order. Filenames are NNNN_description.sql —
+    exactly four digits, so lexicographic order is apply order. A digit-led
+    name that doesn't fit (say 00010_x.sql) is a naming mistake and errors
+    rather than being silently skipped or prefix-matched into a misleading
+    duplicate; a duplicated numeric prefix is ambiguous ordering → error."""
+    files: list[Path] = []
     seen: dict[str, str] = {}
-    for path in files:
-        prefix = path.stem[:4]
+    for path in sorted(migrations_dir.glob("*.sql")):
+        match = _MIGRATION_NAME_RE.match(path.stem)
+        if match is None:
+            if path.stem[:1].isdigit():
+                raise MigrationError(
+                    f"{path.name}: migration filenames are NNNN_description.sql"
+                )
+            continue
+        prefix = match.group(1)
         if prefix in seen:
             raise MigrationError(
                 f"duplicate migration prefix {prefix}: {seen[prefix]} vs {path.name}"
             )
         seen[prefix] = path.name
+        files.append(path)
     return files
 
 
@@ -69,14 +84,16 @@ async def run_migrations(conn, migrations_dir: Path = MIGRATIONS_DIR) -> int:
     """Apply pending migrations on `conn`; returns how many were applied.
     Caller holds the advisory lock (Database does) — this function only owns
     ledger bookkeeping and per-file transactions."""
-    files = _discover(migrations_dir)
+    # File I/O via to_thread: this runs on the event loop (first pool
+    # acquire), and disk reads — however small — don't belong on it.
+    files = await asyncio.to_thread(_discover, migrations_dir)
     await conn.execute(_LEDGER_DDL)
     rows = await conn.fetch("SELECT version, checksum FROM schema_migrations")
     applied = {r["version"]: r["checksum"] for r in rows}
     count = 0
     for path in files:
         version = path.stem
-        sql = path.read_text()
+        sql = await asyncio.to_thread(path.read_text)
         checksum = hashlib.sha256(sql.encode()).hexdigest()
         if version in applied:
             if applied[version] != checksum:

@@ -657,16 +657,12 @@ class GuildRedisStore:
     # TTL management
 
     async def refresh_ttl(self) -> None:
-        """Refresh GUILD_TTL on the TTL-managed guild keys. History is excluded
-        for the same reason as in _pipe_expire_all: the key is persistent."""
+        """Refresh GUILD_TTL on the TTL-managed guild keys — the same set
+        _pipe_expire_all covers, history key included since the Phase C
+        cutover (it is a display-cache seed like the rest)."""
         try:
             pipe = self.redis.pipeline()
-            for key in [
-                self.queue_key(),
-                self.state_key(),
-                self.now_playing_key(),
-            ]:
-                pipe.expire(key, GUILD_TTL)
+            self._pipe_expire_all(pipe)
             await pipe.execute()  # type: ignore[misc]
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis refresh_ttl failed: {e}")

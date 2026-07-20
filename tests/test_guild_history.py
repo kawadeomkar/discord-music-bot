@@ -6,6 +6,9 @@ cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
 truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
 """
 
+import dataclasses
+from datetime import datetime, timezone
+
 import pytest
 
 from src.guild_history import GuildHistory
@@ -237,6 +240,33 @@ class TestRecentArchivePrimary:
         h = GuildHistory(store, archive=archive, guild_id=42)
         h.restore([_entry(3)])
         assert await h.recent(2) == [_entry(3), _entry(2)]
+
+    async def test_merge_excludes_drained_entries_older_than_page(self, store):
+        # 15 songs played and fully drained: the deque holds all 15 but the
+        # archive page holds only the newest 10. The 5 oldest deque entries
+        # are absent from the page because they are OLD, not because they are
+        # undrained — they must not resurface above the page (the C1 review
+        # finding: this is every -history after ten songs in a session).
+        newest_first = [_entry(n) for n in range(15, 0, -1)]
+        archive = _FakeArchive(entries=newest_first[:10])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore(newest_first)
+        assert await h.recent(10) == newest_first[:10]
+
+    async def test_merge_dedups_across_archive_quantization(self, store):
+        # Postgres timestamptz rounds played_at to the microsecond, while the
+        # deque holds the raw sub-µs float — the drained entry must still
+        # dedup instead of appearing both fresh and persisted (H1).
+        raw = 1752969600.1234567
+        played = dataclasses.replace(_entry(1), played_at=raw)
+        roundtripped = dataclasses.replace(
+            played, played_at=datetime.fromtimestamp(raw, tz=timezone.utc).timestamp()
+        )
+        assert played.played_at != roundtripped.played_at  # drift is real
+        archive = _FakeArchive(entries=[roundtripped])
+        h = GuildHistory(store, archive=archive, guild_id=42)
+        h.restore([played])
+        assert await h.recent(10) == [roundtripped]
 
     async def test_empty_archive_serves_deque_via_merge(self, store):
         # Fresh PG + undrained entries: the merge alone carries the answer.

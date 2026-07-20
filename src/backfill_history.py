@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 
 from src.db import Database
 from src.guild_state import HistoryEntry, parse_history_entry
-from src.history_archive import PostgresHistoryArchive
+from src.history_archive import PostgresHistoryArchive, quantized_played_at
 from src.redis_client import GUILD_TTL, HISTORY_CACHE_LIMIT
 from src.util import get_logger
 
@@ -63,8 +63,22 @@ async def _read_guild_entries(
     redis: aioredis.Redis, key: bytes, guild_id: int
 ) -> tuple[list[HistoryEntry], int]:
     """All parseable entries of one list, oldest-first, guild_id stamped from
-    the key. Returns (entries, corrupt_count)."""
-    raw: list[bytes] = await redis.lrange(key, 0, -1)  # type: ignore[misc]
+    the key. Returns (entries, corrupt_count).
+
+    Read in _BATCH-sized pages — pre-cutover lists are unbounded, and LRANGE
+    0 -1 on a years-old guild is one giant reply. Entries LPUSHed by the live
+    bot while we page shift indices and can hand back a duplicate; harmless,
+    the dedup index collapses it on insert."""
+    raw: list[bytes] = []
+    start = 0
+    while True:
+        chunk: list[bytes] = await redis.lrange(  # type: ignore[misc]
+            key, start, start + _BATCH - 1
+        )
+        raw.extend(chunk)
+        if len(chunk) < _BATCH:
+            break
+        start += _BATCH
     entries: list[HistoryEntry] = []
     corrupt = 0
     for item in raw:
@@ -98,6 +112,12 @@ async def run(
     keys.sort()
 
     per_guild: dict[int, tuple[bytes, list[HistoryEntry], int]] = {}
+    if keys:
+        # count() deltas can't tell this run's inserts apart from the live
+        # drainer's — rows it lands between the two counts are attributed to
+        # the backfill. Directionally fine (--verify only compares totals),
+        # but the per-guild numbers are estimates, not an audit.
+        out("note: inserted/dup are approximate while the live bot is writing")
     for key in keys:
         gid = _guild_id_from_key(key)
         assert gid is not None
@@ -126,7 +146,11 @@ async def run(
             if entries:
                 newest = entries[-1]  # oldest-first list → newest is last
                 pg_newest = await archive.recent(gid, 1)
-                identity = (newest.played_at, newest.webpage_url)
+                # The archive side comes back µs-quantized (timestamptz);
+                # quantize the Redis side identically or the identity check
+                # fails forever for sub-µs played_at values — which a Linux
+                # time.time() produces on essentially every entry.
+                identity = (quantized_played_at(newest.played_at), newest.webpage_url)
                 if (
                     not pg_newest
                     or (

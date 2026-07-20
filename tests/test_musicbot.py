@@ -1442,6 +1442,38 @@ class TestStatsEmbed:
         assert "last 30 days" in stats_embed(stats, 30).description
         assert stats_embed(stats, 30).fields == []  # empty boards omitted
 
+    def test_present_member_rendered_as_mention(self):
+        stats = GuildStats(
+            plays=2,
+            distinct_songs=1,
+            seconds_listened=10,
+            top_songs=(),
+            top_requesters=(
+                TopRequester(requester_id=42, requester_name="stored", plays=2),
+            ),
+        )
+        guild = MagicMock()  # get_member returns a truthy mock: member present
+        value = stats_embed(stats, None, guild).fields[0].value
+        assert "<@42> — 2 plays" in value
+
+    def test_departed_member_falls_back_to_stored_name(self):
+        # guild.get_member is None for members who left — their mention would
+        # render as "unknown-user", so the stored name is shown instead.
+        stats = GuildStats(
+            plays=2,
+            distinct_songs=1,
+            seconds_listened=10,
+            top_songs=(),
+            top_requesters=(
+                TopRequester(requester_id=42, requester_name="stored", plays=2),
+            ),
+        )
+        guild = MagicMock()
+        guild.get_member.return_value = None
+        value = stats_embed(stats, None, guild).fields[0].value
+        assert "stored — 2 plays" in value
+        assert "<@42>" not in value
+
     def test_markdown_brackets_escaped_and_title_truncated(self):
         stats = GuildStats(
             plays=1,

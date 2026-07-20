@@ -12,9 +12,6 @@ from typing import (
     assert_never,
 )
 
-if TYPE_CHECKING:
-    from src.history_archive import GuildStats
-
 import discord
 from discord.ext import commands
 
@@ -50,6 +47,9 @@ from src.util import (
     trace_footer,
     get_logger,
 )
+
+if TYPE_CHECKING:
+    from src.history_archive import GuildStats
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -90,7 +90,11 @@ def _plays(n: int) -> str:
     return f"{n} play" if n == 1 else f"{n} plays"
 
 
-def stats_embed(stats: "GuildStats", days: Optional[int]) -> discord.Embed:
+def stats_embed(
+    stats: "GuildStats",
+    days: Optional[int],
+    guild: Optional[discord.Guild] = None,
+) -> discord.Embed:
     """One embed for -stats (docs/POSTGRES_HISTORY_PLAN.md §7.1): headline
     totals in the description, two leaderboard fields below."""
     window = f"last {days} days" if days is not None else "all time"
@@ -113,12 +117,14 @@ def stats_embed(stats: "GuildStats", days: Optional[int]) -> discord.Embed:
             lines.append(f"{i}. {label} — {_plays(song.plays)}")
         embed.add_field(name="Most played", value="\n".join(lines), inline=False)
     if stats.top_requesters:
-        lines = [
-            # Mention renders the live display name; survives via the stored
-            # requester_name only in copy-paste contexts (embeds don't ping).
-            f"{i}. <@{r.requester_id}> — {_plays(r.plays)}"
-            for i, r in enumerate(stats.top_requesters, start=1)
-        ]
+        lines = []
+        for i, r in enumerate(stats.top_requesters, start=1):
+            # Mention renders the live display name (embeds don't ping) — but
+            # only for current members: a departed member's mention shows as
+            # "unknown-user", so fall back to the stored requester_name.
+            member = guild.get_member(r.requester_id) if guild is not None else None
+            who = f"<@{r.requester_id}>" if member is not None else r.requester_name
+            lines.append(f"{i}. {who} — {_plays(r.plays)}")
         embed.add_field(name="Top requesters", value="\n".join(lines), inline=False)
     return embed
 
@@ -1124,7 +1130,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            await ctx.send(embed=stats_embed(stats, flags.days))
+            await ctx.send(embed=stats_embed(stats, flags.days, ctx.guild))
         except Exception as e:
             log.error(f"stats failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)

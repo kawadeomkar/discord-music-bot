@@ -31,20 +31,21 @@ DB_NAME="${DB_NAME:-musicbot}"
 KEEP="${KEEP:-7}"
 
 # Dump: write to a dot-tmp name, fsync-equivalent via pg_dump completing,
-# then atomically rename to the pullable name.
-docker exec "$CONTAINER" sh -c "
+# then atomically rename to the pullable name. Overrides ride in as env vars
+# and the container script is single-quoted, so no value can splice into it.
+docker exec -e DB_USER="$DB_USER" -e DB_NAME="$DB_NAME" "$CONTAINER" sh -c '
   set -eu
-  pg_dump -Fc -U '$DB_USER' '$DB_NAME' -f /backups/.musicbot.dump.tmp
-  mv /backups/.musicbot.dump.tmp \"/backups/musicbot-\$(date -u +%Y%m%d-%H%M%S).dump\"
-"
+  pg_dump -Fc -U "$DB_USER" "$DB_NAME" -f /backups/.musicbot.dump.tmp
+  mv /backups/.musicbot.dump.tmp "/backups/musicbot-$(date -u +%Y%m%d-%H%M%S).dump"
+'
 
 # Prune: keep the newest $KEEP completed dumps. Local retention is only a
 # buffer — long-term retention lives wherever the puller archives.
-docker exec "$CONTAINER" sh -c "
+docker exec -e KEEP="$KEEP" "$CONTAINER" sh -c '
   set -eu
   ls -1t /backups/musicbot-*.dump 2>/dev/null | tail -n +$((KEEP + 1)) | while IFS= read -r f; do
-    rm -- \"\$f\"
+    rm -- "$f"
   done
-"
+'
 
 echo "pg_backup: ok ($(docker exec "$CONTAINER" sh -c 'ls -1 /backups/musicbot-*.dump 2>/dev/null | wc -l' | tr -d ' ') dumps buffered)"

@@ -1,6 +1,9 @@
 """Tests for src/backfill_history.py — the §5.6 migration CLI's testable core
 (`run`) against fakeredis + a dedup-faithful in-memory archive."""
 
+import dataclasses
+from datetime import datetime, timezone
+
 import orjson
 import pytest
 
@@ -43,8 +46,10 @@ def _pre_phase_a_bytes(n: int) -> bytes:
 
 class FakeArchive:
     """Dedup-faithful archive fake: unique on (guild_id, played_at,
-    webpage_url) like the real index. lossy=True silently drops writes —
-    the failure --verify exists to catch."""
+    webpage_url) like the real index, and played_at is µs-quantized on insert
+    like timestamptz — reads return the round-tripped value, not the raw
+    float. lossy=True silently drops writes — the failure --verify exists to
+    catch."""
 
     def __init__(self, lossy: bool = False):
         self.rows: dict[tuple, HistoryEntry] = {}
@@ -54,6 +59,12 @@ class FakeArchive:
         if self.lossy:
             return
         for e in entries:
+            e = dataclasses.replace(
+                e,
+                played_at=datetime.fromtimestamp(
+                    e.played_at, tz=timezone.utc
+                ).timestamp(),
+            )
             self.rows.setdefault((e.guild_id, e.played_at, e.webpage_url), e)
 
     async def count(self, guild_id):
@@ -115,6 +126,20 @@ class TestBackfill:
         assert await run(fake_redis, archive, out=lines.append) == 0
         assert "no guild history lists found" in lines
 
+    async def test_reads_lists_larger_than_one_chunk(
+        self, fake_redis, archive, monkeypatch
+    ):
+        # Pre-cutover lists are unbounded, so the read pages in _BATCH-sized
+        # LRANGEs instead of one giant reply — nothing may be dropped at the
+        # chunk seams.
+        import src.backfill_history as backfill
+
+        monkeypatch.setattr(backfill, "_BATCH", 2)
+        await _seed(fake_redis, 1, 5)
+        lines: list[str] = []
+        assert await run(fake_redis, archive, out=lines.append) == 0
+        assert "guild 1: redis=5 inserted=5 dup=0 corrupt=0" in lines
+
     async def test_oldest_first_insert_order(self, fake_redis, archive):
         recorded: list[list[HistoryEntry]] = []
         real_insert = archive.insert_batch
@@ -133,6 +158,17 @@ class TestBackfill:
 class TestVerify:
     async def test_passes_after_clean_backfill(self, fake_redis, archive):
         await _seed(fake_redis, 1, 3)
+        lines: list[str] = []
+        assert await run(fake_redis, archive, verify=True, out=lines.append) == 0
+        assert "verification passed" in lines
+
+    async def test_sub_microsecond_played_at_verifies(self, fake_redis, archive):
+        # time.time() carries sub-µs precision (essentially every entry on
+        # Linux) while the archive returns the µs-quantized round trip — the
+        # newest-entry identity check must quantize its Redis side or verify
+        # fails forever, and re-running can never fix it (H1).
+        e = dataclasses.replace(_entry(1, guild_id=1), played_at=1752969600.1234567)
+        await fake_redis.lpush("guild:1:history", e.to_redis())
         lines: list[str] = []
         assert await run(fake_redis, archive, verify=True, out=lines.append) == 0
         assert "verification passed" in lines

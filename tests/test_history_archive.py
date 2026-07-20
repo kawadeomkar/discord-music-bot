@@ -196,6 +196,44 @@ class TestDrainerLoop:
     async def test_stop_without_start_is_safe(self, drainer):
         await drainer.stop()
 
+    async def test_loop_survives_exception_outside_drain_once(
+        self, fake_redis, archive, drainer, monkeypatch
+    ):
+        # M2 regression: an exception in the loop body but outside
+        # _drain_once()'s archive call — here the empty-peek gauge write —
+        # must back off and retry like any other failure, not kill the task
+        # and silently halt draining.
+        monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_START", 0.01)
+
+        class _BlowingGauge:
+            def set(self, value, attributes=None):
+                raise RuntimeError("otel exploded")
+
+        drainer._depth_gauge = _BlowingGauge()
+        drainer.start()
+        try:
+            await _push(fake_redis, 1)
+            drainer.notify()
+            await _eventually(lambda: archive.inserted == [_entry(1)])
+            assert not drainer._task.done()  # gauge blew on empty peek; alive
+        finally:
+            await drainer.stop()
+
+    async def test_stop_survives_already_crashed_task(self, drainer, caplog):
+        # M2 regression: awaiting an already-crashed task re-raises its
+        # stored exception — stop() must swallow it (the done-callback logged
+        # it when the task died) so MusicBotApp.close() runs to completion.
+        async def _boom():
+            raise RuntimeError("boom")
+
+        drainer._task = asyncio.create_task(_boom())
+        drainer._task.add_done_callback(drainer._on_task_done)
+        await asyncio.sleep(0)  # let the task crash
+        await drainer.stop()
+        # The done-callback runs via call_soon — give the loop one pass.
+        await asyncio.sleep(0)
+        assert "died unexpectedly" in caplog.text
+
     async def test_stop_swallows_final_drain_failure(
         self, fake_redis, archive, drainer
     ):

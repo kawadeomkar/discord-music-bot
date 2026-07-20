@@ -659,6 +659,7 @@ class TestRefreshTtl:
             store.queue_key(),
             store.state_key(),
             store.now_playing_key(),
+            store.history_key(),
         ]
         for key in managed_keys:
             await fake_redis.set(key, b"x")
@@ -668,12 +669,14 @@ class TestRefreshTtl:
             ttl = await fake_redis.ttl(key)
             assert ttl > 1000  # refreshed to GUILD_TTL
 
-    async def test_never_rearms_history_expiry(self, store, fake_redis):
-        # The history key is persistent (unbounded retention) — refresh_ttl
-        # re-arming an idle expiry on it would silently destroy full history.
+    async def test_rearms_history_expiry(self, store, fake_redis):
+        # Post-cutover the history key is a TTL'd display-cache seed like the
+        # rest (full history lives in Postgres). A guild that only restores
+        # or -stops between plays must re-arm it with the other keys, or the
+        # seed expires alone and the next crash-restore seeds an empty deque.
         await fake_redis.lpush(store.history_key(), b'"entry"')
         await store.refresh_ttl()
-        assert await fake_redis.ttl(store.history_key()) == -1
+        assert await fake_redis.ttl(store.history_key()) > 1000
 
     async def test_swallows_redis_error(self, broken_store):
         await broken_store.refresh_ttl()  # must not raise

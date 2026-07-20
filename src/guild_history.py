@@ -27,6 +27,7 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Optional
 
 from src.guild_state import HistoryEntry
+from src.history_archive import quantized_played_at
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import get_logger
 
@@ -152,16 +153,27 @@ class GuildHistory:
         requester_id: Optional[int] = None,
     ) -> list[HistoryEntry]:
         """Prepend deque entries the archive doesn't have yet (newest first),
-        then the archive's newest-first result, capped at limit. Fresh
-        entries are by construction newer than anything already drained, so
-        prepending preserves global newest-first order. The requester filter
-        applies to the fresh leg too — the archive result is pre-filtered."""
-        seen = {(e.played_at, e.webpage_url) for e in persisted}
-        fresh = [
-            e
-            for e in _filtered(list(self._entries), requester_id)
-            if (e.played_at, e.webpage_url) not in seen
-        ]
+        then the archive's newest-first result, capped at limit. The
+        requester filter applies to the fresh leg too — the archive result is
+        pre-filtered.
+
+        Two subtleties make this more than a set difference. Identity: the
+        archive's played_at is µs-quantized by timestamptz, so the deque side
+        must be quantized through the same round trip before comparing, or a
+        drained entry shows twice. Freshness: `persisted` is only a
+        LIMIT-sized page, so a deque entry absent from it may simply be older
+        than the page window rather than undrained — only entries at least as
+        new as the page's newest count as fresh (safe because the outbox
+        drains FIFO: a genuinely undrained entry is always newer than
+        everything this guild has drained)."""
+        seen = {(quantized_played_at(e.played_at), e.webpage_url) for e in persisted}
+        newest = quantized_played_at(persisted[0].played_at) if persisted else None
+        fresh: list[HistoryEntry] = []
+        for e in _filtered(list(self._entries), requester_id):
+            key = (quantized_played_at(e.played_at), e.webpage_url)
+            if key in seen or (newest is not None and key[0] < newest):
+                continue
+            fresh.append(e)
         fresh.reverse()  # deque is oldest-first
         return (fresh + persisted)[:limit]
 
