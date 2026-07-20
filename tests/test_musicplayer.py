@@ -884,15 +884,22 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         assert embed.colour == discord.Color.green()
 
-    def test_embed_has_youtube_link_field(self, music_player, mock_song):
+    def test_embed_title_links_to_youtube(self, music_player, mock_song):
+        # The webpage URL is both the clickable title link and the standalone
+        # "Youtube link" field.
         embed = music_player._build_now_playing_embed(mock_song)
-        field_names = [f.name for f in embed.fields]
-        assert "Youtube link" in field_names
+        assert embed.url == mock_song.webpage_url
+        fields_by_name = {f.name: f.value for f in embed.fields}
+        assert fields_by_name["Youtube link"] == mock_song.webpage_url
 
-    def test_embed_has_duration_field(self, music_player, mock_song):
+    def test_embed_has_no_duration_field(self, music_player, mock_song):
+        # Duration is not a field — the progress bar's right label shows it, and
+        # dropping it keeps Channel/Views/Likes to Discord's 3-per-row cap so
+        # they render as one row.
         embed = music_player._build_now_playing_embed(mock_song)
         field_names = [f.name for f in embed.fields]
-        assert "Duration" in field_names
+        assert "Duration" not in field_names
+        assert field_names == ["Youtube link", "Channel", "Views", "Likes"]
 
     def test_embed_thumbnail_is_set(self, music_player, mock_song):
         embed = music_player._build_now_playing_embed(mock_song)

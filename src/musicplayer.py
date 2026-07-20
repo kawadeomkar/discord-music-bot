@@ -82,7 +82,7 @@ def _requester_mention(
 # dash character, and — unlike a single-color fill — let the played portion
 # render in a visibly different color from the remaining portion. Width is
 # lower than a typical thin-dash bar since each block glyph is much wider.
-_BAR_WIDTH = 12
+_BAR_WIDTH = 10
 _BAR_FILL_DONE = "🟦"
 _BAR_FILL_REMAINING = "⬜"
 _BAR_HEAD = "🔘"
@@ -165,7 +165,6 @@ def _build_now_playing_base_embed(
     title: str,
     description: str,
     webpage_url: str,
-    duration: str,
     uploader: str,
     views: str,
     likes: str,
@@ -175,11 +174,19 @@ def _build_now_playing_base_embed(
     thumbnail: str,
 ) -> discord.Embed:
     """Shared field layout — used by both the live (YTDL-backed) and
-    Redis-recovery (NowPlayingData-backed) now-playing embed builders."""
+    Redis-recovery (NowPlayingData-backed) now-playing embed builders.
+
+    Channel/Views/Likes are the three inline fields — exactly Discord's
+    per-row cap, so they render as one clean row. Duration is intentionally
+    NOT a field: the progress bar's right-hand label already shows it."""
     embed = (
-        discord.Embed(title=title, description=description, color=discord.Color.green())
+        discord.Embed(
+            title=title,
+            url=webpage_url,
+            description=description,
+            color=discord.Color.green(),
+        )
         .add_field(name="Youtube link", value=webpage_url, inline=False)
-        .add_field(name="Duration", value=duration)
         .add_field(name="Channel", value=uploader)
         .add_field(name="Views", value=views)
         .add_field(name="Likes", value=likes)
@@ -703,7 +710,6 @@ class MusicPlayer:
             title=f"**Now playing:** {song.title}",
             description=description,
             webpage_url=fields.webpage_url,
-            duration=fields.duration,
             uploader=fields.uploader,
             views=fields.view_count,
             likes=fields.like_count,
@@ -744,7 +750,6 @@ class MusicPlayer:
             title=f"**Now playing:** {data.title}",
             description=f"Requester: [{data.requester_mention}]",
             webpage_url=data.webpage_url,
-            duration=data.duration,
             uploader=data.uploader,
             views=data.view_count,
             likes=data.like_count,
