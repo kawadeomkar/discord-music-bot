@@ -85,12 +85,29 @@ poetry run bot
 **Build and run with Docker Compose**
 
 ```bash
-# Using the build script (also runs ruff format + lint)
-./build.sh
+# Full pipeline: test gate → build image → deploy
+./build_docker.sh
 
-# Or manually
-docker compose up --build
+# Or the individual steps
+make check            # lint + type-check + tests (the gate)
+make image            # build the runtime image, no gate
+./deploy_docker.sh    # deploy the image already built for HEAD
 ```
+
+`build_docker.sh` is a composition of those three — it does not reimplement any of
+them. `build_common.sh` is a sourced library, not a runnable script.
+
+**Rolling back**
+
+Deploys are separate from builds precisely so this never requires a rebuild:
+
+```bash
+./deploy_docker.sh <git-sha>   # any SHA whose image is still in the local store
+docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
+```
+
+The script refuses to deploy a tag it cannot find locally rather than letting
+Compose build one from your working tree and label it with that SHA.
 
 The `docker-compose.yml` reads credentials from a `.env` file in the project root and uses host networking.
 
@@ -103,24 +120,38 @@ docker run --env-file .env --network host discord-music-bot
 
 ## Development
 
-**Install dev dependencies**
+`make` is the task index — run `make` on its own to list every target.
 
 ```bash
-poetry install --with test,lint
+make install   # create the venv with main + test + lint dependencies
+make hooks     # install the git hooks (optional, recommended — see below)
+
+make fmt       # format and auto-fix src/ and tests/ (rewrites files)
+make lint      # ruff format --check + ruff check, no rewrites   (~0.1s)
+make types     # pyright over src/ AND tests/                    (~5.5s)
+make test      # pytest with coverage                            (~15s)
+make check     # all three — run this before pushing
+make ci        # check + the containerized test run, mirroring CI
 ```
 
-**Run tests**
+**`make check` is the contract:** it runs exactly what CI's lint and test jobs
+run, so if it passes, CI passes. Nothing else in the repo makes that promise —
+in particular, a successful `./build_docker.sh` used not to, because it applied
+formatting instead of checking it and never ran pyright at all.
 
-```bash
-poetry run pytest
-```
+**Git hooks**
 
-**Format and lint code**
+`make hooks` installs two stages, deliberately split by how long they take:
 
-```bash
-poetry run ruff format src/ tests/
-poetry run ruff check src/ tests/
-```
+| Stage | Runs | Cost |
+|---|---|---|
+| pre-commit | `ruff check --fix`, `ruff format`, whitespace/YAML/TOML checks | ~0.1s |
+| pre-push | `make check` | ~25s |
+
+The hooks are a convenience, not the gate — CI still runs every one of these
+checks, and `--no-verify` is always available when you need it. Note that the
+formatting hooks **rewrite files**: a commit that trips one fails and leaves the
+fixes unstaged, so `git add` them and commit again. That is intended behavior.
 
 ## Project structure
 
