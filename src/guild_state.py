@@ -254,7 +254,11 @@ class NowPlayingData:
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             uploader=song.uploader or "",
-            duration=song.duration or "",
+            # Empty when the duration is unknown (livestream, missing metadata)
+            # rather than the "0:00" fmt_duration renders for zero — mirrors the
+            # live embed, which draws no progress bar when duration_secs <= 0.
+            # The recovered embed keys its Duration line off this being truthy.
+            duration=song.duration if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
             like_count=str(song.likes) if song.likes is not None else "",

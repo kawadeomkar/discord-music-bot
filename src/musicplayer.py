@@ -21,10 +21,12 @@ from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    fmt_duration,
     notice_embed,
     record_span_error,
     send_embed,
     trace_footer,
+    truncate_embed_title,
     get_logger,
 )
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
@@ -41,12 +43,6 @@ _tracer = get_tracer(__name__)
 # Fix is a per-guild timezone setting, or Discord relative timestamps (<t:epoch:R>),
 # which the client renders in each viewer's own locale and would delete this constant.
 _PST = ZoneInfo("America/Los_Angeles")
-
-
-def _fmt_duration(secs: int) -> str:
-    h, r = divmod(secs, 3600)
-    m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _fmt_total_duration(secs: int) -> str:
@@ -137,7 +133,7 @@ class InterjectOutcome:
 
     @property
     def resume_position_str(self) -> str:
-        return _fmt_duration(self.resume_position or 0)
+        return fmt_duration(self.resume_position or 0)
 
 
 def _reached_end(song: YTDL) -> bool:
@@ -183,9 +179,7 @@ def _build_progress_bar(
         + _BAR_HEAD
         + _BAR_FILL_REMAINING * (width - head_pos - 1)
     )
-    return (
-        f"`{_fmt_duration(int(elapsed_secs))}` {bar} `{_fmt_duration(duration_secs)}`"
-    )
+    return f"`{fmt_duration(int(elapsed_secs))}` {bar} `{fmt_duration(duration_secs)}`"
 
 
 def _fmt_finish_time(duration_secs: int) -> str:
@@ -196,6 +190,16 @@ def _fmt_finish_time(duration_secs: int) -> str:
         seconds=duration_secs
     )
     return _fmt_clock_time(finish_dt)
+
+
+# Discord rejects an embed field with an empty value (400, "This field is
+# required") — and a 400 fails the entire send/edit, not just that field. Any
+# value that can legitimately be missing goes through here.
+_FIELD_PLACEHOLDER = "—"
+
+
+def _field_value(value: str) -> str:
+    return value or _FIELD_PLACEHOLDER
 
 
 def _build_now_playing_base_embed(
@@ -216,7 +220,16 @@ def _build_now_playing_base_embed(
 
     Channel/Views/Likes are the three inline fields — exactly Discord's
     per-row cap, so they render as one clean row. Duration is intentionally
-    NOT a field: the progress bar's right-hand label already shows it."""
+    NOT a field: the live embed's progress bar carries it in its right-hand
+    label, and the recovered embed puts it in the description. The webpage URL
+    is likewise not a field — the title links to it.
+
+    Every value goes through _field_value: Discord rejects an empty field
+    value with a 400, which would fail the whole send/edit rather than just
+    dropping the field. Views/likes are routinely absent (livestreams,
+    creators who hide counts) and a partial Redis hash can blank any of them.
+    """
+    title = truncate_embed_title(title)
     embed = (
         discord.Embed(
             title=title,
@@ -224,10 +237,9 @@ def _build_now_playing_base_embed(
             description=description,
             color=discord.Color.green(),
         )
-        .add_field(name="Youtube link", value=webpage_url, inline=False)
-        .add_field(name="Channel", value=uploader)
-        .add_field(name="Views", value=views)
-        .add_field(name="Likes", value=likes)
+        .add_field(name="Channel", value=_field_value(uploader))
+        .add_field(name="Views", value=_field_value(views))
+        .add_field(name="Likes", value=_field_value(likes))
         .set_footer(text=f"Avg Bitrate: {abr} | Avg Sampling: {asr} | Acodec: {acodec}")
     )
     if thumbnail:
@@ -475,10 +487,10 @@ class MusicPlayer:
         if isinstance(item, QueueObject):
             title = item.title or "Unknown"
             requester = _requester_mention(item.requester)
-            dur = _fmt_duration(item.duration) if item.duration is not None else "?:??"
+            dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
             channel = item.uploader or "Unknown channel"
             if item.is_resume and item.ts:
-                ts_note = f"  ·  ⏮ resumes at `{_fmt_duration(item.ts)}`"
+                ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
             elif item.ts:
                 ts_note = f"  ·  starts at `{item.ts}s`"
             else:
@@ -838,7 +850,10 @@ class MusicPlayer:
         description = "\n".join(lines)
         fields = NowPlayingData.from_song(song)
         return _build_now_playing_base_embed(
-            title=f"**Now playing:** {song.title}",
+            # No markdown: Discord renders embed titles literally, so the old
+            # "**Now playing:**" showed its asterisks — and now that the title
+            # is a link, they showed inside the link text.
+            title=f"Now playing: {song.title}",
             description=description,
             webpage_url=fields.webpage_url,
             uploader=fields.uploader,
@@ -865,9 +880,9 @@ class MusicPlayer:
         position = int(song.position_secs)
         duration_secs = song.duration_secs
         if duration_secs > 0:
-            paused_at = f"{_fmt_duration(position)} / {_fmt_duration(duration_secs)}"
+            paused_at = f"{fmt_duration(position)} / {fmt_duration(duration_secs)}"
         else:
-            paused_at = _fmt_duration(position)
+            paused_at = fmt_duration(position)
         return discord.Embed(
             title=f"⏸️ Paused: {song.title}",
             description=f"Paused at: `{paused_at}`",
@@ -876,10 +891,26 @@ class MusicPlayer:
 
     @staticmethod
     def _build_now_playing_embed_from_data(data: NowPlayingData) -> discord.Embed:
-        """Reconstruct a now-playing embed from the recovered Redis snapshot."""
+        """Reconstruct a now-playing embed from the recovered Redis snapshot.
+
+        Duration goes in the description here, in the slot the progress bar
+        occupies in the live embed. The base builder drops the Duration field
+        because the bar's right-hand label carries it — but this embed has no
+        bar (there is no live position to draw one from until loop() starts
+        real playback), so without this line the recovered embed would show no
+        duration at all. Rendered as stored: the string is whatever
+        NowPlayingData.from_song wrote, and re-parsing it to reformat would
+        only add a failure mode.
+        """
+        lines = []
+        if data.duration:
+            # Blank line after, matching the live embed's bar/requester spacing.
+            lines.append(f"Duration: `{data.duration}`")
+            lines.append("")
+        lines.append(f"Requester: [{data.requester_mention}]")
         return _build_now_playing_base_embed(
-            title=f"**Now playing:** {data.title}",
-            description=f"Requester: [{data.requester_mention}]",
+            title=f"Now playing: {data.title}",  # literal, as above
+            description="\n".join(lines),
             webpage_url=data.webpage_url,
             uploader=data.uploader,
             views=data.view_count,
@@ -1337,7 +1368,7 @@ class MusicPlayer:
         NOT send_with_np: this song's NP host hasn't been sent yet, and
         send_with_np would adopt the notice as host only for
         _send_now_playing to immediately retire it."""
-        position = _fmt_duration(int(song.position_secs))
+        position = fmt_duration(int(song.position_secs))
         if song.start_paused:
             text = (
                 f"⏮ Returned to **{song.title}** at `{position}` — still paused. "

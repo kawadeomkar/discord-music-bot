@@ -15,14 +15,15 @@ import pytest
 from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.musicplayer import (
     MusicPlayer,
+    _BAR_WIDTH,
     _build_progress_bar,
-    _fmt_duration,
     _reached_end,
     _fmt_finish_time,
     _fmt_total_duration,
     _requester_mention,
 )
 from src.sources import YTSource
+from src.util import fmt_duration
 from src.youtube import QueueObject
 from tests.helpers import stub_create_task
 
@@ -107,26 +108,6 @@ def _stub_queue_put_tasks(monkeypatch):
 
 
 # ── Formatter helpers ─────────────────────────────────────────────────────────
-
-
-class TestFmtDuration:
-    def test_seconds_only(self):
-        assert _fmt_duration(45) == "0:45"
-
-    def test_minutes_and_seconds(self):
-        assert _fmt_duration(185) == "3:05"
-
-    def test_hours_minutes_seconds(self):
-        assert _fmt_duration(3723) == "1:02:03"
-
-    def test_zero(self):
-        assert _fmt_duration(0) == "0:00"
-
-    def test_exactly_one_hour(self):
-        assert _fmt_duration(3600) == "1:00:00"
-
-    def test_pads_seconds(self):
-        assert _fmt_duration(61) == "1:01"
 
 
 class TestFmtTotalDuration:
@@ -849,6 +830,13 @@ class TestBuildProgressBar:
         bar = _build_progress_bar(0.0, 200, width=5)
         assert bar.count("🟦") + bar.count("🔘") + bar.count("⬜") == 5
 
+    def test_default_width_is_bar_width_constant(self):
+        # Pins the default to the constant rather than a literal, so changing
+        # _BAR_WIDTH stays a one-line edit but an accidental drift in the
+        # signature's default doesn't go unnoticed.
+        bar = _build_progress_bar(0.0, 200)
+        assert bar.count("🟦") + bar.count("🔘") + bar.count("⬜") == _BAR_WIDTH
+
     def test_includes_formatted_elapsed_and_duration(self):
         bar = _build_progress_bar(65.0, 200)
         assert "`1:05`" in bar
@@ -887,21 +875,43 @@ class TestBuildNowPlayingEmbed:
         assert embed.colour == discord.Color.green()
 
     def test_embed_title_links_to_youtube(self, music_player, mock_song):
-        # The webpage URL is both the clickable title link and the standalone
-        # "Youtube link" field.
+        # The title carries the URL, so no separate "Youtube link" field.
         embed = music_player._build_now_playing_embed(mock_song)
         assert embed.url == mock_song.webpage_url
-        fields_by_name = {f.name: f.value for f in embed.fields}
-        assert fields_by_name["Youtube link"] == mock_song.webpage_url
+        assert "Youtube link" not in [f.name for f in embed.fields]
 
-    def test_embed_has_no_duration_field(self, music_player, mock_song):
-        # Duration is not a field — the progress bar's right label shows it, and
-        # dropping it keeps Channel/Views/Likes to Discord's 3-per-row cap so
-        # they render as one row.
+    def test_embed_title_has_no_markdown(self, music_player, mock_song):
+        # Discord renders embed titles literally — "**Now playing:**" would
+        # show its asterisks, inside the title's link text.
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert "*" not in embed.title
+        assert embed.title.startswith("Now playing: ")
+
+    def test_embed_title_truncated_to_discord_limit(self, music_player, mock_song):
+        # An over-length title 400s the whole send, not just the title.
+        mock_song.title = "x" * 400
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert len(embed.title) == 256
+        assert embed.title.endswith("…")
+
+    def test_embed_fields_are_exactly_one_inline_row(self, music_player, mock_song):
+        # Three inline fields — Discord's per-row cap — so they render as one
+        # clean row. Duration is not among them: the progress bar's right-hand
+        # label already shows it.
         embed = music_player._build_now_playing_embed(mock_song)
         field_names = [f.name for f in embed.fields]
-        assert "Duration" not in field_names
-        assert field_names == ["Youtube link", "Channel", "Views", "Likes"]
+        assert field_names == ["Channel", "Views", "Likes"]
+        assert all(f.inline for f in embed.fields)
+
+    def test_empty_field_values_get_placeholder(self, music_player, mock_song):
+        # Discord rejects an empty field value with a 400 that fails the whole
+        # send. Views/likes are routinely absent (livestreams, hidden counts).
+        mock_song.views = None
+        mock_song.likes = None
+        mock_song.uploader = None
+        embed = music_player._build_now_playing_embed(mock_song)
+        assert [f.value for f in embed.fields] == ["—", "—", "—"]
+        assert all(f.value for f in embed.fields)
 
     def test_embed_thumbnail_is_set(self, music_player, mock_song):
         embed = music_player._build_now_playing_embed(mock_song)
@@ -986,7 +996,7 @@ class TestBuildNowPlayingEmbed:
     def test_progress_bar_reflects_elapsed_secs(self, music_player, mock_song):
         mock_song.elapsed_secs = 105.0  # roughly halfway through 210s
         embed = music_player._build_now_playing_embed(mock_song)
-        assert _fmt_duration(105) in embed.description
+        assert fmt_duration(105) in embed.description
 
     def test_no_progress_bar_line_when_duration_unknown(self, music_player, mock_song):
         mock_song.duration_secs = 0
@@ -1001,13 +1011,13 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(
             mock_song, position_override=210.0
         )
-        assert _fmt_duration(210) in embed.description
-        assert _fmt_duration(30) not in embed.description
+        assert fmt_duration(210) in embed.description
+        assert fmt_duration(30) not in embed.description
 
     def test_no_override_falls_back_to_live_position(self, music_player, mock_song):
         mock_song.elapsed_secs = 30.0
         embed = music_player._build_now_playing_embed(mock_song)
-        assert _fmt_duration(30) in embed.description
+        assert fmt_duration(30) in embed.description
 
     def test_progress_bar_includes_start_offset(self, music_player, mock_song):
         """A ?t= song or a crash-recovered song resumed mid-stream via FFmpeg
@@ -1017,8 +1027,8 @@ class TestBuildNowPlayingEmbed:
         mock_song.start_offset = 60
         mock_song.elapsed_secs = 30.0
         embed = music_player._build_now_playing_embed(mock_song)
-        assert _fmt_duration(90) in embed.description
-        assert _fmt_duration(30) not in embed.description
+        assert fmt_duration(90) in embed.description
+        assert fmt_duration(30) not in embed.description
 
 
 class TestBuildPauseConfirmationEmbed:
@@ -2943,8 +2953,8 @@ class TestFinalizeNowPlaying:
 
         message.edit.assert_awaited_once()
         embed = message.edit.call_args.kwargs["embeds"][0]
-        assert _fmt_duration(210) in embed.description
-        assert _fmt_duration(184) not in embed.description
+        assert fmt_duration(210) in embed.description
+        assert fmt_duration(184) not in embed.description
 
     async def test_noop_when_duration_unknown(self, music_player, mock_song):
         mock_song.duration_secs = 0
@@ -2971,7 +2981,7 @@ class TestFinalizeNowPlaying:
         message = AsyncMock(spec=discord.Message)
         await music_player._finalize_now_playing(mock_song, message, own)
         embeds = message.edit.call_args.kwargs["embeds"]
-        assert _fmt_duration(mock_song.duration_secs) in embeds[0].description
+        assert fmt_duration(mock_song.duration_secs) in embeds[0].description
         assert embeds[1].title == "Queue"
 
     async def test_swallows_not_found(self, music_player, mock_song):
@@ -4430,6 +4440,20 @@ class TestBuildNowPlayingEmbedFromData:
     def test_footer_contains_bitrate(self, music_player):
         embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
         assert "128" in embed.footer.text
+
+    def test_duration_in_description(self, music_player):
+        # This embed has no progress bar, so the description is the only place
+        # duration can appear — the base builder dropped the Duration field on
+        # the grounds that the bar's right-hand label shows it.
+        embed = music_player._build_now_playing_embed_from_data(_NP_DATA)
+        assert "Duration: `3:30`" in embed.description
+        assert "Duration" not in [f.name for f in embed.fields]
+
+    def test_duration_line_omitted_when_unknown(self, music_player):
+        data = dataclasses.replace(_NP_DATA, duration="")
+        embed = music_player._build_now_playing_embed_from_data(data)
+        assert "Duration" not in embed.description
+        assert embed.description == "Requester: [<@123>]"
 
     def test_default_fields_render_as_empty_strings(self, music_player):
         data = NowPlayingData(title="Minimal")  # all other fields defaulted

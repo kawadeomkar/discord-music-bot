@@ -237,6 +237,7 @@ def _full_song_stub() -> YTDL:
             webpage_url="https://youtu.be/abc",
             uploader="Test Channel",
             duration="4:00",
+            duration_secs=240,
             thumbnail="https://img/x.jpg",
             views=1000,
             likes=50,
@@ -257,6 +258,7 @@ def _empty_song_stub() -> YTDL:
             webpage_url=None,
             uploader=None,
             duration=None,
+            duration_secs=0,
             thumbnail=None,
             views=None,
             likes=None,
@@ -290,6 +292,19 @@ class TestNowPlayingDataFromSong:
         assert data.view_count == ""
         assert data.requester_id == ""
         assert data.requester_mention == "Unknown"
+
+    def test_duration_blank_when_unknown(self):
+        """A livestream has duration_secs == 0 but a non-empty duration string
+        ("0:00"). Storing that would make the recovered embed claim a real
+        length of zero; blank means the Duration line is omitted entirely,
+        matching the live embed, which draws no bar in the same case."""
+        song = cast(
+            YTDL,
+            SimpleNamespace(
+                **{**vars(_full_song_stub()), "duration": "0:00", "duration_secs": 0},
+            ),
+        )
+        assert NowPlayingData.from_song(song).duration == ""
 
 
 class TestNowPlayingDataFromRedis:

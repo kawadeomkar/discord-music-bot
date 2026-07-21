@@ -90,8 +90,16 @@ def fmt_duration(secs: int) -> str:
 
 
 # Discord's hard limit on an embed title is 256 characters; an over-length
-# title makes the whole send() 400 and the -history command silently no-op.
-_EMBED_TITLE_LIMIT = 256
+# title makes the whole send() 400 — silently no-opping -history, or failing
+# the now-playing send/edit outright.
+EMBED_TITLE_LIMIT = 256
+
+
+def truncate_embed_title(title: str) -> str:
+    """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
+    if len(title) <= EMBED_TITLE_LIMIT:
+        return title
+    return title[: EMBED_TITLE_LIMIT - 1] + "…"
 
 
 def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
@@ -121,9 +129,7 @@ def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
         if entry.played_at:
             meta += f" · <t:{int(entry.played_at)}:f>"
         lines.append(meta)
-        title = f"{i}. {entry.title}"
-        if len(title) > _EMBED_TITLE_LIMIT:
-            title = title[: _EMBED_TITLE_LIMIT - 1] + "…"
+        title = truncate_embed_title(f"{i}. {entry.title}")
         embed = discord.Embed(
             title=title,
             description="\n".join(lines),
