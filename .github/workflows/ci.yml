@@ -36,20 +36,40 @@ jobs:
           # `test` is here for pyright, not to run tests: it type-checks tests/,
           # which imports pytest and fakeredis. Without them every such import is
           # an unresolved-import error.
-          groups: main,lint,test
-          cache-prefix: lint-main-lint-test
+          groups: main,lint,test,dev
+          cache-prefix: lint-main-lint-test-dev
 
+      # The task file has a canonical format; keep it that way. `make` had no
+      # equivalent. ~0.01s.
+      - name: justfile format
+        run: .venv/bin/just --fmt --check
+
+      # Parses the justfile and resolves every variable without running anything
+      # (~0.01s). A justfile typo fails here rather than six minutes in.
+      - name: justfile parses
+        run: .venv/bin/just -n check
+
+      # These four steps ARE `just check`'s dependency list, run by CI instead of
+      # by `just` so a failure names the tool rather than "check". They are not a
+      # second copy of it -- that is the whole point of calling the recipes.
       - name: ruff format --check
-        run: poetry run ruff format --check src/ tests/
+        run: .venv/bin/just fmt-check
 
       - name: ruff check
-        run: poetry run ruff check src/ tests/
+        run: .venv/bin/just lint
 
-      # No path argument: check src/ AND tests/, matching the bare `pyright`
-      # developers run locally via `make types`. Checking only src/ is what let
-      # tests/ accumulate 67 type errors unnoticed.
+      # `just types` passes --pythonpath explicitly, which `poetry run pyright`
+      # did not: pyright resolves imports from the interpreter it is TOLD about.
+      # CI was the one caller not naming the interpreter it meant.
       - name: pyright
-        run: poetry run pyright
+        run: .venv/bin/just types
+
+      # Costs nothing unless something already failed. Dumps every resolved
+      # variable -- VENV_BIN above all -- so the construction layer is visible in
+      # the log instead of being guessed at.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
 
   test:
     name: Test Suite
@@ -65,13 +85,15 @@ jobs:
 
       - uses: ./.github/actions/setup-python-env
         with:
-          groups: main,test
-          cache-prefix: test-main-test
+          groups: main,test,dev
+          cache-prefix: test-main-test-dev
 
+      # `test-report` is `test` plus the reporting flags the coverage comment
+      # below consumes -- it invokes the same recipe, so the gate has one
+      # definition. `set -o pipefail` lives in the recipe now, where it cannot be
+      # forgotten; without it `tee` masks a failing suite.
       - name: Run tests with coverage
-        run: |
-          set -o pipefail
-          poetry run pytest --tb=short -q --cov-report=xml --junitxml=pytest.xml | tee pytest-coverage.txt
+        run: .venv/bin/just test-report
 
       - name: Coverage comment
         id: coverage_comment
