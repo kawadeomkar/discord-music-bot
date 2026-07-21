@@ -1,15 +1,17 @@
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
+from redis.typing import EncodableT, FieldT
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
+    HistoryEntry,
     NowPlayingData,
     QueueEntry,
     SongQueueEntry,
@@ -26,8 +28,12 @@ GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
-GUILD_TTL = 86400  # 24h idle expiry
-HISTORY_LIMIT = 50  # entries kept on both history legs (deque maxlen + LTRIM)
+GUILD_TTL = 86400  # 24h idle expiry (never applied to the history key — see below)
+# In-memory/display cap only — NOT a retention cap. The Redis history list is
+# unbounded (source of truth for all played songs; Postgres eventually — see
+# docs/HISTORY_OVERHAUL_PLAN.md §4/§8); this bounds the GuildHistory deque and
+# every history read so startup stays O(50) against an unbounded list.
+HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields cleared together on song end / disconnect, and the
 # playback-position fields cleared together alongside them. Shared here so
@@ -39,12 +45,23 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_DURATION,
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
+    StateField.CURRENT_SONG_INTERJECTED,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
     StateField.TOTAL_PAUSE_SECONDS,
     StateField.PAUSE_START_EPOCH,
 )
+
+
+def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
+    """Adapt a guild_state str→str mapping to redis-py's HSET mapping type.
+
+    Mapping's key parameter is invariant, so dict[str, str] is not assignable to
+    Mapping[FieldT, EncodableT] even though str is one of FieldT's own members.
+    The cast is a variance workaround only — it widens nothing at runtime.
+    """
+    return cast(Mapping[FieldT, EncodableT], mapping)
 
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -102,6 +119,16 @@ async def cache_set(
         await redis.set(key, orjson.dumps(value), ex=ttl)
     except Exception as e:
         log.warning(f"cache_set failed [{key}]: {e}")
+
+
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+    if redis is None:
+        return
+    try:
+        await redis.delete(key)
+    except Exception as e:
+        log.warning(f"cache_del failed [{key}]: {e}")
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────
@@ -179,13 +206,15 @@ class GuildRedisStore:
         return GUILD_NOW_PLAYING_KEY.format(guild_id=self.guild_id)
 
     def _pipe_expire_all(self, pipe: Pipeline) -> None:
-        """Queue expire commands for all four guild keys onto an existing pipeline."""
+        """Queue expire commands for the TTL-managed guild keys onto an existing
+        pipeline. The history key is deliberately absent: full history is
+        retained indefinitely (PERSISTed by push_history), so it must never be
+        re-armed with an idle expiry."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
-        pipe.expire(self.history_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
 
-    async def _exec_with_state_ttl(self, pipe) -> None:
+    async def _exec_with_state_ttl(self, pipe: Pipeline) -> None:
         """Append the state-key TTL refresh and execute the pipeline.
 
         EXPIRE must come after the write commands already queued on the pipe —
@@ -203,7 +232,7 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), entry.to_redis())
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
 
@@ -215,9 +244,31 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
+
+    async def push_queue_front(self, entries: Sequence[QueueEntry]) -> None:
+        """LPUSH entries so entries[0] ends up at the queue head, and refresh
+        TTL on all guild keys — the -playnow front insert. LPUSH pushes each
+        successive argument to the head, so the batch is reversed first to
+        preserve the given order.
+
+        Failure note (store policy: log, never raise): a swallowed failure
+        here degrades WORSE than a tail-push failure. The in-memory legs end
+        up len(entries) ahead of Redis at the HEAD, so the next commit-time
+        LPOPs retire other songs' entries — a crash before the mismatch
+        drains restores a queue shifted by up to that many songs, not just
+        missing the entries that failed to push."""
+        if not entries:
+            return
+        try:
+            pipe = self.redis.pipeline()
+            pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
+            self._pipe_expire_all(pipe)
+            await pipe.execute()
+        except Exception as e:
+            log.warning(f"[guild:{self.guild_id}] Redis push_queue_front failed: {e}")
 
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes the item immediately with no ack.
@@ -225,7 +276,7 @@ class GuildRedisStore:
         # This is acceptable in Phase 2 (asyncio.Queue is source of truth).
         # Phase 3b migrates to Redis Streams + XACK for at-least-once.
         try:
-            await self.redis.lpop(self.queue_key())  # type: ignore[misc]
+            await self.redis.lpop(self.queue_key())
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis pop_queue failed: {e}")
 
@@ -245,6 +296,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_REQUESTER_ID: (
                 str(current.requester_id) if current.requester_id else ""
             ),
+            StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }
@@ -272,11 +324,14 @@ class GuildRedisStore:
             mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.lpop(self.queue_key())
-            pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
+            pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
-                pipe.hset(self.now_playing_key(), mapping=now_playing.to_redis_mapping())  # type: ignore[misc]
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=_hset_mapping(now_playing.to_redis_mapping()),
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
@@ -295,11 +350,14 @@ class GuildRedisStore:
         try:
             mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
-            pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
+            pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
-                pipe.hset(self.now_playing_key(), mapping=now_playing.to_redis_mapping())  # type: ignore[misc]
+                pipe.hset(
+                    self.now_playing_key(),
+                    mapping=_hset_mapping(now_playing.to_redis_mapping()),
+                )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
         except Exception as e:
@@ -319,29 +377,45 @@ class GuildRedisStore:
             pipe.delete(self.queue_key())
             pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             pipe.expire(self.queue_key(), GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis rebuild_queue failed: {e}")
 
     # History operations
 
-    async def push_history(self, entry: str) -> None:
-        """LPUSH one entry, trim list to HISTORY_LIMIT, and refresh TTL."""
+    # ISSUE: Unbounded, non-evictable history can exhaust Redis and stall all writes.
+    # History keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
+    # eviction candidates. Once history fills the 256mb maxmemory and no TTL-bearing key
+    # is left to evict, Redis rejects EVERY write with OOM — not just history: state,
+    # queue, and cache writes all start failing (each store method swallows the error and
+    # logs, so persistence silently degrades rather than crashing). Small entries make
+    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The planned
+    # fix is migrating full history to Postgres and demoting the Redis list to a bounded
+    # cache (docs/HISTORY_OVERHAUL_PLAN.md §8, architecture plan §3.11); until then this
+    # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
+    # workaround — that would make history itself an eviction candidate and defeat the
+    # whole persistent-history design (see docker-compose.yml redis command).
+    async def push_history(self, entry: HistoryEntry) -> None:
+        """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
+        the unbounded source of truth for all played songs (write-per-song-end
+        is the durability boundary; cadence analysis in
+        docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
+        pre-migration keys still carrying the old 24h idle expiry."""
         try:
             pipe = self.redis.pipeline()
             pipe.lpush(self.history_key(), serialize_history_entry(entry))
-            pipe.ltrim(self.history_key(), 0, HISTORY_LIMIT - 1)
-            pipe.expire(self.history_key(), GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            pipe.persist(self.history_key())
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")
 
-    async def get_history(self) -> list[str]:
-        """Return up to HISTORY_LIMIT history entries newest-first. Corrupt
-        entries are dropped (parse_history_entry warns per entry)."""
+    async def get_history(self) -> list[HistoryEntry]:
+        """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
+        Corrupt entries are dropped (parse_history_entry warns per entry)."""
         try:
-            raw: list[bytes] = await self.redis.lrange(  # type: ignore[misc]
-                self.history_key(), 0, HISTORY_LIMIT - 1
+            raw = cast(
+                list[bytes],
+                await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1),
             )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_history failed: {e}")
@@ -508,7 +582,7 @@ class GuildRedisStore:
             pipe.hgetall(self.state_key())
             pipe.lrange(self.queue_key(), 0, -1)
             pipe.hgetall(self.now_playing_key())
-            pipe.lrange(self.history_key(), 0, HISTORY_LIMIT - 1)
+            pipe.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
             raw_state, raw_queue, raw_np, raw_history = await pipe.execute()
             entries = tuple(
                 entry
@@ -542,11 +616,12 @@ class GuildRedisStore:
     # TTL management
 
     async def refresh_ttl(self) -> None:
-        """Refresh GUILD_TTL on all guild keys."""
+        """Refresh GUILD_TTL on the TTL-managed guild keys. History is excluded
+        for the same reason as in _pipe_expire_all: the key is persistent."""
         try:
             pipe = self.redis.pipeline()
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis refresh_ttl failed: {e}")
 
@@ -580,10 +655,14 @@ class GuildRedisStore:
                 StateField.VOICE_CHANNEL_ID,
                 StateField.TEXT_CHANNEL_ID,
                 *_TRANSIENT_SONG_FIELDS,
-                # last_author_id is no longer written; the HDEL scrubs hashes
-                # left by older builds and is removable after one release. It
-                # is intentionally a literal, not a StateField — it is not part
-                # of the schema.
+                # HACK: last_author_id is dead schema still scrubbed on every disconnect.
+                # Nothing writes this field any more; the HDEL exists only to clean up
+                # state hashes left behind by older builds that did, which is why it is
+                # a bare string literal rather than a StateField constant. Every guild
+                # disconnect now pays to delete a field that cannot exist on any hash
+                # written since that migration.
+                # Safe to delete once no pre-migration hash can still be live — guild
+                # keys carry a 24h TTL, so one release is already more than enough.
                 "last_author_id",
                 *_PLAYBACK_POSITION_FIELDS,
             )

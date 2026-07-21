@@ -1,5 +1,6 @@
 """Tests for src/spotify.py — Spotify API auth, response parsing, and Redis cache."""
 
+import redis.asyncio as aioredis
 import time
 from typing import Any, Dict, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -69,19 +70,23 @@ class TestSpotifyRefreshToken:
         await spotify._refresh_token()
         assert spotify.token_expiry > time.time()
 
-    async def test_refresh_token_uses_redis_cache_on_hit(self, spotify, fake_redis):
+    async def test_refresh_token_uses_redis_cache_on_hit(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
         """When Redis holds a valid token, _refresh_token returns it without calling the API."""
         await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
 
         factory_calls: list = []
-        spotify._session_factory = lambda **kw: factory_calls.append(1)  # type: ignore[func-returns-value]
+        spotify._session_factory = lambda **kw: factory_calls.append(1)
 
         await spotify._refresh_token()
 
         assert spotify.auth_token == "cached_bearer_token"
         assert factory_calls == []  # session factory never called
 
-    async def test_refresh_token_sets_expiry_from_real_ttl(self, spotify, fake_redis):
+    async def test_refresh_token_sets_expiry_from_real_ttl(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
         """token_expiry should reflect the key's actual remaining TTL, not a flat guess."""
         await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
 
@@ -91,8 +96,11 @@ class TestSpotifyRefreshToken:
         assert 115 <= spotify.token_expiry - before <= 121
 
     async def test_refresh_token_falls_through_on_expired_key(
-        self, spotify, fake_redis, mock_auth_response
-    ):
+        self,
+        spotify: Spotify,
+        fake_redis: aioredis.Redis,
+        mock_auth_response: Dict[str, Any],
+    ) -> None:
         """A cached key with no remaining TTL (already expired but not yet
         evicted) must not be trusted — fall through to a fresh HTTP fetch."""
         await fake_redis.set("spotify:auth:token", b"stale_bearer_token")
@@ -108,8 +116,11 @@ class TestSpotifyRefreshToken:
         assert spotify.auth_token == "test_access_token_xyz"
 
     async def test_refresh_token_writes_to_redis_on_api_call(
-        self, spotify, fake_redis, mock_auth_response
-    ):
+        self,
+        spotify: Spotify,
+        fake_redis: aioredis.Redis,
+        mock_auth_response: Dict[str, Any],
+    ) -> None:
         """On a Redis cache miss, _refresh_token fetches from Spotify and writes to Redis."""
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
@@ -121,7 +132,9 @@ class TestSpotifyRefreshToken:
         stored = await fake_redis.get("spotify:auth:token")
         assert stored == b"test_access_token_xyz"
 
-    async def test_refresh_token_without_redis_calls_api(self, mock_auth_response):
+    async def test_refresh_token_without_redis_calls_api(
+        self, mock_auth_response: Dict[str, Any]
+    ) -> None:
         """Spotify instance with redis=None always calls the Spotify API."""
         from src.spotify import Spotify
 
@@ -147,7 +160,6 @@ class TestSpotifyRefreshToken:
 
 
 class TestSpotifyTrack:
-
     async def test_track_combines_name_and_artists(self, spotify: Spotify) -> None:
         mock_response = {
             "name": "Bohemian Rhapsody",
@@ -184,7 +196,6 @@ class TestSpotifyTrack:
 
 
 class TestSpotifyPlaylist:
-
     async def test_playlist_returns_list_of_titles(self, spotify: Spotify) -> None:
         mock_response = {
             "items": [
@@ -252,7 +263,6 @@ class TestSpotifyPlaylist:
 
 
 class TestSpotifyHttpCall:
-
     async def test_http_call_raises_on_non_200(self, spotify: Spotify) -> None:
         spotify.auth_token = "prefetched_token"
         spotify.token_expiry = time.time() + 3600  # skip _refresh_token
@@ -296,7 +306,6 @@ class TestSpotifyHttpCall:
 
 
 class TestSpotifyRedisCache:
-
     async def test_track_cache_hit_skips_http(self, spotify: Spotify) -> None:
         """Second call returns cached value without hitting http_call."""
         with patch.object(

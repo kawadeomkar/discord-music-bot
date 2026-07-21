@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import structlog
 from structlog.typing import EventDict, WrappedLogger
@@ -21,11 +21,18 @@ from opentelemetry.util.types import Attributes
 
 from src.config import ENVIRONMENT
 
+if TYPE_CHECKING:
+    # The SDK providers are imported lazily inside _setup_traces/_setup_logs so the
+    # exporter stack is only pulled in when telemetry is actually enabled. These
+    # type-only imports let the globals below carry their real types regardless.
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk.trace import TracerProvider
+
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
-_tracer_provider: Optional[object] = None
-_log_provider: Optional[object] = None
+_tracer_provider: Optional["TracerProvider"] = None
+_log_provider: Optional["LoggerProvider"] = None
 
 # discord.py makes these HTTP calls during startup with no user-visible parent.
 # Suppress them to avoid cluttering Tempo with orphaned root spans.
@@ -87,11 +94,11 @@ def setup_telemetry() -> None:
 def shutdown_telemetry() -> None:
     """Flush and shut down OTel exporters. Called from MusicBotApp.close() via executor."""
     if _tracer_provider is not None:
-        _tracer_provider.force_flush()  # type: ignore[union-attr]
-        _tracer_provider.shutdown()  # type: ignore[union-attr]
+        _tracer_provider.force_flush()
+        _tracer_provider.shutdown()
     if _log_provider is not None:
-        _log_provider.force_flush()  # type: ignore[union-attr]
-        _log_provider.shutdown()  # type: ignore[union-attr]
+        _log_provider.force_flush()
+        _log_provider.shutdown()
 
 
 def get_tracer(name: str) -> trace.Tracer:
