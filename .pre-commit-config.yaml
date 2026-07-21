@@ -1,4 +1,4 @@
-# Git hooks. Install them with `make hooks`.
+# Git hooks. Install them with `just hooks`.
 #
 # These are a CONVENIENCE, never the gate. Hooks are per-clone, absent on a fresh
 # checkout, and one `--no-verify` from being skipped — so nothing whose absence
@@ -9,7 +9,7 @@
 # The split across stages is a time budget, and it is the whole design:
 #
 #   pre-commit  ruff (~0.13s) + trivia    fast enough to never think about
-#   pre-push    make check (~24s)         the "will CI pass" gate, once per push
+#   pre-push    just check (~24s)         the "will CI pass" gate, once per push
 #
 # pyright (6s) and pytest (14s) are deliberately NOT on pre-commit. A hook slow
 # enough to interrupt your train of thought is a hook that teaches you to reach
@@ -28,7 +28,7 @@ default_install_hook_types: [pre-commit, pre-push]
 #
 # This covers only hooks that declare no stages of their own. Three of the
 # pre-commit-hooks below ship upstream stages that outrank it and opt out
-# individually; make-check opts back IN to pre-push.
+# individually; just-check opts back IN to pre-push.
 default_stages: [pre-commit]
 
 # coverage.json is a generated artifact that happens to be tracked (last written
@@ -41,7 +41,7 @@ exclude: '^coverage\.json$'
 repos:
   # rev must match the ruff version in pyproject.toml's lint group: the hook runs
   # ruff from its own isolated env, so a drift here means the hook formats one way
-  # and `make lint` / CI checks another. `make hooks-update` bumps this; bump the
+  # and `just lint` / CI checks another. `just hooks-update` bumps this; bump the
   # poetry constraint in the same commit.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.21
@@ -76,9 +76,19 @@ repos:
 
   - repo: local
     hooks:
-      - id: make-check
-        name: make check (ruff + pyright + pytest)
-        entry: make check
+      - id: just-check
+        name: just check (ruff + pyright + pytest)
+        # `language: system` runs this against git's ambient PATH, so `just` must be
+        # installed system-wide -- see the README's Requirements. Do NOT "fix" that
+        # with `language: python` + `additional_dependencies: [rust-just]`:
+        # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
+        # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
+        # inside a venv containing only `just`. Measured, not theorised.
+        #
+        # Unlike `make`, this CAN fail for want of the runner. A push from a GUI
+        # client with a minimal PATH may not find `just`; --no-verify is the escape
+        # hatch, as it always was.
+        entry: just check
         language: system
         # Whole-repo gate: pyright is a whole-program analysis and the test suite
         # is not partitioned by path, so passing filenames would be meaningless.
@@ -89,3 +99,12 @@ repos:
         # on precisely the change most likely to break the build.
         always_run: true
         stages: [pre-push]
+
+      # Keeps the task file canonically formatted, which `make` had no equivalent
+      # for. Runs on commit rather than push: it is ~0.01s and only fires when the
+      # justfile itself is staged. Same PATH requirement as just-check above.
+      - id: just-fmt
+        name: just --fmt --check
+        entry: just --fmt --check --justfile
+        language: system
+        files: ^justfile$

@@ -65,7 +65,7 @@ resolve_environment() {
     export ENVIRONMENT
 }
 
-# The gate every deploy passes, delegated to `make check` so there is exactly ONE
+# The gate every deploy passes, delegated to `just check` so there is exactly ONE
 # definition of "will CI pass".
 #
 # The old build.sh kept its own copy of the gate and ran it in a container over
@@ -75,12 +75,12 @@ resolve_environment() {
 # pyright at all), and wrapping 0.13s of ruff in an image build plus two
 # container starts made the fast checks slow enough to skip.
 #
-# The image is still tested end-to-end — by `make container-test`, mirroring CI's
+# The image is still tested end-to-end — by `just container-test`, mirroring CI's
 # container-test job. That is a different question (does the IMAGE run?) and it
-# belongs in `make ci`, not in front of every deploy.
+# belongs in `just ci`, not in front of every deploy.
 run_test_gate() {
-    echo "Running gate: make check"
-    make check
+    echo "Running gate: just check"
+    just check
 }
 
 # build_runtime_image <tag> [extra tags...] — the runtime image every pipeline
