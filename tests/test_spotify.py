@@ -70,7 +70,7 @@ class TestSpotifyRefreshToken:
         await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
 
         factory_calls: list = []
-        spotify._session_factory = lambda **kw: factory_calls.append(1)  # type: ignore[func-returns-value]
+        spotify._session_factory = lambda **kw: factory_calls.append(1)
 
         await spotify._refresh_token()
 
@@ -143,7 +143,6 @@ class TestSpotifyRefreshToken:
 
 
 class TestSpotifyTrack:
-
     async def test_track_combines_name_and_artists(self, spotify):
         mock_response = {
             "name": "Bohemian Rhapsody",
@@ -180,7 +179,6 @@ class TestSpotifyTrack:
 
 
 class TestSpotifyPlaylist:
-
     async def test_playlist_returns_list_of_titles(self, spotify):
         mock_response = {
             "items": [
@@ -246,7 +244,6 @@ class TestSpotifyPlaylist:
 
 
 class TestSpotifyHttpCall:
-
     async def test_http_call_raises_on_non_200(self, spotify):
         spotify.auth_token = "prefetched_token"
         spotify.token_expiry = time.time() + 3600  # skip _refresh_token
@@ -290,7 +287,6 @@ class TestSpotifyHttpCall:
 
 
 class TestSpotifyRedisCache:
-
     async def test_track_cache_hit_skips_http(self, spotify):
         """Second call returns cached value without hitting http_call."""
         with patch.object(

@@ -3,13 +3,19 @@
 import dataclasses
 import logging
 from types import SimpleNamespace
+from typing import cast
 
+import discord
+import orjson
 import pytest
 
+from src.sources import YTSource
+from src.youtube import YTDL, QueueObject
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
+    HistoryEntry,
     NowPlayingData,
     SearchQueueEntry,
     SongQueueEntry,
@@ -197,43 +203,70 @@ class TestGuildStateDataImmutability:
     def test_frozen_assignment_raises(self):
         data = GuildStateData()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            data.volume = 0.5  # type: ignore[misc]
+            setattr(data, "volume", 0.5)
 
     def test_slots_reject_unknown_attributes(self):
         data = GuildStateData()
         with pytest.raises((AttributeError, TypeError)):
-            data.unknown_attr = 1  # type: ignore[attr-defined]
+            setattr(data, "unknown_attr", 1)
 
 
-def _full_song_stub() -> SimpleNamespace:
-    return SimpleNamespace(
-        title="Test Song",
-        webpage_url="https://youtu.be/abc",
-        uploader="Test Channel",
-        duration="4:00",
-        thumbnail="https://img/x.jpg",
-        views=1000,
-        likes=50,
-        abr=128,
-        asr=48000,
-        acodec="opus",
-        requester=SimpleNamespace(id=333, mention="<@333>"),
+def _requester_stub(user_id: int, mention: str | None = None) -> discord.Member:
+    """A stand-in for the requester Member.
+
+    from_song/from_queue_object only ever read .id and .mention off it, and a
+    real Member needs a live connection state to construct.
+    """
+    return cast(
+        discord.Member,
+        SimpleNamespace(id=user_id, mention=mention or f"<@{user_id}>"),
     )
 
 
-def _empty_song_stub() -> SimpleNamespace:
-    return SimpleNamespace(
-        title=None,
-        webpage_url=None,
-        uploader=None,
-        duration=None,
-        thumbnail=None,
-        views=None,
-        likes=None,
-        abr=None,
-        asr=None,
-        acodec=None,
-        requester=None,
+def _full_song_stub() -> YTDL:
+    """A stand-in for a streamed song.
+
+    YTDL subclasses FFmpegOpusAudio, so building a real one spawns an FFmpeg
+    subprocess. NowPlayingData.from_song only reads plain metadata attributes,
+    so a namespace carrying them is a faithful substitute.
+    """
+    return cast(
+        YTDL,
+        SimpleNamespace(
+            title="Test Song",
+            webpage_url="https://youtu.be/abc",
+            uploader="Test Channel",
+            duration="4:00",
+            duration_secs=240,
+            thumbnail="https://img/x.jpg",
+            views=1000,
+            likes=50,
+            abr=128,
+            asr=48000,
+            acodec="opus",
+            requester=_requester_stub(333),
+        ),
+    )
+
+
+def _empty_song_stub() -> YTDL:
+    """As _full_song_stub, with every optional metadata field unset."""
+    return cast(
+        YTDL,
+        SimpleNamespace(
+            title=None,
+            webpage_url=None,
+            uploader=None,
+            duration=None,
+            duration_secs=0,
+            thumbnail=None,
+            views=None,
+            likes=None,
+            abr=None,
+            asr=None,
+            acodec=None,
+            requester=None,
+        ),
     )
 
 
@@ -259,6 +292,19 @@ class TestNowPlayingDataFromSong:
         assert data.view_count == ""
         assert data.requester_id == ""
         assert data.requester_mention == "Unknown"
+
+    def test_duration_blank_when_unknown(self):
+        """A livestream has duration_secs == 0 but a non-empty duration string
+        ("0:00"). Storing that would make the recovered embed claim a real
+        length of zero; blank means the Duration line is omitted entirely,
+        matching the live embed, which draws no bar in the same case."""
+        song = cast(
+            YTDL,
+            SimpleNamespace(
+                **{**vars(_full_song_stub()), "duration": "0:00", "duration_secs": 0},
+            ),
+        )
+        assert NowPlayingData.from_song(song).duration == ""
 
 
 class TestNowPlayingDataFromRedis:
@@ -294,7 +340,7 @@ class TestNowPlayingDataImmutability:
     def test_frozen_assignment_raises(self):
         data = NowPlayingData()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            data.title = "x"  # type: ignore[misc]
+            setattr(data, "title", "x")
 
 
 # ── Queue-entry value objects ─────────────────────────────────────────────────
@@ -322,9 +368,6 @@ _GOLDEN_QOBJ_UNPERSISTED = (
 )
 _GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
-_GOLDEN_LEGACY_NO_TYPE = (
-    b'{"webpage_url":"https://yt.com/v=3","title":"Legacy","requester_id":7,"ts":null}'
-)
 
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
@@ -362,13 +405,6 @@ class TestSongQueueEntryWire:
     def test_reader_parses_golden_bytes(self):
         assert parse_queue_entry(_GOLDEN_QOBJ_FULL) == _FULL_ENTRY
 
-    def test_reader_parses_legacy_entry_without_type_as_song(self):
-        entry = parse_queue_entry(_GOLDEN_LEGACY_NO_TYPE)
-        assert isinstance(entry, SongQueueEntry)
-        assert entry.webpage_url == "https://yt.com/v=3"
-        assert entry.requester_id == 7
-        assert entry.persisted is True  # default when field absent
-
     def test_reader_preserves_persisted_false(self):
         entry = parse_queue_entry(_GOLDEN_QOBJ_UNPERSISTED)
         assert isinstance(entry, SongQueueEntry)
@@ -401,10 +437,10 @@ class TestSongQueueEntryWire:
         assert entry.requester_id == 222222222222222222  # no float path
 
     def test_from_queue_object(self):
-        item = SimpleNamespace(
+        item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
-            requester=SimpleNamespace(id=222222222222222222),
+            requester=_requester_stub(222222222222222222),
             ts=30,
             user_input="golden song",
             duration=240,
@@ -418,10 +454,10 @@ class TestSongQueueEntryWire:
         assert SongQueueEntry.from_queue_object(item) == _FULL_ENTRY
 
     def test_from_queue_object_carries_playnow_flags(self):
-        item = SimpleNamespace(
+        item = QueueObject(
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
-            requester=SimpleNamespace(id=222222222222222222),
+            requester=_requester_stub(222222222222222222),
             ts=151,
             user_input=None,
             duration=240,
@@ -452,7 +488,7 @@ class TestSearchQueueEntryWire:
         assert parse_queue_entry(entry.to_redis()) == entry
 
     def test_from_ytsource(self):
-        source = SimpleNamespace(ytsearch="ytsearch:x", url=None, process=True, ts=None)
+        source = YTSource(ytsearch="ytsearch:x", url=None, process=True, ts=None)
         entry = SearchQueueEntry.from_ytsource(source)
         assert entry == SearchQueueEntry(ytsearch="ytsearch:x", process=True)
 
@@ -472,32 +508,123 @@ class TestParseQueueEntryCorrupt:
         assert "corrupt queue entry" in caplog.text
 
 
+def _history_entry(**overrides) -> HistoryEntry:
+    fields: dict = dict(
+        title="Song Title",
+        webpage_url="https://yt.com/v=1",
+        duration_secs=242,
+        played_secs=225,
+        requester_id=42,
+        requester_name="Omkar",
+        thumbnail="https://i.ytimg.com/t.jpg",
+        uploader="Chan",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
+
+
 class TestHistoryEntryWire:
     def test_golden_bytes(self):
-        # Wire format pinned: entries written before the migration are
-        # JSON-encoded strings and must stay readable across restarts.
-        assert (
-            serialize_history_entry("Song Title - https://yt.com/v=1")
-            == b'"Song Title - https://yt.com/v=1"'
+        # Wire format pinned: rolling restarts mix writers, so the field
+        # names and value encodings must not drift.
+        assert serialize_history_entry(_history_entry()) == (
+            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0}'
         )
 
     def test_round_trip(self):
-        entry = "Song Title - https://yt.com/v=1"
+        entry = _history_entry()
         assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+    def test_unknown_keys_ignored_and_missing_keys_default(self):
+        # Forward/backward tolerance: a newer writer's extra field must not
+        # break this reader, and absent fields become zero-values.
+        raw = orjson.dumps({"title": "x", "future_field": 1})
+        assert parse_history_entry(raw) == HistoryEntry(title="x")
 
     @pytest.mark.parametrize(
         "raw",
         [
             b"not json at all",
-            b'{"a": "json object, not a string"}',
             b"123",
+            b"[1, 2]",
             b"",
+            # Pre-overhaul "<title> - <url>" strings: the deployment storage
+            # was recreated, so these no longer parse — they drop as corrupt.
+            b'"Old Song - https://yt.com/v=old"',
+            b'{"title": "x", "duration_secs": "not a number"}',
+            b'{"title": "x", "played_at": {"nested": true}}',
         ],
     )
     def test_corrupt_entry_dropped_with_warning(self, raw, caplog):
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_history_entry(raw) is None
         assert "corrupt history entry" in caplog.text
+
+
+def _history_song_stub(**overrides) -> YTDL:
+    fields: dict = dict(
+        title="Test Song",
+        webpage_url="https://youtu.be/abc",
+        uploader="Test Channel",
+        duration_secs=242,
+        position_secs=225.0,
+        thumbnail="https://img/x.jpg",
+        requester=SimpleNamespace(id=333, display_name="Omkar"),
+    )
+    fields.update(overrides)
+    return cast(YTDL, SimpleNamespace(**fields))
+
+
+class TestHistoryEntryFromSong:
+    def test_maps_song_fields(self):
+        entry = HistoryEntry.from_song(_history_song_stub(), played_at=1752530000.0)
+        assert entry == HistoryEntry(
+            title="Test Song",
+            webpage_url="https://youtu.be/abc",
+            duration_secs=242,
+            played_secs=225,
+            requester_id=333,
+            requester_name="Omkar",
+            thumbnail="https://img/x.jpg",
+            uploader="Test Channel",
+            played_at=1752530000.0,
+        )
+
+    def test_played_secs_is_position_reached(self):
+        song = _history_song_stub(position_secs=100.4)
+        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 100
+
+    def test_played_secs_capped_at_duration(self):
+        # position can exceed duration by fractions of a frame at natural end.
+        song = _history_song_stub(position_secs=243.02)
+        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 242
+
+    def test_unknown_duration_leaves_position_uncapped(self):
+        song = _history_song_stub(duration_secs=0, position_secs=99.6)
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.duration_secs == 0
+        assert entry.played_secs == 100
+
+    def test_no_requester_degrades_to_zero_values(self):
+        song = _history_song_stub(requester=None)
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.requester_id == 0
+        assert entry.requester_name == ""
+
+    def test_none_metadata_degrades_to_zero_values(self):
+        # yt-dlp can return None for any metadata field.
+        song = _history_song_stub(
+            title=None, webpage_url=None, uploader=None, thumbnail=None
+        )
+        entry = HistoryEntry.from_song(song, played_at=1.0)
+        assert entry.title == ""
+        assert entry.webpage_url == ""
+        assert entry.uploader == ""
+        assert entry.thumbnail == ""
 
 
 class TestFromCrashedState:
@@ -582,7 +709,7 @@ class TestGuildPlaybackSnapshot:
     def test_frozen(self):
         snap = GuildPlaybackSnapshot(state=GuildStateData())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            snap.queue = ()  # type: ignore[misc]
+            setattr(snap, "queue", ())
 
 
 class TestGuildRecoveryGate:
@@ -607,15 +734,15 @@ class TestGuildRecoveryGate:
     def test_frozen(self):
         gate = GuildRecoveryGate(state=GuildStateData())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            gate.pending_count = 5  # type: ignore[misc]
+            setattr(gate, "pending_count", 5)
 
 
 class TestQueueEntryImmutability:
     def test_song_entry_frozen(self):
         with pytest.raises(dataclasses.FrozenInstanceError):
-            _FULL_ENTRY.title = "x"  # type: ignore[misc]
+            setattr(_FULL_ENTRY, "title", "x")
 
     def test_search_entry_frozen(self):
         entry = SearchQueueEntry()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            entry.url = "x"  # type: ignore[misc]
+            setattr(entry, "url", "x")

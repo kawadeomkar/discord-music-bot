@@ -2,7 +2,8 @@
 
 import logging
 
-from src.util import get_logger, queue_message
+from src.guild_state import HistoryEntry
+from src.util import fmt_duration, get_logger, history_embeds, queue_message
 
 
 class TestQueueMessage:
@@ -85,3 +86,112 @@ class TestGetLogger:
         logger_b = get_logger("module.b")
         assert logger_a is not logger_b
         assert logger_a.name != logger_b.name
+
+
+class TestFmtDuration:
+    """The one clock formatter — progress bar, queue/pause/skip lines, history,
+    and YTDL.duration all render through this."""
+
+    def test_minutes_seconds(self):
+        assert fmt_duration(225) == "3:45"
+
+    def test_hours_zero_pads_minutes_and_seconds(self):
+        assert fmt_duration(3725) == "1:02:05"
+
+    def test_zero(self):
+        assert fmt_duration(0) == "0:00"
+
+    def test_negative_clamps_to_zero(self):
+        assert fmt_duration(-5) == "0:00"
+
+    def test_under_a_minute(self):
+        assert fmt_duration(7) == "0:07"
+
+    def test_exactly_one_hour(self):
+        # Boundary: the hours branch must engage at exactly 3600, not above it.
+        assert fmt_duration(3600) == "1:00:00"
+
+    def test_minute_rollover_pads_seconds(self):
+        assert fmt_duration(61) == "1:01"
+
+
+def _rich_entry(**overrides) -> HistoryEntry:
+    fields: dict = dict(
+        title="Rich Song",
+        webpage_url="https://yt.com/v=rich",
+        duration_secs=242,
+        played_secs=225,
+        requester_id=42,
+        requester_name="Omkar",
+        thumbnail="https://i.ytimg.com/t.jpg",
+        uploader="Chan",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
+
+
+class TestHistoryEmbeds:
+    def test_layout_title_url_then_info_line(self):
+        # Plan §6: numbered title; webpage_url on its own line beneath it;
+        # played/duration · requester · absolute timestamp on ONE line below.
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.title == "1. Rich Song"
+        assert embed.description is not None
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>",
+        ]
+
+    def test_numbering_follows_given_order(self):
+        embeds = history_embeds([_rich_entry(), _rich_entry(title="Second")])
+        assert embeds[0].title == "1. Rich Song"
+        assert embeds[1].title == "2. Second"
+
+    def test_thumbnail_set_when_present(self):
+        [embed] = history_embeds([_rich_entry()])
+        assert embed.thumbnail.url == "https://i.ytimg.com/t.jpg"
+
+    def test_no_thumbnail_when_absent(self):
+        [embed] = history_embeds([_rich_entry(thumbnail="")])
+        assert embed.thumbnail.url is None
+
+    def test_requester_mention_survives_member_departure(self):
+        # The raw <@id> mention needs no member cache to render.
+        [embed] = history_embeds([_rich_entry(requester_id=999)])
+        assert embed.description is not None
+        assert "<@999>" in embed.description
+
+    def test_requester_name_fallback_when_id_unknown(self):
+        [embed] = history_embeds(
+            [_rich_entry(requester_id=0, requester_name="SomeUser")]
+        )
+        assert embed.description is not None
+        assert "requested by SomeUser" in embed.description
+
+    def test_timestamp_omitted_when_played_at_unknown(self):
+        # played_at == 0 means unknown; <t:0:f> would render "1 January 1970".
+        [embed] = history_embeds([_rich_entry(played_at=0.0)])
+        assert embed.description is not None
+        assert "<t:" not in embed.description
+        assert embed.description.splitlines() == [
+            "https://yt.com/v=rich",
+            "3:45 / 4:02 · requested by <@42>",
+        ]
+
+    def test_over_length_title_truncated_to_discord_limit(self):
+        # Discord rejects any embed title > 256 chars, failing the whole send.
+        [embed] = history_embeds([_rich_entry(title="x" * 300)])
+        assert embed.title is not None
+        assert len(embed.title) == 256
+        assert embed.title.endswith("…")
+
+    def test_title_at_limit_not_truncated(self):
+        # "1. " (3) + 253 = 256 exactly — must pass through untouched.
+        [embed] = history_embeds([_rich_entry(title="y" * 253)])
+        assert embed.title == "1. " + "y" * 253
+        assert embed.title is not None
+        assert "…" not in embed.title
+
+    def test_empty_input(self):
+        assert history_embeds([]) == []
