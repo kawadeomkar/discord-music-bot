@@ -1,7 +1,16 @@
 import asyncio
 import contextlib
 from itertools import islice
-from typing import Any, AsyncGenerator, Coroutine, List, Optional, Union, assert_never
+from typing import (
+    Any,
+    AsyncGenerator,
+    Coroutine,
+    List,
+    Optional,
+    Union,
+    assert_never,
+    cast,
+)
 
 import discord
 from discord.ext import commands
@@ -329,7 +338,11 @@ class MusicBot(commands.Cog):
         # nothing is playing to interrupt.
         enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(source, SpotifySource):
-            titles: List[str] = qobj  # type: ignore[assignment]
+            # queue_source() correlates element type with source type: a
+            # SpotifySource playlist resolves via Spotify.playlist() to track
+            # titles. The union can't express that correlation because the
+            # playlist/track split is on source.type, a runtime field.
+            titles = cast(List[str], qobj)
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
@@ -347,7 +360,9 @@ class MusicBot(commands.Cog):
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
             )
-            tracks: List[QueueObject] = qobj  # type: ignore[assignment]
+            # Mirror of the Spotify branch above: a YTSource playlist resolves
+            # via YTDL.yt_playlist() to fully-formed QueueObjects.
+            tracks = cast(List[QueueObject], qobj)
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
             await asyncio.gather(
@@ -357,7 +372,7 @@ class MusicBot(commands.Cog):
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
-                enqueue(tracks, prefetch=False),  # type: ignore[arg-type]
+                enqueue(tracks, prefetch=False),
                 ctx.message.add_reaction("👍"),
             )
 
@@ -1409,7 +1424,7 @@ class MusicBot(commands.Cog):
 
                 notify_channel: Optional[discord.TextChannel] = None
                 if text_ok:
-                    notify_channel = text_channel  # type: ignore[assignment]
+                    notify_channel = text_channel
                 elif guild.me is not None:
                     if (
                         guild.system_channel is not None

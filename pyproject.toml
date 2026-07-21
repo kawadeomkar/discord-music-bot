@@ -45,8 +45,21 @@ pyright = "^1.1.409"
 ruff = "^0.15.20"
 
 [tool.pyright]
+# The single source of truth for pyright, read by both CI and Pylance. Settings
+# lived here AND in a gitignored pyrightconfig.json, which silently won wherever
+# it existed — so editors ran one config and CI another. Do not reintroduce that
+# file: pyrightconfig.json takes precedence over this section and would make
+# everything below dead config again.
 pythonVersion = "3.14"
 typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+# Without this, an unnecessary suppression is invisible. The mypy-style
+# `# type: ignore[code]` comments this repo used to carry were blanket pyright
+# suppressions (there is no mypy here): 11 of them silenced nothing, and the
+# rest hid 12 real errors. Prefer `# pyright: ignore[reportSomeRule]`, which
+# names the rule and trips this check once it stops being needed.
+reportUnnecessaryTypeIgnoreComment = "error"
 
 [tool.ruff]
 target-version = "py314"

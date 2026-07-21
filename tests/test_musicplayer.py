@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import re
 import time
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -1357,7 +1358,9 @@ class TestFinalizeCompletion:
             await music_player._finalize_now_playing(
                 mock_song, message, [], completed=True
             )
-        assert push.await_args.kwargs["position_override"] == mock_song.duration_secs
+        push_call = push.await_args
+        assert push_call is not None
+        assert push_call.kwargs["position_override"] == mock_song.duration_secs
 
     async def test_incomplete_renders_true_position(self, music_player, mock_song):
         """position_override=None makes _build_now_playing_embed fall back to
@@ -1367,13 +1370,17 @@ class TestFinalizeCompletion:
             await music_player._finalize_now_playing(
                 mock_song, message, [], completed=False
             )
-        assert push.await_args.kwargs["position_override"] is None
+        push_call = push.await_args
+        assert push_call is not None
+        assert push_call.kwargs["position_override"] is None
 
     async def test_defaults_to_completed(self, music_player, mock_song):
         message = MagicMock(spec=discord.Message)
         with patch.object(MusicPlayer, "_push_np_edit", new=AsyncMock()) as push:
             await music_player._finalize_now_playing(mock_song, message, [])
-        assert push.await_args.kwargs["position_override"] == mock_song.duration_secs
+        push_call = push.await_args
+        assert push_call is not None
+        assert push_call.kwargs["position_override"] == mock_song.duration_secs
 
     async def test_no_edit_without_duration(self, music_player, mock_song):
         mock_song.duration_secs = 0
@@ -4452,6 +4459,7 @@ class TestRestoreStateNowPlaying:
 
         assert music_player.play_message is not None
         assert isinstance(music_player.play_message, discord.Embed)
+        assert music_player.play_message.title is not None
         assert "Restored Song" in music_player.play_message.title
 
     async def test_play_message_none_when_no_now_playing_in_redis(self, music_player):
@@ -5206,11 +5214,23 @@ class TestPlaynowLoopStart:
             await music_player.loop()
         return pause_mock, announce_mock
 
-    def _vc(self):
+    def _vc(self) -> discord.VoiceClient:
+        """A VoiceClient whose play/pause are mocks, built without __init__.
+
+        Deliberately a real instance rather than MagicMock(spec=...): any
+        attribute the loop touches beyond these two should fail loudly, not
+        hand back a truthy mock that quietly steers the loop down another path.
+        Read the mocks back with _mock_call(vc, "pause").
+        """
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
         vc.pause = MagicMock()
         return vc
+
+    @staticmethod
+    def _mock_call(vc: discord.VoiceClient, name: str) -> MagicMock:
+        """Return a VoiceClient method that _vc replaced with a MagicMock."""
+        return cast(MagicMock, getattr(vc, name))
 
     async def test_start_paused_parks_synchronously_and_engages_bookkeeping(
         self, music_player, queue_obj, mock_song
@@ -5219,7 +5239,7 @@ class TestPlaynowLoopStart:
         vc = self._vc()
         pause_mock, _ = await self._run_one_song(music_player, queue_obj, mock_song, vc)
         # Synchronous park right after vc.play (frame-leak guard) …
-        vc.pause.assert_called_once()
+        self._mock_call(vc, "pause").assert_called_once()
         # … plus the full pause() entry point (Redis epochs, debounced refresh).
         pause_mock.assert_awaited_once()
 
@@ -5240,6 +5260,6 @@ class TestPlaynowLoopStart:
         pause_mock, announce_mock = await self._run_one_song(
             music_player, queue_obj, mock_song, vc
         )
-        vc.pause.assert_not_called()
+        self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
