@@ -48,14 +48,30 @@ plain text search query                          # searches YouTube automaticall
 
 ## Requirements
 
-- Python 3.14+ (`pyproject.toml` pins `requires-python = '>=3.14,<4.0'`)
-- [Poetry](https://python-poetry.org/) 2.x
-- [FFmpeg](https://ffmpeg.org/)
+Two audiences, two answers.
 
-To *contribute* rather than run the bot locally, Docker alone is enough — see
-`DOCKER=1` under [Make targets](#make-targets).
+**To run the bot** — Docker, plus credentials:
+
 - A [Discord bot token](https://discord.com/developers/applications)
 - A [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret)
+
+That is the whole list. `docker compose up` needs nothing else.
+
+**To contribute**, add:
+
+- [`just`](https://just.systems) — the task runner every command below goes
+  through (`brew install just`)
+- [Poetry](https://python-poetry.org/) 2.x
+- Python 3.14+ (`pyproject.toml` pins `requires-python = '>=3.14,<4.0'`)
+- [FFmpeg](https://ffmpeg.org/)
+
+`just` has to be installed properly, not just present in the virtualenv. `just
+install` does put a copy at `.venv/bin/just`, but a virtualenv's `bin/` is only on
+your `PATH` while the environment is activated — and the pre-push git hook runs
+`just check` in whatever environment git hands it. Install it system-wide.
+
+With `just` and Docker you can skip Poetry, Python and FFmpeg entirely: every
+check runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
 
 ## Local setup
 
@@ -83,96 +99,115 @@ SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 poetry run bot
 ```
 
-Contributors should use `make install` instead of `poetry install` — it adds the
-`test` and `lint` dependency groups that `make check` needs.
+Contributors should use `just install` instead of `poetry install` — it adds the
+`test`, `lint` and `dev` dependency groups that `just check` needs.
 
-## Make targets
+Every recipe below assumes an activated virtualenv (or `poetry run just <recipe>`,
+which works without one).
 
-`make` is the task index: one verb per entry point, so you can run just the thing
-you need. Run `make` on its own to list every target with its description.
+## Just recipes
+<a id="just-recipes"></a>
+
+[`just`](https://just.systems) is the task index: one verb per entry point, so you
+can run only the thing you need. Run `just` on its own to list every recipe with
+its description, grouped by what it is for.
 
 Multi-step *pipelines* stay in the shell scripts (`./build_docker.sh`,
-`./deploy_docker.sh`); the Makefile is the index over the primitives they compose.
+`./deploy_docker.sh`); the justfile is the index over the primitives they compose.
 
-**Only have Docker?** Add `DOCKER=1` to any of `fmt`, `lint`, `types`, `test` or
-`check` and it runs inside the test image instead of a local virtualenv — no
-Python, no Poetry, no Node needed on your machine:
+**Only have Docker and `just`?** Prefix `DOCKER=1` to `fmt`, `fmt-check`, `lint`,
+`types`, `test` or `check` and it runs inside the test image instead of a local
+virtualenv — no Python, no Poetry, no Node needed on your machine:
 
 ```bash
-make check DOCKER=1    # the full gate, container-only  (~31s)
-make fmt   DOCKER=1    # ruff rewrites YOUR files, not the image's
+DOCKER=1 just check    # the full gate, container-only  (~31s)
+DOCKER=1 just fmt      # ruff rewrites YOUR files, not the image's
 ```
+
+The prefix has to come **before** the recipe name. `just check DOCKER=1` is an
+error (`just` reads it as a second recipe to run), unlike `make check DOCKER=1`.
 
 `src/`, `tests/` and `pyproject.toml` are bind-mounted, so the container reads and
 writes your working tree. Formatting runs as your uid, so rewritten files stay
 yours rather than turning up root-owned. The image is built automatically the
 first time; after changing `pyproject.toml` or `poetry.lock`, run
-`make test-image-rebuild` so the container picks up the new dependencies.
+`just test-image-rebuild` so the container picks up the new dependencies.
 
-The native path stays the default because it is faster (~24s vs ~31s, and ~0.1s
-vs ~0.6s for a bare `make lint` — the difference is container startup).
+The native path stays the default because it is faster (~24s vs ~31s, and ~0.05s
+vs ~0.6s for a bare `just lint` — the difference is container startup).
 
 **Setup**
 
-| Target | Does |
+| Recipe | Does |
 |---|---|
-| `make install` | Create the venv with main + test + lint dependencies |
-| `make hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
-| `make hooks-run` | Run every hook against every file, not just staged ones |
-| `make hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
-| `make test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
+| `just install` | Create the venv with main + test + lint + dev dependencies |
+| `just hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
+| `just hooks-run` | Run every hook against every file, not just staged ones |
+| `just hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
+| `just test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
 
 **Develop** — the inner loop, fastest first
 
-| Target | Does | Cost |
+| Recipe | Does | Cost |
 |---|---|---|
-| `make fmt` | Format and auto-fix `src/` and `tests/` — **rewrites files** | ~0.1s |
-| `make lint` | `ruff format --check` + `ruff check`, no rewrites | ~0.1s |
-| `make types` | pyright over `src/` **and** `tests/` | ~6s |
-| `make test` | pytest with coverage | ~13s |
-| `make check` | `lint` + `types` + `test` — **run this before pushing** | ~24s |
-| `make container-test` | Build the test image and run the suite inside it | ~1min |
-| `make ci` | `check` + `container-test` — full local mirror of CI | ~1.5min |
+| `just fmt` | Format and auto-fix `src/` and `tests/` — **rewrites files** | ~0.1s |
+| `just fmt-check` | `ruff format --check`, no rewrites | ~0.05s |
+| `just lint` | `ruff check`, no rewrites | ~0.05s |
+| `just types` | pyright over `src/` **and** `tests/` | ~6s |
+| `just test` | pytest with coverage | ~13s |
+| `just check` | `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~24s |
+| `just container-test` | Build the test image and run the suite inside it | ~1min |
+| `just ci` | `check` + `container-test` — full local mirror of CI | ~1.5min |
+
+`just test` forwards extra arguments to pytest, which `make` could not do:
+
+```bash
+just test tests/test_youtube.py    # one file
+just test -k spotify               # one pattern
+just test --maxfail=1              # stop at the first failure
+```
 
 **Build**
 
-| Target | Does |
+| Recipe | Does |
 |---|---|
-| `make image` | Build the runtime image as `:latest` and `:<git-sha>` — no test gate |
+| `just image` | Build the runtime image as `:latest` and `:<git-sha>` — no test gate |
 
-`make image` deliberately has no gate. A gate you cannot skip is a gate people
+`just image` deliberately has no gate. A gate you cannot skip is a gate people
 route around, so it lives in the *pipeline* (`./build_docker.sh`) instead. Use
-`make image` when you want the artifact and have already run `make check`.
+`just image` when you want the artifact and have already run `just check`.
 
 **Deploy**
 
-| Target | Does |
+| Recipe | Does |
 |---|---|
-| `make up` | Deploy the already-built image for HEAD |
-| `make down` | Stop the compose stack (volumes are kept) |
-| `make restart` | Restart the running bot in place — does **not** pick up a new image |
-| `make logs` | Follow the bot's logs |
-| `make ps` | Show compose service status |
+| `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA |
+| `just down` | Stop the compose stack (volumes are kept) |
+| `just restart` | Restart the running bot in place — does **not** pick up a new image |
+| `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
+| `just ps` | Show compose service status |
 
-`make up` never builds. If no image exists for the current commit it refuses
+`just up` never builds. If no image exists for the current commit it refuses
 rather than letting Compose build one and label it with that SHA — see
 [Rolling back](#rolling-back).
+
+Shell completions ship in the binary: `just --completions zsh` (or `bash`/`fish`).
 
 **Typical flows**
 
 ```bash
 # Inner loop while writing code
-make fmt && make check
+just fmt && just check
 
 # Ship it: gate → build → deploy, in one step
 ./build_docker.sh
 
 # Same thing, one step at a time
-make check && make image && make up
+just check && just image && just up
 
 # Something's wrong in production
-make logs
-./deploy_docker.sh <last-good-sha>
+just logs
+just up <last-good-sha>
 ```
 
 ## Docker
@@ -184,13 +219,13 @@ make logs
 ./build_docker.sh
 
 # Or the individual steps
-make check            # lint + type-check + tests (the gate)
-make image            # build the runtime image, no gate
+just check            # lint + type-check + tests (the gate)
+just image            # build the runtime image, no gate
 ./deploy_docker.sh    # deploy the image already built for HEAD
 ```
 
 `build_docker.sh` is a composition of those three — it does not reimplement any of
-them. Its gate *is* `make check`, so there is exactly one definition of "will CI
+them. Its gate *is* `just check`, so there is exactly one definition of "will CI
 pass". `build_common.sh` is a sourced library, not a runnable script; running it
 directly exits 64.
 
@@ -200,7 +235,7 @@ directly exits 64.
 Deploys are separate from builds precisely so this never requires a rebuild:
 
 ```bash
-./deploy_docker.sh <git-sha>   # any SHA whose image is still in the local store
+just up <git-sha>              # any SHA whose image is still in the local store
 docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
 ```
 
@@ -211,8 +246,8 @@ Tags are honest about what went into them: building with uncommitted changes to
 tracked files produces `<git-sha>-dirty`, so a tag never claims to be a commit it
 isn't. A clean tree gives the bare SHA, which is what you roll back to.
 
-`make restart` is not a deploy — it restarts the existing container with the image
-it already has. To run a newly built image, use `make up` (or `./deploy_docker.sh`).
+`just restart` is not a deploy — it restarts the existing container with the image
+it already has. To run a newly built image, use `just up` (or `./deploy_docker.sh`).
 
 The `docker-compose.yml` reads credentials from a `.env` file in the project root and uses host networking.
 
@@ -225,34 +260,41 @@ docker run --env-file .env --network host discord-music-bot
 
 ## Development
 
-Every command lives in the Makefile — see [Make targets](#make-targets) for the
+Every command lives in the justfile — see [Just recipes](#just-recipes) for the
 full list. This section covers the two things worth knowing beyond "what runs".
 
-**`make check` is the contract:** it runs exactly what CI's lint and test jobs
-run, in the same order, so if it passes, CI passes. Nothing else in the repo
-makes that promise — in particular, a successful `./build_docker.sh` used not to,
-because it applied formatting instead of checking it and never ran pyright at all.
+**`just check` is the contract:** if it passes, CI passes. Not because the two
+were written to match, but because CI's lint and test jobs *call these recipes* —
+`just fmt-check`, `just lint`, `just types`, `just test-report`. There is one
+definition of each check and both callers use it. Nothing else in the repo makes
+that promise; in particular, a successful `./build_docker.sh` used not to, because
+it applied formatting instead of checking it and never ran pyright at all.
 
-Keeping that promise true is why `make types` passes `--pythonpath` explicitly:
-pyright resolves imports from the interpreter it is *told* about, and pinning it
-to a path that `make install` does not populate is how "green locally, red in CI"
-gets built in. Every target points at the same venv — `$VIRTUAL_ENV` when one is
-active, otherwise `./.venv`.
+That is also why `just types` passes `--pythonpath` explicitly: pyright resolves
+imports from the interpreter it is *told* about, and pinning it to a path that
+`just install` does not populate is how "green locally, red in CI" gets built in.
+Every recipe points at the same venv — `$VIRTUAL_ENV` when one is active,
+otherwise `./.venv`, which is what CI and the Dockerfile use.
 
 **Git hooks**
 <a id="git-hooks"></a>
 
-`make hooks` installs two stages, deliberately split by how long they take:
+`just hooks` installs two stages, deliberately split by how long they take:
 
 | Stage | Runs | Cost |
 |---|---|---|
-| pre-commit | `ruff check --fix`, `ruff format`, whitespace/YAML/TOML checks | ~0.1s |
-| pre-push | `make check` | ~24s |
+| pre-commit | `ruff check --fix`, `ruff format`, `just --fmt --check`, whitespace/YAML/TOML checks | ~0.1s |
+| pre-push | `just check` | ~24s |
 
 The hooks are a convenience, not the gate — CI still runs every one of these
 checks, and `--no-verify` is always available when you need it. Note that the
 formatting hooks **rewrite files**: a commit that trips one fails and leaves the
 fixes unstaged, so `git add` them and commit again. That is intended behavior.
+
+One caveat that did not apply under `make`: the pre-push hook needs `just` on the
+`PATH` git gives it. `/usr/bin/make` was always there; a `just` that only exists
+inside your virtualenv is not. If a push fails with `just: command not found`,
+that is why — install it system-wide (see [Requirements](#requirements)).
 
 ## Project structure
 

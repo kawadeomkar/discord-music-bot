@@ -17,8 +17,8 @@ source ./build_common.sh
 
 resolve_environment
 
-# Default matches what build_docker.sh / `make image` actually tagged, `-dirty`
-# suffix included — otherwise `make up` after a dirty build looks for a clean-SHA
+# Default matches what build_docker.sh / `just image` actually tagged, `-dirty`
+# suffix included — otherwise `just up` after a dirty build looks for a clean-SHA
 # tag that was never created and the guard below rejects it.
 GIT_SHA="${1:-$(git_sha_tag)}"
 export GIT_SHA

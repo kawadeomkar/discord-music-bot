@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Compose pipeline: gate → image → deploy.
 #
-# This is a composition, not a fourth implementation. The gate is `make check`,
+# This is a composition, not a fourth implementation. The gate is `just check`,
 # the image build is build_common.sh, the deploy is deploy_docker.sh. Nothing
 # here reimplements any of them — keeping its own copy of the gate is exactly how
 # the old build.sh drifted out of sync with CI while still reporting success.
 #
-# Need only one step? `make check`, `make image`, `./deploy_docker.sh`.
+# Need only one step? `just check`, `just image`, `./deploy_docker.sh`.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
