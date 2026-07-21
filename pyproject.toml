@@ -59,6 +59,25 @@ pyright = { version = "^1.1.409", extras = ["nodejs"] }
 ruff = "0.15.21"
 pre-commit = "^4.6.0"
 
+[tool.poetry.group.dev.dependencies]
+# The task runner. Its own group because the two consumers cut across the existing
+# ones: CI's lint job installs main,lint,test and its test job installs main,test,
+# and BOTH call `just`. A group they can each add is the only placement that gives
+# them one binary from one pin — with `rust-just` in `lint`, the test job would have
+# to pull in pyright and its bundled Node just to get a task runner. It also keeps
+# `just` out of the test image, which installs main,test,lint and has no use for a
+# 4.9MB binary.
+#
+# Pinned like ruff and pre-commit and for the same reason: the version CI runs and the
+# version developers run must not drift. `rust-just` is the upstream `just` binary
+# republished on PyPI, so this is the same artifact either way.
+#
+# This is NOT a bootstrap. A venv's bin/ is not on PATH unless the venv is activated,
+# so `poetry install` followed by a bare `just` only works for an activated shell —
+# contributors install `just` system-wide (see README), which is also what makes the
+# pre-push hook work. Keep this >= the justfile's `set minimum-version`.
+rust-just = "1.57.0"
+
 [tool.pyright]
 # The single source of truth for pyright, read by both CI and Pylance. Settings
 # lived here AND in a gitignored pyrightconfig.json, which silently won wherever
