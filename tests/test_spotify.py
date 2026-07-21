@@ -70,7 +70,7 @@ class TestSpotifyRefreshToken:
         await fake_redis.set("spotify:auth:token", b"cached_bearer_token", ex=120)
 
         factory_calls: list = []
-        spotify._session_factory = lambda **kw: factory_calls.append(1)  # type: ignore[func-returns-value]
+        spotify._session_factory = lambda **kw: factory_calls.append(1)
 
         await spotify._refresh_token()
 

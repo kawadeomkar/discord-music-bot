@@ -15,8 +15,10 @@ def app():
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
-    # BotBase stores cogs in a name-mangled dict; initialize it so the property works.
-    instance._BotBase__cogs = {}
+    # BotBase stores cogs in a name-mangled private dict; initialize it so the
+    # property works. Set via setattr: the mangled name is deliberately not part
+    # of BotBase's declared surface, so it is invisible to the type checker.
+    setattr(instance, "_BotBase__cogs", {})
     # discord.Client properties (user, guilds, intents) read from _connection.
     conn = MagicMock()
     conn.user = None
@@ -24,8 +26,10 @@ def app():
     conn.intents = MagicMock()
     conn.intents.voice_states = True
     instance._connection = conn
-    # latency reads self.ws; None → returns float('nan'), which is fine for logging.
-    instance.ws = None
+    # latency reads self.ws and returns float('nan') for any falsy value, which
+    # is fine for logging. MISSING is discord.py's own "not connected yet"
+    # sentinel and is falsy, so it takes that same branch.
+    instance.ws = discord.utils.MISSING
     instance.change_presence = AsyncMock()
     return instance
 
@@ -66,6 +70,18 @@ class TestSetupHook:
 
 
 class TestClose:
+    @pytest.fixture(autouse=True)
+    def stub_blocking_shutdowns(self):
+        """close() hands shutdown_ytdlp_pool and shutdown_telemetry to an executor and
+        awaits them for real. Stub both: the first would join (and null out) the shared
+        extraction pool the conftest fixture pins for every test, and the second blocks on
+        an OTLP force_flush. Both are imported inside close(), so patch them at source."""
+        with (
+            patch("src.youtube.shutdown_ytdlp_pool") as pool_shutdown,
+            patch("src.telemetry.shutdown_telemetry"),
+        ):
+            yield pool_shutdown
+
     async def test_closes_redis_pool_when_set(self, app):
         mock_pool = MagicMock()
         app._redis_pool = mock_pool
@@ -92,6 +108,14 @@ class TestClose:
         ) as mock_super:
             await app.close()
         mock_super.assert_awaited_once()
+
+    async def test_shuts_down_the_ytdlp_pool(self, app, stub_blocking_shutdowns):
+        """The extraction workers are child processes — a clean close must join them
+        rather than leave them orphaned."""
+        app._redis_pool = None
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+        stub_blocking_shutdowns.assert_called_once_with()
 
 
 class TestHelpFlag:

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 import time
 from dataclasses import dataclass
@@ -20,10 +21,12 @@ from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    fmt_duration,
     notice_embed,
     record_span_error,
     send_embed,
     trace_footer,
+    truncate_embed_title,
     get_logger,
 )
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
@@ -40,12 +43,6 @@ _tracer = get_tracer(__name__)
 # Fix is a per-guild timezone setting, or Discord relative timestamps (<t:epoch:R>),
 # which the client renders in each viewer's own locale and would delete this constant.
 _PST = ZoneInfo("America/Los_Angeles")
-
-
-def _fmt_duration(secs: int) -> str:
-    h, r = divmod(secs, 3600)
-    m, s = divmod(r, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def _fmt_total_duration(secs: int) -> str:
@@ -82,7 +79,7 @@ def _requester_mention(
 # dash character, and — unlike a single-color fill — let the played portion
 # render in a visibly different color from the remaining portion. Width is
 # lower than a typical thin-dash bar since each block glyph is much wider.
-_BAR_WIDTH = 12
+_BAR_WIDTH = 10
 _BAR_FILL_DONE = "🟦"
 _BAR_FILL_REMAINING = "⬜"
 _BAR_HEAD = "🔘"
@@ -100,6 +97,20 @@ _MIN_RESUME_REMAINING_SECS = 5
 # crash-recovery position cap in _restore_state().
 _RESUME_EOF_MARGIN_SECS = 10
 
+# ── Progress-bar finalize (docs/PLAY_WHILE_PAUSED_PLAN.md §5) ─────────────────
+# Tolerance for "this song reached its end". Absorbs the drift between yt-dlp's
+# duration metadata and the real stream length, so a song that played out fully
+# still renders a complete bar. Songs that stopped short of this — skipped,
+# interjected, or killed by a mid-song stream death — keep the bar at the
+# position they actually reached instead of being finalized to 100%.
+_SONG_COMPLETE_MARGIN_SECS = 5
+
+# ── Playback gate (docs/PLAYBACK_GATE_PLAN.md) ────────────────────────────────
+# How long loop() waits for a voice connection before tearing the player down.
+# Matches the idle queue_get() timeout so a player that never connects and one
+# that connects but is never given a song disconnect on the same schedule.
+_PLAYBACK_GATE_TIMEOUT = 300
+
 
 @dataclass(frozen=True)
 class InterjectOutcome:
@@ -110,12 +121,35 @@ class InterjectOutcome:
     # None → no resume entry was created (the interrupted song was itself an
     # interjection, was nearly finished, or had no webpage_url to rebuild from).
     resume_position: Optional[int]
-    was_paused: bool
+    was_paused: bool  # the OBSERVED state of the song when it was interrupted
     replaced: bool  # the interrupted song was itself a -playnow interjection
+    # Whether the resume entry will come back PAUSED. Distinct from was_paused:
+    # -playnow restores exactly what it interrupted (paused in → paused out),
+    # while -play on a paused song means "stop being paused, play this" and
+    # brings it back playing. Command wording must key off this, not
+    # was_paused, or a -play interjection would announce "will return paused"
+    # for a song that returns playing (docs/PLAY_WHILE_PAUSED_PLAN.md §4.1).
+    returns_paused: bool = False
 
     @property
     def resume_position_str(self) -> str:
-        return _fmt_duration(self.resume_position or 0)
+        return fmt_duration(self.resume_position or 0)
+
+
+def _reached_end(song: YTDL) -> bool:
+    """Did this song play through to its end?
+
+    The bar is finalized to 100% only when this is True. Answering by position
+    rather than by cause covers every early-termination path at once — -skip,
+    -playnow/-play interjection, and a mid-song stream death that produced
+    audio (which `stream_failed` deliberately does NOT classify as a failure).
+
+    Songs with no known duration return False: there is no bar to complete,
+    and _finalize_now_playing skips them anyway.
+    """
+    if song.duration_secs <= 0:
+        return False
+    return song.position_secs >= song.duration_secs - _SONG_COMPLETE_MARGIN_SECS
 
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
@@ -145,9 +179,7 @@ def _build_progress_bar(
         + _BAR_HEAD
         + _BAR_FILL_REMAINING * (width - head_pos - 1)
     )
-    return (
-        f"`{_fmt_duration(int(elapsed_secs))}` {bar} `{_fmt_duration(duration_secs)}`"
-    )
+    return f"`{fmt_duration(int(elapsed_secs))}` {bar} `{fmt_duration(duration_secs)}`"
 
 
 def _fmt_finish_time(duration_secs: int) -> str:
@@ -160,12 +192,21 @@ def _fmt_finish_time(duration_secs: int) -> str:
     return _fmt_clock_time(finish_dt)
 
 
+# Discord rejects an embed field with an empty value (400, "This field is
+# required") — and a 400 fails the entire send/edit, not just that field. Any
+# value that can legitimately be missing goes through here.
+_FIELD_PLACEHOLDER = "—"
+
+
+def _field_value(value: str) -> str:
+    return value or _FIELD_PLACEHOLDER
+
+
 def _build_now_playing_base_embed(
     *,
     title: str,
     description: str,
     webpage_url: str,
-    duration: str,
     uploader: str,
     views: str,
     likes: str,
@@ -175,14 +216,30 @@ def _build_now_playing_base_embed(
     thumbnail: str,
 ) -> discord.Embed:
     """Shared field layout — used by both the live (YTDL-backed) and
-    Redis-recovery (NowPlayingData-backed) now-playing embed builders."""
+    Redis-recovery (NowPlayingData-backed) now-playing embed builders.
+
+    Channel/Views/Likes are the three inline fields — exactly Discord's
+    per-row cap, so they render as one clean row. Duration is intentionally
+    NOT a field: the live embed's progress bar carries it in its right-hand
+    label, and the recovered embed puts it in the description. The webpage URL
+    is likewise not a field — the title links to it.
+
+    Every value goes through _field_value: Discord rejects an empty field
+    value with a 400, which would fail the whole send/edit rather than just
+    dropping the field. Views/likes are routinely absent (livestreams,
+    creators who hide counts) and a partial Redis hash can blank any of them.
+    """
+    title = truncate_embed_title(title)
     embed = (
-        discord.Embed(title=title, description=description, color=discord.Color.green())
-        .add_field(name="Youtube link", value=webpage_url, inline=False)
-        .add_field(name="Duration", value=duration)
-        .add_field(name="Channel", value=uploader)
-        .add_field(name="Views", value=views)
-        .add_field(name="Likes", value=likes)
+        discord.Embed(
+            title=title,
+            url=webpage_url,
+            description=description,
+            color=discord.Color.green(),
+        )
+        .add_field(name="Channel", value=_field_value(uploader))
+        .add_field(name="Views", value=_field_value(views))
+        .add_field(name="Likes", value=_field_value(likes))
         .set_footer(text=f"Avg Bitrate: {abr} | Avg Sampling: {asr} | Acodec: {acodec}")
     )
     if thumbnail:
@@ -208,6 +265,8 @@ class MusicPlayer:
         "store",
         "_restore_task",
         "_restore_complete",
+        "_playback_gate",
+        "_playback_holds",
         "_background_tasks",
         "_progress_task",
         "_np_host_message",
@@ -234,6 +293,8 @@ class MusicPlayer:
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
+    _playback_gate: asyncio.Event
+    _playback_holds: int
     _background_tasks: set
     _progress_task: Optional[asyncio.Task]
     _np_host_message: Optional[discord.Message]
@@ -255,7 +316,7 @@ class MusicPlayer:
         self._guild = guild
         self._channel = channel
         _fallback: Union[discord.Member, discord.User, None] = guild.me or guild.owner
-        self._last_author = _fallback  # type: ignore[assignment]
+        self._last_author = _fallback
         self._cog = cog
 
         self.current_song = None
@@ -276,6 +337,17 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
+        # Playback gate: restoring the persisted queue and *playing* it are
+        # separate concerns. The gate stays closed until a command actually
+        # establishes a voice connection, so a player built by a command that
+        # never connects (cog_before_invoke runs before validate_commands, so
+        # even a rejected command builds one) cannot walk the persisted queue
+        # and discard it. See docs/PLAYBACK_GATE_PLAN.md.
+        self._playback_gate = asyncio.Event()
+        # >0 while an in-flight command owns the opening — -play holds the gate
+        # across the join it triggers so the restored head cannot start before
+        # the requested song is inserted in front of it.
+        self._playback_holds = 0
         self._background_tasks: set = set()
         self._progress_task: Optional[asyncio.Task] = None
         # Now-playing host state: the one message currently carrying the NP
@@ -316,7 +388,14 @@ class MusicPlayer:
         loop() blocks on self._restore_complete before consuming from self.queue —
         see _restore_state() for why. When there's no store, restore is a no-op, so
         the event is set immediately rather than left for _restore_state() to set.
+
+        loop() then blocks on the playback gate. It is opened here when the guild
+        already has a voice client — the crash-recovery path (_restore_guild)
+        connects before calling start(), so recovery keeps resuming from the head
+        with no extra call site. Otherwise -join / -play open it once connected.
         """
+        if self._guild.voice_client is not None:
+            self.open_playback_gate()
         if self.store is not None:
             self._restore_task = self.bot.loop.create_task(self._restore_state())
         else:
@@ -324,6 +403,46 @@ class MusicPlayer:
             # gate in loop() never waits.
             self._restore_complete.set()
         self._player = self.bot.loop.create_task(self.loop())
+
+    # ── Playback gate ─────────────────────────────────────────────────────────
+
+    def open_playback_gate(self) -> None:
+        """Let loop() start consuming the queue. No-op while a hold is
+        outstanding — the holder is responsible for the opening."""
+        if self._playback_holds == 0:
+            self._playback_gate.set()
+
+    @contextlib.asynccontextmanager
+    async def defer_playback(self):
+        """Hold the playback gate shut for the duration of the block.
+
+        -play calls -join, which opens the gate as soon as the voice handshake
+        completes — while -play is still resolving its input (a 1-4s yt-dlp
+        extraction). Without this hold the restored head would start playing in
+        that window, which is the whole bug this exists to prevent.
+
+        The gate opens on the way out even when the block raised: -play's error
+        path calls cleanup(), which cancels loop() and makes the gate moot, but
+        if that is ever skipped the safe fallback is resuming the persisted
+        queue rather than stranding it behind a closed gate.
+        """
+        self._playback_holds += 1
+        try:
+            yield
+        finally:
+            self._playback_holds -= 1
+            if self._playback_holds == 0:
+                self.open_playback_gate()
+
+    async def wait_for_restore(self) -> None:
+        """Block until _restore_state() has finished (or failed).
+
+        Callers inserting into the queue before restore has read its snapshot
+        would be double-queued: put_front() LPUSHes to the Redis mirror, while
+        restore_entries() is in-memory only precisely because its entries are
+        already on that list. See docs/PLAYBACK_GATE_PLAN.md §3.4.
+        """
+        await self._restore_complete.wait()
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -368,10 +487,10 @@ class MusicPlayer:
         if isinstance(item, QueueObject):
             title = item.title or "Unknown"
             requester = _requester_mention(item.requester)
-            dur = _fmt_duration(item.duration) if item.duration is not None else "?:??"
+            dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
             channel = item.uploader or "Unknown channel"
             if item.is_resume and item.ts:
-                ts_note = f"  ·  ⏮ resumes at `{_fmt_duration(item.ts)}`"
+                ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
             elif item.ts:
                 ts_note = f"  ·  starts at `{item.ts}s`"
             else:
@@ -607,10 +726,41 @@ class MusicPlayer:
         """
         items: list[Union[QueueObject, YTSource]]
         if isinstance(obj, list):
-            items = list(obj)  # type: ignore[arg-type]
+            items = list(obj)
         else:
             items = [obj]
         await self.queue.put(items, batch=not prefetch)
+        if prefetch and self.store is not None:
+            for item in items:
+                if isinstance(item, QueueObject):
+                    self._spawn_background(
+                        YTDL.prefetch_stream(item, redis=self.store.redis)
+                    )
+
+    async def queue_put_front(
+        self,
+        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        *,
+        prefetch: bool = True,
+    ):
+        """Insert at the FRONT of the queue, then (optionally) pre-fetch.
+
+        Same contract as queue_put() but for the head of the line — used when
+        -play runs on a disconnected bot with a persisted queue: the requested
+        song plays now and the persisted entries resume behind it.
+
+        Playlists are inserted in full, in order (put_front preserves the
+        order of the sequence it is handed), and with prefetch=False for the
+        same reason queue_put() does: N concurrent prefetches saturate the
+        thread pool and mint stream URLs that expire before playback reaches
+        them.
+        """
+        items: list[Union[QueueObject, YTSource]]
+        if isinstance(obj, list):
+            items = list(obj)
+        else:
+            items = [obj]
+        await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -700,10 +850,12 @@ class MusicPlayer:
         description = "\n".join(lines)
         fields = NowPlayingData.from_song(song)
         return _build_now_playing_base_embed(
-            title=f"**Now playing:** {song.title}",
+            # No markdown: Discord renders embed titles literally, so the old
+            # "**Now playing:**" showed its asterisks — and now that the title
+            # is a link, they showed inside the link text.
+            title=f"Now playing: {song.title}",
             description=description,
             webpage_url=fields.webpage_url,
-            duration=fields.duration,
             uploader=fields.uploader,
             views=fields.view_count,
             likes=fields.like_count,
@@ -728,9 +880,9 @@ class MusicPlayer:
         position = int(song.position_secs)
         duration_secs = song.duration_secs
         if duration_secs > 0:
-            paused_at = f"{_fmt_duration(position)} / {_fmt_duration(duration_secs)}"
+            paused_at = f"{fmt_duration(position)} / {fmt_duration(duration_secs)}"
         else:
-            paused_at = _fmt_duration(position)
+            paused_at = fmt_duration(position)
         return discord.Embed(
             title=f"⏸️ Paused: {song.title}",
             description=f"Paused at: `{paused_at}`",
@@ -739,12 +891,27 @@ class MusicPlayer:
 
     @staticmethod
     def _build_now_playing_embed_from_data(data: NowPlayingData) -> discord.Embed:
-        """Reconstruct a now-playing embed from the recovered Redis snapshot."""
+        """Reconstruct a now-playing embed from the recovered Redis snapshot.
+
+        Duration goes in the description here, in the slot the progress bar
+        occupies in the live embed. The base builder drops the Duration field
+        because the bar's right-hand label carries it — but this embed has no
+        bar (there is no live position to draw one from until loop() starts
+        real playback), so without this line the recovered embed would show no
+        duration at all. Rendered as stored: the string is whatever
+        NowPlayingData.from_song wrote, and re-parsing it to reformat would
+        only add a failure mode.
+        """
+        lines = []
+        if data.duration:
+            # Blank line after, matching the live embed's bar/requester spacing.
+            lines.append(f"Duration: `{data.duration}`")
+            lines.append("")
+        lines.append(f"Requester: [{data.requester_mention}]")
         return _build_now_playing_base_embed(
-            title=f"**Now playing:** {data.title}",
-            description=f"Requester: [{data.requester_mention}]",
+            title=f"Now playing: {data.title}",  # literal, as above
+            description="\n".join(lines),
             webpage_url=data.webpage_url,
-            duration=data.duration,
             uploader=data.uploader,
             views=data.view_count,
             likes=data.like_count,
@@ -963,11 +1130,15 @@ class MusicPlayer:
                 timestamps=timestamps,
             )
         else:
-            # Only reset when no other guild is still playing.
+            # Only reset when no *other* guild is still playing. This guild's own
+            # client must be excluded: cleanup() cancels the playback loop before
+            # it disconnects, so the loop's CancelledError handler reaches here
+            # while our own client is still connected and playing — counting it
+            # would leave the presence stuck on the stopped song.
             active = any(
                 vc.is_playing()
                 for vc in self.bot.voice_clients
-                if isinstance(vc, discord.VoiceClient)
+                if isinstance(vc, discord.VoiceClient) and vc.guild.id != self._guild.id
             )
             if active:
                 return
@@ -1031,7 +1202,11 @@ class MusicPlayer:
 
     @_tracer.start_as_current_span("player.interject")
     async def interject(
-        self, qobj: QueueObject, vc: discord.VoiceClient
+        self,
+        qobj: QueueObject,
+        vc: discord.VoiceClient,
+        *,
+        resume_paused: bool = True,
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
 
@@ -1045,6 +1220,12 @@ class MusicPlayer:
         Replace semantics: when the interrupted song is itself an interjection
         (current.interjected), no resume entry is built for it — the ORIGINAL
         song's resume entry, still at the queue front, is untouched.
+
+        resume_paused controls whether a song interrupted WHILE PAUSED comes
+        back paused. True (-playnow) restores exactly what it interrupted;
+        False (-play on a paused song) brings it back playing, because -play
+        is an explicit instruction to have audio playing. It has no effect on
+        a song that was not paused. See docs/PLAY_WHILE_PAUSED_PLAN.md §3.1.
 
         Returns None when there is no current song (or it ended during the
         prefetch neutralization) — the command falls back to a plain
@@ -1104,7 +1285,7 @@ class MusicPlayer:
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
-                    start_paused=was_paused,
+                    start_paused=was_paused and resume_paused,
                 )
 
         items = [qobj] if resume is None else [qobj, resume]
@@ -1128,6 +1309,7 @@ class MusicPlayer:
             resume_position=position if resume is not None else None,
             was_paused=was_paused,
             replaced=replaced,
+            returns_paused=resume is not None and resume.start_paused,
         )
 
     async def _neutralize_prefetch(self) -> None:
@@ -1190,7 +1372,7 @@ class MusicPlayer:
         NOT send_with_np: this song's NP host hasn't been sent yet, and
         send_with_np would adopt the notice as host only for
         _send_now_playing to immediately retire it."""
-        position = _fmt_duration(int(song.position_secs))
+        position = fmt_duration(int(song.position_secs))
         if song.start_paused:
             text = (
                 f"⏮ Returned to **{song.title}** at `{position}` — still paused. "
@@ -1365,10 +1547,20 @@ class MusicPlayer:
         song: YTDL,
         message: discord.Message,
         own_embeds: list[discord.Embed],
+        *,
+        completed: bool = True,
     ) -> None:
-        """One last embed edit once a song has actually ended, showing the bar
-        fully completed (position == duration) rather than left frozen wherever
-        the last periodic tick happened to land. song/message/own_embeds are
+        """One last embed edit once a song has stopped, so the bar lands on its
+        true final state rather than wherever the last periodic tick happened
+        to fall (up to NOW_PLAYING_UPDATE_INTERVAL_SECS stale).
+
+        completed=True renders the bar full (the song reached its end).
+        completed=False renders the position it actually stopped at — a
+        skipped or interjected song did not finish, and a 100% bar would be a
+        false record. The edit fires in both cases; only the override differs.
+        See docs/PLAY_WHILE_PAUSED_PLAN.md §5.
+
+        song/message/own_embeds are
         captured by the caller rather than read off self.current_song/
         self._np_host_message at run time, since both may already point at the
         next song by the time this (fire-and-forget) task actually runs. The
@@ -1383,7 +1575,13 @@ class MusicPlayer:
             return  # no bar was ever shown for this song — nothing to finalize
         async with self._np_edit_lock:
             await self._push_np_edit(
-                song, message, own_embeds, position_override=song.duration_secs
+                song,
+                message,
+                own_embeds,
+                # None → _build_now_playing_embed falls back to the live
+                # position_secs, which is frozen at the stop point (and, for a
+                # paused song, at the pause point).
+                position_override=song.duration_secs if completed else None,
             )
 
     def _spawn_background(self, coro: Any) -> asyncio.Task:
@@ -1394,9 +1592,16 @@ class MusicPlayer:
         return task
 
     def _fire_finalize_now_playing(
-        self, song: YTDL, message: discord.Message, own_embeds: list[discord.Embed]
+        self,
+        song: YTDL,
+        message: discord.Message,
+        own_embeds: list[discord.Embed],
+        *,
+        completed: bool = True,
     ) -> None:
-        self._spawn_background(self._finalize_now_playing(song, message, own_embeds))
+        self._spawn_background(
+            self._finalize_now_playing(song, message, own_embeds, completed=completed)
+        )
 
     async def _progress_updater(self, song: YTDL) -> None:
         interval = config.NOW_PLAYING_UPDATE_INTERVAL_SECS
@@ -1485,6 +1690,21 @@ class MusicPlayer:
         # this prevents (an erroneous Redis pop_queue() for a crash-recovered
         # song that was never on the Redis queue list in the first place).
         await self._restore_complete.wait()
+        # Restore has populated the queue; wait for a voice connection before
+        # playing any of it. The timeout is not optional: a player blocked here
+        # is NOT blocked in queue_get(), so the 300s idle-disconnect below can
+        # never fire for it, and a player built by a command that never
+        # connects would leak its mps entry and task forever.
+        try:
+            async with async_timeout.timeout(_PLAYBACK_GATE_TIMEOUT):
+                await self._playback_gate.wait()
+        except asyncio.TimeoutError:
+            log.info(
+                f"Playback gate timed out for guild {self._guild.id} "
+                f"(never connected to voice), tearing down player"
+            )
+            asyncio.create_task(self.stop())
+            return
         prefetched_song: Optional[YTDL] = None
 
         while not self.bot.is_closed():
@@ -1581,17 +1801,12 @@ class MusicPlayer:
                         self.current_song = None
                         continue
 
-                    # FIXME: loop() can call vc.play() before the voice handshake completes.
-                    # guild.voice_client exists as soon as connect() starts, but vc.play()
-                    # raises ClientException("Not connected to voice.") until the handshake
-                    # finishes. Hit in practice when -play creates the MusicPlayer and
-                    # leftover Redis queue entries are restored at creation: loop() dequeues
-                    # and resolves the head faster than play's concurrent join task connects,
-                    # so the restored song is dropped ("Playback error — skipping song";
-                    # observed live 2026-07-16 during the §2.2 typing smoke test). Fix is to
-                    # gate playback on voice readiness — await an event set once join
-                    # completes, or poll vc.is_connected() with a short timeout — instead of
-                    # asserting on the client object alone.
+                    # Safe to assert rather than await readiness: the playback
+                    # gate above is only opened once a voice connection is
+                    # established (channel.connect() awaits the full handshake),
+                    # so loop() cannot reach vc.play() mid-handshake — the race
+                    # that used to drop the restored head with "Playback error —
+                    # skipping song". See docs/PLAYBACK_GATE_PLAN.md.
                     vc = self._guild.voice_client
                     assert isinstance(vc, discord.VoiceClient)
                     assert self.current_song is not None
@@ -1721,8 +1936,22 @@ class MusicPlayer:
                                 )
                             )
                         elif self.current_song is not None:
+                            # Complete the bar only for a song that actually
+                            # reached its end. A skipped, interjected, or
+                            # mid-stream-death song stopped short and is
+                            # finalized at its true position instead — a 100%
+                            # bar would claim it finished. Decided by position
+                            # rather than by marking each early-stop call site:
+                            # that answers the real question, and covers causes
+                            # nobody enumerated (docs/PLAY_WHILE_PAUSED_PLAN.md
+                            # §5). The edit still fires either way — the 3s
+                            # progress tick would otherwise leave the bar
+                            # frozen up to a tick BEFORE the interruption.
                             self._fire_finalize_now_playing(
-                                self.current_song, finished_host, finished_own
+                                self.current_song,
+                                finished_host,
+                                finished_own,
+                                completed=_reached_end(self.current_song),
                             )
 
                     # Claim-then-await: interject() may have neutralized (and

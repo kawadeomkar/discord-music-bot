@@ -5,9 +5,26 @@ from any test file or conftest without routing through pytest's plugin machinery
 """
 
 import asyncio
+from typing import Any, Callable, Coroutine, cast
 from unittest.mock import MagicMock
 
+from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
+
+
+def command_callback(
+    command: "commands.Command[Any, ..., Any]",
+) -> Callable[..., Coroutine[Any, Any, Any]]:
+    """Return a command's raw callback, invocable as ``callback(cog, ctx, ...)``.
+
+    Tests drive commands by calling the undecorated function directly, bypassing
+    discord.py's invoke machinery.  ``Command.callback`` is typed as a union of
+    the cog-bound and unbound signatures, and a call has to satisfy *both* union
+    members to type-check — so passing the cog explicitly (correct at runtime for
+    the class-level Command these tests hold) can never resolve statically.  The
+    cast collapses the union to the shape every call site actually uses.
+    """
+    return cast(Callable[..., Coroutine[Any, Any, Any]], command.callback)
 
 
 def noop_ffmpeg_init(self, *args, **kwargs):

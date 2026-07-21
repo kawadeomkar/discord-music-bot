@@ -89,6 +89,9 @@ class TestGetLogger:
 
 
 class TestFmtDuration:
+    """The one clock formatter — progress bar, queue/pause/skip lines, history,
+    and YTDL.duration all render through this."""
+
     def test_minutes_seconds(self):
         assert fmt_duration(225) == "3:45"
 
@@ -103,6 +106,13 @@ class TestFmtDuration:
 
     def test_under_a_minute(self):
         assert fmt_duration(7) == "0:07"
+
+    def test_exactly_one_hour(self):
+        # Boundary: the hours branch must engage at exactly 3600, not above it.
+        assert fmt_duration(3600) == "1:00:00"
+
+    def test_minute_rollover_pads_seconds(self):
+        assert fmt_duration(61) == "1:01"
 
 
 def _rich_entry(**overrides) -> HistoryEntry:
@@ -127,6 +137,7 @@ class TestHistoryEmbeds:
         # played/duration · requester · absolute timestamp on ONE line below.
         [embed] = history_embeds([_rich_entry()])
         assert embed.title == "1. Rich Song"
+        assert embed.description is not None
         assert embed.description.splitlines() == [
             "https://yt.com/v=rich",
             "3:45 / 4:02 · requested by <@42> · <t:1752530000:f>",
@@ -148,17 +159,20 @@ class TestHistoryEmbeds:
     def test_requester_mention_survives_member_departure(self):
         # The raw <@id> mention needs no member cache to render.
         [embed] = history_embeds([_rich_entry(requester_id=999)])
+        assert embed.description is not None
         assert "<@999>" in embed.description
 
     def test_requester_name_fallback_when_id_unknown(self):
         [embed] = history_embeds(
             [_rich_entry(requester_id=0, requester_name="SomeUser")]
         )
+        assert embed.description is not None
         assert "requested by SomeUser" in embed.description
 
     def test_timestamp_omitted_when_played_at_unknown(self):
         # played_at == 0 means unknown; <t:0:f> would render "1 January 1970".
         [embed] = history_embeds([_rich_entry(played_at=0.0)])
+        assert embed.description is not None
         assert "<t:" not in embed.description
         assert embed.description.splitlines() == [
             "https://yt.com/v=rich",
@@ -168,6 +182,7 @@ class TestHistoryEmbeds:
     def test_over_length_title_truncated_to_discord_limit(self):
         # Discord rejects any embed title > 256 chars, failing the whole send.
         [embed] = history_embeds([_rich_entry(title="x" * 300)])
+        assert embed.title is not None
         assert len(embed.title) == 256
         assert embed.title.endswith("…")
 
@@ -175,6 +190,7 @@ class TestHistoryEmbeds:
         # "1. " (3) + 253 = 256 exactly — must pass through untouched.
         [embed] = history_embeds([_rich_entry(title="y" * 253)])
         assert embed.title == "1. " + "y" * 253
+        assert embed.title is not None
         assert "…" not in embed.title
 
     def test_empty_input(self):

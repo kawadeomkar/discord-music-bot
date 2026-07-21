@@ -12,15 +12,21 @@ from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
 
 
-@pytest.fixture(autouse=True, scope="session")
+@pytest.fixture(autouse=True)
 def use_thread_ytdlp_pool():
-    """Run yt-dlp extraction on an in-process ThreadPoolExecutor for the whole session.
+    """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
 
     Production uses a ProcessPoolExecutor (src/youtube.py), which pickles the submitted
     callable to a worker. Tests patch src.youtube._ytdlp_extract with a MagicMock, which
     is unpicklable — and even a real patch would never reach a worker process. A thread
     pool runs in-process so the patch is honored and no children are ever spawned. Setting
     _YTDLP_POOL directly short-circuits _get_pool()'s lazy ProcessPoolExecutor creation.
+
+    Deliberately per-test rather than per-session: a test that exercises the shutdown path
+    (src.main.MusicBotApp.close -> shutdown_ytdlp_pool) joins the pool and resets the
+    global to None, and every later extraction would then build a *real* pool and try to
+    pickle a MagicMock. A fresh pool per test makes that unleakable. ThreadPoolExecutor
+    spawns threads lazily on first submit, so tests that never extract pay nothing.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -151,9 +157,15 @@ def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
     loop() blocks on _restore_complete until _restore_state() finishes (see its docstring
     for why); since start() never runs here, nothing would set it. Tests that
     exercise that race explicitly should clear it again before calling loop().
+
+    loop() then blocks on the playback gate until a voice connection is
+    established (docs/PLAYBACK_GATE_PLAN.md). start() and the -join/-play call
+    sites that open it never run here either, so it is opened for the same
+    reason — tests that exercise the gate itself should clear it again.
     """
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
+    mp._playback_gate.set()
     return mp
 
 
