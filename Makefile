@@ -31,13 +31,62 @@ IMAGE    := discord-music-bot
 # there is one definition of "what tag identifies this build". A `:=` here would
 # also fork git on EVERY make invocation, `make help` included.
 
+# ── Where the tools run: local venv (default) or the test image (DOCKER=1) ────
+#
+#   make check          native, fast — needs Python, Poetry and the venv
+#   make check DOCKER=1 same checks inside the image — needs ONLY Docker
+#
+# DOCKER=1 exists so the project can be handed to someone who has nothing but
+# Docker installed. The checks are the same commands either way; only the
+# interpreter they run under differs.
+ifeq ($(DOCKER),1)
+
+# Mount src/ and tests/ as SUBDIRECTORIES, never the repo root. The image keeps
+# its virtualenv at /app/.venv and puts it on PATH, so `-v $(CURDIR):/app` would
+# shadow the venv and every tool below would vanish. pyproject.toml is mounted
+# read-only so ruff/pytest/pyright read the working tree's config rather than the
+# copy baked into the image.
+DOCKER_MOUNTS := -v "$(CURDIR)/src:/app/src" \
+                 -v "$(CURDIR)/tests:/app/tests" \
+                 -v "$(CURDIR)/pyproject.toml:/app/pyproject.toml:ro"
+
+# Two run modes, and the difference is not cosmetic:
+#
+#   as the host uid  ruff REWRITES the mounted files. Running as root would leave
+#                    them root-owned on the host, which is how a formatter turns
+#                    into a permissions incident. pyright only reads, but runs
+#                    here too so nothing in this group can write as root.
+#   as root          pytest writes .pytest_cache and coverage data into /app,
+#                    which is image-owned and NOT mounted — the host uid cannot
+#                    write there and pytest fails. Nothing it writes escapes the
+#                    container, so root is safe for it specifically.
+DOCKER_RUN      := docker run --rm $(DOCKER_MOUNTS) $(IMAGE):test
+DOCKER_RUN_USER := docker run --rm --user "$$(id -u):$$(id -g)" $(DOCKER_MOUNTS) $(IMAGE):test
+
+RUFF      := $(DOCKER_RUN_USER) ruff
+PYRIGHT   := $(DOCKER_RUN_USER) pyright
+PYTEST    := $(DOCKER_RUN) pytest
+TOOLS_DEP := test-image
+
+else
+
+RUFF      := $(VENV_BIN)/ruff
+PYRIGHT   := $(VENV_BIN)/pyright --pythonpath $(VENV_BIN)/python
+PYTEST    := $(VENV_BIN)/pytest
+TOOLS_DEP := _venv
+
+endif
+
 .PHONY: help install fmt lint types test check container-test ci image up down \
-        restart logs ps hooks hooks-update hooks-run
+        restart logs ps hooks hooks-update hooks-run test-image test-image-rebuild
 
 help: ## Show available targets
 	@echo "Targets (run 'make <target>'):"
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "Add DOCKER=1 to run fmt/lint/types/test inside the test image instead"
+	@echo "of a local venv — requires only Docker, no Python or Poetry."
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 
@@ -60,15 +109,29 @@ _venv:
 	    echo "No usable venv at $(VENV_BIN)/ — run 'make install' first." >&2; \
 	    exit 1; }
 
+# The DOCKER=1 counterpart of _venv: make sure the image the tools live in exists.
+#
+# Built only when ABSENT, not when stale — src/ and tests/ are bind-mounted, so
+# ordinary code changes need no rebuild. Dependency changes do: after touching
+# pyproject.toml or poetry.lock, run `make test-image-rebuild` (or the always-
+# rebuilding `make container-test`) or DOCKER=1 keeps using the old dependency set.
+.PHONY: test-image test-image-rebuild
+test-image:
+	@docker image inspect $(IMAGE):test >/dev/null 2>&1 || $(MAKE) --no-print-directory test-image-rebuild
+
+test-image-rebuild: ## Rebuild the test image DOCKER=1 uses (needed after a dependency change)
+	@bash -c 'source ./build_common.sh && resolve_environment && \
+	    docker build --build-arg ENVIRONMENT="$$ENVIRONMENT" -t "$(IMAGE):test" --target test -f Dockerfile .'
+
 # ── Checks (fast → slow) ─────────────────────────────────────────────────────
 
-fmt: _venv ## Format and auto-fix src/ and tests/ (REWRITES files)
-	$(VENV_BIN)/ruff check --fix src/ tests/
-	$(VENV_BIN)/ruff format src/ tests/
+fmt: $(TOOLS_DEP) ## Format and auto-fix src/ and tests/ (REWRITES files)
+	$(RUFF) check --fix src/ tests/
+	$(RUFF) format src/ tests/
 
-lint: _venv ## Check formatting + lint rules, no rewrites (~0.1s) — CI's ruff steps
-	$(VENV_BIN)/ruff format --check src/ tests/
-	$(VENV_BIN)/ruff check src/ tests/
+lint: $(TOOLS_DEP) ## Check formatting + lint rules, no rewrites (~0.1s) — CI's ruff steps
+	$(RUFF) format --check src/ tests/
+	$(RUFF) check src/ tests/
 
 # --pythonpath is not optional here. pyright resolves imports from the interpreter
 # it is TOLD about, not the one it runs from: with `[tool.pyright] venvPath/venv`
@@ -78,11 +141,11 @@ lint: _venv ## Check formatting + lint rules, no rewrites (~0.1s) — CI's ruff 
 # Those keys are gone from pyproject.toml; this flag replaces them, and it points
 # at exactly the same VENV_BIN as every other target. Worse than wrong, the old
 # setup failed SILENTLY: a missing .venv makes pyright warn and exit 0.
-types: _venv ## Type-check src/ AND tests/ with pyright (~6s)
-	$(VENV_BIN)/pyright --pythonpath $(VENV_BIN)/python
+types: $(TOOLS_DEP) ## Type-check src/ AND tests/ with pyright (~6s)
+	$(PYRIGHT)
 
-test: _venv ## Run the test suite with coverage (~13s)
-	$(VENV_BIN)/pytest --tb=short -q
+test: $(TOOLS_DEP) ## Run the test suite with coverage (~13s)
+	$(PYTEST) --tb=short -q
 
 check: lint types test ## Everything CI gates on — run this before pushing
 

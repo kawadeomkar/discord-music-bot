@@ -51,6 +51,9 @@ plain text search query                          # searches YouTube automaticall
 - Python 3.14+ (`pyproject.toml` pins `requires-python = '>=3.14,<4.0'`)
 - [Poetry](https://python-poetry.org/) 2.x
 - [FFmpeg](https://ffmpeg.org/)
+
+To *contribute* rather than run the bot locally, Docker alone is enough — see
+`DOCKER=1` under [Make targets](#make-targets).
 - A [Discord bot token](https://discord.com/developers/applications)
 - A [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret)
 
@@ -91,6 +94,24 @@ you need. Run `make` on its own to list every target with its description.
 Multi-step *pipelines* stay in the shell scripts (`./build_docker.sh`,
 `./deploy_docker.sh`); the Makefile is the index over the primitives they compose.
 
+**Only have Docker?** Add `DOCKER=1` to any of `fmt`, `lint`, `types`, `test` or
+`check` and it runs inside the test image instead of a local virtualenv — no
+Python, no Poetry, no Node needed on your machine:
+
+```bash
+make check DOCKER=1    # the full gate, container-only  (~31s)
+make fmt   DOCKER=1    # ruff rewrites YOUR files, not the image's
+```
+
+`src/`, `tests/` and `pyproject.toml` are bind-mounted, so the container reads and
+writes your working tree. Formatting runs as your uid, so rewritten files stay
+yours rather than turning up root-owned. The image is built automatically the
+first time; after changing `pyproject.toml` or `poetry.lock`, run
+`make test-image-rebuild` so the container picks up the new dependencies.
+
+The native path stays the default because it is faster (~24s vs ~31s, and ~0.1s
+vs ~0.6s for a bare `make lint` — the difference is container startup).
+
 **Setup**
 
 | Target | Does |
@@ -99,6 +120,7 @@ Multi-step *pipelines* stay in the shell scripts (`./build_docker.sh`,
 | `make hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
 | `make hooks-run` | Run every hook against every file, not just staged ones |
 | `make hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
+| `make test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
 
 **Develop** — the inner loop, fastest first
 
