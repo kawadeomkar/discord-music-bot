@@ -163,6 +163,24 @@ def _remaining_secs(item: QueueObject) -> Optional[int]:
     return item.duration
 
 
+def _queue_runtime(items: List[Union[QueueObject, YTSource]]) -> tuple[int, bool]:
+    """Total remaining playtime of queued items, and whether any item's
+    duration was unknown — an unresolved YTSource or a QueueObject with no
+    duration metadata makes the total a lower bound, which callers flag with a
+    "~" prefix. Shared by queue_embed() and build_resume_notice_embed() so the
+    two can't disagree about how long a queue is.
+    """
+    total_secs = 0
+    partial = False
+    for item in items:
+        remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
+        if remaining is not None:
+            total_secs += remaining
+        else:
+            partial = True
+    return total_secs, partial
+
+
 def _build_progress_bar(
     elapsed_secs: float, duration_secs: int, width: int = _BAR_WIDTH
 ) -> str:
@@ -530,14 +548,7 @@ class MusicPlayer:
         items = self.queue.display_items()
         total = len(items)
 
-        total_secs = 0
-        duration_partial = False
-        for item in items:
-            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
-            if remaining is not None:
-                total_secs += remaining
-            else:
-                duration_partial = True
+        total_secs, duration_partial = _queue_runtime(items)
 
         now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
 
@@ -564,6 +575,68 @@ class MusicPlayer:
             description=header + "\n\n" + songs_text,
             color=discord.Color.blue(),
         )
+
+    def build_resume_notice_embed(self) -> Optional[discord.Embed]:
+        """Heads-up that `-play` on a disconnected bot woke a persisted queue.
+
+        Sent alongside the Now Playing block, so it deliberately says nothing
+        about the song being started — that block already carries the title,
+        link, thumbnail and requester. What it adds is the context only the
+        restore knows: which song the previous session left off on, where it
+        stopped and when, and how much queue is waiting behind the new one.
+
+        Returns None when nothing was restored, which is the common case (a
+        first `-play` in a fresh guild): there is no resumption to announce,
+        and an embed saying so would be pure noise. Callers must build this
+        BEFORE front-inserting, while the queue still holds only the restored
+        entries. docs/PLAYBACK_GATE_PLAN.md.
+        """
+        items = self.queue.display_items()
+        if not items:
+            return None
+
+        count = len(items)
+        plural = "s" if count != 1 else ""
+        verb = "resume" if count != 1 else "resumes"
+        embed = discord.Embed(
+            title="❗ Resumed from queue",
+            description=(
+                f"**{count}** song{plural} from the previous session "
+                f"{verb} after the current one."
+            ),
+            color=discord.Color.orange(),
+        )
+
+        # The last song to finish before the disconnect. Absent when history
+        # was never populated (no Redis, or a guild whose first song is still
+        # its current one) — the queue half of the embed stands on its own.
+        last = self.history.latest
+        if last is not None and last.title:
+            embed.title = truncate_embed_title(
+                f"❗ Resumed from queue — last played song: {last.title}"
+            )
+            if last.thumbnail:
+                embed.set_thumbnail(url=last.thumbnail)
+            stopped = f"`{fmt_duration(last.played_secs)}`"
+            if last.duration_secs > 0:
+                stopped += f" / `{fmt_duration(last.duration_secs)}`"
+            # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
+            # render "56 years ago", so omit the line instead — same rule as
+            # history_embeds().
+            if last.played_at:
+                stopped += f"\n<t:{int(last.played_at)}:R>"
+            embed.add_field(name="Stopped at", value=stopped, inline=True)
+
+        embed.add_field(name="Queued", value=f"**{count}** song{plural}", inline=True)
+        total_secs, partial = _queue_runtime(items)
+        if total_secs > 0:
+            prefix = "~" if partial else ""
+            embed.add_field(
+                name="Runtime",
+                value=f"{prefix}{_fmt_total_duration(total_secs)}",
+                inline=True,
+            )
+        return embed
 
     async def stop(self):
         await self._cog.cleanup(self._guild)

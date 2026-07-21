@@ -715,6 +715,172 @@ class TestGetQueue:
         assert "resolving..." in embed.description
 
 
+# ── Resume notice embed ───────────────────────────────────────────────────────
+
+
+def _fields(embed) -> dict[str, str]:
+    return {f.name: f.value for f in embed.fields}
+
+
+class TestResumeNoticeEmbed:
+    """build_resume_notice_embed() — the -play-on-a-disconnected-bot heads-up."""
+
+    def test_returns_none_when_queue_empty(self, music_player):
+        """The gate: nothing was restored, so there is nothing to announce."""
+        assert music_player.build_resume_notice_embed() is None
+
+    def test_returns_none_when_queue_empty_even_with_history(self, music_player):
+        """History alone is not a resumption — the queue is what gates the send."""
+        music_player.history.restore([HistoryEntry(title="Old Song", played_at=1.0)])
+        assert music_player.build_resume_notice_embed() is None
+
+    def test_highlight_color_is_orange(self, music_player, queue_obj):
+        """Orange, not the blue every other -play embed uses: this is an
+        attention notice about restored state, and the Now Playing block it
+        sits next to is blue. Pinned so a refactor can't quietly re-blue it."""
+        music_player.queue._display.append(queue_obj)
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.colour == discord.Color.orange()
+
+    def test_reports_count_and_runtime(self, music_player, mock_author):
+        for i in range(3):
+            music_player.queue._display.append(
+                QueueObject(
+                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=90
+                )
+            )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert "**3** songs" in embed.description
+        fields = _fields(embed)
+        assert fields["Queued"] == "**3** songs"
+        assert fields["Runtime"] == "4m 30s"
+
+    def test_runtime_marked_approximate_when_a_duration_is_unknown(
+        self, music_player, mock_author
+    ):
+        music_player.queue._display.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90)
+        )
+        music_player.queue._display.append(
+            YTSource(ytsearch="ytsearch:unresolved", process=True)
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Runtime"] == "~1m 30s"
+
+    def test_runtime_field_omitted_when_no_duration_is_known(
+        self, music_player, mock_author
+    ):
+        music_player.queue._display.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert "Runtime" not in _fields(embed)
+
+    def test_singular_wording_for_one_song(self, music_player, mock_author):
+        music_player.queue._display.append(
+            QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90)
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.description == (
+            "**1** song from the previous session resumes after the current one."
+        )
+
+    def test_names_last_played_song_with_stop_position(self, music_player, queue_obj):
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore(
+            [
+                HistoryEntry(
+                    title="Father - Look At Wrist",
+                    duration_secs=233,
+                    played_secs=151,
+                    thumbnail="https://img/thumb.jpg",
+                    played_at=1721530000.0,
+                )
+            ]
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.title == (
+            "❗ Resumed from queue — last played song: Father - Look At Wrist"
+        )
+        assert embed.thumbnail.url == "https://img/thumb.jpg"
+        assert _fields(embed)["Stopped at"] == "`2:31` / `3:53`\n<t:1721530000:R>"
+
+    def test_uses_newest_history_entry(self, music_player, queue_obj):
+        """restore() takes newest-first and reverses; latest must be the newest."""
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore(
+            [
+                HistoryEntry(title="Newest", played_at=2.0),
+                HistoryEntry(title="Older", played_at=1.0),
+            ]
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert "Newest" in embed.title
+        assert "Older" not in embed.title
+
+    def test_omits_duration_when_unknown(self, music_player, queue_obj):
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore(
+            [HistoryEntry(title="Livestream", played_secs=151, duration_secs=0)]
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Stopped at"] == "`2:31`"
+
+    def test_omits_timestamp_when_played_at_unknown(self, music_player, queue_obj):
+        """played_at == 0 is 'absent on the wire'; <t:0:R> would say 1970."""
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore(
+            [HistoryEntry(title="Song", played_secs=10, duration_secs=60)]
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert "<t:" not in _fields(embed)["Stopped at"]
+
+    def test_falls_back_to_bare_title_without_history(self, music_player, queue_obj):
+        music_player.queue._display.append(queue_obj)
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.title == "❗ Resumed from queue"
+        assert "Stopped at" not in _fields(embed)
+
+    def test_long_last_played_title_is_truncated(self, music_player, queue_obj):
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore([HistoryEntry(title="x" * 400)])
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert len(embed.title) <= 256
+
+
 # ── EstimatedPlayingAt ────────────────────────────────────────────────────────
 
 

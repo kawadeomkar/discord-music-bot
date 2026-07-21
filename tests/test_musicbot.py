@@ -1551,6 +1551,11 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
     mp.queue_put_front = AsyncMock()
     mp.queue_put = AsyncMock()
     mp.queue.qsize = MagicMock(return_value=qsize)
+    # Mirrors the real builder's contract: a notice only when the restore
+    # actually left something in the queue (see build_resume_notice_embed).
+    mp.build_resume_notice_embed = MagicMock(
+        return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
+    )
     return mp
 
 
@@ -1979,7 +1984,7 @@ class TestPlayFrontInsertion:
 
         mp.defer_playback.assert_called_once()
 
-    async def test_front_single_uses_queue_put_front_and_announces_resume(
+    async def test_front_single_uses_queue_put_front_and_sends_resume_notice(
         self, music_bot, mock_ctx
     ):
         qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
@@ -1991,20 +1996,21 @@ class TestPlayFrontInsertion:
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mp.queue_put.assert_not_awaited()
         embed = mock_ctx.send.await_args.kwargs["embed"]
-        assert "Playing now" in embed.title
-        assert "3 songs from the previous queue" in embed.description
+        assert embed is mp.build_resume_notice_embed.return_value
 
-    async def test_front_single_omits_resume_line_when_nothing_persisted(
+    async def test_front_single_sends_nothing_when_nothing_persisted(
         self, music_bot, mock_ctx
     ):
+        """No restored queue means no resumption to announce — the Now Playing
+        block is the whole response, so a second embed would only repeat it."""
         qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
         mp = _mock_mp(qsize=0)
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
 
-        embed = mock_ctx.send.await_args.kwargs["embed"]
-        assert "resume after" not in embed.description
+        mp.queue_put_front.assert_awaited_once_with(qobj)
+        mock_ctx.send.assert_not_awaited()
 
     async def test_front_playlist_inserts_all_tracks_in_order(
         self, music_bot, mock_ctx
@@ -2099,6 +2105,13 @@ class TestPlayFrontInsertion:
             for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         ]
         assert stored == ["New Song", "Persisted One", "Persisted Two"]
+
+        # The notice counts the RESTORED entries only. Building it after the
+        # front insert would say 3 and include the song the Now Playing block
+        # is already announcing.
+        notice = mock_ctx.send.await_args.kwargs["embed"]
+        queued = next(f for f in notice.fields if f.name == "Queued")
+        assert queued.value == "**2** songs"
 
 
 class TestEnqueueSingle:
