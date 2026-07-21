@@ -84,6 +84,35 @@ class TestYTDLGetItem:
         assert song["uploader"] == "Test Channel"
 
 
+class TestYTDLDuration:
+    def test_duration_uses_clock_format(self, ytdl_instance):
+        # Same rendering as the progress bar's labels — not timedelta's
+        # "0:03:00", which disagreed with the bar for the same song.
+        song = ytdl_instance({"duration": 180})
+        assert song.duration == "3:00"
+        assert song.duration_secs == 180
+
+    def test_duration_over_an_hour_keeps_hours(self, ytdl_instance):
+        song = ytdl_instance({"duration": 3725})
+        assert song.duration == "1:02:05"
+
+    def test_null_duration_does_not_raise(self, ytdl_instance):
+        """yt-dlp sets "duration" to None (present, not absent) for livestreams
+        and some age-gated videos. The old int(data.get("duration", "0")) got
+        None past its default and raised TypeError, failing the whole
+        construction."""
+        song = ytdl_instance({"duration": None})
+        assert song.duration_secs == 0
+        assert song.duration == "0:00"
+
+    def test_missing_duration_key_does_not_raise(self, ytdl_instance, mock_channel):
+        data = _fake_ytdl_data()
+        del data["duration"]
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = YTDL(mock_channel, data["url"], data=data)
+        assert song.duration_secs == 0
+
+
 class TestYTDLElapsedSecs:
     """Elapsed-time tracking via YTDL.read() call counting — see Design §1 of
     docs/NOW_PLAYING_PROGRESS_BAR_PLAN.md. Deterministic call counting, no

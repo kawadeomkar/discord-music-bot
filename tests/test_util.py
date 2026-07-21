@@ -89,6 +89,9 @@ class TestGetLogger:
 
 
 class TestFmtDuration:
+    """The one clock formatter — progress bar, queue/pause/skip lines, history,
+    and YTDL.duration all render through this."""
+
     def test_minutes_seconds(self):
         assert fmt_duration(225) == "3:45"
 
@@ -103,6 +106,13 @@ class TestFmtDuration:
 
     def test_under_a_minute(self):
         assert fmt_duration(7) == "0:07"
+
+    def test_exactly_one_hour(self):
+        # Boundary: the hours branch must engage at exactly 3600, not above it.
+        assert fmt_duration(3600) == "1:00:00"
+
+    def test_minute_rollover_pads_seconds(self):
+        assert fmt_duration(61) == "1:01"
 
 
 def _rich_entry(**overrides) -> HistoryEntry:

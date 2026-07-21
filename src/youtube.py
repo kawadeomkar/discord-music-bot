@@ -1,6 +1,5 @@
 import asyncio
 import copy
-import datetime
 import os
 import re
 import time
@@ -19,7 +18,7 @@ from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import get_logger, notice_embed
+from src.util import fmt_duration, get_logger, notice_embed
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -442,8 +441,15 @@ class YTDL(discord.FFmpegOpusAudio):
         self.title = data.get("title")
         self.thumbnail = data.get("thumbnail")
         self.description = data.get("description")
-        self.duration = str(datetime.timedelta(seconds=int(data.get("duration", "0"))))
+        # `or 0` rather than a dict default: yt-dlp sets "duration" to None (not
+        # absent) for livestreams and some age-gated videos, so a plain
+        # data.get("duration", 0) would hand int() a None and raise.
         self.duration_secs: int = int(data.get("duration") or 0)
+        # Same clock rendering as the progress bar and every other duration the
+        # bot prints. Was str(timedelta(...)), which spells 3m30s "0:03:30" and
+        # left the recovered now-playing embed and the "Listening to" presence
+        # card disagreeing with the bar's own "3:30" label.
+        self.duration = fmt_duration(self.duration_secs)
         self.tags = data.get("tags")
         self.webpage_url = data.get("webpage_url")
         self.views = data.get("view_count")
