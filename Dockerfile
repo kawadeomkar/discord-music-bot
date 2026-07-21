@@ -34,9 +34,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Used by the container-test CI job. Never pushed to GHCR.
 FROM builder AS test
 
+# The rm shares this RUN deliberately. nodejs-wheel-binaries (pulled by pyright's
+# `nodejs` extra — see pyproject.toml) ships 65MB of C headers for building native
+# Node addons, and pyright is pure JavaScript that compiles nothing. Deleting them
+# in a LATER layer would reclaim nothing: layers are additive, so the files would
+# still sit in this one and only be masked. Same layer, or it is pure theatre.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/pypoetry \
-    poetry install --only=main,test,lint --no-root
+    poetry install --only=main,test,lint --no-root \
+ && rm -rf /app/.venv/lib/python*/site-packages/nodejs_wheel/include
 
 COPY src/ ./src/
 COPY tests/ ./tests/
