@@ -105,6 +105,11 @@ class MusicBotApp(commands.AutoShardedBot):
         self.redis = get_redis(self._redis_pool)
         for extension in EXTENSIONS:
             await self.load_extension(extension)
+        # Spawn the yt-dlp extraction workers before the first -play so it doesn't
+        # pay process-spawn + yt-dlp-import latency. Non-blocking (fire-and-forget).
+        from src.youtube import prewarm_ytdlp_pool
+
+        prewarm_ytdlp_pool()
 
     async def get_context(self, origin, /, *, cls: Any = MusicContext):
         return await super().get_context(origin, cls=cls)
@@ -134,15 +139,15 @@ class MusicBotApp(commands.AutoShardedBot):
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()
-        # shutdown_telemetry() calls force_flush() which blocks for up to 30s.
-        # Run it in an executor to avoid blocking the event loop on shutdown.
+        loop = asyncio.get_running_loop()
+        # Both of these block (joining worker processes / flushing spans for up to
+        # 30s), so run them off the event loop.
+        from src.youtube import shutdown_ytdlp_pool
+
+        await loop.run_in_executor(None, shutdown_ytdlp_pool)
         from src.telemetry import shutdown_telemetry
 
-        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, shutdown_telemetry)
-
-
-bot = MusicBotApp()
 
 
 def main():
@@ -157,6 +162,12 @@ def main():
         raise ValueError("SPOTIFY_CLIENT_ID environment variable is not set")
     if not os.getenv("SPOTIFY_CLIENT_SECRET"):
         raise ValueError("SPOTIFY_CLIENT_SECRET environment variable is not set")
+    # Constructed here, not at module scope: the yt-dlp ProcessPoolExecutor workers
+    # re-import this module under the spawn/forkserver start method, and a module-level
+    # MusicBotApp() would build a full AutoShardedBot (all of discord.py, the help
+    # command) in every worker purely as an import side effect. main() runs only in the
+    # parent, so the bot is built exactly once.
+    bot = MusicBotApp()
     bot.run(token)
 
 

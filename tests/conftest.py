@@ -13,6 +13,28 @@ from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True, scope="session")
+def use_thread_ytdlp_pool():
+    """Run yt-dlp extraction on an in-process ThreadPoolExecutor for the whole session.
+
+    Production uses a ProcessPoolExecutor (src/youtube.py), which pickles the submitted
+    callable to a worker. Tests patch src.youtube._ytdlp_extract with a MagicMock, which
+    is unpicklable — and even a real patch would never reach a worker process. A thread
+    pool runs in-process so the patch is honored and no children are ever spawned. Setting
+    _YTDLP_POOL directly short-circuits _get_pool()'s lazy ProcessPoolExecutor creation.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.youtube as youtube
+
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ytdlp-test")
+    previous = youtube._YTDLP_POOL
+    youtube._YTDLP_POOL = pool
+    yield
+    youtube._YTDLP_POOL = previous
+    pool.shutdown(wait=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests():
     """Configure structlog with minimal output for tests.
 

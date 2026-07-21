@@ -93,6 +93,16 @@ def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
 
 
+def configure_worker_logging() -> None:
+    """Configure structured logging inside a subprocess (the yt-dlp extraction pool
+    workers — see youtube._get_pool). Runs structlog setup only, so yt-dlp's warnings
+    (the SABR / PO-token / signature early-warning system routed via youtube._YtdlpLogger)
+    are emitted as JSON to the worker's stdout and captured alongside the parent's logs,
+    instead of the default unstructured format. Deliberately NOT setup_telemetry(): a full
+    init would stand up a redundant OTLP exporter and TracerProvider in every worker."""
+    _configure_structlog()
+
+
 # ── Internal setup ────────────────────────────────────────────────────────────
 
 
