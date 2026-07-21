@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
-from typing import Any, Coroutine, List, Optional
+from typing import Any, Optional
+from collections.abc import Coroutine
 
 import discord
 import structlog
@@ -9,7 +10,7 @@ from opentelemetry.trace import Span, StatusCode
 from src.guild_state import HistoryEntry
 
 
-def queue_message(songs: List[str]) -> str:
+def queue_message(songs: list[str]) -> str:
     capped = songs[:10]
     msg = "\n".join([f"{i + 1}: {capped[i]}" for i in range(len(capped))])
     if len(songs) > 10:
@@ -31,8 +32,8 @@ async def cancel_task(task: Optional[asyncio.Task]) -> None:
 
 
 def spawn_background(
-    coro: Coroutine[Any, Any, Any], tasks: "set[asyncio.Task]"
-) -> asyncio.Task:
+    coro: Coroutine[Any, Any, Any], tasks: set[asyncio.Task[Any]]
+) -> asyncio.Task[Any]:
     """Create a fire-and-forget task tracked in `tasks`, auto-discarded on completion."""
     task = asyncio.create_task(coro)
     tasks.add(task)
@@ -82,7 +83,7 @@ async def send_embed(
     color: Optional[discord.Color] = None,
     footer: Optional[str] = None,
     thumbnail: Optional[str] = None,
-    fields: Optional[List[tuple[str, str, bool]]] = None,
+    fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
     embed = discord.Embed(title=title, description=description, color=color)
     if footer:
@@ -114,7 +115,7 @@ def truncate_embed_title(title: str) -> str:
     return title[: EMBED_TITLE_LIMIT - 1] + "…"
 
 
-def history_embeds(entries: List[HistoryEntry]) -> List[discord.Embed]:
+def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
     """One embed per played song, in the given (newest-first) order.
 
     Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw

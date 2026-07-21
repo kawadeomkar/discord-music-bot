@@ -1,7 +1,8 @@
 import logging
 import os
 import sys
-from typing import Optional, Sequence, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
+from collections.abc import Sequence
 
 import structlog
 from structlog.typing import EventDict, WrappedLogger

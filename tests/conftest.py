@@ -1,6 +1,7 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
-from typing import Any, AsyncIterator, Callable, Iterator, Optional
+from typing import Any, Optional, cast
+from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -173,7 +174,7 @@ def ytdl_instance(
     """Factory that creates a YTDL instance with FFmpegOpusAudio.__init__ patched out."""
     from unittest.mock import patch
     import discord as d
-    from src.youtube import YTDL
+    from src.youtube import YTDL, YTDLVideoInfo
 
     def _make(data: Optional[dict] = None) -> Any:
         default_data = {
@@ -200,7 +201,9 @@ def ytdl_instance(
             return YTDL(
                 mock_channel,
                 default_data["url"],
-                data=default_data,
+                # Arbitrary per-test overrides merge in above, so this is a plain
+                # dict by construction; the cast is the info-dict shape assertion.
+                data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
             )
 

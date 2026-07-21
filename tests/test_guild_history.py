@@ -27,7 +27,7 @@ def _entry(n: int) -> HistoryEntry:
 
 
 @pytest.fixture
-def store(fake_redis: aioredis.Redis):
+def store(fake_redis: aioredis.Redis) -> GuildRedisStore:
     return GuildRedisStore(fake_redis, guild_id=42)
 
 

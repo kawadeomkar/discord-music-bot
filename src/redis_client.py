@@ -413,9 +413,8 @@ class GuildRedisStore:
         """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         try:
-            raw = cast(
-                list[bytes],
-                await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1),
+            raw = await self.redis.lrange(
+                self.history_key(), 0, HISTORY_CACHE_LIMIT - 1
             )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_history failed: {e}")
@@ -434,6 +433,10 @@ class GuildRedisStore:
         degraded behavior in both cases.
         """
         try:
+            # bytes keys/values, not str: create_redis_pool() sets
+            # decode_responses=False (see :75), an invariant redis-py's own return
+            # type cannot express. Do not "simplify" this away — from_redis()
+            # decodes, and a decoded pool would break it at runtime, not here.
             raw = cast(
                 dict[bytes, bytes], await self.redis.hgetall(self.now_playing_key())
             )
@@ -528,6 +531,7 @@ class GuildRedisStore:
         the end of _restore_state(), which covers the recovery window.
         """
         try:
+            # Same decode_responses=False invariant as get_now_playing() above.
             raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
             return GuildStateData.from_redis(raw)
         except Exception as e:

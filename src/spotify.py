@@ -1,7 +1,8 @@
 import asyncio
 import os
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Optional, Union
+from collections.abc import Awaitable, Callable
 
 import aiohttp
 import ujson
@@ -81,13 +82,23 @@ class Spotify:
     async def http_call(
         self,
         endpoint_route: str,
-        params: Optional[Dict[str, Union[str, int]]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        data: Optional[Dict[str, str]] = None,
+        params: Optional[dict[str, Union[str, int]]] = None,
+        headers: Optional[dict[str, str]] = None,
+        data: Optional[dict[str, str]] = None,
         http_method: str = "GET",
     ) -> Any:
         """Make an authenticated request to the Spotify API, refreshing the
-        token first if it has expired. Raises on any non-2xx response."""
+        token first if it has expired. Raises on any non-2xx response.
+
+        `Any` here is deliberate, and the asymmetry with yt-dlp's `YTDLVideoInfo`
+        is the point. That schema exists because `src/` reads ~19 *named* fields
+        off one known info-dict shape on the playback hot path, so a wrong
+        assumption there breaks playback. This returns whatever the requested
+        endpoint returns — the shape is chosen by the caller's URL, so there is no
+        single schema to write. The two callers that do read named fields
+        (`track()`, `playlist()`) narrow to `str` / `list[str]` at their own
+        boundary, which is where the shape is actually known.
+        """
         if time.time() > self.token_expiry:
             async with self._auth_lock:
                 if time.time() > self.token_expiry:
@@ -138,11 +149,11 @@ class Spotify:
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
     @_tracer.start_as_current_span("spotify.playlist")
-    async def playlist(self, pid: str) -> List[str]:
+    async def playlist(self, pid: str) -> list[str]:
         """Return "<title> <artist1> <artist2> ..." for every track in a playlist, cached for 1h."""
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
 
-        async def fetch() -> List[str]:
+        async def fetch() -> list[str]:
             # FIXME: Spotify playlists over 100 tracks are silently truncated.
             # /v1/playlists/{id}/tracks is a paged endpoint returning 100 items per
             # page. This call reads the first page only and never follows the `next`
@@ -168,8 +179,14 @@ class Spotify:
         return await self._cached_call(f"spotify:playlist:{pid}", _PLAYLIST_TTL, fetch)
 
     @_tracer.start_as_current_span("spotify.artists")
-    async def artists(self, ids: Union[List[str], str]) -> Any:
-        """Return raw Spotify artist objects for one or more artist IDs, cached for 24h."""
+    async def artists(self, ids: Union[list[str], str]) -> Any:
+        """Return raw Spotify artist objects for one or more artist IDs, cached for 24h.
+
+        Untyped by intent: "raw" means the upstream object verbatim, and nothing
+        in `src/` reads a field off it (this method and `albums()` have no
+        production callers). A TypedDict here would be a guess at Spotify's
+        schema with no consumer to check it against — see `http_call`.
+        """
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.artist_ids", ",".join(ids))
@@ -186,8 +203,11 @@ class Spotify:
         )
 
     @_tracer.start_as_current_span("spotify.albums")
-    async def albums(self, ids: Union[List[str], str]) -> Any:
-        """Return raw Spotify album objects for one or more album IDs, cached for 24h."""
+    async def albums(self, ids: Union[list[str], str]) -> Any:
+        """Return raw Spotify album objects for one or more album IDs, cached for 24h.
+
+        Untyped for the same reason as `artists()` above.
+        """
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.album_ids", ",".join(ids))

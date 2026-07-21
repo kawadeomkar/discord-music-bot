@@ -4,13 +4,11 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import (
     Any,
-    AsyncGenerator,
-    Coroutine,
-    List,
     Optional,
     Union,
     assert_never,
 )
+from collections.abc import AsyncGenerator, Coroutine
 
 import discord
 from discord.ext import commands
@@ -30,9 +28,12 @@ from src.sources import (
 )
 from src.spotify import Spotify
 from src.youtube import YTDL, QueueObject
+from contextvars import Token
+
 from opentelemetry import context as otel_context
+from opentelemetry.context import Context
 from opentelemetry import trace
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import Span, StatusCode
 
 from src.telemetry import get_tracer
 from src.util import (
@@ -70,14 +71,14 @@ class ResolvedSpotifyPlaylist:
     """A Spotify playlist resolved to track titles — still needs per-title
     YouTube search resolution before it can be queued."""
 
-    titles: List[str]
+    titles: list[str]
 
 
 @dataclass
 class ResolvedYoutubePlaylist:
     """A YouTube playlist already resolved to playable QueueObjects."""
 
-    tracks: List[QueueObject]
+    tracks: list[QueueObject]
 
 
 def _check_voice_permissions(
@@ -103,6 +104,15 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     try:
         async with ctx.typing():
             await asyncio.sleep(3600)  # held open until cancelled
+    # FIXME: this swallows CancelledError, defeating cooperative cancellation.
+    # background_typing() cancels this task on the way out, and catching
+    # CancelledError here makes the task complete *normally* instead of ending
+    # cancelled — task.cancelled() is False, and a cancellation aimed at the
+    # enclosing scope (shutdown, an outer timeout) stops propagating at this
+    # frame. Only the `Exception` half is wanted: typing failures are cosmetic
+    # and must not surface. Not fixed here because this is a behaviour change,
+    # not a typing one, and this branch is scoped to typing.
+    # Fix: catch Exception only, and let CancelledError propagate.
     except asyncio.CancelledError, Exception:
         pass  # cosmetic — never let typing failures surface
 
@@ -137,10 +147,22 @@ class MusicBot(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # HACK: getattr() hides MusicBot's real dependency on MusicBotApp.redis.
+        # `bot` is typed commands.Bot, but `redis` is a MusicBotApp attribute, so the
+        # access is spelled as getattr() to keep the type checker quiet. getattr()
+        # returns Any, which downgrades the Optional[aioredis.Redis] annotation from a
+        # checked type to an unchecked assertion: renaming MusicBotApp.redis silently
+        # degrades every guild to no-Redis — no persistence, no crash recovery — instead
+        # of failing at startup or at type-check time. Nothing here would go red.
+        # Fix: type `bot` as "MusicBotApp" under `if TYPE_CHECKING` (src/main.py already
+        # uses that idiom to break this exact import cycle), or declare a two-line
+        # Protocol carrying `redis: Optional[aioredis.Redis]`.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
         self.spotify = Spotify(redis=self.redis)
         self.mps: dict[int, MusicPlayer] = {}
-        self._active_spans: dict = {}  # id(ctx) → (Span, context_token)
+        # id(ctx) → (span, the token otel_context.attach() returns, which detach()
+        # requires back — `object` does not satisfy it.
+        self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
 
@@ -398,6 +420,16 @@ class MusicBot(commands.Cog):
                 ctx.message.add_reaction("👍"),
             )
         else:
+            # HACK: this assert stands in for a correlation the signature cannot
+            # express. _enqueue_playlist takes `source` and `qobj` as independent
+            # parameters, but they are not independent: a ResolvedYoutubePlaylist
+            # qobj always arrives with a YTSource source. Nothing in the types says
+            # so, hence the runtime assert — which `python -O` strips, leaving the
+            # attribute reads below unguarded.
+            # Fix: have the Resolved*Playlist dataclasses carry their own source, so
+            # the branch narrows both at once and this deletes itself. Deferred: it
+            # changes a dataclass's constructor and its test call sites, which is
+            # more than this typing branch should move.
             assert isinstance(source, YTSource)
             playlist_url = (
                 source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
@@ -1485,7 +1517,7 @@ class MusicBot(commands.Cog):
                         )
 
                 if notify_channel is not None:
-                    deleted: List[str] = []
+                    deleted: list[str] = []
                     if not voice_ok:
                         deleted.append("voice channel")
                     if not text_ok:

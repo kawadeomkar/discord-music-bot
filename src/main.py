@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
 from discord.ext import commands
@@ -106,7 +106,16 @@ class MusicBotApp(commands.AutoShardedBot):
         for extension in EXTENSIONS:
             await self.load_extension(extension)
 
-    async def get_context(self, origin: Any, /, *, cls: Any = MusicContext) -> Any:
+    async def get_context(
+        self,
+        origin: Union[discord.Message, discord.Interaction],
+        /,
+        *,
+        cls: type[commands.Context[Any]] = MusicContext,
+    ) -> commands.Context[Any]:
+        # Written against discord.py's own signature rather than `Any`: `Any` on an
+        # override parameter makes the override unconditionally LSP-compatible, so
+        # signature drift against the base class becomes uncheckable.
         return await super().get_context(origin, cls=cls)
 
     async def invoke(self, ctx: commands.Context, /) -> None:

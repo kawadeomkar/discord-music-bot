@@ -2,7 +2,8 @@
 Now Playing embed block attached to the newest bot message while a song is live
 (docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md §3)."""
 
-from typing import Any
+from contextlib import AbstractContextManager
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -14,7 +15,7 @@ from src.musicbot import MusicBot
 
 
 @pytest.fixture
-def music_bot_cog(mock_bot: MagicMock):
+def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     """Minimal real MusicBot instance — _np_player's isinstance check needs the
     actual class, not a MagicMock."""
     cog = MusicBot.__new__(MusicBot)
@@ -29,7 +30,9 @@ def music_bot_cog(mock_bot: MagicMock):
 
 
 @pytest.fixture
-def mctx(mock_bot: MagicMock, mock_guild: MagicMock, mock_message: MagicMock):
+def mctx(
+    mock_bot: MagicMock, mock_guild: MagicMock, mock_message: MagicMock
+) -> MusicContext:
     """MusicContext without discord.py's full Context construction — guild/
     channel/author are properties over .message, so setting message suffices."""
     ctx = object.__new__(MusicContext)
@@ -45,7 +48,7 @@ def live_mp(
     mock_bot: MagicMock,
     mock_guild: MagicMock,
     mock_channel: MagicMock,
-):
+) -> MagicMock:
     """A guild MusicPlayer (mocked) with a live song, wired into the cog lookup
     that MusicContext._np_player performs."""
     mock_bot.get_cog = MagicMock(return_value=music_bot_cog)
@@ -60,7 +63,7 @@ def live_mp(
     return mp
 
 
-def _parent_send(sent: Any):
+def _parent_send(sent: Any) -> AbstractContextManager[AsyncMock]:
     return patch.object(commands.Context, "send", new=AsyncMock(return_value=sent))
 
 
@@ -154,7 +157,9 @@ class TestMusicContextVanillaFallthrough:
     """Each no-attach guard falls through to a vanilla send, kwargs untouched."""
 
     @staticmethod
-    async def _assert_vanilla(mctx: MusicContext, live_mp: MagicMock = None):
+    async def _assert_vanilla(
+        mctx: MusicContext, live_mp: Optional[MagicMock] = None
+    ) -> discord.Message:
         sent = MagicMock(spec=discord.Message)
         own = discord.Embed(title="Queue")
         with _parent_send(sent) as parent:

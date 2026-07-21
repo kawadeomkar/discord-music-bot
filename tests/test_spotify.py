@@ -2,7 +2,7 @@
 
 import redis.asyncio as aioredis
 import time
-from typing import Any, Dict, Tuple
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,7 +12,7 @@ from src.spotify import Spotify
 
 
 @pytest.fixture
-def mock_auth_response() -> Dict[str, Any]:
+def mock_auth_response() -> dict[str, Any]:
     return {"access_token": "test_access_token_xyz", "expires_in": 3600}
 
 
@@ -26,7 +26,7 @@ def _make_mock_session(resp: AsyncMock) -> MagicMock:
     return session
 
 
-def _make_session_factory(resp: AsyncMock) -> Tuple[Any, MagicMock]:
+def _make_session_factory(resp: AsyncMock) -> tuple[Any, MagicMock]:
     """Return a session_factory callable that produces a mock session."""
     mock_session = _make_mock_session(resp)
     return lambda **kw: mock_session, mock_session
@@ -34,7 +34,7 @@ def _make_session_factory(resp: AsyncMock) -> Tuple[Any, MagicMock]:
 
 class TestSpotifyRefreshToken:
     async def test_refresh_token_sets_auth_token(
-        self, spotify: Spotify, mock_auth_response: Dict[str, Any]
+        self, spotify: Spotify, mock_auth_response: dict[str, Any]
     ) -> None:
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
@@ -45,7 +45,7 @@ class TestSpotifyRefreshToken:
         assert spotify.auth_token == "test_access_token_xyz"
 
     async def test_refresh_token_sends_client_credentials_grant(
-        self, spotify: Spotify, mock_auth_response: Dict[str, Any]
+        self, spotify: Spotify, mock_auth_response: dict[str, Any]
     ) -> None:
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
@@ -60,7 +60,7 @@ class TestSpotifyRefreshToken:
         assert call_kwargs["data"]["client_secret"] == "test_secret"
 
     async def test_refresh_token_sets_token_expiry_in_future(
-        self, spotify: Spotify, mock_auth_response: Dict[str, Any]
+        self, spotify: Spotify, mock_auth_response: dict[str, Any]
     ) -> None:
         mock_resp = AsyncMock()
         mock_resp.json = AsyncMock(return_value=mock_auth_response)
@@ -99,7 +99,7 @@ class TestSpotifyRefreshToken:
         self,
         spotify: Spotify,
         fake_redis: aioredis.Redis,
-        mock_auth_response: Dict[str, Any],
+        mock_auth_response: dict[str, Any],
     ) -> None:
         """A cached key with no remaining TTL (already expired but not yet
         evicted) must not be trusted — fall through to a fresh HTTP fetch."""
@@ -119,7 +119,7 @@ class TestSpotifyRefreshToken:
         self,
         spotify: Spotify,
         fake_redis: aioredis.Redis,
-        mock_auth_response: Dict[str, Any],
+        mock_auth_response: dict[str, Any],
     ) -> None:
         """On a Redis cache miss, _refresh_token fetches from Spotify and writes to Redis."""
         mock_resp = AsyncMock()
@@ -133,7 +133,7 @@ class TestSpotifyRefreshToken:
         assert stored == b"test_access_token_xyz"
 
     async def test_refresh_token_without_redis_calls_api(
-        self, mock_auth_response: Dict[str, Any]
+        self, mock_auth_response: dict[str, Any]
     ) -> None:
         """Spotify instance with redis=None always calls the Spotify API."""
         from src.spotify import Spotify

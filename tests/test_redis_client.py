@@ -15,6 +15,7 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
+from tests.helpers import mocked
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     GuildRedisStore,
@@ -90,6 +91,7 @@ class TestCacheSet:
     async def test_sets_value_with_ttl(self, fake_redis: aioredis.Redis) -> None:
         await cache_set(fake_redis, "ck", [1, 2, 3], 3600)
         raw = await fake_redis.get("ck")
+        assert raw is not None
         assert orjson.loads(raw) == [1, 2, 3]
         ttl = await fake_redis.ttl("ck")
         assert 3595 <= ttl <= 3600
@@ -107,12 +109,12 @@ class TestCacheSet:
 
 
 @pytest.fixture
-def store(fake_redis: aioredis.Redis):
+def store(fake_redis: aioredis.Redis) -> GuildRedisStore:
     return GuildRedisStore(fake_redis, guild_id=123456789)
 
 
 @pytest.fixture
-def broken_store():
+def broken_store() -> GuildRedisStore:
     """Store backed by a Redis mock that raises on every operation."""
     r = MagicMock()
     err = ConnectionError("redis down")
@@ -454,6 +456,7 @@ class TestGetPlaybackSnapshot:
     ) -> None:
         snap = await store.get_playback_snapshot()
         assert snap == GuildPlaybackSnapshot(state=GuildStateData())
+        assert snap is not None
         assert not snap.has_restorable_playback
 
     async def test_corrupt_queue_entries_dropped(
@@ -508,21 +511,21 @@ class TestGetPlaybackSnapshot:
     async def test_returns_none_on_error(self, broken_store: GuildRedisStore) -> None:
         assert await broken_store.get_playback_snapshot() is None
 
-    async def test_single_pipeline_round_trip(self, fake_redis: aioredis.Redis):
+    async def test_single_pipeline_round_trip(self, fake_redis: aioredis.Redis) -> None:
         """State HGETALL and queue LRANGE ride one pipeline execute()."""
         store = GuildRedisStore(fake_redis, guild_id=42)
         real_pipeline = fake_redis.pipeline
         execute_counts = []
 
-        def counting_pipeline(*args: Any, **kwargs: Any):
+        def counting_pipeline(*args: Any, **kwargs: Any) -> Any:
             pipe = real_pipeline(*args, **kwargs)
             original_execute = pipe.execute
 
-            async def counted_execute():
+            async def counted_execute() -> Any:
                 execute_counts.append(1)
                 return await original_execute()
 
-            pipe.execute = counted_execute
+            mocked(pipe).execute = counted_execute
             return pipe
 
         fake_redis.pipeline = counting_pipeline
@@ -553,23 +556,24 @@ class TestGetRecoveryGate:
     ) -> None:
         gate = await store.get_recovery_gate()
         assert gate == GuildRecoveryGate(state=GuildStateData())
+        assert gate is not None
         assert gate.pending_count == 0
         assert not gate.has_restorable_playback
 
     async def test_does_not_transfer_queue_contents(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
-    ):
+    ) -> None:
         """The whole point of the gate: it reads LLEN, never LRANGE, so the
         queue payload never rides the wire on the recovery path."""
         real_lrange = fake_redis.lrange
         lrange_keys = []
 
-        async def spy_lrange(key: str, *args: Any, **kwargs: Any):
+        async def spy_lrange(key: str, *args: Any, **kwargs: Any) -> Any:
             lrange_keys.append(key)
             return await real_lrange(key, *args, **kwargs)
 
         await fake_redis.rpush(store.queue_key(), _entry(1).to_redis())
-        fake_redis.lrange = spy_lrange
+        mocked(fake_redis).lrange = spy_lrange
         try:
             gate = await store.get_recovery_gate()
         finally:
@@ -589,21 +593,21 @@ class TestGetRecoveryGate:
     async def test_returns_none_on_error(self, broken_store: GuildRedisStore) -> None:
         assert await broken_store.get_recovery_gate() is None
 
-    async def test_single_pipeline_round_trip(self, fake_redis: aioredis.Redis):
+    async def test_single_pipeline_round_trip(self, fake_redis: aioredis.Redis) -> None:
         """State HGETALL and queue LLEN ride one pipeline execute()."""
         store = GuildRedisStore(fake_redis, guild_id=42)
         real_pipeline = fake_redis.pipeline
         execute_counts = []
 
-        def counting_pipeline(*args: Any, **kwargs: Any):
+        def counting_pipeline(*args: Any, **kwargs: Any) -> Any:
             pipe = real_pipeline(*args, **kwargs)
             original_execute = pipe.execute
 
-            async def counted_execute():
+            async def counted_execute() -> Any:
                 execute_counts.append(1)
                 return await original_execute()
 
-            pipe.execute = counted_execute
+            mocked(pipe).execute = counted_execute
             return pipe
 
         fake_redis.pipeline = counting_pipeline

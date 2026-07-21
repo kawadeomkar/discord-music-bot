@@ -20,7 +20,7 @@ DESCRIPTION_LIMIT = 4096
 
 
 @pytest.fixture
-async def bot():
+async def bot() -> commands.Bot:
     """A real Bot with the real cog, so help reflects the actual command table."""
     instance = commands.Bot(
         command_prefix="-",
@@ -32,7 +32,7 @@ async def bot():
 
 
 @pytest.fixture
-def ctx(bot: commands.Bot):
+def ctx(bot: commands.Bot) -> MagicMock:
     """Stub context that captures what the help command sends."""
     context = MagicMock()
     context.bot = bot
@@ -44,8 +44,9 @@ def ctx(bot: commands.Bot):
 
 
 @pytest.fixture
-def help_command(bot: commands.Bot, ctx: MagicMock):
+def help_command(bot: commands.Bot, ctx: MagicMock) -> commands.HelpCommand:
     # copy() is what discord.py does per invocation (issue #2123).
+    assert bot.help_command is not None
     hc = bot.help_command.copy()
     hc.context = ctx
     return hc
@@ -220,6 +221,7 @@ class TestCommandList:
 
         assert "…" not in reassembled and "..." not in reassembled
         for command in bot.commands:
+            assert command.brief is not None
             assert command.brief in reassembled, f"{command.name}'s brief was mangled"
 
     async def test_cog_help_renders_the_full_list(

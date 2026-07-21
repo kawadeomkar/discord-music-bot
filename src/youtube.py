@@ -5,7 +5,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, List, Optional, TypedDict, Union
+from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
@@ -207,9 +207,80 @@ _STREAM_CACHE_FIELDS = frozenset(
     }
 )
 
+
+class _YTDLVideoInfoRequired(TypedDict):
+    """`url`/`webpage_url` are the only fields this codebase accesses via
+    direct subscript (`data["url"]`) rather than `.get()` — yt-dlp always
+    populates both once `data` is narrowed to a single video."""
+
+    url: str
+    webpage_url: str
+
+
+class YTDLVideoMetadata(TypedDict, total=False):
+    """The descriptive half of an info-dict: everything except the two
+    identity fields. Split out because helpers like _enrich_queueobject() and
+    _record_serving_format() read only these — typing them against the full
+    YTDLVideoInfo would demand a `url`/`webpage_url` they never touch."""
+
+    title: str
+    uploader: str
+    uploader_url: str
+    upload_date: str
+    thumbnail: str
+    description: str
+    # float, not int: yt-dlp's SoundCloud extractor emits
+    # `'duration': float_or_none(scale=1000)` (its own fixtures show 942.762), and this
+    # bot accepts SoundcloudSource. Every read below wraps this in int() — that is the
+    # conversion, not a redundancy.
+    duration: float
+    tags: list[str]
+    view_count: int
+    like_count: int
+    dislike_count: int
+    abr: float
+    asr: int
+    acodec: str
+    # Format-shape fields, mirroring the same trio in _STREAM_CACHE_FIELDS:
+    # what _record_serving_format reads to tell a healthy audio-only serve
+    # from a degraded muxed/HLS one.
+    format_id: str
+    protocol: str
+    vcodec: str
+
+
+class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
+    """The subset of yt-dlp's info-dict fields this codebase actually reads,
+    once `data` has been narrowed to a single video (see yt_source()'s
+    "entries" un-wrapping). Everything but `url`/`webpage_url` is optional:
+    yt-dlp's own dict is not a stable, fully-populated contract — any field
+    may be absent depending on extractor/client. Mirrors
+    _STREAM_CACHE_FIELDS field-for-field.
+
+    `total=False` is on an empty body deliberately. It changes nothing today,
+    but without it a key added directly here later would silently be
+    *required* — the opposite of every other field in this hierarchy, and a
+    break that shows up as a type error far from the line that caused it.
+    Required keys belong in _YTDLVideoInfoRequired; descriptive ones in
+    YTDLVideoMetadata.
+    """
+
+
+class YTDLFlatPlaylistEntry(TypedDict, total=False):
+    """One entry from a flat playlist listing (_YTDL_PLAYLIST_OPTS,
+    extract_flat=True) — a much sparser shape than YTDLVideoInfo."""
+
+    id: str
+    title: str
+    url: str
+
+
 # format_ids already warned about by _record_serving_format — once per format per
 # process, so a real android_vr outage doesn't emit a warning for every song.
-_DEGRADED_FORMAT_WARNED: set = set()
+# Optional[str], not str: an info-dict can omit format_id, and that case gets its
+# own dedupe slot (one warning for all id-less degraded serves) rather than being
+# silently dropped.
+_DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 
 
 def _record_serving_format(data: YTDLVideoMetadata) -> None:
@@ -244,61 +315,6 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
 
 def _stream_cache_key(webpage_url: str) -> str:
     return f"ytdl:stream:{webpage_url}"
-
-
-class _YTDLVideoInfoRequired(TypedDict):
-    """`url`/`webpage_url` are the only fields this codebase accesses via
-    direct subscript (`data["url"]`) rather than `.get()` — yt-dlp always
-    populates both once `data` is narrowed to a single video."""
-
-    url: str
-    webpage_url: str
-
-
-class YTDLVideoMetadata(TypedDict, total=False):
-    """The descriptive half of an info-dict: everything except the two
-    identity fields. Split out because helpers like _enrich_queueobject() and
-    _record_serving_format() read only these — typing them against the full
-    YTDLVideoInfo would demand a `url`/`webpage_url` they never touch."""
-
-    title: str
-    uploader: str
-    uploader_url: str
-    upload_date: str
-    thumbnail: str
-    description: str
-    duration: int
-    tags: List[str]
-    view_count: int
-    like_count: int
-    dislike_count: int
-    abr: float
-    asr: int
-    acodec: str
-    # Format-shape fields, mirroring the same trio in _STREAM_CACHE_FIELDS:
-    # what _record_serving_format reads to tell a healthy audio-only serve
-    # from a degraded muxed/HLS one.
-    format_id: str
-    protocol: str
-    vcodec: str
-
-
-class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired):
-    """The subset of yt-dlp's info-dict fields this codebase actually reads,
-    once `data` has been narrowed to a single video (see yt_source()'s
-    "entries" un-wrapping). Everything but `url`/`webpage_url` is optional:
-    yt-dlp's own dict is not a stable, fully-populated contract — any field
-    may be absent depending on extractor/client. Mirrors
-    _STREAM_CACHE_FIELDS field-for-field."""
-
-
-class YTDLFlatPlaylistEntry(TypedDict, total=False):
-    """One entry from a flat playlist listing (_YTDL_PLAYLIST_OPTS,
-    extract_flat=True) — a much sparser shape than YTDLVideoInfo."""
-
-    id: str
-    title: str
-    url: str
 
 
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
@@ -366,7 +382,12 @@ async def _cache_stream(
 
     Returns True when an entry was written; False when the URL isn't worth caching
     (no usable expiry — see _stream_url_ttl)."""
-    stripped = {k: data.get(k) for k in _STREAM_CACHE_FIELDS}
+    # Absent keys are dropped rather than written as None. Every reader goes
+    # through .get(), so the two are indistinguishable downstream — but writing
+    # `{"title": None}` would contradict YTDLVideoInfo, which types title as str
+    # and documents absent fields as *missing*. This makes the value that comes
+    # back out of cache_get() actually conform to the type it is read as.
+    stripped = {k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None}
     ttl = _stream_url_ttl(data.get("url", ""))
     if ttl:
         await cache_set(redis, cache_key, stripped, ttl)
@@ -806,7 +827,9 @@ class YTDL(discord.FFmpegOpusAudio):
 
         # `data` is genuinely Any before this point (video dict vs search/playlist wrapper —
         # see _ytdlp_extract's docstring); the narrowing above always leaves it single-video shaped.
-        video_data: YTDLVideoInfo = data
+        # cast(), not a bare annotation: this asserts something the checker cannot verify,
+        # and `grep cast(` is how those assertions are audited in this codebase.
+        video_data = cast(YTDLVideoInfo, data)
 
         webpage_url = video_data["webpage_url"]
         title = video_data.get("title", "")
@@ -856,7 +879,7 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
-    ) -> List[QueueObject]:
+    ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         loop = asyncio.get_running_loop()
@@ -870,11 +893,14 @@ class YTDL(discord.FFmpegOpusAudio):
         )
         if data is None:
             raise Exception(f"Could not fetch YouTube playlist: {url}")
-        entries = data.get("entries") or []
+        # Optional in the element type, not re-annotated on the loop target: yt-dlp
+        # emits a null entry for a deleted/private video, which is what the guard
+        # below skips. Declaring it non-optional there excluded exactly the case the
+        # next line handles.
+        entries: list[Optional[YTDLFlatPlaylistEntry]] = data.get("entries") or []
         trace.get_current_span().set_attribute("ytdl.playlist_size", len(entries))
-        qobjs: List[QueueObject] = []
+        qobjs: list[QueueObject] = []
         for i, entry in enumerate(entries):
-            entry: YTDLFlatPlaylistEntry = entry
             if not entry:
                 log.warning("Skipping null entry at playlist index %d for %s", i, url)
                 continue

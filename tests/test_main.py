@@ -1,6 +1,6 @@
 """Tests for src/main.py — MusicBotApp lifecycle (setup_hook, close, on_ready)."""
 
-from typing import Iterator
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -8,6 +8,7 @@ import pytest
 from discord.ext import commands
 
 from src.main import EXTENSIONS, MusicBotApp
+from tests.helpers import mocked
 
 
 @pytest.fixture
@@ -163,7 +164,7 @@ class TestOnReady:
 
     async def test_sets_presence(self, app: MusicBotApp) -> None:
         await app.on_ready()
-        app.change_presence.assert_awaited_once()
+        mocked(app.change_presence).assert_awaited_once()
 
     async def test_no_error_when_user_is_none(self, app: MusicBotApp) -> None:
         app._connection.user = None
@@ -175,9 +176,9 @@ class TestOnReady:
         user.id = 123456789
         app._connection.user = user
         await app.on_ready()
-        app.change_presence.assert_awaited_once()
+        mocked(app.change_presence).assert_awaited_once()
 
     async def test_presence_sets_online_status(self, app: MusicBotApp) -> None:
         await app.on_ready()
-        call_kwargs = app.change_presence.call_args[1]
+        call_kwargs = mocked(app.change_presence).call_args[1]
         assert call_kwargs["status"] == discord.Status.online

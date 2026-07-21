@@ -2,7 +2,8 @@
 
 import redis.asyncio as aioredis
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Optional, cast
+from collections.abc import Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -23,6 +24,8 @@ from src.youtube import (
     _stream_url_playable,
     _stream_url_ttl,
     _YtdlpLogger,
+    YTDLVideoInfo,
+    YTDLVideoMetadata,
 )
 from tests.helpers import noop_ffmpeg_init
 
@@ -54,7 +57,7 @@ def playable_urls(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return probe
 
 
-def _fake_ytdl_data(**overrides: Any) -> Dict[str, Any]:
+def _fake_ytdl_data(**overrides: Any) -> YTDLVideoInfo:
     base = {
         "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",
         "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -74,7 +77,7 @@ def _fake_ytdl_data(**overrides: Any) -> Dict[str, Any]:
         "acodec": "opus",
     }
     base.update(overrides)
-    return base
+    return cast(YTDLVideoInfo, base)
 
 
 class TestYTDLGetItem:
@@ -878,7 +881,7 @@ class TestRevokedStreamUrl:
 
     async def _cache(
         self, fake_redis: aioredis.Redis, webpage_url: str, title: str = "Revoked Song"
-    ):
+    ) -> None:
         await fake_redis.set(
             f"ytdl:stream:{webpage_url}",
             orjson.dumps(_fake_ytdl_data(webpage_url=webpage_url, title=title)),
@@ -905,7 +908,9 @@ class TestRevokedStreamUrl:
         mock_extract.assert_called_once()
         assert song.title == "Fresh Song"
         # Re-cached with the URL that actually played, not the revoked one.
-        cached = orjson.loads(await fake_redis.get(f"ytdl:stream:{webpage_url}"))
+        raw = await fake_redis.get(f"ytdl:stream:{webpage_url}")
+        assert raw is not None
+        cached = orjson.loads(raw)
         assert cached["url"] == fresh["url"]
 
     async def test_raises_when_youtube_refuses_even_a_fresh_url(
@@ -1052,7 +1057,7 @@ class TestRecordServingFormat:
     android_vr fell back to muxed-only (yt-dlp#16150) or web_safari is serving."""
 
     @pytest.fixture(autouse=True)
-    def _reset_warned_formats(self):
+    def _reset_warned_formats(self) -> Iterator[None]:
         _DEGRADED_FORMAT_WARNED.clear()
         yield
         _DEGRADED_FORMAT_WARNED.clear()
@@ -1067,7 +1072,11 @@ class TestRecordServingFormat:
     def test_muxed_format_warns_once_per_format(self) -> None:
         """A real android_vr outage affects every song — one warning per format, not
         one per song."""
-        muxed = {"format_id": "18", "protocol": "https", "vcodec": "avc1.42001E"}
+        muxed: YTDLVideoMetadata = {
+            "format_id": "18",
+            "protocol": "https",
+            "vcodec": "avc1.42001E",
+        }
         with patch("src.youtube.log") as mock_log:
             _record_serving_format(muxed)
             _record_serving_format(muxed)
@@ -1211,13 +1220,13 @@ class TestYTStreamPlaynowFlags:
         captured_options = {}
 
         def capture_init(
-            self,
+            self: discord.FFmpegOpusAudio,
             url: str,
             *,
             executable: str,
             before_options: Optional[str],
             options: Optional[str],
-        ):
+        ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
 

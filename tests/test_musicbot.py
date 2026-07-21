@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import orjson
 from types import SimpleNamespace
-from typing import Any, AsyncIterator, Coroutine, Iterator, Optional
+from contextlib import AbstractContextManager
+from typing import Any, Optional
+from collections.abc import AsyncIterator, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -29,7 +31,13 @@ from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
 from src.youtube import YTDL, QueueObject
-from tests.helpers import command_callback, make_mock_task, stub_create_task
+from tests.helpers import (
+    command_callback,
+    make_mock_task,
+    mocked,
+    queue_object,
+    stub_create_task,
+)
 
 
 @pytest.fixture
@@ -99,7 +107,7 @@ class TestBackgroundTyping:
         post_started = asyncio.Event()
         release_post = asyncio.Event()
 
-        async def slow_post():
+        async def slow_post() -> None:
             post_started.set()
             await release_post.wait()
 
@@ -119,7 +127,7 @@ class TestBackgroundTyping:
         hazard of driving __aenter__/__aexit__ manually cannot occur)."""
         post_started = asyncio.Event()
 
-        async def hung_post():
+        async def hung_post() -> None:
             post_started.set()
             await asyncio.sleep(3600)
 
@@ -538,7 +546,7 @@ class TestVoiceStateConsistency:
     def _wire_bot_user(cog: MusicBot) -> None:
         mock_user = MagicMock()
         mock_user.id = 999999999999999999
-        cog.bot.user = mock_user
+        mocked(cog.bot).user = mock_user
 
     async def test_bot_disconnect_triggers_cleanup(
         self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
@@ -900,7 +908,7 @@ class TestCleanup:
 
     async def test_retires_np_host_after_task_cancellation(
         self, music_bot: MusicBot, mock_guild: MagicMock
-    ):
+    ) -> None:
         """-stop / alone-disconnect must dispose of the NP host (delete a
         dedicated NP message, strip a response host) so no message keeps a
         mid-song bar frozen by the stop — and only after the progress/loop
@@ -908,13 +916,13 @@ class TestCleanup:
         call_order: list[str] = []
 
         class _AwaitableTask:
-            def done(self):
+            def done(self) -> bool:
                 return False
 
-            def cancel(self, msg: Any = None):
+            def cancel(self, msg: Any = None) -> None:
                 call_order.append("cancel")
 
-            def __await__(self):
+            def __await__(self) -> Iterator[Any]:
                 return iter([])  # completes immediately, no exception
 
         mp = self._make_minimal_mp(
@@ -1509,14 +1517,14 @@ def _history_entries(n: int) -> list[HistoryEntry]:
     ]
 
 
-def _flags(limit: int = 10):
+def _flags(limit: int = 10) -> SimpleNamespace:
     """Stand-in for a parsed HistoryFlags (FlagConverter can't be constructed
     directly; the command body only reads .limit)."""
     return SimpleNamespace(limit=limit)
 
 
 class TestHistoryCommand:
-    def _mp_with_history(self, music_bot: MusicBot, entries: Any):
+    def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
         history = GuildHistory(None)
         history.restore(list(reversed(entries)))  # restore takes newest-first
@@ -1582,7 +1590,7 @@ class TestHistoryCommand:
         mock_ctx.send.assert_awaited_once()
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "--limit must be between 1 and 50" in embed.description
-        music_bot.get_mp.assert_not_called()
+        mocked(music_bot.get_mp).assert_not_called()
 
     async def test_song_embeds_carry_thumbnail_and_metadata(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1651,7 +1659,7 @@ class TestClearCommand:
         assert "Song A" in embed.description
 
 
-def _no_typing():
+def _no_typing() -> AbstractContextManager[MagicMock]:
     """Stub play()'s background_typing wrapper with an inert async CM.
 
     TestPlayCommand patches asyncio.create_task as a join-task spy; without this
@@ -1846,7 +1854,7 @@ class TestPlayWhilePaused:
     (docs/PLAY_WHILE_PAUSED_PLAN.md §3). Appending would leave the bot silent
     with the request buried behind a paused song."""
 
-    def _paused_mp(self):
+    def _paused_mp(self) -> MagicMock:
         mp = _mock_mp()
         mp.current_song = MagicMock(title="Paused Song")
         mp.interject = AsyncMock(
@@ -1942,7 +1950,7 @@ class TestPlayWhilePaused:
 
     async def test_resume_during_resolution_appends_instead(
         self, music_bot: MusicBot, mock_ctx: MagicMock
-    ):
+    ) -> None:
         """A -resume landing during the 1-4s extraction removes the reason to
         interject, so the resolved track is appended rather than interrupting a
         song the user just chose to keep playing (§3.3)."""
@@ -1954,7 +1962,7 @@ class TestPlayWhilePaused:
         music_bot.queue_source = AsyncMock(return_value=qobj)
         music_bot._enqueue_single = AsyncMock()
 
-        async def _resolve_then_resume(*a: Any, **kw: Any):
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> None:
             vc.is_paused.return_value = False  # user hit -resume mid-extraction
             return None
 
@@ -2042,7 +2050,7 @@ class TestPlayFrontInsertion:
 
     async def test_cold_path_enqueues_at_front(
         self, music_bot: MusicBot, mock_ctx: MagicMock
-    ):
+    ) -> None:
         mock_ctx.voice_client = None
         fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
@@ -2054,7 +2062,7 @@ class TestPlayFrontInsertion:
         join_task = loop.create_future()
         join_task.set_result(None)
 
-        def fake_create_task(coro: Any):
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
             return join_task
 
@@ -2088,7 +2096,7 @@ class TestPlayFrontInsertion:
 
     async def test_cold_path_waits_for_restore_before_enqueueing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
-    ):
+    ) -> None:
         """Load-bearing ordering: put_front LPUSHes the Redis mirror while
         restore_entries replays already-listed entries in memory only, so
         inserting before restore reads its snapshot double-queues the song."""
@@ -2108,7 +2116,7 @@ class TestPlayFrontInsertion:
         join_task = loop.create_future()
         join_task.set_result(None)
 
-        def fake_create_task(coro: Any):
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
             return join_task
 
@@ -2119,7 +2127,7 @@ class TestPlayFrontInsertion:
 
     async def test_cold_path_holds_playback_gate_across_join(
         self, music_bot: MusicBot, mock_ctx: MagicMock
-    ):
+    ) -> None:
         """join opens the gate as soon as the handshake lands — the hold is what
         stops the restored head from starting while queue_source is still
         extracting."""
@@ -2135,7 +2143,7 @@ class TestPlayFrontInsertion:
         join_task = loop.create_future()
         join_task.set_result(None)
 
-        def fake_create_task(coro: Any):
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
             return join_task
 
@@ -2193,7 +2201,7 @@ class TestPlayFrontInsertion:
 
     async def test_cold_path_routes_playlist_through_front(
         self, music_bot: MusicBot, mock_ctx: MagicMock
-    ):
+    ) -> None:
         """End-to-end wiring for the playlist half of the cold path: play()'s
         list branch must carry front=True into _enqueue_playlist. Previously
         only _enqueue_playlist was tested directly, leaving this dispatch —
@@ -2213,7 +2221,7 @@ class TestPlayFrontInsertion:
         join_task = loop.create_future()
         join_task.set_result(None)
 
-        def fake_create_task(coro: Any):
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
             return join_task
 
@@ -2265,7 +2273,9 @@ class TestPlayFrontInsertion:
         with patch("src.youtube.YTDL.prefetch_stream", new=AsyncMock()):
             await music_bot._enqueue_single(mock_ctx, qobj, music_player, front=True)
 
-        titles = [item.title for item in music_player.queue.display_items()]
+        titles = [
+            queue_object(item).title for item in music_player.queue.display_items()
+        ]
         assert titles == ["New Song", "Persisted One", "Persisted Two"]
         assert titles.count("New Song") == 1
 
@@ -2871,7 +2881,7 @@ class TestRestoreGuildChannelDeleted:
         music_bot_with_redis: MusicBot,
         mock_guild: MagicMock,
         fake_redis_bot: aioredis.Redis,
-    ):
+    ) -> None:
         """When only the voice channel is gone, notify via the still-valid text channel."""
         from src.redis_client import GuildRedisStore
 
@@ -2881,7 +2891,7 @@ class TestRestoreGuildChannelDeleted:
         text_channel = MagicMock(spec=discord.TextChannel)
         text_channel.send = AsyncMock()
 
-        def _get_channel(ch_id: int):
+        def _get_channel(ch_id: int) -> Optional[MagicMock]:
             if ch_id == 888000000000000001:
                 return None  # voice deleted
             return text_channel  # text still exists
@@ -3098,7 +3108,7 @@ class TestRemoveCommand:
 
 class TestPlaynow:
     @pytest.fixture
-    def live_mp(self):
+    def live_mp(self) -> MagicMock:
         """A MusicPlayer mock with a song currently playing."""
         from src.musicplayer import InterjectOutcome
 
@@ -3115,7 +3125,7 @@ class TestPlaynow:
         return mp
 
     @pytest.fixture
-    def live_vc(self):
+    def live_vc(self) -> MagicMock:
         vc = MagicMock(spec=discord.VoiceClient)
         vc.is_playing.return_value = True
         vc.is_paused.return_value = False
@@ -3372,7 +3382,7 @@ class TestPlaynow:
         mock_ctx: MagicMock,
         live_mp: MagicMock,
         live_vc: MagicMock,
-    ):
+    ) -> None:
         """The stream-URL cache is warmed BEFORE interject stops the current
         song — a cache miss at dequeue would otherwise put yt-dlp dead air
         between the interrupt and the playnow song starting."""
@@ -3392,7 +3402,7 @@ class TestPlaynow:
             replaced=False,
         )
 
-        def _interject_effect(*args: Any, **kwargs: Any):
+        def _interject_effect(*args: Any, **kwargs: Any) -> InterjectOutcome:
             order.append("interject")
             return outcome
 

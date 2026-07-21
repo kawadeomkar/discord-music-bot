@@ -2,8 +2,15 @@ import asyncio
 import contextlib
 import datetime
 import time
-from dataclasses import dataclass
-from typing import Any, List, Optional, Union
+from dataclasses import dataclass, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    Union,
+    cast,
+)
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 from zoneinfo import ZoneInfo
 
 import async_timeout
@@ -23,6 +30,7 @@ from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    spawn_background,
     fmt_duration,
     notice_embed,
     record_span_error,
@@ -33,6 +41,11 @@ from src.util import (
 )
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
 
+if TYPE_CHECKING:
+    # Runtime import would close the cycle (musicbot imports MusicPlayer); the cog is
+    # only ever named in annotations here. Same guard main.py uses for MusicPlayer.
+    from src.musicbot import MusicBot
+
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
@@ -41,14 +54,28 @@ _tracer = get_tracer(__name__)
 QueueItem = Union[QueueObject, YTSource]
 
 
-@dataclass
+@dataclass(frozen=True)
 class EtaWalk:
     """Accumulator threaded through the queue's ETA-walking fold. `now_pst`
     is deliberately excluded — it's invariant across a single walk, unlike
-    these two fields, and is passed alongside instead of bundled in."""
+    these two fields, and is passed alongside instead of bundled in.
+
+    Frozen so that threading it through a fold means what it looks like it
+    means: advance with `dataclasses.replace()` and rebind the result. This
+    was a plain `(int, bool)` pair before the dataclass, and a mutable version
+    would let a caller that snapshots a walk or reuses one seed across two
+    walks read silently wrong ETAs — with nothing to fail a test.
+    """
 
     cumulative_secs: int
     uncertain: bool
+
+    def advance(self, remaining: Optional[int]) -> "EtaWalk":
+        """The next walk state after a queue item whose remaining time is
+        `remaining`, or None when its duration is unknown."""
+        if remaining is None:
+            return replace(self, uncertain=True)
+        return replace(self, cumulative_secs=self.cumulative_secs + remaining)
 
 
 # HACK: Every guild's ETAs are hardcoded to Pacific time.
@@ -297,8 +324,8 @@ class MusicPlayer:
     bot: commands.Bot
     _guild: discord.Guild
     _channel: discord.TextChannel
-    _last_author: Union[discord.User, discord.Member]
-    _cog: Any
+    _last_author: Optional[Union[discord.User, discord.Member]]
+    _cog: "MusicBot"
     current_song: Optional[YTDL]
     play_next: asyncio.Event
     queue: GuildQueue
@@ -312,7 +339,7 @@ class MusicPlayer:
     _restore_complete: asyncio.Event
     _playback_gate: asyncio.Event
     _playback_holds: int
-    _background_tasks: set
+    _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
@@ -326,12 +353,18 @@ class MusicPlayer:
         bot: commands.Bot,
         guild: discord.Guild,
         channel: discord.TextChannel,
-        cog: Any,
+        cog: "MusicBot",
         redis: Optional[aioredis.Redis] = None,
     ) -> None:
         self.bot = bot
         self._guild = guild
         self._channel = channel
+        # Best-effort seed, and genuinely nullable: guild.me is None until the member
+        # cache fills, and guild.owner can be uncached too. discord.py's stub declares
+        # Guild.me as Member, which collapses the `or` and hides that from the checker —
+        # hence the explicit annotation. from_context()/set_context() overwrite this with
+        # ctx.author before any command path reads it; _require_requester() covers the
+        # rest.
         _fallback: Union[discord.Member, discord.User, None] = guild.me or guild.owner
         self._last_author = _fallback
         self._cog = cog
@@ -365,7 +398,7 @@ class MusicPlayer:
         # across the join it triggers so the restored head cannot start before
         # the requested song is inserted in front of it.
         self._playback_holds = 0
-        self._background_tasks: set = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
         # Now-playing host state: the one message currently carrying the NP
         # embed block, its own (cached, static) embeds that follow the block,
@@ -395,7 +428,10 @@ class MusicPlayer:
         assert ctx.guild is not None
         assert isinstance(ctx.channel, discord.TextChannel)
         assert ctx.cog is not None
-        mp = cls(bot, ctx.guild, ctx.channel, ctx.cog, redis=redis)
+        # ctx.cog is Optional[Cog] to discord.py; the only cog that owns the commands
+        # reaching here is MusicBot. A cast rather than an isinstance assert — the
+        # latter would be a stricter runtime check than this line has ever made.
+        mp = cls(bot, ctx.guild, ctx.channel, cast("MusicBot", ctx.cog), redis=redis)
         mp._last_author = ctx.author
         return mp
 
@@ -430,7 +466,7 @@ class MusicPlayer:
             self._playback_gate.set()
 
     @contextlib.asynccontextmanager
-    async def defer_playback(self):
+    async def defer_playback(self) -> AsyncGenerator[None]:
         """Hold the playback gate shut for the duration of the block.
 
         -play calls -join, which opens the gate as soon as the voice handshake
@@ -465,6 +501,22 @@ class MusicPlayer:
         assert isinstance(ctx.channel, discord.TextChannel)
         self._channel = ctx.channel
         self._last_author = ctx.author
+
+    def _require_requester(self) -> Union[discord.User, discord.Member]:
+        """The fallback requester, for the paths that must have one.
+
+        QueueObject.requester is non-optional because persistence reads
+        `requester.id` (guild_state.py). _last_author only lacks a value on a
+        player built for a guild whose bot member AND owner are both uncached,
+        and never after a command has run — so failing here names the cause
+        instead of surfacing as an AttributeError on None during serialization.
+        """
+        if self._last_author is None:
+            raise RuntimeError(
+                f"No requester available for guild {self._guild.id}: neither the "
+                "bot member nor the guild owner is cached"
+            )
+        return self._last_author
 
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs.
@@ -515,15 +567,11 @@ class MusicPlayer:
                 f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
                 f"{channel} · {requester}"
             )
-            remaining = _remaining_secs(item)
-            if remaining is not None:
-                walk.cumulative_secs += remaining
-            else:
-                walk.uncertain = True
+            walk = walk.advance(_remaining_secs(item))
         else:
             search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
             line = f"`{index}` {search} · *resolving...*"
-            walk.uncertain = True
+            walk = walk.advance(None)
 
         return line, walk
 
@@ -534,11 +582,9 @@ class MusicPlayer:
         """
         now_pst, walk = self._queue_eta_seed()
         for item in self.queue.display_items():
-            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
-            if remaining is not None:
-                walk.cumulative_secs += remaining
-            else:
-                walk.uncertain = True
+            walk = walk.advance(
+                _remaining_secs(item) if isinstance(item, QueueObject) else None
+            )
         est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
         return _fmt_eta(est_dt, walk.uncertain)
 
@@ -579,7 +625,7 @@ class MusicPlayer:
             color=discord.Color.blue(),
         )
 
-    async def stop(self):
+    async def stop(self) -> None:
         await self._cog.cleanup(self._guild)
 
     # ── State restore ─────────────────────────────────────────────────────────
@@ -726,10 +772,10 @@ class MusicPlayer:
 
     async def queue_put(
         self,
-        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ):
+    ) -> None:
         """Enqueue and (optionally) kick off stream pre-fetch.
 
         prefetch=False for bulk playlist enqueues — the Redis mirror is
@@ -739,10 +785,10 @@ class MusicPlayer:
         _prefetch_next_song handles one-ahead prefetch naturally as songs play).
         """
         items: list[QueueItem]
-        if isinstance(obj, list):
-            items = list(obj)
-        else:
+        if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
+        else:
+            items = list(obj)
         await self.queue.put(items, batch=not prefetch)
         if prefetch and self.store is not None:
             for item in items:
@@ -753,7 +799,7 @@ class MusicPlayer:
 
     async def queue_put_front(
         self,
-        obj: Union[QueueItem, List[QueueObject], List[YTSource]],
+        obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
     ) -> None:
@@ -770,10 +816,10 @@ class MusicPlayer:
         them.
         """
         items: list[QueueItem]
-        if isinstance(obj, list):
-            items = list(obj)
-        else:
+        if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
+        else:
+            items = list(obj)
         await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
@@ -801,7 +847,7 @@ class MusicPlayer:
         """
         await cancel_task(self._prefetch_task)
 
-    async def queue_clear(self) -> List[str]:
+    async def queue_clear(self) -> list[str]:
         await self._cancel_prefetch()  # before the drain — see _cancel_prefetch
         cleared_items = await self.queue.clear()
         return [
@@ -1102,7 +1148,7 @@ class MusicPlayer:
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
         if song is not None:
-            timestamps: dict = {}
+            timestamps: dict[str, int] = {}
             vc = self._guild.voice_client
             is_paused = isinstance(vc, discord.VoiceClient) and vc.is_paused()
             if not is_paused:
@@ -1291,7 +1337,7 @@ class MusicPlayer:
                 resume = QueueObject(
                     current.webpage_url,
                     current.title or "",
-                    current.requester or self._last_author,
+                    current.requester or self._require_requester(),
                     ts=position,
                     duration=current.duration_secs or None,
                     uploader=current.uploader,
@@ -1364,7 +1410,7 @@ class MusicPlayer:
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",
-            song.requester or self._last_author,
+            song.requester or self._require_requester(),
             ts=song.start_offset or None,
             duration=song.duration_secs or None,
             uploader=song.uploader,
@@ -1402,7 +1448,7 @@ class MusicPlayer:
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._last_author,
+                self._require_requester(),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
             )
@@ -1594,12 +1640,13 @@ class MusicPlayer:
                 position_override=song.duration_secs if completed else None,
             )
 
-    def _spawn_background(self, coro: Any) -> asyncio.Task:
-        """Create a fire-and-forget task tracked in _background_tasks."""
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+    def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        """Fire-and-forget task tracked in _background_tasks.
+
+        Binds this player's task set to the shared util helper so the ten call
+        sites below don't each have to name it.
+        """
+        return spawn_background(coro, self._background_tasks)
 
     def _fire_finalize_now_playing(
         self,
@@ -1693,7 +1740,7 @@ class MusicPlayer:
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
-    async def loop(self):
+    async def loop(self) -> None:
         await self.bot.wait_until_ready()
         # Wait for _restore_state() to finish populating self.queue before
         # dequeuing anything — see _restore_state()'s docstring for the race
