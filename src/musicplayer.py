@@ -255,7 +255,7 @@ class MusicPlayer:
         self._guild = guild
         self._channel = channel
         _fallback: Union[discord.Member, discord.User, None] = guild.me or guild.owner
-        self._last_author = _fallback  # type: ignore[assignment]
+        self._last_author = _fallback
         self._cog = cog
 
         self.current_song = None
@@ -607,7 +607,7 @@ class MusicPlayer:
         """
         items: list[Union[QueueObject, YTSource]]
         if isinstance(obj, list):
-            items = list(obj)  # type: ignore[arg-type]
+            items = list(obj)
         else:
             items = [obj]
         await self.queue.put(items, batch=not prefetch)

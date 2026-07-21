@@ -133,6 +133,7 @@ class TestParseUrlSoundcloud:
     def test_soundcloud_ts_defaults_to_none(self):
         url = "https://soundcloud.com/artist/track"
         result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SoundcloudSource)
         assert result.ts is None
 
 

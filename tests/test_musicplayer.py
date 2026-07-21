@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import re
 import time
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -4153,6 +4154,7 @@ class TestRestoreStateNowPlaying:
 
         assert music_player.play_message is not None
         assert isinstance(music_player.play_message, discord.Embed)
+        assert music_player.play_message.title is not None
         assert "Restored Song" in music_player.play_message.title
 
     async def test_play_message_none_when_no_now_playing_in_redis(self, music_player):
@@ -4849,11 +4851,23 @@ class TestPlaynowLoopStart:
             await music_player.loop()
         return pause_mock, announce_mock
 
-    def _vc(self):
+    def _vc(self) -> discord.VoiceClient:
+        """A VoiceClient whose play/pause are mocks, built without __init__.
+
+        Deliberately a real instance rather than MagicMock(spec=...): any
+        attribute the loop touches beyond these two should fail loudly, not
+        hand back a truthy mock that quietly steers the loop down another path.
+        Read the mocks back with _mock_call(vc, "pause").
+        """
         vc = object.__new__(discord.VoiceClient)
         vc.play = MagicMock()
         vc.pause = MagicMock()
         return vc
+
+    @staticmethod
+    def _mock_call(vc: discord.VoiceClient, name: str) -> MagicMock:
+        """Return a VoiceClient method that _vc replaced with a MagicMock."""
+        return cast(MagicMock, getattr(vc, name))
 
     async def test_start_paused_parks_synchronously_and_engages_bookkeeping(
         self, music_player, queue_obj, mock_song
@@ -4862,7 +4876,7 @@ class TestPlaynowLoopStart:
         vc = self._vc()
         pause_mock, _ = await self._run_one_song(music_player, queue_obj, mock_song, vc)
         # Synchronous park right after vc.play (frame-leak guard) …
-        vc.pause.assert_called_once()
+        self._mock_call(vc, "pause").assert_called_once()
         # … plus the full pause() entry point (Redis epochs, debounced refresh).
         pause_mock.assert_awaited_once()
 
@@ -4883,6 +4897,6 @@ class TestPlaynowLoopStart:
         pause_mock, announce_mock = await self._run_one_song(
             music_player, queue_obj, mock_song, vc
         )
-        vc.pause.assert_not_called()
+        self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()

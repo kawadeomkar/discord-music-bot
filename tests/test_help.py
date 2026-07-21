@@ -56,11 +56,30 @@ def sent_embed(ctx) -> discord.Embed:
     return ctx.send.call_args.kwargs["embed"]
 
 
-class TestGetDestination:
-    def test_returns_context_not_channel(self, help_command, ctx):
-        """Must route through MusicContext.send so the Now Playing block stays
-        glued to the bottom of the channel — context.channel would bury it."""
-        assert help_command.get_destination() is ctx
+class TestSendDestination:
+    """Help output must route through MusicContext.send so the Now Playing block
+    stays glued to the bottom of the channel — a bare context.channel.send()
+    would bury it (docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md).
+
+    Asserted on behaviour, not on the mechanism: the base HelpCommand's
+    inherited get_destination() returns context.channel, so any send path that
+    reached for it would trip these.
+    """
+
+    async def test_bot_help_sends_via_context(self, help_command, ctx):
+        await help_command.command_callback(ctx, command=None)
+        ctx.send.assert_awaited_once()
+        ctx.channel.send.assert_not_called()
+
+    async def test_command_help_sends_via_context(self, help_command, ctx):
+        await help_command.command_callback(ctx, command="play")
+        ctx.send.assert_awaited_once()
+        ctx.channel.send.assert_not_called()
+
+    async def test_error_message_sends_via_context(self, help_command, ctx):
+        await help_command.command_callback(ctx, command="nonexistent")
+        ctx.send.assert_awaited_once()
+        ctx.channel.send.assert_not_called()
 
 
 class TestBotHelp:
