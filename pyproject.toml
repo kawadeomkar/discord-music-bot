@@ -41,7 +41,16 @@ fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
 
 [tool.poetry.group.lint.dependencies]
-pyright = "^1.1.409"
+# The `nodejs` extra is not optional in practice. The pyright PyPI package is a
+# Python wrapper around a JavaScript analyzer (site-packages/pyright/dist/index.js),
+# so it needs a Node runtime that poetry cannot otherwise provide. Without the
+# extra it silently borrows whatever Node is lying around — Homebrew's on a Mac,
+# the preinstalled one on GitHub's runners — and on a machine with none (every
+# python:3.14-slim container, and any clean dev box) it falls back to downloading
+# its own via nodeenv: 438MB, re-fetched on every `docker run --rm`. The extra
+# pulls nodejs-wheel-binaries instead, which puts Node in poetry.lock and makes
+# host, CI and container resolve the same way.
+pyright = { version = "^1.1.409", extras = ["nodejs"] }
 # Exact-pinned, like yt-dlp and discord-py, because a second file has to agree
 # with it: .pre-commit-config.yaml pins the ruff hook by `rev`, and the hook runs
 # ruff from its own isolated environment. Under a caret range any `poetry update`
