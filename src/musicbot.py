@@ -174,6 +174,12 @@ class MusicBot(commands.Cog):
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
+            # Belt-and-braces: the loop's own CancelledError handler already
+            # resets the presence, but only if it was parked inside the block
+            # that handles it. Repeat it here — after the disconnect, so this
+            # guild's client can no longer register as playing — so a stopped
+            # bot never advertises the song it stopped.
+            await mp.update_activity(None)
             if mp.store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
                 # on_ready does not attempt to recover this guild after restart.
