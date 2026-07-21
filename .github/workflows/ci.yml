@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Supersedes three pushes to a PR racing three full pipelines. Never cancel on
+# main: an aborted main run means no image was published for that commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   resolve-env:
     name: Resolve Environment
@@ -25,35 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
-
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          # Key on poetry.lock — only invalidates when dependency versions change.
-          # The installed group set is part of the key: keying on poetry.lock
-          # alone would restore a venv built from a different --only= list and
-          # never re-save it (actions/cache skips saving on an exact key hit),
-          # re-installing the difference on every run.
-          key: venv-lint-${{ runner.os }}-py3.14-main-lint-test-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-lint-${{ runner.os }}-py3.14-main-lint-test-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
           # `test` is here for pyright, not to run tests: it type-checks tests/,
-          # which imports pytest and fakeredis. Without them every such import
-          # is an unresolved-import error.
-          poetry install --only=main,lint,test --no-root
-
-      - name: compile (syntax check)
-        run: poetry run python -m compileall src/
+          # which imports pytest and fakeredis. Without them every such import is
+          # an unresolved-import error.
+          groups: main,lint,test
+          cache-prefix: lint-main-lint-test
 
       - name: ruff format --check
         run: poetry run ruff format --check src/ tests/
@@ -61,8 +45,8 @@ jobs:
       - name: ruff check
         run: poetry run ruff check src/ tests/
 
-      # No path argument: check src/ AND tests/, matching black above and the
-      # bare `pyright` developers run locally. Checking only src/ is what let
+      # No path argument: check src/ AND tests/, matching the bare `pyright`
+      # developers run locally via `make types`. Checking only src/ is what let
       # tests/ accumulate 67 type errors unnoticed.
       - name: pyright
         run: poetry run pyright
@@ -79,24 +63,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
-
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          key: venv-test-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-test-${{ runner.os }}-py3.14-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
-          poetry install --only=main,test --no-root
+          groups: main,test
+          cache-prefix: test-main-test
 
       - name: Run tests with coverage
         run: |
@@ -111,7 +81,6 @@ jobs:
           junitxml-path: ./pytest.xml
           title: Test Coverage Report
           badge-title: Coverage
-
 
   container-test:
     name: Container Test
@@ -137,3 +106,64 @@ jobs:
 
       - name: Run tests in container
         run: docker run --rm discord-music-bot:test
+
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [resolve-env, lint, test, container-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+
+    # This job used to live in a separate build.yml triggered by `workflow_run`.
+    # That was a provenance hole: for the workflow_run event GITHUB_SHA is
+    # documented as "last commit on default branch", NOT the commit whose CI just
+    # passed — so a bare `actions/checkout` plus metadata-action's `type=sha`
+    # could publish an image tagged with a SHA whose contents it did not contain,
+    # any time a second merge landed during the first one's run. As a job here it
+    # inherits the correct SHA, reuses the BuildKit cache container-test just
+    # warmed, and is testable from a PR at all (workflow_run always executes the
+    # DEFAULT branch's copy of the workflow file).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The job only runs on main (see `if:` above), so `latest` needs no
+          # further branch condition.
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          push: true
+          # build.yml never passed this. It changes nothing today — the job only
+          # runs on main, where the resolved name and the Dockerfile's runtime
+          # default are both "production" — but relying on two independent
+          # defaults agreeing is not a property worth depending on.
+          build-args: |
+            ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha
+            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=gha,mode=max
