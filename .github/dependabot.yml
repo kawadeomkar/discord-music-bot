@@ -28,3 +28,15 @@ updates:
       interval: weekly
     labels:
       - dependencies
+
+  # Keeps .pre-commit-config.yaml's pinned revs current. The ruff hook's rev must
+  # stay in step with the ruff constraint in pyproject.toml's lint group — the
+  # hook runs ruff from its own isolated env, so a drift means the hook formats
+  # one way and `make lint`/CI check another. When Dependabot bumps one, bump the
+  # other in the same PR (`make hooks-update` does the config side).
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
