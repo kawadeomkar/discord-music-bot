@@ -129,9 +129,15 @@ def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
     loop() blocks on _restore_complete until _restore_state() finishes (see its docstring
     for why); since start() never runs here, nothing would set it. Tests that
     exercise that race explicitly should clear it again before calling loop().
+
+    loop() then blocks on the playback gate until a voice connection is
+    established (docs/PLAYBACK_GATE_PLAN.md). start() and the -join/-play call
+    sites that open it never run here either, so it is opened for the same
+    reason — tests that exercise the gate itself should clear it again.
     """
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
+    mp._playback_gate.set()
     return mp
 
 

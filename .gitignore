@@ -1,10 +1,10 @@
 # Ignore
 pyproject.bak.toml
-pyrightconfig.json
 docs/
 
 # Claude Code
 .claude/
+CLAUDE.md
 /CLAUDE.md
 
 # PyCharm and misc

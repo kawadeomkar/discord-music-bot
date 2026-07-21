@@ -96,18 +96,19 @@ class MusicHelpCommand(commands.HelpCommand):
             **options,
         )
 
-    def get_destination(self) -> discord.abc.Messageable:  # type: ignore[override]
-        """The invoking Context, not its channel.
-
-        The base implementation returns ``context.channel``, whose bare send()
-        would bury the Now Playing host message mid-song. MusicContext.send
-        keeps the NP block glued to the bottom of the channel — see
-        docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md.
-
-        The base signature promises a MessageableChannel; a Context is only
-        Messageable, which is all this class ever uses it for (send()).
-        """
-        return self.context
+    # Every send below goes through self.context, never self.get_destination():
+    # the inherited get_destination() returns context.channel, whose bare send()
+    # would bury the Now Playing host message mid-song. MusicContext.send keeps
+    # the NP block glued to the bottom of the channel (see
+    # docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md), and routing help output through
+    # ctx.send is the same rule the rest of the bot follows.
+    #
+    # Overriding get_destination() to return the Context would be the natural
+    # hook, but its base signature promises a MessageableChannel and a Context
+    # is not one — only Messageable, which is all a caller here needs. Rather
+    # than override it incompatibly, we leave it alone: this class overrides
+    # every send_* method the base defines, so the base's own call to it (in
+    # send_error_message) never runs.
 
     # ── formatting helpers ────────────────────────────────────────────────────
 
@@ -241,7 +242,7 @@ class MusicHelpCommand(commands.HelpCommand):
         embed.set_footer(
             text=f"{len(visible)} commands · {prefix}help <command> for details"
         )
-        await self.get_destination().send(embed=embed)
+        await self.context.send(embed=embed)
 
     async def send_cog_help(self, cog: commands.Cog, /) -> None:
         # Every command lives in the single MusicBot cog, so `-help MusicBot` is
@@ -283,7 +284,7 @@ class MusicHelpCommand(commands.HelpCommand):
         if note:
             embed.add_field(name="NOTES", value=note, inline=False)
         embed.set_footer(text=f"{category} · {prefix}help for the full command list")
-        await self.get_destination().send(embed=embed)
+        await self.context.send(embed=embed)
 
     async def send_group_help(self, group: commands.Group, /) -> None:
         # No command groups exist today; degrade to the single-command embed
@@ -291,7 +292,7 @@ class MusicHelpCommand(commands.HelpCommand):
         await self.send_command_help(group)
 
     async def send_error_message(self, error: str, /) -> None:
-        await self.get_destination().send(
+        await self.context.send(
             embed=notice_embed(
                 f"{error}\nRun `{self.prefix}help` to see every command.",
                 discord.Color.red(),
