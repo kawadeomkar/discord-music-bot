@@ -11,6 +11,9 @@
 # that branch's merge into a rewrite under conflict markers, months from now.
 # Rationale: docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §4.1.
 #
+# git_sha_tag is ADDITIVE — new callers may use it, the three names above keep
+# working untouched, so the k8s merge is unaffected by its existence.
+#
 # Cluster-side helpers live in k8s_common.sh (also unmerged). This file knows
 # nothing about Kubernetes, which is exactly why build_docker.sh can source it.
 #
@@ -24,6 +27,31 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 fi
 
 IMAGE_NAME="discord-music-bot"
+
+# The tag that identifies what is actually in the image.
+#
+# deploy_docker.sh refuses to deploy a SHA tag it cannot find, precisely so a
+# rollback can never get "today's source wearing last week's tag". Building had
+# the same hole from the other side: `docker build -t $IMAGE:$(git rev-parse HEAD)`
+# with uncommitted changes stamps HEAD's SHA onto bytes that are not HEAD, and the
+# deploy guard then waves it through because the tag does exist.
+#
+# The fix is honesty rather than a gate. Refusing to build a dirty tree would be a
+# gate people route around (iterating and deploying from the same working tree is
+# the normal case here); a `-dirty` suffix instead makes the tag true, keeps the
+# deploy guard meaningful, and leaves clean-SHA rollbacks untouched.
+# `git diff --quiet HEAD` covers staged AND unstaged changes to TRACKED files —
+# the case that actually matters, since those are the bytes the Dockerfile copies.
+# A brand-new untracked file is not flagged; it would be over-flagging, as scratch
+# files sit in the tree constantly and .dockerignore keeps most of them out.
+git_sha_tag() {
+    local sha
+    sha=$(git rev-parse HEAD)
+    if ! git diff --quiet HEAD 2>/dev/null; then
+        sha="$sha-dirty"
+    fi
+    echo "$sha"
+}
 
 # ENVIRONMENT: an explicit env var wins, else derive it from the branch.
 # Exported for `docker build --build-arg` and for docker-compose.yml.

@@ -11,7 +11,7 @@
 #   pre-commit  ruff (~0.13s) + trivia    fast enough to never think about
 #   pre-push    make check (~24s)         the "will CI pass" gate, once per push
 #
-# pyright (5.5s) and pytest (15s) are deliberately NOT on pre-commit. A hook slow
+# pyright (6s) and pytest (14s) are deliberately NOT on pre-commit. A hook slow
 # enough to interrupt your train of thought is a hook that teaches you to reach
 # for --no-verify, and that habit costs more than the checks ever caught.
 #
@@ -20,6 +20,16 @@
 # intended, not a bug.
 
 default_install_hook_types: [pre-commit, pre-push]
+
+# Required, not cosmetic. pre-commit's default for a hook that omits `stages` is
+# EVERY stage, not "pre-commit" — so without this line the ruff hooks also ran on
+# pre-push, against the whole origin..HEAD file list, rewriting files and leaving
+# a failed push with unstaged edits to already-finished commits.
+#
+# This covers only hooks that declare no stages of their own. Three of the
+# pre-commit-hooks below ship upstream stages that outrank it and opt out
+# individually; make-check opts back IN to pre-push.
+default_stages: [pre-commit]
 
 # coverage.json is a generated artifact that happens to be tracked (last written
 # 2026-06-17, long stale). Reformatting a build output produces pure churn, and a
@@ -34,7 +44,7 @@ repos:
   # and `make lint` / CI checks another. `make hooks-update` bumps this; bump the
   # poetry constraint in the same commit.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.20
+    rev: v0.15.21
     hooks:
       # Lint before format: --fix can emit changes that need reformatting.
       - id: ruff-check
@@ -45,9 +55,18 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-merge-conflict
+      # These three ship `stages: [pre-commit, pre-push, manual]` in the upstream
+      # .pre-commit-hooks.yaml, and a hook's OWN stages beat this file's
+      # default_stages — so the top-level default does not reach them and they
+      # have to opt out one by one. It matters most for the two fixers: on a push
+      # they would rewrite every file in origin..HEAD, abort the push, and leave
+      # unstaged edits behind on already-finished commits.
       - id: check-added-large-files
+        stages: [pre-commit]
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: trailing-whitespace
+        stages: [pre-commit]
       - id: check-toml
       - id: check-yaml
         # deploy/k8s/ manifests (docs/K8S_DEPLOYMENT_PLAN.md) are multi-document
@@ -64,4 +83,9 @@ repos:
         # Whole-repo gate: pyright is a whole-program analysis and the test suite
         # is not partitioned by path, so passing filenames would be meaningless.
         pass_filenames: false
+        # always_run is the necessary partner to pass_filenames: false. pre-commit
+        # skips a hook whose filename list came out empty, and a push containing
+        # only deletions produces exactly that — the gate would report "Skipped"
+        # on precisely the change most likely to break the build.
+        always_run: true
         stages: [pre-push]

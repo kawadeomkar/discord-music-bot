@@ -25,7 +25,11 @@
 # Both branches are pure Make — no subprocess, so `make help` stays instant.
 VENV_BIN := $(if $(VIRTUAL_ENV),$(VIRTUAL_ENV)/bin,.venv/bin)
 IMAGE    := discord-music-bot
-GIT_SHA  := $(shell git rev-parse HEAD)
+
+# No GIT_SHA variable here on purpose: the tag comes from build_common.sh's
+# git_sha_tag (which appends `-dirty` when the tree has uncommitted changes), so
+# there is one definition of "what tag identifies this build". A `:=` here would
+# also fork git on EVERY make invocation, `make help` included.
 
 .PHONY: help install fmt lint types test check container-test ci image up down \
         restart logs ps hooks hooks-update hooks-run
@@ -66,10 +70,18 @@ lint: _venv ## Check formatting + lint rules, no rewrites (~0.1s) — CI's ruff 
 	$(VENV_BIN)/ruff format --check src/ tests/
 	$(VENV_BIN)/ruff check src/ tests/
 
-types: _venv ## Type-check src/ AND tests/ with pyright (~5.5s)
-	$(VENV_BIN)/pyright
+# --pythonpath is not optional here. pyright resolves imports from the interpreter
+# it is TOLD about, not the one it runs from: with `[tool.pyright] venvPath/venv`
+# it read ./.venv, which on a pyenv box is a different (and stale) environment
+# from the $VIRTUAL_ENV that `make install`, `make lint` and `make test` all use —
+# so `make types` type-checked against a package set the other targets never saw.
+# Those keys are gone from pyproject.toml; this flag replaces them, and it points
+# at exactly the same VENV_BIN as every other target. Worse than wrong, the old
+# setup failed SILENTLY: a missing .venv makes pyright warn and exit 0.
+types: _venv ## Type-check src/ AND tests/ with pyright (~6s)
+	$(VENV_BIN)/pyright --pythonpath $(VENV_BIN)/python
 
-test: _venv ## Run the test suite with coverage (~10s)
+test: _venv ## Run the test suite with coverage (~13s)
 	$(VENV_BIN)/pytest --tb=short -q
 
 check: lint types test ## Everything CI gates on — run this before pushing
@@ -91,7 +103,7 @@ ci: check container-test ## Full local mirror of the CI workflow
 
 image: ## Build the runtime image as :latest and :<git-sha> — no test gate
 	@bash -c 'source ./build_common.sh && resolve_environment && \
-	    build_runtime_image "$(IMAGE):latest" "$(IMAGE):$(GIT_SHA)"'
+	    build_runtime_image "$(IMAGE):latest" "$(IMAGE):$$(git_sha_tag)"'
 
 up: ## Deploy the already-built image for HEAD (rollback: ./deploy_docker.sh <sha>)
 	./deploy_docker.sh
@@ -99,7 +111,11 @@ up: ## Deploy the already-built image for HEAD (rollback: ./deploy_docker.sh <sh
 down: ## Stop the compose stack (volumes are kept)
 	docker compose down
 
-restart: ## Recreate the bot container only, leaving Redis and friends running
+# NOT a deploy. `docker compose restart` stops and starts the EXISTING container
+# with the image it already has, so a newly built image is not picked up — the
+# old help text said "recreate", which sent `make image && make restart` down a
+# path that silently kept running the old code. Use `make up` to deploy.
+restart: ## Restart the running bot in place — does NOT pick up a new image (use `make up`)
 	docker compose restart discord-music-bot
 
 logs: ## Follow the bot's logs

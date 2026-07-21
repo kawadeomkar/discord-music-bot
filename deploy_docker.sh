@@ -17,7 +17,10 @@ source ./build_common.sh
 
 resolve_environment
 
-GIT_SHA="${1:-$(git rev-parse HEAD)}"
+# Default matches what build_docker.sh / `make image` actually tagged, `-dirty`
+# suffix included — otherwise `make up` after a dirty build looks for a clean-SHA
+# tag that was never created and the guard below rejects it.
+GIT_SHA="${1:-$(git_sha_tag)}"
 export GIT_SHA
 TAG="$IMAGE_NAME:$GIT_SHA"
 
@@ -29,7 +32,14 @@ TAG="$IMAGE_NAME:$GIT_SHA"
 if ! docker image inspect "$TAG" >/dev/null 2>&1; then
     echo "No local image $TAG — refusing to let compose build one and label it with that SHA." >&2
     echo "Build the current commit with ./build_docker.sh, or pick a tag that exists:" >&2
-    docker images "$IMAGE_NAME" --format '  {{.Tag}}\t{{.CreatedSince}}' | head -20 >&2
+    # `|| true` guards a SIGPIPE race. `head` closes the pipe after 20 lines; if
+    # docker is still writing at that point it dies of SIGPIPE (141), and under
+    # `set -o pipefail` that becomes the script's status — aborting HERE, before
+    # the `exit 1` below, so the user would see a bare 141 instead of this
+    # message. It needs output larger than the ~64KB pipe buffer to fire (docker
+    # exits cleanly below that, measured), i.e. on the order of a thousand tags —
+    # latent, not imminent, but free to rule out.
+    docker images "$IMAGE_NAME" --format '  {{.Tag}}\t{{.CreatedSince}}' | head -20 >&2 || true
     exit 1
 fi
 

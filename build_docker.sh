@@ -17,7 +17,10 @@ run_test_gate
 
 # Split from the export deliberately: `export FOO="$(cmd)"` returns export's own
 # status, so a failing command inside it does NOT trip set -e.
-GIT_SHA="$(git rev-parse HEAD)"
+#
+# git_sha_tag, not `git rev-parse HEAD`: a build from a dirty tree gets a
+# `-dirty` suffix so the tag never claims to be a commit it isn't.
+GIT_SHA="$(git_sha_tag)"
 export GIT_SHA
 
 # `:latest` too — docker-compose.yml falls back to it when GIT_SHA is unset, so a
