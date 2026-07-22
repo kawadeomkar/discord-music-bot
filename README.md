@@ -102,8 +102,12 @@ poetry run bot
 Contributors should use `just install` instead of `poetry install` — it adds the
 `test`, `lint` and `dev` dependency groups that `just check` needs.
 
-Every recipe below assumes an activated virtualenv (or `poetry run just <recipe>`,
-which works without one).
+Every recipe below assumes the project's virtualenv is the active one. If you use
+pyenv-virtualenv (this project ships a `.python-version`), that happens
+automatically and `poetry install` lands there rather than in `./.venv` — which is
+why every recipe follows `$VIRTUAL_ENV` when it is set and falls back to `./.venv`
+otherwise. Recipes tell you which interpreter they resolved to if anything is
+missing; `just --evaluate` prints it outright.
 
 ## Just recipes
 <a id="just-recipes"></a>
