@@ -464,11 +464,12 @@ class MusicBot(commands.Cog):
             # The song is about to play, so the "Queued song / Est. playing at"
             # embed below would be wrong — the queue is non-empty here whenever
             # a persisted queue was restored, but those entries are BEHIND this
-            # song, not ahead of it. The only thing worth saying is that they
-            # were restored at all, and the Now Playing block this response
-            # hosts already describes the song itself. Built before the insert,
-            # while the queue still holds only the restored entries.
-            resume_notice = mp.build_resume_notice_embed()
+            # song, not ahead of it. The resume notice replaces it: it names the
+            # song starting now (nothing else in this response does — the
+            # playback gate is shut, so there is no Now Playing block to host)
+            # and adds what the restore knows. Built before the insert, while
+            # the queue still holds only the restored entries.
+            resume_notice = mp.build_resume_notice_embed(qobj)
             coros: list[Coroutine[Any, Any, Any]] = [
                 mp.queue_put_front(qobj),
                 ctx.message.add_reaction("👍"),

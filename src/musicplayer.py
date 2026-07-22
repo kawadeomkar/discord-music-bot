@@ -636,14 +636,69 @@ class MusicPlayer:
             color=discord.Color.blue(),
         )
 
-    def build_resume_notice_embed(self) -> Optional[discord.Embed]:
+    def _resume_left_off_field(self) -> Optional[tuple[str, str]]:
+        """(name, value) for the resume notice's "where the last session got
+        to" field, or None when nothing recorded it.
+
+        The two restores that land here know different things, and conflating
+        them names the wrong song:
+
+        * A crash re-queues the song that was mid-play as the display head,
+          flagged persisted=False with its recovery offset in `ts`. That song
+          IS where the session stopped, and it is about to play again.
+        * A `-stop` cancels the playback loop mid-song, and the cancel path
+          never reaches loop()'s history bookkeeping, so the interrupted song
+          is recorded nowhere — clear_connection() has already dropped its
+          state fields too. The newest history entry is the last song that ran
+          to its end, which is *older* than the stop. Hence "Last played",
+          which is true of it, rather than any claim about where playback
+          stopped, which is not.
+
+        Must be called before the front insertion, while the display head is
+        still the restored one.
+        """
+        head = self.queue.peek_next()
+        if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
+            value = f"**{truncate_embed_title(head.title)}**"
+            if head.ts:
+                value += f"\n`{fmt_duration(head.ts)}`"
+                if head.duration:
+                    value += f" / `{fmt_duration(head.duration)}`"
+            return "Left off on", value
+
+        # Absent when history was never populated (no Redis, or a guild whose
+        # first song is still its current one) — the queue half of the embed
+        # stands on its own.
+        last = self.history.latest
+        if last is None or not last.title:
+            return None
+        value = f"**{truncate_embed_title(last.title)}**"
+        value += f"\n`{fmt_duration(last.played_secs)}`"
+        if last.duration_secs > 0:
+            value += f" / `{fmt_duration(last.duration_secs)}`"
+        # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
+        # render "56 years ago", so omit the line instead — same rule as
+        # history_embeds().
+        if last.played_at:
+            value += f"\n<t:{int(last.played_at)}:R>"
+        return "Last played", value
+
+    def build_resume_notice_embed(
+        self, started: QueueObject
+    ) -> Optional[discord.Embed]:
         """Heads-up that `-play` on a disconnected bot woke a persisted queue.
 
-        Sent alongside the Now Playing block, so it deliberately says nothing
-        about the song being started — that block already carries the title,
-        link, thumbnail and requester. What it adds is the context only the
-        restore knows: which song the previous session left off on, where it
-        stopped and when, and how much queue is waiting behind the new one.
+        `started` is the song this `-play` is starting, and it has to be named
+        here: this response hosts no Now Playing block. The playback gate is
+        held shut across the enqueue, so current_song is still None and
+        MusicContext._np_player() returns None — the real Now Playing message
+        only lands seconds later, once extraction and the voice handshake
+        finish. Leave the title out and the first thing the user sees after
+        `-play` is an embed about a *different* song.
+
+        What the embed adds on top is the context only the restore knows:
+        which song the previous session left off on and how much queue is
+        waiting behind the one starting now.
 
         Returns None when nothing was restored, which is the common case (a
         first `-play` in a fresh guild): there is no resumption to announce,
@@ -661,31 +716,20 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
+                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
                 f"**{count}** song{plural} from the previous session "
-                f"{verb} after the current one."
+                f"{verb} after it."
             ),
             color=discord.Color.orange(),
         )
+        # The song being started, not the one being resumed from: the thumbnail
+        # sits next to "Playing now" and has to match it.
+        if started.thumbnail:
+            embed.set_thumbnail(url=started.thumbnail)
 
-        # The last song to finish before the disconnect. Absent when history
-        # was never populated (no Redis, or a guild whose first song is still
-        # its current one) — the queue half of the embed stands on its own.
-        last = self.history.latest
-        if last is not None and last.title:
-            embed.title = truncate_embed_title(
-                f"❗ Resumed from queue — last played song: {last.title}"
-            )
-            if last.thumbnail:
-                embed.set_thumbnail(url=last.thumbnail)
-            stopped = f"`{fmt_duration(last.played_secs)}`"
-            if last.duration_secs > 0:
-                stopped += f" / `{fmt_duration(last.duration_secs)}`"
-            # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
-            # render "56 years ago", so omit the line instead — same rule as
-            # history_embeds().
-            if last.played_at:
-                stopped += f"\n<t:{int(last.played_at)}:R>"
-            embed.add_field(name="Stopped at", value=stopped, inline=True)
+        left_off = self._resume_left_off_field()
+        if left_off is not None:
+            embed.add_field(name=left_off[0], value=left_off[1], inline=True)
 
         embed.add_field(name="Queued", value=f"**{count}** song{plural}", inline=True)
         total_secs, partial = _queue_runtime(items)

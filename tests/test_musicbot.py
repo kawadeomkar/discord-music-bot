@@ -2168,14 +2168,18 @@ class TestPlayFrontInsertion:
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mp.queue_put.assert_not_awaited()
+        # The song being started is handed to the builder: it is the only thing
+        # in this response that names it (no Now Playing block exists yet).
+        mp.build_resume_notice_embed.assert_called_once_with(qobj)
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert embed is mp.build_resume_notice_embed.return_value
 
     async def test_front_single_sends_nothing_when_nothing_persisted(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """No restored queue means no resumption to announce — the Now Playing
-        block is the whole response, so a second embed would only repeat it."""
+        """No restored queue means no resumption to announce, and the notice
+        exists only to explain a restore — the 👍 plus the Now Playing message
+        that follows are the whole response."""
         qobj = QueueObject("https://yt.com/v=1", "New Song", mock_ctx.author)
         mp = _mock_mp(qsize=0)
         mock_ctx.message.add_reaction = AsyncMock()
