@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 from src.util import get_logger
 
@@ -64,7 +64,7 @@ class SoundcloudSource:
     stype: URLSource = URLSource.SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(titles: List[str]) -> List[YTSource]:
+def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
     return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
 
 

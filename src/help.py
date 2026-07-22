@@ -17,7 +17,8 @@ help output as soon as it is declared.
 """
 
 import textwrap
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Mapping, Sequence
 
 import discord
 from discord.ext import commands
@@ -127,7 +128,7 @@ class MusicHelpCommand(commands.HelpCommand):
         """
         return f"{self.prefix}{command.qualified_name} {command.signature}".strip()
 
-    def _extras(self, command: commands.Command) -> dict:
+    def _extras(self, command: commands.Command) -> dict[str, Any]:
         return command.extras or {}
 
     def _category(self, command: commands.Command) -> str:
@@ -143,14 +144,14 @@ class MusicHelpCommand(commands.HelpCommand):
         except ValueError:
             return (len(order), command.qualified_name)
 
-    def _forms(self, command: commands.Command) -> List[str]:
+    def _forms(self, command: commands.Command) -> list[str]:
         """Every way to invoke the command, canonical name first."""
         return [
             f"{self.prefix}{name}"
             for name in (command.qualified_name, *command.aliases)
         ]
 
-    def _entry_lines(self, command: commands.Command) -> List[str]:
+    def _entry_lines(self, command: commands.Command) -> list[str]:
         """One command as a hanging-indent entry, the way man(1) lists options:
 
             -play, -p, -sing <url|search>
@@ -170,7 +171,7 @@ class MusicHelpCommand(commands.HelpCommand):
         )
 
     def _add_entries_field(
-        self, embed: discord.Embed, name: str, entries: Sequence[List[str]]
+        self, embed: discord.Embed, name: str, entries: Sequence[list[str]]
     ) -> None:
         """Add one section of entries (blank line between them), continuing into
         "(cont.)" fields rather than letting Discord reject an over-long value
@@ -182,7 +183,7 @@ class MusicHelpCommand(commands.HelpCommand):
             return sum(len(line) + 1 for line in lines)
 
         field_name = name
-        chunk: List[str] = []
+        chunk: list[str] = []
         for lines in entries:
             spaced = lines if not chunk else ["", *lines]
             if chunk and size(chunk) + size(spaced) > budget:
@@ -200,7 +201,7 @@ class MusicHelpCommand(commands.HelpCommand):
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     async def send_bot_help(
-        self, mapping: Mapping[Optional[commands.Cog], List[commands.Command]], /
+        self, mapping: Mapping[Optional[commands.Cog], list[commands.Command]], /
     ) -> None:
         prefix = self.prefix
         everything = [cmd for cmds in mapping.values() for cmd in cmds]
@@ -222,7 +223,7 @@ class MusicHelpCommand(commands.HelpCommand):
             inline=False,
         )
 
-        buckets: dict[str, List[commands.Command]] = {}
+        buckets: dict[str, list[commands.Command]] = {}
         for command in visible:
             buckets.setdefault(self._category(command), []).append(command)
         ordered = [c for c in CATEGORY_ORDER if c in buckets]
@@ -277,7 +278,7 @@ class MusicHelpCommand(commands.HelpCommand):
             value=command.help or command.brief or "no description",
             inline=False,
         )
-        examples: List[str] = extras.get("examples", [])
+        examples: list[str] = extras.get("examples", [])
         if examples:
             embed.add_field(name="EXAMPLES", value=self._fence(examples), inline=False)
         note: Optional[str] = extras.get("note")

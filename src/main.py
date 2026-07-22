@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
 from discord.ext import commands
@@ -87,7 +87,7 @@ class MusicContext(commands.Context):
 # setup_hook is a method override on the Bot subclass, NOT a @bot.event dispatcher.
 # In discord.py 2.x, setup_hook is invoked by the library before the bot connects.
 class MusicBotApp(commands.AutoShardedBot):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(
             command_prefix="-",
             intents=intents,
@@ -111,7 +111,16 @@ class MusicBotApp(commands.AutoShardedBot):
 
         prewarm_ytdlp_pool()
 
-    async def get_context(self, origin, /, *, cls: Any = MusicContext):
+    async def get_context(
+        self,
+        origin: Union[discord.Message, discord.Interaction],
+        /,
+        *,
+        cls: type[commands.Context[Any]] = MusicContext,
+    ) -> commands.Context[Any]:
+        # Written against discord.py's own signature rather than `Any`: `Any` on an
+        # override parameter makes the override unconditionally LSP-compatible, so
+        # signature drift against the base class becomes uncheckable.
         return await super().get_context(origin, cls=cls)
 
     async def invoke(self, ctx: commands.Context, /) -> None:
@@ -125,7 +134,7 @@ class MusicBotApp(commands.AutoShardedBot):
             return
         await super().invoke(ctx)
 
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         activity = discord.Game(name="music", type=3)
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
@@ -150,7 +159,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await loop.run_in_executor(None, shutdown_telemetry)
 
 
-def main():
+def main() -> None:
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves

@@ -2,13 +2,22 @@ import asyncio
 import contextlib
 import datetime
 import time
-from dataclasses import dataclass
-from typing import Any, List, Optional, Union
+from dataclasses import dataclass, replace
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Optional,
+    Union,
+    cast,
+)
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 from zoneinfo import ZoneInfo
 
 import async_timeout
 import discord
 from discord.ext import commands
+
+import redis.asyncio as aioredis
 
 from opentelemetry import trace
 
@@ -21,6 +30,7 @@ from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
+    spawn_background,
     fmt_duration,
     notice_embed,
     record_span_error,
@@ -31,8 +41,42 @@ from src.util import (
 )
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
 
+if TYPE_CHECKING:
+    # Runtime import would close the cycle (musicbot imports MusicPlayer); the cog is
+    # only ever named in annotations here. Same guard main.py uses for MusicPlayer.
+    from src.musicbot import MusicBot
+
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
+
+# The two things a song queue can hold: a resolved QueueObject or a not-yet-
+# resolved YTSource (e.g. a Spotify playlist track awaiting YouTube search).
+QueueItem = Union[QueueObject, YTSource]
+
+
+@dataclass(frozen=True)
+class EtaWalk:
+    """Accumulator threaded through the queue's ETA-walking fold. `now_pst`
+    is deliberately excluded — it's invariant across a single walk, unlike
+    these two fields, and is passed alongside instead of bundled in.
+
+    Frozen so that threading it through a fold means what it looks like it
+    means: advance with `dataclasses.replace()` and rebind the result. This
+    was a plain `(int, bool)` pair before the dataclass, and a mutable version
+    would let a caller that snapshots a walk or reuses one seed across two
+    walks read silently wrong ETAs — with nothing to fail a test.
+    """
+
+    cumulative_secs: int
+    uncertain: bool
+
+    def advance(self, remaining: Optional[int]) -> "EtaWalk":
+        """The next walk state after a queue item whose remaining time is
+        `remaining`, or None when its duration is unknown."""
+        if remaining is None:
+            return replace(self, uncertain=True)
+        return replace(self, cumulative_secs=self.cumulative_secs + remaining)
+
 
 # HACK: Every guild's ETAs are hardcoded to Pacific time.
 # queue_embed()'s "Est. playing at" and the now-playing "Estimated finish" both render
@@ -163,6 +207,24 @@ def _remaining_secs(item: QueueObject) -> Optional[int]:
     return item.duration
 
 
+def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
+    """Total remaining playtime of queued items, and whether any item's
+    duration was unknown — an unresolved YTSource or a QueueObject with no
+    duration metadata makes the total a lower bound, which callers flag with a
+    "~" prefix. Shared by queue_embed() and build_resume_notice_embed() so the
+    two can't disagree about how long a queue is.
+    """
+    total_secs = 0
+    partial = False
+    for item in items:
+        remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
+        if remaining is not None:
+            total_secs += remaining
+        else:
+            partial = True
+    return total_secs, partial
+
+
 def _build_progress_bar(
     elapsed_secs: float, duration_secs: int, width: int = _BAR_WIDTH
 ) -> str:
@@ -280,8 +342,8 @@ class MusicPlayer:
     bot: commands.Bot
     _guild: discord.Guild
     _channel: discord.TextChannel
-    _last_author: Union[discord.User, discord.Member]
-    _cog: Any
+    _last_author: Optional[Union[discord.User, discord.Member]]
+    _cog: "MusicBot"
     current_song: Optional[YTDL]
     play_next: asyncio.Event
     queue: GuildQueue
@@ -295,7 +357,7 @@ class MusicPlayer:
     _restore_complete: asyncio.Event
     _playback_gate: asyncio.Event
     _playback_holds: int
-    _background_tasks: set
+    _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
@@ -309,12 +371,18 @@ class MusicPlayer:
         bot: commands.Bot,
         guild: discord.Guild,
         channel: discord.TextChannel,
-        cog: Any,
-        redis=None,
-    ):
+        cog: "MusicBot",
+        redis: Optional[aioredis.Redis] = None,
+    ) -> None:
         self.bot = bot
         self._guild = guild
         self._channel = channel
+        # Best-effort seed, and genuinely nullable: guild.me is None until the member
+        # cache fills, and guild.owner can be uncached too. discord.py's stub declares
+        # Guild.me as Member, which collapses the `or` and hides that from the checker —
+        # hence the explicit annotation. from_context()/set_context() overwrite this with
+        # ctx.author before any command path reads it; _require_requester() covers the
+        # rest.
         _fallback: Union[discord.Member, discord.User, None] = guild.me or guild.owner
         self._last_author = _fallback
         self._cog = cog
@@ -348,7 +416,7 @@ class MusicPlayer:
         # across the join it triggers so the restored head cannot start before
         # the requested song is inserted in front of it.
         self._playback_holds = 0
-        self._background_tasks: set = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
         # Now-playing host state: the one message currently carrying the NP
         # embed block, its own (cached, static) embeds that follow the block,
@@ -373,12 +441,15 @@ class MusicPlayer:
         cls,
         bot: commands.Bot,
         ctx: commands.Context,
-        redis=None,
+        redis: Optional[aioredis.Redis] = None,
     ) -> "MusicPlayer":
         assert ctx.guild is not None
         assert isinstance(ctx.channel, discord.TextChannel)
         assert ctx.cog is not None
-        mp = cls(bot, ctx.guild, ctx.channel, ctx.cog, redis=redis)
+        # ctx.cog is Optional[Cog] to discord.py; the only cog that owns the commands
+        # reaching here is MusicBot. A cast rather than an isinstance assert — the
+        # latter would be a stricter runtime check than this line has ever made.
+        mp = cls(bot, ctx.guild, ctx.channel, cast("MusicBot", ctx.cog), redis=redis)
         mp._last_author = ctx.author
         return mp
 
@@ -413,7 +484,7 @@ class MusicPlayer:
             self._playback_gate.set()
 
     @contextlib.asynccontextmanager
-    async def defer_playback(self):
+    async def defer_playback(self) -> AsyncGenerator[None]:
         """Hold the playback gate shut for the duration of the block.
 
         -play calls -join, which opens the gate as soon as the voice handshake
@@ -449,14 +520,30 @@ class MusicPlayer:
         self._channel = ctx.channel
         self._last_author = ctx.author
 
-    def _queue_eta_seed(self) -> tuple[datetime.datetime, int, bool]:
+    def _require_requester(self) -> Union[discord.User, discord.Member]:
+        """The fallback requester, for the paths that must have one.
+
+        QueueObject.requester is non-optional because persistence reads
+        `requester.id` (guild_state.py). _last_author only lacks a value on a
+        player built for a guild whose bot member AND owner are both uncached,
+        and never after a command has run — so failing here names the cause
+        instead of surfacing as an AttributeError on None during serialization.
+        """
+        if self._last_author is None:
+            raise RuntimeError(
+                f"No requester available for guild {self._guild.id}: neither the "
+                "bot member nor the guild owner is cached"
+            )
+        return self._last_author
+
+    def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs.
 
-        Returns (now_pst, cumulative_secs, uncertain), where cumulative_secs
-        is seeded with the current song's total duration as a proxy for its
-        remaining time (we don't track elapsed; this overestimates but keeps
-        the math simple and avoids showing "now" for everything), and
-        uncertain flags whether any preceding song had an unknown duration.
+        Returns (now_pst, walk), where walk.cumulative_secs is seeded with the
+        current song's total duration as a proxy for its remaining time (we
+        don't track elapsed; this overestimates but keeps the math simple and
+        avoids showing "now" for everything), and walk.uncertain flags whether
+        any preceding song had an unknown duration.
         """
         uncertain = False
         cumulative_secs = 0
@@ -466,23 +553,22 @@ class MusicPlayer:
                 cumulative_secs = secs
             else:
                 uncertain = True
-        return datetime.datetime.now(tz=_PST), cumulative_secs, uncertain
+        return datetime.datetime.now(tz=_PST), EtaWalk(cumulative_secs, uncertain)
 
     def _format_queue_line(
         self,
-        item: Union[QueueObject, YTSource],
+        item: QueueItem,
         index: int,
         now_pst: datetime.datetime,
-        cumulative_secs: int,
-        uncertain: bool,
-    ) -> tuple[str, int, bool]:
+        walk: EtaWalk,
+    ) -> tuple[str, EtaWalk]:
         """Format a single queue line with its "Est. playing at" ETA.
 
-        Returns (line, updated cumulative_secs, updated uncertain) so callers
-        can chain this across consecutive queue items.
+        Returns (line, updated walk) so callers can chain this across
+        consecutive queue items.
         """
-        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
-        est_str = _fmt_eta(est_dt, uncertain)
+        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        est_str = _fmt_eta(est_dt, walk.uncertain)
 
         if isinstance(item, QueueObject):
             title = item.title or "Unknown"
@@ -499,53 +585,38 @@ class MusicPlayer:
                 f"`{index}` [**{title}**]({item.webpage_url}) · `{dur}`{ts_note} · Est. playing at {est_str}\n"
                 f"{channel} · {requester}"
             )
-            remaining = _remaining_secs(item)
-            if remaining is not None:
-                cumulative_secs += remaining
-            else:
-                uncertain = True
+            walk = walk.advance(_remaining_secs(item))
         else:
             search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
             line = f"`{index}` {search} · *resolving...*"
-            uncertain = True
+            walk = walk.advance(None)
 
-        return line, cumulative_secs, uncertain
+        return line, walk
 
     def estimated_playing_at(self) -> str:
         """ETA text for a song appended to the queue right now — i.e. after the
         current song and everything already queued. Reuses the same ETA-walking
         seed as queue_embed()/_build_next_up_embed() so all three stay consistent.
         """
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        now_pst, walk = self._queue_eta_seed()
         for item in self.queue.display_items():
-            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
-            if remaining is not None:
-                cumulative_secs += remaining
-            else:
-                uncertain = True
-        est_dt = now_pst + datetime.timedelta(seconds=cumulative_secs)
-        return _fmt_eta(est_dt, uncertain)
+            walk = walk.advance(
+                _remaining_secs(item) if isinstance(item, QueueObject) else None
+            )
+        est_dt = now_pst + datetime.timedelta(seconds=walk.cumulative_secs)
+        return _fmt_eta(est_dt, walk.uncertain)
 
     def queue_embed(self) -> discord.Embed:
         items = self.queue.display_items()
         total = len(items)
 
-        total_secs = 0
-        duration_partial = False
-        for item in items:
-            remaining = _remaining_secs(item) if isinstance(item, QueueObject) else None
-            if remaining is not None:
-                total_secs += remaining
-            else:
-                duration_partial = True
+        total_secs, duration_partial = _queue_runtime(items)
 
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
+        now_pst, walk = self._queue_eta_seed()
 
         lines = []
         for i, item in enumerate(items[:10], start=1):
-            line, cumulative_secs, uncertain = self._format_queue_line(
-                item, i, now_pst, cumulative_secs, uncertain
-            )
+            line, walk = self._format_queue_line(item, i, now_pst, walk)
             lines.append(line)
 
         header = f"Songs: **{total}**"
@@ -565,7 +636,113 @@ class MusicPlayer:
             color=discord.Color.blue(),
         )
 
-    async def stop(self):
+    def _resume_left_off_field(self) -> Optional[tuple[str, str]]:
+        """(name, value) for the resume notice's "where the last session got
+        to" field, or None when nothing recorded it.
+
+        The two restores that land here know different things, and conflating
+        them names the wrong song:
+
+        * A crash re-queues the song that was mid-play as the display head,
+          flagged persisted=False with its recovery offset in `ts`. That song
+          IS where the session stopped, and it is about to play again.
+        * A `-stop` cancels the playback loop mid-song, and the cancel path
+          never reaches loop()'s history bookkeeping, so the interrupted song
+          is recorded nowhere — clear_connection() has already dropped its
+          state fields too. The newest history entry is the last song that ran
+          to its end, which is *older* than the stop. Hence "Last played",
+          which is true of it, rather than any claim about where playback
+          stopped, which is not.
+
+        Must be called before the front insertion, while the display head is
+        still the restored one.
+        """
+        head = self.queue.peek_next()
+        if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
+            value = f"**{truncate_embed_title(head.title)}**"
+            if head.ts:
+                value += f"\n`{fmt_duration(head.ts)}`"
+                if head.duration:
+                    value += f" / `{fmt_duration(head.duration)}`"
+            return "Left off on", value
+
+        # Absent when history was never populated (no Redis, or a guild whose
+        # first song is still its current one) — the queue half of the embed
+        # stands on its own.
+        last = self.history.latest
+        if last is None or not last.title:
+            return None
+        value = f"**{truncate_embed_title(last.title)}**"
+        value += f"\n`{fmt_duration(last.played_secs)}`"
+        if last.duration_secs > 0:
+            value += f" / `{fmt_duration(last.duration_secs)}`"
+        # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
+        # render "56 years ago", so omit the line instead — same rule as
+        # history_embeds().
+        if last.played_at:
+            value += f"\n<t:{int(last.played_at)}:R>"
+        return "Last played", value
+
+    def build_resume_notice_embed(
+        self, started: QueueObject
+    ) -> Optional[discord.Embed]:
+        """Heads-up that `-play` on a disconnected bot woke a persisted queue.
+
+        `started` is the song this `-play` is starting, and it has to be named
+        here: this response hosts no Now Playing block. The playback gate is
+        held shut across the enqueue, so current_song is still None and
+        MusicContext._np_player() returns None — the real Now Playing message
+        only lands seconds later, once extraction and the voice handshake
+        finish. Leave the title out and the first thing the user sees after
+        `-play` is an embed about a *different* song.
+
+        What the embed adds on top is the context only the restore knows:
+        which song the previous session left off on and how much queue is
+        waiting behind the one starting now.
+
+        Returns None when nothing was restored, which is the common case (a
+        first `-play` in a fresh guild): there is no resumption to announce,
+        and an embed saying so would be pure noise. Callers must build this
+        BEFORE front-inserting, while the queue still holds only the restored
+        entries. docs/PLAYBACK_GATE_PLAN.md.
+        """
+        items = self.queue.display_items()
+        if not items:
+            return None
+
+        count = len(items)
+        plural = "s" if count != 1 else ""
+        verb = "resume" if count != 1 else "resumes"
+        embed = discord.Embed(
+            title="❗ Resumed from queue",
+            description=(
+                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
+                f"**{count}** song{plural} from the previous session "
+                f"{verb} after it."
+            ),
+            color=discord.Color.orange(),
+        )
+        # The song being started, not the one being resumed from: the thumbnail
+        # sits next to "Playing now" and has to match it.
+        if started.thumbnail:
+            embed.set_thumbnail(url=started.thumbnail)
+
+        left_off = self._resume_left_off_field()
+        if left_off is not None:
+            embed.add_field(name=left_off[0], value=left_off[1], inline=True)
+
+        embed.add_field(name="Queued", value=f"**{count}** song{plural}", inline=True)
+        total_secs, partial = _queue_runtime(items)
+        if total_secs > 0:
+            prefix = "~" if partial else ""
+            embed.add_field(
+                name="Runtime",
+                value=f"{prefix}{_fmt_total_duration(total_secs)}",
+                inline=True,
+            )
+        return embed
+
+    async def stop(self) -> None:
         await self._cog.cleanup(self._guild)
 
     # ── State restore ─────────────────────────────────────────────────────────
@@ -712,10 +889,10 @@ class MusicPlayer:
 
     async def queue_put(
         self,
-        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ):
+    ) -> None:
         """Enqueue and (optionally) kick off stream pre-fetch.
 
         prefetch=False for bulk playlist enqueues — the Redis mirror is
@@ -724,11 +901,11 @@ class MusicPlayer:
         stream URLs that expire before the song reaches playback position;
         _prefetch_next_song handles one-ahead prefetch naturally as songs play).
         """
-        items: list[Union[QueueObject, YTSource]]
-        if isinstance(obj, list):
-            items = list(obj)
-        else:
+        items: list[QueueItem]
+        if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
+        else:
+            items = list(obj)
         await self.queue.put(items, batch=not prefetch)
         if prefetch and self.store is not None:
             for item in items:
@@ -739,10 +916,10 @@ class MusicPlayer:
 
     async def queue_put_front(
         self,
-        obj: Union[QueueObject, YTSource, List[QueueObject], List[YTSource]],
+        obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ):
+    ) -> None:
         """Insert at the FRONT of the queue, then (optionally) pre-fetch.
 
         Same contract as queue_put() but for the head of the line — used when
@@ -755,11 +932,11 @@ class MusicPlayer:
         thread pool and mint stream URLs that expire before playback reaches
         them.
         """
-        items: list[Union[QueueObject, YTSource]]
-        if isinstance(obj, list):
-            items = list(obj)
-        else:
+        items: list[QueueItem]
+        if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
+        else:
+            items = list(obj)
         await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
@@ -768,7 +945,7 @@ class MusicPlayer:
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
 
-    async def queue_get(self) -> Union[QueueObject, YTSource]:
+    async def queue_get(self) -> QueueItem:
         return await self.queue.get()
 
     async def _cancel_prefetch(self) -> None:
@@ -787,7 +964,7 @@ class MusicPlayer:
         """
         await cancel_task(self._prefetch_task)
 
-    async def queue_clear(self) -> List[str]:
+    async def queue_clear(self) -> list[str]:
         await self._cancel_prefetch()  # before the drain — see _cancel_prefetch
         cleared_items = await self.queue.clear()
         return [
@@ -925,10 +1102,8 @@ class MusicPlayer:
         item = self.queue.peek_next()
         if item is None:
             return None
-        now_pst, cumulative_secs, uncertain = self._queue_eta_seed()
-        description, _, _ = self._format_queue_line(
-            item, 1, now_pst, cumulative_secs, uncertain
-        )
+        now_pst, walk = self._queue_eta_seed()
+        description, _ = self._format_queue_line(item, 1, now_pst, walk)
         return discord.Embed(
             title="Up next",
             description=description,
@@ -1090,7 +1265,7 @@ class MusicPlayer:
 
     async def update_activity(self, song: Optional[YTDL] = None) -> None:
         if song is not None:
-            timestamps: dict = {}
+            timestamps: dict[str, int] = {}
             vc = self._guild.voice_client
             is_paused = isinstance(vc, discord.VoiceClient) and vc.is_paused()
             if not is_paused:
@@ -1279,7 +1454,7 @@ class MusicPlayer:
                 resume = QueueObject(
                     current.webpage_url,
                     current.title or "",
-                    current.requester or self._last_author,
+                    current.requester or self._require_requester(),
                     ts=position,
                     duration=current.duration_secs or None,
                     uploader=current.uploader,
@@ -1352,7 +1527,7 @@ class MusicPlayer:
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",
-            song.requester or self._last_author,
+            song.requester or self._require_requester(),
             ts=song.start_offset or None,
             duration=song.duration_secs or None,
             uploader=song.uploader,
@@ -1387,12 +1562,10 @@ class MusicPlayer:
 
     # ── Playback pipeline helpers ─────────────────────────────────────────────
 
-    async def _resolve_source(
-        self, source: Union[QueueObject, YTSource]
-    ) -> QueueObject:
+    async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._last_author,
+                self._require_requester(),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
             )
@@ -1584,12 +1757,13 @@ class MusicPlayer:
                 position_override=song.duration_secs if completed else None,
             )
 
-    def _spawn_background(self, coro: Any) -> asyncio.Task:
-        """Create a fire-and-forget task tracked in _background_tasks."""
-        task = asyncio.create_task(coro)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
+    def _spawn_background(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        """Fire-and-forget task tracked in _background_tasks.
+
+        Binds this player's task set to the shared util helper so the ten call
+        sites below don't each have to name it.
+        """
+        return spawn_background(coro, self._background_tasks)
 
     def _fire_finalize_now_playing(
         self,
@@ -1683,7 +1857,7 @@ class MusicPlayer:
 
     # ── Main playback loop ────────────────────────────────────────────────────
 
-    async def loop(self):
+    async def loop(self) -> None:
         await self.bot.wait_until_ready()
         # Wait for _restore_state() to finish populating self.queue before
         # dequeuing anything — see _restore_state()'s docstring for the race

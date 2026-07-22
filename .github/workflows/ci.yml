@@ -6,6 +6,32 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Supersedes three pushes to a PR racing three full pipelines. Never supersede on
+# main: a dropped main run means no image was published for that commit.
+#
+# `cancel-in-progress: false` alone does NOT achieve that. It protects a run that has
+# already started; a run still PENDING in the same group is cancelled regardless when
+# a newer one arrives. Three merges inside ten minutes therefore silently dropped the
+# middle commit's build — and a cancelled run reports as cancelled, not failed, so
+# nothing went red and `sha-<middle>` simply never reached GHCR.
+#
+# Including github.sha for push events puts every main commit in its own group, so
+# they queue instead of evicting each other. PRs keep one group per ref, which is the
+# whole point of superseding there.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'shared' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default. This repository's org setting grants workflows a
+# write-all GITHUB_TOKEN, which `container-test` in particular should never hold:
+# it runs `docker run` on code from the PR branch, so any test file would execute
+# beside a token that can push to main, delete workflow runs, or publish packages.
+# The two jobs that genuinely need more (`test` comments on PRs, `build` pushes to
+# GHCR) declare it themselves below, and a job-level block replaces this one
+# wholesale rather than adding to it.
+permissions:
+  contents: read
+
 jobs:
   resolve-env:
     name: Resolve Environment
@@ -15,9 +41,15 @@ jobs:
     steps:
       - name: Compute environment name
         id: env_name
+        # Via env:, never `${{ }}` inside run:. A branch name is attacker-chosen
+        # text — git accepts `a";id;#`, `a$(id)b` and backticks in a ref — and
+        # ${{ }} is substituted before bash parses the line, so interpolating it
+        # directly makes any PR author's branch name executable here. Through env:
+        # it arrives as data that bash never re-parses.
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          BRANCH="${{ github.head_ref || github.ref_name }}"
-          [ "$BRANCH" = "main" ] && echo "name=production" >> $GITHUB_OUTPUT || echo "name=$BRANCH" >> $GITHUB_OUTPUT
+          [ "$BRANCH" = "main" ] && echo "name=production" >> "$GITHUB_OUTPUT" || echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
 
   lint:
     name: Lint & Type Check
@@ -25,47 +57,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
-
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          # Key on poetry.lock — only invalidates when dependency versions change.
-          # The installed group set is part of the key: keying on poetry.lock
-          # alone would restore a venv built from a different --only= list and
-          # never re-save it (actions/cache skips saving on an exact key hit),
-          # re-installing the difference on every run.
-          key: venv-lint-${{ runner.os }}-py3.14-main-lint-test-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-lint-${{ runner.os }}-py3.14-main-lint-test-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
           # `test` is here for pyright, not to run tests: it type-checks tests/,
-          # which imports pytest and fakeredis. Without them every such import
-          # is an unresolved-import error.
-          poetry install --only=main,lint,test --no-root
+          # which imports pytest and fakeredis. Without them every such import is
+          # an unresolved-import error.
+          groups: main,lint,test,dev
+          cache-prefix: lint
 
-      - name: compile (syntax check)
-        run: poetry run python -m compileall src/
+      # The task file has a canonical format; keep it that way. `make` had no
+      # equivalent. ~0.01s.
+      - name: justfile format
+        run: .venv/bin/just --fmt --check
+
+      # Expands the `check` recipe tree without running anything (~0.01s), so a
+      # typo in a recipe `check` depends on fails here rather than six minutes in.
+      # It does NOT reach recipes outside that tree — `just --evaluate`, in the
+      # failure-diagnostic step below, is what resolves every variable.
+      - name: justfile parses
+        run: .venv/bin/just -n check
+
+      # These steps ARE `just check`'s dependency list, run by CI instead of by
+      # `just` so a failure names the tool rather than "check". They are not a
+      # second copy of it -- that is the whole point of calling the recipes.
+      #
+      # `pins` belongs here specifically because of Dependabot: it asserts that the
+      # ruff version in pyproject.toml matches .pre-commit-config.yaml's hook rev,
+      # and the `pip` and `pre-commit` ecosystems open SEPARATE PRs that each move
+      # one half. Those PRs are validated by CI and never by a local `just check`,
+      # so enforcing this only locally would miss the one case it exists for.
+      - name: version pins agree
+        run: .venv/bin/just pins
 
       - name: ruff format --check
-        run: poetry run ruff format --check src/ tests/
+        run: .venv/bin/just fmt-check
 
       - name: ruff check
-        run: poetry run ruff check src/ tests/
+        run: .venv/bin/just lint
 
-      # No path argument: check src/ AND tests/, matching black above and the
-      # bare `pyright` developers run locally. Checking only src/ is what let
-      # tests/ accumulate 67 type errors unnoticed.
+      # `just types` passes --pythonpath explicitly, which `poetry run pyright`
+      # did not: pyright resolves imports from the interpreter it is TOLD about.
+      # CI was the one caller not naming the interpreter it meant.
       - name: pyright
-        run: poetry run pyright
+        run: .venv/bin/just types
+
+      # Costs nothing unless something already failed. Dumps every resolved
+      # variable -- VENV_BIN above all -- so the construction layer is visible in
+      # the log instead of being guessed at.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
 
   test:
     name: Test Suite
@@ -79,39 +120,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
+          groups: main,test,dev
+          cache-prefix: test
 
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          key: venv-test-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-test-${{ runner.os }}-py3.14-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
-          poetry install --only=main,test --no-root
-
+      # `test-report` is `test` plus the reporting flags the coverage comment
+      # below consumes -- it invokes the same recipe, so the gate has one
+      # definition. `set -o pipefail` lives in the recipe now, where it cannot be
+      # forgotten; without it `tee` masks a failing suite.
       - name: Run tests with coverage
-        run: |
-          set -o pipefail
-          poetry run pytest --tb=short -q --cov-report=xml --junitxml=pytest.xml | tee pytest-coverage.txt
+        run: .venv/bin/just test-report
 
+      # Mirrors the lint job's step. It lived only there until a real failure
+      # landed in THIS job and the diagnostic was not where it was needed.
+      # Placed before the coverage comment so a failing suite shows the resolved
+      # variables and then stops, exactly as it did before.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
+
+      # Pinned by commit SHA, not by `@main` as this previously was. The step runs
+      # with contents:write + pull-requests:write (the action posts commit comments
+      # on push events, so the write scope is genuinely required), after the suite,
+      # with the full workspace readable. A mutable branch ref there means a single
+      # upstream commit — this is a one-maintainer repository — executes here with
+      # no review, no version bump and no PR. Dependabot cannot cover the gap
+      # either: it does not bump branch refs, only tags and SHAs. Bump deliberately.
       - name: Coverage comment
         id: coverage_comment
-        uses: MishaKav/pytest-coverage-comment@main
+        uses: MishaKav/pytest-coverage-comment@fd9adbdca9fdfbe2b9bfa44a7340e6a83346ce6c # v1.10.0
         with:
           pytest-coverage-path: ./pytest-coverage.txt
           junitxml-path: ./pytest.xml
           title: Test Coverage Report
           badge-title: Coverage
-
 
   container-test:
     name: Container Test
@@ -132,8 +175,101 @@ jobs:
           tags: discord-music-bot:test
           build-args: |
             ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped, because both this job and `build` export a GHA cache and an
+          # unscoped export writes the same default key. They build different
+          # targets, so each run's export replaced the other's and the next run
+          # restored a manifest missing its own layers. Cost, not correctness.
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
 
       - name: Run tests in container
         run: docker run --rm discord-music-bot:test
+
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: [resolve-env, lint, test, container-test]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # One definition of "is this a publish?", read by the login step's `if:` and
+      # by `push:` below. The job itself runs on EVERY commit: `container-test`
+      # builds the `test` stage, so without this nothing exercised the `runtime`
+      # stage until after merge, and a runtime-only breakage (a missing system
+      # package, a COPY that resolves differently) would land on main unseen.
+      # Building always and pushing only from main means the image published at
+      # merge is produced by the same steps that validated every commit before it.
+      # workflow_dispatch is included so an image can be re-published for a commit
+      # that is already on main — after a GHCR incident, or a registry-side failure
+      # that has nothing to do with the code. Without it the only way to republish
+      # was an empty commit. It still requires being ON main, so a manual run from a
+      # branch publishes nothing.
+      PUBLISH: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+
+    # This job used to live in a separate build.yml triggered by `workflow_run`.
+    # That was a provenance hole: for the workflow_run event GITHUB_SHA is
+    # documented as "last commit on default branch", NOT the commit whose CI just
+    # passed — so a bare `actions/checkout` plus metadata-action's `type=sha`
+    # could publish an image tagged with a SHA whose contents it did not contain,
+    # any time a second merge landed during the first one's run. As a job here it
+    # inherits the correct SHA, reuses the BuildKit cache container-test just
+    # warmed, and is testable from a PR at all (workflow_run always executes the
+    # DEFAULT branch's copy of the workflow file).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Only needed to push. Skipped on branches, where nothing leaves the runner —
+      # which also keeps the commit-level build working for a fork PR, whose
+      # GITHUB_TOKEN cannot be granted packages: write.
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `latest` is gated explicitly now that the job also runs on branches.
+          # `push:` below would stop it being published either way, but a tag that
+          # is only safe because of a second setting elsewhere is one refactor away
+          # from being wrong.
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build runtime image (push only from main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          # False on branches: the image is built, loaded into the local BuildKit
+          # cache, and discarded. The validation is that it BUILDS.
+          push: ${{ env.PUBLISH }}
+          # build.yml never passed this. It changes nothing today — the job only
+          # runs on main, where the resolved name and the Dockerfile's runtime
+          # default are both "production" — but relying on two independent
+          # defaults agreeing is not a property worth depending on.
+          build-args: |
+            ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Dead config removed: `cache-to` only ever wrote `type=gha`, so
+          # `:buildcache` was never populated by this workflow or by the build.yml
+          # it replaced — the registry import always missed. On a branch build it
+          # would also be an unauthenticated pull, since the login step above is
+          # skipped.
+          #
+          # scope=runtime pairs with container-test's scope=test: this job builds the
+          # runtime target, that one builds test, and sharing the default scope meant
+          # each overwrote the other's export between runs.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime

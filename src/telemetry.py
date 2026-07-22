@@ -2,9 +2,12 @@ import logging
 import os
 import sys
 from typing import Optional, TYPE_CHECKING
+from collections.abc import Sequence
 
 import structlog
+from structlog.typing import EventDict, WrappedLogger
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
@@ -13,6 +16,9 @@ from opentelemetry.sdk.trace.sampling import (
     SamplingResult,
 )
 from opentelemetry.semconv.resource import ResourceAttributes
+from opentelemetry.trace import Link, SpanKind
+from opentelemetry.trace.span import TraceState
+from opentelemetry.util.types import Attributes
 
 from src.config import ENVIRONMENT
 
@@ -49,14 +55,14 @@ class _DiscordGatewayFilter(Sampler):
 
     def should_sample(
         self,
-        parent_context,
-        trace_id,
-        name,
-        kind=None,
-        attributes=None,
-        links=None,
-        trace_state=None,
-    ):
+        parent_context: Optional[Context],
+        trace_id: int,
+        name: str,
+        kind: Optional[SpanKind] = None,
+        attributes: Attributes = None,
+        links: Optional[Sequence[Link]] = None,
+        trace_state: Optional[TraceState] = None,
+    ) -> SamplingResult:
         url = str((attributes or {}).get("http.url", ""))
         if any(p in url for p in _DISCORD_INTERNAL_URL_PATTERNS):
             return SamplingResult(Decision.DROP)
@@ -113,7 +119,9 @@ def configure_worker_logging() -> None:
 # ── Internal setup ────────────────────────────────────────────────────────────
 
 
-def _add_otel_context(logger, method, event_dict):
+def _add_otel_context(
+    logger: WrappedLogger, method: str, event_dict: EventDict
+) -> EventDict:
     """Structlog processor: inject trace_id and span_id into every log event."""
     span = trace.get_current_span()
     ctx = span.get_span_context()
@@ -123,7 +131,9 @@ def _add_otel_context(logger, method, event_dict):
     return event_dict
 
 
-def _add_environment(logger, method, event_dict):
+def _add_environment(
+    logger: WrappedLogger, method: str, event_dict: EventDict
+) -> EventDict:
     """Structlog processor: stamp every log event with the current environment."""
     event_dict["environment"] = ENVIRONMENT
     return event_dict

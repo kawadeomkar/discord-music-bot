@@ -2,6 +2,8 @@
 Now Playing embed block attached to the newest bot message while a song is live
 (docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md §3)."""
 
+from contextlib import AbstractContextManager
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -13,7 +15,7 @@ from src.musicbot import MusicBot
 
 
 @pytest.fixture
-def music_bot_cog(mock_bot):
+def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     """Minimal real MusicBot instance — _np_player's isinstance check needs the
     actual class, not a MagicMock."""
     cog = MusicBot.__new__(MusicBot)
@@ -28,7 +30,9 @@ def music_bot_cog(mock_bot):
 
 
 @pytest.fixture
-def mctx(mock_bot, mock_guild, mock_message):
+def mctx(
+    mock_bot: MagicMock, mock_guild: MagicMock, mock_message: MagicMock
+) -> MusicContext:
     """MusicContext without discord.py's full Context construction — guild/
     channel/author are properties over .message, so setting message suffices."""
     ctx = object.__new__(MusicContext)
@@ -39,7 +43,12 @@ def mctx(mock_bot, mock_guild, mock_message):
 
 
 @pytest.fixture
-def live_mp(music_bot_cog, mock_bot, mock_guild, mock_channel):
+def live_mp(
+    music_bot_cog: MusicBot,
+    mock_bot: MagicMock,
+    mock_guild: MagicMock,
+    mock_channel: MagicMock,
+) -> MagicMock:
     """A guild MusicPlayer (mocked) with a live song, wired into the cog lookup
     that MusicContext._np_player performs."""
     mock_bot.get_cog = MagicMock(return_value=music_bot_cog)
@@ -54,12 +63,14 @@ def live_mp(music_bot_cog, mock_bot, mock_guild, mock_channel):
     return mp
 
 
-def _parent_send(sent):
+def _parent_send(sent: Any) -> AbstractContextManager[AsyncMock]:
     return patch.object(commands.Context, "send", new=AsyncMock(return_value=sent))
 
 
 class TestMusicContextAttach:
-    async def test_block_leads_single_embed(self, mctx, live_mp):
+    async def test_block_leads_single_embed(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         sent = MagicMock(spec=discord.Message)
         own = discord.Embed(title="Queue")
         with _parent_send(sent) as parent:
@@ -73,7 +84,9 @@ class TestMusicContextAttach:
         )
         assert message is sent
 
-    async def test_block_leads_embeds_list(self, mctx, live_mp):
+    async def test_block_leads_embeds_list(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         sent = MagicMock(spec=discord.Message)
         own = [discord.Embed(title="A"), discord.Embed(title="B")]
         with _parent_send(sent) as parent:
@@ -85,7 +98,9 @@ class TestMusicContextAttach:
             sent, own, live_mp.current_song
         )
 
-    async def test_content_only_message_carries_block(self, mctx, live_mp):
+    async def test_content_only_message_carries_block(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         """Plain-text responses need no embed conversion — content and embeds
         coexist on one message (settled decision §4 of the plan)."""
         sent = MagicMock(spec=discord.Message)
@@ -99,7 +114,9 @@ class TestMusicContextAttach:
             sent, [], live_mp.current_song
         )
 
-    async def test_skips_attach_when_embed_cap_would_be_exceeded(self, mctx, live_mp):
+    async def test_skips_attach_when_embed_cap_would_be_exceeded(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         """Defensive ≤10 guard: never expected to trip, but it must skip the
         attach rather than fail the send."""
         sent = MagicMock(spec=discord.Message)
@@ -110,7 +127,9 @@ class TestMusicContextAttach:
         assert len(parent.call_args.kwargs["embeds"]) == 9
         live_mp._adopt_np_host_if_current.assert_not_called()
 
-    async def test_raises_on_embed_and_embeds_together(self, mctx, live_mp):
+    async def test_raises_on_embed_and_embeds_together(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         """Parity with discord.py's send() contract — mixing embed= and
         embeds= raises rather than being silently merged."""
         with _parent_send(MagicMock(spec=discord.Message)) as parent:
@@ -120,7 +139,9 @@ class TestMusicContextAttach:
                 )
         parent.assert_not_awaited()
 
-    async def test_content_only_send_without_block_omits_embeds(self, mctx, live_mp):
+    async def test_content_only_send_without_block_omits_embeds(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         """Defensive else-branch: a live player whose block comes back empty
         falls through to a plain content send with no embeds kwarg."""
         live_mp.np_embed_block.return_value = []
@@ -136,7 +157,9 @@ class TestMusicContextVanillaFallthrough:
     """Each no-attach guard falls through to a vanilla send, kwargs untouched."""
 
     @staticmethod
-    async def _assert_vanilla(mctx, live_mp=None):
+    async def _assert_vanilla(
+        mctx: MusicContext, live_mp: Optional[MagicMock] = None
+    ) -> discord.Message:
         sent = MagicMock(spec=discord.Message)
         own = discord.Embed(title="Queue")
         with _parent_send(sent) as parent:
@@ -147,30 +170,36 @@ class TestMusicContextVanillaFallthrough:
             live_mp._adopt_np_host_if_current.assert_not_called()
         return message
 
-    async def test_dm_message(self, mctx, live_mp):
+    async def test_dm_message(self, mctx: MusicContext, live_mp: MagicMock) -> None:
         mctx.message.guild = None
         await self._assert_vanilla(mctx, live_mp)
 
-    async def test_cog_not_loaded(self, mctx, live_mp, mock_bot):
+    async def test_cog_not_loaded(
+        self, mctx: MusicContext, live_mp: MagicMock, mock_bot: MagicMock
+    ) -> None:
         mock_bot.get_cog = MagicMock(return_value=None)
         await self._assert_vanilla(mctx, live_mp)
 
-    async def test_no_player_for_guild(self, mctx, live_mp, music_bot_cog):
+    async def test_no_player_for_guild(
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+    ) -> None:
         music_bot_cog.mps.clear()
         await self._assert_vanilla(mctx, live_mp)
 
-    async def test_no_live_song(self, mctx, live_mp):
+    async def test_no_live_song(self, mctx: MusicContext, live_mp: MagicMock) -> None:
         live_mp.current_song = None
         await self._assert_vanilla(mctx, live_mp)
 
-    async def test_different_channel_never_steals_host(self, mctx, live_mp):
+    async def test_different_channel_never_steals_host(
+        self, mctx: MusicContext, live_mp: MagicMock
+    ) -> None:
         other_channel = MagicMock(spec=discord.TextChannel)
         live_mp._channel = other_channel  # distinct MagicMock → distinct .id
         await self._assert_vanilla(mctx, live_mp)
 
 
 class TestGetContextWiring:
-    async def test_bot_builds_music_context(self):
+    async def test_bot_builds_music_context(self) -> None:
         """MusicBotApp.get_context defaults cls to MusicContext — the wiring
         that routes every command response through the attach hook."""
         app = object.__new__(MusicBotApp)  # avoid full Bot construction
