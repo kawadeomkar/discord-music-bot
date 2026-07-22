@@ -462,27 +462,21 @@ class MusicBot(commands.Cog):
         vc = ctx.voice_client
         if front:
             # The song is about to play, so the "Queued song / Est. playing at"
-            # embed below would be wrong — qsize() is non-zero here whenever a
-            # persisted queue was restored, but those entries are BEHIND this
-            # song, not ahead of it.
-            resuming = mp.queue.qsize()
-            desc = f"Requested by: [{ctx.author.mention}]\n{qobj.title} - ({qobj.webpage_url})"
-            if resuming:
-                desc += (
-                    f"\n\n{resuming} song{'s' if resuming != 1 else ''} from the "
-                    f"previous queue will resume after this one."
-                )
-            await asyncio.gather(
+            # embed below would be wrong — the queue is non-empty here whenever
+            # a persisted queue was restored, but those entries are BEHIND this
+            # song, not ahead of it. The resume notice replaces it: it names the
+            # song starting now (nothing else in this response does — the
+            # playback gate is shut, so there is no Now Playing block to host)
+            # and adds what the restore knows. Built before the insert, while
+            # the queue still holds only the restored entries.
+            resume_notice = mp.build_resume_notice_embed(qobj)
+            coros: list[Coroutine[Any, Any, Any]] = [
                 mp.queue_put_front(qobj),
                 ctx.message.add_reaction("👍"),
-                send_embed(
-                    ctx,
-                    f"▶️ Playing now: {qobj.title}",
-                    desc,
-                    discord.Color.blue(),
-                    thumbnail=qobj.thumbnail,
-                ),
-            )
+            ]
+            if resume_notice is not None:
+                coros.append(ctx.send(embed=resume_notice))
+            await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
 

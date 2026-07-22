@@ -25,7 +25,8 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **`-playnow` interjection** — interrupt the current song with another one; the
   interrupted song resumes afterward from the exact position it left off
 - **Crash recovery** — queue, current song (with playback position), volume, and
-  history persist in Redis; on restart the bot rejoins voice and picks up where it died
+  history persist in Redis; on restart the bot rejoins voice and resumes from the
+  saved position
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
 - **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
   persistent play history
@@ -94,21 +95,18 @@ never gonna give you up                          # plain text searches YouTube
 ### Requirements
 <a id="requirements"></a>
 
-Two audiences, two answers.
-
 **To run the bot** — Docker, plus credentials:
 
 - A [Discord bot token](https://discord.com/developers/applications)
 - A [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret)
 
-That is the whole toolchain — no Python, no Poetry. Compose brings its own Redis, so
-persistence, caching, and crash recovery work out of the box. You do still need to put
-those credentials in a `.env` file at the project root before starting anything:
+The Docker Compose stack contains its own Redis to enable persistence, caching, and crash recovery.
+Credentials *must* be set in a `.env` file at the project root before starting anything:
 `docker-compose.yml` declares `env_file: .env`, and Compose treats a missing one as
 an error rather than a warning. The format is under [step 2](#install-and-configure).
 
-Note `docker compose up` starts the whole stack, not just the bot: Redis, the
-bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
+`docker compose up` starts the whole stack, not just the bot: Redis, the bgutil POT
+provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 
 **To contribute**, add:
 
@@ -120,13 +118,12 @@ bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 - [Redis](https://redis.io/) 7+ if you run the bot outside Compose — strongly
   recommended; the bot runs degraded without it
 
-`just` has to be installed properly, not just present in the virtualenv. `just
-install` does put a copy at `.venv/bin/just`, but a virtualenv's `bin/` is only on
-your `PATH` while the environment is activated — and the pre-push git hook runs
-`just check` in whatever environment git hands it. Install it system-wide.
+`just` must be installed system-wide, not only in the virtualenv. `just install`
+places a copy at `.venv/bin/just`, but a virtualenv's `bin/` is on `PATH` only
+while the environment is activated, and the pre-push git hook does not activate it.
 
-With `just` and Docker you can skip Poetry, Python and FFmpeg entirely: every
-check runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
+With `just` and Docker, Poetry, Python and FFmpeg are not required: every check
+runs in a container via `DOCKER=1` — see [Just recipes](#just-recipes).
 
 ### 1. Create the Discord application
 
@@ -154,20 +151,19 @@ SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 ```
 
-`poetry install` gives you the bot and nothing else. The `test`, `lint` and `dev`
-groups are optional, so running the bot does not drag in pyright and its bundled
-Node runtime.
+`poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
+and `dev` groups are optional, so running the bot does not pull in pyright and its
+bundled Node runtime.
 
-Contributors want `just install` instead — it adds those three groups, which is
-what `just check` needs. If you get "ruff not found … run 'just install' first",
-this is why.
+Contributors should use `just install`, which adds those three groups. `just check`
+requires them; the error "ruff not found … run 'just install' first" means they are
+missing.
 
-Every recipe below assumes the project's virtualenv is the active one. If you use
-pyenv-virtualenv (this project ships a `.python-version`), that happens
-automatically and `poetry install` lands there rather than in `./.venv` — which is
-why every recipe follows `$VIRTUAL_ENV` when it is set and falls back to `./.venv`
-otherwise. Recipes tell you which interpreter they resolved to if anything is
-missing; `just --evaluate` prints it outright.
+Every recipe below uses the project's virtualenv. With pyenv-virtualenv (this
+project ships a `.python-version`), `poetry install` installs into that environment
+rather than `./.venv`, so every recipe follows `$VIRTUAL_ENV` when it is set and
+falls back to `./.venv` otherwise. Recipes report which interpreter they resolved
+to when something is missing; `just --evaluate` prints it directly.
 
 ### 3. Run
 
@@ -181,33 +177,33 @@ poetry run bot
 ## Just recipes
 <a id="just-recipes"></a>
 
-[`just`](https://just.systems) is the task index: one verb per entry point, so you
-can run only the thing you need. Run `just` on its own to list every recipe with
-its description, grouped by what it is for.
+[`just`](https://just.systems) is the task index: one recipe per entry point. Run
+`just` with no arguments to list every recipe with its description, grouped by
+purpose.
 
-Multi-step *pipelines* stay in the shell scripts (`./build_docker.sh`,
-`./deploy_docker.sh`); the justfile is the index over the primitives they compose.
+Multi-step pipelines live in the shell scripts (`./build_docker.sh`,
+`./deploy_docker.sh`); the justfile indexes the primitives those scripts compose.
 
-**Only have Docker and `just`?** Prefix `DOCKER=1` to `fmt`, `fmt-check`, `lint`,
-`types`, `test` or `check` and it runs inside the test image instead of a local
-virtualenv — no Python, no Poetry, no Node needed on your machine:
+**With only Docker and `just`**, prefix `DOCKER=1` to `fmt`, `fmt-check`, `lint`,
+`types`, `test` or `check` to run it inside the test image instead of a local
+virtualenv. No Python, Poetry or Node is required on the host:
 
 ```bash
 DOCKER=1 just check    # the full gate, container-only  (~31s)
-DOCKER=1 just fmt      # ruff rewrites YOUR files, not the image's
+DOCKER=1 just fmt      # ruff rewrites your files, not the image's
 ```
 
-The prefix has to come **before** the recipe name. `just check DOCKER=1` is an
-error (`just` reads it as a second recipe to run), unlike `make check DOCKER=1`.
+The prefix must come **before** the recipe name. `just check DOCKER=1` is an error
+(`just` reads it as a second recipe to run), unlike `make check DOCKER=1`.
 
 `src/`, `tests/` and `pyproject.toml` are bind-mounted, so the container reads and
-writes your working tree. Formatting runs as your uid, so rewritten files stay
-yours rather than turning up root-owned. The image is built automatically the
-first time; after changing `pyproject.toml` or `poetry.lock`, run
-`just test-image-rebuild` so the container picks up the new dependencies.
+writes your working tree. Formatting runs as your uid, so rewritten files are owned
+by you rather than by root. The image is built automatically the first time; after
+changing `pyproject.toml` or `poetry.lock`, run `just test-image-rebuild` so the
+container picks up the new dependencies.
 
-The native path stays the default because it is faster (~24s vs ~31s, and ~0.05s
-vs ~0.6s for a bare `just lint` — the difference is container startup).
+The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
+~0.6s for a bare `just lint` — the difference is container startup).
 
 **Setup**
 
@@ -219,7 +215,7 @@ vs ~0.6s for a bare `just lint` — the difference is container startup).
 | `just hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
 | `just test-image-rebuild` | Rebuild the image `DOCKER=1` uses — needed after a dependency change |
 
-**Develop** — the inner loop, fastest first
+**Develop** — ordered fastest first
 
 | Recipe | Does | Cost |
 |---|---|---|
@@ -232,7 +228,7 @@ vs ~0.6s for a bare `just lint` — the difference is container startup).
 | `just container-test` | Build the test image and run the suite inside it | ~1min |
 | `just ci` | `check` + `container-test` — full local mirror of CI | ~1.5min |
 
-`just test` forwards extra arguments to pytest, which `make` could not do:
+`just test` forwards extra arguments to pytest:
 
 ```bash
 just test tests/test_youtube.py    # one file
@@ -246,9 +242,9 @@ just test --maxfail=1              # stop at the first failure
 |---|---|
 | `just image` | Build the runtime image as `:latest` and `:<git-sha>` — no test gate |
 
-`just image` deliberately has no gate. A gate you cannot skip is a gate people
-route around, so it lives in the *pipeline* (`./build_docker.sh`) instead. Use
-`just image` when you want the artifact and have already run `just check`.
+`just image` has no test gate; the gate lives in the pipeline
+(`./build_docker.sh`). Use `just image` when you want the artifact and have already
+run `just check`.
 
 **Deploy**
 
@@ -260,8 +256,8 @@ route around, so it lives in the *pipeline* (`./build_docker.sh`) instead. Use
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
 | `just ps` | Show compose service status |
 
-`just up` never builds. If no image exists for the current commit it refuses
-rather than letting Compose build one and label it with that SHA — see
+`just up` never builds. If no image exists for the current commit it fails rather
+than letting Compose build one and label it with that SHA — see
 [Rolling back](#rolling-back).
 
 Shell completions ship in the binary: `just --completions zsh` (or `bash`/`fish`).
@@ -272,13 +268,13 @@ Shell completions ship in the binary: `just --completions zsh` (or `bash`/`fish`
 # Inner loop while writing code
 just fmt && just check
 
-# Ship it: gate → build → deploy, in one step
+# Gate, build and deploy in one step
 ./build_docker.sh
 
-# Same thing, one step at a time
+# The same steps individually
 just check && just image && just up
 
-# Something's wrong in production
+# Inspect a running deployment, then roll back
 just logs
 just up <last-good-sha>
 ```
@@ -307,10 +303,10 @@ just image            # build the runtime image, no gate
 docker compose up -d discord-music-bot redis
 ```
 
-`build_docker.sh` is a composition of those three — it does not reimplement any of
-them. Its gate *is* `just check`, so there is exactly one definition of "will CI
-pass". `build_common.sh` is a sourced library, not a runnable script; running it
-directly exits 64.
+`build_docker.sh` composes those three steps rather than reimplementing them. Its
+gate is `just check`, so there is one definition of "will CI pass".
+`build_common.sh` is a sourced library, not a runnable script; running it directly
+exits 64.
 
 Compose reads credentials from the same `.env` file and uses host networking. A named
 volume persists yt-dlp's disk cache across container restarts so the first song after
@@ -319,7 +315,7 @@ a restart stays fast.
 **Rolling back**
 <a id="rolling-back"></a>
 
-Deploys are separate from builds precisely so this never requires a rebuild:
+Deploys are separate from builds, so a rollback never requires a rebuild:
 
 ```bash
 just up <git-sha>              # any SHA whose image is still in the local store
@@ -329,15 +325,15 @@ docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
 The script refuses to deploy a tag it cannot find locally rather than letting
 Compose build one from your working tree and label it with that SHA.
 
-Tags are honest about what went into them: building from anything other than a
-clean checkout produces `<git-sha>-dirty.<digest>`, so a tag never claims to be a
-commit it isn't. A clean tree gives the bare SHA, which is what you roll back to.
+A tag identifies exactly what was built. Building from anything other than a clean
+checkout produces `<git-sha>-dirty.<digest>`, so a tag never identifies a commit it
+was not built from. A clean tree produces the bare SHA, which is what you roll back
+to.
 
-"Anything other than clean" includes untracked files — they are not in the commit,
-but `COPY src/` puts them in the image just the same. The digest is a hash of the
-actual tree that gets built, so two different sets of local edits never share a
-tag: rebuild after an edit and you get a new tag, which is what makes `just up`
-notice there is something new to deploy.
+Untracked files also count as unclean: they are not in the commit, but `COPY src/`
+adds them to the image. The digest is a hash of the tree that was built, so two
+different sets of local edits never share a tag. Rebuilding after an edit produces
+a new tag, which is how `just up` detects there is a new image to deploy.
 
 `just restart` is not a deploy — it restarts the existing container with the image
 it already has. To run a newly built image, use `just up` (or `./deploy_docker.sh`).
@@ -409,21 +405,21 @@ tests/                 # one test_*.py per src/ module, plus:
 docs/                  # architecture reference + design docs (see docs/README.md)
 ```
 
-Most modules have a matching `tests/test_<name>.py`; `config.py` and `telemetry.py`
-currently do not, which is why they are the two lowest-covered files in the report.
+Most modules have a matching `tests/test_<name>.py`. `config.py` and `telemetry.py`
+do not, and are the two lowest-covered files in the report.
 The coverage gate (`fail_under = 80`, project-wide) is enforced by `just test`.
 
 ## Development
 
 Every command lives in the justfile — see [Just recipes](#just-recipes) for the
-full list. This section covers the two things worth knowing beyond "what runs".
+full list. This section covers behavior beyond the recipe list itself.
 
 **`just check` is the contract for CI's lint and test jobs:** if it passes, those
-two pass. Not because the two were written to match, but because those jobs *call
-these recipes* — `just fmt-justfile`, `just fmt-check`, `just lint`, `just types`,
-`just test-report`. There is one definition of each check and both callers use it.
+two pass. Those jobs call the same recipes — `just fmt-justfile`, `just fmt-check`,
+`just lint`, `just types`, `just test-report` — so there is one definition of each
+check and both callers use it.
 
-It is not the whole pipeline, and the gap is worth knowing before you push:
+`just check` does not cover the whole pipeline:
 
 | CI job | Covered locally by |
 |---|---|
@@ -433,37 +429,38 @@ It is not the whole pipeline, and the gap is worth knowing before you push:
 | Build Image | nothing — it builds the `runtime` stage, which no local recipe exercises |
 | Security / pip-audit | nothing — it audits `poetry.lock` against advisories |
 
-So a green `just check` is a strong signal, not a guarantee of a green PR: a
+A green `just check` is therefore a strong signal, not a guarantee of a green PR: a
 dependency that breaks only the runtime image, or a CVE published against a locked
 package, turns the PR red with no local warning. `just ci` closes the container gap;
-the other two are remote by nature. Green CI on `main` publishes the runtime image
-to GHCR.
+the other two run only remotely. Green CI on `main` publishes the runtime image to
+GHCR.
 
-That is also why `just types` passes `--pythonpath` explicitly: pyright resolves
-imports from the interpreter it is *told* about, and pinning it to a path that
-`just install` does not populate is how "green locally, red in CI" gets built in.
-Every recipe points at the same venv — `$VIRTUAL_ENV` when one is active,
-otherwise `./.venv`, which is what CI and the Dockerfile use.
+`just types` passes `--pythonpath` explicitly for the same reason: pyright resolves
+imports from the interpreter it is given, and pointing it at a path that `just
+install` does not populate produces "green locally, red in CI". Every recipe uses
+the same venv — `$VIRTUAL_ENV` when one is active, otherwise `./.venv`, which is
+what CI and the Dockerfile use.
 
 **Git hooks**
 <a id="git-hooks"></a>
 
-`just hooks` installs two stages, deliberately split by how long they take:
+`just hooks` installs two stages, split by how long they take:
 
 | Stage | Runs | Cost |
 |---|---|---|
 | pre-commit | `ruff check --fix`, `ruff format`, `just --fmt --check`, whitespace/YAML/TOML checks | ~0.1s |
 | pre-push | `just check` | ~24s |
 
-The hooks are a convenience, not the gate — CI still runs every one of these
-checks, and `--no-verify` is always available when you need it. Note that the
-formatting hooks **rewrite files**: a commit that trips one fails and leaves the
-fixes unstaged, so `git add` them and commit again. That is intended behavior.
+The hooks are a convenience, not the gate — CI runs every one of these checks, and
+`--no-verify` is available. The formatting hooks **rewrite files**: a commit that
+trips one fails and leaves the fixes unstaged, so `git add` them and commit again.
+This is intended behavior.
 
-One caveat that did not apply under `make`: the pre-push hook needs `just` on the
-`PATH` git gives it. `/usr/bin/make` was always there; a `just` that only exists
-inside your virtualenv is not. If a push fails with `just: command not found`,
-that is why — install it system-wide (see [Requirements](#requirements)).
+The pre-push hook needs `just` on the `PATH` git provides, which the previous
+`make`-based hook did not require: `/usr/bin/make` was always present, and a `just`
+that exists only inside your virtualenv is not. A push failing with `just: command
+not found` means `just` is not installed system-wide (see
+[Requirements](#requirements)).
 
 ## License
 
