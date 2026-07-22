@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import redis.asyncio as aioredis
+import pickle
 import time
 from concurrent.futures import Executor
 from typing import Any, Optional, cast
@@ -12,18 +13,21 @@ import orjson
 import pytest
 from redis.asyncio import Redis
 
+from src.telemetry import configure_worker_logging
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
     _stream_url_playable,
     _stream_url_ttl,
+    _ytdlp_extract,
     _YtdlpLogger,
     YTDLVideoInfo,
     YTDLVideoMetadata,
@@ -1403,3 +1407,54 @@ class TestExtractionPool:
         finally:
             pool.shutdown(wait=False)
             self._swap_pool(previous)
+
+
+class TestProcessBoundaryContract:
+    """Everything that must survive being pickled to a worker process.
+
+    The suite runs extraction on an in-process ThreadPoolExecutor (see conftest), so
+    nothing else here ever exercises the pickling that the production
+    ProcessPoolExecutor performs on every submit. These tests are the cheap half of
+    that coverage gap — they assert the contract directly, in microseconds, without
+    spawning anything. The expensive half (a real worker actually spawning) is
+    docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
+
+    What they catch: adding an unpicklable value to an opts profile — a logger
+    instance, a session, a lambda, a compiled callback — or turning a submitted
+    top-level function into a closure/lambda/bound method. Either breaks every
+    extraction in production the moment it ships, while a green suite says nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "name,opts",
+        [
+            ("stream", _YTDL_STREAM_OPTS),
+            ("search", _YTDL_STREAM_SEARCH_OPTS),
+            ("playlist", _YTDL_PLAYLIST_OPTS),
+        ],
+    )
+    def test_opts_profile_survives_a_round_trip(
+        self, name: str, opts: dict[str, Any]
+    ) -> None:
+        """Every profile is an argument to _ytdlp_extract, so it is pickled per call.
+
+        Round-tripped rather than merely dumped: a value that serialises but does not
+        reconstruct (a class whose module moved, say) fails only in the worker, where
+        the failure surfaces as an opaque BrokenProcessPool.
+        """
+        restored = pickle.loads(pickle.dumps(opts))
+        assert restored.keys() == opts.keys(), f"{name} profile lost keys"
+
+    def test_extract_worker_is_picklable_by_reference(self) -> None:
+        """_ytdlp_extract is pickled by qualified name, not by value — so it must stay
+        a module-level function. `is` rather than `==`: pickle resolves the name on the
+        far side, and only a real module-level lookup round-trips to the same object."""
+        assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
+
+    def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
+        """ProcessPoolExecutor pickles `initializer` to every worker. A closure or a
+        bound method here breaks pool construction rather than one extraction."""
+        assert (
+            pickle.loads(pickle.dumps(configure_worker_logging))
+            is configure_worker_logging
+        )

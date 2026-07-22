@@ -122,6 +122,20 @@ def shutdown_ytdlp_pool() -> None:
         _YTDLP_POOL = None
 
 
+# FIXME: yt-dlp's own errors do not survive the process boundary.
+# yt-dlp raises DownloadError with the originating exception attached as exc_info, and
+# that chain (DownloadError → TransportError → RequestsRH → _YDLLogger) is unpicklable.
+# ProcessPoolExecutor therefore cannot ship the failure back: the parent gets
+# _pickle.PicklingError("Can't pickle <class 'yt_dlp.utils._YDLLogger'>") and the actual
+# reason — "Unable to download webpage: …", the line that distinguishes a private video
+# from a dead network from a broken extractor — is lost from both the logs and the error
+# embed the user sees. Verified 2026-07-22 against a real worker. This is a regression of
+# the ProcessPoolExecutor migration, not a pre-existing gap: the old ThreadPoolExecutor
+# propagated the real exception because nothing was pickled.
+# Fix: catch here — this function runs *in* the worker, where the exception is still
+# intact — and re-raise a plain picklable error carrying str(e) and the original class
+# name, so callers keep something to branch on. Pairs with the typed-errors TODO in
+# yt_source(). Design: docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §9.
 def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     """Extraction worker run in the process pool. Top-level so it's picklable to a
     worker and named in tracebacks."""
