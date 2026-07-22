@@ -55,7 +55,14 @@ Two audiences, two answers.
 - A [Discord bot token](https://discord.com/developers/applications)
 - A [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret)
 
-That is the whole list. `docker compose up` needs nothing else.
+That is the whole toolchain — no Python, no Poetry. You do still need to put those
+credentials in a `.env` file at the project root before starting anything:
+`docker-compose.yml` declares `env_file: .env`, and Compose treats a missing one as
+an error rather than a warning. The format is under
+[Local setup, step 2](#local-setup).
+
+Note `docker compose up` starts the whole stack, not just the bot: Redis, the
+bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 
 **To contribute**, add:
 
@@ -99,8 +106,13 @@ SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 poetry run bot
 ```
 
-Contributors should use `just install` instead of `poetry install` — it adds the
-`test`, `lint` and `dev` dependency groups that `just check` needs.
+`poetry install` gives you the bot and nothing else. The `test`, `lint` and `dev`
+groups are optional, so running the bot does not drag in pyright and its bundled
+Node runtime.
+
+Contributors want `just install` instead — it adds those three groups, which is
+what `just check` needs. If you get "ruff not found … run 'just install' first",
+this is why.
 
 Every recipe below assumes the project's virtualenv is the active one. If you use
 pyenv-virtualenv (this project ships a `.python-version`), that happens
@@ -246,9 +258,15 @@ docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
 The script refuses to deploy a tag it cannot find locally rather than letting
 Compose build one from your working tree and label it with that SHA.
 
-Tags are honest about what went into them: building with uncommitted changes to
-tracked files produces `<git-sha>-dirty`, so a tag never claims to be a commit it
-isn't. A clean tree gives the bare SHA, which is what you roll back to.
+Tags are honest about what went into them: building from anything other than a
+clean checkout produces `<git-sha>-dirty.<digest>`, so a tag never claims to be a
+commit it isn't. A clean tree gives the bare SHA, which is what you roll back to.
+
+"Anything other than clean" includes untracked files — they are not in the commit,
+but `COPY src/` puts them in the image just the same. The digest is a hash of the
+actual tree that gets built, so two different sets of local edits never share a
+tag: rebuild after an edit and you get a new tag, which is what makes `just up`
+notice there is something new to deploy.
 
 `just restart` is not a deploy — it restarts the existing container with the image
 it already has. To run a newly built image, use `just up` (or `./deploy_docker.sh`).
@@ -267,12 +285,25 @@ docker run --env-file .env --network host discord-music-bot
 Every command lives in the justfile — see [Just recipes](#just-recipes) for the
 full list. This section covers the two things worth knowing beyond "what runs".
 
-**`just check` is the contract:** if it passes, CI passes. Not because the two
-were written to match, but because CI's lint and test jobs *call these recipes* —
-`just fmt-check`, `just lint`, `just types`, `just test-report`. There is one
-definition of each check and both callers use it. Nothing else in the repo makes
-that promise; in particular, a successful `./build_docker.sh` used not to, because
-it applied formatting instead of checking it and never ran pyright at all.
+**`just check` is the contract for CI's lint and test jobs:** if it passes, those
+two pass. Not because the two were written to match, but because those jobs *call
+these recipes* — `just fmt-justfile`, `just fmt-check`, `just lint`, `just types`,
+`just test-report`. There is one definition of each check and both callers use it.
+
+It is not the whole pipeline, and the gap is worth knowing before you push:
+
+| CI job | Covered locally by |
+|---|---|
+| Lint & Type Check | `just check` |
+| Test Suite | `just check` |
+| Container Test | `just ci` (adds `just container-test`) |
+| Build Image | nothing — it builds the `runtime` stage, which no local recipe exercises |
+| Security / pip-audit | nothing — it audits `poetry.lock` against advisories |
+
+So a green `just check` is a strong signal, not a guarantee of a green PR: a
+dependency that breaks only the runtime image, or a CVE published against a locked
+package, turns the PR red with no local warning. `just ci` closes the container gap;
+the other two are remote by nature.
 
 That is also why `just types` passes `--pythonpath` explicitly: pyright resolves
 imports from the interpreter it is *told* about, and pinning it to a path that
@@ -304,21 +335,30 @@ that is why — install it system-wide (see [Requirements](#requirements)).
 
 ```
 src/
-├── main.py          # bot entrypoint, intents, extension loading
-├── musicbot.py      # Discord Cog with all slash commands
-├── musicplayer.py   # per-guild queue management and playback loop
-├── youtube.py       # yt-dlp integration, YTDL audio source class
-├── sources.py       # URL parsing, source type detection
-├── spotify.py       # Spotify API client (track/playlist lookup)
-└── util.py          # logging factory, queue formatting utilities
-tests/
-├── conftest.py      # shared fixtures
-├── test_sources.py
-├── test_util.py
-├── test_musicplayer.py
-├── test_spotify.py
-└── test_youtube.py
+├── main.py           # bot entrypoint, intents, extension loading
+├── config.py         # environment-backed settings
+├── musicbot.py       # Discord Cog with all commands
+├── musicplayer.py    # per-guild playback loop and now-playing state
+├── guild_queue.py    # the queue domain object (owns queue/history/current)
+├── guild_state.py    # per-guild runtime state, Redis-backed
+├── guild_history.py  # played-track history
+├── redis_client.py   # Redis connection and repository helpers
+├── youtube.py        # yt-dlp integration, YTDL audio source class
+├── sources.py        # URL parsing, source type detection
+├── spotify.py        # Spotify API client (track/playlist lookup)
+├── telemetry.py      # OpenTelemetry setup (traces, metrics, logs)
+├── help.py           # the -help command's embeds
+└── util.py           # logging factory, formatting utilities
+
+tests/                # one test_*.py per src/ module, plus:
+├── conftest.py       # shared fixtures
+├── helpers.py        # test-only builders
+└── test_context.py   # Discord context doubles
 ```
+
+Most modules have a matching `tests/test_<name>.py`; `config.py` and `telemetry.py`
+currently do not, which is why they are the two lowest-covered files in the report.
+The coverage gate (`fail_under = 80`, project-wide) is enforced by `just test`.
 
 ## Discord bot setup
 
