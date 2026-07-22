@@ -67,6 +67,14 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Written by `just test-report`, which CI runs and anyone can run locally.
+# coverage.xml is already covered above; these two were only ever generated on a
+# runner before the recipe existed.
+pytest.xml
+pytest-coverage.txt
+# Written by security.yml's `poetry export`. Same reasoning: reproducing the audit
+# locally used to leave an untracked file behind.
+requirements-audit.txt
 
 # Translations
 *.mo
