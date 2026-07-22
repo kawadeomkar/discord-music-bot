@@ -20,7 +20,21 @@ resolve_environment
 # Default matches what build_docker.sh / `just image` actually tagged, `-dirty`
 # suffix included — otherwise `just up` after a dirty build looks for a clean-SHA
 # tag that was never created and the guard below rejects it.
-GIT_SHA="${1:-$(git_sha_tag)}"
+#
+# Written as an if rather than "${1:-$(git_sha_tag)}": a command substitution inside
+# a ${:-} default does not set the assignment's exit status, so `set -e` did not fire
+# when git failed and GIT_SHA silently became "". The guard below then reported "No
+# local image discord-music-bot:" — a confusing symptom for "this is not a git
+# repository". build_docker.sh already splits its own assignment for this reason.
+# `-n "${1:-}"` and not just `$# -ge 1`: `just up` passes its empty TAG default as a
+# quoted argument, so this is called with one EMPTY argument in the common case.
+# Counting arguments alone would take that empty string as the requested tag and try
+# to deploy `discord-music-bot:`.
+if [ -n "${1:-}" ]; then
+    GIT_SHA="$1"
+else
+    GIT_SHA="$(git_sha_tag)"
+fi
 export GIT_SHA
 TAG="$IMAGE_NAME:$GIT_SHA"
 
@@ -29,6 +43,15 @@ TAG="$IMAGE_NAME:$GIT_SHA"
 # from the current working tree and then label it with the SHA you asked for.
 # On a rollback that is silently, dangerously wrong: you get today's source
 # wearing last week's tag, and the image store now lies about it. Refuse instead.
+# Probed first so the guard below can only mean one thing. `docker image inspect`
+# fails identically when the daemon is unreachable, and the guard then told you to
+# build an image you already had — while its "here are the tags that exist" hint came
+# back empty for the same reason, muted by the `|| true`.
+if ! docker info >/dev/null 2>&1; then
+    echo "Cannot reach the Docker daemon — is Docker running?" >&2
+    exit 1
+fi
+
 if ! docker image inspect "$TAG" >/dev/null 2>&1; then
     echo "No local image $TAG — refusing to let compose build one and label it with that SHA." >&2
     echo "Build the current commit with ./build_docker.sh, or pick a tag that exists:" >&2
