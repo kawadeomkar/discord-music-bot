@@ -29,8 +29,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # ── Test stage ────────────────────────────────────────────────────────────────
 # Inherits the builder venv and adds test deps (pytest, fakeredis, pytest-cov)
-# plus lint deps (ruff, pyright). Runs pytest by default; build.sh overrides the
-# command to run ruff against a bind-mounted src/ and tests/.
+# plus lint deps (ruff, pyright). Runs pytest by default; `DOCKER=1 just <recipe>`
+# overrides the command to run ruff or pyright against a bind-mounted src/ and
+# tests/ instead. Deliberately does NOT include the `dev` group, so the task
+# runner itself stays out of this image -- it is invoked from the host.
 # Used by the container-test CI job. Never pushed to GHCR.
 FROM builder AS test
 
