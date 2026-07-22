@@ -22,8 +22,17 @@ updates:
     labels:
       - dependencies
 
+  # `directories` with a glob, not `directory: /`. The github-actions ecosystem scans
+  # .github/workflows/ plus a root action.yml — and nothing else. Moving the shared
+  # setup steps into .github/actions/setup-python-env/ therefore took actions/checkout,
+  # actions/setup-python and actions/cache out of Dependabot's view entirely: a
+  # security advisory against any of them would open no PR, silently and indefinitely.
+  # (dependabot-core#6704 is open upstream; the two adjacent requests were declined.)
+  # Only `directories` accepts globs.
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     labels:

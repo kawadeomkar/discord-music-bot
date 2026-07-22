@@ -17,6 +17,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Least privilege by default — see the same block in ci.yml. Auditing a lockfile
+# needs to read the repository and nothing more, but the org default hands out a
+# write-all token to any workflow that does not say otherwise.
+permissions:
+  contents: read
+
 jobs:
   pip-audit:
     name: Python Dependency Audit
@@ -24,12 +30,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # install: false — `poetry export` reads poetry.lock and never touches a
+      # virtualenv, so this job used to build the full lint environment (pyright plus
+      # its bundled Node runtime) on every push and PR to produce a text file.
       - uses: ./.github/actions/setup-python-env
         with:
-          groups: main,test,lint
-          cache-prefix: audit-main-test-lint
+          cache-prefix: audit
+          install: 'false'
           poetry-plugins: poetry-plugin-export
 
+      # `--with=test,lint` is load-bearing now that those groups are optional in
+      # pyproject.toml — without it the audit would silently cover runtime
+      # dependencies only. (While the groups were non-optional this flag was a no-op
+      # that happened to describe what poetry did anyway.)
       - name: Export requirements for pip-audit
         run: poetry export --without-hashes --with=test,lint -f requirements.txt -o requirements-audit.txt
 

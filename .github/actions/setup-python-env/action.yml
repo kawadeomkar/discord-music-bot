@@ -9,16 +9,26 @@ description: Python 3.14 + pinned Poetry + a cached, in-project virtualenv.
 inputs:
   groups:
     description: >-
-      Poetry group list passed to --only=, e.g. "main,test". Part of the cache
-      key via cache-prefix — see below.
-    required: true
+      Poetry group list passed to --only=, e.g. "main,test". Folded into the
+      cache key. Ignored when `install` is false.
+    required: false
+    default: ''
+  install:
+    description: >-
+      Whether to create the virtualenv at all. Set false for jobs that only need
+      Poetry itself — `poetry export` reads poetry.lock and needs no venv, so
+      security.yml was installing pyright and its bundled Node runtime on every
+      run to produce a requirements file. Skipping the install also skips the
+      cache, since there is nothing to cache.
+    required: false
+    default: 'true'
   cache-prefix:
     description: >-
-      Distinguishes cache entries whose installed group set differs. This must
-      change whenever `groups` does: keying on poetry.lock alone would restore a
-      venv built from a different --only= list and then never re-save it
-      (actions/cache skips saving on an exact key hit), re-installing the
-      difference on every single run.
+      A short label for the caller (e.g. "lint"). It only has to be unique per
+      job — the installed group set is folded into the cache key from `groups`
+      directly, so the two cannot drift. It used to carry the group set by hand,
+      which made every caller responsible for remembering to update two inputs
+      together: exactly the duplication this action exists to remove.
     required: true
   poetry-plugins:
     description: Extra Poetry plugins to install alongside Poetry itself.
@@ -36,15 +46,27 @@ runs:
       shell: bash
       run: pip install poetry==2.1.3 ${{ inputs.poetry-plugins }}
 
+    # The group set is part of the key directly, so a caller cannot change `groups`
+    # and forget to bump the prefix. No restore-keys: a near-miss restore hands
+    # `poetry sync` a venv built from a different lockfile, and while sync would
+    # reconcile it, actions/cache does not re-save on a restore-key hit — so the
+    # reconciliation would be paid on every run, forever, and never cached.
     - name: Cache virtualenv
+      if: inputs.install == 'true'
       uses: actions/cache@v6
       with:
         path: .venv
-        key: venv-${{ inputs.cache-prefix }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
-        restore-keys: venv-${{ inputs.cache-prefix }}-${{ runner.os }}-py3.14-
+        key: venv-${{ inputs.cache-prefix }}-${{ inputs.groups }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
 
     # poetry.toml commits virtualenvs.in-project, so the venv lands at .venv/
     # and matches the cache path above without a `poetry config` call here.
+    #
+    # `sync`, not `install`: install adds what the lock requires but never REMOVES
+    # what it dropped, so a restored venv could keep serving a dependency that the
+    # PR deleted — imports would resolve in CI that fail on a clean machine. sync
+    # makes the environment match the lockfile exactly. (`install --sync` is the
+    # deprecated spelling in Poetry 2.x.)
     - name: Install dependencies
+      if: inputs.install == 'true'
       shell: bash
-      run: poetry install --only=${{ inputs.groups }} --no-root
+      run: poetry sync --only=${{ inputs.groups }} --no-root

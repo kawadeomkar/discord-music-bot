@@ -6,11 +6,31 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Supersedes three pushes to a PR racing three full pipelines. Never cancel on
-# main: an aborted main run means no image was published for that commit.
+# Supersedes three pushes to a PR racing three full pipelines. Never supersede on
+# main: a dropped main run means no image was published for that commit.
+#
+# `cancel-in-progress: false` alone does NOT achieve that. It protects a run that has
+# already started; a run still PENDING in the same group is cancelled regardless when
+# a newer one arrives. Three merges inside ten minutes therefore silently dropped the
+# middle commit's build — and a cancelled run reports as cancelled, not failed, so
+# nothing went red and `sha-<middle>` simply never reached GHCR.
+#
+# Including github.sha for push events puts every main commit in its own group, so
+# they queue instead of evicting each other. PRs keep one group per ref, which is the
+# whole point of superseding there.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'shared' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default. This repository's org setting grants workflows a
+# write-all GITHUB_TOKEN, which `container-test` in particular should never hold:
+# it runs `docker run` on code from the PR branch, so any test file would execute
+# beside a token that can push to main, delete workflow runs, or publish packages.
+# The two jobs that genuinely need more (`test` comments on PRs, `build` pushes to
+# GHCR) declare it themselves below, and a job-level block replaces this one
+# wholesale rather than adding to it.
+permissions:
+  contents: read
 
 jobs:
   resolve-env:
@@ -21,9 +41,15 @@ jobs:
     steps:
       - name: Compute environment name
         id: env_name
+        # Via env:, never `${{ }}` inside run:. A branch name is attacker-chosen
+        # text — git accepts `a";id;#`, `a$(id)b` and backticks in a ref — and
+        # ${{ }} is substituted before bash parses the line, so interpolating it
+        # directly makes any PR author's branch name executable here. Through env:
+        # it arrives as data that bash never re-parses.
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          BRANCH="${{ github.head_ref || github.ref_name }}"
-          [ "$BRANCH" = "main" ] && echo "name=production" >> $GITHUB_OUTPUT || echo "name=$BRANCH" >> $GITHUB_OUTPUT
+          [ "$BRANCH" = "main" ] && echo "name=production" >> "$GITHUB_OUTPUT" || echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
 
   lint:
     name: Lint & Type Check
@@ -37,15 +63,17 @@ jobs:
           # which imports pytest and fakeredis. Without them every such import is
           # an unresolved-import error.
           groups: main,lint,test,dev
-          cache-prefix: lint-main-lint-test-dev
+          cache-prefix: lint
 
       # The task file has a canonical format; keep it that way. `make` had no
       # equivalent. ~0.01s.
       - name: justfile format
         run: .venv/bin/just --fmt --check
 
-      # Parses the justfile and resolves every variable without running anything
-      # (~0.01s). A justfile typo fails here rather than six minutes in.
+      # Expands the `check` recipe tree without running anything (~0.01s), so a
+      # typo in a recipe `check` depends on fails here rather than six minutes in.
+      # It does NOT reach recipes outside that tree — `just --evaluate`, in the
+      # failure-diagnostic step below, is what resolves every variable.
       - name: justfile parses
         run: .venv/bin/just -n check
 
@@ -86,7 +114,7 @@ jobs:
       - uses: ./.github/actions/setup-python-env
         with:
           groups: main,test,dev
-          cache-prefix: test-main-test-dev
+          cache-prefix: test
 
       # `test-report` is `test` plus the reporting flags the coverage comment
       # below consumes -- it invokes the same recipe, so the gate has one
@@ -103,9 +131,16 @@ jobs:
         if: failure()
         run: .venv/bin/just --evaluate
 
+      # Pinned by commit SHA, not by `@main` as this previously was. The step runs
+      # with contents:write + pull-requests:write (the action posts commit comments
+      # on push events, so the write scope is genuinely required), after the suite,
+      # with the full workspace readable. A mutable branch ref there means a single
+      # upstream commit — this is a one-maintainer repository — executes here with
+      # no review, no version bump and no PR. Dependabot cannot cover the gap
+      # either: it does not bump branch refs, only tags and SHAs. Bump deliberately.
       - name: Coverage comment
         id: coverage_comment
-        uses: MishaKav/pytest-coverage-comment@main
+        uses: MishaKav/pytest-coverage-comment@fd9adbdca9fdfbe2b9bfa44a7340e6a83346ce6c # v1.10.0
         with:
           pytest-coverage-path: ./pytest-coverage.txt
           junitxml-path: ./pytest.xml
@@ -131,8 +166,12 @@ jobs:
           tags: discord-music-bot:test
           build-args: |
             ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped, because both this job and `build` export a GHA cache and an
+          # unscoped export writes the same default key. They build different
+          # targets, so each run's export replaced the other's and the next run
+          # restored a manifest missing its own layers. Cost, not correctness.
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
 
       - name: Run tests in container
         run: docker run --rm discord-music-bot:test
@@ -152,7 +191,12 @@ jobs:
       # package, a COPY that resolves differently) would land on main unseen.
       # Building always and pushing only from main means the image published at
       # merge is produced by the same steps that validated every commit before it.
-      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # workflow_dispatch is included so an image can be re-published for a commit
+      # that is already on main — after a GHCR incident, or a registry-side failure
+      # that has nothing to do with the code. Without it the only way to republish
+      # was an empty commit. It still requires being ON main, so a manual run from a
+      # branch publishes nothing.
+      PUBLISH: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
 
     # This job used to live in a separate build.yml triggered by `workflow_run`.
     # That was a provenance hole: for the workflow_run event GITHUB_SHA is
@@ -214,5 +258,9 @@ jobs:
           # it replaced — the registry import always missed. On a branch build it
           # would also be an unauthenticated pull, since the login step above is
           # skipped.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          #
+          # scope=runtime pairs with container-test's scope=test: this job builds the
+          # runtime target, that one builds test, and sharing the default scope meant
+          # each overwrote the other's export between runs.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
