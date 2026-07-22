@@ -46,6 +46,19 @@ runs:
       shell: bash
       run: pip install poetry==2.1.3 ${{ inputs.poetry-plugins }}
 
+    # actions/cache rejects a key containing a comma, and `groups` is a comma list —
+    # so it cannot go into the key as-is. Normalised here rather than reverting to a
+    # hand-written prefix, which is what made the group set and the key two things a
+    # caller had to remember to change together. Via env:, not `${{ }}` inside run:,
+    # for the same reason as ci.yml's branch name.
+    - name: Normalise the group set for the cache key
+      if: inputs.install == 'true'
+      id: cache_key
+      shell: bash
+      env:
+        GROUPS: ${{ inputs.groups }}
+      run: echo "groups=${GROUPS//,/-}" >> "$GITHUB_OUTPUT"
+
     # The group set is part of the key directly, so a caller cannot change `groups`
     # and forget to bump the prefix. No restore-keys: a near-miss restore hands
     # `poetry sync` a venv built from a different lockfile, and while sync would
@@ -56,7 +69,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: .venv
-        key: venv-${{ inputs.cache-prefix }}-${{ inputs.groups }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
+        key: venv-${{ inputs.cache-prefix }}-${{ steps.cache_key.outputs.groups }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
 
     # poetry.toml commits virtualenvs.in-project, so the venv lands at .venv/
     # and matches the cache path above without a `poetry config` call here.

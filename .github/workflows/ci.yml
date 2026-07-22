@@ -77,9 +77,18 @@ jobs:
       - name: justfile parses
         run: .venv/bin/just -n check
 
-      # These four steps ARE `just check`'s dependency list, run by CI instead of
-      # by `just` so a failure names the tool rather than "check". They are not a
+      # These steps ARE `just check`'s dependency list, run by CI instead of by
+      # `just` so a failure names the tool rather than "check". They are not a
       # second copy of it -- that is the whole point of calling the recipes.
+      #
+      # `pins` belongs here specifically because of Dependabot: it asserts that the
+      # ruff version in pyproject.toml matches .pre-commit-config.yaml's hook rev,
+      # and the `pip` and `pre-commit` ecosystems open SEPARATE PRs that each move
+      # one half. Those PRs are validated by CI and never by a local `just check`,
+      # so enforcing this only locally would miss the one case it exists for.
+      - name: version pins agree
+        run: .venv/bin/just pins
+
       - name: ruff format --check
         run: .venv/bin/just fmt-check
 
