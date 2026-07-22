@@ -6,9 +6,11 @@
 # Multi-step *pipelines* still live in the .sh scripts; this file is the index over
 # the primitives they compose.
 #
-# `just check` is the contract: if it passes, CI passes. It is not a copy of
-# .github/workflows/ci.yml's lint and test jobs — those jobs CALL these recipes, so
-# the two cannot drift.
+# `just check` is the contract for CI's lint and test jobs: if it passes, those two
+# pass. It is not a copy of them — they CALL these recipes, so the two cannot drift.
+# It is NOT the whole pipeline: `container-test` and `build` are separate CI jobs, and
+# security.yml audits the lockfile. `just ci` covers the container job too; nothing
+# local covers `build` or the audit. See the note above `check`.
 
 set shell := ["bash", "-cu"]
 
@@ -16,6 +18,19 @@ set shell := ["bash", "-cu"]
 # On an older `just` this is an unknown-setting parse error rather than a clean
 # message, which is still an error, which is the point.
 set minimum-version := '1.55.0'
+
+# Recipe arguments reach the body as "$@" instead of only as a flattened {{ ARGS }}
+# string. Without this, `just test -k "spotify or youtube"` interpolates to
+#   pytest -k spotify or youtube
+# and pytest reads `or` and `youtube` as test paths — the README documents that
+# forwarding, so it has to survive quoting. Recipes that use it must be shebang
+# recipes; line-based recipes still interpolate {{ }} as before.
+#
+# Note this also sets $0 to the recipe's script path. build_common.sh's sourced-only
+# guard compares ${BASH_SOURCE[0]} against $0 and still behaves — inside a sourced
+# file BASH_SOURCE[0] is that file, never the caller's $0 — so `container-test` and
+# `test-image-rebuild` keep working.
+set positional-arguments
 
 # Variables are evaluated EAGERLY by default (unlike Make's `=`): a backtick
 # assignment would fork on every invocation, `just --list` included. There are none
@@ -70,7 +85,14 @@ DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tes
 DOCKER_RUN := 'docker run --rm ' + DOCKER_MOUNTS + ' ' + IMAGE + ':test'
 DOCKER_RUN_USER := 'docker run --rm --user "$(id -u):$(id -g)" ' + DOCKER_MOUNTS + ' ' + IMAGE + ':test'
 
-RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { VENV_BIN / 'ruff' }
+# quote() on the native leg, and it is load-bearing rather than defensive: these
+# expand into recipe bodies unquoted (they cannot simply be wrapped in "" at the use
+# site, because under DOCKER=1 the same variable is a whole command line, not a path).
+# A repo cloned to a path containing a space therefore produced
+#   /Users/me/my repo/.venv/bin/ruff check src/
+# → `command not found: /Users/me/my`, and _venv's `test -x` guard turned into
+# `test: too many arguments`, reporting "No usable venv" against a working one.
+RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { quote(VENV_BIN / 'ruff') }
 
 # --pythonpath is not optional here. pyright resolves imports from the interpreter it
 # is TOLD about, not the one it runs from: with `[tool.pyright] venvPath/venv` it read
@@ -80,12 +102,18 @@ RUFF := if DOCKER == "1" { DOCKER_RUN_USER + ' ruff' } else { VENV_BIN / 'ruff' 
 # gone from pyproject.toml; this flag replaces them, and it points at exactly the same
 # VENV_BIN as every other recipe. Worse than wrong, the old setup failed SILENTLY: a
 # missing .venv makes pyright warn and exit 0.
-PYRIGHT := if DOCKER == "1" { DOCKER_RUN_USER + ' pyright' } else { VENV_BIN / 'pyright' + ' --pythonpath ' + VENV_BIN / 'python' }
-PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { VENV_BIN / 'pytest' }
+#
+# The DOCKER=1 leg names its interpreter too. It used to rely on the image putting
+# /app/.venv/bin first on PATH so pyright's implicit "first python found" happened to
+# be the right one — which made the container the single caller not covered by the
+# rule above, in the one file that states the rule. Anything that prepends another
+# Python to PATH in the test stage would have silently repointed it.
+PYRIGHT := if DOCKER == "1" { DOCKER_RUN_USER + ' pyright --pythonpath /app/.venv/bin/python' } else { quote(VENV_BIN / 'pyright') + ' --pythonpath ' + quote(VENV_BIN / 'python') }
+PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { quote(VENV_BIN / 'pytest') }
 
 [private]
 default:
-    @{{ just_executable() }} --justfile {{ justfile() }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
+    @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
     @echo ""
     @echo "Prefix DOCKER=1 to run fmt/lint/types/test inside the test image instead"
     @echo "of a local venv — requires only Docker and just, no Python or Poetry."
@@ -100,17 +128,17 @@ install:
 # Install the git hooks (ruff on commit, `just check` on push)
 [group('setup')]
 hooks: _venv
-    {{ VENV_BIN }}/pre-commit install
+    {{ quote(VENV_BIN / 'pre-commit') }} install
 
 # Bump pinned hook revisions in .pre-commit-config.yaml
 [group('setup')]
 hooks-update: _venv
-    {{ VENV_BIN }}/pre-commit autoupdate
+    {{ quote(VENV_BIN / 'pre-commit') }} autoupdate
 
 # Run every hook against every file (not just staged ones)
 [group('setup')]
 hooks-run: _venv
-    {{ VENV_BIN }}/pre-commit run --all-files
+    {{ quote(VENV_BIN / 'pre-commit') }} run --all-files
 
 # Rebuild the test image DOCKER=1 uses (needed after a dependency change)
 [group('setup')]
@@ -119,13 +147,15 @@ test-image-rebuild:
     set -euo pipefail
     source ./build_common.sh
     resolve_environment
-    docker build --build-arg ENVIRONMENT="$ENVIRONMENT" -t "{{ IMAGE }}:test" --target test -f Dockerfile .
+    docker build --build-arg ENVIRONMENT="$ENVIRONMENT" \
+        --label "dmb.dep-hash=$(dep_hash)" \
+        -t "{{ IMAGE }}:test" --target test -f Dockerfile .
 
 # Fail with an actionable message rather than "No such file or directory". Probes
 # pre-commit specifically because that is the only tool the hooks* recipes call.
 [private]
 _venv:
-    @test -x {{ VENV_BIN }}/pre-commit || { echo "No usable venv at {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }
+    @test -x {{ quote(VENV_BIN / 'pre-commit') }} || { echo "No usable venv at {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }
 
 # Make sure the ONE tool this check calls actually exists, on whichever path is selected.
 #
@@ -141,15 +171,21 @@ _venv:
 # that; `just` de-duplicates by (recipe, arguments), so `check` runs this three times,
 # not four.
 #
-# The image is built only when ABSENT, not when stale: src/ and tests/ are bind-mounted,
-# so ordinary code changes need no rebuild. Dependency changes do — run
-# `just test-image-rebuild` (or the always-rebuilding `just container-test`) after
-# touching pyproject.toml or poetry.lock, or DOCKER=1 keeps using the old dependency set.
+# The image is rebuilt when absent OR when its dependency set is stale. Source changes
+# never trigger it — src/ and tests/ are bind-mounted — but dependency changes must,
+# and used not to: pyproject.toml is mounted read-only over a venv baked at build time,
+# so `DOCKER=1 just check` after a poetry.lock edit checked the new config against the
+# old packages and passed. build_docker.sh then shipped the new dependencies behind a
+# green gate that never saw them. dep_hash lives in build_common.sh so the build and
+# the staleness check cannot disagree about what "same dependencies" means.
 [private]
 _tools TOOL:
     @if [ "{{ DOCKER }}" = "1" ]; then \
-        docker image inspect "{{ IMAGE }}:test" >/dev/null 2>&1 \
-            || {{ just_executable() }} --justfile "{{ justfile() }}" test-image-rebuild; \
+        source {{ quote(REPO / 'build_common.sh') }}; \
+        want="$(dep_hash)"; \
+        have="$(docker image inspect --format '{{{{ index .Config.Labels "dmb.dep-hash" }}' "{{ IMAGE }}:test" 2>/dev/null || true)"; \
+        { [ -n "$have" ] && [ "$want" = "$have" ]; } \
+            || {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test-image-rebuild; \
     else \
         test -x "{{ VENV_BIN }}/{{ TOOL }}" \
             || { echo "{{ TOOL }} not found in {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }; \
@@ -160,11 +196,22 @@ _tools TOOL:
 # One recipe per tool invocation, and `check` chains them. CI runs these as separately
 # named steps so GitHub names the failing TOOL in the checks UI, not just "check".
 
-# Format and auto-fix src/ and tests/ (REWRITES files)
+# The formatter must run even when the linter still has unfixable findings, which a
+# two-line recipe could not do: `ruff check --fix` exits non-zero while anything
+# remains unfixed, and just abandons the recipe on the first failing line — so the
+# recipe advertised as "REWRITES files" quietly rewrote nothing in exactly the
+# situation you reach for it. Status is recorded and re-raised at the end so the
+# lint-before-format order (and the failure) both survive.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Format and auto-fix src/ and tests/ (REWRITES files)')]
 [group('check')]
 fmt: (_tools 'ruff')
-    {{ RUFF }} check --fix src/ tests/
+    #!/usr/bin/env bash
+    set -uo pipefail
+    {{ RUFF }} check --fix src/ tests/ || lint_rc=$?
     {{ RUFF }} format src/ tests/
+    exit "${lint_rc:-0}"
 
 # Check formatting only, no rewrites (~0.04s)
 [group('check')]
@@ -182,13 +229,75 @@ types: (_tools 'pyright')
     {{ PYRIGHT }}
 
 # Run the test suite with coverage (~13s); extra pytest flags may be appended
+#
+# Shebang + "$@" rather than a plain line + {{ ARGS }}, because {{ ARGS }} flattens to
+# one space-joined string: `just test -k "spotify or youtube"` reached pytest as
+# `-k spotify or youtube`, i.e. `or` and `youtube` as test paths. The ~0.3s a shebang
+# body costs on macOS is noise against a 13s suite. See `set positional-arguments`.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Run the test suite with coverage (~13s); extra pytest flags may be appended')]
 [group('check')]
 test *ARGS: (_tools 'pytest')
-    {{ PYTEST }} --tb=short -q {{ ARGS }}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ PYTEST }} --tb=short -q "$@"
 
-# Everything CI gates on — run this before pushing
+# Check this file's own formatting (~0.01s)
 [group('check')]
-check: fmt-check lint types test
+fmt-justfile:
+    @{{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} --fmt --check
+
+# Both of these were enforced by a comment saying "keep these in step", which is not
+# enforcement — and Dependabot is configured to move each half independently (the
+# `pip` and `pre-commit` ecosystems open separate PRs). ruff in particular is
+# exact-pinned precisely so the hook and CI agree; if the two drift, the commit hook
+# reformats to a version `just fmt-check` then rejects, and you get a commit-then-fail
+# loop with no explanation. Cheap enough to sit in `check`.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Assert the version/name pins duplicated across two files each (~0.02s)')]
+[group('check')]
+pins:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ quote(REPO) }}
+    fail=0
+
+    want_ruff="$(sed -n 's/^ruff = "\(.*\)"$/\1/p' pyproject.toml)"
+    hook_ruff="$(sed -n 's|^ *rev: v\(.*\)$|\1|p' .pre-commit-config.yaml | head -1)"
+    if [ -z "$want_ruff" ] || [ "$want_ruff" != "$hook_ruff" ]; then
+        echo "ruff pin drift: pyproject.toml=[$want_ruff] .pre-commit-config.yaml rev=[v$hook_ruff]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    just_image="$(sed -n 's/^IMAGE := "\(.*\)"$/\1/p' justfile)"
+    sh_image="$(sed -n 's/^IMAGE_NAME="\(.*\)"$/\1/p' build_common.sh)"
+    if [ -z "$just_image" ] || [ "$just_image" != "$sh_image" ]; then
+        echo "image name drift: justfile IMAGE=[$just_image] build_common.sh IMAGE_NAME=[$sh_image]" >&2
+        fail=1
+    fi
+
+    exit "$fail"
+
+# What CI's lint and test jobs run — run this before pushing
+#
+# NOT the whole pipeline, and the difference has bitten: CI also runs `just --fmt
+# --check` (now `fmt-justfile`, above, so this no longer omits it), the container-test
+# job (`just ci` adds it), the `build` job, and security.yml's lockfile audit. The last
+# two have no local equivalent — a green `check` does not promise a green PR.
+#
+# `python -m compileall src/` used to run in CI and is deliberately not reproduced
+# here. It answered "does every file parse", which `ruff check`, pyright and pytest
+# collection each already answer for the same file set — including modules nothing
+# imports. Dropping it was intentional, not an oversight; this note exists because
+# the diff that dropped it did not say so.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc("What CI's lint and test jobs run — run this before pushing")]
+[group('check')]
+check: fmt-justfile pins fmt-check lint types test
 
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
@@ -209,8 +318,8 @@ check: fmt-check lint types test
 test-report *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ just_executable() }} --justfile "{{ justfile() }}" test \
-        --cov-report=xml --junitxml=pytest.xml {{ ARGS }} | tee pytest-coverage.txt
+    {{ quote(just_executable()) }} --justfile {{ quote(justfile()) }} test \
+        --cov-report=xml --junitxml=pytest.xml "$@" | tee pytest-coverage.txt
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
 # missing a dependency is invisible to `just test`), which is why it is not part of
@@ -219,12 +328,9 @@ test-report *ARGS:
 # [doc] and not a trailing `#` line — see the note on test-report.
 [doc('Build the test image and run the suite inside it')]
 [group('check')]
-container-test:
+container-test: test-image-rebuild
     #!/usr/bin/env bash
     set -euo pipefail
-    source ./build_common.sh
-    resolve_environment
-    docker build --build-arg ENVIRONMENT="$ENVIRONMENT" -t "{{ IMAGE }}:test" --target test -f Dockerfile .
     docker run --rm "{{ IMAGE }}:test"
 
 # Full local mirror of the CI workflow
@@ -243,12 +349,20 @@ image:
     set -euo pipefail
     source ./build_common.sh
     resolve_environment
-    build_runtime_image "{{ IMAGE }}:latest" "{{ IMAGE }}:$(git_sha_tag)"
+    # Assigned first, not inlined as an argument: a failing command substitution
+    # inside an argument does not trip `set -e` (the caller's status is what counts),
+    # so a git failure would have built and tagged `discord-music-bot:`.
+    tag="$(git_sha_tag)"
+    build_runtime_image "{{ IMAGE }}:latest" "{{ IMAGE }}:$tag"
 
 # Deploy an already-built image; pass a git sha to roll back
 [group('deploy')]
 up TAG='':
-    ./deploy_docker.sh {{ TAG }}
+    # Quoted: unquoted, `just up '*'` globbed against the repo root and `just up "a b"`
+    # passed two arguments. Both ended at the deploy guard's refusal, but naming a tag
+    # nobody asked for. Quoting means the empty default arrives as one EMPTY argument
+    # rather than none, which is why deploy_docker.sh tests `-n "${1:-}"` and not `$#`.
+    ./deploy_docker.sh "{{ TAG }}"
 
 # Stop the compose stack (volumes are kept)
 [group('deploy')]
@@ -269,7 +383,9 @@ restart:
 # Follow the bot's logs
 [group('deploy')]
 logs *ARGS:
-    docker compose logs -f discord-music-bot {{ ARGS }}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker compose logs -f discord-music-bot "$@"
 
 # Show compose service status
 [group('deploy')]
