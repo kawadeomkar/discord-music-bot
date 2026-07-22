@@ -4,6 +4,7 @@ from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
+from redis.asyncio.client import Pipeline
 from redis.typing import EncodableT, FieldT
 
 from src.guild_state import (
@@ -204,7 +205,7 @@ class GuildRedisStore:
     def now_playing_key(self) -> str:
         return GUILD_NOW_PLAYING_KEY.format(guild_id=self.guild_id)
 
-    def _pipe_expire_all(self, pipe) -> None:
+    def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for the TTL-managed guild keys onto an existing
         pipeline. The history key is deliberately absent: full history is
         retained indefinitely (PERSISTed by push_history), so it must never be
@@ -213,7 +214,7 @@ class GuildRedisStore:
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
 
-    async def _exec_with_state_ttl(self, pipe) -> None:
+    async def _exec_with_state_ttl(self, pipe: Pipeline) -> None:
         """Append the state-key TTL refresh and execute the pipeline.
 
         EXPIRE must come after the write commands already queued on the pipe —
@@ -412,9 +413,8 @@ class GuildRedisStore:
         """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         try:
-            raw = cast(
-                list[bytes],
-                await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1),
+            raw = await self.redis.lrange(
+                self.history_key(), 0, HISTORY_CACHE_LIMIT - 1
             )
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis get_history failed: {e}")
@@ -433,6 +433,10 @@ class GuildRedisStore:
         degraded behavior in both cases.
         """
         try:
+            # bytes keys/values, not str: create_redis_pool() sets
+            # decode_responses=False (see :75), an invariant redis-py's own return
+            # type cannot express. Do not "simplify" this away — from_redis()
+            # decodes, and a decoded pool would break it at runtime, not here.
             raw = cast(
                 dict[bytes, bytes], await self.redis.hgetall(self.now_playing_key())
             )
@@ -527,6 +531,7 @@ class GuildRedisStore:
         the end of _restore_state(), which covers the recovery window.
         """
         try:
+            # Same decode_responses=False invariant as get_now_playing() above.
             raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
             return GuildStateData.from_redis(raw)
         except Exception as e:
@@ -619,12 +624,7 @@ class GuildRedisStore:
         for the same reason as in _pipe_expire_all: the key is persistent."""
         try:
             pipe = self.redis.pipeline()
-            for key in [
-                self.queue_key(),
-                self.state_key(),
-                self.now_playing_key(),
-            ]:
-                pipe.expire(key, GUILD_TTL)
+            self._pipe_expire_all(pipe)
             await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis refresh_ttl failed: {e}")

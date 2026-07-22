@@ -1,11 +1,14 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+from typing import Any, Optional, cast
+from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import fakeredis
 import pytest
 import structlog
+from redis.asyncio import Redis
 
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -13,7 +16,7 @@ from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True, scope="session")
-def configure_structlog_for_tests():
+def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.
 
     Replaces the JSON renderer with a plain renderer so test output is readable,
@@ -33,7 +36,7 @@ def configure_structlog_for_tests():
 
 
 @pytest.fixture(autouse=True)
-def reset_structlog_contextvars():
+def reset_structlog_contextvars() -> Iterator[None]:
     """Clear structlog context variables between every test.
 
     Without this, a test that calls bind_contextvars(guild_id=...) would
@@ -45,7 +48,7 @@ def reset_structlog_contextvars():
 
 
 @pytest.fixture
-def mock_guild():
+def mock_guild() -> MagicMock:
     guild = MagicMock(spec=discord.Guild)
     guild.id = 111111111111111111
     guild.voice_client = MagicMock(spec=discord.VoiceClient)
@@ -60,7 +63,7 @@ def mock_guild():
 
 
 @pytest.fixture
-def mock_author():
+def mock_author() -> MagicMock:
     member = MagicMock(spec=discord.Member)
     member.id = 222222222222222222
     member.name = "testuser"
@@ -71,14 +74,14 @@ def mock_author():
 
 
 @pytest.fixture
-def mock_channel():
+def mock_channel() -> MagicMock:
     channel = MagicMock(spec=discord.TextChannel)
     channel.send = AsyncMock()
     return channel
 
 
 @pytest.fixture
-def mock_message(mock_author, mock_channel):
+def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message = MagicMock(spec=discord.Message)
     message.author = mock_author
     message.channel = mock_channel
@@ -88,7 +91,12 @@ def mock_message(mock_author, mock_channel):
 
 
 @pytest.fixture
-def mock_ctx(mock_guild, mock_author, mock_channel, mock_message):
+def mock_ctx(
+    mock_guild: MagicMock,
+    mock_author: MagicMock,
+    mock_channel: MagicMock,
+    mock_message: MagicMock,
+) -> MagicMock:
     ctx = MagicMock()
     ctx.guild = mock_guild
     ctx.author = mock_author
@@ -103,7 +111,7 @@ def mock_ctx(mock_guild, mock_author, mock_channel, mock_message):
 
 
 @pytest.fixture
-def mock_bot(mock_guild):
+def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot = MagicMock()
     bot.guilds = [mock_guild]
     bot.latency = 0.05
@@ -114,7 +122,7 @@ def mock_bot(mock_guild):
 
 
 @pytest.fixture
-async def fake_redis():
+async def fake_redis() -> AsyncIterator[Redis]:
     """In-memory Redis for tests. Async fixture so aclose() runs at teardown."""
     server = fakeredis.FakeServer()
     client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=False)
@@ -123,7 +131,13 @@ async def fake_redis():
 
 
 @pytest.fixture
-def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
+def music_player(
+    mock_bot: MagicMock,
+    mock_guild: MagicMock,
+    mock_channel: MagicMock,
+    mock_ctx: MagicMock,
+    fake_redis: Redis,
+) -> MusicPlayer:
     """Construct MusicPlayer with fake Redis. start() is NOT called — tests operate on state directly.
 
     loop() blocks on _restore_complete until _restore_state() finishes (see its docstring
@@ -142,7 +156,7 @@ def music_player(mock_bot, mock_guild, mock_channel, mock_ctx, fake_redis):
 
 
 @pytest.fixture
-def spotify(fake_redis):
+def spotify(fake_redis: Redis) -> Spotify:
     """Spotify instance with fake Redis cache and no blocking auth call at construction."""
     from unittest.mock import patch
 
@@ -154,13 +168,15 @@ def spotify(fake_redis):
 
 
 @pytest.fixture
-def ytdl_instance(mock_channel, mock_author):
+def ytdl_instance(
+    mock_channel: MagicMock, mock_author: MagicMock
+) -> Callable[..., Any]:
     """Factory that creates a YTDL instance with FFmpegOpusAudio.__init__ patched out."""
     from unittest.mock import patch
     import discord as d
-    from src.youtube import YTDL
+    from src.youtube import YTDL, YTDLVideoInfo
 
-    def _make(data=None):
+    def _make(data: Optional[dict] = None) -> Any:
         default_data = {
             "url": "https://r2.googlevideo.com/stream?expire=9999999999",
             "webpage_url": "https://www.youtube.com/watch?v=test",
@@ -185,7 +201,9 @@ def ytdl_instance(mock_channel, mock_author):
             return YTDL(
                 mock_channel,
                 default_data["url"],
-                data=default_data,
+                # Arbitrary per-test overrides merge in above, so this is a plain
+                # dict by construction; the cast is the info-dict shape assertion.
+                data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
             )
 

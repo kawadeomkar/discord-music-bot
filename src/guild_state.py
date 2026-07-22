@@ -504,7 +504,10 @@ class SearchQueueEntry:
 QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 
 
-def parse_queue_entry(data: bytes) -> QueueEntry | None:
+# `bytes | str`, matching orjson.loads() and what redis-py declares LRANGE to return.
+# Narrowing this to bytes only forced every caller to cast for a call that was always
+# fine at runtime (see parse_history_entry for the sibling).
+def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
     """Deserialize one queue-list entry into a value object.
 
     The "type" field discriminates search entries from songs. Corrupt
@@ -627,7 +630,7 @@ def serialize_history_entry(entry: HistoryEntry) -> bytes:
     return entry.to_redis()
 
 
-def parse_history_entry(data: bytes) -> HistoryEntry | None:
+def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
     """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong
     JSON type, malformed fields) return None with a warning — the entry is
     dropped and the rest of the history survives, matching parse_queue_entry.

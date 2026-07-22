@@ -96,6 +96,17 @@ typeCheckingMode = "basic"
 # calls that same recipe rather than running pyright itself, and editors follow
 # the interpreter you select. (The pyrightconfig.json warning above still stands
 # — that file would override all of this.)
+#
+# main re-added venvPath/venv in the merge that brought the rule below. Dropped
+# again here rather than kept: it is the exact configuration this branch removed,
+# and it fails SILENTLY — a missing ./.venv makes pyright warn and exit 0, so CI
+# goes green having type-checked nothing.
+
+# Arrived from main with PR #87's typing work, and kept: `basic` mode does not
+# require parameter annotations on its own. Checked against the bundled analyzer
+# rather than taken on faith — this section used to carry `reportMissingReturnType`,
+# which is not a pyright rule at all and silenced nothing the whole time it sat here.
+reportMissingParameterType = "error"
 # Without this, an unnecessary suppression is invisible. The mypy-style
 # `# type: ignore[code]` comments this repo used to carry were blanket pyright
 # suppressions (there is no mypy here): 11 of them silenced nothing, and the
@@ -108,6 +119,22 @@ target-version = "py314"
 # Default lint rules (pyflakes F + a pycodestyle E subset) already cover unused
 # imports, undefined names, and import placement. ruff format is black-compatible
 # and replaces black as the formatter.
+
+[tool.ruff.lint]
+# Return-annotation enforcement lives here, not in [tool.pyright]. This section
+# replaces a `reportMissingReturnType = "error"` key that pyright never
+# implemented: pyright reports unrecognized settings on stderr without changing
+# its exit code, so CI read a clean pass out of a rule that was never evaluated.
+# Anything added here must be a rule the tool actually has — verify with
+# `ruff rule <CODE>` before adding.
+extend-select = ["ANN"]
+# ANN401 (`Any` in a signature) is the one ANN rule that is not mechanical: the
+# `Any`s in this repo are load-bearing at the yt-dlp and discord.py boundaries,
+# where the upstream types are genuinely dynamic. Narrowing the ones that *can*
+# be narrowed is tracked separately (see docs/TYPING_BRANCH_REVIEW_FIXES_PLAN.md
+# Phase 2); enabling the rule now would bury the 4 real return-type gaps under
+# 94 judgement calls.
+ignore = ["ANN401"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
