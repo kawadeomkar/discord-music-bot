@@ -95,6 +95,14 @@ jobs:
       - name: Run tests with coverage
         run: .venv/bin/just test-report
 
+      # Mirrors the lint job's step. It lived only there until a real failure
+      # landed in THIS job and the diagnostic was not where it was needed.
+      # Placed before the coverage comment so a failing suite shows the resolved
+      # variables and then stops, exactly as it did before.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
+
       - name: Coverage comment
         id: coverage_comment
         uses: MishaKav/pytest-coverage-comment@main
