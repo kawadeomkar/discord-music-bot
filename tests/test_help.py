@@ -20,7 +20,7 @@ DESCRIPTION_LIMIT = 4096
 
 
 @pytest.fixture
-async def bot():
+async def bot() -> commands.Bot:
     """A real Bot with the real cog, so help reflects the actual command table."""
     instance = commands.Bot(
         command_prefix="-",
@@ -32,7 +32,7 @@ async def bot():
 
 
 @pytest.fixture
-def ctx(bot):
+def ctx(bot: commands.Bot) -> MagicMock:
     """Stub context that captures what the help command sends."""
     context = MagicMock()
     context.bot = bot
@@ -44,14 +44,15 @@ def ctx(bot):
 
 
 @pytest.fixture
-def help_command(bot, ctx):
+def help_command(bot: commands.Bot, ctx: MagicMock) -> commands.HelpCommand:
     # copy() is what discord.py does per invocation (issue #2123).
+    assert bot.help_command is not None
     hc = bot.help_command.copy()
     hc.context = ctx
     return hc
 
 
-def sent_embed(ctx) -> discord.Embed:
+def sent_embed(ctx: MagicMock) -> discord.Embed:
     ctx.send.assert_called_once()
     return ctx.send.call_args.kwargs["embed"]
 
@@ -66,44 +67,58 @@ class TestSendDestination:
     reached for it would trip these.
     """
 
-    async def test_bot_help_sends_via_context(self, help_command, ctx):
+    async def test_bot_help_sends_via_context(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         ctx.send.assert_awaited_once()
         ctx.channel.send.assert_not_called()
 
-    async def test_command_help_sends_via_context(self, help_command, ctx):
+    async def test_command_help_sends_via_context(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="play")
         ctx.send.assert_awaited_once()
         ctx.channel.send.assert_not_called()
 
-    async def test_error_message_sends_via_context(self, help_command, ctx):
+    async def test_error_message_sends_via_context(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="nonexistent")
         ctx.send.assert_awaited_once()
         ctx.channel.send.assert_not_called()
 
 
 class TestBotHelp:
-    async def test_lists_every_visible_command(self, help_command, ctx, bot):
+    async def test_lists_every_visible_command(
+        self, help_command: MusicHelpCommand, ctx: MagicMock, bot: commands.Bot
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         embed = sent_embed(ctx)
         body = "\n".join(f.value or "" for f in embed.fields)
         for command in bot.commands:
             assert f"-{command.name}" in body
 
-    async def test_shows_every_alias(self, help_command, ctx, bot):
+    async def test_shows_every_alias(
+        self, help_command: MusicHelpCommand, ctx: MagicMock, bot: commands.Bot
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
         for command in bot.commands:
             for alias in command.aliases:
                 assert f"-{alias}" in body, f"alias {alias} of {command.name} missing"
 
-    async def test_documents_sources_and_behaviour(self, help_command, ctx):
+    async def test_documents_sources_and_behaviour(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         body = "\n".join(f.value or "" for f in sent_embed(ctx).fields)
         for topic in ("YouTube", "Spotify", "SoundCloud", "Now Playing"):
             assert topic in body
 
-    async def test_respects_discord_size_limits(self, help_command, ctx):
+    async def test_respects_discord_size_limits(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         embed = sent_embed(ctx)
         assert len(embed.description or "") <= DESCRIPTION_LIMIT
@@ -118,7 +133,7 @@ class TestCommandList:
     indented beneath — inside a code block, the only construct Discord renders
     in monospace so the indent survives."""
 
-    def _sections(self, ctx) -> dict[str, list[str]]:
+    def _sections(self, ctx: MagicMock) -> dict[str, list[str]]:
         """The code-block body of each *COMMANDS field, as lines."""
         sections = {}
         for field in sent_embed(ctx).fields:
@@ -127,20 +142,24 @@ class TestCommandList:
                 sections[field.name or ""] = value.strip("`").strip("\n").splitlines()
         return sections
 
-    async def test_synopsis_comes_first(self, help_command, ctx):
+    async def test_synopsis_comes_first(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         fields = sent_embed(ctx).fields
         assert fields[0].name == "SYNOPSIS"
         assert "-<command> [argument ...]" in (fields[0].value or "")
 
-    async def test_one_section_per_category_in_order(self, help_command, ctx):
+    async def test_one_section_per_category_in_order(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command=None)
         names = list(self._sections(ctx))
         assert names == [f"{category.upper()} COMMANDS" for category in CATEGORY_ORDER]
 
     async def test_heading_lines_list_every_form_of_the_command(
-        self, help_command, ctx
-    ):
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         """Aliases join the heading comma-list the way man writes `-h, --help`,
         and arguments survive unwrapped — not discord.py's `-[play|p|sing]`."""
         await help_command.command_callback(ctx, command=None)
@@ -150,7 +169,9 @@ class TestCommandList:
         assert "-now, -np, -rn, -nowplaying" in body
         assert "[play|p|sing]" not in body
 
-    async def test_entries_follow_importance_order(self, help_command, ctx):
+    async def test_entries_follow_importance_order(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         """Within a category, commands render by importance/frequency of use
         (play before playnow before pause…), not alphabetically — which put
         `pause` above `play`."""
@@ -165,7 +186,9 @@ class TestCommandList:
             expected = [c for c in CATEGORY_COMMANDS[category] if c in rendered]
             assert rendered == expected, f"{name}: {rendered}"
 
-    async def test_entries_hang_indent(self, help_command, ctx):
+    async def test_entries_hang_indent(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         """Heading lines sit at column 0 and start with the prefix; summary
         lines are indented — reading the left edge scans the command names."""
         await help_command.command_callback(ctx, command=None)
@@ -175,7 +198,9 @@ class TestCommandList:
                     continue  # blank separator between entries
                 assert line.startswith("-") or line.startswith("    "), repr(line)
 
-    async def test_no_line_exceeds_the_width_budget(self, help_command, ctx):
+    async def test_no_line_exceeds_the_width_budget(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         """A code block does not soft-wrap — an over-long line scrolls sideways
         on mobile instead. Cells wrap so that never happens."""
         await help_command.command_callback(ctx, command=None)
@@ -183,7 +208,9 @@ class TestCommandList:
             for line in lines:
                 assert len(line) <= WIDTH, f"{len(line)} chars: {line!r}"
 
-    async def test_wrapping_never_drops_text(self, help_command, ctx, bot):
+    async def test_wrapping_never_drops_text(
+        self, help_command: MusicHelpCommand, ctx: MagicMock, bot: commands.Bot
+    ) -> None:
         """Summaries wrap rather than truncate: reading the indented lines top
         to bottom reassembles every brief in full."""
         await help_command.command_callback(ctx, command=None)
@@ -194,15 +221,20 @@ class TestCommandList:
 
         assert "…" not in reassembled and "..." not in reassembled
         for command in bot.commands:
+            assert command.brief is not None
             assert command.brief in reassembled, f"{command.name}'s brief was mangled"
 
-    async def test_cog_help_renders_the_full_list(self, help_command, ctx):
+    async def test_cog_help_renders_the_full_list(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="MusicBot")
         assert sent_embed(ctx).title == "MUSICBOT(1)"
 
 
 class TestCommandHelp:
-    async def test_renders_man_sections(self, help_command, ctx):
+    async def test_renders_man_sections(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="play")
         embed = sent_embed(ctx)
         assert embed.title == "-play(1)"
@@ -212,7 +244,9 @@ class TestCommandHelp:
         assert "SoundCloud" in fields["DESCRIPTION"]
         assert "-play never gonna give you up" in fields["EXAMPLES"]
 
-    async def test_synopsis_lists_every_form(self, help_command, ctx):
+    async def test_synopsis_lists_every_form(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         """One line per spelling, aliases included — man-page SYNOPSIS style,
         instead of a separate Aliases blurb the reader has to recombine with
         the usage line themselves."""
@@ -225,18 +259,20 @@ class TestCommandHelp:
             "-sing <url|search>",
         ]
 
-    async def test_resolves_an_alias_to_its_command(self, help_command, ctx):
+    async def test_resolves_an_alias_to_its_command(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="np")
         assert sent_embed(ctx).title == "-now(1)"
 
     async def test_command_without_aliases_has_single_synopsis_line(
-        self, help_command, ctx
-    ):
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="shuffle")
         fields = {f.name: f.value or "" for f in sent_embed(ctx).fields}
         assert fields["SYNOPSIS"].strip("`").strip("\n").splitlines() == ["-shuffle"]
 
-    async def test_every_command_has_help_metadata(self, bot):
+    async def test_every_command_has_help_metadata(self, bot: commands.Bot) -> None:
         """A new command must not silently land in the help output bare — and
         its long help has to fit the DESCRIPTION field's 1024-char cap."""
         for command in bot.commands:
@@ -254,7 +290,9 @@ class TestCommandHelp:
 
 
 class TestErrors:
-    async def test_unknown_command_sends_red_embed(self, help_command, ctx):
+    async def test_unknown_command_sends_red_embed(
+        self, help_command: MusicHelpCommand, ctx: MagicMock
+    ) -> None:
         await help_command.command_callback(ctx, command="bogus")
         embed = sent_embed(ctx)
         assert embed.color == discord.Color.red()
@@ -262,7 +300,7 @@ class TestErrors:
 
 
 class TestHelpFlagEndToEnd:
-    async def test_play_dash_dash_help_renders_the_play_man_page(self):
+    async def test_play_dash_dash_help_renders_the_play_man_page(self) -> None:
         """`-play --help` through the real MusicBotApp.invoke lands on the same
         embed as `-help play` — the flag diverts before argument parsing, so
         the extra words never reach the play command."""
