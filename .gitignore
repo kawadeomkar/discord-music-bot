@@ -1,6 +1,10 @@
 # Ignore
 pyproject.bak.toml
-docs/
+# No trailing slash, deliberately. `docs/` matches a directory only, and
+# `just worktree` links docs/ into each worktree as a SYMLINK — which git does
+# not consider a directory, so the pattern missed it and every worktree showed
+# an untracked `docs` one `git add -A` away from committing an absolute path.
+docs
 
 # Claude Code
 .claude/

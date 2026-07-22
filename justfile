@@ -275,3 +275,134 @@ logs *ARGS:
 [group('deploy')]
 ps:
     docker compose ps
+
+# ── Worktrees ────────────────────────────────────────────────────────────────
+#
+# Provisioning a worktree is NOT `git worktree add` plus copying the gitignored
+# dotfiles, and one file is the reason. The venv's site-packages holds
+#
+#     discord_music_bot.pth  ->  <absolute path of the tree it was installed from>
+#
+# so a venv puts THAT tree on sys.path. Share or symlink one into a worktree and its
+# tools import the other tree's src/ while you edit this one — a green suite proving
+# nothing about the code in front of you. Every worktree therefore gets its own venv.
+#
+# The sharper trap is .python-version. Copying it looks like the way to make the
+# worktree behave like this tree; what it actually does is make pyenv activate the
+# SHARED env there, so `poetry install` writes into that env and rewrites the .pth
+# above to point at the worktree — breaking this tree from a command run in another
+# directory. It is deliberately not copied, and VIRTUAL_ENV is unset below so poetry
+# cannot reach the shared env by that route either.
+
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('Create a sibling worktree on a new branch with its own venv (--env also links .env)')]
+[group('setup')]
+worktree NAME *FLAGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Every guard here is an if-statement, not `cond && { ...; }`. As a bare
+    # statement that idiom is a set -e landmine: when the condition is FALSE the
+    # list returns non-zero and the recipe exits instead of falling through.
+    name='{{ NAME }}'
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo "Invalid name '$name' — letters, digits, dot, dash, underscore, no slashes." >&2
+        exit 1
+    fi
+
+    # Empty-safe expansion: `for x in {{ FLAGS }}` with no flags is a syntax error on
+    # bash 3.2, which is still what /usr/bin/env bash finds on a stock macOS.
+    link_env=0
+    flags=( {{ FLAGS }} )
+    for flag in ${flags[@]+"${flags[@]}"}; do
+        case "$flag" in
+            --env) link_env=1 ;;
+            *) echo "Unknown flag '$flag' — the only flag is --env." >&2; exit 1 ;;
+        esac
+    done
+
+    repo='{{ REPO }}'
+    wt="$(dirname "$repo")/$(basename "$repo")-$name"
+    branch="task/$name"
+
+    # Sibling of the repo, never inside it: .dockerignore does not exclude a nested
+    # worktree, so one under this tree would join every `docker build .` context as a
+    # second full copy of the repo — growing again the moment it has its own .venv.
+    if [ -e "$wt" ]; then
+        echo "$wt already exists — remove it or pick another name." >&2
+        exit 1
+    fi
+    if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+        echo "Branch $branch already exists." >&2
+        exit 1
+    fi
+
+    # poetry is installed in the project venv, not in pyenv's global version, so the
+    # `poetry` shim resolves to nothing at all once we stop selecting this env — which
+    # is exactly what the worktree does. Resolve it absolutely while we still can.
+    poetry_bin='{{ VENV_BIN }}/poetry'
+    if [ ! -x "$poetry_bin" ]; then
+        poetry_bin="$(command -v poetry || true)"
+    fi
+    if [ ! -x "$poetry_bin" ]; then
+        echo "No poetry found — run 'just install' in $repo first." >&2
+        exit 1
+    fi
+
+    # The BASE interpreter, never {{ VENV_BIN }}/python: `poetry env use` given a
+    # venv's python ADOPTS that venv, which is the sharing this whole recipe exists
+    # to prevent.
+    base_python="$('{{ VENV_BIN }}/python' -c 'import os, sys; print(os.path.join(sys.base_prefix, "bin", "python3"))' 2>/dev/null || true)"
+    if [ ! -x "$base_python" ]; then
+        base_python="$(command -v python3.14 || true)"
+    fi
+    if [ ! -x "$base_python" ]; then
+        echo "No base Python 3.14 to build the worktree venv from." >&2
+        exit 1
+    fi
+
+    git -C "$repo" worktree add -b "$branch" "$wt"
+
+    # docs/ is gitignored, so the checkout does not bring it across. Symlinked rather
+    # than copied because the plan documents are shared state and two diverging copies
+    # is the failure mode.
+    if [ -d "$repo/docs" ]; then
+        ln -s "$repo/docs" "$wt/docs"
+    fi
+
+    # Opt-in, and symlinked for a different reason: .env holds the live Discord token,
+    # and one file means deleting a worktree can never strand a copy of it. Off by
+    # default because .env is precisely what makes `just up` work in that directory,
+    # and `just up` brings the live bot online.
+    if [ "$link_env" = 1 ]; then
+        if [ -f "$repo/.env" ]; then
+            ln -s "$repo/.env" "$wt/.env"
+        else
+            echo "warning: --env given but $repo/.env does not exist — skipped." >&2
+        fi
+    fi
+
+    # Subshell so the unset cannot leak. poetry.toml is tracked with in-project = true,
+    # so with nothing activated the venv lands at $wt/.venv.
+    (
+        cd "$wt"
+        unset VIRTUAL_ENV
+        "$poetry_bin" env use "$base_python"
+        "$poetry_bin" install --with test,lint,dev
+    )
+
+    # Proves the header's hazard did not happen, rather than assuming it. Had poetry
+    # reached the shared env, $wt/.venv would not exist; had it installed in-project
+    # against the wrong source root, the .pth would name $repo.
+    pth="$(echo "$wt"/.venv/lib/python*/site-packages/discord_music_bot.pth)"
+    if [ ! -f "$pth" ] || [ "$(cat "$pth")" != "$wt" ]; then
+        echo "FAILED: $wt/.venv does not resolve src/ to the worktree." >&2
+        echo "Inspect before using it — the shared venv may have been written to." >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "Worktree:  $wt"
+    echo "Branch:    $branch"
+    echo "It has its own .venv — run 'just check' from there."
+    echo "Remove it with: git worktree remove $wt && git branch -d $branch"
