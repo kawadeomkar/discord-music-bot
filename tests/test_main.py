@@ -73,16 +73,12 @@ class TestSetupHook:
 
 class TestClose:
     @pytest.fixture(autouse=True)
-    def stub_blocking_shutdowns(self) -> Iterator[MagicMock]:
-        """close() hands shutdown_ytdlp_pool and shutdown_telemetry to an executor and
-        awaits them for real. Stub both: the first would join (and null out) the shared
-        extraction pool the conftest fixture pins for every test, and the second blocks on
-        an OTLP force_flush. Both are imported inside close(), so patch them at source."""
-        with (
-            patch("src.youtube.shutdown_ytdlp_pool") as pool_shutdown,
-            patch("src.telemetry.shutdown_telemetry"),
-        ):
-            yield pool_shutdown
+    def stub_telemetry_shutdown(self) -> Iterator[None]:
+        """close() awaits shutdown_telemetry in an executor for real, and it blocks on an
+        OTLP force_flush. The yt-dlp pool needs no stub: conftest gives each test its own
+        thread-backed YtdlpPool, so close() may shut it down for real."""
+        with patch("src.telemetry.shutdown_telemetry"):
+            yield
 
     async def test_closes_redis_pool_when_set(self, app: MusicBotApp) -> None:
         mock_pool = MagicMock()
@@ -111,15 +107,16 @@ class TestClose:
             await app.close()
         mock_super.assert_awaited_once()
 
-    async def test_shuts_down_the_ytdlp_pool(
-        self, app: MusicBotApp, stub_blocking_shutdowns: MagicMock
-    ) -> None:
+    async def test_shuts_down_the_ytdlp_pool(self, app: MusicBotApp) -> None:
         """The extraction workers are child processes — a clean close must join them
-        rather than leave them orphaned."""
+        rather than leave them orphaned. Asserts the real pool's state rather than a
+        mock call: the pool close() reaches is the one conftest installed."""
+        import src.youtube as youtube
+
         app._redis_pool = None
         with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
             await app.close()
-        stub_blocking_shutdowns.assert_called_once_with()
+        assert youtube.ytdlp_pool.is_closed
 
 
 class TestHelpFlag:

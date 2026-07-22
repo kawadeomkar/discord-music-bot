@@ -1,10 +1,7 @@
-import asyncio
 import copy
 import os
 import re
 import time
-from concurrent.futures import Executor, ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
@@ -18,108 +15,18 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_del, cache_get, cache_set
-from src.telemetry import configure_worker_logging, get_tracer
+from src.telemetry import get_tracer
 from src.util import fmt_duration, get_logger, notice_embed
+from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
 
-# yt-dlp extraction is only half I/O — JSON parsing, signature decryption and format
-# selection are all GIL-bound Python. Running it in a ProcessPoolExecutor (not threads)
-# gives concurrent extractions across guilds true parallelism instead of GIL contention
-# that also steals time from the event loop serving voice heartbeats. Worker count is
-# env-tunable (YTDLP_POOL_WORKERS); each worker holds a full CPython + yt-dlp import
-# (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild
-# extraction bursts become the bottleneck. Design: docs/ARCHITECTURE_PLAN.md §3.1.
-_POOL_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
-
-# Created lazily so importing this module never spawns children. Under the 3.14
-# spawn/forkserver start method each worker re-imports src.youtube; a lazy pool keeps
-# that re-import from constructing a nested pool. _get_pool() and _discard_pool() both
-# run on the single event-loop thread, so the lazy create/rebuild can't be raced — no
-# lock needed. (shutdown_ytdlp_pool() also mutates this global from an executor thread,
-# but only at close(), when no extraction is in flight.) Tests swap this for an in-process
-# ThreadPoolExecutor (see conftest):
-# ProcessPoolExecutor pickles the submitted callable, and the MagicMock that tests patch
-# onto _ytdlp_extract is unpicklable (and a real patch would never reach a worker anyway).
-_YTDLP_POOL: Optional[Executor] = None
-
-
-def _get_pool() -> Executor:
-    global _YTDLP_POOL
-    if _YTDLP_POOL is None:
-        # initializer runs configure_worker_logging() once per worker so yt-dlp's
-        # warnings (emitted from inside extract_info, now in a worker) stay structured.
-        _YTDLP_POOL = ProcessPoolExecutor(
-            max_workers=_POOL_WORKERS,
-            initializer=configure_worker_logging,
-        )
-    return _YTDLP_POOL
-
-
-def _discard_pool() -> None:
-    """Drop the current pool so the next _get_pool() builds a fresh one. Used to heal a
-    BrokenProcessPool; the broken pool is best-effort shut down to release its manager
-    thread (a broken pool never accepts new work, so waiting would be pointless)."""
-    global _YTDLP_POOL
-    pool = _YTDLP_POOL
-    _YTDLP_POOL = None
-    if pool is not None:
-        try:
-            pool.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
-
-
-async def _run_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
-    """Run one yt-dlp extraction in the process pool, healing a broken pool once.
-
-    A ProcessPoolExecutor becomes permanently broken if a worker dies abnormally — most
-    plausibly the OOM killer reaping one under memory pressure — after which every submit
-    raises BrokenProcessPool for the life of the process. Rebuild the pool and retry once
-    so a single worker death doesn't brick all extraction across every guild (the old
-    ThreadPoolExecutor had no equivalent all-or-nothing failure mode). A second failure is
-    a real problem and propagates to the caller's existing error handling."""
-    loop = asyncio.get_running_loop()
-    try:
-        return await loop.run_in_executor(
-            _get_pool(), _ytdlp_extract, url, opts, download, process
-        )
-    except BrokenProcessPool:
-        log.warning(
-            "yt-dlp process pool broke (a worker died) — rebuilding and retrying once"
-        )
-        _discard_pool()
-        return await loop.run_in_executor(
-            _get_pool(), _ytdlp_extract, url, opts, download, process
-        )
-
-
-def _pool_warmup_noop() -> None:
-    """Submitted by prewarm_ytdlp_pool() only to force a worker to spawn and import
-    yt-dlp before the first real extraction has to pay that cost."""
-    return None
-
-
-def prewarm_ytdlp_pool() -> None:
-    """Spawn the extraction workers now (from setup_hook) so the first -play doesn't
-    absorb process-spawn + yt-dlp-import latency. Fire-and-forget: submits one no-op
-    per worker and returns without awaiting them."""
-    pool = _get_pool()
-    if not isinstance(pool, ProcessPoolExecutor):
-        return  # a thread pool (tests) has nothing to spawn
-    for _ in range(_POOL_WORKERS):
-        pool.submit(_pool_warmup_noop)
-
-
-def shutdown_ytdlp_pool() -> None:
-    """Tear the extraction workers down on clean shutdown. Blocking (joins workers), so
-    callers on the event loop should run it in an executor. Safe to call when no pool was
-    ever created."""
-    global _YTDLP_POOL
-    if _YTDLP_POOL is not None:
-        _YTDLP_POOL.shutdown(wait=True, cancel_futures=True)
-        _YTDLP_POOL = None
+# The process's one extraction pool. A module-level *binding*, not module-level mutable
+# state: production never reassigns it, and everything about the pool's lifecycle lives
+# on the object (src/ytdlp_pool.py). Tests substitute a thread-pool-backed instance by
+# patching this name — one seam, one place (tests/conftest.py).
+ytdlp_pool = YtdlpPool()
 
 
 # FIXME: yt-dlp's own errors do not survive the process boundary.
@@ -705,8 +612,8 @@ class YTDL(discord.FFmpegOpusAudio):
             _enrich_queueobject(qo, cached)
             return
         try:
-            data: Optional[YTDLVideoInfo] = await _run_extract(
-                qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+            data: Optional[YTDLVideoInfo] = await ytdlp_pool.run(
+                _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
             )
             trace.get_current_span().set_attribute(
                 "ytdl.extract_success", data is not None
@@ -748,8 +655,8 @@ class YTDL(discord.FFmpegOpusAudio):
         for attempt in range(2):
             extracted_fresh = False
             if data is None:
-                data = await _run_extract(
-                    qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+                data = await ytdlp_pool.run(
+                    _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
                 )
                 span.set_attribute("ytdl.extracted_fresh", True)
                 if data is None:
@@ -880,7 +787,9 @@ class YTDL(discord.FFmpegOpusAudio):
         # with process=False). For a single watch URL the page + player fetch is paid
         # either way; processing adds only format-selection CPU (~tens of ms), no
         # extra network, and it eliminates prefetch_stream's second extraction.
-        data = await _run_extract(search, _YTDL_STREAM_SEARCH_OPTS, download, True)
+        data = await ytdlp_pool.run(
+            _ytdlp_extract, search, _YTDL_STREAM_SEARCH_OPTS, download, True
+        )
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped Exception("Could not find
@@ -965,7 +874,9 @@ class YTDL(discord.FFmpegOpusAudio):
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist."""
         trace.get_current_span().set_attribute("ytdl.url", url)
-        data = await _run_extract(url, _YTDL_PLAYLIST_OPTS, False, True)
+        data = await ytdlp_pool.run(
+            _ytdlp_extract, url, _YTDL_PLAYLIST_OPTS, False, True
+        )
         if data is None:
             raise Exception(f"Could not fetch YouTube playlist: {url}")
         # Optional in the element type, not re-annotated on the loop target: yt-dlp
