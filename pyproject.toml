@@ -34,11 +34,28 @@ opentelemetry-instrumentation-redis = ">=0.48b0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
 
+# The three groups below are optional, which is what makes `--with` mean anything.
+# Poetry installs every NON-optional group by default and `--with` is documented as
+# "the optional dependency groups to include" — so while these were non-optional,
+# `just install`'s `--with test,lint,dev` selected nothing that a bare `poetry install`
+# had not already installed, and the README's claim that it added the toolchain was
+# false. Worse in the other direction: the "just run the bot" reader was told Docker
+# and credentials were the whole list, then handed a `poetry install` that pulled
+# pyright and its ~110MB bundled Node runtime.
+#
+# `--only=` is unaffected by this flag — it selects groups explicitly — so the
+# Dockerfile stages and CI's composite action keep resolving exactly as before.
+[tool.poetry.group.test]
+optional = true
+
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
 fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
+
+[tool.poetry.group.lint]
+optional = true
 
 [tool.poetry.group.lint.dependencies]
 # The `nodejs` extra is not optional in practice. The pyright PyPI package is a
@@ -50,7 +67,14 @@ pytest-cov = "^7.1.0"
 # its own via nodeenv: 438MB, re-fetched on every `docker run --rm`. The extra
 # pulls nodejs-wheel-binaries instead, which puts Node in poetry.lock and makes
 # host, CI and container resolve the same way.
-pyright = { version = "^1.1.409", extras = ["nodejs"] }
+#
+# Exact-pinned like ruff, pre-commit and rust-just, and for the same reason: the
+# version CI runs and the version developers run must not drift. pyright is the one
+# where drift is most visible, because its point releases add new diagnostics — a
+# Dependabot bump inside a caret range turns an untouched PR red at the `types` step
+# while everyone who has not re-run `just install` still passes locally. The range
+# had already drifted once: the floor read ^1.1.409 while the lock resolved 1.1.411.
+pyright = { version = "1.1.411", extras = ["nodejs"] }
 # Exact-pinned, like yt-dlp and discord-py, because a second file has to agree
 # with it: .pre-commit-config.yaml pins the ruff hook by `rev`, and the hook runs
 # ruff from its own isolated environment. Under a caret range any `poetry update`
@@ -58,6 +82,9 @@ pyright = { version = "^1.1.409", extras = ["nodejs"] }
 # than `just lint` and CI checked. Bump both in the same commit.
 ruff = "0.15.21"
 pre-commit = "^4.6.0"
+
+[tool.poetry.group.dev]
+optional = true
 
 [tool.poetry.group.dev.dependencies]
 # The task runner. Its own group because the two consumers cut across the existing

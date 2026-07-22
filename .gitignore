@@ -72,6 +72,9 @@ coverage.xml
 # runner before the recipe existed.
 pytest.xml
 pytest-coverage.txt
+# Written by security.yml's `poetry export`. Same reasoning: reproducing the audit
+# locally used to leave an untracked file behind.
+requirements-audit.txt
 
 # Translations
 *.mo
