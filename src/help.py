@@ -17,7 +17,8 @@ help output as soon as it is declared.
 """
 
 import textwrap
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Mapping, Sequence
 
 import discord
 from discord.ext import commands
@@ -96,18 +97,19 @@ class MusicHelpCommand(commands.HelpCommand):
             **options,
         )
 
-    def get_destination(self) -> discord.abc.Messageable:  # type: ignore[override]
-        """The invoking Context, not its channel.
-
-        The base implementation returns ``context.channel``, whose bare send()
-        would bury the Now Playing host message mid-song. MusicContext.send
-        keeps the NP block glued to the bottom of the channel — see
-        docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md.
-
-        The base signature promises a MessageableChannel; a Context is only
-        Messageable, which is all this class ever uses it for (send()).
-        """
-        return self.context
+    # Every send below goes through self.context, never self.get_destination():
+    # the inherited get_destination() returns context.channel, whose bare send()
+    # would bury the Now Playing host message mid-song. MusicContext.send keeps
+    # the NP block glued to the bottom of the channel (see
+    # docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md), and routing help output through
+    # ctx.send is the same rule the rest of the bot follows.
+    #
+    # Overriding get_destination() to return the Context would be the natural
+    # hook, but its base signature promises a MessageableChannel and a Context
+    # is not one — only Messageable, which is all a caller here needs. Rather
+    # than override it incompatibly, we leave it alone: this class overrides
+    # every send_* method the base defines, so the base's own call to it (in
+    # send_error_message) never runs.
 
     # ── formatting helpers ────────────────────────────────────────────────────
 
@@ -126,7 +128,7 @@ class MusicHelpCommand(commands.HelpCommand):
         """
         return f"{self.prefix}{command.qualified_name} {command.signature}".strip()
 
-    def _extras(self, command: commands.Command) -> dict:
+    def _extras(self, command: commands.Command) -> dict[str, Any]:
         return command.extras or {}
 
     def _category(self, command: commands.Command) -> str:
@@ -142,14 +144,14 @@ class MusicHelpCommand(commands.HelpCommand):
         except ValueError:
             return (len(order), command.qualified_name)
 
-    def _forms(self, command: commands.Command) -> List[str]:
+    def _forms(self, command: commands.Command) -> list[str]:
         """Every way to invoke the command, canonical name first."""
         return [
             f"{self.prefix}{name}"
             for name in (command.qualified_name, *command.aliases)
         ]
 
-    def _entry_lines(self, command: commands.Command) -> List[str]:
+    def _entry_lines(self, command: commands.Command) -> list[str]:
         """One command as a hanging-indent entry, the way man(1) lists options:
 
             -play, -p, -sing <url|search>
@@ -169,7 +171,7 @@ class MusicHelpCommand(commands.HelpCommand):
         )
 
     def _add_entries_field(
-        self, embed: discord.Embed, name: str, entries: Sequence[List[str]]
+        self, embed: discord.Embed, name: str, entries: Sequence[list[str]]
     ) -> None:
         """Add one section of entries (blank line between them), continuing into
         "(cont.)" fields rather than letting Discord reject an over-long value
@@ -181,7 +183,7 @@ class MusicHelpCommand(commands.HelpCommand):
             return sum(len(line) + 1 for line in lines)
 
         field_name = name
-        chunk: List[str] = []
+        chunk: list[str] = []
         for lines in entries:
             spaced = lines if not chunk else ["", *lines]
             if chunk and size(chunk) + size(spaced) > budget:
@@ -199,7 +201,7 @@ class MusicHelpCommand(commands.HelpCommand):
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     async def send_bot_help(
-        self, mapping: Mapping[Optional[commands.Cog], List[commands.Command]], /
+        self, mapping: Mapping[Optional[commands.Cog], list[commands.Command]], /
     ) -> None:
         prefix = self.prefix
         everything = [cmd for cmds in mapping.values() for cmd in cmds]
@@ -221,7 +223,7 @@ class MusicHelpCommand(commands.HelpCommand):
             inline=False,
         )
 
-        buckets: dict[str, List[commands.Command]] = {}
+        buckets: dict[str, list[commands.Command]] = {}
         for command in visible:
             buckets.setdefault(self._category(command), []).append(command)
         ordered = [c for c in CATEGORY_ORDER if c in buckets]
@@ -241,7 +243,7 @@ class MusicHelpCommand(commands.HelpCommand):
         embed.set_footer(
             text=f"{len(visible)} commands · {prefix}help <command> for details"
         )
-        await self.get_destination().send(embed=embed)
+        await self.context.send(embed=embed)
 
     async def send_cog_help(self, cog: commands.Cog, /) -> None:
         # Every command lives in the single MusicBot cog, so `-help MusicBot` is
@@ -276,14 +278,14 @@ class MusicHelpCommand(commands.HelpCommand):
             value=command.help or command.brief or "no description",
             inline=False,
         )
-        examples: List[str] = extras.get("examples", [])
+        examples: list[str] = extras.get("examples", [])
         if examples:
             embed.add_field(name="EXAMPLES", value=self._fence(examples), inline=False)
         note: Optional[str] = extras.get("note")
         if note:
             embed.add_field(name="NOTES", value=note, inline=False)
         embed.set_footer(text=f"{category} · {prefix}help for the full command list")
-        await self.get_destination().send(embed=embed)
+        await self.context.send(embed=embed)
 
     async def send_group_help(self, group: commands.Group, /) -> None:
         # No command groups exist today; degrade to the single-command embed
@@ -291,7 +293,7 @@ class MusicHelpCommand(commands.HelpCommand):
         await self.send_command_help(group)
 
     async def send_error_message(self, error: str, /) -> None:
-        await self.get_destination().send(
+        await self.context.send(
             embed=notice_embed(
                 f"{error}\nRun `{self.prefix}help` to see every command.",
                 discord.Color.red(),

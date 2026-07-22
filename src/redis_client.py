@@ -1,9 +1,11 @@
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional, cast
 
 import orjson
 import redis.asyncio as aioredis
+from redis.asyncio.client import Pipeline
+from redis.typing import EncodableT, FieldT
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
@@ -50,6 +52,16 @@ _PLAYBACK_POSITION_FIELDS = (
     StateField.TOTAL_PAUSE_SECONDS,
     StateField.PAUSE_START_EPOCH,
 )
+
+
+def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
+    """Adapt a guild_state str→str mapping to redis-py's HSET mapping type.
+
+    Mapping's key parameter is invariant, so dict[str, str] is not assignable to
+    Mapping[FieldT, EncodableT] even though str is one of FieldT's own members.
+    The cast is a variance workaround only — it widens nothing at runtime.
+    """
+    return cast(Mapping[FieldT, EncodableT], mapping)
 
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -193,7 +205,7 @@ class GuildRedisStore:
     def now_playing_key(self) -> str:
         return GUILD_NOW_PLAYING_KEY.format(guild_id=self.guild_id)
 
-    def _pipe_expire_all(self, pipe) -> None:
+    def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for the TTL-managed guild keys onto an existing
         pipeline. The history key is deliberately absent: full history is
         retained indefinitely (PERSISTed by push_history), so it must never be
@@ -202,7 +214,7 @@ class GuildRedisStore:
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
 
-    async def _exec_with_state_ttl(self, pipe) -> None:
+    async def _exec_with_state_ttl(self, pipe: Pipeline) -> None:
         """Append the state-key TTL refresh and execute the pipeline.
 
         EXPIRE must come after the write commands already queued on the pipe —
@@ -220,7 +232,7 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), entry.to_redis())
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue failed: {e}")
 
@@ -232,7 +244,7 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_batch failed: {e}")
 
@@ -254,7 +266,7 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.lpush(self.queue_key(), *[e.to_redis() for e in reversed(entries)])
             self._pipe_expire_all(pipe)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_queue_front failed: {e}")
 
@@ -264,7 +276,7 @@ class GuildRedisStore:
         # This is acceptable in Phase 2 (asyncio.Queue is source of truth).
         # Phase 3b migrates to Redis Streams + XACK for at-least-once.
         try:
-            await self.redis.lpop(self.queue_key())  # type: ignore[misc]
+            await self.redis.lpop(self.queue_key())
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis pop_queue failed: {e}")
 
@@ -312,13 +324,13 @@ class GuildRedisStore:
             mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
             pipe.lpop(self.queue_key())
-            pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
+            pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
                 pipe.hset(
                     self.now_playing_key(),
-                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                    mapping=_hset_mapping(now_playing.to_redis_mapping()),
                 )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
@@ -338,13 +350,13 @@ class GuildRedisStore:
         try:
             mapping = self._now_playing_state_mapping(current, play_start_epoch)
             pipe = self.redis.pipeline(transaction=True)
-            pipe.hset(self.state_key(), mapping=mapping)  # type: ignore[misc]
+            pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
             pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
             pipe.expire(self.state_key(), GUILD_TTL)
             if now_playing is not None:
                 pipe.hset(
                     self.now_playing_key(),
-                    mapping=now_playing.to_redis_mapping(),  # type: ignore[misc]
+                    mapping=_hset_mapping(now_playing.to_redis_mapping()),
                 )
                 pipe.expire(self.now_playing_key(), GUILD_TTL)
             await pipe.execute()
@@ -365,7 +377,7 @@ class GuildRedisStore:
             pipe.delete(self.queue_key())
             pipe.rpush(self.queue_key(), *[e.to_redis() for e in entries])
             pipe.expire(self.queue_key(), GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis rebuild_queue failed: {e}")
 
@@ -393,7 +405,7 @@ class GuildRedisStore:
             pipe = self.redis.pipeline()
             pipe.lpush(self.history_key(), serialize_history_entry(entry))
             pipe.persist(self.history_key())
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")
 
@@ -401,7 +413,7 @@ class GuildRedisStore:
         """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         try:
-            raw: list[bytes] = await self.redis.lrange(  # type: ignore[misc]
+            raw = await self.redis.lrange(
                 self.history_key(), 0, HISTORY_CACHE_LIMIT - 1
             )
         except Exception as e:
@@ -421,6 +433,10 @@ class GuildRedisStore:
         degraded behavior in both cases.
         """
         try:
+            # bytes keys/values, not str: create_redis_pool() sets
+            # decode_responses=False (see :75), an invariant redis-py's own return
+            # type cannot express. Do not "simplify" this away — from_redis()
+            # decodes, and a decoded pool would break it at runtime, not here.
             raw = cast(
                 dict[bytes, bytes], await self.redis.hgetall(self.now_playing_key())
             )
@@ -515,6 +531,7 @@ class GuildRedisStore:
         the end of _restore_state(), which covers the recovery window.
         """
         try:
+            # Same decode_responses=False invariant as get_now_playing() above.
             raw = cast(dict[bytes, bytes], await self.redis.hgetall(self.state_key()))
             return GuildStateData.from_redis(raw)
         except Exception as e:
@@ -607,13 +624,8 @@ class GuildRedisStore:
         for the same reason as in _pipe_expire_all: the key is persistent."""
         try:
             pipe = self.redis.pipeline()
-            for key in [
-                self.queue_key(),
-                self.state_key(),
-                self.now_playing_key(),
-            ]:
-                pipe.expire(key, GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            self._pipe_expire_all(pipe)
+            await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis refresh_ttl failed: {e}")
 
