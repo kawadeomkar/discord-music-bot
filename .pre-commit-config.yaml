@@ -44,7 +44,7 @@ repos:
   # and `just lint` / CI checks another. `just hooks-update` bumps this; bump the
   # poetry constraint in the same commit.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.21
+    rev: v0.15.22
     hooks:
       # Lint before format: --fix can emit changes that need reformatting.
       - id: ruff-check
