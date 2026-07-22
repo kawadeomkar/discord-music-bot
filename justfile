@@ -85,7 +85,7 @@ PYTEST := if DOCKER == "1" { DOCKER_RUN + ' pytest' } else { VENV_BIN / 'pytest'
 
 [private]
 default:
-    @just --justfile {{ justfile() }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
+    @{{ just_executable() }} --justfile {{ justfile() }} --list --list-heading $'Recipes (run `just <recipe>`):\n'
     @echo ""
     @echo "Prefix DOCKER=1 to run fmt/lint/types/test inside the test image instead"
     @echo "of a local venv — requires only Docker and just, no Python or Poetry."
@@ -149,7 +149,7 @@ _venv:
 _tools TOOL:
     @if [ "{{ DOCKER }}" = "1" ]; then \
         docker image inspect "{{ IMAGE }}:test" >/dev/null 2>&1 \
-            || just --justfile "{{ justfile() }}" test-image-rebuild; \
+            || {{ just_executable() }} --justfile "{{ justfile() }}" test-image-rebuild; \
     else \
         test -x "{{ VENV_BIN }}/{{ TOOL }}" \
             || { echo "{{ TOOL }} not found in {{ VENV_BIN }}/ — run 'just install' first." >&2; exit 1; }; \
@@ -209,7 +209,7 @@ check: fmt-check lint types test
 test-report *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    just --justfile "{{ justfile() }}" test \
+    {{ just_executable() }} --justfile "{{ justfile() }}" test \
         --cov-report=xml --junitxml=pytest.xml {{ ARGS }} | tee pytest-coverage.txt
 
 # Mirrors CI's container-test job. Its value is proving the IMAGE runs (a runtime stage
