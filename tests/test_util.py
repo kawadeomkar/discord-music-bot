@@ -1,10 +1,19 @@
 """Tests for src/util.py — queue formatting and logging utilities."""
 
+import re
 from typing import Any
 import logging
+from unittest.mock import mock_open, patch
 
 from src.guild_state import HistoryEntry
-from src.util import fmt_duration, get_logger, history_embeds, queue_message
+from src import util
+from src.util import (
+    fmt_duration,
+    get_logger,
+    get_version,
+    history_embeds,
+    queue_message,
+)
 
 
 class TestQueueMessage:
@@ -196,3 +205,50 @@ class TestHistoryEmbeds:
 
     def test_empty_input(self) -> None:
         assert history_embeds([]) == []
+
+
+class TestGetVersion:
+    """get_version reads tool.poetry.version from pyproject.toml. It is cached,
+    so each test clears the cache first to read fresh."""
+
+    def setup_method(self) -> None:
+        get_version.cache_clear()
+
+    def teardown_method(self) -> None:
+        get_version.cache_clear()
+
+    def test_reads_real_pyproject_version(self) -> None:
+        # The repo's own pyproject.toml — a valid PEP 440-ish version, not "unknown".
+        version = get_version()
+        assert version != "unknown"
+        assert re.match(r"^\d+\.\d+\.\d+", version)
+
+    def test_parses_version_from_toml_contents(self) -> None:
+        toml = b'[tool.poetry]\nversion = "9.9.9"\n'
+        with patch.object(
+            util.Path, "open", mock_open(read_data=toml)
+        ):
+            assert get_version() == "9.9.9"
+
+    def test_returns_unknown_when_file_missing(self) -> None:
+        with patch.object(util.Path, "open", side_effect=OSError):
+            assert get_version() == "unknown"
+
+    def test_returns_unknown_when_key_absent(self) -> None:
+        toml = b'[tool.other]\nname = "x"\n'
+        with patch.object(
+            util.Path, "open", mock_open(read_data=toml)
+        ):
+            assert get_version() == "unknown"
+
+    def test_returns_unknown_on_malformed_toml(self) -> None:
+        with patch.object(
+            util.Path, "open", mock_open(read_data=b"not = valid = toml")
+        ):
+            assert get_version() == "unknown"
+
+    def test_result_is_cached(self) -> None:
+        get_version()  # populate cache from the real file
+        # A subsequent failing read must not be consulted — the cache serves it.
+        with patch.object(util.Path, "open", side_effect=OSError):
+            assert get_version() != "unknown"

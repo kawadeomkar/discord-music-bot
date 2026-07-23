@@ -39,6 +39,7 @@ from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     fmt_duration,
+    get_version,
     history_embeds,
     latency_color,
     notice_embed,
@@ -1374,6 +1375,31 @@ class MusicBot(commands.Cog):
             )
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
+            await self._command_error(ctx, e)
+
+    @commands.command(
+        name="version",
+        aliases=["ver"],
+        brief="show the bot's running version",
+        help=(
+            "Reports the version of the bot's code that is currently running, "
+            "read from the project's `pyproject.toml`. Useful for verifying which "
+            "build a live bot is on.\n\n"
+            "Works anywhere — you do not need to be in a voice channel."
+        ),
+        extras={"category": "Utility", "examples": ["-version", "-ver"]},
+    )
+    @_tracer.start_as_current_span("bot.version")
+    async def version(self, ctx: commands.Context) -> None:
+        try:
+            await send_embed(
+                ctx,
+                "Version",
+                f"Running version **{get_version()}**",
+                discord.Color.blurple(),
+            )
+        except Exception as e:
+            log.error(f"version failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────

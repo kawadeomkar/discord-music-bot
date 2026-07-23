@@ -1628,6 +1628,27 @@ class TestPingCommand:
         assert "embed" in call_kwargs
 
 
+class TestVersionCommand:
+    async def test_sends_embed_with_version(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        with patch("src.musicbot.get_version", return_value="1.2.3"):
+            await command_callback(MusicBot.version)(music_bot, mock_ctx)
+        mock_ctx.send.assert_awaited_once()
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.title == "Version"
+        assert "1.2.3" in embed.description
+
+    async def test_reports_the_real_pyproject_version(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # No patch — exercises the actual pyproject.toml read end to end.
+        await command_callback(MusicBot.version)(music_bot, mock_ctx)
+        embed = mock_ctx.send.call_args.kwargs["embed"]
+        assert embed.description is not None
+        assert "unknown" not in embed.description
+
+
 class TestClearCommand:
     async def test_sends_empty_message_when_queue_already_empty(
         self, music_bot: MusicBot, mock_ctx: MagicMock

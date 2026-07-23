@@ -33,7 +33,7 @@ HELP_COLOR = discord.Color.blurple()
 CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
     "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
     "Queue": ("queue", "now", "history", "shuffle", "remove", "clear", "jump"),
-    "Utility": ("help", "join", "ping"),
+    "Utility": ("help", "join", "ping", "version"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"

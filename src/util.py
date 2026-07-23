@@ -1,5 +1,8 @@
 import asyncio
 import contextlib
+import tomllib
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 from collections.abc import Coroutine
 
@@ -8,6 +11,25 @@ import structlog
 from opentelemetry.trace import Span, StatusCode
 
 from src.guild_state import HistoryEntry
+
+# pyproject.toml sits at the project root, one directory above src/. It is the
+# single source of truth for the version (tool.poetry.version) and is copied
+# into the runtime image (see Dockerfile), so it is readable at runtime even
+# though the package is installed --no-root and carries no dist metadata.
+_PYPROJECT_PATH = Path(__file__).resolve().parent.parent / "pyproject.toml"
+
+
+@lru_cache(maxsize=1)
+def get_version() -> str:
+    """Return the project version from pyproject.toml, or "unknown" if it can't
+    be read. Cached — the file never changes while the bot is running."""
+    try:
+        with _PYPROJECT_PATH.open("rb") as f:
+            data = tomllib.load(f)
+        version = data["tool"]["poetry"]["version"]
+        return version if isinstance(version, str) else "unknown"
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        return "unknown"
 
 
 def queue_message(songs: list[str]) -> str:
