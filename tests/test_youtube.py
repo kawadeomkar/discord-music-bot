@@ -10,6 +10,7 @@ import discord
 import orjson
 import pytest
 from redis.asyncio import Redis
+from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.youtube import (
     YTDL,
@@ -429,6 +430,39 @@ class TestYTSource:
             mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
                 await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing")
+
+    async def test_yt_source_unsupported_url_gives_friendly_error(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """yt-dlp reports an unrecognised site by raising UnsupportedError, which
+        extract_info wraps in a DownloadError. yt_source unwraps exc_info and turns it
+        into an actionable message instead of the generic "Failed to queue song"."""
+        url = "https://example.com/not-media"
+        # Mirror how yt-dlp wraps an extractor error: extract_info catches the
+        # UnsupportedError and re-raises a DownloadError carrying it in exc_info.
+        # cast() because yt-dlp's ExcInfo type wants a non-None traceback we don't
+        # have (and don't need — yt_source only reads exc_info[0], the type).
+        cause = UnsupportedError(url)
+        wrapped = DownloadError(
+            "ERROR: Unsupported URL", cast(Any, (type(cause), cause, None))
+        )
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = wrapped
+            with pytest.raises(Exception, match="isn't from a site I can play"):
+                await YTDL.yt_source(mock_ctx.author, url)
+
+    async def test_yt_source_reraises_non_unsupported_download_error(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A DownloadError that is NOT an unsupported-site error (e.g. a network
+        failure) is re-raised untouched — only genuine UnsupportedError is remapped."""
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = DownloadError(
+                "ERROR: unable to download webpage"
+            )
+            with pytest.raises(DownloadError, match="unable to download webpage"):
+                await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
 
     async def test_yt_source_picks_first_entry_from_playlist(
         self, mock_ctx: MagicMock

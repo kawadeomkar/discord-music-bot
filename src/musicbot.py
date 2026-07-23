@@ -15,6 +15,7 @@ from discord.ext import commands
 
 import redis.asyncio as aioredis
 
+from src.config import spotify_enabled
 from src.musicplayer import MusicPlayer
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
@@ -52,6 +53,23 @@ from src.util import (
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
+
+
+class SpotifyDisabledError(Exception):
+    """Raised when a Spotify link is played but Spotify support is not configured.
+
+    The message is user-facing: _command_error renders it (with the class name) into
+    the error embed the requester sees, so it explains the config gap and points at the
+    sources that still work.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Spotify links aren't available on this bot — it was started without "
+            "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+            "Try a YouTube or SoundCloud link, or just search by name."
+        )
+
 
 HISTORY_MIN_LIMIT = 1
 # The ceiling is the display cache depth — -history reads the in-memory cache,
@@ -158,13 +176,27 @@ class MusicBot(commands.Cog):
         # uses that idiom to break this exact import cycle), or declare a two-line
         # Protocol carrying `redis: Optional[aioredis.Redis]`.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        self.spotify = Spotify(redis=self.redis)
+        # Spotify is optional: only build the client when credentials are present.
+        # When None, playing a Spotify link raises SpotifyDisabledError; every other
+        # source (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
+        self.spotify: Optional[Spotify] = (
+            Spotify(redis=self.redis) if spotify_enabled() else None
+        )
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → (span, the token otel_context.attach() returns, which detach()
         # requires back — `object` does not satisfy it.
         self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
+
+    def _require_spotify(self) -> Spotify:
+        """Return the Spotify client, or raise SpotifyDisabledError if the feature
+        is off. Call this at every Spotify source dispatch: it both narrows the
+        Optional away for the type checker and produces the user-facing error when
+        credentials are absent."""
+        if self.spotify is None:
+            raise SpotifyDisabledError()
+        return self.spotify
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         """Return the guild's MusicPlayer, creating and starting one if absent."""
@@ -363,7 +395,9 @@ class MusicBot(commands.Cog):
         YouTube playlist (already resolved), or a bare QueueObject otherwise.
         """
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            return ResolvedSpotifyPlaylist(await self.spotify.playlist(source.id))
+            return ResolvedSpotifyPlaylist(
+                await self._require_spotify().playlist(source.id)
+            )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -377,7 +411,7 @@ class MusicBot(commands.Cog):
             ts: Optional[int] = None
             search: str
             if isinstance(source, SpotifySource):
-                search = await self.spotify.track(source.id)
+                search = await self._require_spotify().track(source.id)
             elif isinstance(source, YTSource):
                 search = source.ytsearch or source.url or ""
                 ts = source.ts
@@ -639,7 +673,7 @@ class MusicBot(commands.Cog):
             discord.Color.orange(),
         )
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            titles = await self.spotify.playlist(source.id)
+            titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)

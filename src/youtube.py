@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
+from yt_dlp.utils import DownloadError, UnsupportedError
 
 import redis.asyncio as aioredis
 from opentelemetry import trace
@@ -790,14 +791,32 @@ class YTDL(discord.FFmpegOpusAudio):
         # with process=False). For a single watch URL the page + player fetch is paid
         # either way; processing adds only format-selection CPU (~tens of ms), no
         # extra network, and it eliminates prefetch_stream's second extraction.
-        data = await loop.run_in_executor(
-            _YTDLP_POOL,
-            _ytdlp_extract,
-            search,
-            _YTDL_STREAM_SEARCH_OPTS,
-            download,
-            True,
-        )
+        try:
+            data = await loop.run_in_executor(
+                _YTDLP_POOL,
+                _ytdlp_extract,
+                search,
+                _YTDL_STREAM_SEARCH_OPTS,
+                download,
+                True,
+            )
+        except DownloadError as e:
+            # We no longer whitelist domains in parse_url — any dotted host is handed
+            # here for yt-dlp to accept or reject. yt-dlp reports an unrecognised site
+            # by raising UnsupportedError, but extract_info wraps it in a DownloadError,
+            # so the original cause is read off exc_info. Surface a clear message the
+            # user can act on instead of the generic "Failed to queue song".
+            # exc_info is (type, value, tb) when yt-dlp wrapped an extractor error, or
+            # None for a bare DownloadError (e.g. a network failure) — hence `or (None,)`.
+            cause = (getattr(e, "exc_info", None) or (None,))[0]
+            if cause is not None and issubclass(cause, UnsupportedError):
+                trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
+                raise Exception(
+                    f"This link isn't from a site I can play: {search}. Try a "
+                    "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
+                    "site, or just search by name."
+                ) from e
+            raise
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped Exception("Could not find

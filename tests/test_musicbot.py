@@ -24,6 +24,7 @@ from src.musicbot import (
     MusicBot,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
+    SpotifyDisabledError,
     _check_voice_permissions,
     background_typing,
 )
@@ -213,6 +214,7 @@ class TestQueueSource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(mock_ctx, source)
         assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
@@ -222,6 +224,7 @@ class TestQueueSource:
     ) -> None:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
@@ -241,6 +244,58 @@ class TestQueueSource:
         ):
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
+
+
+class TestSpotifyDisabled:
+    """When the bot is started without Spotify credentials, self.spotify is None
+    and any Spotify source must raise SpotifyDisabledError — while every other
+    source keeps working."""
+
+    def test_require_spotify_returns_client_when_present(
+        self, music_bot: MusicBot
+    ) -> None:
+        assert music_bot._require_spotify() is music_bot.spotify
+
+    def test_require_spotify_raises_when_disabled(self, music_bot: MusicBot) -> None:
+        music_bot.spotify = None
+        with pytest.raises(SpotifyDisabledError):
+            music_bot._require_spotify()
+
+    async def test_spotify_playlist_raises_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_spotify_track_raises_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_non_spotify_source_unaffected_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A YouTube link still resolves normally with Spotify turned off."""
+        music_bot.spotify = None
+        source = YTSource(url="https://yt.com/watch?v=abc", process=False)
+        fake_qobj = QueueObject(
+            "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
+        )
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, QueueObject)
+
+    def test_error_message_is_actionable(self) -> None:
+        msg = str(SpotifyDisabledError())
+        assert "SPOTIFY_CLIENT_ID" in msg
+        assert "SoundCloud" in msg or "search" in msg
 
     async def test_youtube_search_uses_ytsearch(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3334,6 +3389,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         mock_ctx.message.content = f"-playnow {url}"
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 

@@ -142,15 +142,37 @@ class TestParseUrlErrors:
         with pytest.raises(ValueError, match="Not a recognised URL"):
             parse_url("never gonna give you up", "-play never gonna give you up")
 
-    def test_unsupported_domain_raises(self) -> None:
-        url = "https://example.com/video/123"
-        with pytest.raises(Exception, match="Domain not supported"):
-            parse_url(url, f"-play {url}")
+    def test_dotless_host_raises_value_error(self) -> None:
+        """A search term like "98/99" matches the domain regex with a dotless
+        "host" of "98" — not a real URL, so it raises ValueError and parse_input
+        falls back to search rather than shipping it to yt-dlp."""
+        with pytest.raises(ValueError, match="Not a recognised URL"):
+            parse_url("98/99", "-play 98/99")
 
-    def test_vimeo_raises(self) -> None:
+
+class TestParseUrlOther:
+    """Domains we don't special-case are handed to yt-dlp rather than rejected."""
+
+    def test_unknown_domain_becomes_generic_ytdlp_source(self) -> None:
+        url = "https://example.com/video/123"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert result.url == url
+
+    def test_vimeo_becomes_generic_ytdlp_source(self) -> None:
         url = "https://vimeo.com/12345678"
-        with pytest.raises(Exception, match="Domain not supported"):
-            parse_url(url, f"-play {url}")
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert result.url == url
+
+    def test_tiktok_becomes_generic_ytdlp_source(self) -> None:
+        url = "https://www.tiktok.com/@user/video/1234567890"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert result.url == url
 
 
 class TestParseInput:
@@ -194,6 +216,22 @@ class TestParseInput:
         url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         result = parse_input(url, f"-p {url}")
         assert isinstance(result, YTSource)
+        assert result.url == url
+
+    def test_single_word_dotless_slash_falls_back_to_search(self) -> None:
+        """A lone "98/99" (no dot, no scheme) is not a URL — parse_url raises
+        ValueError and parse_input recovers with a YouTube search."""
+        result = parse_input("98/99", "-p 98/99")
+        assert isinstance(result, YTSource)
+        assert result.ytsearch == "ytsearch:98/99"
+        assert result.url is None
+
+    def test_single_word_unknown_domain_is_parsed_as_url(self) -> None:
+        """A bare link on a non-special-cased site routes straight to yt-dlp."""
+        url = "https://www.tiktok.com/@user/video/1234567890"
+        result = parse_input(url, f"-p {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
         assert result.url == url
 
 
