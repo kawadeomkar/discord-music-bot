@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
+from yt_dlp.utils import YoutubeDLError
 
 import redis.asyncio as aioredis
 from opentelemetry import trace
@@ -29,29 +30,92 @@ _tracer = get_tracer(__name__)
 ytdlp_pool = YtdlpPool()
 
 
-# FIXME: yt-dlp's own errors do not survive the process boundary.
-# yt-dlp raises DownloadError with the originating exception attached as exc_info, and
-# that chain (DownloadError → TransportError → RequestsRH → _YDLLogger) is unpicklable.
-# ProcessPoolExecutor therefore cannot ship the failure back: the parent gets
-# _pickle.PicklingError("Can't pickle <class 'yt_dlp.utils._YDLLogger'>") and the actual
-# reason — "Unable to download webpage: …", the line that distinguishes a private video
-# from a dead network from a broken extractor — is lost from both the logs and the error
-# embed the user sees. Verified 2026-07-22 against a real worker. This is a regression of
-# the ProcessPoolExecutor migration, not a pre-existing gap: the old ThreadPoolExecutor
-# propagated the real exception because nothing was pickled.
-# Fix: catch here — this function runs *in* the worker, where the exception is still
-# intact — and re-raise a plain picklable error carrying str(e) and the original class
-# name, so callers keep something to branch on. Pairs with the typed-errors TODO in
-# yt_source(). Design: docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §9.
+class ExtractionError(Exception):
+    """A yt-dlp failure, flattened so it survives the process boundary.
+
+    yt-dlp's own errors cannot be pickled: ExtractorError.__init__ stores
+    sys.exc_info(), so the exception's __dict__ carries a live traceback (and, via
+    .cause/.ie, a _YDLLogger). ProcessPoolExecutor therefore cannot ship the failure
+    back and the real reason is replaced by a pickling error. This carries the same
+    information as flat, picklable fields, classified in the worker where the original
+    structure still exists.
+
+    Every field MUST have a default. That is what makes the exception picklable: the
+    default BaseException.__reduce__ reconstructs it as `cls(*args)` (args is just the
+    message) and then restores the rest from __dict__ state — so a required positional
+    would raise TypeError on the *parent* side while unpickling, killing the executor's
+    result thread and breaking the pool permanently (§12.1). The round-trip test in
+    tests/test_youtube.py guards this invariant; an explicit __reduce__ would be redundant
+    with it.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        original_type: str = "",
+        expected: bool = False,
+        video_id: str = "",
+        cause_type: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.original_type = original_type
+        self.expected = expected
+        self.video_id = video_id
+        self.cause_type = cause_type
+
+    @property
+    def user_message(self) -> str:
+        """The line to show a Discord user (§12.5). The full message always reaches the
+        span/logs via the caller's record_span_error — this is only what is safe and
+        useful to surface.
+
+        expected=True is yt-dlp's own user-facing reason ("Video unavailable", "Private
+        video", a geo-block): show it, minus yt-dlp's "ERROR: " prefix. expected=False is
+        an extractor/network fault whose raw text can carry yt-dlp's
+        "please report this issue on github.com/yt-dlp" bug-report boilerplate, which must
+        never reach a user — so it degrades to a generic line.
+        """
+        if not self.expected:
+            return "Couldn't load this track — the extractor hit an unexpected error."
+        prefix = "ERROR: "
+        message = self.message
+        if message.startswith(prefix):
+            message = message[len(prefix) :]
+        return message or "Couldn't load this track."
+
+
+def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
+    """Mine the classification that exists only here, inside the worker."""
+    inner = None
+    exc_info = getattr(e, "exc_info", None)
+    if isinstance(exc_info, tuple) and len(exc_info) == 3:
+        inner = exc_info[1]
+    cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
+    return ExtractionError(
+        message=str(e),
+        original_type=type(e).__name__,
+        expected=bool(getattr(inner, "expected", False)),
+        video_id=str(getattr(inner, "video_id", "") or ""),
+        cause_type=type(cause).__name__ if cause is not None else "",
+    )
+
+
 def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     """Extraction worker run in the process pool. Top-level so it's picklable to a
     worker and named in tracebacks."""
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it
     # (js_runtimes, http_headers, ...); the copy keeps the (unpickled) opts profile
     # immutable across repeated extractions within a worker.
-    return youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
-        url, download=download, process=process
-    )
+    try:
+        return youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
+            url, download=download, process=process
+        )
+    except YoutubeDLError as e:
+        # `from e`, not `from None`: the stdlib stringifies the whole chain into the
+        # parent's __cause__ (_RemoteTraceback), so this preserves the original
+        # traceback text for free.
+        raise _classify_ytdlp_error(e) from e
 
 
 class _YtdlpLogger:

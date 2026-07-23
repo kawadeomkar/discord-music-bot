@@ -14,15 +14,23 @@ see docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.5.
 """
 
 import asyncio
+import logging
+import multiprocessing
 import os
+import pickle
 import sys
 import threading
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
+from logging.handlers import QueueListener
 from typing import Any, Optional, TypeVar
+
+import structlog
+from opentelemetry import trace
 
 from src.telemetry import configure_worker_logging
 from src.util import get_logger
@@ -46,7 +54,7 @@ def _warmup_noop() -> None:
     return None
 
 
-def _worker_init() -> None:
+def _worker_init(log_queue: Optional[Any] = None) -> None:
     """Per-worker setup, hardened so it can never raise.
 
     The stdlib contract is unforgiving: "Should initializer raise an exception, all
@@ -60,10 +68,70 @@ def _worker_init() -> None:
     that just failed is the logging configuration.
     """
     try:
-        configure_worker_logging()
+        configure_worker_logging(log_queue)
     except Exception:
         print("yt-dlp worker logging setup failed:", file=sys.stderr)
         traceback.print_exc()
+
+
+def _trace_carrier() -> dict[str, str]:
+    """The parent's current trace context, as picklable strings for a worker to rebind.
+
+    A worker has no TracerProvider under Option B, so trace.get_current_span() there is
+    always invalid — the correlation has to be carried in explicitly. Empty when there is
+    no active span (prewarm, tests without a span)."""
+    ctx = trace.get_current_span().get_span_context()
+    if not ctx.is_valid:
+        return {}
+    return {
+        "trace_id": format(ctx.trace_id, "032x"),
+        "span_id": format(ctx.span_id, "016x"),
+    }
+
+
+def _call_with_context(carrier: dict[str, str], fn: Callable[..., T], *args: Any) -> T:
+    """Bind the parent's trace context for the duration of the call, then run fn through
+    the picklable-error net. Runs in the worker (or the test thread). bound_contextvars
+    resets on exit, so a worker serving its next job does not inherit a stale trace_id."""
+    with structlog.contextvars.bound_contextvars(**carrier):
+        return _picklable_call(fn, *args)
+
+
+class RemoteCallError(Exception):
+    """Generic picklable stand-in for a worker exception that cannot cross the boundary.
+
+    Every field MUST have a default (see ExtractionError in src/youtube.py for the full
+    reasoning): the default BaseException.__reduce__ reconstructs the exception as
+    `cls(*args)` and restores the rest from __dict__ state, so a required positional would
+    *serialise* fine in the worker and then fail to *unpickle* in the parent's
+    executor-manager thread, killing it and breaking the pool permanently — the exact
+    failure this class exists to prevent.
+    """
+
+    def __init__(self, message: str = "", original_type: str = "") -> None:
+        super().__init__(message)
+        self.message = message
+        self.original_type = original_type
+
+
+def _picklable_call(fn: Callable[..., T], *args: Any) -> T:
+    """Run fn(*args) in the worker, guaranteeing whatever propagates survives pickling.
+
+    BrokenExecutor is re-raised untouched: it is the parent's healing signal, and a real
+    one never originates in a worker anyway.
+    """
+    try:
+        return fn(*args)
+    except BrokenExecutor:
+        raise
+    except Exception as e:
+        try:
+            pickle.loads(
+                pickle.dumps(e)
+            )  # loads too: dumps alone passes the broken case
+        except Exception:
+            raise RemoteCallError(str(e), type(e).__name__) from e
+        raise
 
 
 class PoolClosedError(RuntimeError):
@@ -114,16 +182,43 @@ class YtdlpPool:
         # a signal handler, and the class should be correct when it is. Never held
         # across a join.
         self._lock = threading.Lock()
+        # Option B worker-log plumbing (§12.2). Pool-scoped, not executor-scoped: built
+        # once on the first real spawn and reused across break-heal rebuilds, since the
+        # listener forwards to the parent's root handlers regardless of which executor
+        # generation produced the record. None under the thread-pool test seam.
+        self._log_queue: Optional[Any] = None
+        self._log_listener: Optional[QueueListener] = None
 
     def _spawn_process_pool(self) -> Executor:
         # initializer runs _worker_init() once per worker so yt-dlp's warnings (emitted
-        # from inside extract_info, now in a worker) stay structured.
+        # from inside extract_info, now in a worker) reach the parent structured.
         # ProcessPoolExecutor.__init__ does not spawn — workers start on first submit —
         # so constructing this under the lock is cheap.
+        if self._log_listener is None:
+            # respect_handler_level=True so a worker DEBUG record is not force-emitted by
+            # an INFO handler. Started with the root handlers live at spawn time — in
+            # production that is after setup_telemetry(), so the OTel LoggingHandler is
+            # among them and worker records reach Loki by the same path as the parent's.
+            self._log_queue = multiprocessing.Queue()
+            self._log_listener = QueueListener(
+                self._log_queue, *logging.root.handlers, respect_handler_level=True
+            )
+            self._log_listener.start()
         return ProcessPoolExecutor(
             max_workers=self._max_workers,
             initializer=_worker_init,
+            initargs=(self._log_queue,),
         )
+
+    def _stop_log_listener(self) -> None:
+        """Drain and stop the listener. MUST run only after the workers are gone
+        (join or terminate): stop() enqueues a sentinel and drains what is already
+        queued, so stopping while workers still emit discards their final records."""
+        listener = self._log_listener
+        self._log_listener = None
+        self._log_queue = None
+        if listener is not None:
+            listener.stop()
 
     @property
     def is_closed(self) -> bool:
@@ -174,16 +269,21 @@ class YtdlpPool:
         tests that rely on it.
         """
         loop = asyncio.get_running_loop()
+        carrier = _trace_carrier()
         executor = self._acquire()
         try:
-            return await loop.run_in_executor(executor, fn, *args)
+            return await loop.run_in_executor(
+                executor, _call_with_context, carrier, fn, *args
+            )
         except BrokenProcessPool:
             log.warning(
                 f"yt-dlp process pool #{self._generation} broke (a worker died) — "
                 "rebuilding and retrying once"
             )
             self._replace(executor)
-            return await loop.run_in_executor(self._acquire(), fn, *args)
+            return await loop.run_in_executor(
+                self._acquire(), _call_with_context, carrier, fn, *args
+            )
 
     def prewarm(self) -> None:
         """Spawn the workers now (from setup_hook) so the first -play doesn't absorb
@@ -233,9 +333,19 @@ class YtdlpPool:
         except TimeoutError:
             log.warning(
                 f"yt-dlp pool #{self._generation} did not finish joining within "
-                f"{timeout}s — abandoning the join"
+                f"{timeout}s — terminating its workers"
             )
-            executor.shutdown(wait=False, cancel_futures=True)
+            # shutdown(wait=False) does NOT bound exit: the abandoned join keeps the
+            # executor-manager thread alive, and concurrent.futures registers
+            # _python_exit (via threading._register_atexit) to join that thread at
+            # interpreter exit. Measured: 61s to exit with an in-flight extraction,
+            # 3.4s once the workers are actually SIGTERMed.
+            if isinstance(executor, ProcessPoolExecutor):
+                executor.terminate_workers()
+            else:
+                executor.shutdown(wait=False, cancel_futures=True)
+        # After the workers are gone, never before (see _stop_log_listener).
+        self._stop_log_listener()
 
     def shutdown(self, wait: bool = True) -> None:
         """Synchronous close, for callers with no event loop (tests, atexit, signals).
@@ -248,3 +358,4 @@ class YtdlpPool:
         executor = self._close()
         if executor is not None:
             executor.shutdown(wait=wait, cancel_futures=True)
+        self._stop_log_listener()

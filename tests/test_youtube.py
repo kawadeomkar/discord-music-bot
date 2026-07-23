@@ -1155,10 +1155,24 @@ class TestPrefetchStream:
     async def test_swallows_extraction_errors(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        """prefetch_stream does not propagate yt-dlp exceptions."""
+        """prefetch_stream does not propagate yt-dlp exceptions.
+
+        The failure is an ExtractionError, the shape production now raises: since the
+        pool migration, _ytdlp_extract catches yt-dlp's own (unpicklable) errors in the
+        worker and re-raises this flat, picklable one (§12.1). A bare Exception here would
+        assert a shape the code can no longer produce.
+        """
+        from src.youtube import ExtractionError
+
         qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
         with patch(
-            "src.youtube._ytdlp_extract", side_effect=Exception("network error")
+            "src.youtube._ytdlp_extract",
+            side_effect=ExtractionError(
+                "ERROR: [youtube] pf4: Video unavailable",
+                original_type="DownloadError",
+                expected=True,
+                video_id="pf4",
+            ),
         ):
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
@@ -1304,8 +1318,135 @@ class TestProcessBoundaryContract:
 
     def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
         """ProcessPoolExecutor pickles `initializer` to every worker. A closure or a
-        bound method here breaks pool construction rather than one extraction."""
+        bound method here breaks pool construction rather than one extraction.
+
+        The initializer is `_worker_init` (which calls configure_worker_logging with the
+        log queue) — not configure_worker_logging itself; asserting the wrong one passes
+        while missing the real contract.
+        """
+        from src.ytdlp_pool import _worker_init
+
+        assert pickle.loads(pickle.dumps(_worker_init)) is _worker_init
+        # the function it delegates to must survive the boundary too
         assert (
             pickle.loads(pickle.dumps(configure_worker_logging))
             is configure_worker_logging
+        )
+
+
+class TestExtractionErrorClassification:
+    """_ytdlp_extract's worker-side rewrap of yt-dlp's own (unpicklable) errors.
+
+    yt-dlp's DownloadError carries exc_info → a live traceback, so it cannot cross the
+    process boundary; the parent would receive an opaque pickling error instead of the
+    reason (§12.1). _ytdlp_extract catches it in the worker — where the structure still
+    exists — and re-raises a flat ExtractionError. These assert the classification and
+    that the flat error round-trips; the far half (a real worker) is TestErrorAcrossBoundary
+    in tests/test_ytdlp_pool.py.
+    """
+
+    def _real_downloaderror(self) -> Any:
+        """A DownloadError shaped exactly like yt-dlp's: exc_info holds the ExtractorError
+        that carries .expected / .video_id. Built without any network."""
+        import sys
+
+        from yt_dlp.utils import DownloadError, ExtractorError
+
+        try:
+            raise ExtractorError("Video unavailable", video_id="vid42", expected=True)
+        except ExtractorError:
+            return DownloadError(
+                "ERROR: [youtube] vid42: Video unavailable",
+                sys.exc_info(),  # type: ignore[arg-type]
+            )
+
+    def test_downloaderror_is_reclassified_with_its_fields_mined(self) -> None:
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        real_error = self._real_downloaderror()
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = real_error
+
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+
+        err = caught.value
+        assert err.original_type == "DownloadError"
+        assert err.video_id == "vid42"
+        assert err.expected is True
+        assert "Video unavailable" in err.message
+        # `raise ... from e` — the original error is preserved as the cause, so the
+        # worker traceback reaches the parent (as _RemoteTraceback across a real boundary).
+        assert err.__cause__ is real_error
+
+    def test_non_ytdlp_errors_are_not_swallowed(self) -> None:
+        """Only yt-dlp's own errors get rewrapped. A programming error (KeyError, …) must
+        propagate unchanged so it is not silently relabelled as an extraction failure."""
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = KeyError("bug")
+
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(KeyError):
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+        assert not isinstance(KeyError("bug"), ExtractionError)
+
+    def test_extractionerror_survives_pickle_round_trip(self) -> None:
+        """loads(dumps(...)), not dumps alone: a multi-arg __init__ without __reduce__
+        serialises fine and fails only on the *parent* side while unpickling, which is
+        exactly how the naive fix bricks the pool (§12.1). Values, not just keys."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+            video_id="v9",
+            cause_type="NameResolutionError",
+        )
+        back = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(back, ExtractionError)
+        assert str(back) == "ERROR: [youtube] v9: Video unavailable"
+        assert back.message == err.message
+        assert back.original_type == "DownloadError"
+        assert back.expected is True
+        assert back.video_id == "v9"
+        assert back.cause_type == "NameResolutionError"
+
+    def test_user_message_shows_the_reason_for_an_expected_error(self) -> None:
+        """expected=True is yt-dlp's own user-facing reason; show it minus the prefix."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+        )
+        assert err.user_message == "[youtube] v9: Video unavailable"
+
+    def test_user_message_is_generic_for_an_unexpected_error(self) -> None:
+        """expected=False can carry yt-dlp's 'please report this issue on github.com/yt-dlp'
+        boilerplate — never surface the raw text; full detail stays in the span/logs."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [generic] x: Unable to download webpage; please report this issue on "
+            "https://github.com/yt-dlp/yt-dlp/issues",
+            original_type="DownloadError",
+            expected=False,
+        )
+        assert err.user_message == (
+            "Couldn't load this track — the extractor hit an unexpected error."
+        )
+        assert "github.com" not in err.user_message
+
+    def test_user_message_falls_back_when_expected_but_empty(self) -> None:
+        from src.youtube import ExtractionError
+
+        assert (
+            ExtractionError("", expected=True).user_message
+            == "Couldn't load this track."
         )
