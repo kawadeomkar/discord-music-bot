@@ -323,32 +323,44 @@ class YtdlpPool:
         but the process is exiting, and the workers are killed with it.
         """
         executor = self._close()
-        if executor is None:
-            return
-        loop = asyncio.get_running_loop()
-        join = partial(executor.shutdown, wait=True, cancel_futures=True)
-        try:
-            async with asyncio.timeout(timeout):
-                await loop.run_in_executor(None, join)
-        except TimeoutError:
-            log.warning(
-                f"yt-dlp pool #{self._generation} did not finish joining within "
-                f"{timeout}s — terminating its workers"
-            )
-            # shutdown(wait=False) does NOT bound exit: the abandoned join keeps the
-            # executor-manager thread alive, and concurrent.futures registers
-            # _python_exit (via threading._register_atexit) to join that thread at
-            # interpreter exit. Measured: 61s to exit with an in-flight extraction,
-            # 3.4s once the workers are actually SIGTERMed.
-            if isinstance(executor, ProcessPoolExecutor):
-                executor.terminate_workers()
-            else:
-                executor.shutdown(wait=False, cancel_futures=True)
-        # After the workers are gone, never before (see _stop_log_listener).
+        if executor is not None:
+            loop = asyncio.get_running_loop()
+            join = partial(executor.shutdown, wait=True, cancel_futures=True)
+            try:
+                async with asyncio.timeout(timeout):
+                    await loop.run_in_executor(None, join)
+            except TimeoutError:
+                log.warning(
+                    f"yt-dlp pool #{self._generation} did not finish joining within "
+                    f"{timeout}s — terminating its workers"
+                )
+                # shutdown(wait=False) does NOT bound exit: the abandoned join keeps the
+                # executor-manager thread alive, and concurrent.futures registers
+                # _python_exit (via threading._register_atexit) to join that thread at
+                # interpreter exit. Measured: 61s to exit with an in-flight extraction,
+                # 3.4s once the workers are actually SIGTERMed.
+                if isinstance(executor, ProcessPoolExecutor):
+                    executor.terminate_workers()
+                else:
+                    executor.shutdown(wait=False, cancel_futures=True)
+        # Unconditional, even when _close() returned None: a concurrent _replace() during
+        # a break-heal can null the executor out from under _close() while leaving the log
+        # listener running, so an early return here would leak that listener thread (and
+        # its multiprocessing.Queue feeder) for the life of the process. When there IS an
+        # executor, this still runs only after its workers are gone — join or terminate
+        # above — never before (see _stop_log_listener).
         self._stop_log_listener()
 
     def shutdown(self, wait: bool = True) -> None:
-        """Synchronous close, for callers with no event loop (tests, atexit, signals).
+        """Synchronous close — the counterpart to aclose() for a caller with no event loop
+        to await. Used by the test suite; production shutdown flows through aclose()
+        (MusicBotApp.close() -> ytdlp_pool.aclose()).
+
+        No atexit or signal handler is registered onto this, despite the shape inviting
+        it: discord.py already routes SIGTERM/KeyboardInterrupt through the bot's close(),
+        and ProcessPoolExecutor's own _python_exit atexit hook reaps any worker-manager
+        thread that outlives the process. It is exposed for a no-loop caller that wants an
+        explicit join rather than relying on that reaping.
 
         Blocking by default (joins worker processes). Idempotent, and safe when no
         executor was ever created. After this, submits raise PoolClosedError rather than

@@ -101,14 +101,178 @@ def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     )
 
 
-def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
+class _YTDLVideoInfoRequired(TypedDict):
+    """`url`/`webpage_url` are the only fields this codebase accesses via
+    direct subscript (`data["url"]`) rather than `.get()` — yt-dlp always
+    populates both once `data` is narrowed to a single video."""
+
+    url: str
+    webpage_url: str
+
+
+class YTDLVideoMetadata(TypedDict, total=False):
+    """The descriptive half of an info-dict: everything except the two
+    identity fields. Split out because helpers like _enrich_queueobject() and
+    _record_serving_format() read only these — typing them against the full
+    YTDLVideoInfo would demand a `url`/`webpage_url` they never touch."""
+
+    title: str
+    uploader: str
+    uploader_url: str
+    upload_date: str
+    thumbnail: str
+    description: str
+    # float, not int: yt-dlp's SoundCloud extractor emits
+    # `'duration': float_or_none(scale=1000)` (its own fixtures show 942.762), and this
+    # bot accepts SoundcloudSource. Every read below wraps this in int() — that is the
+    # conversion, not a redundancy.
+    duration: float
+    tags: list[str]
+    view_count: int
+    like_count: int
+    dislike_count: int
+    abr: float
+    asr: int
+    acodec: str
+    # Format-shape fields, mirroring the same trio in _STREAM_CACHE_FIELDS:
+    # what _record_serving_format reads to tell a healthy audio-only serve
+    # from a degraded muxed/HLS one.
+    format_id: str
+    protocol: str
+    vcodec: str
+
+
+class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
+    """The subset of yt-dlp's info-dict fields this codebase actually reads,
+    once `data` has been narrowed to a single video (see yt_source()'s
+    "entries" un-wrapping). Everything but `url`/`webpage_url` is optional:
+    yt-dlp's own dict is not a stable, fully-populated contract — any field
+    may be absent depending on extractor/client. Mirrors
+    _STREAM_CACHE_FIELDS field-for-field.
+
+    `total=False` is on an empty body deliberately. It changes nothing today,
+    but without it a key added directly here later would silently be
+    *required* — the opposite of every other field in this hierarchy, and a
+    break that shows up as a type error far from the line that caused it.
+    Required keys belong in _YTDLVideoInfoRequired; descriptive ones in
+    YTDLVideoMetadata.
+    """
+
+
+class YTDLEntry(YTDLVideoMetadata, total=False):
+    """One item in a listing, or the fields of a lone video — a *leaf* of yt-dlp's
+    info-dict tree. A search result's entries are full videos; a flat playlist's entries
+    (_YTDL_PLAYLIST_OPTS, extract_flat) are the much sparser `id`/`title`/`url` shape.
+    Both are covered here: every key is optional, and `id`/`_type` are present for the
+    entry reads this codebase does — yt_playlist's `entry.get("id")` and yt_source's
+    `entry.get("_type")`.
+
+    Deliberately a leaf, NOT the recursive top-level type: this codebase never descends
+    into an entry's own `entries`. yt-dlp *can* nest (a playlist entry may itself be a
+    playlist), but yt_source skips such an entry (`_type == "playlist"`) rather than
+    recursing, so an entry is always a leaf here. Typing it as one says exactly that,
+    where a self-referential `entries` field would advertise a nesting we never read.
+    """
+
+    url: str
+    webpage_url: str
+    id: str
+    _type: str
+
+
+class YTDLExtractResult(YTDLEntry, total=False):
+    """The raw shape _ytdlp_extract / _slim_info return, before any caller narrows it: a
+    YTDLEntry (a lone video's fields) that MAY also carry `entries` (a search/playlist
+    wrapper). Which of the two depends on the opts profile — the stream profiles yield a
+    single video, the search/playlist profiles a wrapper — so, like YTDLEntry, every key
+    is optional and it cannot promise `url` the way YTDLVideoInfo does. The stream call
+    sites cast() to YTDLVideoInfo once the shape is known; yt_source casts after picking
+    an entry out of `entries`.
+
+    `entries` elements are YTDLEntry (leaves), not YTDLExtractResult: see YTDLEntry for
+    why the recursion this codebase never follows is left out of the type.
+    """
+
+    entries: list[Optional[YTDLEntry]]
+
+
+# Large info-dict collections no caller reads once process=True has hoisted the
+# *served* format's fields (url, abr, acodec, asr, format_id, protocol, vcodec) to
+# the top level. A real process=True result carries the whole `formats` ladder plus
+# `thumbnails`/`automatic_captions`/`subtitles`/`heatmap` — commonly 100 KB-1 MB of
+# nested data. On the process pool that payload is pickled worker->parent on every
+# extraction, so it is dropped in the worker; grep the reads to confirm none survive
+# (`_STREAM_CACHE_FIELDS` is the exhaustive list of fields callers consume).
+_UNUSED_INFO_COLLECTIONS = frozenset(
+    {
+        "formats",
+        "requested_formats",
+        "requested_downloads",
+        "thumbnails",
+        "automatic_captions",
+        "subtitles",
+        "heatmap",
+        "chapters",
+    }
+)
+
+
+# Bound once at import to the real staticmethod, not looked up through the class per
+# call: it decouples slimming from `youtube_dl.YoutubeDL` being patched wholesale in
+# tests (which would otherwise stub out sanitize_info), and saves an attribute lookup.
+_sanitize_info = youtube_dl.YoutubeDL.sanitize_info
+
+
+def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
+    """Make a yt-dlp result cheap and safe to ship back from the worker.
+
+    Two problems this solves, both on the success path that crosses the process
+    boundary on *every* extraction:
+
+    1. Picklability (correctness). A raw process=True info-dict carries live objects
+       — LazyList format ladders, a _YDLLogger, callables — that ProcessPoolExecutor
+       cannot pickle. The worker pickles the result synchronously into the pool's
+       result queue, so an unpicklable field there does not hang the pool: it fails
+       *every* extraction with an opaque pickling error. sanitize_info() reduces the
+       dict to JSON primitives (LazyList->list, any non-primitive->repr, kept keys
+       only str/int/float/bool/list/dict/None), which is what makes the result
+       picklable at all. The exception path is already flattened (ExtractionError);
+       this closes the same contract for the return value.
+
+    2. Payload (performance). sanitize_info() keeps the full `formats` ladder and the
+       other large collections no caller reads, so they are dropped here — at the top
+       level and inside each search/playlist `entries` element — leaving only the
+       scalar fields callers actually consume to be serialized.
+
+    Non-dict results (None from a failed extract) pass straight through.
+    """
+    info = _sanitize_info(info)
+    if not isinstance(info, dict):
+        # extract_info and sanitize_info only ever return a dict or None.
+        return None
+    for field in _UNUSED_INFO_COLLECTIONS:
+        info.pop(field, None)
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                for field in _UNUSED_INFO_COLLECTIONS:
+                    entry.pop(field, None)
+    # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
+    # conforms to YTDLExtractResult, and `grep cast(` is how those assertions are audited.
+    return cast(YTDLExtractResult, info)
+
+
+def _ytdlp_extract(
+    url: str, opts: Any, download: bool, process: bool
+) -> Optional[YTDLExtractResult]:
     """Extraction worker run in the process pool. Top-level so it's picklable to a
     worker and named in tracebacks."""
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it
     # (js_runtimes, http_headers, ...); the copy keeps the (unpickled) opts profile
     # immutable across repeated extractions within a worker.
     try:
-        return youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
+        result = youtube_dl.YoutubeDL(copy.copy(opts)).extract_info(
             url, download=download, process=process
         )
     except YoutubeDLError as e:
@@ -116,6 +280,9 @@ def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
         # parent's __cause__ (_RemoteTraceback), so this preserves the original
         # traceback text for free.
         raise _classify_ytdlp_error(e) from e
+    # Slimmed in the worker, not the parent: the point is to keep the unpicklable /
+    # oversized payload from ever entering the pool's result queue.
+    return _slim_info(result)
 
 
 class _YtdlpLogger:
@@ -280,73 +447,6 @@ _STREAM_CACHE_FIELDS = frozenset(
         "vcodec",
     }
 )
-
-
-class _YTDLVideoInfoRequired(TypedDict):
-    """`url`/`webpage_url` are the only fields this codebase accesses via
-    direct subscript (`data["url"]`) rather than `.get()` — yt-dlp always
-    populates both once `data` is narrowed to a single video."""
-
-    url: str
-    webpage_url: str
-
-
-class YTDLVideoMetadata(TypedDict, total=False):
-    """The descriptive half of an info-dict: everything except the two
-    identity fields. Split out because helpers like _enrich_queueobject() and
-    _record_serving_format() read only these — typing them against the full
-    YTDLVideoInfo would demand a `url`/`webpage_url` they never touch."""
-
-    title: str
-    uploader: str
-    uploader_url: str
-    upload_date: str
-    thumbnail: str
-    description: str
-    # float, not int: yt-dlp's SoundCloud extractor emits
-    # `'duration': float_or_none(scale=1000)` (its own fixtures show 942.762), and this
-    # bot accepts SoundcloudSource. Every read below wraps this in int() — that is the
-    # conversion, not a redundancy.
-    duration: float
-    tags: list[str]
-    view_count: int
-    like_count: int
-    dislike_count: int
-    abr: float
-    asr: int
-    acodec: str
-    # Format-shape fields, mirroring the same trio in _STREAM_CACHE_FIELDS:
-    # what _record_serving_format reads to tell a healthy audio-only serve
-    # from a degraded muxed/HLS one.
-    format_id: str
-    protocol: str
-    vcodec: str
-
-
-class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
-    """The subset of yt-dlp's info-dict fields this codebase actually reads,
-    once `data` has been narrowed to a single video (see yt_source()'s
-    "entries" un-wrapping). Everything but `url`/`webpage_url` is optional:
-    yt-dlp's own dict is not a stable, fully-populated contract — any field
-    may be absent depending on extractor/client. Mirrors
-    _STREAM_CACHE_FIELDS field-for-field.
-
-    `total=False` is on an empty body deliberately. It changes nothing today,
-    but without it a key added directly here later would silently be
-    *required* — the opposite of every other field in this hierarchy, and a
-    break that shows up as a type error far from the line that caused it.
-    Required keys belong in _YTDLVideoInfoRequired; descriptive ones in
-    YTDLVideoMetadata.
-    """
-
-
-class YTDLFlatPlaylistEntry(TypedDict, total=False):
-    """One entry from a flat playlist listing (_YTDL_PLAYLIST_OPTS,
-    extract_flat=True) — a much sparser shape than YTDLVideoInfo."""
-
-    id: str
-    title: str
-    url: str
 
 
 # format_ids already warned about by _record_serving_format — once per format per
@@ -676,8 +776,14 @@ class YTDL(discord.FFmpegOpusAudio):
             _enrich_queueobject(qo, cached)
             return
         try:
-            data: Optional[YTDLVideoInfo] = await ytdlp_pool.run(
-                _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+            # cast to the single-video shape: _YTDL_STREAM_OPTS on a watch URL never
+            # yields a search/playlist wrapper, so the YTDLExtractResult run() returns is
+            # always a lone video here (see YTDLExtractResult / the `grep cast(` convention).
+            data = cast(
+                Optional[YTDLVideoInfo],
+                await ytdlp_pool.run(
+                    _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+                ),
             )
             trace.get_current_span().set_attribute(
                 "ytdl.extract_success", data is not None
@@ -719,8 +825,17 @@ class YTDL(discord.FFmpegOpusAudio):
         for attempt in range(2):
             extracted_fresh = False
             if data is None:
-                data = await ytdlp_pool.run(
-                    _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+                # Single-video cast, as in prefetch_stream: the stream profile on a watch
+                # URL cannot return a search/playlist wrapper.
+                data = cast(
+                    Optional[YTDLVideoInfo],
+                    await ytdlp_pool.run(
+                        _ytdlp_extract,
+                        qo.webpage_url,
+                        _YTDL_STREAM_OPTS,
+                        False,
+                        True,
+                    ),
                 )
                 span.set_attribute("ytdl.extracted_fresh", True)
                 if data is None:
@@ -864,6 +979,11 @@ class YTDL(discord.FFmpegOpusAudio):
             # Pairs with the error-handling consolidation in docs/ARCHITECTURE_PLAN.md §3.3.
             raise Exception("Could not find song")
 
+        # A wrapper carries the video in `entries`; a lone-video result already is the
+        # entry. `selected` is the single entry to serve either way — a distinct variable
+        # from `data` because a leaf (YTDLEntry) is not assignable back to the result type,
+        # and because "the raw result" and "the chosen entry" are genuinely two things.
+        selected: YTDLEntry = data
         if "entries" in data:
             # TODO: Validate search results have a usable audio format before accepting.
             # An entry wins purely by being the first non-playlist result — nothing
@@ -872,7 +992,7 @@ class YTDL(discord.FFmpegOpusAudio):
             # blows up later, at stream time, where the failure looks unrelated.
             for entry in data["entries"]:
                 if entry and entry.get("_type", None) != "playlist":
-                    data = entry
+                    selected = entry
                     break
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
@@ -881,11 +1001,11 @@ class YTDL(discord.FFmpegOpusAudio):
             # passing download=True silently gets streaming behavior and no error.
             pass
 
-        # `data` is genuinely Any before this point (video dict vs search/playlist wrapper —
-        # see _ytdlp_extract's docstring); the narrowing above always leaves it single-video shaped.
-        # cast(), not a bare annotation: this asserts something the checker cannot verify,
-        # and `grep cast(` is how those assertions are audited in this codebase.
-        video_data = cast(YTDLVideoInfo, data)
+        # `selected` is one entry now — a wrapper's chosen entry unwrapped above, or the
+        # lone video `data` already was. cast() to the narrowed single-video type, not a
+        # bare annotation: it asserts something the checker cannot verify, and `grep cast(`
+        # is how those assertions are audited.
+        video_data = cast(YTDLVideoInfo, selected)
 
         webpage_url = video_data["webpage_url"]
         title = video_data.get("title", "")
@@ -915,7 +1035,7 @@ class YTDL(discord.FFmpegOpusAudio):
             # fails yt_source: the song enqueues on identity alone and dequeue-time
             # _resolve_playable_stream re-extracts, exactly the pre-§2.1 behavior.
             stream_cached = await _probe_and_cache(
-                redis, _stream_cache_key(webpage_url), data
+                redis, _stream_cache_key(webpage_url), video_data
             )
             trace.get_current_span().set_attribute("ytdl.stream_cached", stream_cached)
 
@@ -947,7 +1067,7 @@ class YTDL(discord.FFmpegOpusAudio):
         # emits a null entry for a deleted/private video, which is what the guard
         # below skips. Declaring it non-optional there excluded exactly the case the
         # next line handles.
-        entries: list[Optional[YTDLFlatPlaylistEntry]] = data.get("entries") or []
+        entries: list[Optional[YTDLEntry]] = data.get("entries") or []
         trace.get_current_span().set_attribute("ytdl.playlist_size", len(entries))
         qobjs: list[QueueObject] = []
         for i, entry in enumerate(entries):

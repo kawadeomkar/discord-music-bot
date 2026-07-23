@@ -67,7 +67,8 @@ class _UnpicklableBroken(BrokenExecutor):
 def _raise_classified_error_in_worker(_ignored: object) -> object:
     """Runs in a real worker: reproduce _ytdlp_extract's except path with a genuine
     yt-dlp error whose exc_info/cause are populated, without any network. Proves the flat
-    ExtractionError — and its cause — survive a real pickle boundary with fields intact."""
+    ExtractionError — and its cause — survive a real pickle boundary with fields intact.
+    """
     import sys
 
     from yt_dlp.utils import DownloadError, ExtractorError
@@ -86,9 +87,30 @@ def _raise_classified_error_in_worker(_ignored: object) -> object:
         raise _classify_ytdlp_error(e) from e
 
 
+def _return_raw_info_from_worker(_ignored: object) -> object:
+    """Runs in a real worker: return the un-slimmed info dict extract_info() hands back,
+    live unpicklable object and all. The pool must pickle this into its result queue, so
+    it proves — across a real boundary — that returning the raw dict fails the *call*
+    (not silently succeeds) the way _slim_info's absence would in production."""
+    from tests.test_youtube import _realistic_raw_info
+
+    return _realistic_raw_info()
+
+
+def _return_slimmed_info_from_worker(_ignored: object) -> object:
+    """Runs in a real worker: return the same dict through _slim_info, exactly as
+    _ytdlp_extract does. Proves the slimmed result crosses the boundary intact."""
+    from tests.test_youtube import _realistic_raw_info
+
+    from src.youtube import _slim_info
+
+    return _slim_info(_realistic_raw_info())
+
+
 def _log_warning_in_worker(message: str) -> int:
     """Runs in a real worker: emit one warning the way youtube._YtdlpLogger does, so the
-    parent's listener can prove it arrives with worker_id and the propagated trace_id."""
+    parent's listener can prove it arrives with worker_id and the propagated trace_id.
+    """
     from src.util import get_logger
 
     get_logger("yt_dlp.worker").warning(message)
@@ -305,7 +327,8 @@ class TestRun:
     def test_pool_closed_error_is_a_runtime_error(self) -> None:
         """Subclassed deliberately: the stdlib raises RuntimeError for a submit after
         shutdown, so a handler written against the executor's contract keeps working —
-        including for the accepted race where the stdlib's own error surfaces instead."""
+        including for the accepted race where the stdlib's own error surfaces instead.
+        """
         assert issubclass(PoolClosedError, RuntimeError)
 
 
@@ -487,7 +510,8 @@ class TestAclose:
     async def test_worker_termination_precedes_the_log_listener_stop(self) -> None:
         """The §12.2 ordering rule: terminate_workers() THEN listener.stop(). Reversed,
         stop() drains and closes the queue while the dying workers are still emitting, so
-        their final records — the reason a shutdown-time extraction failed — are lost."""
+        their final records — the reason a shutdown-time extraction failed — are lost.
+        """
         order: list[str] = []
         started = threading.Event()
         release = threading.Event()
@@ -516,6 +540,28 @@ class TestAclose:
             release.set()
 
         assert order == ["terminate", "stop"]
+
+    async def test_aclose_stops_the_listener_even_when_the_executor_was_already_nulled(
+        self,
+    ) -> None:
+        """A BrokenProcessPool heal (_replace) can null the executor out from under a
+        concurrent aclose(), so _close() returns None. The listener the original spawn
+        started is still draining the worker-log queue — aclose() must stop it anyway,
+        not early-return and leak the QueueListener thread (and its queue feeder) for the
+        life of the process."""
+        listener = MagicMock(spec=QueueListener)
+        pool = YtdlpPool(executor_factory=lambda: MagicMock(spec=ProcessPoolExecutor))
+        # The state a break-heal leaves behind: _replace() already dropped the executor,
+        # but the log listener from the original spawn is still running.
+        pool._log_listener = listener
+        pool._log_queue = MagicMock()
+        assert pool._executor is None
+
+        await pool.aclose()
+
+        assert pool.is_closed
+        listener.stop.assert_called_once_with()
+        assert pool._log_listener is None
 
 
 class TestPicklableCall:
@@ -659,7 +705,8 @@ class TestRealWorkerProcess:
     async def test_a_worker_extraction_error_survives_the_real_boundary(self) -> None:
         """The defect the branch shipped (§12.1): a worker's yt-dlp error reaches the
         parent as a flat ExtractionError with its fields, not an opaque pickling error,
-        and the original is preserved as __cause__ (a _RemoteTraceback once it crosses)."""
+        and the original is preserved as __cause__ (a _RemoteTraceback once it crosses).
+        """
         from src.youtube import ExtractionError
 
         pool = YtdlpPool(max_workers=1)
@@ -677,6 +724,31 @@ class TestRealWorkerProcess:
         # the real worker traceback came back attached, stringified by the stdlib
         assert err.__cause__ is not None
         assert "DownloadError" in str(err.__cause__)
+
+    async def test_the_returned_info_dict_survives_the_real_boundary_only_slimmed(
+        self,
+    ) -> None:
+        """The success-path return value (§ Finding 1): a raw process=True info dict
+        carries live/oversized values the pool cannot pickle back, so returning it fails
+        the call with a pickling error — while _slim_info's result crosses intact. Both on
+        one pool, which also proves a result-queue pickling failure does not brick it (the
+        stdlib re-delivers the error on the future; the result thread survives)."""
+        pool = YtdlpPool(max_workers=1)
+        try:
+            # Raw: the pool pickles the result synchronously; the unpicklable field comes
+            # back as an exception on the future, not an opaque BrokenProcessPool.
+            with pytest.raises((TypeError, pickle.PicklingError, RemoteCallError)):
+                await pool.run(_return_raw_info_from_worker, None)
+
+            # Same worker pool still serves the slimmed result — the fix, end to end.
+            slim = await pool.run(_return_slimmed_info_from_worker, None)
+        finally:
+            await pool.aclose()
+
+        assert isinstance(slim, dict)
+        assert slim["webpage_url"] == "https://www.youtube.com/watch?v=test"
+        assert slim["url"].startswith("https://r2.googlevideo.com/")
+        assert "formats" not in slim and "thumbnails" not in slim
 
     async def test_worker_logs_reach_the_parent_with_worker_id_and_trace_id(
         self,

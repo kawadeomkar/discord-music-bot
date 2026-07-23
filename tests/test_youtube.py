@@ -2,6 +2,7 @@
 
 import redis.asyncio as aioredis
 import pickle
+import threading
 import time
 from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
@@ -19,11 +20,13 @@ from src.youtube import (
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _UNUSED_INFO_COLLECTIONS,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
+    _slim_info,
     _stream_url_playable,
     _stream_url_ttl,
     _ytdlp_extract,
@@ -1334,6 +1337,111 @@ class TestProcessBoundaryContract:
         )
 
 
+def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
+    """A process=True-shaped info dict carrying the exact things a real one does that a
+    flat _fake_ytdl_data() never has: a genuinely unpicklable live object, a LazyList
+    format ladder, and the large collections callers never read. This is what
+    extract_info() actually hands back — the thing _ytdlp_extract must not return as-is.
+    """
+    from yt_dlp.utils import LazyList
+
+    base: dict[str, Any] = {
+        "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",
+        "webpage_url": "https://www.youtube.com/watch?v=test",
+        "title": "Test Song",
+        "duration": 180,
+        "uploader": "Test Channel",
+        "thumbnail": "https://img.yt.com/test.jpg",
+        "abr": 128,
+        "asr": 44100,
+        "acodec": "opus",
+        "format_id": "251",
+        "protocol": "https",
+        "vcodec": "none",
+        # A LazyList of format dicts — what yt-dlp stores `formats` as; sanitize_info
+        # must materialise it to a plain list before it can cross the boundary.
+        "formats": LazyList(iter([{"format_id": "251", "url": "https://x"}])),
+        "thumbnails": [{"url": "https://img/1.jpg"}, {"url": "https://img/2.jpg"}],
+        "automatic_captions": {"en": [{"url": "https://c"}]},
+        "heatmap": [{"start_time": 0.0, "value": 1.0}],
+        # A live, genuinely-unpicklable object under a private key — a lock stands in
+        # for the loggers/tracebacks/callables a real info-dict carries. This is what
+        # makes the raw dict impossible to ship back untouched.
+        "__lock": threading.Lock(),
+    }
+    base.update(overrides)
+    return base
+
+
+class TestSlimInfoReturnContract:
+    """The success-path return value crosses the process boundary on *every* extraction.
+
+    TestProcessBoundaryContract covers the arguments and the callable; the exception path
+    has its own round-trip tests. This covers the fourth thing that crosses — the info-dict
+    _ytdlp_extract returns — which the rest of the suite never exercises against a realistic
+    shape (_fake_ytdl_data is flat scalars with none of the live/oversized fields a real
+    process=True result carries). _slim_info is what makes that return value picklable at
+    all and keeps the oversized collections off the wire.
+    """
+
+    def test_a_realistic_raw_info_dict_is_genuinely_unpicklable(self) -> None:
+        """Guards the premise: if this ever starts pickling on its own, the fix below is
+        no longer load-bearing and this test should be revisited — not deleted silently.
+        """
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            pickle.dumps(_realistic_raw_info())
+
+    def test_slimmed_info_round_trips_through_pickle(self) -> None:
+        """The whole point: _ytdlp_extract's return value survives the boundary. The pool
+        pickles the result synchronously into its result queue, so a value that fails here
+        fails *every* extraction in production with an opaque pickling error."""
+        # cast to a plain dict: these assertions poke raw content, not the narrowed
+        # YTDLExtractResult contract, and a realistic raw dict is never slimmed to None.
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        restored = pickle.loads(pickle.dumps(slim))
+        assert restored["url"] == slim["url"]
+        assert restored["webpage_url"] == slim["webpage_url"]
+
+    def test_slimmed_info_keeps_every_field_callers_read(self) -> None:
+        """No consumed field is lost to slimming. _STREAM_CACHE_FIELDS is the exhaustive
+        set of info-dict keys this codebase reads; each one present in the raw dict must
+        survive, unchanged."""
+        raw = _realistic_raw_info()
+        slim = cast(dict[str, Any], _slim_info(raw))
+        for field in _STREAM_CACHE_FIELDS:
+            if field in raw:
+                assert slim.get(field) == raw[field], f"{field} lost or altered"
+
+    def test_slimmed_info_drops_the_oversized_collections(self) -> None:
+        """The performance half: the large lists no caller reads are gone, so they are
+        not serialised worker->parent on every extraction."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        for field in _UNUSED_INFO_COLLECTIONS:
+            assert field not in slim, f"{field} should have been dropped"
+
+    def test_slimming_preserves_search_entries_but_slims_each(self) -> None:
+        """A search/playlist wrapper's `entries` list must survive (yt_source unwraps it),
+        but each entry carries its own formats ladder that must be dropped too."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [_realistic_raw_info(), None, _realistic_raw_info()],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        entries = slim["entries"]
+        assert len(entries) == 3
+        assert entries[1] is None  # null entries (deleted/private) are preserved
+        for entry in (entries[0], entries[2]):
+            assert entry["webpage_url"] == "https://www.youtube.com/watch?v=test"
+            for field in _UNUSED_INFO_COLLECTIONS:
+                assert field not in entry
+        pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
+
+    def test_slim_info_passes_none_through(self) -> None:
+        """A failed extract_info returns None; callers branch on `data is None`, so
+        slimming must not turn it into anything else."""
+        assert _slim_info(None) is None
+
+
 class TestExtractionErrorClassification:
     """_ytdlp_extract's worker-side rewrap of yt-dlp's own (unpicklable) errors.
 
@@ -1382,7 +1490,8 @@ class TestExtractionErrorClassification:
 
     def test_non_ytdlp_errors_are_not_swallowed(self) -> None:
         """Only yt-dlp's own errors get rewrapped. A programming error (KeyError, …) must
-        propagate unchanged so it is not silently relabelled as an extraction failure."""
+        propagate unchanged so it is not silently relabelled as an extraction failure.
+        """
         from src.youtube import ExtractionError, _ytdlp_extract
 
         fake_ydl = MagicMock()
