@@ -168,9 +168,14 @@ def main() -> None:
     # Spotify is an OPTIONAL source: with credentials it's enabled, without them
     # the bot runs fine and only Spotify links are rejected (YouTube/SoundCloud/
     # search all still work). Log which mode we're in so a missing credential is
-    # visible at startup rather than surfacing later as a per-link error.
+    # visible at startup rather than surfacing later as a per-link error. When
+    # credentials ARE present, MusicBot.cog_load probes them against the live
+    # Spotify API once the bot connects and logs the ENABLED/INVALID outcome —
+    # this early line only reports whether credentials were provided at all.
     if spotify_enabled():
-        log.info("Spotify source enabled")
+        log.info(
+            "Spotify credentials found — validating against Spotify API on startup"
+        )
     else:
         log.warning(
             "Spotify source disabled — set SPOTIFY_CLIENT_ID and "

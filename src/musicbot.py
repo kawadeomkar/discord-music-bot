@@ -15,7 +15,11 @@ from discord.ext import commands
 
 import redis.asyncio as aioredis
 
-from src.config import spotify_enabled
+from src.config import (
+    SPOTIFY_TEST_TRACK_ID,
+    SpotifyStatus,
+    spotify_enabled,
+)
 from src.musicplayer import MusicPlayer
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
@@ -56,19 +60,32 @@ _tracer = get_tracer(__name__)
 
 
 class SpotifyDisabledError(Exception):
-    """Raised when a Spotify link is played but Spotify support is not configured.
+    """Raised when a Spotify link is played but Spotify support isn't usable.
 
-    The message is user-facing: _command_error renders it (with the class name) into
-    the error embed the requester sees, so it explains the config gap and points at the
-    sources that still work.
+    Carries the SpotifyStatus so the message distinguishes the two failure modes:
+    no credentials were configured (DISABLED) vs. credentials were configured but
+    rejected by Spotify at startup (INVALID). The message is user-facing:
+    _command_error renders it (with the class name) into the error embed the
+    requester sees, so it explains the config gap and points at the sources that
+    still work.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "Spotify links aren't available on this bot — it was started without "
-            "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
-            "Try a YouTube or SoundCloud link, or just search by name."
-        )
+    def __init__(self, status: SpotifyStatus) -> None:
+        self.status = status
+        if status is SpotifyStatus.INVALID:
+            message = (
+                "Spotify links aren't available right now — this bot has Spotify "
+                "credentials configured, but Spotify rejected them at startup "
+                "(check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        else:  # DISABLED (and any unexpected value — safest generic message)
+            message = (
+                "Spotify links aren't available on this bot — it was started without "
+                "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        super().__init__(message)
 
 
 HISTORY_MIN_LIMIT = 1
@@ -157,6 +174,7 @@ class MusicBot(commands.Cog):
         "bot",
         "mps",
         "spotify",
+        "_spotify_status",
         "redis",
         "_active_spans",
         "_alone_timers",
@@ -182,6 +200,16 @@ class MusicBot(commands.Cog):
         self.spotify: Optional[Spotify] = (
             Spotify(redis=self.redis) if spotify_enabled() else None
         )
+        # Status starts ENABLED when credentials are present and DISABLED when
+        # they're absent. cog_load() then probes the live API and downgrades to
+        # INVALID if the credentials don't authenticate. The optimistic ENABLED
+        # start is safe because cog_load runs inside setup_hook, before the
+        # gateway connects — no command can arrive until the probe has resolved.
+        self._spotify_status: SpotifyStatus = (
+            SpotifyStatus.ENABLED
+            if self.spotify is not None
+            else SpotifyStatus.DISABLED
+        )
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → (span, the token otel_context.attach() returns, which detach()
         # requires back — `object` does not satisfy it.
@@ -189,14 +217,52 @@ class MusicBot(commands.Cog):
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
 
+    async def cog_load(self) -> None:
+        """Validate Spotify credentials at startup, without blocking it.
+
+        discord.py awaits this when the cog is added — inside setup_hook, before
+        the bot connects — so the probe finishes before any command can run. With
+        no credentials there's nothing to check. With credentials, fetch the probe
+        track once: success confirms them (status stays ENABLED), any failure
+        (rejected credentials, network error, timeout) logs an error and flips
+        status to INVALID so Spotify links fail fast with a clear message. A
+        transient network blip at startup therefore disables Spotify for the
+        process lifetime — deliberately conservative: the failure is logged loudly
+        and a restart re-probes."""
+        if self.spotify is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self.spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
+            )
+            self._spotify_status = SpotifyStatus.ENABLED
+            log.info("Spotify credentials validated — Spotify source enabled")
+        except Exception as e:
+            self._spotify_status = SpotifyStatus.INVALID
+            log.error(
+                "Spotify credentials are set but failed validation "
+                f"({type(e).__name__}: {e}); Spotify links will be rejected. "
+                "Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET.",
+                exc_info=True,
+            )
+
     def _require_spotify(self) -> Spotify:
         """Return the Spotify client, or raise SpotifyDisabledError if the feature
-        is off. Call this at every Spotify source dispatch: it both narrows the
-        Optional away for the type checker and produces the user-facing error when
-        credentials are absent."""
-        if self.spotify is None:
-            raise SpotifyDisabledError()
+        is off or its credentials failed startup validation. Call this at every
+        Spotify source dispatch: it both narrows the Optional away for the type
+        checker and produces the user-facing error, whose text depends on why
+        Spotify is unavailable (never configured vs. configured-but-rejected)."""
+        if self.spotify is None or self._spotify_status is not SpotifyStatus.ENABLED:
+            raise SpotifyDisabledError(self._spotify_status)
         return self.spotify
+
+    def _spotify_status_text(self) -> str:
+        """One-line human-readable Spotify status for the -ping embed."""
+        if self._spotify_status is SpotifyStatus.ENABLED:
+            return "🟢 Enabled"
+        if self._spotify_status is SpotifyStatus.INVALID:
+            return "🔴 Disabled — credentials provided but rejected by Spotify"
+        return "⚪ Disabled — no credentials configured"
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         """Return the guild's MusicPlayer, creating and starting one if absent."""
@@ -1391,7 +1457,8 @@ class MusicBot(commands.Cog):
         help=(
             "Reports the bot's WebSocket latency to Discord in milliseconds. The "
             "embed is colour-coded — green is healthy, red means playback may "
-            "stutter."
+            "stutter. Also shows whether the Spotify source is enabled, disabled "
+            "(no credentials), or disabled because the credentials were rejected."
         ),
         extras={"category": "Utility", "examples": ["-ping", "-latency"]},
     )
@@ -1405,6 +1472,7 @@ class MusicBot(commands.Cog):
                 "Ping - latency in ms",
                 f"Ping: **{round(ms)}** milliseconds!",
                 latency_color(ms),
+                fields=[("Spotify source", self._spotify_status_text(), False)],
             )
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)

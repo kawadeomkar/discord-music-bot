@@ -17,6 +17,7 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
@@ -48,6 +49,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog._alone_timers = {}
@@ -247,24 +249,40 @@ class TestQueueSource:
 
 
 class TestSpotifyDisabled:
-    """When the bot is started without Spotify credentials, self.spotify is None
-    and any Spotify source must raise SpotifyDisabledError — while every other
-    source keeps working."""
+    """When Spotify isn't usable — no credentials (self.spotify is None, status
+    DISABLED) or credentials rejected at startup (status INVALID) — any Spotify
+    source must raise SpotifyDisabledError, while every other source keeps
+    working."""
 
-    def test_require_spotify_returns_client_when_present(
+    def test_require_spotify_returns_client_when_enabled(
         self, music_bot: MusicBot
     ) -> None:
         assert music_bot._require_spotify() is music_bot.spotify
 
-    def test_require_spotify_raises_when_disabled(self, music_bot: MusicBot) -> None:
+    def test_require_spotify_raises_when_no_credentials(
+        self, music_bot: MusicBot
+    ) -> None:
         music_bot.spotify = None
-        with pytest.raises(SpotifyDisabledError):
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
+        assert exc.value.status is SpotifyStatus.DISABLED
+
+    def test_require_spotify_raises_when_credentials_invalid(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Credentials were present (client built) but rejected at startup: the
+        gate still refuses, and the error reports INVALID rather than DISABLED."""
+        music_bot._spotify_status = SpotifyStatus.INVALID
+        with pytest.raises(SpotifyDisabledError) as exc:
+            music_bot._require_spotify()
+        assert exc.value.status is SpotifyStatus.INVALID
 
     async def test_spotify_playlist_raises_when_disabled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(mock_ctx, source)
@@ -273,6 +291,17 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_spotify_track_raises_when_credentials_invalid(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Even with a live client object, an INVALID status short-circuits the
+        source before any Spotify API call is attempted."""
+        music_bot._spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(mock_ctx, source)
@@ -282,6 +311,7 @@ class TestSpotifyDisabled:
     ) -> None:
         """A YouTube link still resolves normally with Spotify turned off."""
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
         fake_qobj = QueueObject(
             "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
@@ -292,10 +322,16 @@ class TestSpotifyDisabled:
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
 
-    def test_error_message_is_actionable(self) -> None:
-        msg = str(SpotifyDisabledError())
+    def test_disabled_error_message_is_actionable(self) -> None:
+        msg = str(SpotifyDisabledError(SpotifyStatus.DISABLED))
         assert "SPOTIFY_CLIENT_ID" in msg
+        assert "without" in msg
         assert "SoundCloud" in msg or "search" in msg
+
+    def test_invalid_error_message_distinguishes_bad_credentials(self) -> None:
+        msg = str(SpotifyDisabledError(SpotifyStatus.INVALID))
+        assert "SPOTIFY_CLIENT_ID" in msg
+        assert "rejected" in msg
 
     async def test_youtube_search_uses_ytsearch(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -482,6 +518,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     cog._active_spans = {}
     cog._alone_timers = {}
@@ -1681,6 +1718,75 @@ class TestPingCommand:
         mock_ctx.send.assert_awaited_once()
         call_kwargs = mock_ctx.send.call_args[1]
         assert "embed" in call_kwargs
+
+    async def test_ping_reports_spotify_enabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embed = mock_ctx.send.call_args[1]["embed"]
+        field = next(f for f in embed.fields if f.name == "Spotify source")
+        assert "Enabled" in field.value
+
+    async def test_ping_reports_spotify_disabled_no_credentials(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embed = mock_ctx.send.call_args[1]["embed"]
+        field = next(f for f in embed.fields if f.name == "Spotify source")
+        assert "Disabled" in field.value
+        assert "no credentials" in field.value
+
+    async def test_ping_reports_spotify_invalid_credentials(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._spotify_status = SpotifyStatus.INVALID
+        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embed = mock_ctx.send.call_args[1]["embed"]
+        field = next(f for f in embed.fields if f.name == "Spotify source")
+        assert "Disabled" in field.value
+        assert "rejected" in field.value
+
+
+class TestCogLoadSpotifyValidation:
+    """cog_load probes Spotify credentials at startup: it must resolve
+    _spotify_status without ever raising (startup must not be blocked)."""
+
+    async def test_no_op_when_spotify_disabled(self, music_bot: MusicBot) -> None:
+        music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        await music_bot.cog_load()
+        assert music_bot._spotify_status is SpotifyStatus.DISABLED
+
+    async def test_valid_credentials_stay_enabled(self, music_bot: MusicBot) -> None:
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(return_value=None)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot.cog_load()
+        music_bot.spotify.validate.assert_awaited_once()
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+
+    async def test_rejected_credentials_flip_to_invalid(
+        self, music_bot: MusicBot
+    ) -> None:
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(side_effect=KeyError("access_token"))
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot.cog_load()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.INVALID
+
+    async def test_validation_timeout_flips_to_invalid(
+        self, music_bot: MusicBot
+    ) -> None:
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        # A validate() that exceeds the deadline surfaces as TimeoutError out of
+        # asyncio.wait_for; cog_load must treat it like any other failure.
+        music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot.cog_load()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.INVALID
 
 
 class TestClearCommand:

@@ -10,6 +10,7 @@ import discord
 import pytest
 from discord.ext import commands
 
+from src.config import SpotifyStatus
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
 
@@ -22,6 +23,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog._alone_timers = {}

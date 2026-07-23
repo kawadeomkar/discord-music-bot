@@ -55,9 +55,13 @@ class Spotify:
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
-    async def _refresh_token(self) -> None:
-        """Fetch a fresh access token via the client-credentials flow and update expiry."""
-        if self._redis is not None:
+    async def _refresh_token(self, use_cache: bool = True) -> None:
+        """Fetch a fresh access token via the client-credentials flow and update expiry.
+
+        `use_cache=False` skips the Redis-cached token and always hits the auth
+        endpoint, so the configured client_id/secret are genuinely exercised
+        rather than a token minted from earlier credentials — used by validate()."""
+        if use_cache and self._redis is not None:
             cached = await spotify_token_get_with_ttl(self._redis)
             if cached is not None:
                 token, ttl = cached
@@ -116,6 +120,29 @@ class Spotify:
                 return await resp.json(content_type=None)
             raise Exception(
                 f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+            )
+
+    async def validate(self, track_id: str) -> None:
+        """Exercise the configured credentials against the live Spotify API.
+
+        Forces a fresh client-credentials token (bypassing any Redis-cached one,
+        so the client_id/secret themselves are tested — not a token minted from
+        earlier credentials), then fetches a known track. Raises on any failure:
+        rejected credentials (`_refresh_token` KeyErrors on the missing
+        `access_token`), a non-2xx track lookup (`http_call` raises), a network
+        error, or an unexpected response shape.
+
+        Intended for a one-shot startup probe. It does not mutate any feature
+        flag itself — the caller decides how to treat success vs. failure
+        (this bot logs a failure and disables the Spotify source; it never
+        blocks startup)."""
+        async with self._auth_lock:
+            await self._refresh_token(use_cache=False)
+        endpoint = self.spotify_endpoint + f"v1/tracks/{track_id}"
+        resp = await self.http_call(endpoint)
+        if not resp.get("name"):
+            raise ValueError(
+                f"Spotify returned no track name for probe id {track_id!r}: {resp!r}"
             )
 
     # ── Cached API methods ────────────────────────────────────────────────────
