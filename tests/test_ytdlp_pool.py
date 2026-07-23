@@ -795,7 +795,14 @@ class TestRealWorkerProcess:
         matching = [r for r in captured if "marker-6" in r.getMessage()]
         assert matching, "worker log never reached the parent handler"
         body = matching[0].getMessage()
-        assert "SpawnProcess" in body, f"worker_id missing from: {body}"
+        # worker_id is multiprocessing.current_process().name, whose prefix is
+        # start-method dependent: SpawnProcess-N (spawn, macOS default), ForkProcess-N
+        # (fork), ForkServerProcess-N (forkserver, the Linux/3.14 default under CI). Assert
+        # the start-method-independent shape so the test passes wherever the pool runs.
+        import json
+
+        worker_id = json.loads(body).get("worker_id", "")
+        assert "Process-" in worker_id, f"worker_id missing from: {body}"
         assert format(trace_id, "032x") in body, f"trace_id missing from: {body}"
 
 
