@@ -36,9 +36,19 @@ jobs:
   resolve-env:
     name: Resolve Environment
     runs-on: ubuntu-latest
+    # The shared-facts job: values other jobs need computed once so they cannot
+    # drift between copies. `name` gates the build environment; `version` is the
+    # single source of truth for both the image tag (`build`) and the release tag
+    # (`release`), read here so those two never disagree about what this commit is.
     outputs:
       name: ${{ steps.env_name.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
     steps:
+      # Needed only for the version step below — the env-name step reads context,
+      # not the tree. Cheap enough that a second facts-only job to avoid it would
+      # cost more than it saves.
+      - uses: actions/checkout@v4
+
       - name: Compute environment name
         id: env_name
         # Via env:, never `${{ }}` inside run:. A branch name is attacker-chosen
@@ -50,6 +60,28 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           [ "$BRANCH" = "main" ] && echo "name=production" >> "$GITHUB_OUTPUT" || echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Read version from pyproject.toml
+        id: version
+        # tomllib, not grep: `version` is only unambiguous as the value under
+        # [tool.poetry], and a line match would also catch a `version =` under some
+        # future [tool.*] table. The runner's system python is 3.12, so tomllib
+        # (stdlib since 3.11) needs no install. Read at RUNTIME so the value always
+        # reflects the file AT THIS COMMIT — the number is never hardcoded here.
+        #
+        # Validated once, here, for every build. A malformed version is caught on the
+        # PR that introduced it rather than after merge, and both consumers — the
+        # image tag and the permanent release tag — are spared a garbage value. This
+        # is stricter than `just pins`, which checks names agree, not that the version
+        # string is releasable.
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["tool"]["poetry"]["version"])')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.].+)?$ ]]; then
+            echo "::error::pyproject.toml version '$version' is not semver" >&2
+            exit 1
+          fi
+          echo "Resolved version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   lint:
     name: Lint & Type Check
@@ -238,13 +270,21 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          # `latest` is gated explicitly now that the job also runs on branches.
-          # `push:` below would stop it being published either way, but a tag that
-          # is only safe because of a second setting elsewhere is one refactor away
-          # from being wrong.
+          # Three tags, three questions: `sha-<...>` is the immutable "this exact
+          # commit" (never gated — provenance is meaningful on every build); `latest`
+          # is the moving "newest published"; and the bare pyproject version is the
+          # human "which release". The version carries NO `v` prefix — that is the git
+          # tag's convention (release job), not the image's (`python:3.12`, not
+          # `:v3.12`).
+          #
+          # `latest` and the version are gated to the default branch explicitly. The
+          # `push:` guard below already stops a branch build publishing anything, but
+          # a tag that is only safe because of a second setting elsewhere is one
+          # refactor away from being wrong.
           tags: |
             type=sha,format=long
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve-env.outputs.version }},enable={{is_default_branch}}
 
       - name: Build runtime image (push only from main)
         uses: docker/build-push-action@v7
@@ -273,3 +313,65 @@ jobs:
           # each overwrote the other's export between runs.
           cache-from: type=gha,scope=runtime
           cache-to: type=gha,mode=max,scope=runtime
+
+  release:
+    name: Tag & Release
+    runs-on: ubuntu-latest
+    # After build, not beside it: a version tag is a permanent, outward-facing claim
+    # that this commit is a release, so it must not be minted until the commit has
+    # passed every gate AND its image actually published. `build` pulls in
+    # lint/test/container-test transitively, and its publish step is what puts the
+    # image on GHCR — tag only what shipped. resolve-env is named directly (not just
+    # via build) because outputs are only visible from a job's OWN needs; that is
+    # where the version comes from, so the git tag and the image tag are the same
+    # string by construction rather than by two extractions agreeing.
+    needs: [resolve-env, build]
+    # Real merges to main only. `needs` does NOT inherit build's publish gate — build
+    # runs on branches and PRs too (to prove the runtime image still builds), so
+    # without this line a branch push would fall straight through and cut a release
+    # off a feature branch. Mirrors the PUBLISH predicate, minus workflow_dispatch:
+    # re-publishing an image for an existing commit must never re-cut its release, and
+    # the idempotency guard below would no-op it anyway.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      # A release is a tag ref plus a release object — both writes to repository
+      # contents, and the only scope this job needs. The top-level block is
+      # contents:read; a job-level block replaces it wholesale rather than adding.
+      contents: write
+    steps:
+      # No checkout: the version is a resolve-env output and `gh` talks to the API
+      # via GH_TOKEN + GITHUB_REPOSITORY, so this job never touches the tree.
+      - name: Create release if the version is new
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `v` prefix here, bare in the image tag: git tags conventionally carry it,
+          # image tags conventionally do not. Same version string, one source.
+          TAG: v${{ needs.resolve-env.outputs.version }}
+          # github.sha is the merge commit CI ran against, so the release's tag points
+          # at exactly the validated, published commit and never at whatever the
+          # default branch has drifted to since.
+          SHA: ${{ github.sha }}
+        # CI runs on every merge to main; the version in pyproject.toml bumps on only
+        # some (SemVer, per-PR). An existing release for this version is therefore the
+        # normal no-bump case, not an error — skip it. Creating the release is what
+        # creates the tag, and --generate-notes writes the changelog from the PRs
+        # merged since the previous release. A tag push does not re-enter this
+        # workflow (no `tags:` trigger, and GITHUB_TOKEN-authored refs don't fan out),
+        # so there is no recursion to guard against.
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already released — nothing to do."
+            exit 0
+          fi
+          # Two same-version merges landing together each get their own concurrency
+          # group (github.sha is in the key), so they can overlap and both pass the
+          # check above; the loser's create then 422s on the now-existing tag.
+          # Re-check and treat that as success rather than failing a merge over a race
+          # whose outcome — the release exists — is exactly what we wanted.
+          if ! gh release create "$TAG" --target "$SHA" --title "$TAG" --generate-notes; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "$TAG was created concurrently — treating as success."
+              exit 0
+            fi
+            exit 1
+          fi
