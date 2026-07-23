@@ -31,7 +31,7 @@ from src.sources import (
     parse_input,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify
+from src.spotify import Spotify, SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from contextvars import Token
 
@@ -218,32 +218,48 @@ class MusicBot(commands.Cog):
         self._restore_tasks: set[asyncio.Task] = set()
 
     async def cog_load(self) -> None:
-        """Validate Spotify credentials at startup, without blocking it.
+        """Kick off Spotify credential validation without blocking startup.
 
         discord.py awaits this when the cog is added — inside setup_hook, before
-        the bot connects — so the probe finishes before any command can run. With
-        no credentials there's nothing to check. With credentials, fetch the probe
-        track once: success confirms them (status stays ENABLED), any failure
-        (rejected credentials, network error, timeout) logs an error and flips
-        status to INVALID so Spotify links fail fast with a clear message. A
-        transient network blip at startup therefore disables Spotify for the
-        process lifetime — deliberately conservative: the failure is logged loudly
-        and a restart re-probes."""
+        the bot connects — so anything awaited here delays the connection. The
+        probe is a live network call, so it's spawned as a fire-and-forget
+        background task instead: startup proceeds immediately and _spotify_status
+        stays optimistically ENABLED until the probe resolves. With no credentials
+        there's nothing to check."""
         if self.spotify is None:
+            return
+        spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
+
+    async def _validate_spotify_credentials(self) -> None:
+        """Background credential probe (spawned by cog_load, never awaited on the
+        startup path).
+
+        Only an authentication rejection — SpotifyAuthError — marks Spotify
+        INVALID. Network errors, timeouts, and non-auth HTTP failures are
+        inconclusive: they say nothing about whether the credentials are valid,
+        so the source is left ENABLED and a genuine problem simply surfaces on
+        the first Spotify link. The 10s cap keeps a hung probe from lingering;
+        a timeout is treated as inconclusive, not invalid."""
+        spotify = self.spotify
+        if spotify is None:  # narrowing for the type checker; cog_load already checked
             return
         try:
             await asyncio.wait_for(
-                self.spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
+                spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
             )
             self._spotify_status = SpotifyStatus.ENABLED
             log.info("Spotify credentials validated — Spotify source enabled")
-        except Exception as e:
+        except SpotifyAuthError as e:
             self._spotify_status = SpotifyStatus.INVALID
             log.error(
-                "Spotify credentials are set but failed validation "
-                f"({type(e).__name__}: {e}); Spotify links will be rejected. "
-                "Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET.",
-                exc_info=True,
+                f"Spotify rejected the configured credentials ({e}); Spotify links "
+                "will be declined. Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET."
+            )
+        except Exception as e:
+            log.warning(
+                "Could not validate Spotify credentials at startup "
+                f"({type(e).__name__}: {e}); leaving Spotify enabled — a genuine "
+                "credential problem will surface on the first Spotify link."
             )
 
     def _require_spotify(self) -> Spotify:

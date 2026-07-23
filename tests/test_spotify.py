@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from redis.asyncio import Redis
 
-from src.spotify import Spotify
+from src.spotify import Spotify, SpotifyAuthError
 
 
 @pytest.fixture
@@ -179,25 +179,42 @@ class TestSpotifyRefreshToken:
         assert str(spotify) == "my_token"
 
 
+def _make_split_session(post_resp: AsyncMock, request_resp: AsyncMock) -> MagicMock:
+    """Session mock whose auth POST and API request return different responses —
+    needed by validate(), which grants a token then fetches a track."""
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.post = AsyncMock(return_value=post_resp)
+    session.request = AsyncMock(return_value=request_resp)
+    return session
+
+
+def _resp(status: int, payload: dict[str, Any]) -> AsyncMock:
+    resp = AsyncMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=payload)
+    return resp
+
+
 class TestSpotifyValidate:
     """validate() is the startup credential probe: it forces a fresh token and
-    fetches a known track, raising on any failure so the caller can disable the
-    Spotify source."""
+    fetches a known track. It raises SpotifyAuthError only when Spotify rejects
+    the credentials; every other failure surfaces as its own (non-auth) type."""
 
     async def test_validate_succeeds_with_valid_credentials(
         self, spotify: Spotify
     ) -> None:
         # One resp serves both the auth POST and the track GET (validate reads
         # access_token/expires_in from the first and name from the second).
-        resp = AsyncMock()
-        resp.status = 200
-        resp.json = AsyncMock(
-            return_value={
+        resp = _resp(
+            200,
+            {
                 "access_token": "tok",
                 "expires_in": 3600,
                 "name": "Never Gonna Give You Up",
                 "artists": [{"name": "Rick Astley"}],
-            }
+            },
         )
         session = _make_mock_session(resp)
         spotify._session_factory = lambda **kw: session
@@ -206,42 +223,59 @@ class TestSpotifyValidate:
 
         session.request.assert_awaited_once()
 
-    async def test_validate_raises_on_rejected_credentials(
+    async def test_validate_raises_auth_error_on_rejected_grant(
         self, spotify: Spotify
     ) -> None:
-        """Invalid client_id/secret: Spotify's token response has no access_token,
-        so _refresh_token KeyErrors before the track call is ever reached."""
-        resp = AsyncMock()
-        resp.status = 400
-        resp.json = AsyncMock(return_value={"error": "invalid_client"})
+        """Invalid client_id/secret: the token grant returns non-2xx, which
+        strict=True turns into SpotifyAuthError before the track call is reached."""
+        resp = _resp(400, {"error": "invalid_client"})
         session = _make_mock_session(resp)
         spotify._session_factory = lambda **kw: session
 
-        with pytest.raises(KeyError):
+        with pytest.raises(SpotifyAuthError) as exc:
             await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
+        assert exc.value.status == 400
+        session.request.assert_not_awaited()  # never got to the track call
 
-    async def test_validate_raises_on_non_2xx_track_lookup(
+    async def test_validate_raises_auth_error_on_track_401(
         self, spotify: Spotify
     ) -> None:
-        """Auth succeeds but the track endpoint returns non-2xx: http_call raises."""
-        resp = AsyncMock()
-        resp.status = 404
-        resp.json = AsyncMock(return_value={"access_token": "tok", "expires_in": 3600})
-        session = _make_mock_session(resp)
+        """Grant succeeds but the track call is refused with 401 — still an auth
+        rejection, surfaced as SpotifyAuthError."""
+        session = _make_split_session(
+            _resp(200, {"access_token": "tok", "expires_in": 3600}),
+            _resp(401, {"error": {"message": "invalid token"}}),
+        )
         spotify._session_factory = lambda **kw: session
 
-        with pytest.raises(Exception):
+        with pytest.raises(SpotifyAuthError) as exc:
             await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
+        assert exc.value.status == 401
 
-    async def test_validate_raises_on_missing_track_name(
+    async def test_validate_non_auth_http_error_is_not_auth_error(
         self, spotify: Spotify
     ) -> None:
-        """Auth and the request both succeed, but the payload has no name — an
-        unexpected shape that must not be treated as a healthy Spotify."""
-        resp = AsyncMock()
-        resp.status = 200
-        resp.json = AsyncMock(return_value={"access_token": "tok", "expires_in": 3600})
-        session = _make_mock_session(resp)
+        """Grant succeeds but the track endpoint 404s: a plain Exception, NOT a
+        SpotifyAuthError — the caller treats this as inconclusive, not invalid."""
+        session = _make_split_session(
+            _resp(200, {"access_token": "tok", "expires_in": 3600}),
+            _resp(404, {"error": "not found"}),
+        )
+        spotify._session_factory = lambda **kw: session
+
+        with pytest.raises(Exception) as exc:
+            await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
+        assert not isinstance(exc.value, SpotifyAuthError)
+
+    async def test_validate_raises_value_error_on_missing_track_name(
+        self, spotify: Spotify
+    ) -> None:
+        """Grant and request both succeed, but the payload has no name — an
+        unexpected shape (ValueError), which is non-auth / inconclusive."""
+        session = _make_split_session(
+            _resp(200, {"access_token": "tok", "expires_in": 3600}),
+            _resp(200, {"id": "x"}),  # 2xx but no "name"
+        )
         spotify._session_factory = lambda **kw: session
 
         with pytest.raises(ValueError):

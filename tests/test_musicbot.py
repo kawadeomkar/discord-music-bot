@@ -32,6 +32,7 @@ from src.musicbot import (
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
+from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -1751,42 +1752,67 @@ class TestPingCommand:
 
 
 class TestCogLoadSpotifyValidation:
-    """cog_load probes Spotify credentials at startup: it must resolve
-    _spotify_status without ever raising (startup must not be blocked)."""
+    """cog_load spawns the credential probe as a background task so startup is
+    never blocked, and the probe resolves _spotify_status without ever raising."""
 
     async def test_no_op_when_spotify_disabled(self, music_bot: MusicBot) -> None:
         music_bot.spotify = None
         music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot._restore_tasks = set()
         await music_bot.cog_load()
         assert music_bot._spotify_status is SpotifyStatus.DISABLED
+        assert music_bot._restore_tasks == set()  # no probe spawned
+
+    async def test_cog_load_spawns_probe_without_blocking(
+        self, music_bot: MusicBot
+    ) -> None:
+        """cog_load returns immediately (leaving status ENABLED) and the probe
+        runs as a tracked background task, not inline."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(return_value=None)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot._restore_tasks = set()
+
+        await music_bot.cog_load()
+        assert len(music_bot._restore_tasks) == 1  # probe spawned, not awaited
+
+        await asyncio.gather(*music_bot._restore_tasks)  # let the probe finish
+        music_bot.spotify.validate.assert_awaited_once()
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
     async def test_valid_credentials_stay_enabled(self, music_bot: MusicBot) -> None:
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
         music_bot._spotify_status = SpotifyStatus.ENABLED
-        await music_bot.cog_load()
+        await music_bot._validate_spotify_credentials()
         music_bot.spotify.validate.assert_awaited_once()
         assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
-    async def test_rejected_credentials_flip_to_invalid(
-        self, music_bot: MusicBot
-    ) -> None:
+    async def test_auth_error_flips_to_invalid(self, music_bot: MusicBot) -> None:
+        """Only an authentication rejection disables Spotify."""
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.validate = AsyncMock(side_effect=KeyError("access_token"))
+        music_bot.spotify.validate = AsyncMock(side_effect=SpotifyAuthError(400))
         music_bot._spotify_status = SpotifyStatus.ENABLED
-        await music_bot.cog_load()  # must not raise
+        await music_bot._validate_spotify_credentials()  # must not raise
         assert music_bot._spotify_status is SpotifyStatus.INVALID
 
-    async def test_validation_timeout_flips_to_invalid(
-        self, music_bot: MusicBot
-    ) -> None:
+    async def test_network_error_leaves_enabled(self, music_bot: MusicBot) -> None:
+        """A non-auth failure is inconclusive: Spotify stays ENABLED."""
         assert music_bot.spotify is not None  # fixture provides a mock client
-        # A validate() that exceeds the deadline surfaces as TimeoutError out of
-        # asyncio.wait_for; cog_load must treat it like any other failure.
+        music_bot.spotify.validate = AsyncMock(
+            side_effect=OSError("connection refused")
+        )
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot._validate_spotify_credentials()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+
+    async def test_timeout_leaves_enabled(self, music_bot: MusicBot) -> None:
+        """A probe timeout is inconclusive (not an auth rejection): stays ENABLED."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
         music_bot._spotify_status = SpotifyStatus.ENABLED
-        await music_bot.cog_load()  # must not raise
-        assert music_bot._spotify_status is SpotifyStatus.INVALID
+        await music_bot._validate_spotify_credentials()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
 
 class TestClearCommand:
