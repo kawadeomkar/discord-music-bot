@@ -33,6 +33,7 @@ from src.util import (
     spawn_background,
     fmt_duration,
     notice_embed,
+    pluralize,
     record_span_error,
     send_embed,
     trace_footer,
@@ -711,13 +712,13 @@ class MusicPlayer:
             return None
 
         count = len(items)
-        plural = "s" if count != 1 else ""
+        songs = pluralize(count, "song")
         verb = "resume" if count != 1 else "resumes"
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
                 f"Playing now: {started.title} - ({started.webpage_url})\n\n"
-                f"**{count}** song{plural} from the previous session "
+                f"**{count}** {songs} from the previous session "
                 f"{verb} after it."
             ),
             color=discord.Color.orange(),
@@ -731,7 +732,7 @@ class MusicPlayer:
         if left_off is not None:
             embed.add_field(name=left_off[0], value=left_off[1], inline=True)
 
-        embed.add_field(name="Queued", value=f"**{count}** song{plural}", inline=True)
+        embed.add_field(name="Queued", value=f"**{count}** {songs}", inline=True)
         total_secs, partial = _queue_runtime(items)
         if total_secs > 0:
             prefix = "~" if partial else ""
@@ -1516,6 +1517,13 @@ class MusicPlayer:
             return
         try:
             song = task.result()
+        # CancelledError kept deliberately: this reads a *done* task's result,
+        # and a cancelled prefetch surfaces here as CancelledError from
+        # .result() — which means "no song", exactly like a failure. (Unlike
+        # _typing_keepalive, this is NOT swallowing this coroutine's own
+        # cancellation.) CancelledError is not an Exception subclass, so it
+        # must be listed explicitly. (Bare tuple form is PEP 758, 3.14+ — see
+        # guild_state._b_float.)
         except asyncio.CancelledError, Exception:
             song = None
         if song is None:

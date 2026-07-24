@@ -44,6 +44,20 @@ def _ytdlp_extract(url: str, opts: Any, download: bool, process: bool) -> Any:
     )
 
 
+async def _run_extract(
+    url: str, opts: Any, *, download: bool = False, process: bool = True
+) -> Any:
+    """Await a yt-dlp extraction on the shared thread pool. The single call
+    site for _ytdlp_extract — every extraction path (prefetch_stream,
+    _resolve_playable_stream, yt_source, yt_playlist) routes through here so
+    the pool binding and the get_running_loop()/run_in_executor boilerplate
+    live in one place."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _YTDLP_POOL, _ytdlp_extract, url, opts, download, process
+    )
+
+
 class _YtdlpLogger:
     """Routes yt-dlp's own diagnostics into our logger instead of dropping them.
 
@@ -342,6 +356,8 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
             expire = int(match.group(1)) if match else 0
         ttl = min(expire - int(time.time()) - 1800, _STREAM_URL_MAX_TTL)
         return ttl if ttl > 60 else None
+    # Bare `except A, B:` is PEP 758 (3.14+) tuple-catch syntax, not the py2
+    # form — see guild_state._b_float's note on ruff's py314 normalization.
     except ValueError, IndexError:
         return None
 
@@ -601,15 +617,9 @@ class YTDL(discord.FFmpegOpusAudio):
         if already_cached:
             _enrich_queueobject(qo, cached)
             return
-        loop = asyncio.get_running_loop()
         try:
-            data: Optional[YTDLVideoInfo] = await loop.run_in_executor(
-                _YTDLP_POOL,
-                _ytdlp_extract,
-                qo.webpage_url,
-                _YTDL_STREAM_OPTS,
-                False,
-                True,
+            data: Optional[YTDLVideoInfo] = await _run_extract(
+                qo.webpage_url, _YTDL_STREAM_OPTS
             )
             trace.get_current_span().set_attribute(
                 "ytdl.extract_success", data is not None
@@ -643,7 +653,6 @@ class YTDL(discord.FFmpegOpusAudio):
         re-extracting a video whose cached URL had died reliably produced a playable one.
         """
         span = trace.get_current_span()
-        loop = asyncio.get_running_loop()
         cache_key = _stream_cache_key(qo.webpage_url)
 
         data: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
@@ -652,14 +661,7 @@ class YTDL(discord.FFmpegOpusAudio):
         for attempt in range(2):
             extracted_fresh = False
             if data is None:
-                data = await loop.run_in_executor(
-                    _YTDLP_POOL,
-                    _ytdlp_extract,
-                    qo.webpage_url,
-                    _YTDL_STREAM_OPTS,
-                    False,
-                    True,
-                )
+                data = await _run_extract(qo.webpage_url, _YTDL_STREAM_OPTS)
                 span.set_attribute("ytdl.extracted_fresh", True)
                 if data is None:
                     raise RuntimeError("Could not extract stream data")
@@ -779,7 +781,6 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
-        loop = asyncio.get_running_loop()
 
         # Unified single extraction (docs/PERFORMANCE_PLAN.md §2.1): one stream-opts
         # call yields identity AND a playable stream URL, so both the ytdl:source and
@@ -790,14 +791,7 @@ class YTDL(discord.FFmpegOpusAudio):
         # with process=False). For a single watch URL the page + player fetch is paid
         # either way; processing adds only format-selection CPU (~tens of ms), no
         # extra network, and it eliminates prefetch_stream's second extraction.
-        data = await loop.run_in_executor(
-            _YTDLP_POOL,
-            _ytdlp_extract,
-            search,
-            _YTDL_STREAM_SEARCH_OPTS,
-            download,
-            True,
-        )
+        data = await _run_extract(search, _YTDL_STREAM_SEARCH_OPTS, download=download)
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped Exception("Could not find
@@ -882,15 +876,7 @@ class YTDL(discord.FFmpegOpusAudio):
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist."""
         trace.get_current_span().set_attribute("ytdl.url", url)
-        loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(
-            _YTDLP_POOL,
-            _ytdlp_extract,
-            url,
-            _YTDL_PLAYLIST_OPTS,
-            False,
-            True,
-        )
+        data = await _run_extract(url, _YTDL_PLAYLIST_OPTS)
         if data is None:
             raise Exception(f"Could not fetch YouTube playlist: {url}")
         # Optional in the element type, not re-annotated on the loop target: yt-dlp
