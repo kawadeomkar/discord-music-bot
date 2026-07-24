@@ -180,6 +180,16 @@ class InterjectOutcome:
         return fmt_duration(self.resume_position or 0)
 
 
+@dataclass(frozen=True)
+class StreamFailure:
+    """Why a song's stream failed to resolve, captured at the point of failure
+    so the user-facing skip notice can name the concrete cause and the trace
+    that carries the full exception in Loki/Tempo."""
+
+    detail: str  # "<ExceptionType>: <message>"
+    trace_id: str  # 32-hex OTel trace id, or "unavailable" when no span is active
+
+
 def _reached_end(song: YTDL) -> bool:
     """Did this song play through to its end?
 
@@ -337,6 +347,7 @@ class MusicPlayer:
         "_np_edit_lock",
         "_pause_debounce_task",
         "_skip_history_for",
+        "_last_stream_error",
     )
 
     bot: commands.Bot
@@ -365,6 +376,7 @@ class MusicPlayer:
     _np_edit_lock: asyncio.Lock
     _pause_debounce_task: Optional[asyncio.Task]
     _skip_history_for: Optional[YTDL]
+    _last_stream_error: Optional[StreamFailure]
 
     def __init__(
         self,
@@ -388,6 +400,9 @@ class MusicPlayer:
         self._cog = cog
 
         self.current_song = None
+        # Set by _stream_source() whenever a stream fails to resolve; read by the
+        # playback loop to build a descriptive skip notice, then cleared.
+        self._last_stream_error: Optional[StreamFailure] = None
         self.play_next = asyncio.Event()
 
         self.play_message = None
@@ -1572,6 +1587,7 @@ class MusicPlayer:
         return source
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
+        self._last_stream_error = None
         try:
             return await YTDL.yt_stream(
                 source,
@@ -1580,7 +1596,15 @@ class MusicPlayer:
                 redis=self.store.redis if self.store is not None else None,
             )
         except Exception as e:
-            log.error(f"Error processing song: {type(e).__name__}: {e}", exc_info=True)
+            ctx = trace.get_current_span().get_span_context()
+            trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else "unavailable"
+            self._last_stream_error = StreamFailure(
+                detail=f"{type(e).__name__}: {e}", trace_id=trace_id
+            )
+            log.error(
+                f"Error processing song: {type(e).__name__}: {e} [trace_id={trace_id}]",
+                exc_info=True,
+            )
             return None
 
     async def _handle_dead_stream(self, song: YTDL) -> None:
@@ -1948,12 +1972,18 @@ class MusicPlayer:
                             source, context="failed-song pop"
                         )
                         dequeue_owed = False
+                        failure = self._last_stream_error
+                        if failure is not None:
+                            message = (
+                                "Failed to load the next song, skipping.\n"
+                                f"**Reason:** `{failure.detail}`\n"
+                                f"**Trace ID:** `{failure.trace_id}`"
+                            )
+                        else:
+                            message = "Failed to load the next song, skipping."
                         try:
                             await self.send_with_np(
-                                embed=notice_embed(
-                                    "Failed to load the next song, skipping.",
-                                    discord.Color.red(),
-                                )
+                                embed=notice_embed(message, discord.Color.red())
                             )
                         except Exception as e:
                             log.warning(
