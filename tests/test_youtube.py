@@ -1,6 +1,8 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import redis.asyncio as aioredis
+import pickle
+import threading
 import time
 from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
@@ -11,18 +13,23 @@ import orjson
 import pytest
 from redis.asyncio import Redis
 
+from src.telemetry import configure_worker_logging
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
     QueueObject,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _UNUSED_INFO_COLLECTIONS,
+    _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
+    _slim_info,
     _stream_url_playable,
     _stream_url_ttl,
+    _ytdlp_extract,
     _YtdlpLogger,
     YTDLVideoInfo,
     YTDLVideoMetadata,
@@ -1151,10 +1158,24 @@ class TestPrefetchStream:
     async def test_swallows_extraction_errors(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        """prefetch_stream does not propagate yt-dlp exceptions."""
+        """prefetch_stream does not propagate yt-dlp exceptions.
+
+        The failure is an ExtractionError, the shape production now raises: since the
+        pool migration, _ytdlp_extract catches yt-dlp's own (unpicklable) errors in the
+        worker and re-raises this flat, picklable one (§12.1). A bare Exception here would
+        assert a shape the code can no longer produce.
+        """
+        from src.youtube import ExtractionError
+
         qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
         with patch(
-            "src.youtube._ytdlp_extract", side_effect=Exception("network error")
+            "src.youtube._ytdlp_extract",
+            side_effect=ExtractionError(
+                "ERROR: [youtube] pf4: Video unavailable",
+                original_type="DownloadError",
+                expected=True,
+                video_id="pf4",
+            ),
         ):
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf4")
@@ -1254,3 +1275,287 @@ class TestYTStreamPlaynowFlags:
             await YTDL.yt_stream(qobj, channel)
 
         channel.send.assert_awaited_once()
+
+
+class TestProcessBoundaryContract:
+    """Everything that must survive being pickled to a worker process.
+
+    The suite runs extraction on an in-process ThreadPoolExecutor (see conftest), so
+    nothing else here ever exercises the pickling that the production
+    ProcessPoolExecutor performs on every submit. These tests are the cheap half of
+    that coverage gap — they assert the contract directly, in microseconds, without
+    spawning anything. The expensive half (a real worker actually spawning) is
+    docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
+
+    What they catch: adding an unpicklable value to an opts profile — a logger
+    instance, a session, a lambda, a compiled callback — or turning a submitted
+    top-level function into a closure/lambda/bound method. Either breaks every
+    extraction in production the moment it ships, while a green suite says nothing.
+    """
+
+    @pytest.mark.parametrize(
+        "name,opts",
+        [
+            ("stream", _YTDL_STREAM_OPTS),
+            ("search", _YTDL_STREAM_SEARCH_OPTS),
+            ("playlist", _YTDL_PLAYLIST_OPTS),
+        ],
+    )
+    def test_opts_profile_survives_a_round_trip(
+        self, name: str, opts: dict[str, Any]
+    ) -> None:
+        """Every profile is an argument to _ytdlp_extract, so it is pickled per call.
+
+        Round-tripped rather than merely dumped: a value that serialises but does not
+        reconstruct (a class whose module moved, say) fails only in the worker, where
+        the failure surfaces as an opaque BrokenProcessPool.
+        """
+        restored = pickle.loads(pickle.dumps(opts))
+        assert restored.keys() == opts.keys(), f"{name} profile lost keys"
+
+    def test_extract_worker_is_picklable_by_reference(self) -> None:
+        """_ytdlp_extract is pickled by qualified name, not by value — so it must stay
+        a module-level function. `is` rather than `==`: pickle resolves the name on the
+        far side, and only a real module-level lookup round-trips to the same object."""
+        assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
+
+    def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
+        """ProcessPoolExecutor pickles `initializer` to every worker. A closure or a
+        bound method here breaks pool construction rather than one extraction.
+
+        The initializer is `_worker_init` (which calls configure_worker_logging with the
+        log queue) — not configure_worker_logging itself; asserting the wrong one passes
+        while missing the real contract.
+        """
+        from src.ytdlp_pool import _worker_init
+
+        assert pickle.loads(pickle.dumps(_worker_init)) is _worker_init
+        # the function it delegates to must survive the boundary too
+        assert (
+            pickle.loads(pickle.dumps(configure_worker_logging))
+            is configure_worker_logging
+        )
+
+
+def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
+    """A process=True-shaped info dict carrying the exact things a real one does that a
+    flat _fake_ytdl_data() never has: a genuinely unpicklable live object, a LazyList
+    format ladder, and the large collections callers never read. This is what
+    extract_info() actually hands back — the thing _ytdlp_extract must not return as-is.
+    """
+    from yt_dlp.utils import LazyList
+
+    base: dict[str, Any] = {
+        "url": f"https://r2.googlevideo.com/stream?expire={int(time.time()) + 7200}",
+        "webpage_url": "https://www.youtube.com/watch?v=test",
+        "title": "Test Song",
+        "duration": 180,
+        "uploader": "Test Channel",
+        "thumbnail": "https://img.yt.com/test.jpg",
+        "abr": 128,
+        "asr": 44100,
+        "acodec": "opus",
+        "format_id": "251",
+        "protocol": "https",
+        "vcodec": "none",
+        # A LazyList of format dicts — what yt-dlp stores `formats` as; sanitize_info
+        # must materialise it to a plain list before it can cross the boundary.
+        "formats": LazyList(iter([{"format_id": "251", "url": "https://x"}])),
+        "thumbnails": [{"url": "https://img/1.jpg"}, {"url": "https://img/2.jpg"}],
+        "automatic_captions": {"en": [{"url": "https://c"}]},
+        "heatmap": [{"start_time": 0.0, "value": 1.0}],
+        # A live, genuinely-unpicklable object under a private key — a lock stands in
+        # for the loggers/tracebacks/callables a real info-dict carries. This is what
+        # makes the raw dict impossible to ship back untouched.
+        "__lock": threading.Lock(),
+    }
+    base.update(overrides)
+    return base
+
+
+class TestSlimInfoReturnContract:
+    """The success-path return value crosses the process boundary on *every* extraction.
+
+    TestProcessBoundaryContract covers the arguments and the callable; the exception path
+    has its own round-trip tests. This covers the fourth thing that crosses — the info-dict
+    _ytdlp_extract returns — which the rest of the suite never exercises against a realistic
+    shape (_fake_ytdl_data is flat scalars with none of the live/oversized fields a real
+    process=True result carries). _slim_info is what makes that return value picklable at
+    all and keeps the oversized collections off the wire.
+    """
+
+    def test_a_realistic_raw_info_dict_is_genuinely_unpicklable(self) -> None:
+        """Guards the premise: if this ever starts pickling on its own, the fix below is
+        no longer load-bearing and this test should be revisited — not deleted silently.
+        """
+        with pytest.raises((TypeError, pickle.PicklingError)):
+            pickle.dumps(_realistic_raw_info())
+
+    def test_slimmed_info_round_trips_through_pickle(self) -> None:
+        """The whole point: _ytdlp_extract's return value survives the boundary. The pool
+        pickles the result synchronously into its result queue, so a value that fails here
+        fails *every* extraction in production with an opaque pickling error."""
+        # cast to a plain dict: these assertions poke raw content, not the narrowed
+        # YTDLExtractResult contract, and a realistic raw dict is never slimmed to None.
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        restored = pickle.loads(pickle.dumps(slim))
+        assert restored["url"] == slim["url"]
+        assert restored["webpage_url"] == slim["webpage_url"]
+
+    def test_slimmed_info_keeps_every_field_callers_read(self) -> None:
+        """No consumed field is lost to slimming. _STREAM_CACHE_FIELDS is the exhaustive
+        set of info-dict keys this codebase reads; each one present in the raw dict must
+        survive, unchanged."""
+        raw = _realistic_raw_info()
+        slim = cast(dict[str, Any], _slim_info(raw))
+        for field in _STREAM_CACHE_FIELDS:
+            if field in raw:
+                assert slim.get(field) == raw[field], f"{field} lost or altered"
+
+    def test_slimmed_info_drops_the_oversized_collections(self) -> None:
+        """The performance half: the large lists no caller reads are gone, so they are
+        not serialised worker->parent on every extraction."""
+        slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
+        for field in _UNUSED_INFO_COLLECTIONS:
+            assert field not in slim, f"{field} should have been dropped"
+
+    def test_slimming_preserves_search_entries_but_slims_each(self) -> None:
+        """A search/playlist wrapper's `entries` list must survive (yt_source unwraps it),
+        but each entry carries its own formats ladder that must be dropped too."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [_realistic_raw_info(), None, _realistic_raw_info()],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        entries = slim["entries"]
+        assert len(entries) == 3
+        assert entries[1] is None  # null entries (deleted/private) are preserved
+        for entry in (entries[0], entries[2]):
+            assert entry["webpage_url"] == "https://www.youtube.com/watch?v=test"
+            for field in _UNUSED_INFO_COLLECTIONS:
+                assert field not in entry
+        pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
+
+    def test_slim_info_passes_none_through(self) -> None:
+        """A failed extract_info returns None; callers branch on `data is None`, so
+        slimming must not turn it into anything else."""
+        assert _slim_info(None) is None
+
+
+class TestExtractionErrorClassification:
+    """_ytdlp_extract's worker-side rewrap of yt-dlp's own (unpicklable) errors.
+
+    yt-dlp's DownloadError carries exc_info → a live traceback, so it cannot cross the
+    process boundary; the parent would receive an opaque pickling error instead of the
+    reason (§12.1). _ytdlp_extract catches it in the worker — where the structure still
+    exists — and re-raises a flat ExtractionError. These assert the classification and
+    that the flat error round-trips; the far half (a real worker) is TestErrorAcrossBoundary
+    in tests/test_ytdlp_pool.py.
+    """
+
+    def _real_downloaderror(self) -> Any:
+        """A DownloadError shaped exactly like yt-dlp's: exc_info holds the ExtractorError
+        that carries .expected / .video_id. Built without any network."""
+        import sys
+
+        from yt_dlp.utils import DownloadError, ExtractorError
+
+        try:
+            raise ExtractorError("Video unavailable", video_id="vid42", expected=True)
+        except ExtractorError:
+            return DownloadError(
+                "ERROR: [youtube] vid42: Video unavailable",
+                sys.exc_info(),  # type: ignore[arg-type]
+            )
+
+    def test_downloaderror_is_reclassified_with_its_fields_mined(self) -> None:
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        real_error = self._real_downloaderror()
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = real_error
+
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+
+        err = caught.value
+        assert err.original_type == "DownloadError"
+        assert err.video_id == "vid42"
+        assert err.expected is True
+        assert "Video unavailable" in err.message
+        # `raise ... from e` — the original error is preserved as the cause, so the
+        # worker traceback reaches the parent (as _RemoteTraceback across a real boundary).
+        assert err.__cause__ is real_error
+
+    def test_non_ytdlp_errors_are_not_swallowed(self) -> None:
+        """Only yt-dlp's own errors get rewrapped. A programming error (KeyError, …) must
+        propagate unchanged so it is not silently relabelled as an extraction failure.
+        """
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = KeyError("bug")
+
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(KeyError):
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+        assert not isinstance(KeyError("bug"), ExtractionError)
+
+    def test_extractionerror_survives_pickle_round_trip(self) -> None:
+        """loads(dumps(...)), not dumps alone: a multi-arg __init__ without __reduce__
+        serialises fine and fails only on the *parent* side while unpickling, which is
+        exactly how the naive fix bricks the pool (§12.1). Values, not just keys."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+            video_id="v9",
+            cause_type="NameResolutionError",
+        )
+        back = pickle.loads(pickle.dumps(err))
+
+        assert isinstance(back, ExtractionError)
+        assert str(back) == "ERROR: [youtube] v9: Video unavailable"
+        assert back.message == err.message
+        assert back.original_type == "DownloadError"
+        assert back.expected is True
+        assert back.video_id == "v9"
+        assert back.cause_type == "NameResolutionError"
+
+    def test_user_message_shows_the_reason_for_an_expected_error(self) -> None:
+        """expected=True is yt-dlp's own user-facing reason; show it minus the prefix."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+        )
+        assert err.user_message == "[youtube] v9: Video unavailable"
+
+    def test_user_message_is_generic_for_an_unexpected_error(self) -> None:
+        """expected=False can carry yt-dlp's 'please report this issue on github.com/yt-dlp'
+        boilerplate — never surface the raw text; full detail stays in the span/logs."""
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [generic] x: Unable to download webpage; please report this issue on "
+            "https://github.com/yt-dlp/yt-dlp/issues",
+            original_type="DownloadError",
+            expected=False,
+        )
+        assert err.user_message == (
+            "Couldn't load this track — the extractor hit an unexpected error."
+        )
+        assert "github.com" not in err.user_message
+
+    def test_user_message_falls_back_when_expected_but_empty(self) -> None:
+        from src.youtube import ExtractionError
+
+        assert (
+            ExtractionError("", expected=True).user_message
+            == "Couldn't load this track."
+        )

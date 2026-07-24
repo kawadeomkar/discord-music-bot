@@ -27,7 +27,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
 from opentelemetry import context as otel_context
@@ -341,11 +341,17 @@ class MusicBot(commands.Cog):
         title: str = "Command failed",
     ) -> None:
         span = trace.get_current_span()
-        record_span_error(span, e)
+        record_span_error(span, e)  # full detail always goes to the span/logs
+        if isinstance(e, ExtractionError):
+            # A classified yt-dlp failure: show the user-safe line, not the raw message
+            # (which can carry yt-dlp's bug-report boilerplate). See ExtractionError.user_message.
+            detail = e.user_message
+        else:
+            detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
-            f"**{type(e).__name__}:** {e}",
+            detail,
             discord.Color.red(),
             footer=trace_footer(span),
         )

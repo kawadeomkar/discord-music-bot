@@ -54,6 +54,63 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     return cog
 
 
+class TestCommandErrorRendering:
+    """_command_error must not leak yt-dlp's raw error text to the user (§12.5)."""
+
+    async def test_extraction_error_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == "[youtube] v9: Video unavailable"
+        assert "ExtractionError" not in detail  # not the raw type: message form
+
+    async def test_unexpected_extraction_error_is_generic(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: boom; please report this issue on https://github.com/yt-dlp/yt-dlp",
+            expected=False,
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert "github.com" not in detail
+        assert "unexpected error" in detail
+
+    async def test_a_plain_exception_still_renders_type_and_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, ValueError("nope"))
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == "**ValueError:** nope"
+
+
 class TestCheckVoicePermissions:
     def test_rejects_non_member_user(self) -> None:
         user = MagicMock(spec=discord.User)
