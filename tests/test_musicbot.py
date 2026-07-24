@@ -17,6 +17,8 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+from src import diagnostics
+from src.diagnostics import ProbeResult, ProbeState
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
@@ -1675,14 +1677,143 @@ class TestHistoryCommand:
         assert HistoryFlags.get_flags()["limit"].default == 10
 
 
+def _probe(state: ProbeState, ms: float | None = None) -> ProbeResult:
+    return ProbeResult("x", state, latency_ms=ms)
+
+
+def _patch_probes(**results: ProbeResult) -> Any:
+    """Patch each diagnostics.probe_* to resolve to the given ProbeResult, and
+    collect_versions to a fast coroutine that still yields once (so the command's
+    pre-drain can settle the immediate probes). Unnamed probes default to NA/OFF."""
+
+    async def _make(res: ProbeResult) -> ProbeResult:
+        return res
+
+    async def _versions() -> dict[str, str]:
+        await asyncio.sleep(0)  # a real yield: lets the scheduled probe tasks run
+        return {
+            "bot": "1.1.0",
+            "yt-dlp": "2026.7.4",
+            "ffmpeg": "7.1",
+            "python": "3.14.0",
+            "discord.py": "2.4.0",
+        }
+
+    return patch.multiple(
+        "src.musicbot.diagnostics",
+        probe_redis=lambda *a, **k: _make(results.get("redis", _probe(ProbeState.NA))),
+        probe_spotify=lambda *a, **k: _make(
+            results.get("spotify", _probe(ProbeState.NA))
+        ),
+        probe_postgres=lambda *a, **k: _make(
+            results.get("postgres", _probe(ProbeState.NA))
+        ),
+        probe_otel=lambda *a, **k: _make(results.get("otel", _probe(ProbeState.OFF))),
+        collect_versions=_versions,
+    )
+
+
+def _ping_message(mock_ctx: MagicMock) -> MagicMock:
+    """Wire channel.send → a message whose edit() is awaitable; return the message."""
+    message = MagicMock(spec=discord.Message)
+    message.edit = AsyncMock()
+    mock_ctx.channel.send = AsyncMock(return_value=message)
+    return message
+
+
+def _latency_field(embed: discord.Embed) -> str:
+    return next(f.value for f in embed.fields if f.name == "Latency") or ""
+
+
 class TestPingCommand:
-    async def test_sends_embed_with_latency(
+    async def test_posts_skeleton_via_channel_send_not_ctx_send(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        call_kwargs = mock_ctx.send.call_args[1]
-        assert "embed" in call_kwargs
+        """Top-level ping bypasses the NP host: sends via channel.send, not ctx.send."""
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        mock_ctx.channel.send.assert_awaited_once()
+        assert "embed" in mock_ctx.channel.send.call_args.kwargs
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_all_resolved_settles_in_the_send_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Every probe resolves immediately → the pre-drain settles them and the
+        very first send carries the final state; no edits needed (finalize-early)."""
+        message = _ping_message(mock_ctx)
+        with _patch_probes(
+            redis=_probe(ProbeState.OK, 1.0),
+            spotify=_probe(ProbeState.OK, 120.0),
+            postgres=_probe(ProbeState.NA),
+            otel=_probe(ProbeState.OK, 3.0),
+        ):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        latency = _latency_field(sent)
+        assert "120 ms" in latency and "pending" not in latency
+        message.edit.assert_not_awaited()
+
+    async def test_skeleton_prefills_na_and_off_not_pending(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """D2: unconfigured/disabled deps must never flash 'pending…' — the
+        pre-drain lands them in the skeleton send."""
+        _ping_message(mock_ctx)
+        with _patch_probes(otel=_probe(ProbeState.OFF)):  # redis None → NA on music_bot
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        latency = _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        assert "n/a" in latency and "off" in latency and "pending" not in latency
+
+    async def test_deadline_marks_straggler_failed(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A probe still pending at the deadline is cancelled → 'failed', via an edit."""
+        message = _ping_message(mock_ctx)
+        # Collapse the deadline so the never-returning probe fails at once.
+        monkeypatch.setattr(diagnostics, "PING_TICK_SECS", 0.0)
+        monkeypatch.setattr(diagnostics, "PING_DEADLINE_SECS", 0.0)
+
+        never = asyncio.Event()  # never set → the probe hangs until cancelled
+
+        async def _hang(*a: Any, **k: Any) -> ProbeResult:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.musicbot.diagnostics.probe_spotify", new=_hang):
+                await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        message.edit.assert_awaited()  # the deadline edit
+        assert "failed" in _latency_field(message.edit.await_args.kwargs["embed"])
+
+    async def test_join_uses_latency_line_not_the_dashboard(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Regression for §2.3 / C1: the internal join path must NOT run probes."""
+        spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
+        with patch("src.musicbot.diagnostics.probe_redis", new=spy):
+            await music_bot._send_latency_line(mock_ctx)
+        spy.assert_not_awaited()
+        mock_ctx.send.assert_awaited_once()  # cheap one-liner via ctx.send (NP-aware)
+
+
+class TestMaxConcurrencyNotice:
+    async def test_reports_already_running(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "ping"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "already running" in embed.description
+        assert "ping" in embed.description
 
 
 class TestClearCommand:

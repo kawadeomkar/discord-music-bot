@@ -35,6 +35,9 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
+from src import diagnostics
+from src.config import ENVIRONMENT
+from src.diagnostics import ProbeResult, ProbeState
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -128,6 +131,115 @@ async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
         yield
     finally:
         task.cancel()
+
+
+# ── -ping health-dashboard rendering (docs/PING_METADATA_PLAN.md §6.2) ──────────
+# One band table drives BOTH the status dot and the embed accent so a probe can't
+# show, say, a green dot under a yellow accent. These bands (≤100/≤200) differ on
+# purpose from util.latency_color's (≤50/≤100/≤200), which backs the lighter
+# _send_latency_line reply — don't swap one for the other.
+_LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
+    (100, "🟢", 0x44FF44),
+    (200, "🟡", 0xFFD000),
+    (float("inf"), "🟠", 0xFF6600),
+)
+_STATE_DOT = {
+    ProbeState.PENDING: "⏳",
+    ProbeState.NA: "⚪",
+    ProbeState.OFF: "⚪",
+    ProbeState.DOWN: "🔴",
+    ProbeState.FAILED: "🔴",
+}
+_PING_RED = 0x990000
+_PING_PROBING = 0x5865F2  # blurple: at least one row still pending
+
+
+def _latency_band(ms: float) -> tuple[str, int]:
+    return next((dot, hue) for cap, dot, hue in _LATENCY_BANDS if ms <= cap)
+
+
+def _ping_dot(r: ProbeResult) -> str:
+    if r.state is not ProbeState.OK:
+        return _STATE_DOT[r.state]
+    return _latency_band(r.latency_ms or 0)[0]
+
+
+def _ping_value(r: ProbeResult) -> str:
+    if r.state is ProbeState.OK:
+        return f"{round(r.latency_ms or 0)} ms"
+    return {
+        ProbeState.PENDING: "pending…",
+        ProbeState.NA: "n/a",
+        ProbeState.OFF: "off",
+        ProbeState.DOWN: "down",
+        ProbeState.FAILED: "failed",
+    }[r.state]
+
+
+def _ping_line(r: ProbeResult) -> str:
+    return f"{_ping_dot(r)} {r.label:<16}{_ping_value(r)}"
+
+
+def render_ping_embed(
+    results: dict[str, ProbeResult],
+    versions: dict[str, str],
+    discord_ms: float,
+    span: Span,
+) -> discord.Embed:
+    """Build the live health embed from the current probe results + versions.
+
+    Accent: any down/failed → red; else any still-pending → blurple; else the
+    worst OK latency's band colour (same bands as the dots)."""
+    disc = ProbeResult("Discord gateway", ProbeState.OK, latency_ms=discord_ms)
+    rows = [disc, *results.values()]
+    lat_lines = [_ping_line(r) for r in rows]
+
+    if any(r.state in (ProbeState.DOWN, ProbeState.FAILED) for r in rows):
+        color = _PING_RED
+    elif any(r.state is ProbeState.PENDING for r in rows):
+        color = _PING_PROBING
+    else:
+        worst = max((r.latency_ms or 0) for r in rows)
+        color = _latency_band(worst)[1]
+
+    ver_lines = [
+        f"Bot        {versions['bot']}",
+        f"yt-dlp     {versions['yt-dlp']}",
+        f"ffmpeg     {versions['ffmpeg']}",
+        f"Python     {versions['python']}  ·  discord.py  {versions['discord.py']}",
+    ]
+    embed = discord.Embed(title="🏓 Pong — service health", color=discord.Color(color))
+    embed.add_field(
+        name="Latency", value="```\n" + "\n".join(lat_lines) + "\n```", inline=False
+    )
+    embed.add_field(
+        name="Versions", value="```\n" + "\n".join(ver_lines) + "\n```", inline=False
+    )
+    footer = f"environment: {ENVIRONMENT}"
+    if any(r.state is ProbeState.PENDING for r in rows):
+        footer += " · probing…"
+    if (tf := trace_footer(span)) is not None:
+        footer += f" · {tf}"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
+    """True when a re-render actually differs — the only things that move are the
+    two field values, the colour, and the footer, all captured by to_dict()."""
+    return new.to_dict() != old.to_dict()
+
+
+async def _safe_edit(
+    message: discord.Message, embed: discord.Embed
+) -> Optional[discord.Embed]:
+    """Edit a message, tolerating a host the user deleted mid-loop (mirrors
+    musicplayer._progress_updater). Returns the embed on success, None if gone."""
+    try:
+        await message.edit(embed=embed)
+        return embed
+    except discord.NotFound:
+        return None
 
 
 class MusicBot(commands.Cog):
@@ -321,6 +433,17 @@ class MusicBot(commands.Cog):
             # try/except never sees it — e.g. `-history --limit abc`.
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
+        elif isinstance(error, commands.MaxConcurrencyReached):
+            # Raised in prepare(), before the command body — so the command's own
+            # try/except never sees it (e.g. a second -ping while one is live).
+            # Worded off the command name since any future guarded command lands here.
+            cmd = ctx.command.name if ctx.command else "command"
+            await ctx.send(
+                embed=notice_embed(
+                    f"A `{cmd}` request is already running in this server.",
+                    discord.Color.orange(),
+                )
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
@@ -1058,7 +1181,10 @@ class MusicBot(commands.Cog):
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
-                ctx.invoke(self.ping),
+                # NOT ctx.invoke(self.ping): that would run the full ~3s health
+                # dashboard on every join/cold-play AND skip prepare() (so the
+                # ping max_concurrency guard). Cheap one-liner only — §2.3.
+                self._send_latency_line(ctx),
             )
         except Exception as e:
             log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
@@ -1356,31 +1482,115 @@ class MusicBot(commands.Cog):
             log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
+    async def _send_latency_line(self, ctx: commands.Context) -> None:
+        """The lightweight one-line WS-latency reply. Used by -join (and cold
+        -play, via join) so the common connect path never pays for the full
+        health dashboard — see docs/PING_METADATA_PLAN.md §2.3. Sent through
+        ctx.send so it still honours the Now Playing host machinery."""
+        ms = self.bot.latency * 1000
+        await send_embed(
+            ctx,
+            "Ping - latency in ms",
+            f"Ping: **{round(ms)}** milliseconds!",
+            latency_color(ms),
+        )
+
     @commands.command(
         name="ping",
-        aliases=["latency", "l", "delay"],
-        brief="check the bot's latency to Discord",
+        aliases=["latency", "l", "delay", "health", "status"],
+        brief="bot & dependency health + versions",
         help=(
-            "Reports the bot's WebSocket latency to Discord in milliseconds. The "
-            "embed is colour-coded — green is healthy, red means playback may "
-            "stutter."
+            "Live health check: round-trip latency to Discord, Redis, Spotify, "
+            "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
+            "ffmpeg versions. The message posts instantly and fills in as each "
+            "dependency answers; the embed colour tracks the worst one."
         ),
-        extras={"category": "Utility", "examples": ["-ping", "-latency"]},
+        extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
-    @commands.before_invoke(validate_commands)
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context) -> None:
+        """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md
+        §5). Fires a skeleton embed immediately, then edits it in place each tick
+        as probes return; a hard 3s deadline fails any straggler. Reached only by
+        a top-level -ping — the internal join/play path uses _send_latency_line."""
+        span = trace.get_current_span()
+        loop = asyncio.get_running_loop()
+        tasks: dict[str, asyncio.Task[ProbeResult]] = {}
+
+        def _drain() -> bool:
+            """Fold every finished probe task into `results`; True if a row moved.
+            Only genuinely-completed tasks are done() here (cancellation happens at
+            the deadline/finally), so .result() never re-raises."""
+            changed = False
+            for label in [lbl for lbl in pending if tasks[lbl].done()]:
+                results[label] = tasks[label].result()
+                pending.discard(label)
+                changed = True
+            return changed
+
         try:
-            ms = self.bot.latency * 1000
-            await send_embed(
-                ctx,
-                "Ping - latency in ms",
-                f"Ping: **{round(ms)}** milliseconds!",
-                latency_color(ms),
-            )
+            # 1. launch probes INSIDE try so `finally` cancels them no matter where
+            #    a later await raises. create_task copies the otel context, so child
+            #    probe spans (auto-instrumented Redis/aiohttp) nest under bot.ping.
+            tasks = {
+                "Redis": asyncio.create_task(diagnostics.probe_redis(self.redis)),
+                "Spotify API": asyncio.create_task(
+                    diagnostics.probe_spotify(self.spotify)
+                ),
+                "Postgres": asyncio.create_task(
+                    diagnostics.probe_postgres(getattr(self, "pg_pool", None))
+                ),
+                "OTEL collector": asyncio.create_task(diagnostics.probe_otel()),
+            }
+            results = {label: ProbeResult(label, ProbeState.PENDING) for label in tasks}
+            pending = set(tasks)
+
+            # 2. instant data + skeleton. collect_versions() awaits (executor hop),
+            #    which lets the immediate NA/OFF probes complete; pre-drain them so
+            #    those rows never flash "pending…" for a tick.
+            versions = await diagnostics.collect_versions()
+            _drain()
+            discord_ms = self.bot.latency * 1000
+            last = render_ping_embed(results, versions, discord_ms, span)
+            message = await ctx.channel.send(embed=last)  # bypass NP host (§5.3)
+
+            # 3. live-edit loop: tick, drain, edit-on-change; exit early when done.
+            deadline = loop.time() + diagnostics.PING_DEADLINE_SECS
+            while pending and (remaining := deadline - loop.time()) > 0:
+                await asyncio.sleep(min(diagnostics.PING_TICK_SECS, remaining))
+                if _drain():
+                    embed = render_ping_embed(results, versions, discord_ms, span)
+                    if _ping_embed_changed(embed, last):
+                        last = await _safe_edit(message, embed) or last
+
+            # 4. deadline: fail only what is STILL pending. Re-check done() first —
+            #    a probe can finish during step 3's final edit await, and flipping
+            #    it to FAILED unconditionally would report a healthy dep as red.
+            if pending:
+                for label in pending:
+                    if tasks[label].done():
+                        results[label] = tasks[label].result()
+                    else:
+                        tasks[label].cancel()
+                        results[label] = ProbeResult(label, ProbeState.FAILED)
+                await _safe_edit(
+                    message, render_ping_embed(results, versions, discord_ms, span)
+                )
+
+            for r in results.values():  # self-documenting trace
+                span.set_attribute(f"ping.{r.label}.state", r.state.name.lower())
+                if r.latency_ms is not None:
+                    span.set_attribute(
+                        f"ping.{r.label}.latency_ms", round(r.latency_ms, 2)
+                    )
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
+        finally:
+            for t in tasks.values():  # never leak a probe task
+                if not t.done():
+                    t.cancel()
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 
