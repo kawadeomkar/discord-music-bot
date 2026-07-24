@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 
 import pytest
 
+from collections.abc import Callable
+from typing import Any
+
+from redis.asyncio import Redis
 from src.db import Database
 from src.guild_state import HistoryEntry
 from src.history_archive import (
@@ -40,7 +44,7 @@ def _entry(n: int, guild_id: int = 42) -> HistoryEntry:
 class FakeArchive:
     """In-memory HistoryArchive: records insert batches, fails on demand."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.batches: list[list[HistoryEntry]] = []
         self.fail = False
 
@@ -48,55 +52,63 @@ class FakeArchive:
     def inserted(self) -> list[HistoryEntry]:
         return [e for batch in self.batches for e in batch]
 
-    async def insert_batch(self, entries):
+    async def insert_batch(self, entries: list[HistoryEntry]) -> None:
         if self.fail:
             raise RuntimeError("pg down")
         self.batches.append(list(entries))
 
-    async def recent(self, guild_id, limit):
+    async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
         return [e for e in self.inserted if e.guild_id == guild_id][:limit]
 
 
 @pytest.fixture
-def archive():
+def archive() -> FakeArchive:
     return FakeArchive()
 
 
 @pytest.fixture
-def drainer(fake_redis, archive):
+def drainer(fake_redis: Redis, archive: Any) -> HistoryOutboxDrainer:
     return HistoryOutboxDrainer(fake_redis, archive)
 
 
-async def _push(fake_redis, *ns: int) -> None:
+async def _push(fake_redis: Redis, *ns: int) -> None:
     store = GuildRedisStore(fake_redis, guild_id=42)
     for n in ns:
         await store.push_history(_entry(n), outbox=True)
 
 
-async def _eventually(cond, timeout: float = 2.0) -> None:
+async def _eventually(cond: Callable[[], bool], timeout: float = 2.0) -> None:
     async with asyncio.timeout(timeout):
         while not cond():
             await asyncio.sleep(0.01)
 
 
 class TestDrainOnce:
-    async def test_moves_entries_oldest_first(self, fake_redis, archive, drainer):
+    async def test_moves_entries_oldest_first(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         await _push(fake_redis, 1, 2, 3)
         assert await drainer._drain_once() == 3
         assert archive.batches == [[_entry(1), _entry(2), _entry(3)]]
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
 
-    async def test_display_list_untouched(self, fake_redis, drainer):
+    async def test_display_list_untouched(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
         store = GuildRedisStore(fake_redis, guild_id=42)
         await _push(fake_redis, 1)
         await drainer._drain_once()
         assert await store.get_history() == [_entry(1)]
 
-    async def test_empty_outbox_is_noop(self, archive, drainer):
+    async def test_empty_outbox_is_noop(
+        self, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         assert await drainer._drain_once() == 0
         assert archive.batches == []
 
-    async def test_batch_capped(self, fake_redis, archive, drainer):
+    async def test_batch_capped(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         await _push(fake_redis, *range(drainer.BATCH_SIZE + 7))
         assert await drainer._drain_once() == drainer.BATCH_SIZE
         assert len(archive.inserted) == drainer.BATCH_SIZE
@@ -105,8 +117,8 @@ class TestDrainOnce:
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 7
 
     async def test_corrupt_entry_retired_not_inserted(
-        self, fake_redis, archive, drainer
-    ):
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         # Corrupt bytes must be consumed (or they'd wedge the queue head
         # forever) while the surviving entries still make it to the archive.
         await _push(fake_redis, 1)
@@ -116,8 +128,8 @@ class TestDrainOnce:
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_archive_failure_leaves_outbox_intact(
-        self, fake_redis, archive, drainer
-    ):
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         # Retire happens strictly after a successful insert — a failed insert
         # must leave every entry in place for the retry.
         await _push(fake_redis, 1, 2)
@@ -126,7 +138,9 @@ class TestDrainOnce:
             await drainer._drain_once()
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
 
-    async def test_redelivery_after_failure(self, fake_redis, archive, drainer):
+    async def test_redelivery_after_failure(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         await _push(fake_redis, 1, 2)
         archive.fail = True
         with pytest.raises(RuntimeError):
@@ -137,7 +151,9 @@ class TestDrainOnce:
 
 
 class TestDrainerLoop:
-    async def test_notify_triggers_drain(self, fake_redis, archive, drainer):
+    async def test_notify_triggers_drain(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         drainer.start()
         try:
             await _push(fake_redis, 1)
@@ -148,8 +164,8 @@ class TestDrainerLoop:
             await drainer.stop()
 
     async def test_backlog_drained_across_batches_without_renotify(
-        self, fake_redis, archive, drainer
-    ):
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         # More than one batch waiting: the loop keeps draining until empty
         # instead of stalling one-batch-per-wakeup.
         await _push(fake_redis, *range(drainer.BATCH_SIZE + 5))
@@ -161,8 +177,13 @@ class TestDrainerLoop:
             await drainer.stop()
 
     async def test_failure_backs_off_then_recovers(
-        self, fake_redis, archive, drainer, monkeypatch, caplog
-    ):
+        self,
+        fake_redis: Redis,
+        archive: Any,
+        drainer: HistoryOutboxDrainer,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_START", 0.01)
         archive.fail = True
         drainer.start()
@@ -177,15 +198,22 @@ class TestDrainerLoop:
             await drainer.stop()
 
     async def test_depth_alarm_escalates_to_error(
-        self, fake_redis, archive, drainer, monkeypatch, caplog
-    ):
+        self,
+        fake_redis: Redis,
+        archive: Any,
+        drainer: HistoryOutboxDrainer,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         monkeypatch.setattr(HistoryOutboxDrainer, "DEPTH_ALARM", 2)
         await _push(fake_redis, 1, 2, 3)
         archive.fail = True
         await drainer._log_retry(RuntimeError("pg down"), backoff=1.0)
         assert any(r.levelname == "ERROR" for r in caplog.records)
 
-    async def test_stop_makes_final_drain_attempt(self, fake_redis, archive, drainer):
+    async def test_stop_makes_final_drain_attempt(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         # Entries pushed but never notify()ed (e.g. the notify was lost to a
         # crash) still ship on clean shutdown.
         drainer.start()
@@ -193,12 +221,14 @@ class TestDrainerLoop:
         await drainer.stop()
         assert archive.inserted == [_entry(1)]
 
-    async def test_stop_without_start_is_safe(self, drainer):
+    async def test_stop_without_start_is_safe(
+        self, drainer: HistoryOutboxDrainer
+    ) -> None:
         await drainer.stop()
 
     async def test_stop_swallows_final_drain_failure(
-        self, fake_redis, archive, drainer
-    ):
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
         # Shutdown must never raise — undrained entries stay in the outbox
         # for the next start.
         await _push(fake_redis, 1)
@@ -209,7 +239,7 @@ class TestDrainerLoop:
 
 
 class TestRowMapping:
-    def test_round_trip(self):
+    def test_round_trip(self) -> None:
         entry = _entry(1, guild_id=222222222222222222)
         row = _entry_to_row(entry)
         keys = (
@@ -226,11 +256,11 @@ class TestRowMapping:
         )
         assert _row_to_entry(dict(zip(keys, row))) == entry
 
-    def test_played_at_maps_to_utc_datetime(self):
+    def test_played_at_maps_to_utc_datetime(self) -> None:
         row = _entry_to_row(_entry(1))
         assert row[-1] == datetime.fromtimestamp(1001.0, tz=timezone.utc)
 
-    def test_epoch_zero_unknown_sentinel_survives(self):
+    def test_epoch_zero_unknown_sentinel_survives(self) -> None:
         # played_at 0.0 = "unknown" — carried into Postgres as to_timestamp(0),
         # not NULL (docs/POSTGRES_HISTORY_PLAN.md §4).
         entry = HistoryEntry(guild_id=1, title="x")
@@ -252,13 +282,13 @@ class TestRowMapping:
 
 
 class TestPostgresArchiveWithoutServer:
-    async def test_empty_insert_never_connects(self):
+    async def test_empty_insert_never_connects(self) -> None:
         # insert_batch([]) early-outs before any acquire — a bogus DSN proves
         # no connection was attempted.
         archive = PostgresHistoryArchive(Database("postgresql://nope:1/nope"))
         await archive.insert_batch([])
 
-    async def test_nonpositive_recent_never_connects(self):
+    async def test_nonpositive_recent_never_connects(self) -> None:
         archive = PostgresHistoryArchive(Database("postgresql://nope:1/nope"))
         assert await archive.recent(42, 0) == []
         assert await archive.recent(42, -1) == []

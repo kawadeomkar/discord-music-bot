@@ -25,8 +25,10 @@ itself lives in db/migrations/ (docs/POSTGRES_HISTORY_PLAN.md §4).
 
 import asyncio
 from collections.abc import Sequence
+
+import redis.asyncio as aioredis
 from datetime import datetime, timezone
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 from src.db import Database
 from src.guild_state import HistoryEntry, parse_history_entry
@@ -68,7 +70,7 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
     )
 
 
-def _row_to_entry(row) -> HistoryEntry:
+def _row_to_entry(row: Any) -> HistoryEntry:
     return HistoryEntry(
         guild_id=row["guild_id"],
         title=row["title"],
@@ -145,7 +147,7 @@ class HistoryOutboxDrainer:
     _BACKOFF_START = 1.0
     _BACKOFF_MAX = 60.0
 
-    def __init__(self, redis, archive: HistoryArchive) -> None:
+    def __init__(self, redis: aioredis.Redis, archive: HistoryArchive) -> None:
         self._redis = redis
         self._archive = archive
         self._wake = asyncio.Event()

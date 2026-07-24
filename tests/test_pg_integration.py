@@ -16,6 +16,11 @@ import os
 
 import pytest
 
+from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
+from typing import Any
+
+from redis.asyncio import Redis
 from src.backfill_history import run as backfill_run
 from src.db import Database, MigrationError
 from src.guild_state import HistoryEntry
@@ -35,7 +40,7 @@ _dbname_counter = itertools.count(1)
 
 
 @pytest.fixture(scope="session")
-def pg_container():
+def pg_container() -> Iterator[Any]:
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer(_PG_IMAGE, username="test", password="test") as pg:
@@ -43,14 +48,14 @@ def pg_container():
 
 
 @pytest.fixture
-def admin_dsn(pg_container) -> str:
+def admin_dsn(pg_container: Any) -> str:
     host = pg_container.get_container_host_ip()
     port = pg_container.get_exposed_port(5432)
     return f"postgresql://test:test@{host}:{port}/{pg_container.dbname}"
 
 
 @pytest.fixture
-async def pg_dsn(pg_container, admin_dsn):
+async def pg_dsn(pg_container: Any, admin_dsn: str) -> AsyncIterator[str]:
     """A fresh database per test — full isolation, ~ms to create."""
     import asyncpg
 
@@ -69,14 +74,14 @@ async def pg_dsn(pg_container, admin_dsn):
 
 
 @pytest.fixture
-async def db(pg_dsn):
+async def db(pg_dsn: str) -> AsyncIterator[Database]:
     database = Database(pg_dsn)
     yield database
     await database.close()
 
 
 @pytest.fixture
-def archive(db):
+def archive(db: Database) -> PostgresHistoryArchive:
     return PostgresHistoryArchive(db)
 
 
@@ -96,7 +101,7 @@ def _entry(n: int, guild_id: int = 42, played_at: float | None = None) -> Histor
 
 
 class TestMigrations:
-    async def test_fresh_database_gets_schema_and_ledger(self, db):
+    async def test_fresh_database_gets_schema_and_ledger(self, db: Database) -> None:
         async with db.acquire() as conn:
             versions = [
                 r["version"]
@@ -114,7 +119,9 @@ class TestMigrations:
                 == 1
             )
 
-    async def test_second_database_same_dsn_is_noop(self, pg_dsn, db):
+    async def test_second_database_same_dsn_is_noop(
+        self, pg_dsn: str, db: Database
+    ) -> None:
         async with db.acquire():
             pass  # first: applies migrations
         second = Database(pg_dsn)
@@ -125,7 +132,9 @@ class TestMigrations:
             await second.close()
         assert count == 1  # ledger unchanged — no re-apply
 
-    async def test_tampered_migration_fails_closed(self, pg_dsn, tmp_path):
+    async def test_tampered_migration_fails_closed(
+        self, pg_dsn: str, tmp_path: Path
+    ) -> None:
         d = tmp_path / "m"
         d.mkdir()
         f = d / "0001_thing.sql"
@@ -145,7 +154,9 @@ class TestMigrations:
         finally:
             await tampered.close()
 
-    async def test_failed_pool_attempt_leaves_no_half_open_pool(self, pg_dsn, tmp_path):
+    async def test_failed_pool_attempt_leaves_no_half_open_pool(
+        self, pg_dsn: str, tmp_path: Path
+    ) -> None:
         # A broken migration must not leave a usable-looking Database behind.
         d = tmp_path / "m"
         d.mkdir()
@@ -166,27 +177,35 @@ class TestMigrations:
 
 
 class TestArchiveAgainstRealPG:
-    async def test_round_trip_preserves_every_field(self, archive):
+    async def test_round_trip_preserves_every_field(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
         await archive.insert_batch([_entry(1)])
         assert await archive.recent(42, 10) == [_entry(1)]
 
-    async def test_epoch_zero_unknown_survives(self, archive):
+    async def test_epoch_zero_unknown_survives(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
         e = _entry(1, played_at=0.0)
         await archive.insert_batch([e])
         got = await archive.recent(42, 10)
         assert got == [e] and got[0].played_at == 0.0
 
-    async def test_dedup_on_replay(self, archive):
+    async def test_dedup_on_replay(self, archive: PostgresHistoryArchive) -> None:
         await archive.insert_batch([_entry(1), _entry(2)])
         await archive.insert_batch([_entry(1), _entry(2)])  # full replay
         assert len(await archive.recent(42, 10)) == 2
 
-    async def test_dedup_under_concurrent_inserts(self, archive):
+    async def test_dedup_under_concurrent_inserts(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
         batch = [_entry(n) for n in range(20)]
         await asyncio.gather(*(archive.insert_batch(batch) for _ in range(4)))
         assert len(await archive.recent(42, 50)) == 20
 
-    async def test_recent_orders_newest_first_with_id_tiebreak(self, archive):
+    async def test_recent_orders_newest_first_with_id_tiebreak(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
         # Same played_at, different songs: later insert (higher id) wins ties.
         a = _entry(1, played_at=5000.0)
         b = _entry(2, played_at=5000.0)
@@ -194,23 +213,25 @@ class TestArchiveAgainstRealPG:
         await archive.insert_batch([a, b, newer])
         assert await archive.recent(42, 10) == [newer, b, a]
 
-    async def test_guild_isolation(self, archive):
+    async def test_guild_isolation(self, archive: PostgresHistoryArchive) -> None:
         await archive.insert_batch([_entry(1, guild_id=1), _entry(2, guild_id=2)])
         assert await archive.recent(1, 10) == [_entry(1, guild_id=1)]
 
-    async def test_limit_applies(self, archive):
+    async def test_limit_applies(self, archive: PostgresHistoryArchive) -> None:
         await archive.insert_batch([_entry(n) for n in range(5)])
         assert len(await archive.recent(42, 3)) == 3
 
 
 class TestBackfillAgainstRealPG:
-    async def test_count(self, archive):
+    async def test_count(self, archive: PostgresHistoryArchive) -> None:
         assert await archive.count(42) == 0
         await archive.insert_batch([_entry(1), _entry(2), _entry(3, guild_id=7)])
         assert await archive.count(42) == 2
         assert await archive.count(7) == 1
 
-    async def test_full_backfill_verify_demote_flow(self, fake_redis, archive):
+    async def test_full_backfill_verify_demote_flow(
+        self, fake_redis: Redis, archive: PostgresHistoryArchive
+    ) -> None:
         # Runbook §6 steps 2–5 in miniature: seed two guilds' Redis lists
         # (one oversized), backfill + verify + demote in one invocation.
         for n in range(HISTORY_CACHE_LIMIT + 5):
@@ -236,7 +257,9 @@ class TestBackfillAgainstRealPG:
 
 
 class TestDrainerAgainstRealPG:
-    async def test_outbox_to_rows_and_redelivery_dedup(self, fake_redis, archive):
+    async def test_outbox_to_rows_and_redelivery_dedup(
+        self, fake_redis: Redis, archive: PostgresHistoryArchive
+    ) -> None:
         store = GuildRedisStore(fake_redis, guild_id=42)
         for n in (1, 2, 3):
             await store.push_history(_entry(n), outbox=True)

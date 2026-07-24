@@ -29,6 +29,7 @@ import asyncio
 import dataclasses
 import os
 import sys
+from collections.abc import Callable
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -83,7 +84,7 @@ async def run(
     *,
     verify: bool = False,
     demote: bool = False,
-    out=print,
+    out: Callable[[str], object] = print,
 ) -> int:
     """The testable core; returns the process exit code."""
     if demote and not verify:
@@ -153,7 +154,7 @@ async def run(
             pipe = redis.pipeline()
             pipe.ltrim(key, 0, HISTORY_CACHE_LIMIT - 1)
             pipe.expire(key, GUILD_TTL)
-            await pipe.execute()  # type: ignore[misc]
+            await pipe.execute()
             out(f"demoted guild {gid}: trimmed to {HISTORY_CACHE_LIMIT}, TTL armed")
         out(f"demoted {len(per_guild)} history list(s)")
 

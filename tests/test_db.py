@@ -7,6 +7,9 @@ import hashlib
 
 import pytest
 
+from pathlib import Path
+from typing import Any
+
 from src.db import MIGRATIONS_DIR, Database, MigrationError, _discover, run_migrations
 
 
@@ -18,29 +21,31 @@ class FakeConn:
     """Just enough asyncpg Connection for run_migrations: execute/fetch and a
     transaction context manager, all recorded."""
 
-    def __init__(self, ledger=None, fail_on: str | None = None):
+    def __init__(self, ledger: Any = None, fail_on: str | None = None) -> None:
         self.ledger = ledger or []  # rows for the SELECT version, checksum
         self.executed: list[tuple[str, tuple]] = []
         self.fail_on = fail_on  # substring: execute raises when it appears
         self.tx_events: list[str] = []
 
-    async def execute(self, sql, *args):
+    async def execute(self, sql: str, *args: object) -> None:
         if self.fail_on and self.fail_on in sql:
             raise RuntimeError("scripted failure")
         self.executed.append((sql.strip(), args))
 
-    async def fetch(self, sql, *args):
+    async def fetch(self, sql: str, *args: object) -> list:
         return self.ledger
 
-    def transaction(self):
+    def transaction(self) -> Any:
         conn = self
 
         class _Tx:
-            async def __aenter__(self):
+            async def __aenter__(self) -> "_Tx":
                 conn.tx_events.append("begin")
                 return self
 
-            async def __aexit__(self, exc_type, exc, tb):
+            async def __aexit__(
+                self, exc_type: object, exc: object, tb: object
+            ) -> bool:
                 conn.tx_events.append("rollback" if exc_type else "commit")
                 return False
 
@@ -48,7 +53,7 @@ class FakeConn:
 
 
 @pytest.fixture
-def migrations(tmp_path):
+def migrations(tmp_path: Path) -> Path:
     d = tmp_path / "migrations"
     d.mkdir()
     (d / "0001_first.sql").write_text("CREATE TABLE one (id int);")
@@ -57,7 +62,7 @@ def migrations(tmp_path):
 
 
 class TestDiscover:
-    def test_orders_by_filename(self, migrations):
+    def test_orders_by_filename(self, migrations: Path) -> None:
         (migrations / "0010_tenth.sql").write_text("SELECT 10;")
         assert [p.name for p in _discover(migrations)] == [
             "0001_first.sql",
@@ -65,16 +70,16 @@ class TestDiscover:
             "0010_tenth.sql",
         ]
 
-    def test_ignores_non_numbered_files(self, migrations):
+    def test_ignores_non_numbered_files(self, migrations: Path) -> None:
         (migrations / "README.sql").write_text("-- not a migration")
         assert len(_discover(migrations)) == 2
 
-    def test_duplicate_prefix_is_ambiguous(self, migrations):
+    def test_duplicate_prefix_is_ambiguous(self, migrations: Path) -> None:
         (migrations / "0002_other.sql").write_text("SELECT 2;")
         with pytest.raises(MigrationError, match="duplicate migration prefix 0002"):
             _discover(migrations)
 
-    def test_real_repo_baseline_present(self):
+    def test_real_repo_baseline_present(self) -> None:
         # Guard the DDL's move out of code: the shipped migrations dir must
         # hold the 0001 baseline with the table + dedup index.
         files = _discover(MIGRATIONS_DIR)
@@ -85,7 +90,7 @@ class TestDiscover:
 
 
 class TestRunMigrations:
-    async def test_fresh_database_applies_all_in_order(self, migrations):
+    async def test_fresh_database_applies_all_in_order(self, migrations: Path) -> None:
         conn = FakeConn()
         assert await run_migrations(conn, migrations) == 2
         sqls = [s for s, _ in conn.executed]
@@ -95,7 +100,9 @@ class TestRunMigrations:
             "CREATE TABLE two (id int);"
         )
 
-    async def test_ledger_rows_carry_version_and_checksum(self, migrations):
+    async def test_ledger_rows_carry_version_and_checksum(
+        self, migrations: Path
+    ) -> None:
         conn = FakeConn()
         await run_migrations(conn, migrations)
         inserts = [
@@ -108,12 +115,12 @@ class TestRunMigrations:
             ("0002_second", _sha("CREATE TABLE two (id int);")),
         ]
 
-    async def test_each_file_in_its_own_transaction(self, migrations):
+    async def test_each_file_in_its_own_transaction(self, migrations: Path) -> None:
         conn = FakeConn()
         await run_migrations(conn, migrations)
         assert conn.tx_events == ["begin", "commit", "begin", "commit"]
 
-    async def test_applied_versions_skipped(self, migrations):
+    async def test_applied_versions_skipped(self, migrations: Path) -> None:
         conn = FakeConn(
             ledger=[
                 {
@@ -127,7 +134,7 @@ class TestRunMigrations:
         assert "CREATE TABLE one (id int);" not in sqls
         assert "CREATE TABLE two (id int);" in sqls
 
-    async def test_rerun_is_noop(self, migrations):
+    async def test_rerun_is_noop(self, migrations: Path) -> None:
         conn = FakeConn(
             ledger=[
                 {
@@ -146,7 +153,9 @@ class TestRunMigrations:
             for s, _ in conn.executed
         )
 
-    async def test_tampered_file_is_an_error_not_a_rerun(self, migrations):
+    async def test_tampered_file_is_an_error_not_a_rerun(
+        self, migrations: Path
+    ) -> None:
         conn = FakeConn(
             ledger=[{"version": "0001_first", "checksum": "not-the-real-checksum"}]
         )
@@ -155,7 +164,9 @@ class TestRunMigrations:
         # And nothing after the mismatch ran — fail closed.
         assert not any("CREATE TABLE two" in s for s, _ in conn.executed)
 
-    async def test_failed_file_rolls_back_and_propagates(self, migrations):
+    async def test_failed_file_rolls_back_and_propagates(
+        self, migrations: Path
+    ) -> None:
         conn = FakeConn(fail_on="CREATE TABLE two")
         with pytest.raises(RuntimeError, match="scripted failure"):
             await run_migrations(conn, migrations)
@@ -170,12 +181,12 @@ class TestRunMigrations:
 
 
 class TestDatabaseLifecycle:
-    async def test_construct_makes_no_connection(self):
+    async def test_construct_makes_no_connection(self) -> None:
         # A bogus DSN would explode on any connection attempt — constructing
         # must be free (startup never blocks on Postgres).
         Database("postgresql://nope:1/nope")
 
-    async def test_close_before_connect_is_safe(self):
+    async def test_close_before_connect_is_safe(self) -> None:
         await Database("postgresql://nope:1/nope").close()
         # Idempotent too.
         db = Database("postgresql://nope:1/nope")

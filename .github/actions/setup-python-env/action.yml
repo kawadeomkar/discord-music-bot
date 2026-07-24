@@ -1,0 +1,85 @@
+name: Set up Python environment
+description: Python 3.14 + pinned Poetry + a cached, in-project virtualenv.
+
+# Extracted from three near-identical copies (ci.yml's lint and test jobs,
+# security.yml). Each maintained its own cache key by hand, and the comment
+# explaining the key's group-set component survived in only one of them — which
+# is precisely how the next cache bug would have arrived.
+
+inputs:
+  groups:
+    description: >-
+      Poetry group list passed to --only=, e.g. "main,test". Folded into the
+      cache key. Ignored when `install` is false.
+    required: false
+    default: ''
+  install:
+    description: >-
+      Whether to create the virtualenv at all. Set false for jobs that only need
+      Poetry itself — `poetry export` reads poetry.lock and needs no venv, so
+      security.yml was installing pyright and its bundled Node runtime on every
+      run to produce a requirements file. Skipping the install also skips the
+      cache, since there is nothing to cache.
+    required: false
+    default: 'true'
+  cache-prefix:
+    description: >-
+      A short label for the caller (e.g. "lint"). It only has to be unique per
+      job — the installed group set is folded into the cache key from `groups`
+      directly, so the two cannot drift. It used to carry the group set by hand,
+      which made every caller responsible for remembering to update two inputs
+      together: exactly the duplication this action exists to remove.
+    required: true
+  poetry-plugins:
+    description: Extra Poetry plugins to install alongside Poetry itself.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.14'
+
+    - name: Install Poetry
+      shell: bash
+      run: pip install poetry==2.1.3 ${{ inputs.poetry-plugins }}
+
+    # actions/cache rejects a key containing a comma, and `groups` is a comma list —
+    # so it cannot go into the key as-is. Normalised here rather than reverting to a
+    # hand-written prefix, which is what made the group set and the key two things a
+    # caller had to remember to change together. Via env:, not `${{ }}` inside run:,
+    # for the same reason as ci.yml's branch name.
+    - name: Normalise the group set for the cache key
+      if: inputs.install == 'true'
+      id: cache_key
+      shell: bash
+      env:
+        GROUPS: ${{ inputs.groups }}
+      run: echo "groups=${GROUPS//,/-}" >> "$GITHUB_OUTPUT"
+
+    # The group set is part of the key directly, so a caller cannot change `groups`
+    # and forget to bump the prefix. No restore-keys: a near-miss restore hands
+    # `poetry sync` a venv built from a different lockfile, and while sync would
+    # reconcile it, actions/cache does not re-save on a restore-key hit — so the
+    # reconciliation would be paid on every run, forever, and never cached.
+    - name: Cache virtualenv
+      if: inputs.install == 'true'
+      uses: actions/cache@v6
+      with:
+        path: .venv
+        key: venv-${{ inputs.cache-prefix }}-${{ steps.cache_key.outputs.groups }}-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
+
+    # poetry.toml commits virtualenvs.in-project, so the venv lands at .venv/
+    # and matches the cache path above without a `poetry config` call here.
+    #
+    # `sync`, not `install`: install adds what the lock requires but never REMOVES
+    # what it dropped, so a restored venv could keep serving a dependency that the
+    # PR deleted — imports would resolve in CI that fail on a clean machine. sync
+    # makes the environment match the lockfile exactly. (`install --sync` is the
+    # deprecated spelling in Poetry 2.x.)
+    - name: Install dependencies
+      if: inputs.install == 'true'
+      shell: bash
+      run: poetry sync --only=${{ inputs.groups }} --no-root

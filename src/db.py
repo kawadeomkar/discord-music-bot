@@ -18,9 +18,10 @@ the rollback story (§8.1), by design.
 
 import asyncio
 import hashlib
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 
@@ -65,7 +66,7 @@ def _discover(migrations_dir: Path) -> list[Path]:
     return files
 
 
-async def run_migrations(conn, migrations_dir: Path = MIGRATIONS_DIR) -> int:
+async def run_migrations(conn: Any, migrations_dir: Path = MIGRATIONS_DIR) -> int:
     """Apply pending migrations on `conn`; returns how many were applied.
     Caller holds the advisory lock (Database does) — this function only owns
     ledger bookkeeping and per-file transactions."""
@@ -153,7 +154,7 @@ class Database:
         return self._pool
 
     @asynccontextmanager
-    async def acquire(self):
+    async def acquire(self) -> AsyncIterator[Any]:
         """`async with db.acquire() as conn:` — connection from the (lazily
         created, migrated) pool."""
         pool = await self._ensure()
