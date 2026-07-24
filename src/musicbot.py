@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import math
 from dataclasses import dataclass
 from itertools import islice
 from typing import (
@@ -155,7 +156,14 @@ _PING_PROBING = 0x5865F2  # blurple: at least one row still pending
 
 
 def _latency_band(ms: float) -> tuple[str, int]:
-    return next((dot, hue) for cap, dot, hue in _LATENCY_BANDS if ms <= cap)
+    # Total over every float, INCLUDING nan (nan <= cap is always False): fall back
+    # to the worst band so an unknown latency can never StopIteration. discord.py's
+    # Client.latency is nan whenever the gateway ws is down (reconnect window), which
+    # is exactly when -ping is most likely to be run.
+    return next(
+        ((dot, hue) for cap, dot, hue in _LATENCY_BANDS if ms <= cap),
+        _LATENCY_BANDS[-1][1:],
+    )
 
 
 def _ping_dot(r: ProbeResult) -> str:
@@ -190,7 +198,13 @@ def render_ping_embed(
 
     Accent: any down/failed → red; else any still-pending → blurple; else the
     worst OK latency's band colour (same bands as the dots)."""
-    disc = ProbeResult("Discord gateway", ProbeState.OK, latency_ms=discord_ms)
+    # discord.py reports nan latency while the gateway ws is reconnecting — show it
+    # as down (red) rather than a bogus number, matching the old latency_color(nan).
+    disc = (
+        ProbeResult("Discord gateway", ProbeState.DOWN, detail="reconnecting")
+        if math.isnan(discord_ms)
+        else ProbeResult("Discord gateway", ProbeState.OK, latency_ms=discord_ms)
+    )
     rows = [disc, *results.values()]
     lat_lines = [_ping_line(r) for r in rows]
 

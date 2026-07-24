@@ -1725,6 +1725,16 @@ def _latency_field(embed: discord.Embed) -> str:
     return next(f.value for f in embed.fields if f.name == "Latency") or ""
 
 
+async def _until(cond: Any, tries: int = 2000) -> None:
+    """Yield to the loop until cond() is true (bounded), for interleaving a
+    running ping command with external state changes in a test."""
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("condition never became true")
+
+
 class TestPingCommand:
     async def test_posts_skeleton_via_channel_send_not_ctx_send(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1791,15 +1801,101 @@ class TestPingCommand:
         message.edit.assert_awaited()  # the deadline edit
         assert "failed" in _latency_field(message.edit.await_args.kwargs["embed"])
 
+    async def test_probe_resolving_mid_loop_edits_in_place(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The headline behavior: a probe that returns AFTER the skeleton send is
+        folded in on a tick and the message is edited from pending → its latency."""
+        message = _ping_message(mock_ctx)
+        monkeypatch.setattr(diagnostics, "PING_TICK_SECS", 0.01)
+        monkeypatch.setattr(diagnostics, "PING_DEADLINE_SECS", 5.0)
+
+        gate = asyncio.Event()
+
+        async def _gated(*a: Any, **k: Any) -> ProbeResult:
+            await gate.wait()
+            return ProbeResult("Spotify API", ProbeState.OK, latency_ms=42.0)
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.musicbot.diagnostics.probe_spotify", new=_gated):
+                task = asyncio.create_task(
+                    command_callback(MusicBot.ping)(music_bot, mock_ctx)
+                )
+                await _until(lambda: mock_ctx.channel.send.await_count == 1)
+                # skeleton: Spotify still pending, nothing edited yet
+                skeleton = mock_ctx.channel.send.await_args.kwargs["embed"]
+                assert "pending" in _latency_field(skeleton)
+                message.edit.assert_not_awaited()
+                gate.set()  # Spotify returns → next tick must edit
+                await task
+
+        message.edit.assert_awaited()
+        final = _latency_field(message.edit.await_args.kwargs["embed"])
+        assert "42 ms" in final and "pending" not in final
+
+    async def test_edit_on_deleted_message_is_tolerated(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_safe_edit: a host the user deleted mid-loop (edit → NotFound) must not
+        crash the command."""
+        message = _ping_message(mock_ctx)
+        message.edit = AsyncMock(
+            side_effect=discord.NotFound(MagicMock(status=404), "gone")
+        )
+        monkeypatch.setattr(diagnostics, "PING_TICK_SECS", 0.0)
+        monkeypatch.setattr(diagnostics, "PING_DEADLINE_SECS", 0.0)
+
+        never = asyncio.Event()
+
+        async def _hang(*a: Any, **k: Any) -> ProbeResult:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.musicbot.diagnostics.probe_spotify", new=_hang):
+                await command_callback(MusicBot.ping)(music_bot, mock_ctx)  # no raise
+
+        message.edit.assert_awaited()  # attempted the deadline edit, swallowed NotFound
+
+    async def test_nan_gateway_latency_renders_red_not_crash(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Regression: discord.py reports nan latency while reconnecting — the
+        embed must render (red 'down'), not raise and fall to the error path."""
+        _ping_message(mock_ctx)
+        mocked(music_bot.bot).latency = float("nan")
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        assert sent.color is not None and sent.color.value == 0x990000
+        assert "down" in _latency_field(sent)  # gateway row, not a crash
+
     async def test_join_uses_latency_line_not_the_dashboard(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Regression for §2.3 / C1: the internal join path must NOT run probes."""
-        spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
-        with patch("src.musicbot.diagnostics.probe_redis", new=spy):
-            await music_bot._send_latency_line(mock_ctx)
-        spy.assert_not_awaited()
-        mock_ctx.send.assert_awaited_once()  # cheap one-liner via ctx.send (NP-aware)
+        """Regression for §2.3 / C1: -join must post the cheap latency line and
+        must NOT run the dependency probes."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
+        mock_ctx.guild.change_voice_state = AsyncMock()
+        mp = MagicMock()
+        mp.store = None
+        mp.open_playback_gate = MagicMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._send_latency_line = AsyncMock()
+        redis_spy = AsyncMock(return_value=_probe(ProbeState.OK, 1.0))
+
+        with patch("src.musicbot.diagnostics.probe_redis", new=redis_spy):
+            await command_callback(MusicBot.join)(music_bot, mock_ctx)
+
+        music_bot._send_latency_line.assert_awaited_once_with(mock_ctx)
+        redis_spy.assert_not_awaited()  # no health dashboard on the join path
 
 
 class TestMaxConcurrencyNotice:
