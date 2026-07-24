@@ -1,10 +1,16 @@
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+from collections.abc import Sequence
+
+if TYPE_CHECKING:
+    from multiprocessing.queues import Queue
 
 import structlog
+from structlog.typing import EventDict, WrappedLogger
 from opentelemetry import trace
+from opentelemetry.context import Context
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace.sampling import (
     ALWAYS_ON,
@@ -13,14 +19,24 @@ from opentelemetry.sdk.trace.sampling import (
     SamplingResult,
 )
 from opentelemetry.semconv.resource import ResourceAttributes
+from opentelemetry.trace import Link, SpanKind
+from opentelemetry.trace.span import TraceState
+from opentelemetry.util.types import Attributes
 
 from src.config import ENVIRONMENT
+
+if TYPE_CHECKING:
+    # The SDK providers are imported lazily inside _setup_traces/_setup_logs so the
+    # exporter stack is only pulled in when telemetry is actually enabled. These
+    # type-only imports let the globals below carry their real types regardless.
+    from opentelemetry.sdk._logs import LoggerProvider
+    from opentelemetry.sdk.trace import TracerProvider
 
 _SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "discord-music-bot")
 _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
-_tracer_provider: Optional[object] = None
-_log_provider: Optional[object] = None
+_tracer_provider: Optional["TracerProvider"] = None
+_log_provider: Optional["LoggerProvider"] = None
 
 # discord.py makes these HTTP calls during startup with no user-visible parent.
 # Suppress them to avoid cluttering Tempo with orphaned root spans.
@@ -42,14 +58,14 @@ class _DiscordGatewayFilter(Sampler):
 
     def should_sample(
         self,
-        parent_context,
-        trace_id,
-        name,
-        kind=None,
-        attributes=None,
-        links=None,
-        trace_state=None,
-    ):
+        parent_context: Optional[Context],
+        trace_id: int,
+        name: str,
+        kind: Optional[SpanKind] = None,
+        attributes: Attributes = None,
+        links: Optional[Sequence[Link]] = None,
+        trace_state: Optional[TraceState] = None,
+    ) -> SamplingResult:
         url = str((attributes or {}).get("http.url", ""))
         if any(p in url for p in _DISCORD_INTERNAL_URL_PATTERNS):
             return SamplingResult(Decision.DROP)
@@ -82,21 +98,59 @@ def setup_telemetry() -> None:
 def shutdown_telemetry() -> None:
     """Flush and shut down OTel exporters. Called from MusicBotApp.close() via executor."""
     if _tracer_provider is not None:
-        _tracer_provider.force_flush()  # type: ignore[union-attr]
-        _tracer_provider.shutdown()  # type: ignore[union-attr]
+        _tracer_provider.force_flush()
+        _tracer_provider.shutdown()
     if _log_provider is not None:
-        _log_provider.force_flush()  # type: ignore[union-attr]
-        _log_provider.shutdown()  # type: ignore[union-attr]
+        _log_provider.force_flush()
+        _log_provider.shutdown()
 
 
 def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
 
 
+def configure_worker_logging(log_queue: Optional["Queue"] = None) -> None:
+    """Configure structured logging inside a subprocess (the yt-dlp extraction pool
+    workers — see ytdlp_pool.YtdlpPool._spawn_process_pool, which passes the wrapper
+    _worker_init so a failure here can never break the pool).
+
+    Runs structlog setup, then — when a log_queue is supplied (production; the thread-pool
+    test seam passes none) — routes the worker's records to the parent instead of standing
+    up a redundant OTLP exporter and TracerProvider in every worker (Option B,
+    docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §12.2):
+
+      * The stdout StreamHandler that _configure_structlog installs is *replaced* by a
+        logging.handlers.QueueHandler. Replaced, not added: the parent re-emits every
+        record it drains, so keeping the worker's own stdout handler would double-print.
+      * worker_id (multiprocessing.current_process().name, e.g. 'SpawnProcess-1') is bound
+        as a structlog contextvar so it lands on every worker log line. Stable and free —
+        no coordination with the parent.
+
+    yt-dlp's warnings (the SABR / PO-token / signature early-warning system routed via
+    youtube._YtdlpLogger) therefore reach Loki through the parent's existing LoggingHandler,
+    carrying worker_id and — via run()'s context propagation — the originating trace_id."""
+    _configure_structlog()
+    if log_queue is None:
+        return
+    import logging.handlers
+    import multiprocessing
+
+    root = logging.root
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.addHandler(logging.handlers.QueueHandler(log_queue))
+    root.setLevel(logging.INFO)
+    structlog.contextvars.bind_contextvars(
+        worker_id=multiprocessing.current_process().name
+    )
+
+
 # ── Internal setup ────────────────────────────────────────────────────────────
 
 
-def _add_otel_context(logger, method, event_dict):
+def _add_otel_context(
+    logger: WrappedLogger, method: str, event_dict: EventDict
+) -> EventDict:
     """Structlog processor: inject trace_id and span_id into every log event."""
     span = trace.get_current_span()
     ctx = span.get_span_context()
@@ -106,7 +160,9 @@ def _add_otel_context(logger, method, event_dict):
     return event_dict
 
 
-def _add_environment(logger, method, event_dict):
+def _add_environment(
+    logger: WrappedLogger, method: str, event_dict: EventDict
+) -> EventDict:
     """Structlog processor: stamp every log event with the current environment."""
     event_dict["environment"] = ENVIRONMENT
     return event_dict

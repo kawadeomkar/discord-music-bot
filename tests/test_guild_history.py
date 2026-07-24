@@ -6,6 +6,9 @@ cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
 truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
 """
 
+import redis.asyncio as aioredis
+from typing import Any, cast
+from redis.asyncio import Redis
 import pytest
 
 from src.guild_history import GuildHistory
@@ -30,24 +33,26 @@ def _entry(n: int) -> HistoryEntry:
 
 
 @pytest.fixture
-def store(fake_redis):
+def store(fake_redis: aioredis.Redis) -> GuildRedisStore:
     return GuildRedisStore(fake_redis, guild_id=42)
 
 
 class TestAdd:
-    async def test_appends_and_mirrors_to_redis(self, store):
+    async def test_appends_and_mirrors_to_redis(self, store: GuildRedisStore) -> None:
         h = GuildHistory(store)
         await h.add(_entry(1))
         await h.add(_entry(2))
         assert list(h) == [_entry(1), _entry(2)]  # oldest first
         assert await store.get_history() == [_entry(2), _entry(1)]
 
-    async def test_works_without_store(self):
+    async def test_works_without_store(self) -> None:
         h = GuildHistory(None)
         await h.add(_entry(1))
         assert list(h) == [_entry(1)]
 
-    async def test_cache_capped_redis_leg_unbounded(self, store, fake_redis):
+    async def test_cache_capped_redis_leg_unbounded(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
         h = GuildHistory(store)
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await h.add(_entry(i))
@@ -58,7 +63,9 @@ class TestAdd:
         raw = await fake_redis.lrange(store.history_key(), 0, -1)
         assert len(raw) == HISTORY_CACHE_LIMIT + 5
 
-    async def test_cache_matches_newest_slice_of_redis(self, store):
+    async def test_cache_matches_newest_slice_of_redis(
+        self, store: GuildRedisStore
+    ) -> None:
         h = GuildHistory(store)
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await h.add(_entry(i))
@@ -72,13 +79,17 @@ class TestAddOutboxGating:
     configured. Write path only — recent() is untouched until the Phase C
     read flip."""
 
-    async def test_no_archive_means_no_outbox(self, store, fake_redis):
+    async def test_no_archive_means_no_outbox(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
         h = GuildHistory(store)
         await h.add(_entry(1))
         assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
 
-    async def test_archive_routes_entry_to_outbox_too(self, store, fake_redis):
-        h = GuildHistory(store, archive=object(), guild_id=42)
+    async def test_archive_routes_entry_to_outbox_too(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        h = GuildHistory(store, archive=cast(Any, object()), guild_id=42)
         await h.add(_entry(1))
         assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
             _entry(1).to_redis()
@@ -87,38 +98,47 @@ class TestAddOutboxGating:
         assert list(h) == [_entry(1)]
         assert await store.get_history() == [_entry(1)]
 
-    async def test_notify_fires_once_per_add_with_archive(self, store):
+    async def test_notify_fires_once_per_add_with_archive(
+        self, store: GuildRedisStore
+    ) -> None:
         calls = []
         h = GuildHistory(
-            store, archive=object(), guild_id=42, on_outbox_push=lambda: calls.append(1)
+            store,
+            archive=cast(Any, object()),
+            guild_id=42,
+            on_outbox_push=lambda: calls.append(1),
         )
         await h.add(_entry(1))
         await h.add(_entry(2))
         assert len(calls) == 2
 
-    async def test_notify_not_fired_without_archive(self, store):
+    async def test_notify_not_fired_without_archive(
+        self, store: GuildRedisStore
+    ) -> None:
         calls = []
         h = GuildHistory(store, on_outbox_push=lambda: calls.append(1))
         await h.add(_entry(1))
         assert calls == []
 
-    async def test_no_store_skips_outbox_and_notify(self):
+    async def test_no_store_skips_outbox_and_notify(self) -> None:
         # Without Redis there is nowhere to buffer — degrade to memory-only
         # exactly as before the archive existed.
         calls = []
-        h = GuildHistory(None, archive=object(), on_outbox_push=lambda: calls.append(1))
+        h = GuildHistory(
+            None, archive=cast(Any, object()), on_outbox_push=lambda: calls.append(1)
+        )
         await h.add(_entry(1))
         assert list(h) == [_entry(1)]
         assert calls == []
 
 
 class TestRestore:
-    def test_reverses_newest_first_input(self):
+    def test_reverses_newest_first_input(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(3), _entry(2), _entry(1)])
         assert list(h) == [_entry(1), _entry(2), _entry(3)]
 
-    def test_restore_respects_cache_limit(self):
+    def test_restore_respects_cache_limit(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(i) for i in range(HISTORY_CACHE_LIMIT + 10)])
         assert len(h) == HISTORY_CACHE_LIMIT
@@ -126,26 +146,28 @@ class TestRestore:
 
 
 class TestRecent:
-    async def test_newest_first_selection(self):
+    async def test_newest_first_selection(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(3), _entry(2), _entry(1)])  # newest-first input
         assert await h.recent(2) == [_entry(3), _entry(2)]
 
-    async def test_limit_larger_than_history_returns_all(self):
+    async def test_limit_larger_than_history_returns_all(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
 
-    async def test_nonpositive_limit_returns_nothing(self):
+    async def test_nonpositive_limit_returns_nothing(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(1)])
         assert await h.recent(0) == []
         assert await h.recent(-1) == []
 
-    async def test_empty_history(self):
+    async def test_empty_history(self) -> None:
         assert await GuildHistory(None).recent(10) == []
 
-    async def test_reads_persisted_when_cache_cold(self, store):
+    async def test_reads_persisted_when_cache_cold(
+        self, store: GuildRedisStore
+    ) -> None:
         """After a clean stop+restart the cache is empty but Redis still holds
         history — recent() must surface it from the store."""
         seed = GuildHistory(store)
@@ -155,14 +177,14 @@ class TestRecent:
         assert len(cold) == 0
         assert await cold.recent(10) == [_entry(2), _entry(1), _entry(0)]
 
-    async def test_falls_back_to_cache_without_store(self):
+    async def test_falls_back_to_cache_without_store(self) -> None:
         h = GuildHistory(None)
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
 
 
 class TestSequenceProtocol:
-    def test_len_iter_getitem(self):
+    def test_len_iter_getitem(self) -> None:
         # The -history command and tests read the cache as a plain sequence.
         h = GuildHistory(None)
         h.restore([_entry(2), _entry(1)])
@@ -170,5 +192,5 @@ class TestSequenceProtocol:
         assert h[0] == _entry(1)
         assert list(h) == [_entry(1), _entry(2)]
 
-    def test_empty_is_falsy(self):
+    def test_empty_is_falsy(self) -> None:
         assert not GuildHistory(None)

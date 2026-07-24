@@ -8,8 +8,24 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Local poetry config — Dockerfile sets virtualenvs.create false explicitly
+# Local poetry config. The Dockerfile sets POETRY_VIRTUALENVS_IN_PROJECT=1 itself,
+# so this file is redundant inside the image — and excluding it keeps a developer's
+# local poetry settings from changing how the image resolves its venv.
 poetry.toml
+
+# Not copied by any stage, but every `docker build .` uploads them as build context
+# first. .git/ alone is the bulk of it, and `DOCKER=1 just check` pays that cost on
+# the path sold as "the fast way in for someone with no Python toolchain".
+.git/
+.gitignore
+.github/
+docs/
+.ruff_cache/
+coverage.json
+pytest.xml
+pytest-coverage.txt
+requirements-audit.txt
+*.md
 
 # Dev/local files
 .env

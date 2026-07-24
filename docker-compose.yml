@@ -17,7 +17,7 @@ services:
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
       # Built from the same POSTGRES_* vars as the postgres service below, so the
       # password lives in exactly one place (.env). Overrides any POSTGRES_URL in
-      # the env_file. Comment this out to disable the archive (see main.py:113).
+      # the env_file. Comment this out to disable the archive (see MusicBotApp.setup_hook).
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/${POSTGRES_DB:-musicbot}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a

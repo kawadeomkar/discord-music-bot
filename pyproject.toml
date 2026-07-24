@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "0.1.0"
+version = "1.0.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -35,19 +35,115 @@ opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
 asyncpg = ">=0.30"
 
+# The three groups below are optional, which is what makes `--with` mean anything.
+# Poetry installs every NON-optional group by default and `--with` is documented as
+# "the optional dependency groups to include" — so while these were non-optional,
+# `just install`'s `--with test,lint,dev` selected nothing that a bare `poetry install`
+# had not already installed, and the README's claim that it added the toolchain was
+# false. Worse in the other direction: the "just run the bot" reader was told Docker
+# and credentials were the whole list, then handed a `poetry install` that pulled
+# pyright and its ~110MB bundled Node runtime.
+#
+# `--only=` is unaffected by this flag — it selects groups explicitly — so the
+# Dockerfile stages and CI's composite action keep resolving exactly as before.
+[tool.poetry.group.test]
+optional = true
+
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
 fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
+# Opt-in Postgres integration tier (tests/test_pg_integration.py, marker `pg`).
+# Only imported when RUN_PG_TESTS=1; needs Docker.
+testcontainers = ">=4.8"
+
+[tool.poetry.group.lint]
+optional = true
 
 [tool.poetry.group.lint.dependencies]
-pyright = "^1.1.409"
-ruff = "^0.15.20"
+# The `nodejs` extra is not optional in practice. The pyright PyPI package is a
+# Python wrapper around a JavaScript analyzer (site-packages/pyright/dist/index.js),
+# so it needs a Node runtime that poetry cannot otherwise provide. Without the
+# extra it silently borrows whatever Node is lying around — Homebrew's on a Mac,
+# the preinstalled one on GitHub's runners — and on a machine with none (every
+# python:3.14-slim container, and any clean dev box) it falls back to downloading
+# its own via nodeenv: 438MB, re-fetched on every `docker run --rm`. The extra
+# pulls nodejs-wheel-binaries instead, which puts Node in poetry.lock and makes
+# host, CI and container resolve the same way.
+#
+# Exact-pinned like ruff, pre-commit and rust-just, and for the same reason: the
+# version CI runs and the version developers run must not drift. pyright is the one
+# where drift is most visible, because its point releases add new diagnostics — a
+# Dependabot bump inside a caret range turns an untouched PR red at the `types` step
+# while everyone who has not re-run `just install` still passes locally. The range
+# had already drifted once: the floor read ^1.1.409 while the lock resolved 1.1.411.
+pyright = { version = "1.1.411", extras = ["nodejs"] }
+# Exact-pinned, like yt-dlp and discord-py, because a second file has to agree
+# with it: .pre-commit-config.yaml pins the ruff hook by `rev`, and the hook runs
+# ruff from its own isolated environment. Under a caret range any `poetry update`
+# moved this side silently and the hook then formatted to a different version
+# than `just lint` and CI checked. Bump both in the same commit.
+ruff = "0.15.21"
+pre-commit = "^4.6.0"
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+# The task runner. Its own group because the two consumers cut across the existing
+# ones: CI's lint job installs main,lint,test and its test job installs main,test,
+# and BOTH call `just`. A group they can each add is the only placement that gives
+# them one binary from one pin — with `rust-just` in `lint`, the test job would have
+# to pull in pyright and its bundled Node just to get a task runner. It also keeps
+# `just` out of the test image, which installs main,test,lint and has no use for a
+# 4.9MB binary.
+#
+# Pinned like ruff and pre-commit and for the same reason: the version CI runs and the
+# version developers run must not drift. `rust-just` is the upstream `just` binary
+# republished on PyPI, so this is the same artifact either way.
+#
+# This is NOT a bootstrap. A venv's bin/ is not on PATH unless the venv is activated,
+# so `poetry install` followed by a bare `just` only works for an activated shell —
+# contributors install `just` system-wide (see README), which is also what makes the
+# pre-push hook work. Keep this >= the justfile's `set minimum-version`.
+rust-just = "1.57.0"
 
 [tool.pyright]
+# The single source of truth for pyright, read by both CI and Pylance. Settings
+# lived here AND in a gitignored pyrightconfig.json, which silently won wherever
+# it existed — so editors ran one config and CI another. Do not reintroduce that
+# file: pyrightconfig.json takes precedence over this section and would make
+# everything below dead config again.
 pythonVersion = "3.14"
 typeCheckingMode = "basic"
+# No venvPath/venv here, deliberately. Hardcoding ./.venv made pyright resolve
+# imports from that directory regardless of which environment was actually in
+# use — and on a pyenv-virtualenv box `poetry install` lands in $VIRTUAL_ENV
+# instead, leaving ./.venv stale. `just types` then type-checked a package set
+# that `just lint` and `just test` never saw, which is exactly the "green
+# locally, red in CI" failure `just check` exists to prevent. Each caller now
+# names the interpreter it means: `just types` passes --pythonpath VENV_BIN, CI
+# calls that same recipe rather than running pyright itself, and editors follow
+# the interpreter you select. (The pyrightconfig.json warning above still stands
+# — that file would override all of this.)
+#
+# main re-added venvPath/venv in the merge that brought the rule below. Dropped
+# again here rather than kept: it is the exact configuration this branch removed,
+# and it fails SILENTLY — a missing ./.venv makes pyright warn and exit 0, so CI
+# goes green having type-checked nothing.
+
+# Arrived from main with PR #87's typing work, and kept: `basic` mode does not
+# require parameter annotations on its own. Checked against the bundled analyzer
+# rather than taken on faith — this section used to carry `reportMissingReturnType`,
+# which is not a pyright rule at all and silenced nothing the whole time it sat here.
+reportMissingParameterType = "error"
+# Without this, an unnecessary suppression is invisible. The mypy-style
+# `# type: ignore[code]` comments this repo used to carry were blanket pyright
+# suppressions (there is no mypy here): 11 of them silenced nothing, and the
+# rest hid 12 real errors. Prefer `# pyright: ignore[reportSomeRule]`, which
+# names the rule and trips this check once it stops being needed.
+reportUnnecessaryTypeIgnoreComment = "error"
 
 [tool.ruff]
 target-version = "py314"
@@ -55,11 +151,33 @@ target-version = "py314"
 # imports, undefined names, and import placement. ruff format is black-compatible
 # and replaces black as the formatter.
 
+[tool.ruff.lint]
+# Return-annotation enforcement lives here, not in [tool.pyright]. This section
+# replaces a `reportMissingReturnType = "error"` key that pyright never
+# implemented: pyright reports unrecognized settings on stderr without changing
+# its exit code, so CI read a clean pass out of a rule that was never evaluated.
+# Anything added here must be a rule the tool actually has — verify with
+# `ruff rule <CODE>` before adding.
+extend-select = ["ANN"]
+# ANN401 (`Any` in a signature) is the one ANN rule that is not mechanical: the
+# `Any`s in this repo are load-bearing at the yt-dlp and discord.py boundaries,
+# where the upstream types are genuinely dynamic. Narrowing the ones that *can*
+# be narrowed is tracked separately (see docs/TYPING_BRANCH_REVIEW_FIXES_PLAN.md
+# Phase 2); enabling the rule now would bury the 4 real return-type gaps under
+# 94 judgement calls.
+ignore = ["ANN401"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing"
+markers = [
+    # Opt-in integration tier against a real Postgres (testcontainers).
+    # Auto-skipped unless RUN_PG_TESTS=1; run with:
+    #   RUN_PG_TESTS=1 poetry run pytest -m pg --no-cov
+    "pg: real-Postgres integration test (needs Docker; opt-in via RUN_PG_TESTS=1)",
+]
 filterwarnings = [
     "error",
     # audioop was removed in Python 3.13 but discord.py's Ogg/Opus parser still

@@ -24,9 +24,10 @@ imports, and asyncpg is very much a runtime import.
 import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import Optional, Protocol
+from typing import Any, Optional, Protocol
 
 import asyncpg
+import redis.asyncio as aioredis
 
 from src.guild_state import HistoryEntry, parse_history_entry
 from src.redis_client import outbox_depth, peek_outbox_oldest, retire_outbox
@@ -92,7 +93,7 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
     )
 
 
-def _row_to_entry(row) -> HistoryEntry:
+def _row_to_entry(row: Any) -> HistoryEntry:
     return HistoryEntry(
         guild_id=row["guild_id"],
         title=row["title"],
@@ -166,6 +167,11 @@ class PostgresHistoryArchive:
         return [_row_to_entry(r) for r in rows]
 
     async def close(self) -> None:
+        # _pool is nulled before the await deliberately. This is safe ONLY
+        # because MusicBotApp.close() runs drainer.stop() (which finishes or
+        # cancels all draining) strictly before archive.close(), so no _ensure()
+        # can race a second pool into existence during the await. Do not reorder
+        # those two closes, or shutdown could leak a freshly-built pool.
         pool = self._pool
         self._pool = None
         if pool is not None:
@@ -190,7 +196,7 @@ class HistoryOutboxDrainer:
     _BACKOFF_START = 1.0
     _BACKOFF_MAX = 60.0
 
-    def __init__(self, redis, archive: HistoryArchive) -> None:
+    def __init__(self, redis: aioredis.Redis, archive: HistoryArchive) -> None:
         self._redis = redis
         self._archive = archive
         self._wake = asyncio.Event()
@@ -198,6 +204,23 @@ class HistoryOutboxDrainer:
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="history-outbox-drainer")
+        self._task.add_done_callback(self._on_task_done)
+
+    @staticmethod
+    def _on_task_done(task: "asyncio.Task[None]") -> None:
+        """Last-resort supervision: _run only ever exits via cancellation, so
+        any exception surfacing here is a bug — log it loudly the moment it
+        happens (not at shutdown), because a dead drainer means the outbox
+        grows silently until restart."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error(
+                f"history outbox drainer died unexpectedly "
+                f"({type(exc).__name__}: {exc}); entries will accumulate in "
+                f"the Redis outbox until the next start"
+            )
 
     def notify(self) -> None:
         """Signal a fresh outbox push — cheap, sync, callable from anywhere."""

@@ -100,6 +100,16 @@ class GuildHistory:
                 return persisted[:limit]
         return list(self._entries)[-limit:][::-1]
 
+    @property
+    def latest(self) -> Optional[HistoryEntry]:
+        """The most recently played song, or None when the cache is cold.
+
+        Cache-only (unlike recent(), which prefers the Redis list) so callers
+        on a latency-sensitive path get an answer without a round-trip;
+        restore() has already refilled the cache from Redis by the time
+        anything reads this after a restart."""
+        return self._entries[-1] if self._entries else None
+
     def __len__(self) -> int:
         return len(self._entries)
 
