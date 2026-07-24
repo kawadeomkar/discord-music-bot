@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 
 from src import diagnostics, telemetry
 from src.diagnostics import ProbeState
@@ -27,12 +28,35 @@ class TestProbeRedis:
         assert r.state is ProbeState.OK
         assert r.latency_ms is not None and r.latency_ms >= 0
 
+    async def test_exercises_the_write_path_not_just_ping(
+        self, fake_redis: Redis
+    ) -> None:
+        # PING alone would stay green while Redis refuses writes (MISCONF/OOM/
+        # READONLY), so the probe must actually write a short-TTL key.
+        await diagnostics.probe_redis(fake_redis)
+        assert await fake_redis.get(diagnostics._REDIS_HEALTH_KEY) == b"1"
+        assert 0 < await fake_redis.ttl(diagnostics._REDIS_HEALTH_KEY) <= 30
+
     async def test_ping_error_is_down(self) -> None:
         client = MagicMock()
         client.ping = AsyncMock(side_effect=ConnectionError("boom"))
         r = await diagnostics.probe_redis(client)
         assert r.state is ProbeState.DOWN
         assert r.detail == "ConnectionError"
+
+    async def test_write_refused_is_down_with_the_server_code(self) -> None:
+        """Reads fine, writes refused — the exact shape of the live MISCONF outage."""
+        client = MagicMock()
+        client.ping = AsyncMock(return_value=True)
+        client.set = AsyncMock(
+            side_effect=ResponseError(
+                "MISCONF Redis is configured to save RDB snapshots, but is "
+                "currently unable to persist to disk."
+            )
+        )
+        r = await diagnostics.probe_redis(client)
+        assert r.state is ProbeState.DOWN
+        assert r.detail == "MISCONF"  # not the useless "ResponseError"
 
 
 # ── Spotify ────────────────────────────────────────────────────────────────────
@@ -151,6 +175,22 @@ class TestTimed:
 
         r = await diagnostics._timed("x", body)
         assert r.state is ProbeState.OK and r.latency_ms is not None
+
+
+class TestErrorDetail:
+    @pytest.mark.parametrize(
+        "exc,expected",
+        [
+            (ResponseError("MISCONF cannot persist to disk"), "MISCONF"),
+            (ResponseError("OOM command not allowed"), "OOM"),
+            (ResponseError("READONLY You can't write against a replica"), "READONLY"),
+            (ConnectionError("Connection refused"), "ConnectionError"),
+            (ResponseError("some lowercase message"), "ResponseError"),
+            (ValueError(""), "ValueError"),
+        ],
+    )
+    def test_prefers_the_server_error_code(self, exc: Exception, expected: str) -> None:
+        assert diagnostics._error_detail(exc) == expected
 
 
 # ── Versions ───────────────────────────────────────────────────────────────────

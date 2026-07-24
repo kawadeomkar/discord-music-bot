@@ -70,13 +70,18 @@ def _ping_dot(r: ProbeResult) -> str:
 def _ping_value(r: ProbeResult) -> str:
     if r.state is ProbeState.OK:
         return f"{round(r.latency_ms or 0)} ms"
-    return {
+    word = {
         ProbeState.PENDING: "pending…",
         ProbeState.NA: "n/a",
         ProbeState.OFF: "off",
         ProbeState.DOWN: "down",
         ProbeState.FAILED: "failed",
     }[r.state]
+    # A bare "down" makes an operator go read logs; the reason (MISCONF, OOM,
+    # ConnectionError) is the actionable half and costs one short parenthetical.
+    if r.state is ProbeState.DOWN and r.detail:
+        return f"{word} ({r.detail})"
+    return word
 
 
 def _ping_line(r: ProbeResult) -> str:

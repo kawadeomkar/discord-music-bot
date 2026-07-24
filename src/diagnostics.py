@@ -44,6 +44,12 @@ log = get_logger(__name__)
 PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
 PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
 
+# Throwaway key the Redis probe writes to prove the write path is open (see
+# probe_redis). Namespaced away from guild:* / spotify:* and self-expiring, so it
+# never accumulates and can't collide with real state.
+_REDIS_HEALTH_KEY = "health:ping"
+_REDIS_HEALTH_TTL_SECS = 30
+
 _FFMPEG_PROBE_TIMEOUT_SECS = 2.0
 _ffmpeg_version_cache: Optional[str] = None
 _bot_version_cache: Optional[str] = None
@@ -65,7 +71,21 @@ class ProbeResult:
     label: str
     state: ProbeState
     latency_ms: Optional[float] = None  # set only when state is OK
-    detail: Optional[str] = None  # short error class, for the span/logs
+    detail: Optional[str] = None  # short failure reason; rendered next to "down"
+
+
+def _error_detail(e: Exception) -> str:
+    """A short, renderable reason for a failed probe.
+
+    Server-side Redis errors lead with an uppercase code — MISCONF (persistence
+    broken), OOM (maxmemory + noeviction), READONLY (replica) — which says far
+    more to an operator than the redis-py exception class ("ResponseError").
+    Falls back to the exception class name for everything else.
+    """
+    head = str(e).split(maxsplit=1)[0] if str(e) else ""
+    if head.isalpha() and head.isupper() and 2 < len(head) <= 12:
+        return head
+    return type(e).__name__
 
 
 async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResult:
@@ -81,7 +101,7 @@ async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResu
         raise
     except Exception as e:  # noqa: BLE001 — a probe must never raise out
         log.warning(f"{label} probe failed: {type(e).__name__}: {e}")
-        return ProbeResult(label, ProbeState.DOWN, detail=type(e).__name__)
+        return ProbeResult(label, ProbeState.DOWN, detail=_error_detail(e))
     ms = (time.perf_counter() - start) * 1000
     return ProbeResult(label, ProbeState.OK, latency_ms=ms)
 
@@ -90,9 +110,23 @@ async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResu
 
 
 async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
+    """PING *and* a throwaway write.
+
+    PING alone is misleading: Redis keeps serving reads while refusing writes —
+    MISCONF after a failed bgsave (observed live: full disk → every guild's state
+    write failing while -ping still showed green), OOM under maxmemory+noeviction,
+    READONLY on a replica. The bot writes guild state, queues and history
+    constantly, so a probe that never writes isn't measuring what the bot needs.
+    One short-TTL key, self-expiring, is enough to exercise the write path.
+    """
     if redis is None:
         return ProbeResult("Redis", ProbeState.NA)
-    return await _timed("Redis", lambda: redis.ping())
+
+    async def _do() -> None:
+        await redis.ping()
+        await redis.set(_REDIS_HEALTH_KEY, b"1", ex=_REDIS_HEALTH_TTL_SECS)
+
+    return await _timed("Redis", _do)
 
 
 async def probe_spotify(spotify: Spotify) -> ProbeResult:

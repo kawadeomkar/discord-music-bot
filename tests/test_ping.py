@@ -7,10 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from opentelemetry import trace
 
 from src import diagnostics
 from src.diagnostics import ProbeResult, ProbeState
 from src.musicbot import MusicBot
+from src.ping import render_ping_embed
 from tests.helpers import command_callback, mocked
 
 
@@ -235,3 +237,28 @@ class TestPingCommand:
 
         latency_line.assert_awaited_once()
         redis_spy.assert_not_awaited()  # no health dashboard on the join path
+
+
+class TestDownReasonRendering:
+    """A bare "down" sends the operator to the logs; the server's reason code is
+    the actionable half (regression for the live MISCONF outage)."""
+
+    def test_down_row_shows_the_reason(self) -> None:
+        results = {
+            "Redis": ProbeResult("Redis", ProbeState.DOWN, detail="MISCONF"),
+        }
+        versions: dict[str, str] = dict.fromkeys(
+            ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
+        )
+        embed = render_ping_embed(results, versions, 42.0, trace.get_current_span())
+        latency = next(f.value for f in embed.fields if f.name == "Latency") or ""
+        assert "down (MISCONF)" in latency
+
+    def test_down_without_detail_stays_bare(self) -> None:
+        results = {"Redis": ProbeResult("Redis", ProbeState.DOWN)}
+        versions: dict[str, str] = dict.fromkeys(
+            ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
+        )
+        embed = render_ping_embed(results, versions, 42.0, trace.get_current_span())
+        latency = next(f.value for f in embed.fields if f.name == "Latency") or ""
+        assert "down" in latency and "(" not in latency
