@@ -141,8 +141,11 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
     return await _timed("Redis", _do)
 
 
-async def probe_spotify(spotify: Spotify) -> ProbeResult:
-    if not (spotify.client_id and spotify.client_secret):
+async def probe_spotify(spotify: Optional[Spotify]) -> ProbeResult:
+    # spotify is None when the bot was started without Spotify credentials (the
+    # feature is off entirely); a non-None client with empty creds is the same story
+    # from a probe's point of view. Both are "not configured" → N/A, not a failure.
+    if spotify is None or not (spotify.client_id and spotify.client_secret):
         return ProbeResult("Spotify API", ProbeState.NA)
 
     async def _do() -> None:
@@ -420,7 +423,7 @@ async def run_health_dashboard(
     *,
     bot_latency: float,
     redis: Optional[aioredis.Redis],
-    spotify: Spotify,
+    spotify: Optional[Spotify],
     pg_pool: Optional[object] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md §5).

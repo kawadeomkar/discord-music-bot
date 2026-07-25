@@ -325,6 +325,12 @@ class TestProbeSpotify:
             http_call=http_call,
         )
 
+    async def test_none_is_na(self) -> None:
+        # spotify is None when the bot was started without Spotify credentials
+        # (optional-Spotify feature): the probe reports N/A, not a failure.
+        r = await ping.probe_spotify(None)
+        assert r.state is ProbeState.NA
+
     async def test_no_credentials_is_na(self) -> None:
         r = await ping.probe_spotify(self._spotify(AsyncMock(), creds=False))  # type: ignore[arg-type]
         assert r.state is ProbeState.NA
