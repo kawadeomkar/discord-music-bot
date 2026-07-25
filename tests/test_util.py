@@ -3,8 +3,16 @@
 from typing import Any
 import logging
 
+import pytest
+
 from src.guild_state import HistoryEntry
-from src.util import fmt_duration, get_logger, history_embeds, queue_message
+from src.util import (
+    fmt_duration,
+    get_logger,
+    history_embeds,
+    pluralize,
+    queue_message,
+)
 
 
 class TestQueueMessage:
@@ -87,6 +95,56 @@ class TestGetLogger:
         logger_b = get_logger("module.b")
         assert logger_a is not logger_b
         assert logger_a.name != logger_b.name
+
+
+class TestPluralize:
+    """The one noun-form helper. Every embed and command line that used to spell
+    `f"song{'s' if n != 1 else ''}"` inline routes through this, so its
+    boundaries are user-visible text in ~7 places."""
+
+    @pytest.mark.parametrize(
+        "count,expected",
+        [
+            (1, "song"),
+            (2, "songs"),
+            (0, "songs"),  # English pluralizes zero — "0 songs", not "0 song"
+            (-1, "songs"),
+            (100, "songs"),
+        ],
+    )
+    def test_only_exactly_one_is_singular(self, count: int, expected: str) -> None:
+        """The rule is `count == 1`, not `count <= 1`.
+
+        0 and -1 are the cases that separate the two: relaxing the condition to
+        `<= 1` would render "0 song" and "-1 song" and pass every other test.
+        """
+        assert pluralize(count, "song") == expected
+
+    def test_plural_override_used_for_irregulars(self) -> None:
+        assert pluralize(2, "person", "people") == "people"
+
+    def test_plural_override_ignored_when_singular(self) -> None:
+        assert pluralize(1, "person", "people") == "person"
+
+    @pytest.mark.parametrize("count", [0, -1, 3])
+    def test_plural_override_applies_to_every_non_one_count(self, count: int) -> None:
+        """The override must not be reachable only via count > 1 — the zero and
+        negative paths share the same branch and were previously unexercised."""
+        assert pluralize(count, "person", "people") == "people"
+
+    def test_explicit_none_plural_falls_back_to_s_suffix(self) -> None:
+        """`plural=None` must mean "derive it", not "return None"."""
+        assert pluralize(3, "song", None) == "songs"
+
+    def test_empty_plural_override_is_honored_not_treated_as_missing(self) -> None:
+        """`plural=""` is falsy but explicitly passed. The implementation tests
+        `is not None`, so it must be respected; an `if plural:` regression would
+        silently emit "s" instead."""
+        assert pluralize(3, "song", "") == ""
+
+    def test_singular_returned_verbatim(self) -> None:
+        """No suffix logic on the singular branch — multi-word nouns survive."""
+        assert pluralize(1, "queued song") == "queued song"
 
 
 class TestFmtDuration:

@@ -27,6 +27,7 @@ from src.youtube import (
     _YTDL_STREAM_SEARCH_OPTS,
     _enrich_queueobject,
     _record_serving_format,
+    _run_extract,
     _slim_info,
     _stream_url_playable,
     _stream_url_ttl,
@@ -1638,3 +1639,97 @@ class TestExtractionErrorClassification:
             ExtractionError("", expected=True).user_message
             == "Couldn't load this track."
         )
+
+
+class TestRunExtract:
+    """`_run_extract` — the single call site for _ytdlp_extract. Every extraction
+    path (prefetch_stream, _resolve_playable_stream, yt_source, yt_playlist)
+    routes through it, so its argument order and defaults are load-bearing four
+    times over.
+
+    _ytdlp_extract takes (url, opts, download, process) POSITIONALLY across the
+    process boundary. _run_extract's own download/process are keyword-only, so a
+    transposition here is invisible at the call sites and at type-check time —
+    both are bool — and would silently swap "download this" with "process this".
+    """
+
+    async def test_forwards_arguments_in_ytdlp_extract_positional_order(self) -> None:
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(return_value={"title": "T"})
+            await _run_extract("https://yt.com/v=x", {"quiet": True})
+
+        fn, url, opts, download, process = mock_pool.run.call_args[0]
+        assert url == "https://yt.com/v=x"
+        assert opts == {"quiet": True}
+        assert download is False
+        assert process is True
+
+    async def test_submits_the_module_level_ytdlp_extract(self) -> None:
+        """The callable must be resolved per call, not captured at def time.
+
+        ~29 tests and tests/conftest.py patch `src.youtube._ytdlp_extract` and
+        `src.youtube.ytdlp_pool`; capturing either at import would make every
+        one of those patches silently ineffective.
+        """
+        sentinel = MagicMock(name="patched_extract")
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(return_value=None)
+            with patch("src.youtube._ytdlp_extract", sentinel):
+                await _run_extract("https://yt.com/v=x", {})
+
+        assert mock_pool.run.call_args[0][0] is sentinel
+
+    async def test_uses_the_pool_bound_at_call_time(self) -> None:
+        """Same seam for the pool itself — conftest swaps in a thread pool."""
+        with patch("src.youtube.ytdlp_pool") as first:
+            first.run = AsyncMock(return_value=None)
+            await _run_extract("https://yt.com/v=x", {})
+        with patch("src.youtube.ytdlp_pool") as second:
+            second.run = AsyncMock(return_value=None)
+            await _run_extract("https://yt.com/v=y", {})
+
+        first.run.assert_awaited_once()
+        second.run.assert_awaited_once()
+
+    @pytest.mark.parametrize("download", [True, False])
+    @pytest.mark.parametrize("process", [True, False])
+    async def test_both_flags_forwarded_independently(
+        self, download: bool, process: bool
+    ) -> None:
+        """Guards the transposition case: with both flags exercised in all four
+        combinations, swapping the two positions fails two of them."""
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(return_value=None)
+            await _run_extract(
+                "https://yt.com/v=x", {}, download=download, process=process
+            )
+
+        assert mock_pool.run.call_args[0][3] is download
+        assert mock_pool.run.call_args[0][4] is process
+
+    async def test_flags_are_keyword_only(self) -> None:
+        """`*` in the signature is deliberate: `_run_extract(url, opts, True)`
+        must not silently mean download=True."""
+        with pytest.raises(TypeError):
+            await _run_extract("https://yt.com/v=x", {}, True)  # pyright: ignore[reportCallIssue]
+
+    async def test_returns_the_pool_result_unchanged(self) -> None:
+        """No post-processing here — _slim_info already ran in the worker."""
+        payload = {"webpage_url": "https://yt.com/v=x", "title": "Song"}
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(return_value=payload)
+            assert await _run_extract("https://yt.com/v=x", {}) is payload
+
+    async def test_none_result_is_passed_through(self) -> None:
+        """A None extraction is a normal "nothing found" outcome, not an error."""
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(return_value=None)
+            assert await _run_extract("https://yt.com/v=x", {}) is None
+
+    async def test_pool_exception_propagates(self) -> None:
+        """_classify_ytdlp_error already ran in the worker; _run_extract must not
+        add a second layer of swallowing that would hide it from callers."""
+        with patch("src.youtube.ytdlp_pool") as mock_pool:
+            mock_pool.run = AsyncMock(side_effect=DownloadError("boom"))
+            with pytest.raises(DownloadError):
+                await _run_extract("https://yt.com/v=x", {})
