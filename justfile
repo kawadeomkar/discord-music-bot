@@ -243,6 +243,28 @@ test *ARGS: (_tools 'pytest')
     set -euo pipefail
     {{ PYTEST }} --tb=short -q "$@"
 
+# The whole suite across 8 worker processes, no coverage. Exists because both halves
+# of that sentence are non-obvious, and getting either wrong throws the win away:
+#
+#   -n 8, not -n auto. `auto` takes all 12 cores and is SLOWER than 8 — past 8
+#   workers, scheduling and boot overhead cost more than the added parallelism.
+#
+#   --no-cov, and this is the load-bearing part. `addopts` turns coverage on for
+#   every run, and combining coverage data from 8 workers eats the entire gain:
+#   measured, `-n 8` with coverage burns ~49s of CPU to save under 1s of wall time.
+#   Without it the speedup is real and stable.
+#
+# Not part of `check`, and `test` keeps the coverage gate: this trades the 80% floor
+# for wall-clock, so it is the "am I green?" loop, not the pre-push gate.
+#
+# [doc] and not a trailing `#` line — see the note on test-report.
+[doc('The suite in parallel without coverage — faster inner loop, no coverage gate')]
+[group('check')]
+test-fast *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ PYTEST }} --tb=short -q -n 8 --no-cov "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:

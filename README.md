@@ -232,6 +232,7 @@ The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
 | `just lint` | `ruff check`, no rewrites | ~0.05s |
 | `just types` | pyright over `src/` **and** `tests/` | ~6s |
 | `just test` | pytest with coverage | ~13s |
+| `just test-fast` | pytest across 8 workers, no coverage — inner loop only | ~9s |
 | `just check` | `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~24s |
 | `just container-test` | Build the test image and run the suite inside it | ~1min |
 | `just ci` | `check` + `container-test` — full local mirror of CI | ~1.5min |
@@ -243,6 +244,12 @@ just test tests/test_youtube.py    # one file
 just test -k spotify               # one pattern
 just test --maxfail=1              # stop at the first failure
 ```
+
+`just test-fast` does the same across 8 worker processes with coverage off. Use it
+while iterating; use `just test` (or `just check`) before pushing, since `test-fast`
+trades the 80% coverage gate for wall-clock. Prefer the recipe over `pytest -n` by
+hand — `-n auto` is slower than `-n 8` on a 12-core machine, and leaving coverage on
+cancels the speedup outright.
 
 **Build**
 
