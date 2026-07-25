@@ -414,6 +414,32 @@ class TestSignatureGuard:
         with pytest.raises(RuntimeError, match="now writes"):
             mock_spec_cache._recompute(EatSelfProbe, False, False)
 
+    def test_rejects_a_spec_class_that_is_not_the_spec(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The payload deliberately does not store `_spec_class`, because it *is*
+        the cache key and storing it would keep every entry alive in the
+        WeakKeyDictionary. That is only sound while upstream keeps setting
+        `_spec_class = spec` for a class spec, so `_recompute` asserts it."""
+        original = mock_spec_cache._ORIG_ADD_SPEC
+
+        def sets_a_different_spec_class(
+            self: Any,
+            spec: Any,
+            spec_set: Any,
+            _spec_as_instance: bool = False,
+            _eat_self: bool = False,
+        ) -> None:
+            original(self, spec, spec_set, _spec_as_instance, _eat_self)
+            self.__dict__["_spec_class"] = object
+
+        monkeypatch.setattr(
+            mock_spec_cache, "_ORIG_ADD_SPEC", sets_a_different_spec_class
+        )
+
+        with pytest.raises(RuntimeError, match="relies on"):
+            mock_spec_cache._recompute(EatSelfProbe, False, False)
+
     def test_rejects_a_second_import_of_the_module(self) -> None:
         """`install()`'s idempotence flag is a module global, so it only holds
         within one module object. A reload — or an import under a second name —
