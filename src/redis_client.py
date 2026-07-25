@@ -191,7 +191,8 @@ _R = TypeVar("_R")
 
 
 def _guild_op(
-    default: Any,
+    default: Any = None,
+    default_factory: Optional[Callable[[], Any]] = None,
 ) -> Callable[
     [Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]]],
     Callable[Concatenate["GuildRedisStore", _P], Awaitable[_R]],
@@ -204,6 +205,14 @@ def _guild_op(
     `[guild:{id}] {method} failed: {e}` and returns `default`, so each method
     is just its happy path. The method name comes from the wrapped function, so
     the log line names the operation without repeating it by hand.
+
+    Pass `default` for immutable fallbacks (None, False) and `default_factory`
+    for anything mutable. A decorator argument is evaluated ONCE, at class-body
+    execution, so `default=[]` would hand the *same* list to every guild on
+    every failure — one caller mutating it in place would poison "empty" for
+    the whole process. The factory is called per failure instead, so each
+    caller gets its own object. Do not add a mutable `default`; the test
+    `test_mutable_defaults_use_a_factory` fails if you do.
 
     `default` is typed Any (not `_R`) on purpose: pinning it to the return
     TypeVar would let `default=None` collapse `_R` to `None` for the
@@ -223,7 +232,7 @@ def _guild_op(
                 return await func(self, *args, **kwargs)
             except Exception as e:
                 log.warning(f"[guild:{self.guild_id}] {func.__name__} failed: {e}")
-                return default
+                return default_factory() if default_factory is not None else default
 
         return wrapper
 
@@ -439,7 +448,7 @@ class GuildRedisStore:
         pipe.persist(self.history_key())
         await pipe.execute()
 
-    @_guild_op(default=[])
+    @_guild_op(default_factory=list)
     async def get_history(self) -> list[HistoryEntry]:
         """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
