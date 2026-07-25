@@ -43,19 +43,61 @@ from tests.helpers import (
 )
 
 
-@pytest.fixture
-def music_bot(mock_bot: MagicMock) -> MusicBot:
-    """Minimal MusicBot instance bypassing __init__ Discord registration."""
-    cog = MusicBot.__new__(MusicBot)
-    cog.bot = mock_bot
-    cog.mps = {}
-    cog.spotify = MagicMock()
-    cog._spotify_status = SpotifyStatus.ENABLED
-    cog.redis = None
-    cog._active_spans = {}
-    cog._alone_timers = {}
-    cog._restore_tasks = set()
-    return cog
+class TestCommandErrorRendering:
+    """_command_error must not leak yt-dlp's raw error text to the user (§12.5)."""
+
+    async def test_extraction_error_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: [youtube] v9: Video unavailable",
+            original_type="DownloadError",
+            expected=True,
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == "[youtube] v9: Video unavailable"
+        assert "ExtractionError" not in detail  # not the raw type: message form
+
+    async def test_unexpected_extraction_error_is_generic(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        from src.youtube import ExtractionError
+
+        err = ExtractionError(
+            "ERROR: boom; please report this issue on https://github.com/yt-dlp/yt-dlp",
+            expected=False,
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert "github.com" not in detail
+        assert "unexpected error" in detail
+
+    async def test_a_plain_exception_still_renders_type_and_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, ValueError("nope"))
+
+        assert (call := send_embed.await_args) is not None
+        assert call.args[2] == "**ValueError:** nope"
 
 
 class TestCheckVoicePermissions:
@@ -1711,44 +1753,18 @@ class TestHistoryCommand:
         assert HistoryFlags.get_flags()["limit"].default == 10
 
 
-class TestPingCommand:
-    async def test_sends_embed_with_latency(
+class TestMaxConcurrencyNotice:
+    async def test_reports_already_running(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        call_kwargs = mock_ctx.send.call_args[1]
-        assert "embed" in call_kwargs
-
-    async def test_ping_reports_spotify_enabled(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        music_bot._spotify_status = SpotifyStatus.ENABLED
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        embed = mock_ctx.send.call_args[1]["embed"]
-        field = next(f for f in embed.fields if f.name == "Spotify source")
-        assert "Enabled" in field.value
-
-    async def test_ping_reports_spotify_disabled_no_credentials(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        music_bot.spotify = None
-        music_bot._spotify_status = SpotifyStatus.DISABLED
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        embed = mock_ctx.send.call_args[1]["embed"]
-        field = next(f for f in embed.fields if f.name == "Spotify source")
-        assert "Disabled" in field.value
-        assert "no credentials" in field.value
-
-    async def test_ping_reports_spotify_invalid_credentials(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        music_bot._spotify_status = SpotifyStatus.INVALID
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        embed = mock_ctx.send.call_args[1]["embed"]
-        field = next(f for f in embed.fields if f.name == "Spotify source")
-        assert "Disabled" in field.value
-        assert "rejected" in field.value
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "ping"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "already running" in embed.description
+        assert "ping" in embed.description
 
 
 class TestCogLoadSpotifyValidation:

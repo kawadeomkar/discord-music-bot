@@ -32,7 +32,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify, SpotifyAuthError
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
 from opentelemetry import context as otel_context
@@ -40,12 +40,12 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
+from src.ping import run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     fmt_duration,
     history_embeds,
-    latency_color,
     notice_embed,
     queue_message,
     record_span_error,
@@ -272,14 +272,6 @@ class MusicBot(commands.Cog):
             raise SpotifyDisabledError(self._spotify_status)
         return self.spotify
 
-    def _spotify_status_text(self) -> str:
-        """One-line human-readable Spotify status for the -ping embed."""
-        if self._spotify_status is SpotifyStatus.ENABLED:
-            return "🟢 Enabled"
-        if self._spotify_status is SpotifyStatus.INVALID:
-            return "🔴 Disabled — credentials provided but rejected by Spotify"
-        return "⚪ Disabled — no credentials configured"
-
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         """Return the guild's MusicPlayer, creating and starting one if absent."""
         assert ctx.guild is not None
@@ -436,6 +428,17 @@ class MusicBot(commands.Cog):
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
+        elif isinstance(error, commands.MaxConcurrencyReached):
+            # Raised in prepare(), before the command body — so the command's own
+            # try/except never sees it (e.g. a second -ping while one is live).
+            # Worded off the command name since any future guarded command lands here.
+            cmd = ctx.command.name if ctx.command else "command"
+            await ctx.send(
+                embed=notice_embed(
+                    f"A `{cmd}` request is already running in this server.",
+                    discord.Color.orange(),
+                )
+            )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         """before_invoke hook: rejects the command with a user-facing message
@@ -455,11 +458,17 @@ class MusicBot(commands.Cog):
         title: str = "Command failed",
     ) -> None:
         span = trace.get_current_span()
-        record_span_error(span, e)
+        record_span_error(span, e)  # full detail always goes to the span/logs
+        if isinstance(e, ExtractionError):
+            # A classified yt-dlp failure: show the user-safe line, not the raw message
+            # (which can carry yt-dlp's bug-report boilerplate). See ExtractionError.user_message.
+            detail = e.user_message
+        else:
+            detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
-            f"**{type(e).__name__}:** {e}",
+            detail,
             discord.Color.red(),
             footer=trace_footer(span),
         )
@@ -1168,7 +1177,10 @@ class MusicBot(commands.Cog):
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
-                ctx.invoke(self.ping),
+                # NOT ctx.invoke(self.ping): that would run the full ~3s health
+                # dashboard on every join/cold-play AND skip prepare() (so the
+                # ping max_concurrency guard). Cheap one-liner only — §2.3.
+                send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
             log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
@@ -1468,27 +1480,35 @@ class MusicBot(commands.Cog):
 
     @commands.command(
         name="ping",
-        aliases=["latency", "l", "delay"],
-        brief="check the bot's latency to Discord",
+        aliases=["latency", "l", "delay", "health", "status"],
+        brief="bot & dependency health + versions",
         help=(
-            "Reports the bot's WebSocket latency to Discord in milliseconds. The "
-            "embed is colour-coded — green is healthy, red means playback may "
-            "stutter. Also shows whether the Spotify source is enabled, disabled "
-            "(no credentials), or disabled because the credentials were rejected."
+            "Live health check: round-trip latency to Discord, Redis, Spotify, "
+            "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
+            "ffmpeg versions. The message posts instantly and fills in as each "
+            "dependency answers; the embed colour tracks the worst one. The "
+            "Spotify row also reports the optional source's state: not "
+            "configured, or configured with credentials Spotify rejected."
         ),
-        extras={"category": "Utility", "examples": ["-ping", "-latency"]},
+        extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
-    @commands.before_invoke(validate_commands)
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context) -> None:
+        """Live dependency-health dashboard. The rendering and the live-edit loop
+        live in src/ping.py; this is only the command surface. Reached only by a
+        top-level -ping — the internal join/play path uses send_latency_line."""
         try:
-            ms = self.bot.latency * 1000
-            await send_embed(
+            await run_health_dashboard(
                 ctx,
-                "Ping - latency in ms",
-                f"Ping: **{round(ms)}** milliseconds!",
-                latency_color(ms),
-                fields=[("Spotify source", self._spotify_status_text(), False)],
+                bot_latency=self.bot.latency,
+                redis=self.redis,
+                spotify=self.spotify,
+                # Startup validation outcome, not just "is a client configured":
+                # it lets the Spotify row say *why* the source is unusable
+                # without spending a doomed API call (see probe_spotify).
+                spotify_status=self._spotify_status,
+                pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)

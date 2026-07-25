@@ -4,6 +4,9 @@ import sys
 from typing import Optional, TYPE_CHECKING
 from collections.abc import Sequence
 
+if TYPE_CHECKING:
+    from multiprocessing.queues import Queue
+
 import structlog
 from structlog.typing import EventDict, WrappedLogger
 from opentelemetry import trace
@@ -104,6 +107,42 @@ def shutdown_telemetry() -> None:
 
 def get_tracer(name: str) -> trace.Tracer:
     return trace.get_tracer(name)
+
+
+def configure_worker_logging(log_queue: Optional["Queue"] = None) -> None:
+    """Configure structured logging inside a subprocess (the yt-dlp extraction pool
+    workers — see ytdlp_pool.YtdlpPool._spawn_process_pool, which passes the wrapper
+    _worker_init so a failure here can never break the pool).
+
+    Runs structlog setup, then — when a log_queue is supplied (production; the thread-pool
+    test seam passes none) — routes the worker's records to the parent instead of standing
+    up a redundant OTLP exporter and TracerProvider in every worker (Option B,
+    docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §12.2):
+
+      * The stdout StreamHandler that _configure_structlog installs is *replaced* by a
+        logging.handlers.QueueHandler. Replaced, not added: the parent re-emits every
+        record it drains, so keeping the worker's own stdout handler would double-print.
+      * worker_id (multiprocessing.current_process().name, e.g. 'SpawnProcess-1') is bound
+        as a structlog contextvar so it lands on every worker log line. Stable and free —
+        no coordination with the parent.
+
+    yt-dlp's warnings (the SABR / PO-token / signature early-warning system routed via
+    youtube._YtdlpLogger) therefore reach Loki through the parent's existing LoggingHandler,
+    carrying worker_id and — via run()'s context propagation — the originating trace_id."""
+    _configure_structlog()
+    if log_queue is None:
+        return
+    import logging.handlers
+    import multiprocessing
+
+    root = logging.root
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.addHandler(logging.handlers.QueueHandler(log_queue))
+    root.setLevel(logging.INFO)
+    structlog.contextvars.bind_contextvars(
+        worker_id=multiprocessing.current_process().name
+    )
 
 
 # ── Internal setup ────────────────────────────────────────────────────────────
