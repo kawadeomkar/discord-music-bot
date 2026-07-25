@@ -15,6 +15,43 @@ from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
 
 
+@pytest.fixture(autouse=True)
+def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
+
+    Production uses a ProcessPoolExecutor, which pickles the submitted callable to a
+    worker. Tests patch src.youtube._ytdlp_extract with a MagicMock, which is unpicklable
+    — and even a real patch would never reach a worker process. A thread pool runs
+    in-process so the patch is honored and no children are ever spawned.
+
+    A fresh YtdlpPool per test, not a shared one: a test that exercises the shutdown path
+    (src.main.MusicBotApp.close) closes the pool permanently, and the next test must not
+    inherit a closed one. ThreadPoolExecutor spawns threads lazily on first submit, so
+    tests that never extract pay nothing.
+
+    Consequence worth stating plainly: **no test that goes through src.youtube ever
+    spawns a worker process.** The pickling that production performs on every submit is
+    asserted directly and cheaply by TestProcessBoundaryContract (tests/test_youtube.py),
+    and one dedicated test in tests/test_ytdlp_pool.py spawns a real worker end-to-end.
+    Everything else about the process path — orphan reaping, live playback — is the
+    manual gate in docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    import src.youtube as youtube
+    from src.ytdlp_pool import YtdlpPool
+
+    pool = YtdlpPool(
+        max_workers=4,
+        executor_factory=lambda: ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="ytdlp-test"
+        ),
+    )
+    monkeypatch.setattr(youtube, "ytdlp_pool", pool)
+    yield
+    pool.shutdown(wait=False)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.
