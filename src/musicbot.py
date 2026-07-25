@@ -36,12 +36,12 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
+from src.ping import run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     fmt_duration,
     history_embeds,
-    latency_color,
     notice_embed,
     queue_message,
     record_span_error,
@@ -353,6 +353,17 @@ class MusicBot(commands.Cog):
             # try/except never sees it — e.g. `-history --limit abc`.
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
+            )
+        elif isinstance(error, commands.MaxConcurrencyReached):
+            # Raised in prepare(), before the command body — so the command's own
+            # try/except never sees it (e.g. a second -ping while one is live).
+            # Worded off the command name since any future guarded command lands here.
+            cmd = ctx.command.name if ctx.command else "command"
+            await ctx.send(
+                embed=notice_embed(
+                    f"A `{cmd}` request is already running in this server.",
+                    discord.Color.orange(),
+                )
             )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
@@ -1092,7 +1103,10 @@ class MusicBot(commands.Cog):
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
-                ctx.invoke(self.ping),
+                # NOT ctx.invoke(self.ping): that would run the full ~3s health
+                # dashboard on every join/cold-play AND skip prepare() (so the
+                # ping max_concurrency guard). Cheap one-liner only — §2.3.
+                send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
             log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
@@ -1392,25 +1406,29 @@ class MusicBot(commands.Cog):
 
     @commands.command(
         name="ping",
-        aliases=["latency", "l", "delay"],
-        brief="check the bot's latency to Discord",
+        aliases=["latency", "l", "delay", "health", "status"],
+        brief="bot & dependency health + versions",
         help=(
-            "Reports the bot's WebSocket latency to Discord in milliseconds. The "
-            "embed is colour-coded — green is healthy, red means playback may "
-            "stutter."
+            "Live health check: round-trip latency to Discord, Redis, Spotify, "
+            "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
+            "ffmpeg versions. The message posts instantly and fills in as each "
+            "dependency answers; the embed colour tracks the worst one."
         ),
-        extras={"category": "Utility", "examples": ["-ping", "-latency"]},
+        extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
-    @commands.before_invoke(validate_commands)
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context) -> None:
+        """Live dependency-health dashboard. The rendering and the live-edit loop
+        live in src/ping.py; this is only the command surface. Reached only by a
+        top-level -ping — the internal join/play path uses send_latency_line."""
         try:
-            ms = self.bot.latency * 1000
-            await send_embed(
+            await run_health_dashboard(
                 ctx,
-                "Ping - latency in ms",
-                f"Ping: **{round(ms)}** milliseconds!",
-                latency_color(ms),
+                bot_latency=self.bot.latency,
+                redis=self.redis,
+                spotify=self.spotify,
+                pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
             log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)

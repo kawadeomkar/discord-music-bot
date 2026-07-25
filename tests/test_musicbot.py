@@ -41,20 +41,6 @@ from tests.helpers import (
 )
 
 
-@pytest.fixture
-def music_bot(mock_bot: MagicMock) -> MusicBot:
-    """Minimal MusicBot instance bypassing __init__ Discord registration."""
-    cog = MusicBot.__new__(MusicBot)
-    cog.bot = mock_bot
-    cog.mps = {}
-    cog.spotify = MagicMock()
-    cog.redis = None
-    cog._active_spans = {}
-    cog._alone_timers = {}
-    cog._restore_tasks = set()
-    return cog
-
-
 class TestCommandErrorRendering:
     """_command_error must not leak yt-dlp's raw error text to the user (§12.5)."""
 
@@ -1730,14 +1716,18 @@ class TestHistoryCommand:
         assert HistoryFlags.get_flags()["limit"].default == 10
 
 
-class TestPingCommand:
-    async def test_sends_embed_with_latency(
+class TestMaxConcurrencyNotice:
+    async def test_reports_already_running(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        call_kwargs = mock_ctx.send.call_args[1]
-        assert "embed" in call_kwargs
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "ping"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "already running" in embed.description
+        assert "ping" in embed.description
 
 
 class TestClearCommand:

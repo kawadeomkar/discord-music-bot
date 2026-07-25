@@ -10,6 +10,7 @@ import pytest
 import structlog
 from redis.asyncio import Redis
 
+from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
@@ -245,3 +246,21 @@ def ytdl_instance(
             )
 
     return _make
+
+
+@pytest.fixture
+def music_bot(mock_bot: MagicMock) -> MusicBot:
+    """Minimal MusicBot instance bypassing __init__ Discord registration.
+
+    Shared: tests/test_musicbot.py drives the cog's commands, tests/test_ping.py
+    drives the -ping dashboard through the same cog.
+    """
+    cog = MusicBot.__new__(MusicBot)
+    cog.bot = mock_bot
+    cog.mps = {}
+    cog.spotify = MagicMock()
+    cog.redis = None
+    cog._active_spans = {}
+    cog._alone_timers = {}
+    cog._restore_tasks = set()
+    return cog
