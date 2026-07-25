@@ -14,10 +14,11 @@ The at-rest wire format is owned by guild_state.py (HistoryEntry +
 serialize_history_entry/parse_history_entry); the store surface is
 push_history/get_history. This class never sees wire bytes.
 
-When a Postgres archive is configured (docs/POSTGRES_HISTORY_PLAN.md), add()
-also LPUSHes the entry onto the global outbox — in the same pipeline as the
-display-list push — and nudges the drainer. Postgres itself is never awaited
-here: the outbox/drainer split keeps the playback loop on Redis-only latency.
+add() also LPUSHes every entry onto the global Postgres outbox — in the same
+pipeline as the display-list push — and nudges the drainer
+(docs/POSTGRES_HISTORY_PLAN.md). The archive is a required tier, so that leg is
+unconditional. Postgres itself is never awaited here: the outbox/drainer split
+keeps the playback loop on Redis-only latency.
 """
 
 from collections import deque
@@ -46,14 +47,19 @@ class GuildHistory:
         self,
         store: Optional[GuildRedisStore],
         *,
-        archive: Optional["HistoryArchive"] = None,
+        archive: "HistoryArchive",
         guild_id: int = 0,
-        on_outbox_push: Optional[Callable[[], None]] = None,
+        on_outbox_push: Callable[[], None],
     ) -> None:
-        # archive gates the outbox push (without a drainer the outbox would
-        # grow unbounded) and becomes recent()'s primary read in Phase B;
-        # guild_id is held for that same read. on_outbox_push is the
-        # drainer's notify — a sync callable so add() stays Redis-only.
+        # archive and on_outbox_push are REQUIRED: the Postgres tier is not
+        # optional, so there is no shape of this object that writes history
+        # without an outbox consumer behind it. archive becomes recent()'s
+        # primary read in Phase B; guild_id is held for that same read.
+        # on_outbox_push is the drainer's notify — a sync callable so add()
+        # stays Redis-only.
+        #
+        # store IS still Optional, and that is a different axis: Redis may be
+        # unconfigured, in which case there is no wire to push to at all.
         self._store = store
         self._entries: deque[HistoryEntry] = deque(maxlen=HISTORY_CACHE_LIMIT)
         self._archive = archive
@@ -61,15 +67,15 @@ class GuildHistory:
         self._on_outbox_push = on_outbox_push
 
     async def add(self, entry: HistoryEntry) -> None:
-        """Record one played song on both legs — plus the Postgres outbox
-        when an archive is configured. Degrades gracefully when the store is
-        None or the push fails (GuildRedisStore logs, never raises; a notify
-        after a failed push just drains an empty outbox)."""
+        """Record one played song on all three legs — in-memory cache, the
+        Redis display list, and the Postgres outbox (the latter two in one
+        pipeline). Degrades gracefully when the store is None or the push
+        fails (GuildRedisStore logs, never raises; a notify after a failed
+        push just drains an empty outbox)."""
         self._entries.append(entry)
         if self._store is not None:
-            await self._store.push_history(entry, outbox=self._archive is not None)
-            if self._archive is not None and self._on_outbox_push is not None:
-                self._on_outbox_push()
+            await self._store.push_history(entry)
+            self._on_outbox_push()
 
     def restore(self, newest_first: Sequence[HistoryEntry]) -> None:
         """Populate from persisted history after a restart. In-memory leg

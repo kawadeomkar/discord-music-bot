@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     # Runtime import would close the cycle (musicbot imports MusicPlayer); the cog is
     # only ever named in annotations here. Same guard main.py uses for MusicPlayer.
     from src.musicbot import MusicBot
+    from src.main import MusicBotApp
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -400,16 +401,16 @@ class MusicPlayer:
         # mutex, cleared-flag) lives behind this one object — see guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
         # Played-song history (in-memory ring + Redis mirror) — see
-        # guild_history.py. The Postgres archive + drainer live on the app
-        # (one pair per process, None when POSTGRES_URL is unset); getattr
-        # because `bot` is typed as the plain commands.Bot base.
-        _archive = getattr(bot, "history_archive", None)
-        _drainer = getattr(bot, "history_drainer", None)
+        # guild_history.py. The Postgres archive + drainer live on the app,
+        # one pair per process, always present (MusicBotApp.setup_hook refuses
+        # to start without POSTGRES_URL). The cast is only because `bot` is
+        # typed as the plain commands.Bot base; it is a no-op at runtime.
+        app = cast("MusicBotApp", bot)
         self.history = GuildHistory(
             self.store,
-            archive=_archive,
+            archive=app.history_archive,
             guild_id=guild.id,
-            on_outbox_push=_drainer.notify if _drainer is not None else None,
+            on_outbox_push=app.history_drainer.notify,
         )
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None

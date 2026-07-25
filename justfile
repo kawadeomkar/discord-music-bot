@@ -243,6 +243,24 @@ test *ARGS: (_tools 'pytest')
     set -euo pipefail
     {{ PYTEST }} --tb=short -q "$@"
 
+# The real-Postgres tier, excluded from `test` by its `pg` marker.
+#
+# Server comes from one of two places, decided by the tests themselves: with
+# POSTGRES_TEST_URL set it uses that server (how CI's pg-integration job points
+# at its service container), otherwise testcontainers starts postgres:18-alpine
+# and Docker must be running. RUN_PG_TESTS=1 is set here so the local invocation
+# is just `just test-pg`; the tests also accept POSTGRES_TEST_URL alone.
+#
+# --no-cov, and not as a shortcut: this tier drives SQL against a real server
+# rather than exercising src/ branches, so measuring it under the 80% gate would
+# fail the run on a coverage number that means nothing for what it tests.
+[doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
+[group('check')]
+test-pg *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:
@@ -276,6 +294,18 @@ pins:
     sh_image="$(sed -n 's/^IMAGE_NAME="\(.*\)"$/\1/p' build_common.sh)"
     if [ -z "$just_image" ] || [ "$just_image" != "$sh_image" ]; then
         echo "image name drift: justfile IMAGE=[$just_image] build_common.sh IMAGE_NAME=[$sh_image]" >&2
+        fail=1
+    fi
+
+    # The pg tier runs against testcontainers locally and a CI service container
+    # on GitHub, and the two must be the same server: a schema or type behaviour
+    # that differs between majors would pass in one place and fail in the other,
+    # with nothing pointing at the version as the cause.
+    py_pg="$(sed -n 's/^_PG_IMAGE = "\(.*\)"$/\1/p' tests/test_pg_integration.py)"
+    ci_pg="$(sed -n 's|^ *image: \(postgres:.*\)$|\1|p' .github/workflows/ci.yml | head -1)"
+    if [ -z "$py_pg" ] || [ "$py_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: test_pg_integration.py=[$py_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
         fail=1
     fi
 
@@ -334,8 +364,12 @@ container-test: test-image-rebuild
     docker run --rm "{{ IMAGE }}:test"
 
 # Full local mirror of the CI workflow
+#
+# test-pg is here because CI's pg-integration job is a merge gate (`build`
+# needs it), so a green `ci` that skipped it would not mean what it says. It
+# needs Docker, which `container-test` already required of this recipe.
 [group('check')]
-ci: check container-test
+ci: check container-test test-pg
 
 # ── Image and deployment ─────────────────────────────────────────────────────
 #

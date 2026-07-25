@@ -1,6 +1,7 @@
 """Tests for src/main.py — MusicBotApp lifecycle (setup_hook, close, on_ready)."""
 
 from collections.abc import Iterator
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -17,8 +18,10 @@ def app() -> MusicBotApp:
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
-    instance.history_archive = None
-    instance.history_drainer = None
+    # history_archive / history_drainer are deliberately left UNSET. __new__
+    # bypasses __init__, and setup_hook is what assigns them — so an unset
+    # attribute is exactly the real pre-setup_hook state, which is what
+    # close()'s getattr guard exists to survive.
     # BotBase stores cogs in a name-mangled private dict; initialize it so the
     # property works. Set via setattr: the mangled name is deliberately not part
     # of BotBase's declared surface, so it is invisible to the type checker.
@@ -39,6 +42,19 @@ def app() -> MusicBotApp:
 
 
 class TestSetupHook:
+    @pytest.fixture(autouse=True)
+    def postgres_configured(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+        """POSTGRES_URL is required — setup_hook raises without it. Every test
+        in this class that isn't specifically about that refusal needs it set,
+        and needs the archive/drainer stubbed so no real pool or task is
+        created. Tests that assert on the constructors re-patch them locally."""
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
+        with (
+            patch("src.main.PostgresHistoryArchive"),
+            patch("src.main.HistoryOutboxDrainer"),
+        ):
+            yield
+
     async def test_creates_redis_pool(self, app: MusicBotApp) -> None:
         mock_pool = MagicMock()
         with (
@@ -72,18 +88,30 @@ class TestSetupHook:
         for ext in EXTENSIONS:
             mock_load.assert_any_await(ext)
 
-    async def test_no_postgres_url_leaves_archive_off(
-        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("value", [None, ""])
+    async def test_missing_postgres_url_refuses_to_start(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        value: Optional[str],
     ) -> None:
-        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        """The archive is a required tier, so an unset (or empty) POSTGRES_URL
+        is a startup error, not a degraded mode. Failing here is what stops the
+        bot from silently LPUSHing onto an outbox no drainer will ever read."""
+        if value is None:
+            monkeypatch.delenv("POSTGRES_URL", raising=False)
+        else:
+            monkeypatch.setenv("POSTGRES_URL", value)
+        mock_load = AsyncMock()
         with (
             patch("src.main.create_redis_pool", return_value=MagicMock()),
             patch("src.main.get_redis", return_value=MagicMock()),
-            patch.object(app, "load_extension", new=AsyncMock()),
+            patch.object(app, "load_extension", new=mock_load),
+            pytest.raises(RuntimeError, match="POSTGRES_URL is not set"),
         ):
             await app.setup_hook()
-        assert app.history_archive is None
-        assert app.history_drainer is None
+        # It refuses BEFORE loading the cogs, so no partially-wired bot is left.
+        mock_load.assert_not_awaited()
 
     async def test_postgres_url_starts_archive_and_drainer(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch

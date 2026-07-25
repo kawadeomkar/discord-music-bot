@@ -105,8 +105,15 @@ Credentials *must* be set in a `.env` file at the project root before starting a
 `docker-compose.yml` declares `env_file: .env`, and Compose treats a missing one as
 an error rather than a warning. The format is under [step 2](#install-and-configure).
 
-`docker compose up` starts the whole stack, not just the bot: Redis, the bgutil POT
-provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
+`docker compose up` starts the whole stack, not just the bot: Redis, Postgres, the
+bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
+
+Postgres is the durable home of play history and is **required** — the bot refuses to
+start without `POSTGRES_URL`, rather than quietly buffering history into a Redis
+outbox nothing would ever drain. `POSTGRES_PASSWORD` is mandatory and has no
+fallback; run [`./setup_env.sh`](#install-and-configure) to derive one. To use a
+Postgres you already run instead of the bundled service, set `POSTGRES_URL` in `.env`
+and comment out the `POSTGRES_URL` line in `docker-compose.yml`.
 
 **To contribute**, add:
 
@@ -150,6 +157,19 @@ DISCORD_TOKEN=your_discord_bot_token
 SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 ```
+
+Or start from the template and let the helper fill in the derived values:
+
+```bash
+./setup_env.sh     # copies .env.example -> .env, derives POSTGRES_PASSWORD
+```
+
+It requires `DISCORD_TOKEN` to be set to your real token first — `POSTGRES_PASSWORD`
+is derived from it (`sha256`), so there is nothing to derive from while the
+placeholder is still in place. Re-running is safe: an existing password is left
+alone, because Postgres only reads it when it first initializes its data volume and
+a silently-changed value would lock the bot out of its own database. `--force`
+re-derives anyway and warns about exactly that.
 
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its

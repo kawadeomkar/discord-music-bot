@@ -1,9 +1,11 @@
 """Real-Postgres integration tier (docs/POSTGRES_HISTORY_PLAN.md §9).
 
-Opt-in: skipped unless RUN_PG_TESTS=1 (needs Docker). One postgres:18-alpine
-testcontainer per session; a throwaway database per test for isolation.
+Opt-in, with two ways to supply the server — see `admin_dsn` below:
 
-    RUN_PG_TESTS=1 poetry run pytest -m pg --no-cov
+    just test-pg                        # local: testcontainers, needs Docker
+    POSTGRES_TEST_URL=... just test-pg  # CI: an already-running server
+
+A throwaway database per test gives isolation either way.
 
 Covers exactly what the in-memory fakes cannot: PostgresHistoryArchive against a
 real server — _SCHEMA_DDL actually executing, the _INSERT_SQL/_RECENT_SQL
@@ -15,43 +17,83 @@ those SQL constants are validated only by inspection.
 import itertools
 import os
 from collections.abc import AsyncIterator, Iterator
-from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
 from src.guild_state import HistoryEntry
 from src.history_archive import PostgresHistoryArchive
 
+# POSTGRES_TEST_URL enables the tier on its own, deliberately. If it only
+# *selected the provider* and RUN_PG_TESTS still had to be set as well, a CI job
+# that supplied the server but forgot the flag would skip every test in this
+# file and report green — a blind job that looks covered is worse than a
+# missing one. One variable is enough to say "there is a Postgres here".
+_PG_ENABLED = bool(os.getenv("RUN_PG_TESTS") or os.getenv("POSTGRES_TEST_URL"))
+
 pytestmark = [
     pytest.mark.pg,
     pytest.mark.skipif(
-        not os.getenv("RUN_PG_TESTS"),
-        reason="pg tier is opt-in: set RUN_PG_TESTS=1 (requires Docker)",
+        not _PG_ENABLED,
+        reason="pg tier is opt-in: set RUN_PG_TESTS=1 (Docker) or POSTGRES_TEST_URL",
     ),
 ]
 
+# Must match the postgres service image in .github/workflows/ci.yml's
+# pg-integration job — `just pins` asserts they agree, so this is enforcement
+# rather than a "keep these in step" comment.
 _PG_IMAGE = "postgres:18-alpine"
 _dbname_counter = itertools.count(1)
 
 
+def _with_database(dsn: str, name: str) -> str:
+    """The same DSN pointed at a different database.
+
+    urlsplit rather than rsplit("/", 1): an externally supplied DSN may carry a
+    query string (?sslmode=require) or a password containing a slash, and a
+    naive split corrupts both.
+    """
+    return urlunsplit(urlsplit(dsn)._replace(path=f"/{name}"))
+
+
 @pytest.fixture(scope="session")
-def pg_container() -> Iterator[Any]:
+def admin_dsn() -> Iterator[str]:
+    """A Postgres this suite may CREATE and DROP databases on.
+
+    Two providers behind one fixture. POSTGRES_TEST_URL wins when set: CI runs a
+    GitHub Actions *service container*, which the runner pulls and health-checks
+    during job setup — before the first step executes — so paying testcontainers'
+    pull, container start and ryuk-reaper cost again inside the job would buy
+    nothing. Unset (the local default) falls back to testcontainers, which is
+    what keeps this tier zero-setup for a developer who just has Docker running.
+
+    Session-scoped and synchronous on purpose: the value is a plain string, so
+    it survives the per-function event loop that asyncio_default_fixture_loop_scope
+    pins us to. A pooled *connection* here would not.
+    """
+    external = os.getenv("POSTGRES_TEST_URL")
+    if external:
+        yield external
+        return
+
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer(_PG_IMAGE, username="test", password="test") as pg:
-        yield pg
+        yield (
+            f"postgresql://test:test@{pg.get_container_host_ip()}"
+            f":{pg.get_exposed_port(5432)}/{pg.dbname}"
+        )
 
 
 @pytest.fixture
-def admin_dsn(pg_container: Any) -> str:
-    host = pg_container.get_container_host_ip()
-    port = pg_container.get_exposed_port(5432)
-    return f"postgresql://test:test@{host}:{port}/{pg_container.dbname}"
+async def pg_dsn(admin_dsn: str) -> AsyncIterator[str]:
+    """A fresh database per test — full isolation, ~ms to create.
 
-
-@pytest.fixture
-async def pg_dsn(pg_container: Any, admin_dsn: str) -> AsyncIterator[str]:
-    """A fresh database per test — full isolation, ~ms to create."""
+    Connects per operation instead of holding one admin connection open for the
+    session: fixture loop scope is "function", so a connection opened in one
+    test's loop is unusable in the next. Two extra connects are microseconds
+    against CREATE DATABASE — do not "optimize" this into a session fixture.
+    """
     import asyncpg
 
     name = f"t{next(_dbname_counter)}"
@@ -60,7 +102,7 @@ async def pg_dsn(pg_container: Any, admin_dsn: str) -> AsyncIterator[str]:
         await conn.execute(f"CREATE DATABASE {name}")
     finally:
         await conn.close()
-    yield admin_dsn.rsplit("/", 1)[0] + f"/{name}"
+    yield _with_database(admin_dsn, name)
     conn = await asyncpg.connect(admin_dsn)
     try:
         await conn.execute(f"DROP DATABASE {name} WITH (FORCE)")

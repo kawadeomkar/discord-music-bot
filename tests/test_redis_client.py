@@ -358,18 +358,18 @@ class TestPushHistory:
 
 
 class TestPushHistoryOutbox:
-    async def test_default_does_not_touch_outbox(
+    async def test_every_push_reaches_the_outbox(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
-        # No archive configured → no outbox writes, or the (undrained) outbox
-        # would grow without bound.
+        # Unconditional: the archive is a required tier, so there is always a
+        # drainer behind the outbox and no shape of push_history that skips it.
         await store.push_history(_hentry(1))
-        assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
 
     async def test_outbox_gets_same_wire_bytes(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
-        await store.push_history(_hentry(1), outbox=True)
+        await store.push_history(_hentry(1))
         assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
             _hentry(1).to_redis()
         ]
@@ -378,7 +378,7 @@ class TestPushHistoryOutbox:
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
         # Phase A: the display list still gets the entry, untrimmed, PERSISTed.
-        await store.push_history(_hentry(1), outbox=True)
+        await store.push_history(_hentry(1))
         assert await fake_redis.lrange(store.history_key(), 0, -1) == [
             _hentry(1).to_redis()
         ]
@@ -390,8 +390,8 @@ class TestPushHistoryOutbox:
         # One outbox for all guilds — entries carry guild_id on the wire.
         a = GuildRedisStore(fake_redis, guild_id=1)
         b = GuildRedisStore(fake_redis, guild_id=2)
-        await a.push_history(_hentry(1), outbox=True)
-        await b.push_history(_hentry(2), outbox=True)
+        await a.push_history(_hentry(1))
+        await b.push_history(_hentry(2))
         assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
 
     async def test_outbox_key_has_no_ttl(
@@ -399,18 +399,18 @@ class TestPushHistoryOutbox:
     ) -> None:
         # Not-yet-durable entries must never be eviction candidates under
         # volatile-lru — the same property that protects history today.
-        await store.push_history(_hentry(1), outbox=True)
+        await store.push_history(_hentry(1))
         assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.push_history(_hentry(1), outbox=True)  # must not raise
+        await broken_store.push_history(_hentry(1))  # must not raise
 
 
 class TestOutboxDrainHelpers:
     async def _push(self, fake_redis: Redis, *ns: int) -> None:
         store = GuildRedisStore(fake_redis, guild_id=42)
         for n in ns:
-            await store.push_history(_hentry(n), outbox=True)
+            await store.push_history(_hentry(n))
 
     async def test_peek_returns_oldest_first(self, fake_redis: Redis) -> None:
         await self._push(fake_redis, 1, 2, 3)

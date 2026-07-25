@@ -85,7 +85,7 @@ def drainer(fake_redis: Redis, archive: Any) -> HistoryOutboxDrainer:
 async def _push(fake_redis: Redis, *ns: int) -> None:
     store = GuildRedisStore(fake_redis, guild_id=42)
     for n in ns:
-        await store.push_history(_entry(n), outbox=True)
+        await store.push_history(_entry(n))
 
 
 async def _eventually(cond: Callable[[], bool], timeout: float = 2.0) -> None:

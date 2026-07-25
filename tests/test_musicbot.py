@@ -7,7 +7,7 @@ import contextlib
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1583,7 +1583,9 @@ def _flags(limit: int = 10) -> SimpleNamespace:
 class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
-        history = GuildHistory(None)
+        history = GuildHistory(
+            None, archive=cast(Any, object()), on_outbox_push=lambda: None
+        )
         history.restore(list(reversed(entries)))  # restore takes newest-first
         mp.history = history
         music_bot.get_mp = MagicMock(return_value=mp)

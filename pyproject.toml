@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "1.0.0"
+version = "2.0.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -173,10 +173,12 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing"
 markers = [
-    # Opt-in integration tier against a real Postgres (testcontainers).
-    # Auto-skipped unless RUN_PG_TESTS=1; run with:
-    #   RUN_PG_TESTS=1 poetry run pytest -m pg --no-cov
-    "pg: real-Postgres integration test (needs Docker; opt-in via RUN_PG_TESTS=1)",
+    # Integration tier against a real Postgres, excluded from the default run.
+    # Locally it starts postgres:18-alpine via testcontainers (needs Docker);
+    # CI's pg-integration job points it at a service container instead. Both go
+    # through one recipe:
+    #   just test-pg
+    "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
 ]
 filterwarnings = [
     "error",

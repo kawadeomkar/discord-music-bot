@@ -100,25 +100,38 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
-        # Postgres play-history archive + its outbox drainer — both None when
-        # POSTGRES_URL is unset, and every consumer treats that as "feature
-        # off" (docs/POSTGRES_HISTORY_PLAN.md; None → bot behaves exactly as
-        # before the archive existed).
-        self.history_archive: Optional[PostgresHistoryArchive] = None
-        self.history_drainer: Optional[HistoryOutboxDrainer] = None
+        # Postgres play-history archive + its outbox drainer — one pair per
+        # process, built in setup_hook. The tier is REQUIRED: Postgres is the
+        # durable home of play history, so there is no "archive off" mode and
+        # no consumer has to handle its absence (docs/POSTGRES_HISTORY_PLAN.md).
+        # Declared here only because setup_hook, not __init__, is where the
+        # event loop exists to start the drainer on.
+        self.history_archive: PostgresHistoryArchive
+        self.history_drainer: HistoryOutboxDrainer
 
     async def setup_hook(self) -> None:
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
+        # Fail fast rather than degrade. A bot that silently ran without the
+        # archive would keep accepting plays while every song-end quietly
+        # LPUSHed onto an outbox nobody drains — the failure would surface
+        # days later as an un-evictable Redis list, not at the moment of
+        # misconfiguration.
         postgres_url = os.getenv("POSTGRES_URL")
-        if postgres_url:
-            # Lazy inside: no connection is made here, so startup never
-            # blocks on Postgres — the drainer's backoff loop absorbs an
-            # unreachable database.
-            self.history_archive = PostgresHistoryArchive(postgres_url)
-            drainer = HistoryOutboxDrainer(self.redis, self.history_archive)
-            drainer.start()
-            self.history_drainer = drainer
+        if not postgres_url:
+            raise RuntimeError(
+                "POSTGRES_URL is not set. The play-history archive is a required "
+                "tier, not an optional one — run ./setup_env.sh to populate .env, "
+                "or set POSTGRES_URL to an external Postgres "
+                "(postgresql://user:password@host:5432/dbname)."
+            )
+        # Lazy inside: no connection is made here, so startup never blocks on
+        # Postgres — the drainer's backoff loop absorbs an unreachable database.
+        # That is what keeps "required" from meaning "Postgres must be up before
+        # the bot can start".
+        self.history_archive = PostgresHistoryArchive(postgres_url)
+        self.history_drainer = HistoryOutboxDrainer(self.redis, self.history_archive)
+        self.history_drainer.start()
         for extension in EXTENSIONS:
             await self.load_extension(extension)
         # Spawn the yt-dlp extraction workers before the first -play so it doesn't
@@ -163,10 +176,20 @@ class MusicBotApp(commands.AutoShardedBot):
     async def close(self) -> None:
         # Drainer first (its final drain still needs Redis and the archive),
         # then the archive pool, then the Redis pool they both sat on.
-        if self.history_drainer is not None:
-            await self.history_drainer.stop()
-        if self.history_archive is not None:
-            await self.history_archive.close()
+        #
+        # getattr, not a plain attribute read: discord.py calls close() from
+        # run()'s finally even when setup_hook RAISED, and setup_hook is where
+        # these two are assigned. A bare read would then throw AttributeError
+        # out of close() and mask the original startup error — including the
+        # "POSTGRES_URL is not set" message above, which is the one the
+        # operator actually needs to see. This is a lifecycle guard, not the
+        # feature being optional.
+        drainer = getattr(self, "history_drainer", None)
+        if drainer is not None:
+            await drainer.stop()
+        archive = getattr(self, "history_archive", None)
+        if archive is not None:
+            await archive.close()
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()

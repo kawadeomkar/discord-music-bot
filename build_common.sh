@@ -182,33 +182,41 @@ build_runtime_image() {
         ${tag_args[@]+"${tag_args[@]}"} --target runtime -f Dockerfile .
 }
 
+# _env_value <NAME> <file> — the effective value of NAME in a .env file: the last
+# uncommented assignment (compose is last-wins), with an optional `export ` prefix,
+# surrounding quotes and trailing whitespace stripped. Empty output means unset,
+# commented out, or explicitly empty — compose treats all three identically, and
+# so does every caller here.
+_env_value() {
+    local name="$1" file="$2"
+    grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$file" 2>/dev/null \
+        | tail -n1 \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?'"${name}"'=//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' \
+        || true
+}
+
 # require_postgres_password — compose-path preflight. NOT part of the fixed API
-# the k8s build contract depends on (that path gets its secret from a Secret, not
-# .env), so it is called only from build_docker.sh, never build_common's callers.
+# the k8s build contract depends on (that path gets its secret from a Secret,
+# not .env), so it is called only from build_docker.sh, never build_common's
+# other callers.
 #
-# compose interpolates POSTGRES_PASSWORD from .env into both the postgres service
-# and the bot's POSTGRES_URL (docker-compose.yml). Its `:?` guard only fails at
-# `docker compose up` — after the whole image build. Fail here instead so we
-# don't build an image just to trip over a missing secret. (Ported from the
-# preflight the pre-restructure build.sh carried; see task/async-pg-impl 2827fcd.)
+# The play-history archive is a required tier, so this is unconditional: both
+# the postgres service and the bot's POSTGRES_URL interpolate the same
+# `${POSTGRES_PASSWORD:?}` in docker-compose.yml. Compose would catch an unset
+# password on its own, but only at `docker compose up` — after the whole image
+# build. Fail here instead, with a message that says what to do. (Ported from
+# the preflight the pre-restructure build.sh carried; see 2827fcd.)
 require_postgres_password() {
-    local env_file=".env" pg_password
+    local env_file=".env"
     if [ ! -f "$env_file" ]; then
-        echo "Error: $env_file not found — copy .env.example and fill it in." >&2
+        echo "Error: $env_file not found — run ./setup_env.sh to create it." >&2
         exit 1
     fi
-    # Last uncommented assignment wins (compose semantics); strip an optional
-    # `export`, surrounding quotes, and trailing whitespace, then require non-empty.
-    pg_password=$(
-        grep -E '^[[:space:]]*(export[[:space:]]+)?POSTGRES_PASSWORD=' "$env_file" \
-            | tail -n1 \
-            | sed -E 's/^[[:space:]]*(export[[:space:]]+)?POSTGRES_PASSWORD=//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' \
-            || true
-    )
-    if [ -z "$pg_password" ]; then
+    if [ -z "$(_env_value POSTGRES_PASSWORD "$env_file")" ]; then
         echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
-        echo "       Set it (see .env.example) — the postgres service and the bot's" >&2
-        echo "       POSTGRES_URL are both built from it." >&2
+        echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
+        echo "       built from it, and it has no fallback by design." >&2
+        echo "       Run ./setup_env.sh to derive one from DISCORD_TOKEN." >&2
         exit 1
     fi
 }

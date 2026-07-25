@@ -443,7 +443,7 @@ class GuildRedisStore:
     # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
     # workaround — that would make history itself an eviction candidate and defeat the
     # whole persistent-history design (see docker-compose.yml redis command).
-    async def push_history(self, entry: HistoryEntry, *, outbox: bool = False) -> None:
+    async def push_history(self, entry: HistoryEntry) -> None:
         """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
         the unbounded source of truth for all played songs (write-per-song-end
         is the durability boundary; cadence analysis in
@@ -452,19 +452,17 @@ class GuildRedisStore:
         (The Phase C cutover of docs/POSTGRES_HISTORY_PLAN.md replaces PERSIST
         with LTRIM+EXPIRE once Postgres is the source of truth.)
 
-        outbox=True additionally LPUSHes the same wire bytes onto
-        HISTORY_OUTBOX_KEY in the same pipeline — set when a Postgres archive
-        is configured (GuildHistory gates it), never otherwise: without a
-        drainer the outbox would grow unbounded."""
+        The same wire bytes are also LPUSHed onto HISTORY_OUTBOX_KEY in the
+        same (transactional) pipeline, for the Postgres drainer. Unconditional:
+        the archive is a required tier, so there is always a drainer behind the
+        outbox. The two legs share one serialize_history_entry call so they
+        cannot drift and song-end pays only one orjson.dumps."""
         try:
             wire = serialize_history_entry(entry)
             pipe = self.redis.pipeline()
             pipe.lpush(self.history_key(), wire)
             pipe.persist(self.history_key())
-            if outbox:
-                # Same bytes as the display push — serialize once so the two legs
-                # can't drift and we don't orjson.dumps twice per song-end.
-                pipe.lpush(HISTORY_OUTBOX_KEY, wire)
+            pipe.lpush(HISTORY_OUTBOX_KEY, wire)
             await pipe.execute()
         except Exception as e:
             log.warning(f"[guild:{self.guild_id}] Redis push_history failed: {e}")
