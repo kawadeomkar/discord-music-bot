@@ -14,6 +14,12 @@ from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
+from tests.mock_spec_cache import install as install_mock_spec_cache
+
+# At import, before any test module is collected, so module-level mocks are
+# covered too. Makes every `Mock(spec=...)` in the suite cheap without the call
+# sites having to opt in. See tests/mock_spec_cache.py.
+install_mock_spec_cache()
 
 
 @pytest.fixture(autouse=True)
