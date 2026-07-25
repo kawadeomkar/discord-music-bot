@@ -15,6 +15,7 @@ from discord.ext import commands
 
 import redis.asyncio as aioredis
 
+from src.config import spotify_enabled
 from src.musicplayer import MusicPlayer
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
@@ -27,7 +28,7 @@ from src.sources import (
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify
-from src.youtube import YTDL, QueueObject
+from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
 from opentelemetry import context as otel_context
@@ -35,12 +36,12 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
+from src.ping import run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     fmt_duration,
     history_embeds,
-    latency_color,
     notice_embed,
     pluralize,
     queue_message,
@@ -53,6 +54,23 @@ from src.util import (
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
+
+
+class SpotifyDisabledError(Exception):
+    """Raised when a Spotify link is played but Spotify support is not configured.
+
+    The message is user-facing: _command_error renders it (with the class name) into
+    the error embed the requester sees, so it explains the config gap and points at the
+    sources that still work.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Spotify links aren't available on this bot — it was started without "
+            "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+            "Try a YouTube or SoundCloud link, or just search by name."
+        )
+
 
 HISTORY_MIN_LIMIT = 1
 # The ceiling is the display cache depth — -history reads the in-memory cache,
@@ -157,13 +175,27 @@ class MusicBot(commands.Cog):
         # uses that idiom to break this exact import cycle), or declare a two-line
         # Protocol carrying `redis: Optional[aioredis.Redis]`.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        self.spotify = Spotify(redis=self.redis)
+        # Spotify is optional: only build the client when credentials are present.
+        # When None, playing a Spotify link raises SpotifyDisabledError; every other
+        # source (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
+        self.spotify: Optional[Spotify] = (
+            Spotify(redis=self.redis) if spotify_enabled() else None
+        )
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → (span, the token otel_context.attach() returns, which detach()
         # requires back — `object` does not satisfy it.
         self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
+
+    def _require_spotify(self) -> Spotify:
+        """Return the Spotify client, or raise SpotifyDisabledError if the feature
+        is off. Call this at every Spotify source dispatch: it both narrows the
+        Optional away for the type checker and produces the user-facing error when
+        credentials are absent."""
+        if self.spotify is None:
+            raise SpotifyDisabledError()
+        return self.spotify
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
         """Return the guild's MusicPlayer, creating and starting one if absent."""
@@ -321,6 +353,17 @@ class MusicBot(commands.Cog):
             await ctx.send(
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
+        elif isinstance(error, commands.MaxConcurrencyReached):
+            # Raised in prepare(), before the command body — so the command's own
+            # try/except never sees it (e.g. a second -ping while one is live).
+            # Worded off the command name since any future guarded command lands here.
+            cmd = ctx.command.name if ctx.command else "command"
+            await ctx.send(
+                embed=notice_embed(
+                    f"A `{cmd}` request is already running in this server.",
+                    discord.Color.orange(),
+                )
+            )
 
     async def validate_commands(self, ctx: commands.Context) -> None:
         """before_invoke hook: rejects the command with a user-facing message
@@ -348,11 +391,17 @@ class MusicBot(commands.Cog):
         cmd = ctx.command.name if ctx.command else "command"
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
-        record_span_error(span, e)
+        record_span_error(span, e)  # full detail always goes to the span/logs
+        if isinstance(e, ExtractionError):
+            # A classified yt-dlp failure: show the user-safe line, not the raw message
+            # (which can carry yt-dlp's bug-report boilerplate). See ExtractionError.user_message.
+            detail = e.user_message
+        else:
+            detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
-            f"**{type(e).__name__}:** {e}",
+            detail,
             discord.Color.red(),
             footer=trace_footer(span),
         )
@@ -370,7 +419,9 @@ class MusicBot(commands.Cog):
         YouTube playlist (already resolved), or a bare QueueObject otherwise.
         """
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            return ResolvedSpotifyPlaylist(await self.spotify.playlist(source.id))
+            return ResolvedSpotifyPlaylist(
+                await self._require_spotify().playlist(source.id)
+            )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -381,7 +432,7 @@ class MusicBot(commands.Cog):
             ts: Optional[int] = None
             search: str
             if isinstance(source, SpotifySource):
-                search = await self.spotify.track(source.id)
+                search = await self._require_spotify().track(source.id)
             elif isinstance(source, YTSource):
                 search = source.ytsearch or source.url or ""
                 ts = source.ts
@@ -640,7 +691,7 @@ class MusicBot(commands.Cog):
             discord.Color.orange(),
         )
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            titles = await self.spotify.playlist(source.id)
+            titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
@@ -1044,7 +1095,10 @@ class MusicBot(commands.Cog):
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
-                ctx.invoke(self.ping),
+                # NOT ctx.invoke(self.ping): that would run the full ~3s health
+                # dashboard on every join/cold-play AND skip prepare() (so the
+                # ping max_concurrency guard). Cheap one-liner only — §2.3.
+                send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
             await self._command_error(ctx, e)
@@ -1337,25 +1391,29 @@ class MusicBot(commands.Cog):
 
     @commands.command(
         name="ping",
-        aliases=["latency", "l", "delay"],
-        brief="check the bot's latency to Discord",
+        aliases=["latency", "l", "delay", "health", "status"],
+        brief="bot & dependency health + versions",
         help=(
-            "Reports the bot's WebSocket latency to Discord in milliseconds. The "
-            "embed is colour-coded — green is healthy, red means playback may "
-            "stutter."
+            "Live health check: round-trip latency to Discord, Redis, Spotify, "
+            "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
+            "ffmpeg versions. The message posts instantly and fills in as each "
+            "dependency answers; the embed colour tracks the worst one."
         ),
-        extras={"category": "Utility", "examples": ["-ping", "-latency"]},
+        extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
-    @commands.before_invoke(validate_commands)
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.ping")
     async def ping(self, ctx: commands.Context) -> None:
+        """Live dependency-health dashboard. The rendering and the live-edit loop
+        live in src/ping.py; this is only the command surface. Reached only by a
+        top-level -ping — the internal join/play path uses send_latency_line."""
         try:
-            ms = self.bot.latency * 1000
-            await send_embed(
+            await run_health_dashboard(
                 ctx,
-                "Ping - latency in ms",
-                f"Ping: **{round(ms)}** milliseconds!",
-                latency_color(ms),
+                bot_latency=self.bot.latency,
+                redis=self.redis,
+                spotify=self.spotify,
+                pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
             await self._command_error(ctx, e)

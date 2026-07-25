@@ -12,6 +12,11 @@ class URLSource(Enum):
     SPOTIFY = "spotify"
     YOUTUBE = "youtube"
     SOUNDCLOUD = "soundcloud"
+    # Any other host we don't special-case (tiktok, twitter/x, vimeo, bandcamp,
+    # twitch clips, …). We don't maintain the list — yt-dlp's ~1800 extractors are
+    # the source of truth, so the URL is handed straight to it and only rejected if
+    # yt-dlp itself reports the site as unsupported (see YTDL.yt_source).
+    OTHER = "other"
 
 
 class SpotifyType(Enum):
@@ -125,8 +130,20 @@ def parse_url(
         return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):
         return SoundcloudSource(url, process=True)
+    elif "." in domain:
+        # Not a host we special-case, but it looks like a real domain. Rather than
+        # maintain a whitelist of yt-dlp's ~1800 supported sites, hand the raw URL to
+        # yt-dlp and let it decide: a supported site (tiktok, vimeo, twitch clips, …)
+        # just plays, and a genuinely unsupported one surfaces yt-dlp's own
+        # "Unsupported URL" as a clear message from YTDL.yt_source. Routed exactly like
+        # a bare YouTube watch URL — resolved to a QueueObject in queue_source before it
+        # ever reaches the queue — so no downstream path needs to know it's generic.
+        return YTSource(url=url, process=True, stype=URLSource.OTHER)
     else:
-        raise Exception(f"Domain not supported {domain}")
+        # The domain regex matched but the "host" has no dot (e.g. "98" from a search
+        # term like "98/99"). That's not a URL — raise ValueError so parse_input falls
+        # back to a YouTube search instead of shipping a bogus host to yt-dlp.
+        raise ValueError(f"Not a recognised URL: {url!r}")
 
 
 def parse_input(
@@ -137,8 +154,9 @@ def parse_input(
 
     Only attempts parse_url when the command argument is a single word (a bare
     link) — URLs never contain spaces, so multi-word input is always a search
-    query. This also avoids the loose domain regex misidentifying search terms
-    like "98/99" as a URL with an unsupported domain.
+    query. A single-word search term that happens to contain a slash (e.g. "98/99")
+    still reaches parse_url, but its dotless "host" raises ValueError there and is
+    caught below, falling back to search rather than being shipped to yt-dlp.
 
     :param user_input: the URL or search term from the command argument
     :param message: full message content (used to extract the search query)

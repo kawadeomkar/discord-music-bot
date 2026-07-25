@@ -49,3 +49,19 @@ ENVIRONMENT: str = _parse()
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
+
+
+def spotify_enabled() -> bool:
+    """True when Spotify-link support should be active — i.e. both Spotify
+    credentials are present in the environment.
+
+    Read at call time (not cached as a module constant) so the value tracks
+    the live environment: tests monkeypatch these vars per case, and the bot
+    process only ever reads them once at startup, so there is no hot path to
+    optimise. Presence, not validity, is the gate here — credentials that are
+    set but wrong still count as "enabled" and fail at the first Spotify API
+    call with a clear error, rather than silently disabling the feature.
+    """
+    return bool(
+        os.environ.get("SPOTIFY_CLIENT_ID") and os.environ.get("SPOTIFY_CLIENT_SECRET")
+    )
