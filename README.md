@@ -8,7 +8,7 @@
 <!-- Pytest Coverage Comment:Begin -->
 <!-- Pytest Coverage Comment:End -->
 
-A self-hosted Discord music bot that streams audio from YouTube, Spotify, and SoundCloud
+A self-hosted Discord music bot that streams audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site
 into voice channels. Built as a single-process Python asyncio application on
 [discord.py](https://github.com/Rapptz/discord.py), [yt-dlp](https://github.com/yt-dlp/yt-dlp),
 and FFmpeg, with Redis for playback state, caching, and crash recovery.
@@ -16,7 +16,8 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 ## Features
 
 - **Multi-source playback** — YouTube URLs and playlists, plain-text YouTube search,
-  Spotify tracks and playlists (expanded to YouTube searches), and SoundCloud links
+  Spotify tracks and playlists (expanded to YouTube searches), SoundCloud links, and
+  any other site yt-dlp supports (TikTok, Vimeo, Bandcamp, Twitch clips, …)
 - **Near-zero inter-song latency** — a three-phase yt-dlp pipeline resolves metadata
   instantly at enqueue time, prefetches stream URLs in the background while the current
   song plays, and caches them in Redis
@@ -74,7 +75,7 @@ details, aliases, and examples.
 | Command | Aliases | Description |
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
-| `-ping` | `latency`, `l`, `delay` | Check the bot's WebSocket latency |
+| `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs
@@ -87,8 +88,15 @@ https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
 https://soundcloud.com/artist/track
+https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube
 ```
+
+YouTube, Spotify, and SoundCloud get first-class handling (timestamps, playlist
+expansion, Spotify→YouTube matching). Any other link is handed straight to
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) — if it's one of the ~1800 sites yt-dlp
+supports (TikTok, Vimeo, Bandcamp, Twitch clips, …) it just plays; if not, the bot
+replies that the link isn't from a site it can play.
 
 ## Quick start
 
@@ -98,7 +106,7 @@ never gonna give you up                          # plain text searches YouTube
 **To run the bot** — Docker, plus credentials:
 
 - A [Discord bot token](https://discord.com/developers/applications)
-- A [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret)
+- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work.
 
 The Docker Compose stack contains its own Redis to enable persistence, caching, and crash recovery.
 Credentials *must* be set in a `.env` file at the project root before starting anything:
@@ -346,8 +354,8 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DISCORD_TOKEN` | ✅ | — | Discord bot token |
-| `SPOTIFY_CLIENT_ID` | ✅ | — | Spotify app client ID (Client Credentials flow) |
-| `SPOTIFY_CLIENT_SECRET` | ✅ | — | Spotify app client secret |
+| `SPOTIFY_CLIENT_ID` | | — | Spotify app client ID (Client Credentials flow). Enables Spotify links; omit both Spotify vars to run without Spotify support |
+| `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |

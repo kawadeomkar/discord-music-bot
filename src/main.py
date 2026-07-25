@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import discord
 from discord.ext import commands
 
-from src.config import ENVIRONMENT
+from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
@@ -142,6 +142,9 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Environment: {ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
+        # FIXME: this line is labelled "Bot commands:" but logs the `voice_states`
+        # intent flag (a bool), not the registered commands. Either drop it or log
+        # the real command list, e.g. `sorted(c.qualified_name for c in self.walk_commands())`.
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
@@ -169,10 +172,17 @@ def main() -> None:
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise ValueError("DISCORD_TOKEN environment variable is not set")
-    if not os.getenv("SPOTIFY_CLIENT_ID"):
-        raise ValueError("SPOTIFY_CLIENT_ID environment variable is not set")
-    if not os.getenv("SPOTIFY_CLIENT_SECRET"):
-        raise ValueError("SPOTIFY_CLIENT_SECRET environment variable is not set")
+    # Spotify is an OPTIONAL source: with credentials it's enabled, without them
+    # the bot runs fine and only Spotify links are rejected (YouTube/SoundCloud/
+    # search all still work). Log which mode we're in so a missing credential is
+    # visible at startup rather than surfacing later as a per-link error.
+    if spotify_enabled():
+        log.info("Spotify source enabled")
+    else:
+        log.warning(
+            "Spotify source disabled — set SPOTIFY_CLIENT_ID and "
+            "SPOTIFY_CLIENT_SECRET to enable Spotify links"
+        )
     # Constructed here, not at module scope: the yt-dlp ProcessPoolExecutor workers
     # re-import this module under the spawn/forkserver start method, and a module-level
     # MusicBotApp() would build a full AutoShardedBot (all of discord.py, the help

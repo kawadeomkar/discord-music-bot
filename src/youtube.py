@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
-from yt_dlp.utils import YoutubeDLError
+from yt_dlp.utils import UnsupportedError, YoutubeDLError
 
 import redis.asyncio as aioredis
 from opentelemetry import trace
@@ -56,6 +56,7 @@ class ExtractionError(Exception):
         expected: bool = False,
         video_id: str = "",
         cause_type: str = "",
+        unsupported: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -63,6 +64,12 @@ class ExtractionError(Exception):
         self.expected = expected
         self.video_id = video_id
         self.cause_type = cause_type
+        # True when yt-dlp rejected the URL as coming from a site it does not support
+        # (UnsupportedError). Classified in the worker where the original exception
+        # structure still exists; yt_source reads it to surface the actionable
+        # "not a site I can play" message instead of the generic extractor error.
+        # Defaulted like every other field so the pickle round-trip stays intact (§12.1).
+        self.unsupported = unsupported
 
     @property
     def user_message(self) -> str:
@@ -92,12 +99,18 @@ def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     if isinstance(exc_info, tuple) and len(exc_info) == 3:
         inner = exc_info[1]
     cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
+    # An unsupported-site rejection reaches here as an UnsupportedError, but extract_info
+    # wraps it in a DownloadError carrying the original in exc_info — so check both the
+    # outer error and its wrapped inner. Recorded as a flat bool because the UnsupportedError
+    # type itself cannot cross the process boundary; yt_source keys off this flag.
+    unsupported = isinstance(e, UnsupportedError) or isinstance(inner, UnsupportedError)
     return ExtractionError(
         message=str(e),
         original_type=type(e).__name__,
         expected=bool(getattr(inner, "expected", False)),
         video_id=str(getattr(inner, "video_id", "") or ""),
         cause_type=type(cause).__name__ if cause is not None else "",
+        unsupported=unsupported,
     )
 
 
@@ -966,9 +979,28 @@ class YTDL(discord.FFmpegOpusAudio):
         # with process=False). For a single watch URL the page + player fetch is paid
         # either way; processing adds only format-selection CPU (~tens of ms), no
         # extra network, and it eliminates prefetch_stream's second extraction.
-        data = await ytdlp_pool.run(
-            _ytdlp_extract, search, _YTDL_STREAM_SEARCH_OPTS, download, True
-        )
+        try:
+            data = await ytdlp_pool.run(
+                _ytdlp_extract, search, _YTDL_STREAM_SEARCH_OPTS, download, True
+            )
+        except ExtractionError as e:
+            # We no longer whitelist domains in parse_url — any dotted host is handed
+            # here for yt-dlp to accept or reject. yt-dlp rejects an unrecognised site
+            # with UnsupportedError; extraction now runs in a worker process, so that
+            # error is flattened to an ExtractionError before it crosses back (its
+            # .unsupported flag is set in _classify_ytdlp_error, where the original
+            # structure still exists). Surface a clear message the user can act on
+            # instead of the generic extractor error. Any other ExtractionError is a
+            # real extraction failure and is re-raised untouched for _command_error to
+            # render via user_message.
+            if e.unsupported:
+                trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
+                raise Exception(
+                    f"This link isn't from a site I can play: {search}. Try a "
+                    "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
+                    "site, or just search by name."
+                ) from e
+            raise
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped Exception("Could not find

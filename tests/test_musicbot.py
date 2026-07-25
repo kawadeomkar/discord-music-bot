@@ -24,6 +24,7 @@ from src.musicbot import (
     MusicBot,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
+    SpotifyDisabledError,
     _check_voice_permissions,
     background_typing,
 )
@@ -38,20 +39,6 @@ from tests.helpers import (
     queue_object,
     stub_create_task,
 )
-
-
-@pytest.fixture
-def music_bot(mock_bot: MagicMock) -> MusicBot:
-    """Minimal MusicBot instance bypassing __init__ Discord registration."""
-    cog = MusicBot.__new__(MusicBot)
-    cog.bot = mock_bot
-    cog.mps = {}
-    cog.spotify = MagicMock()
-    cog.redis = None
-    cog._active_spans = {}
-    cog._alone_timers = {}
-    cog._restore_tasks = set()
-    return cog
 
 
 class TestCommandErrorRendering:
@@ -270,6 +257,7 @@ class TestQueueSource:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         result = await music_bot.queue_source(mock_ctx, source)
         assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
@@ -279,6 +267,7 @@ class TestQueueSource:
     ) -> None:
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
@@ -298,6 +287,58 @@ class TestQueueSource:
         ):
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
+
+
+class TestSpotifyDisabled:
+    """When the bot is started without Spotify credentials, self.spotify is None
+    and any Spotify source must raise SpotifyDisabledError — while every other
+    source keeps working."""
+
+    def test_require_spotify_returns_client_when_present(
+        self, music_bot: MusicBot
+    ) -> None:
+        assert music_bot._require_spotify() is music_bot.spotify
+
+    def test_require_spotify_raises_when_disabled(self, music_bot: MusicBot) -> None:
+        music_bot.spotify = None
+        with pytest.raises(SpotifyDisabledError):
+            music_bot._require_spotify()
+
+    async def test_spotify_playlist_raises_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_spotify_track_raises_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_non_spotify_source_unaffected_when_disabled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A YouTube link still resolves normally with Spotify turned off."""
+        music_bot.spotify = None
+        source = YTSource(url="https://yt.com/watch?v=abc", process=False)
+        fake_qobj = QueueObject(
+            "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
+        )
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, QueueObject)
+
+    def test_error_message_is_actionable(self) -> None:
+        msg = str(SpotifyDisabledError())
+        assert "SPOTIFY_CLIENT_ID" in msg
+        assert "SoundCloud" in msg or "search" in msg
 
     async def test_youtube_search_uses_ytsearch(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -1675,14 +1716,18 @@ class TestHistoryCommand:
         assert HistoryFlags.get_flags()["limit"].default == 10
 
 
-class TestPingCommand:
-    async def test_sends_embed_with_latency(
+class TestMaxConcurrencyNotice:
+    async def test_reports_already_running(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        mock_ctx.send.assert_awaited_once()
-        call_kwargs = mock_ctx.send.call_args[1]
-        assert "embed" in call_kwargs
+        mock_ctx.command = MagicMock()
+        mock_ctx.command.name = "ping"
+        await music_bot.cog_command_error(
+            mock_ctx, commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        )
+        embed = mock_ctx.send.await_args.kwargs["embed"]
+        assert "already running" in embed.description
+        assert "ping" in embed.description
 
 
 class TestClearCommand:
@@ -3391,6 +3436,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         mock_ctx.message.content = f"-playnow {url}"
+        assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 
