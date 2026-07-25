@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.33.0"
+version = "2.33.1"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -89,6 +89,7 @@ pytest-timeout = "^2.3"
 # For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
 # code; needs Docker.
 testcontainers = ">=4.8"
+pytest-xdist = "^3.8.0"
 
 [tool.poetry.group.lint]
 optional = true
