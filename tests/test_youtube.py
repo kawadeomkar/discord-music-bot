@@ -12,6 +12,7 @@ import discord
 import orjson
 import pytest
 from redis.asyncio import Redis
+from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
 from src.youtube import (
@@ -436,6 +437,50 @@ class TestYTSource:
             mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
                 await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing")
+
+    async def test_yt_source_unsupported_url_gives_friendly_error(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """yt-dlp reports an unrecognised site by raising UnsupportedError, which
+        extract_info wraps in a DownloadError. Extraction runs in a worker process, so
+        _classify_ytdlp_error flattens that to an ExtractionError with .unsupported set;
+        yt_source keys off that flag to raise an actionable message instead of the
+        generic extractor error."""
+        url = "https://example.com/not-media"
+        # Mirror how yt-dlp wraps an extractor error: extract_info catches the
+        # UnsupportedError and re-raises a DownloadError carrying it in exc_info.
+        # cast() because yt-dlp's ExcInfo type wants a non-None traceback we don't
+        # have (and don't need — _classify_ytdlp_error only reads exc_info[1], the
+        # instance). In tests _ytdlp_extract runs in-process (thread pool), so the
+        # worker-side classification runs for real against this mocked yt-dlp error.
+        cause = UnsupportedError(url)
+        wrapped = DownloadError(
+            "ERROR: Unsupported URL", cast(Any, (type(cause), cause, None))
+        )
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = wrapped
+            with pytest.raises(Exception, match="isn't from a site I can play"):
+                await YTDL.yt_source(mock_ctx.author, url)
+
+    async def test_yt_source_reraises_non_unsupported_extraction_error(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A yt-dlp failure that is NOT an unsupported-site error (e.g. a network
+        failure) is re-raised untouched as the classified ExtractionError — only a
+        genuine UnsupportedError is remapped to the friendly message. _command_error
+        renders the ExtractionError via its user_message."""
+        from src.youtube import ExtractionError
+
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.side_effect = DownloadError(
+                "ERROR: unable to download webpage"
+            )
+            with pytest.raises(ExtractionError) as caught:
+                await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
+        assert caught.value.unsupported is False
+        assert "unable to download webpage" in caught.value.message
+        assert "isn't from a site I can play" not in str(caught.value)
 
     async def test_yt_source_picks_first_entry_from_playlist(
         self, mock_ctx: MagicMock
@@ -1514,6 +1559,7 @@ class TestExtractionErrorClassification:
             expected=True,
             video_id="v9",
             cause_type="NameResolutionError",
+            unsupported=True,
         )
         back = pickle.loads(pickle.dumps(err))
 
@@ -1524,6 +1570,39 @@ class TestExtractionErrorClassification:
         assert back.expected is True
         assert back.video_id == "v9"
         assert back.cause_type == "NameResolutionError"
+        assert back.unsupported is True
+
+    def test_unsupported_url_is_classified_from_the_wrapped_cause(self) -> None:
+        """yt-dlp raises UnsupportedError, then extract_info re-raises a DownloadError
+        carrying it in exc_info. The worker classifies .unsupported off that wrapped
+        inner error so the flag survives the (otherwise unpicklable) boundary."""
+        import sys
+
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        try:
+            raise UnsupportedError("https://example.com/not-media")
+        except UnsupportedError:
+            wrapped = DownloadError("ERROR: Unsupported URL", sys.exc_info())  # type: ignore[arg-type]
+
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = wrapped
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+        assert caught.value.unsupported is True
+
+    def test_non_unsupported_error_is_not_flagged_unsupported(self) -> None:
+        """A garden-variety DownloadError (network failure, video unavailable) must
+        classify with unsupported=False — only genuine UnsupportedError sets it."""
+        from src.youtube import ExtractionError, _ytdlp_extract
+
+        fake_ydl = MagicMock()
+        fake_ydl.extract_info.side_effect = self._real_downloaderror()
+        with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
+            with pytest.raises(ExtractionError) as caught:
+                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+        assert caught.value.unsupported is False
 
     def test_user_message_shows_the_reason_for_an_expected_error(self) -> None:
         """expected=True is yt-dlp's own user-facing reason; show it minus the prefix."""
