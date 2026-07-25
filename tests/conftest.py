@@ -14,12 +14,39 @@ from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
+from tests.mock_spec_cache import check_for_drift
 from tests.mock_spec_cache import install as install_mock_spec_cache
 
 # At import, before any test module is collected, so module-level mocks are
 # covered too. Makes every `Mock(spec=...)` in the suite cheap without the call
 # sites having to opt in. See tests/mock_spec_cache.py.
 install_mock_spec_cache()
+
+
+@pytest.fixture(autouse=True, scope="session")
+def fail_on_stale_mock_spec_cache() -> Iterator[None]:
+    """Fail the run if a spec class was mutated after its first spec'd mock.
+
+    The cache snapshots `dir(spec)` the first time it sees a class and answers
+    from that snapshot for the rest of the process. A `patch.object` or
+    `monkeypatch.setattr` on a spec class therefore poisons every later mock of
+    it — and keeps poisoning them after the `with` block restores the class,
+    because nothing invalidates the entry. The failure is silent (a mock that is
+    subtly wrong, not one that raises) and under `-n 8` it depends on which
+    worker happened to run the mutating test.
+
+    Recomputing every entry costs one `dir()` walk each, ~15ms for a full run.
+    See `check_for_drift` in tests/mock_spec_cache.py.
+    """
+    yield
+    drift = check_for_drift()
+    if drift:
+        raise AssertionError(
+            "tests/mock_spec_cache.py served stale spec data: a spec class was "
+            "mutated after its first spec'd mock, so an unknown number of the "
+            "mocks built in this run came from the pre-mutation snapshot.\n  "
+            + "\n  ".join(drift)
+        )
 
 
 @pytest.fixture(autouse=True)
