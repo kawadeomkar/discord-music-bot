@@ -74,7 +74,7 @@ details, aliases, and examples.
 | Command | Aliases | Description |
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
-| `-ping` | `latency`, `l`, `delay` | Check the bot's WebSocket latency |
+| `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs
