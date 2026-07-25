@@ -27,6 +27,7 @@ from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from src.youtube import close_probe_session
 from tests.helpers import noop_ffmpeg_init, tier_enabled
+from tests.mock_spec_cache import install as install_mock_spec_cache
 
 # Set at MODULE scope, not in a fixture: matplotlib reads MPLCONFIGDIR once, when it
 # is first imported, so a per-test setenv would lose the race with whichever test
@@ -35,6 +36,11 @@ from tests.helpers import noop_ffmpeg_init, tier_enabled
 # here, which is what would otherwise look like `just test` hanging. Third copy of
 # this path — Dockerfile's test and runtime stages hold the other two (rule 6).
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplcache")
+
+# At import, before any test module is collected, so module-level mocks are
+# covered too. Makes every `Mock(spec=...)` in the suite cheap without the call
+# sites having to opt in. See tests/mock_spec_cache.py.
+install_mock_spec_cache()
 
 
 def pytest_collection_modifyitems(
