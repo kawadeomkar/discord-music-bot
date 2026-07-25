@@ -245,11 +245,17 @@ just test -k spotify               # one pattern
 just test --maxfail=1              # stop at the first failure
 ```
 
-`just test-fast` does the same across 8 worker processes with coverage off. Use it
-while iterating; use `just test` (or `just check`) before pushing, since `test-fast`
-trades the 80% coverage gate for wall-clock. Prefer the recipe over `pytest -n` by
-hand — `-n auto` is slower than `-n 8` on a 12-core machine, and leaving coverage on
-cancels the speedup outright.
+`just test-fast` runs the whole suite across 8 worker processes with coverage off.
+Use it while iterating; use `just test` (or `just check`) before pushing, since
+`test-fast` trades the 80% coverage gate for wall-clock. Two caveats worth knowing:
+
+- **It is for the whole suite.** Worker startup is a flat ~4s, so on a narrow
+  selection it is *slower* — `just test tests/test_util.py` beats
+  `just test-fast -k test_util` comfortably.
+- **Coverage is not what makes parallel fast.** `-n 8` with coverage still runs the
+  suite in about two-thirds of the serial time; dropping coverage saves a further
+  ~3s (at the cost of the gate). If you want both, `just test -n 8` forwards
+  through. Prefer `-n 8` over `-n auto`, which is slower on a 12-core machine.
 
 **Build**
 

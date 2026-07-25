@@ -243,16 +243,26 @@ test *ARGS: (_tools 'pytest')
     set -euo pipefail
     {{ PYTEST }} --tb=short -q "$@"
 
-# The whole suite across 8 worker processes, no coverage. Exists because both halves
-# of that sentence are non-obvious, and getting either wrong throws the win away:
+# The whole suite across 8 worker processes, no coverage. Both halves of that
+# sentence are non-obvious. Measured back-to-back, full suite, 12-core macOS:
 #
-#   -n 8, not -n auto. `auto` takes all 12 cores and is SLOWER than 8 — past 8
-#   workers, scheduling and boot overhead cost more than the added parallelism.
+#     just test (serial, coverage on)   23.5s wall / 19.4s CPU
+#     -n 8, coverage on                 15.3s wall / 68.7s CPU
+#     -n 8 --no-cov (this recipe)       12.2s wall / 54.3s CPU
+#     -n auto --no-cov                  13.3s wall
 #
-#   --no-cov, and this is the load-bearing part. `addopts` turns coverage on for
-#   every run, and combining coverage data from 8 workers eats the entire gain:
-#   measured, `-n 8` with coverage burns ~49s of CPU to save under 1s of wall time.
-#   Without it the speedup is real and stable.
+#   -n 8, not -n auto. `auto` takes all 12 cores and is SLOWER — past 8 workers,
+#   scheduling and boot overhead cost more than the added parallelism.
+#
+#   --no-cov, but know what it buys. Combining coverage across 8 workers costs
+#   ~49s of CPU, which is the number worth remembering; in WALL time it is only
+#   ~3s. So this is a real trade, not a free one, and `-n 8` with coverage is
+#   still a large win over serial. If you want the gate and the parallelism,
+#   `just test -n 8` is the middle option — args forward to pytest.
+#
+# Whole-suite only. Worker startup is a flat ~4s, so on a narrow selection this
+# LOSES: `-k test_util` costs 6.7s here against 4.2s for `just test -k test_util`
+# and 1.8s for a plain `pytest --no-cov tests/test_util.py`. Use `just test <path>`.
 #
 # Not part of `check`, and `test` keeps the coverage gate: this trades the 80% floor
 # for wall-clock, so it is the "am I green?" loop, not the pre-push gate.
