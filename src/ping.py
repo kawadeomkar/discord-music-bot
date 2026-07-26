@@ -35,7 +35,8 @@ from opentelemetry.trace import Span
 from yt_dlp.version import __version__ as _YTDLP_VERSION
 
 from src import telemetry
-from src.config import ENVIRONMENT, SpotifyStatus
+from src import config
+from src.config import SpotifyStatus
 from src.spotify import Spotify
 from src.util import get_logger, latency_color, send_embed, trace_footer
 
@@ -394,7 +395,7 @@ def render_ping_embed(
     embed.add_field(
         name="Versions", value="```\n" + "\n".join(ver_lines) + "\n```", inline=False
     )
-    footer = f"environment: {ENVIRONMENT}"
+    footer = f"environment: {config.ENVIRONMENT}"
     if any(r.state is ProbeState.PENDING for r in rows):
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:

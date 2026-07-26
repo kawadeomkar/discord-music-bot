@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import discord
 from discord.ext import commands
 
-from src.config import ENVIRONMENT, spotify_enabled
+from src import config
+from src.config import spotify_enabled
 from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
 from src.util import get_logger
@@ -139,7 +140,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
-        log.info(f"Environment: {ENVIRONMENT}")
+        log.info(f"Environment: {config.ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         # FIXME: this line is labelled "Bot commands:" but logs the `voice_states`
@@ -165,6 +166,17 @@ class MusicBotApp(commands.AutoShardedBot):
 
 
 def main() -> None:
+    # Dev convenience, deliberately here and not at config import time: when
+    # ENVIRONMENT is unset, name the environment after the current git branch.
+    # Running a subprocess is reasonable in an entrypoint and pointless in a
+    # module import — and doing it at import time is what used to kill the test
+    # suite at collection in any detached worktree. Must precede
+    # setup_telemetry(), which stamps the value onto the OTel resource.
+    if not os.environ.get("ENVIRONMENT"):
+        inferred = config.infer_environment_from_git()
+        if inferred is not None:
+            config.ENVIRONMENT = inferred
+
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves
