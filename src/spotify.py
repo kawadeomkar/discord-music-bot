@@ -77,7 +77,19 @@ class Spotify:
         self._session_factory = session_factory or aiohttp.ClientSession
 
     def __str__(self) -> str:
-        return self.auth_token
+        # Never the bearer token. This used to return `self.auth_token`, so a
+        # single f-string anywhere — `log.info(f"...{self.spotify}")`, or an
+        # exception repr that happens to include the client — would put a live
+        # credential into the logs. That is worse here than it sounds: logs are
+        # shipped to Loki and indexed, so a leak is retained and searchable.
+        # A redacted identity is all any caller could legitimately want.
+        client = self.client_id or "unset"
+        return (
+            f"Spotify(client_id={client[:6]}…, "
+            f"token={'set' if self.auth_token else 'unset'})"
+        )
+
+    __repr__ = __str__
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
