@@ -6515,3 +6515,82 @@ class TestPlaynowLoopStart:
         self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
+
+
+class TestNowPlayingEditDiffing:
+    """A 3s tick re-renders an identical payload most of the time; the bar only
+    changes ~10 times in a 4-minute song. Per *bot*, those PATCHes are the
+    dominant REST rate-limit cost."""
+
+    @staticmethod
+    def _host() -> AsyncMock:
+        message = AsyncMock(spec=discord.Message)
+        message.id = 999
+        return message
+
+    async def test_identical_rerender_is_not_pushed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = self._host()
+        assert await music_player._push_np_edit(mock_song, message, []) is True
+        assert message.edit.await_count == 1
+
+        assert await music_player._push_np_edit(mock_song, message, []) is True
+        assert message.edit.await_count == 1  # skipped
+
+    async def test_changed_render_is_pushed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = self._host()
+        await music_player._push_np_edit(mock_song, message, [])
+        mock_song.elapsed_secs = 120.0  # bar advances
+        await music_player._push_np_edit(mock_song, message, [])
+        assert message.edit.await_count == 2
+
+    async def test_a_different_host_always_gets_its_own_edit(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """A host swap must not inherit the old host's cache — the new message
+        has never been written to, so an identical payload is still needed."""
+        first = self._host()
+        await music_player._push_np_edit(mock_song, first, [])
+        second = self._host()
+        second.id = 1000
+        await music_player._push_np_edit(mock_song, second, [])
+        assert second.edit.await_count == 1
+
+    async def test_failed_edit_is_not_cached(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Caching a payload we failed to push would suppress the retry that
+        fixes it."""
+        message = self._host()
+        message.edit.side_effect = discord.HTTPException(MagicMock(), "boom")
+        assert await music_player._push_np_edit(mock_song, message, []) is True
+
+        message.edit.side_effect = None
+        await music_player._push_np_edit(mock_song, message, [])
+        assert message.edit.await_count == 2  # retried, not suppressed
+
+    async def test_releasing_the_host_drops_the_cache(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Retiring can strip-edit the message outside _push_np_edit, so a
+        stale cache entry could suppress a genuinely needed edit."""
+        message = self._host()
+        await music_player._push_np_edit(mock_song, message, [])
+        music_player._release_np_host()
+        assert music_player._np_last_rendered is None
+        await music_player._push_np_edit(mock_song, message, [])
+        assert message.edit.await_count == 2
+
+    async def test_own_embeds_changing_forces_an_edit(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Keyed on the rendered payload, not on position — so every reason an
+        embed can differ is covered without enumerating them."""
+        message = self._host()
+        await music_player._push_np_edit(mock_song, message, [])
+        extra = discord.Embed(title="a command response")
+        await music_player._push_np_edit(mock_song, message, [extra])
+        assert message.edit.await_count == 2
