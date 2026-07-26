@@ -15,7 +15,11 @@ from discord.ext import commands
 
 import redis.asyncio as aioredis
 
-from src.config import spotify_enabled
+from src.config import (
+    SPOTIFY_TEST_TRACK_ID,
+    SpotifyStatus,
+    spotify_enabled,
+)
 from src.musicplayer import MusicPlayer
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
@@ -27,7 +31,7 @@ from src.sources import (
     parse_input,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify
+from src.spotify import Spotify, SpotifyAuthError
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -43,6 +47,7 @@ from src.util import (
     fmt_duration,
     history_embeds,
     notice_embed,
+    pluralize,
     queue_message,
     record_span_error,
     send_embed,
@@ -56,19 +61,32 @@ _tracer = get_tracer(__name__)
 
 
 class SpotifyDisabledError(Exception):
-    """Raised when a Spotify link is played but Spotify support is not configured.
+    """Raised when a Spotify link is played but Spotify support isn't usable.
 
-    The message is user-facing: _command_error renders it (with the class name) into
-    the error embed the requester sees, so it explains the config gap and points at the
-    sources that still work.
+    Carries the SpotifyStatus so the message distinguishes the two failure modes:
+    no credentials were configured (DISABLED) vs. credentials were configured but
+    rejected by Spotify at startup (INVALID). The message is user-facing:
+    _command_error renders it (with the class name) into the error embed the
+    requester sees, so it explains the config gap and points at the sources that
+    still work.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "Spotify links aren't available on this bot — it was started without "
-            "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
-            "Try a YouTube or SoundCloud link, or just search by name."
-        )
+    def __init__(self, status: SpotifyStatus) -> None:
+        self.status = status
+        if status is SpotifyStatus.INVALID:
+            message = (
+                "Spotify links aren't available right now — this bot has Spotify "
+                "credentials configured, but Spotify rejected them at startup "
+                "(check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        else:  # DISABLED (and any unexpected value — safest generic message)
+            message = (
+                "Spotify links aren't available on this bot — it was started without "
+                "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        super().__init__(message)
 
 
 HISTORY_MIN_LIMIT = 1
@@ -122,16 +140,14 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     try:
         async with ctx.typing():
             await asyncio.sleep(3600)  # held open until cancelled
-    # FIXME: this swallows CancelledError, defeating cooperative cancellation.
-    # background_typing() cancels this task on the way out, and catching
-    # CancelledError here makes the task complete *normally* instead of ending
-    # cancelled — task.cancelled() is False, and a cancellation aimed at the
-    # enclosing scope (shutdown, an outer timeout) stops propagating at this
-    # frame. Only the `Exception` half is wanted: typing failures are cosmetic
-    # and must not surface. Not fixed here because this is a behaviour change,
-    # not a typing one, and this branch is scoped to typing.
-    # Fix: catch Exception only, and let CancelledError propagate.
-    except asyncio.CancelledError, Exception:
+    # Catch Exception only — NOT CancelledError. This task is cancelled by
+    # background_typing() on the way out, and letting that CancelledError
+    # propagate is what marks the task genuinely cancelled (task.cancelled()
+    # True) instead of completing normally; swallowing it here would defeat
+    # cooperative cancellation and stop a shutdown/outer-timeout cancellation
+    # at this frame. Typing failures, on the other hand, are purely cosmetic
+    # and must never surface — hence the Exception catch.
+    except Exception:
         pass  # cosmetic — never let typing failures surface
 
 
@@ -157,6 +173,7 @@ class MusicBot(commands.Cog):
         "bot",
         "mps",
         "spotify",
+        "_spotify_status",
         "redis",
         "_active_spans",
         "_alone_timers",
@@ -182,6 +199,16 @@ class MusicBot(commands.Cog):
         self.spotify: Optional[Spotify] = (
             Spotify(redis=self.redis) if spotify_enabled() else None
         )
+        # Status starts ENABLED when credentials are present and DISABLED when
+        # they're absent. cog_load() then probes the live API and downgrades to
+        # INVALID if the credentials don't authenticate. The optimistic ENABLED
+        # start is safe because cog_load runs inside setup_hook, before the
+        # gateway connects — no command can arrive until the probe has resolved.
+        self._spotify_status: SpotifyStatus = (
+            SpotifyStatus.ENABLED
+            if self.spotify is not None
+            else SpotifyStatus.DISABLED
+        )
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → (span, the token otel_context.attach() returns, which detach()
         # requires back — `object` does not satisfy it.
@@ -189,13 +216,59 @@ class MusicBot(commands.Cog):
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
 
+    async def cog_load(self) -> None:
+        """Kick off Spotify credential validation without blocking startup.
+
+        discord.py awaits this when the cog is added — inside setup_hook, before
+        the bot connects — so anything awaited here delays the connection. The
+        probe is a live network call, so it's spawned as a fire-and-forget
+        background task instead: startup proceeds immediately and _spotify_status
+        stays optimistically ENABLED until the probe resolves. With no credentials
+        there's nothing to check."""
+        if self.spotify is None:
+            return
+        spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
+
+    async def _validate_spotify_credentials(self) -> None:
+        """Background credential probe (spawned by cog_load, never awaited on the
+        startup path).
+
+        Only an authentication rejection — SpotifyAuthError — marks Spotify
+        INVALID. Network errors, timeouts, and non-auth HTTP failures are
+        inconclusive: they say nothing about whether the credentials are valid,
+        so the source is left ENABLED and a genuine problem simply surfaces on
+        the first Spotify link. The 10s cap keeps a hung probe from lingering;
+        a timeout is treated as inconclusive, not invalid."""
+        spotify = self.spotify
+        if spotify is None:  # narrowing for the type checker; cog_load already checked
+            return
+        try:
+            await asyncio.wait_for(
+                spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
+            )
+            self._spotify_status = SpotifyStatus.ENABLED
+            log.info("Spotify credentials validated — Spotify source enabled")
+        except SpotifyAuthError as e:
+            self._spotify_status = SpotifyStatus.INVALID
+            log.error(
+                f"Spotify rejected the configured credentials ({e}); Spotify links "
+                "will be declined. Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET."
+            )
+        except Exception as e:
+            log.warning(
+                "Could not validate Spotify credentials at startup "
+                f"({type(e).__name__}: {e}); leaving Spotify enabled — a genuine "
+                "credential problem will surface on the first Spotify link."
+            )
+
     def _require_spotify(self) -> Spotify:
         """Return the Spotify client, or raise SpotifyDisabledError if the feature
-        is off. Call this at every Spotify source dispatch: it both narrows the
-        Optional away for the type checker and produces the user-facing error when
-        credentials are absent."""
-        if self.spotify is None:
-            raise SpotifyDisabledError()
+        is off or its credentials failed startup validation. Call this at every
+        Spotify source dispatch: it both narrows the Optional away for the type
+        checker and produces the user-facing error, whose text depends on why
+        Spotify is unavailable (never configured vs. configured-but-rejected)."""
+        if self.spotify is None or self._spotify_status is not SpotifyStatus.ENABLED:
+            raise SpotifyDisabledError(self._spotify_status)
         return self.spotify
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
@@ -383,6 +456,14 @@ class MusicBot(commands.Cog):
         e: Exception,
         title: str = "Command failed",
     ) -> None:
+        # The command's own failure log, folded in here so the 15 command
+        # bodies don't each repeat the identical `log.error(f"<cmd> failed:
+        # ...")` line before calling this. exc_info=True still captures the
+        # live traceback: this runs inside the command's `except` block, so
+        # sys.exc_info() is `e`. The command name comes from ctx (the canonical
+        # name, matching the literals it replaces) rather than being hand-typed.
+        cmd = ctx.command.name if ctx.command else "command"
+        log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
         if isinstance(e, ExtractionError):
@@ -418,11 +499,8 @@ class MusicBot(commands.Cog):
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
             return ResolvedYoutubePlaylist(
-                await YTDL.yt_playlist(playlist_url, ctx.author)
+                await YTDL.yt_playlist(source.playlist_url, ctx.author)
             )
         else:
             ts: Optional[int] = None
@@ -482,9 +560,7 @@ class MusicBot(commands.Cog):
             # changes a dataclass's constructor and its test call sites, which is
             # more than this typing branch should move.
             assert isinstance(source, YTSource)
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
+            playlist_url = source.playlist_url
             # Mirror of the Spotify branch above: a YTSource playlist resolves
             # via YTDL.yt_playlist() to fully-formed QueueObjects.
             tracks = qobj.tracks
@@ -493,7 +569,7 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                    f"Queued playlist — {count} {pluralize(count, 'song')}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
@@ -673,7 +749,6 @@ class MusicBot(commands.Cog):
                         await self._enqueue_playlist(ctx, source, qobj, mp, front=front)
 
             except Exception as e:
-                log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to queue song")
 
     async def _resolve_playnow_source(
@@ -699,10 +774,7 @@ class MusicBot(commands.Cog):
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
-            tracks = await YTDL.yt_playlist(playlist_url, ctx.author)
+            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
             if not tracks:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
@@ -760,7 +832,6 @@ class MusicBot(commands.Cog):
 
                 await self._interject_flow(ctx, url, mp, vc)
             except Exception as e:
-                log.error(f"playnow failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to play song now")
 
     @_tracer.start_as_current_span("bot.interject_flow")
@@ -943,7 +1014,6 @@ class MusicBot(commands.Cog):
             if coros:
                 await asyncio.gather(*coros)
         except Exception as e:
-            log.error(f"skip failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -972,7 +1042,6 @@ class MusicBot(commands.Cog):
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
-            log.error(f"stop failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -999,7 +1068,6 @@ class MusicBot(commands.Cog):
                 if embed is not None:
                     await ctx.send(embed=embed)
         except Exception as e:
-            log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1031,7 +1099,6 @@ class MusicBot(commands.Cog):
                 # beneath a live, advancing bar for the rest of the song.
                 await mp.rehost_np_after_resume()
         except Exception as e:
-            log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1057,7 +1124,6 @@ class MusicBot(commands.Cog):
                 await ctx.message.add_reaction("🔀")
                 await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
         except Exception as e:
-            log.error(f"shuffle failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1109,7 +1175,6 @@ class MusicBot(commands.Cog):
                 send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
-            log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1141,13 +1206,12 @@ class MusicBot(commands.Cog):
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
                     ctx,
-                    f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
+                    f"Queue cleared — {len(cleared)} {pluralize(len(cleared), 'song')} removed",
                     description,
                     discord.Color.red(),
                 ),
             )
         except Exception as e:
-            log.error(f"clear failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1186,8 +1250,8 @@ class MusicBot(commands.Cog):
             )
             return
         count = len(positions)
-        noun = "song" if count == 1 else "songs"
-        pos_label = "Position" if count == 1 else "Positions"
+        noun = pluralize(count, "song")
+        pos_label = pluralize(count, "Position")
         pos_str = ", ".join(str(p) for p in positions)
         await send_embed(
             ctx,
@@ -1253,7 +1317,6 @@ class MusicBot(commands.Cog):
                     )
                 )
         except Exception as e:
-            log.error(f"now failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1303,7 +1366,6 @@ class MusicBot(commands.Cog):
                     embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
                 )
         except Exception as e:
-            log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1332,7 +1394,6 @@ class MusicBot(commands.Cog):
                 embed=notice_embed("currently in development", discord.Color.blue())
             )
         except Exception as e:
-            log.error(f"jump failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1353,7 +1414,6 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             await ctx.send(embed=mp.queue_embed())
         except Exception as e:
-            log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1401,7 +1461,6 @@ class MusicBot(commands.Cog):
                 )
             )
         except Exception as e:
-            log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1412,7 +1471,9 @@ class MusicBot(commands.Cog):
             "Live health check: round-trip latency to Discord, Redis, Spotify, "
             "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
             "ffmpeg versions. The message posts instantly and fills in as each "
-            "dependency answers; the embed colour tracks the worst one."
+            "dependency answers; the embed colour tracks the worst one. The "
+            "Spotify row also reports the optional source's state: not "
+            "configured, or configured with credentials Spotify rejected."
         ),
         extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
@@ -1428,10 +1489,13 @@ class MusicBot(commands.Cog):
                 bot_latency=self.bot.latency,
                 redis=self.redis,
                 spotify=self.spotify,
+                # Startup validation outcome, not just "is a client configured":
+                # it lets the Spotify row say *why* the source is unusable
+                # without spending a doomed API call (see probe_spotify).
+                spotify_status=self._spotify_status,
                 pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
-            log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────

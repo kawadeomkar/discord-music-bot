@@ -17,6 +17,7 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
@@ -26,11 +27,13 @@ from src.musicbot import (
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
+    _typing_keepalive,
     background_typing,
 )
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
+from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -229,6 +232,126 @@ class TestBackgroundTyping:
         await asyncio.wait_for(exited.wait(), timeout=1)
 
 
+class TestTypingKeepaliveCancellation:
+    """_typing_keepalive must catch Exception only and let CancelledError propagate.
+
+    The distinction is invisible to statement coverage — one `except` line serves
+    both arms, so a handler that also swallows CancelledError reports as covered
+    while silently completing the task *normally*. These assert on
+    task.cancelled(), the only observable that separates the two.
+    """
+
+    async def test_cancelled_keepalive_ends_cancelled_not_completed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """cancel() must leave the task CANCELLED, not merely done().
+
+        Swallowing CancelledError here makes cooperative cancellation a lie:
+        task.cancelled() is False, and a cancellation aimed at an enclosing
+        scope (shutdown, an outer timeout) stops propagating at this frame.
+        """
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.sleep(0)  # let it reach the sleep(3600)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled(), (
+            "keepalive completed normally instead of ending cancelled — "
+            "the handler is swallowing CancelledError"
+        )
+        # done() alone cannot tell the two apart; that is why it is not the assert.
+        assert task.done()
+
+    async def test_cancellation_still_exits_the_typing_cm(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Letting CancelledError propagate must not skip Typing.__aexit__.
+
+        The indicator is dropped by the `async with` unwind. If __aexit__ were
+        skipped the bot would appear to type forever after every command.
+        """
+        exited = asyncio.Event()
+        entered = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            return_value=None, side_effect=lambda: entered.set()
+        )
+        # return_value=None is load-bearing for any test that asserts on
+        # cancellation through this CM: __aexit__ returning a *truthy* value
+        # SUPPRESSES the exception being unwound, so a bare AsyncMock() would
+        # eat the CancelledError inside the `async with` and make the assert
+        # below fail for a reason that has nothing to do with the handler.
+        # Real discord.py Typing.__aexit__ returns None — keep it that way.
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            return_value=None, side_effect=lambda *a: exited.set()
+        )
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        await asyncio.wait_for(exited.wait(), timeout=1)
+        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+        assert task.cancelled()
+
+    async def test_cosmetic_typing_failure_is_still_swallowed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The Exception arm must survive: typing failures stay invisible."""
+        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await task  # must not raise
+
+        assert task.done() and not task.cancelled()
+        assert task.exception() is None
+
+    async def test_base_exception_is_not_swallowed(self, mock_ctx: MagicMock) -> None:
+        """Only Exception is cosmetic; a BaseException must propagate.
+
+        CancelledError is itself a BaseException, so this pins the general rule
+        the handler now follows. Uses a custom subclass rather than SystemExit:
+        asyncio special-cases SystemExit/KeyboardInterrupt by re-raising them
+        into the event loop, which would escape pytest.raises for reasons that
+        have nothing to do with this handler.
+        """
+
+        class Shutdown(BaseException):
+            pass
+
+        mock_ctx.typing.side_effect = Shutdown("shutting down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        with pytest.raises(Shutdown):
+            await task
+
+    async def test_background_typing_leaves_its_keepalive_cancelled(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """End-to-end: the task background_typing() spawns and cancels on exit
+        must settle as CANCELLED. background_typing does not await it, so this
+        is the only place the contract is observable from outside."""
+        spawned: list[asyncio.Task[Any]] = []
+        real_create_task = asyncio.create_task
+
+        def capture(coro: Any, **kw: Any) -> asyncio.Task[Any]:
+            task = real_create_task(coro, **kw)
+            spawned.append(task)
+            return task
+
+        with patch("src.musicbot.asyncio.create_task", side_effect=capture):
+            async with background_typing(mock_ctx):
+                await asyncio.sleep(0)
+
+        assert len(spawned) == 1
+        keepalive = spawned[0]
+        with contextlib.suppress(asyncio.CancelledError):
+            await keepalive
+        assert keepalive.cancelled()
+
+
 class TestLatencyColor:
     def test_excellent_latency_is_green(self) -> None:
         assert latency_color(30).value == 0x44FF44
@@ -290,24 +413,40 @@ class TestQueueSource:
 
 
 class TestSpotifyDisabled:
-    """When the bot is started without Spotify credentials, self.spotify is None
-    and any Spotify source must raise SpotifyDisabledError — while every other
-    source keeps working."""
+    """When Spotify isn't usable — no credentials (self.spotify is None, status
+    DISABLED) or credentials rejected at startup (status INVALID) — any Spotify
+    source must raise SpotifyDisabledError, while every other source keeps
+    working."""
 
-    def test_require_spotify_returns_client_when_present(
+    def test_require_spotify_returns_client_when_enabled(
         self, music_bot: MusicBot
     ) -> None:
         assert music_bot._require_spotify() is music_bot.spotify
 
-    def test_require_spotify_raises_when_disabled(self, music_bot: MusicBot) -> None:
+    def test_require_spotify_raises_when_no_credentials(
+        self, music_bot: MusicBot
+    ) -> None:
         music_bot.spotify = None
-        with pytest.raises(SpotifyDisabledError):
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
+        assert exc.value.status is SpotifyStatus.DISABLED
+
+    def test_require_spotify_raises_when_credentials_invalid(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Credentials were present (client built) but rejected at startup: the
+        gate still refuses, and the error reports INVALID rather than DISABLED."""
+        music_bot._spotify_status = SpotifyStatus.INVALID
+        with pytest.raises(SpotifyDisabledError) as exc:
+            music_bot._require_spotify()
+        assert exc.value.status is SpotifyStatus.INVALID
 
     async def test_spotify_playlist_raises_when_disabled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(mock_ctx, source)
@@ -316,6 +455,17 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
+        with pytest.raises(SpotifyDisabledError):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_spotify_track_raises_when_credentials_invalid(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Even with a live client object, an INVALID status short-circuits the
+        source before any Spotify API call is attempted."""
+        music_bot._spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
             await music_bot.queue_source(mock_ctx, source)
@@ -325,6 +475,7 @@ class TestSpotifyDisabled:
     ) -> None:
         """A YouTube link still resolves normally with Spotify turned off."""
         music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
         source = YTSource(url="https://yt.com/watch?v=abc", process=False)
         fake_qobj = QueueObject(
             "https://yt.com/watch?v=abc", "YT Song", mock_ctx.author
@@ -335,10 +486,16 @@ class TestSpotifyDisabled:
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
 
-    def test_error_message_is_actionable(self) -> None:
-        msg = str(SpotifyDisabledError())
+    def test_disabled_error_message_is_actionable(self) -> None:
+        msg = str(SpotifyDisabledError(SpotifyStatus.DISABLED))
         assert "SPOTIFY_CLIENT_ID" in msg
+        assert "without" in msg
         assert "SoundCloud" in msg or "search" in msg
+
+    def test_invalid_error_message_distinguishes_bad_credentials(self) -> None:
+        msg = str(SpotifyDisabledError(SpotifyStatus.INVALID))
+        assert "SPOTIFY_CLIENT_ID" in msg
+        assert "rejected" in msg
 
     async def test_youtube_search_uses_ytsearch(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -525,6 +682,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     cog._active_spans = {}
     cog._alone_timers = {}
@@ -1728,6 +1886,70 @@ class TestMaxConcurrencyNotice:
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "already running" in embed.description
         assert "ping" in embed.description
+
+
+class TestCogLoadSpotifyValidation:
+    """cog_load spawns the credential probe as a background task so startup is
+    never blocked, and the probe resolves _spotify_status without ever raising."""
+
+    async def test_no_op_when_spotify_disabled(self, music_bot: MusicBot) -> None:
+        music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        music_bot._restore_tasks = set()
+        await music_bot.cog_load()
+        assert music_bot._spotify_status is SpotifyStatus.DISABLED
+        assert music_bot._restore_tasks == set()  # no probe spawned
+
+    async def test_cog_load_spawns_probe_without_blocking(
+        self, music_bot: MusicBot
+    ) -> None:
+        """cog_load returns immediately (leaving status ENABLED) and the probe
+        runs as a tracked background task, not inline."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(return_value=None)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        music_bot._restore_tasks = set()
+
+        await music_bot.cog_load()
+        assert len(music_bot._restore_tasks) == 1  # probe spawned, not awaited
+
+        await asyncio.gather(*music_bot._restore_tasks)  # let the probe finish
+        music_bot.spotify.validate.assert_awaited_once()
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+
+    async def test_valid_credentials_stay_enabled(self, music_bot: MusicBot) -> None:
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(return_value=None)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot._validate_spotify_credentials()
+        music_bot.spotify.validate.assert_awaited_once()
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+
+    async def test_auth_error_flips_to_invalid(self, music_bot: MusicBot) -> None:
+        """Only an authentication rejection disables Spotify."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(side_effect=SpotifyAuthError(400))
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot._validate_spotify_credentials()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.INVALID
+
+    async def test_network_error_leaves_enabled(self, music_bot: MusicBot) -> None:
+        """A non-auth failure is inconclusive: Spotify stays ENABLED."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(
+            side_effect=OSError("connection refused")
+        )
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot._validate_spotify_credentials()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
+
+    async def test_timeout_leaves_enabled(self, music_bot: MusicBot) -> None:
+        """A probe timeout is inconclusive (not an auth rejection): stays ENABLED."""
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        await music_bot._validate_spotify_credentials()  # must not raise
+        assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
 
 class TestClearCommand:

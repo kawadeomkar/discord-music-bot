@@ -35,7 +35,7 @@ from opentelemetry.trace import Span
 from yt_dlp.version import __version__ as _YTDLP_VERSION
 
 from src import telemetry
-from src.config import ENVIRONMENT
+from src.config import ENVIRONMENT, SpotifyStatus
 from src.spotify import Spotify
 from src.util import get_logger, latency_color, send_embed, trace_footer
 
@@ -141,12 +141,32 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
     return await _timed("Redis", _do)
 
 
-async def probe_spotify(spotify: Optional[Spotify]) -> ProbeResult:
+async def probe_spotify(
+    spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
+) -> ProbeResult:
+    """Spotify's row, which reports the *source's* usability, not just reachability.
+
+    `status` is the outcome of the startup credential probe (MusicBot._spotify_status):
+    it is the only thing that can tell "configured but Spotify rejected the
+    credentials" apart from "reachable but slow", and it does so without spending a
+    doomed API call. It defaults to ENABLED so a caller that has no status to offer
+    still gets the plain reachability probe.
+    """
     # spotify is None when the bot was started without Spotify credentials (the
     # feature is off entirely); a non-None client with empty creds is the same story
     # from a probe's point of view. Both are "not configured" → N/A, not a failure.
-    if spotify is None or not (spotify.client_id and spotify.client_secret):
-        return ProbeResult("Spotify API", ProbeState.NA)
+    if (
+        spotify is None
+        or status is SpotifyStatus.DISABLED
+        or not (spotify.client_id and spotify.client_secret)
+    ):
+        return ProbeResult("Spotify API", ProbeState.NA, detail="not configured")
+    if status is SpotifyStatus.INVALID:
+        # Credentials were present at startup and Spotify rejected them. Probing
+        # would only re-earn the same 401 a second time, so report the known cause.
+        return ProbeResult(
+            "Spotify API", ProbeState.DOWN, detail="credentials rejected"
+        )
 
     async def _do() -> None:
         # Reachability without spending quota: a tiny authenticated GET that also
@@ -322,7 +342,9 @@ def _ping_value(r: ProbeResult) -> str:
     }[r.state]
     # A bare "down" makes an operator go read logs; the reason (MISCONF, OOM,
     # ConnectionError) is the actionable half and costs one short parenthetical.
-    if r.state is ProbeState.DOWN and r.detail:
+    # An n/a row gets the same treatment when it has a reason to give — "not
+    # configured" is why an optional dependency is dark, and it costs nothing.
+    if r.state in (ProbeState.DOWN, ProbeState.NA) and r.detail:
         return f"{word} ({r.detail})"
     return word
 
@@ -424,6 +446,7 @@ async def run_health_dashboard(
     bot_latency: float,
     redis: Optional[aioredis.Redis],
     spotify: Optional[Spotify],
+    spotify_status: SpotifyStatus = SpotifyStatus.ENABLED,
     pg_pool: Optional[object] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md §5).
@@ -453,7 +476,7 @@ async def run_health_dashboard(
         #    probe spans (auto-instrumented Redis/aiohttp) nest under bot.ping.
         tasks = {
             "Redis": asyncio.create_task(probe_redis(redis)),
-            "Spotify API": asyncio.create_task(probe_spotify(spotify)),
+            "Spotify API": asyncio.create_task(probe_spotify(spotify, spotify_status)),
             "Postgres": asyncio.create_task(probe_postgres(pg_pool)),
             "OTEL collector": asyncio.create_task(probe_otel()),
         }

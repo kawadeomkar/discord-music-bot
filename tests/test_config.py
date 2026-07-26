@@ -2,7 +2,7 @@
 
 import pytest
 
-from src.config import spotify_enabled
+from src.config import SPOTIFY_TEST_TRACK_ID, SpotifyStatus, spotify_enabled
 
 
 class TestSpotifyEnabled:
@@ -52,3 +52,13 @@ class TestSpotifyEnabled:
         monkeypatch.setenv("SPOTIFY_CLIENT_ID", "id")
         monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "secret")
         assert spotify_enabled() is True
+
+
+class TestSpotifyConfigConstants:
+    def test_probe_track_id_is_the_documented_track(self) -> None:
+        # "Never Gonna Give You Up" — a permanent public track used as the
+        # startup credential probe. Guards against an accidental edit.
+        assert SPOTIFY_TEST_TRACK_ID == "4PTG3Z6ehGkBFwjybzWkR8"
+
+    def test_status_has_three_distinct_states(self) -> None:
+        assert {s.value for s in SpotifyStatus} == {"disabled", "invalid", "enabled"}

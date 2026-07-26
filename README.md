@@ -106,7 +106,7 @@ replies that the link isn't from a site it can play.
 **To run the bot** — Docker, plus credentials:
 
 - A [Discord bot token](https://discord.com/developers/applications)
-- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work.
+- _Optional:_ a [Spotify app](https://developer.spotify.com/dashboard) (client ID + secret) — only needed to play Spotify links. Without it the bot starts normally and Spotify links are declined; YouTube, SoundCloud, other yt-dlp sites, and search all still work. When credentials are provided, the bot validates them against the Spotify API on startup — invalid credentials are logged as an error and Spotify links are declined (everything else keeps working). Run `-ping` to see the current Spotify status.
 
 The Docker Compose stack contains its own Redis to enable persistence, caching, and crash recovery.
 Credentials *must* be set in a `.env` file at the project root before starting anything:
