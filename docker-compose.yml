@@ -7,6 +7,11 @@ services:
       dockerfile: Dockerfile
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
+    # Linux-only: network_mode: host is a no-op on Docker Desktop for macOS and
+    # Windows, where the daemon runs in a VM — the bot would not reach Redis or
+    # the OTLP endpoint on localhost. Documented rather than changed: the bot
+    # reaches otel-lgtm and the POT sidecar via 127.0.0.1 by design, and moving
+    # to a bridge network means rewriting those endpoints.
     network_mode: host
     env_file:
     - .env
@@ -18,7 +23,9 @@ services:
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
-      - ytdlp-cache:/root/.cache/yt-dlp
+      # Path follows HOME for the non-root `app` user in the Dockerfile — the two
+      # must move together, and the old /root path is unwritable now.
+      - ytdlp-cache:/home/app/.cache/yt-dlp
     depends_on:
       redis:
         condition: service_healthy
@@ -88,6 +95,9 @@ services:
       - otel-tempo:/tmp/tempo
       - otel-loki:/tmp/loki
     environment:
+      # Dev credentials for a dev stack. Acceptable ONLY because this service is
+      # not published beyond the host — anyone deploying otel-lgtm somewhere
+      # reachable must replace these.
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:

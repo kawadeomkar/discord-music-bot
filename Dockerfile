@@ -80,9 +80,39 @@ COPY --from=builder /app/.venv /app/.venv
 COPY src/ ./src/
 COPY pyproject.toml ./
 
+# Run as a non-root user. Nothing here needs privilege — ffmpeg and the venv
+# both run fine unprivileged — so root was pure blast radius. A fixed uid/gid
+# (not a distro-assigned one) keeps volume ownership stable across rebuilds and
+# base-image bumps.
+#
+# HOME is set explicitly because yt-dlp derives its cache directory from it:
+# the cache lived at /root/.cache/yt-dlp, and without this the volume would
+# mount to a path the process can no longer write. docker-compose.yml mounts
+# the new path — the two must be changed together.
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
+ && mkdir -p /home/app/.cache/yt-dlp \
+ && chown -R app:app /home/app
+USER app
+
 ARG ENVIRONMENT=production
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
-    ENVIRONMENT="${ENVIRONMENT}"
+    HOME="/home/app" \
+    ENVIRONMENT="${ENVIRONMENT}" \
+    LIVENESS_FILE="/tmp/bot-alive"
+
+# `restart: always` only covers the process EXITING. A bot whose event loop has
+# wedged — a deadlock, a blocked call starving the loop — stays "up" forever
+# while answering nothing. The bot touches LIVENESS_FILE from a loop-resident
+# task, so a stale mtime means the loop stopped turning even though the process
+# is alive. Deliberately not a dependency probe: a Redis blip must not restart
+# the container (which is also why src/healthz.py stays a K8s-plan concern —
+# see src/ping.py's module docstring).
+#
+# start-period covers login + extension load; interval/retries give a wedged
+# loop ~90s before a restart, comfortably above the 15s touch cadence.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
 CMD ["python", "-m", "src.main"]
