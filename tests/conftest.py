@@ -10,6 +10,7 @@ import pytest
 import structlog
 from redis.asyncio import Redis
 
+from src.config import SpotifyStatus
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -259,6 +260,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.bot = mock_bot
     cog.mps = {}
     cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
     cog._alone_timers = {}

@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from src import ping, telemetry
+from src.config import SpotifyStatus
 from src.ping import ProbeResult, ProbeState, render_ping_embed
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
@@ -243,6 +244,67 @@ class TestPingCommand:
         redis_spy.assert_not_awaited()  # no health dashboard on the join path
 
 
+class TestPingReportsSpotifySource:
+    """End-to-end: the Spotify row reports the *source's* startup state — never
+    configured, configured-but-rejected, or live — so a user can see why Spotify
+    links are being declined without anyone reading the bot's logs.
+
+    Unlike the tests above, these leave probe_spotify unpatched: the cog's
+    _spotify_status is exactly what is under test here.
+    """
+
+    def _patch_everything_but_spotify(self) -> Any:
+        async def _make(res: ProbeResult) -> ProbeResult:
+            return res
+
+        async def _versions() -> dict[str, str]:
+            await asyncio.sleep(0)  # yield so the immediate probes settle
+            return dict.fromkeys(
+                ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
+            )
+
+        return patch.multiple(
+            "src.ping",
+            probe_redis=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_postgres=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_otel=lambda *a, **k: _make(_probe(ProbeState.OFF)),
+            collect_versions=_versions,
+        )
+
+    async def _run(self, music_bot: MusicBot, mock_ctx: MagicMock) -> str:
+        _ping_message(mock_ctx)
+        with self._patch_everything_but_spotify():
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        return _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+
+    async def test_no_credentials_row_says_not_configured(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.spotify = None
+        music_bot._spotify_status = SpotifyStatus.DISABLED
+        latency = await self._run(music_bot, mock_ctx)
+        assert "Spotify API" in latency
+        assert "n/a (not configured)" in latency
+
+    async def test_rejected_credentials_row_says_so(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The startup probe found the credentials invalid: the row is red and
+        names the cause rather than reporting a generic outage."""
+        music_bot._spotify_status = SpotifyStatus.INVALID
+        latency = await self._run(music_bot, mock_ctx)
+        assert "down (credentials rejected)" in latency
+
+    async def test_validated_credentials_row_is_a_live_latency(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mocked(music_bot.spotify).http_call = AsyncMock(return_value={"x": 1})
+        music_bot._spotify_status = SpotifyStatus.ENABLED
+        latency = await self._run(music_bot, mock_ctx)
+        assert "ms" in latency
+        assert "rejected" not in latency and "not configured" not in latency
+
+
 class TestDownReasonRendering:
     """A bare "down" sends the operator to the logs; the server's reason code is
     the actionable half (regression for the live MISCONF outage)."""
@@ -328,21 +390,38 @@ class TestProbeSpotify:
     async def test_none_is_na(self) -> None:
         # spotify is None when the bot was started without Spotify credentials
         # (optional-Spotify feature): the probe reports N/A, not a failure.
-        r = await ping.probe_spotify(None)
+        r = await ping.probe_spotify(None, SpotifyStatus.DISABLED)
         assert r.state is ProbeState.NA
+        assert r.detail == "not configured"
 
     async def test_no_credentials_is_na(self) -> None:
         r = await ping.probe_spotify(self._spotify(AsyncMock(), creds=False))  # type: ignore[arg-type]
         assert r.state is ProbeState.NA
 
+    async def test_disabled_status_is_na_without_calling_the_api(self) -> None:
+        """DISABLED wins even if a client object is somehow present: no API call."""
+        http_call = AsyncMock()
+        r = await ping.probe_spotify(self._spotify(http_call), SpotifyStatus.DISABLED)  # type: ignore[arg-type]
+        assert r.state is ProbeState.NA
+        http_call.assert_not_awaited()
+
+    async def test_invalid_status_is_down_without_calling_the_api(self) -> None:
+        """Startup validation already saw Spotify reject these credentials — the
+        row says so instead of spending a doomed request to re-earn the 401."""
+        http_call = AsyncMock()
+        r = await ping.probe_spotify(self._spotify(http_call), SpotifyStatus.INVALID)  # type: ignore[arg-type]
+        assert r.state is ProbeState.DOWN
+        assert r.detail == "credentials rejected"
+        http_call.assert_not_awaited()
+
     async def test_success_is_ok(self) -> None:
         spotify = self._spotify(AsyncMock(return_value={"categories": {}}))
-        r = await ping.probe_spotify(spotify)  # type: ignore[arg-type]
+        r = await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.OK
 
     async def test_error_is_down(self) -> None:
         spotify = self._spotify(AsyncMock(side_effect=Exception("401")))
-        r = await ping.probe_spotify(spotify)  # type: ignore[arg-type]
+        r = await ping.probe_spotify(spotify, SpotifyStatus.ENABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.DOWN
 
 

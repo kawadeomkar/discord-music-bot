@@ -15,7 +15,11 @@ from discord.ext import commands
 
 import redis.asyncio as aioredis
 
-from src.config import spotify_enabled
+from src.config import (
+    SPOTIFY_TEST_TRACK_ID,
+    SpotifyStatus,
+    spotify_enabled,
+)
 from src.musicplayer import MusicPlayer
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import (
@@ -27,7 +31,7 @@ from src.sources import (
     parse_input,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify
+from src.spotify import Spotify, SpotifyAuthError
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -57,19 +61,32 @@ _tracer = get_tracer(__name__)
 
 
 class SpotifyDisabledError(Exception):
-    """Raised when a Spotify link is played but Spotify support is not configured.
+    """Raised when a Spotify link is played but Spotify support isn't usable.
 
-    The message is user-facing: _command_error renders it (with the class name) into
-    the error embed the requester sees, so it explains the config gap and points at the
-    sources that still work.
+    Carries the SpotifyStatus so the message distinguishes the two failure modes:
+    no credentials were configured (DISABLED) vs. credentials were configured but
+    rejected by Spotify at startup (INVALID). The message is user-facing:
+    _command_error renders it (with the class name) into the error embed the
+    requester sees, so it explains the config gap and points at the sources that
+    still work.
     """
 
-    def __init__(self) -> None:
-        super().__init__(
-            "Spotify links aren't available on this bot — it was started without "
-            "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
-            "Try a YouTube or SoundCloud link, or just search by name."
-        )
+    def __init__(self, status: SpotifyStatus) -> None:
+        self.status = status
+        if status is SpotifyStatus.INVALID:
+            message = (
+                "Spotify links aren't available right now — this bot has Spotify "
+                "credentials configured, but Spotify rejected them at startup "
+                "(check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        else:  # DISABLED (and any unexpected value — safest generic message)
+            message = (
+                "Spotify links aren't available on this bot — it was started without "
+                "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
+                "Try a YouTube or SoundCloud link, or just search by name."
+            )
+        super().__init__(message)
 
 
 HISTORY_MIN_LIMIT = 1
@@ -156,6 +173,7 @@ class MusicBot(commands.Cog):
         "bot",
         "mps",
         "spotify",
+        "_spotify_status",
         "redis",
         "_active_spans",
         "_alone_timers",
@@ -181,6 +199,16 @@ class MusicBot(commands.Cog):
         self.spotify: Optional[Spotify] = (
             Spotify(redis=self.redis) if spotify_enabled() else None
         )
+        # Status starts ENABLED when credentials are present and DISABLED when
+        # they're absent. cog_load() then probes the live API and downgrades to
+        # INVALID if the credentials don't authenticate. The optimistic ENABLED
+        # start is safe because cog_load runs inside setup_hook, before the
+        # gateway connects — no command can arrive until the probe has resolved.
+        self._spotify_status: SpotifyStatus = (
+            SpotifyStatus.ENABLED
+            if self.spotify is not None
+            else SpotifyStatus.DISABLED
+        )
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → (span, the token otel_context.attach() returns, which detach()
         # requires back — `object` does not satisfy it.
@@ -188,13 +216,59 @@ class MusicBot(commands.Cog):
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
 
+    async def cog_load(self) -> None:
+        """Kick off Spotify credential validation without blocking startup.
+
+        discord.py awaits this when the cog is added — inside setup_hook, before
+        the bot connects — so anything awaited here delays the connection. The
+        probe is a live network call, so it's spawned as a fire-and-forget
+        background task instead: startup proceeds immediately and _spotify_status
+        stays optimistically ENABLED until the probe resolves. With no credentials
+        there's nothing to check."""
+        if self.spotify is None:
+            return
+        spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
+
+    async def _validate_spotify_credentials(self) -> None:
+        """Background credential probe (spawned by cog_load, never awaited on the
+        startup path).
+
+        Only an authentication rejection — SpotifyAuthError — marks Spotify
+        INVALID. Network errors, timeouts, and non-auth HTTP failures are
+        inconclusive: they say nothing about whether the credentials are valid,
+        so the source is left ENABLED and a genuine problem simply surfaces on
+        the first Spotify link. The 10s cap keeps a hung probe from lingering;
+        a timeout is treated as inconclusive, not invalid."""
+        spotify = self.spotify
+        if spotify is None:  # narrowing for the type checker; cog_load already checked
+            return
+        try:
+            await asyncio.wait_for(
+                spotify.validate(SPOTIFY_TEST_TRACK_ID), timeout=10.0
+            )
+            self._spotify_status = SpotifyStatus.ENABLED
+            log.info("Spotify credentials validated — Spotify source enabled")
+        except SpotifyAuthError as e:
+            self._spotify_status = SpotifyStatus.INVALID
+            log.error(
+                f"Spotify rejected the configured credentials ({e}); Spotify links "
+                "will be declined. Check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET."
+            )
+        except Exception as e:
+            log.warning(
+                "Could not validate Spotify credentials at startup "
+                f"({type(e).__name__}: {e}); leaving Spotify enabled — a genuine "
+                "credential problem will surface on the first Spotify link."
+            )
+
     def _require_spotify(self) -> Spotify:
         """Return the Spotify client, or raise SpotifyDisabledError if the feature
-        is off. Call this at every Spotify source dispatch: it both narrows the
-        Optional away for the type checker and produces the user-facing error when
-        credentials are absent."""
-        if self.spotify is None:
-            raise SpotifyDisabledError()
+        is off or its credentials failed startup validation. Call this at every
+        Spotify source dispatch: it both narrows the Optional away for the type
+        checker and produces the user-facing error, whose text depends on why
+        Spotify is unavailable (never configured vs. configured-but-rejected)."""
+        if self.spotify is None or self._spotify_status is not SpotifyStatus.ENABLED:
+            raise SpotifyDisabledError(self._spotify_status)
         return self.spotify
 
     def get_mp(self, ctx: commands.Context) -> MusicPlayer:
@@ -1397,7 +1471,9 @@ class MusicBot(commands.Cog):
             "Live health check: round-trip latency to Discord, Redis, Spotify, "
             "Postgres and the OTEL collector, plus the running bot / yt-dlp / "
             "ffmpeg versions. The message posts instantly and fills in as each "
-            "dependency answers; the embed colour tracks the worst one."
+            "dependency answers; the embed colour tracks the worst one. The "
+            "Spotify row also reports the optional source's state: not "
+            "configured, or configured with credentials Spotify rejected."
         ),
         extras={"category": "Utility", "examples": ["-ping", "-health"]},
     )
@@ -1413,6 +1489,10 @@ class MusicBot(commands.Cog):
                 bot_latency=self.bot.latency,
                 redis=self.redis,
                 spotify=self.spotify,
+                # Startup validation outcome, not just "is a client configured":
+                # it lets the Spotify row say *why* the source is unusable
+                # without spending a doomed API call (see probe_spotify).
+                spotify_status=self._spotify_status,
                 pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
