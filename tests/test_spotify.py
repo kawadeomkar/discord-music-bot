@@ -555,3 +555,58 @@ class TestSpotifyAlbums:
             await spotify.albums(["zid", "aid"])
         cached = await fake_redis.get("spotify:album:aid,zid")
         assert cached is not None
+
+
+class TestSharedSession:
+    """One session per client instead of one per request — the documented
+    aiohttp anti-pattern discards the connection pool and DNS cache, so every
+    call paid a fresh TCP + TLS handshake to a host it had just talked to."""
+
+    async def test_session_is_reused_across_calls(self, spotify: Spotify) -> None:
+        factory_calls = 0
+        session = _make_mock_session(AsyncMock())
+
+        def _factory(**kw: Any) -> Any:
+            nonlocal factory_calls
+            factory_calls += 1
+            return session
+
+        spotify._session_factory = _factory
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        session.request.return_value.status = 200
+
+        await spotify.http_call("https://api.spotify.com/v1/tracks/a")
+        await spotify.http_call("https://api.spotify.com/v1/tracks/b")
+
+        assert factory_calls == 1
+        assert session.request.await_count == 2
+
+    async def test_session_is_created_lazily(self, spotify: Spotify) -> None:
+        """A ClientSession must be built on the running loop, and __init__ runs
+        before the bot connects — so construction must not create one."""
+        assert spotify._session is None
+
+    async def test_aclose_closes_and_clears(self, spotify: Spotify) -> None:
+        session = _make_mock_session(AsyncMock())
+        session.close = AsyncMock()
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+
+        await spotify.aclose()
+
+        session.close.assert_awaited_once()
+        assert spotify._session is None
+
+    async def test_aclose_without_a_session_is_a_noop(self, spotify: Spotify) -> None:
+        await spotify.aclose()  # must not raise
+
+    async def test_aclose_swallows_close_errors(self, spotify: Spotify) -> None:
+        """Shutdown must not be derailed by a socket that is already gone."""
+        session = _make_mock_session(AsyncMock())
+        session.close = AsyncMock(side_effect=OSError("already gone"))
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+
+        await spotify.aclose()  # must not raise
+        assert spotify._session is None

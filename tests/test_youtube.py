@@ -1805,3 +1805,41 @@ class TestRunExtract:
             mock_pool.run = AsyncMock(side_effect=DownloadError("boom"))
             with pytest.raises(DownloadError):
                 await _run_extract(ExtractRequest(url="https://yt.com/v=x", opts={}))
+
+
+class TestProbeSessionSharing:
+    """The stream probe runs before EVERY song; a per-call session made each one
+    pay a fresh TCP + TLS handshake to googlevideo."""
+
+    async def test_probe_session_is_reused(self) -> None:
+        import src.youtube as youtube
+
+        first = youtube._get_probe_session()
+        second = youtube._get_probe_session()
+        assert first is second
+        await youtube.close_probe_session()
+
+    async def test_close_clears_the_global(self) -> None:
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        await youtube.close_probe_session()
+        assert youtube._probe_session is None
+        assert session.closed
+
+    async def test_a_closed_session_is_replaced(self) -> None:
+        """Defensive: if something closes it out from under us, the next probe
+        must build a new one rather than raise on a dead session."""
+        import src.youtube as youtube
+
+        first = youtube._get_probe_session()
+        await first.close()
+        second = youtube._get_probe_session()
+        assert second is not first
+        await youtube.close_probe_session()
+
+    async def test_close_without_a_session_is_a_noop(self) -> None:
+        import src.youtube as youtube
+
+        await youtube.close_probe_session()
+        await youtube.close_probe_session()  # must not raise

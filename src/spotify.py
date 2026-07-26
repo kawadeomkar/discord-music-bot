@@ -75,9 +75,36 @@ class Spotify:
         self._auth_lock = asyncio.Lock()
         self._redis = redis
         self._session_factory = session_factory or aiohttp.ClientSession
+        # One session for the life of the client, created lazily on first use.
+        # A ClientSession must be constructed on the running loop, and __init__
+        # runs before the bot connects — so this cannot be built here.
+        self._session: Optional[Any] = None
 
     def __str__(self) -> str:
         return self.auth_token
+
+    def _session_or_create(self) -> Any:
+        """The shared session, created on first use.
+
+        Every call used to construct and tear down its own ClientSession — the
+        documented aiohttp anti-pattern. It discards the connection pool and the
+        DNS cache, so each Spotify request paid a fresh TCP + TLS handshake to
+        the same host it had just finished talking to.
+        """
+        if self._session is None:
+            self._session = self._session_factory(json_serialize=ujson.dumps)
+        return self._session
+
+    async def aclose(self) -> None:
+        """Close the shared session. Called from the cog's unload."""
+        session = self._session
+        self._session = None
+        if session is None:
+            return
+        try:
+            await session.close()
+        except Exception as e:
+            log.warning(f"Failed to close Spotify HTTP session: {e}")
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -108,11 +135,11 @@ class Spotify:
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         }
-        async with self._session_factory(json_serialize=ujson.dumps) as session:
-            resp = await session.post(self.auth_endpoint, data=data)
-            if strict and resp.status not in (200, 201):
-                raise SpotifyAuthError(resp.status, "client-credentials grant failed")
-            resp_data = await resp.json(content_type=None)
+        session = self._session_or_create()
+        resp = await session.post(self.auth_endpoint, data=data)
+        if strict and resp.status not in (200, 201):
+            raise SpotifyAuthError(resp.status, "client-credentials grant failed")
+        resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
         expires_in: int = resp_data["expires_in"]
         self.token_expiry += expires_in
@@ -147,19 +174,19 @@ class Spotify:
             headers = {}
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        async with self._session_factory(json_serialize=ujson.dumps) as session:
-            resp = await session.request(
-                http_method, endpoint_route, headers=headers, data=data, params=params
-            )
-            if resp.status in (200, 201):
-                return await resp.json(content_type=None)
-            if resp.status in (401, 403):
-                # Credential/token rejection — distinct from other non-2xx codes
-                # so validate() can tell "bad credentials" from "request failed".
-                raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
-            raise Exception(
-                f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
-            )
+        session = self._session_or_create()
+        resp = await session.request(
+            http_method, endpoint_route, headers=headers, data=data, params=params
+        )
+        if resp.status in (200, 201):
+            return await resp.json(content_type=None)
+        if resp.status in (401, 403):
+            # Credential/token rejection — distinct from other non-2xx codes
+            # so validate() can tell "bad credentials" from "request failed".
+            raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
+        raise Exception(
+            f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+        )
 
     async def validate(self, track_id: str) -> None:
         """Exercise the configured credentials against the live Spotify API.

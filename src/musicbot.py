@@ -229,6 +229,16 @@ class MusicBot(commands.Cog):
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
 
+    async def cog_unload(self) -> None:
+        """Release the Spotify client's shared HTTP session.
+
+        discord.py's BotBase.close() removes every cog before disconnecting, so
+        this runs on any orderly shutdown — an unclosed aiohttp session logs an
+        "Unclosed client session" warning at interpreter exit otherwise.
+        """
+        if self.spotify is not None:
+            await self.spotify.aclose()
+
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited on the
         startup path).
