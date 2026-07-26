@@ -55,6 +55,13 @@ async def _assert_triad_sync(
 # ── is_persisted ──────────────────────────────────────────────────────────────
 
 
+async def _commit(gq: GuildQueue) -> bool:
+    """Enter/exit commit_dequeue() the way the playback loop does, for tests
+    that only care about the committed/not-committed outcome."""
+    async with gq.commit_dequeue() as committed:
+        return committed
+
+
 class TestIsPersisted:
     def test_queue_object_reflects_flag(self, mock_author: MagicMock) -> None:
         assert is_persisted(_qobj(1, mock_author)) is True
@@ -751,7 +758,7 @@ class TestDequeueBookkeeping:
     async def test_commit_dequeue_shares_the_bulk_mutation_lock(
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """try_commit_dequeue() and the bulk ops really do serialize on one
+        """commit_dequeue() and the bulk ops really do serialize on one
         lock — a held lock blocks clear() until released. (Whitebox: the lock
         is deliberately not part of the public API since Phase 5.)"""
         await gq.put([_qobj(1, mock_author)])
@@ -795,13 +802,13 @@ class TestDequeueBookkeeping:
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 1  # persisted entry untouched
 
-    async def test_try_commit_dequeue_true_then_false_after_clear(
+    async def test_commit_dequeue_true_then_false_after_clear(
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
-        assert await gq.try_commit_dequeue() is True
+        assert await _commit(gq) is True
         await gq.clear()
-        assert await gq.try_commit_dequeue() is False
+        assert await _commit(gq) is False
 
 
 # ── requeue_front ─────────────────────────────────────────────────────────────
@@ -883,7 +890,7 @@ class TestShuffleWithInFlightDequeue:
 
         # The loop finishes resolving and commits, exactly as musicplayer
         # does: display pop + the start transaction's LPOP.
-        assert await gq.try_commit_dequeue() is True
+        assert await _commit(gq) is True
         await store.pop_queue()
         gq.task_done()
         await _assert_triad_sync(gq, fake_redis, store)
@@ -949,7 +956,7 @@ class TestRemoveWithInFlightDequeue:
             queue_object(in_flight)
         )
 
-        assert await gq.try_commit_dequeue() is True
+        assert await _commit(gq) is True
         await store.pop_queue()
         gq.task_done()
         await _assert_triad_sync(gq, fake_redis, store)
@@ -1013,3 +1020,70 @@ class TestPutClearMutualExclusion:
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+
+class TestCommitDequeueHoldsTheLock:
+    """The dequeue-commit race (was a standing ISSUE in this module's header).
+
+    The display pop and the Redis LPOP used to be separated by an await
+    boundary: `try_commit_dequeue()` released the mutex on return, and the
+    caller's `await store.pop_queue_and_start_song(...)` yields before the LPOP
+    reaches the server. A bulk mutation already scheduled on the loop runs in
+    that gap.
+    """
+
+    async def test_bulk_mutation_cannot_land_between_commit_and_mirror(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The scenario that produced real drift: `-clear` then `-play X`
+        scheduled while the loop is mid-dispatch. With the lock held across the
+        caller's mirror dispatch, neither can interleave."""
+        await gq.put([_qobj(1, mock_author)])
+
+        interleaved: list[str] = []
+
+        async def bulk_mutation() -> None:
+            await gq.clear()
+            interleaved.append("clear")
+
+        async with gq.commit_dequeue() as committed:
+            assert committed is True
+            task = asyncio.create_task(bulk_mutation())
+            # Yield the way an awaited Redis dispatch does. Under the old code
+            # this is exactly where clear() ran.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert interleaved == [], "bulk mutation ran inside the commit window"
+            interleaved.append("mirror")
+
+        await task
+        assert interleaved == ["mirror", "clear"]
+
+    async def test_lock_is_released_after_the_block(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Released before the caller's Discord I/O — an embed send must never
+        block -clear on a network round trip."""
+        await gq.put([_qobj(1, mock_author)])
+        async with gq.commit_dequeue():
+            assert gq._mutex.locked()
+        assert not gq._mutex.locked()
+
+    async def test_lock_is_released_when_the_body_raises(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """A store failure inside the block must not wedge every future bulk
+        mutation on a permanently-held lock."""
+        await gq.put([_qobj(1, mock_author)])
+        with pytest.raises(RuntimeError):
+            async with gq.commit_dequeue():
+                raise RuntimeError("store dispatch blew up")
+        assert not gq._mutex.locked()
+        await gq.clear()  # still usable
+
+    async def test_empty_display_yields_false_and_still_releases(
+        self, gq: GuildQueue
+    ) -> None:
+        async with gq.commit_dequeue() as committed:
+            assert committed is False
+        assert not gq._mutex.locked()

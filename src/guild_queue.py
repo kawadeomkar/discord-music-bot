@@ -17,8 +17,10 @@ finish_failed_dequeue) runs under one bulk-mutation mutex, so no two of them
 can interleave between a memory write and its mirror write. Bulk mutations
 carry a dequeued-but-uncommitted head through untouched (_in_flight_head),
 so a shuffle/remove during a multi-second resolve can't retire the wrong
-entry. One residual window remains open — see the ISSUE below. The class also
-owns the cleared-flag the playback loop consumes.
+entry. The dequeue-commit window is closed too: commit_dequeue() holds the
+mutex across the caller's Redis mirror dispatch, so no bulk mutation can land
+between the display pop and the LPOP. The class also owns the cleared-flag
+the playback loop consumes.
 
 What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md §2.2):
 - stream prefetch (yt-dlp/FFmpeg) — MusicPlayer cancels its prefetch task
@@ -30,22 +32,11 @@ What this class deliberately does NOT know (see docs/GUILD_QUEUE_SCHEMA_PLAN.md 
   (SongQueueEntry.from_crashed_state bridges the two schemas)
 """
 
-# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
-# The playback loop's try_commit_dequeue() → pop_queue_and_start_song() handoff releases
-# the bulk mutex before the store's atomic LPOP+HSET transaction dispatches (the start
-# transaction is a store-level atomicity boundary — see GUILD_QUEUE_SCHEMA_PLAN §4). A
-# bulk mutation scheduled in that single event-loop tick therefore races the LPOP
-# server-side: a -clear landing between commit and dispatch lets the transaction pop an
-# entry the clear already deleted, drifting memory and Redis by one entry until the next
-# rebuild — and a crash inside that drift restores the queue one song out of alignment.
-# Documented and accepted so far, never actually fixed.
-# Cheapest fix is to hold the mutex across the store dispatch, costing one ~1ms
-# localhost round-trip. Design: docs/ARCHITECTURE_PLAN.md §3.6.
-
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from enum import Enum, auto
 from typing import Optional, Union
 
@@ -460,16 +451,33 @@ class GuildQueue:
             await self.redis_pop_for(item)
         self._pending.task_done()
 
-    async def try_commit_dequeue(self) -> bool:
-        """Commit the display-side dequeue for a song about to play.
+    @asynccontextmanager
+    async def commit_dequeue(self) -> AsyncIterator[bool]:
+        """Commit the display-side dequeue for a song about to play, holding the
+        bulk-mutation lock until the caller has dispatched the Redis mirror.
 
-        Takes the bulk-mutation lock so the emptiness check cannot race a
-        concurrent clear()/shuffle(). Returns False when the display is empty
-        — the queue was cleared while the song was resolving — in which case
-        the caller discards the song (its task_done() and FFmpeg cleanup are
-        playback concerns and stay caller-side)."""
+        Yields False when the display is empty — the queue was cleared while the
+        song was resolving — in which case the caller discards the song (its
+        task_done() and FFmpeg cleanup are playback concerns and stay
+        caller-side).
+
+        The lock spans the caller's store dispatch, which is the whole point.
+        This used to be a plain `try_commit_dequeue()` that released the mutex
+        on return, leaving the display pop and the Redis LPOP separated by an
+        await boundary. Nothing runs *synchronously* in that gap — but the
+        caller's `await store.pop_queue_and_start_song(...)` yields before the
+        LPOP reaches the server, so a bulk mutation already scheduled on the
+        loop runs in between. `-clear` followed by `-play X` in that window
+        left the LPOP popping X (the newly queued song) off Redis while X
+        stayed in memory: a one-entry drift, and a crash inside it restored a
+        queue missing a song. Holding the lock costs one localhost round trip
+        per song start and closes the window entirely.
+
+        Deliberately released before the caller's Discord I/O — an embed send
+        must never block `-clear` on a network round trip.
+        """
         async with self._mutex:
-            return self.try_pop_display_head()
+            yield self.try_pop_display_head()
 
     async def redis_pop_for(self, item: Optional[QueueItem]) -> None:
         """Mirror one in-memory dequeue to Redis via LPOP — unless the item
