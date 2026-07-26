@@ -80,7 +80,7 @@ pyright = { version = "1.1.411", extras = ["nodejs"] }
 # ruff from its own isolated environment. Under a caret range any `poetry update`
 # moved this side silently and the hook then formatted to a different version
 # than `just lint` and CI checked. Bump both in the same commit.
-ruff = "0.15.21"
+ruff = "0.16.0"
 pre-commit = "^4.6.0"
 
 [tool.poetry.group.dev]
