@@ -1,10 +1,12 @@
 import asyncio
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
 from discord.ext import commands
 
+from src import config
 from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.redis_client import close_redis_pool, create_redis_pool, get_redis
@@ -99,8 +101,31 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
+        self._liveness_task: Optional[asyncio.Task] = None
+
+    async def _liveness_heartbeat(self) -> None:
+        """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
+
+        Deliberately trivial and dependency-free: the question it answers is
+        "is the event loop still turning?", which `restart: always` cannot ask
+        (that only sees the process exit). A wedged loop stops touching the
+        file, its mtime goes stale, and the healthcheck fails. Checking Redis
+        or Discord here would turn a dependency blip into a container restart
+        loop, which is the opposite of useful.
+        """
+        path = Path(config.LIVENESS_FILE)
+        while True:
+            try:
+                path.touch()
+            except OSError as e:
+                # An unwritable path must not kill the bot — degrade to "no
+                # liveness signal" and let the healthcheck fail loudly instead.
+                log.warning(f"Liveness touch failed for {path}: {e}")
+            await asyncio.sleep(config.LIVENESS_INTERVAL_SECS)
 
     async def setup_hook(self) -> None:
+        if config.LIVENESS_FILE:
+            self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
         for extension in EXTENSIONS:
@@ -148,6 +173,9 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
+        if self._liveness_task is not None:
+            self._liveness_task.cancel()
+            self._liveness_task = None
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
         await super().close()
