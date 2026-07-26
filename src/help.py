@@ -54,8 +54,9 @@ _FENCE = "```"
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
     "A `?t=` / `?ts=` timestamp starts the song at that offset.\n"
-    "**Spotify** — track and playlist links. Each title is matched to its "
-    "YouTube audio, so a playlist may take a moment to queue.\n"
+    "**Spotify** — track, album and playlist links (including `intl-` share "
+    "links). Each title is matched to its YouTube audio, so an album or "
+    "playlist may take a moment to queue.\n"
     "**SoundCloud** — track links."
 )
 
