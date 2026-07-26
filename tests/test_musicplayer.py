@@ -849,9 +849,10 @@ def _fields(embed: discord.Embed) -> dict[str, str]:
 @pytest.fixture
 def started(mock_author: MagicMock) -> QueueObject:
     """The song `-play` is starting — the one front-inserted ahead of the
-    restored queue. Deliberately distinct from `queue_obj` (which stands in for
-    restored entries) so a test can tell which song the embed is talking
-    about."""
+    restored queue, and the one the resume notice must NOT name (its Now
+    Playing embed does, seconds later). Every field is deliberately distinct
+    from `queue_obj`'s and the history entries', so a leak of the started
+    song's title, link or thumbnail into the notice is visible."""
     return QueueObject(
         webpage_url="https://www.youtube.com/watch?v=started",
         title="The Requested Song",
@@ -884,67 +885,89 @@ def _crashed(
 class TestResumeNoticeEmbed:
     """build_resume_notice_embed() — the -play-on-a-disconnected-bot heads-up."""
 
-    def test_returns_none_when_queue_empty(
-        self, music_player: MusicPlayer, started: QueueObject
-    ) -> None:
+    def test_returns_none_when_queue_empty(self, music_player: MusicPlayer) -> None:
         """The gate: nothing was restored, so there is nothing to announce."""
-        assert music_player.build_resume_notice_embed(started) is None
+        assert music_player.build_resume_notice_embed() is None
 
     def test_returns_none_when_queue_empty_even_with_history(
-        self, music_player: MusicPlayer, started: QueueObject
+        self, music_player: MusicPlayer
     ) -> None:
         """History alone is not a resumption — the queue is what gates the send."""
         music_player.history.restore([HistoryEntry(title="Old Song", played_at=1.0)])
-        assert music_player.build_resume_notice_embed(started) is None
+        assert music_player.build_resume_notice_embed() is None
+
+    def test_context_field_survives_an_empty_queue(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The embed builder gates on the empty queue before ever asking, so
+        this guards the field builder itself: peek_next() returns None there,
+        and "Up next" has no head to name."""
+        assert music_player._resume_context_field() is None
 
     def test_highlight_color_is_orange(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """Orange, not the blue every other -play embed uses: this is an
         attention notice about restored state. Pinned so a refactor can't
         quietly re-blue it."""
         music_player.queue._display.append(queue_obj)
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert embed.colour == discord.Color.orange()
 
-    def test_names_the_song_being_started(
+    def test_does_not_name_the_song_being_started(
         self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
     ) -> None:
-        """This embed is the only thing naming the requested song: the playback
-        gate is shut across the enqueue, so the response hosts no Now Playing
-        block and the real one is seconds away. Dropping the title left the
-        user staring at an embed about some other song."""
+        """The Now Playing embed arriving seconds later carries that song's
+        title, link and thumbnail. Repeating them here made this notice a
+        preview of the next message instead of a report on the restore, so the
+        description only says the requested song goes first."""
         music_player.queue._display.append(queue_obj)
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
-        assert described(embed).startswith(
-            "Playing now: The Requested Song "
-            "- (https://www.youtube.com/watch?v=started)"
-        )
+        rendered = described(embed) + repr(_fields(embed)) + str(embed.thumbnail.url)
+        assert started.title not in rendered
+        assert started.webpage_url not in rendered
+        assert str(started.thumbnail) not in rendered
+        assert described(embed).endswith("after the song you just queued.")
 
-    def test_thumbnail_is_the_started_song_not_the_last_played(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+    def test_thumbnail_is_the_song_the_embed_names(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
-        """The thumbnail sits next to "Playing now" and has to match it."""
+        """It sits beside the "Last played" / "Up next" field, so it has to
+        match that song — the started song's own thumbnail arrives with its Now
+        Playing embed."""
         music_player.queue._display.append(queue_obj)
         music_player.history.restore(
             [HistoryEntry(title="Old Song", thumbnail="https://img/old.jpg")]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
-        assert embed.thumbnail.url == "https://img/started.jpg"
+        assert embed.thumbnail.url == "https://img/old.jpg"
+
+    def test_no_thumbnail_when_the_named_song_has_none(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """A crash-recovered entry is rebuilt from state fields that never held
+        a thumbnail. Falling back to the started song's would put a picture of
+        one song next to the name of another."""
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore([HistoryEntry(title="Old Song")])
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.thumbnail.url is None
 
     def test_reports_count_and_runtime(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         for i in range(3):
@@ -954,7 +977,7 @@ class TestResumeNoticeEmbed:
                 )
             )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert "**3** songs" in described(embed)
@@ -965,7 +988,6 @@ class TestResumeNoticeEmbed:
     def test_runtime_marked_approximate_when_a_duration_is_unknown(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         music_player.queue._display.append(
@@ -975,7 +997,7 @@ class TestResumeNoticeEmbed:
             YTSource(ytsearch="ytsearch:unresolved", process=True)
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert _fields(embed)["Runtime"] == "~1m 30s"
@@ -983,14 +1005,13 @@ class TestResumeNoticeEmbed:
     def test_runtime_field_omitted_when_no_duration_is_known(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=None)
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert "Runtime" not in _fields(embed)
@@ -998,24 +1019,23 @@ class TestResumeNoticeEmbed:
     def test_singular_wording_for_one_song(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         music_player.queue._display.append(
             QueueObject("https://yt.com/v=1", "Song 1", mock_author, duration=90)
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
-        assert described(embed).endswith(
-            "**1** song from the previous session resumes after it."
+        assert described(embed) == (
+            "**1** song from the previous session resumes "
+            "after the song you just queued."
         )
 
     def test_crash_recovered_head_is_named_as_where_playback_stopped(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         """A crash re-queues the mid-play song as the display head with its
@@ -1023,7 +1043,7 @@ class TestResumeNoticeEmbed:
         and it is about to play again."""
         music_player.queue._display.append(_crashed(mock_author))
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert _fields(embed)["Left off on"] == (
@@ -1033,7 +1053,6 @@ class TestResumeNoticeEmbed:
     def test_crash_recovered_head_beats_history(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         """The regression this guards: history's newest entry is the last song
@@ -1045,7 +1064,7 @@ class TestResumeNoticeEmbed:
             [HistoryEntry(title="Finished Earlier", played_at=1721530000.0)]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         fields = _fields(embed)
@@ -1055,7 +1074,6 @@ class TestResumeNoticeEmbed:
     def test_crash_recovered_head_without_a_position(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
         """crashed_position_at() returns None when no play_start_epoch was
@@ -1063,7 +1081,7 @@ class TestResumeNoticeEmbed:
         offset to show."""
         music_player.queue._display.append(_crashed(mock_author, ts=None))
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert _fields(embed)["Left off on"] == "**Interrupted Song**"
@@ -1071,7 +1089,6 @@ class TestResumeNoticeEmbed:
     def test_names_last_played_song_after_a_stop(
         self,
         music_player: MusicPlayer,
-        started: QueueObject,
         queue_obj: QueueObject,
     ) -> None:
         """No crashed head (a -stop leaves none), so history is all there is.
@@ -1093,7 +1110,7 @@ class TestResumeNoticeEmbed:
             ]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         fields = _fields(embed)
@@ -1103,7 +1120,7 @@ class TestResumeNoticeEmbed:
         )
 
     def test_uses_newest_history_entry(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """restore() takes newest-first and reverses; latest must be the newest."""
         music_player.queue._display.append(queue_obj)
@@ -1114,7 +1131,7 @@ class TestResumeNoticeEmbed:
             ]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         last_played = _fields(embed)["Last played"]
@@ -1122,20 +1139,20 @@ class TestResumeNoticeEmbed:
         assert "Older" not in last_played
 
     def test_omits_duration_when_unknown(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         music_player.queue._display.append(queue_obj)
         music_player.history.restore(
             [HistoryEntry(title="Livestream", played_secs=151, duration_secs=0)]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert _fields(embed)["Last played"] == "**Livestream**\n`2:31`"
 
     def test_omits_timestamp_when_played_at_unknown(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         """played_at == 0 is 'absent on the wire'; <t:0:R> would say 1970."""
         music_player.queue._display.append(queue_obj)
@@ -1143,43 +1160,127 @@ class TestResumeNoticeEmbed:
             [HistoryEntry(title="Song", played_secs=10, duration_secs=60)]
         )
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert "<t:" not in _fields(embed)["Last played"]
 
-    def test_no_left_off_field_without_history_or_crashed_head(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+    def test_next_song_in_queue_when_nothing_recorded_the_past(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
+        """No crashed head and no history (cold Redis, or a guild whose first
+        song is still its current one): the notice looks forward instead and
+        names the restored head — the song that plays after the requested one."""
         music_player.queue._display.append(queue_obj)
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert embed.title == "❗ Resumed from queue"
         fields = _fields(embed)
+        assert fields["Up next"] == "**Test Song**\n`3:30`"
         assert "Last played" not in fields
         assert "Left off on" not in fields
 
-    def test_history_entry_without_a_title_is_skipped(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+    def test_next_song_is_the_head_not_a_later_entry(
+        self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """An empty title would render a bolded nothing."""
+        """Built before the front insertion, so the head is still the restored
+        queue's first song — the one that plays once the requested song ends."""
+        for i in range(3):
+            music_player.queue._display.append(
+                QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+            )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Up next"] == "**Song 0**"
+
+    def test_next_song_thumbnail(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player.queue._display.append(
+            QueueObject(
+                "https://yt.com/v=1",
+                "Song 1",
+                mock_author,
+                thumbnail="https://img/next.jpg",
+            )
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert embed.thumbnail.url == "https://img/next.jpg"
+
+    def test_next_song_names_an_unresolved_search_entry(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """A restored Spotify track is still an unresolved YTSource; its search
+        terms are what the queue embed shows for it too."""
+        music_player.queue._display.append(
+            YTSource(ytsearch="ytsearch:Father - Look At Wrist", process=True)
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Up next"] == "**Father - Look At Wrist**\n*resolving...*"
+
+    def test_history_outranks_the_next_song_in_queue(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Where the last session got to is the scarcer fact: the queue's own
+        contents are one `-queue` away, and the notice already sizes them."""
+        music_player.queue._display.append(queue_obj)
+        music_player.history.restore([HistoryEntry(title="Old Song", played_secs=30)])
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        fields = _fields(embed)
+        assert "Old Song" in fields["Last played"]
+        assert "Up next" not in fields
+
+    def test_no_context_field_when_the_head_cannot_name_itself(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """An empty title would render a bolded nothing; the queue summary
+        stands on its own instead."""
+        music_player.queue._display.append(
+            QueueObject("https://yt.com/v=1", "", mock_author, duration=90)
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        fields = _fields(embed)
+        assert "Up next" not in fields
+        assert fields["Queued"] == "**1** song"
+
+    def test_history_entry_without_a_title_is_skipped(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """An empty title would render a bolded nothing — the entry is passed
+        over as if history were cold, leaving the queue's own head to speak."""
         music_player.queue._display.append(queue_obj)
         music_player.history.restore([HistoryEntry(title="", played_secs=10)])
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
-        assert "Last played" not in _fields(embed)
+        fields = _fields(embed)
+        assert "Last played" not in fields
+        assert fields["Up next"] == "**Test Song**\n`3:30`"
 
     def test_long_last_played_title_is_truncated(
-        self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
+        self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         music_player.queue._display.append(queue_obj)
         music_player.history.restore([HistoryEntry(title="x" * 400)])
 
-        embed = music_player.build_resume_notice_embed(started)
+        embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
         assert len(_fields(embed)["Last played"]) <= 1024

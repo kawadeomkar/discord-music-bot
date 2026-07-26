@@ -2492,9 +2492,9 @@ class TestPlayFrontInsertion:
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mp.queue_put.assert_not_awaited()
-        # The song being started is handed to the builder: it is the only thing
-        # in this response that names it (no Now Playing block exists yet).
-        mp.build_resume_notice_embed.assert_called_once_with(qobj)
+        # Built before the front insertion, off the restored queue alone — the
+        # notice reports the restore and never re-describes the started song.
+        mp.build_resume_notice_embed.assert_called_once_with()
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert embed is mp.build_resume_notice_embed.return_value
 

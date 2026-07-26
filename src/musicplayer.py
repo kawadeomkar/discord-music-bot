@@ -79,6 +79,22 @@ class EtaWalk:
         return replace(self, cumulative_secs=self.cumulative_secs + remaining)
 
 
+@dataclass(frozen=True)
+class ResumeContext:
+    """The one song the resume notice names, the label that is true of it, and
+    the thumbnail that belongs beside it.
+
+    A (name, value) pair carried this before the thumbnail joined it. Three
+    parallel returns whose meaning is positional is exactly the shape that
+    gets mis-unpacked, and `thumbnail` is optional in a way a tuple can't say:
+    a crash-recovered entry is rebuilt from state fields that never held one.
+    """
+
+    label: str
+    value: str
+    thumbnail: str = ""
+
+
 # HACK: Every guild's ETAs are hardcoded to Pacific time.
 # queue_embed()'s "Est. playing at" and the now-playing "Estimated finish" both render
 # in US/Pacific for everyone. That is fine while the bot serves one operator's servers,
@@ -218,6 +234,13 @@ def _remaining_secs(item: QueueObject) -> Optional[int]:
     return item.duration
 
 
+def _search_label(item: YTSource) -> str:
+    """Display text for a queue entry still awaiting YouTube resolution — the
+    search terms it will be resolved from, with the `ytsearch:` scheme stripped.
+    Shared by _format_queue_line() and the resume notice's "Up next"."""
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+
+
 def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
     """Total remaining playtime of queued items, and whether any item's
     duration was unknown — an unresolved YTSource or a QueueObject with no
@@ -234,6 +257,31 @@ def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
         else:
             partial = True
     return total_secs, partial
+
+
+def _up_next_context(head: Optional[QueueItem]) -> Optional[ResumeContext]:
+    """ "Up next" for the head of the restored queue — the song that plays once
+    the one this `-play` is starting finishes. The resume notice is built
+    before the front insertion, so the head is still a restored entry rather
+    than the song being started.
+
+    An entry that hasn't been resolved to a video yet (a restored Spotify
+    track awaiting its YouTube search) is named by its search terms: knowing
+    what is queued next is the point, and "resolving..." is the same thing the
+    queue embed says about it. None when the queue is empty or its head can't
+    name itself, which leaves the notice's queue summary to stand alone.
+    """
+    if isinstance(head, QueueObject):
+        if not head.title:
+            return None
+        value = f"**{truncate_embed_title(head.title)}**"
+        if head.duration:
+            value += f"\n`{fmt_duration(head.duration)}`"
+        return ResumeContext("Up next", value, head.thumbnail or "")
+    if isinstance(head, YTSource):
+        label = truncate_embed_title(_search_label(head))
+        return ResumeContext("Up next", f"**{label}**\n*resolving...*")
+    return None
 
 
 def _build_progress_bar(
@@ -603,8 +651,7 @@ class MusicPlayer:
             )
             walk = walk.advance(_remaining_secs(item))
         else:
-            search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-            line = f"`{index}` {search} · *resolving...*"
+            line = f"`{index}` {_search_label(item)} · *resolving...*"
             walk = walk.advance(None)
 
         return line, walk
@@ -652,16 +699,23 @@ class MusicPlayer:
             color=discord.Color.blue(),
         )
 
-    def _resume_left_off_field(self) -> Optional[tuple[str, str]]:
-        """(name, value) for the resume notice's "where the last session got
-        to" field, or None when nothing recorded it.
+    def _resume_context_field(self) -> Optional[ResumeContext]:
+        """The one song the resume notice names: where the last session got to
+        or, when nothing recorded that, what plays after the song starting now.
+        None when the restore knows neither.
 
-        The two restores that land here know different things, and conflating
-        them names the wrong song:
+        Never the song being started. That one is named by the Now Playing
+        embed landing seconds later — same title, same link, same thumbnail —
+        so repeating it here left two consecutive messages saying the same
+        thing while the queue the notice exists to announce went undescribed.
 
-        * A crash re-queues the song that was mid-play as the display head,
-          flagged persisted=False with its recovery offset in `ts`. That song
-          IS where the session stopped, and it is about to play again.
+        The restores that land here know different things, and conflating them
+        names the wrong song:
+
+        * A crash (or a restart while paused) re-queues the song that was
+          mid-play as the display head, flagged persisted=False with its
+          recovery offset in `ts`. That song IS where the session stopped, and
+          it is about to play again.
         * A `-stop` cancels the playback loop mid-song, and the cancel path
           never reaches loop()'s history bookkeeping, so the interrupted song
           is recorded nowhere — clear_connection() has already dropped its
@@ -669,6 +723,10 @@ class MusicPlayer:
           to its end, which is *older* than the stop. Hence "Last played",
           which is true of it, rather than any claim about where playback
           stopped, which is not.
+        * Neither, when history was never populated (no Redis, or a guild
+          whose first song is still its current one). Nothing records the past,
+          so the notice looks forward instead: the restored head is the song
+          that plays once the requested one finishes.
 
         Must be called before the front insertion, while the display head is
         still the restored one.
@@ -680,41 +738,39 @@ class MusicPlayer:
                 value += f"\n`{fmt_duration(head.ts)}`"
                 if head.duration:
                     value += f" / `{fmt_duration(head.duration)}`"
-            return "Left off on", value
+            return ResumeContext("Left off on", value, head.thumbnail or "")
 
-        # Absent when history was never populated (no Redis, or a guild whose
-        # first song is still its current one) — the queue half of the embed
-        # stands on its own.
         last = self.history.latest
-        if last is None or not last.title:
-            return None
-        value = f"**{truncate_embed_title(last.title)}**"
-        value += f"\n`{fmt_duration(last.played_secs)}`"
-        if last.duration_secs > 0:
-            value += f" / `{fmt_duration(last.duration_secs)}`"
-        # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
-        # render "56 years ago", so omit the line instead — same rule as
-        # history_embeds().
-        if last.played_at:
-            value += f"\n<t:{int(last.played_at)}:R>"
-        return "Last played", value
+        if last is not None and last.title:
+            value = f"**{truncate_embed_title(last.title)}**"
+            value += f"\n`{fmt_duration(last.played_secs)}`"
+            if last.duration_secs > 0:
+                value += f" / `{fmt_duration(last.duration_secs)}`"
+            # played_at == 0 means "unknown" (absent on the wire); <t:0:R> would
+            # render "56 years ago", so omit the line instead — same rule as
+            # history_embeds().
+            if last.played_at:
+                value += f"\n<t:{int(last.played_at)}:R>"
+            return ResumeContext("Last played", value, last.thumbnail)
 
-    def build_resume_notice_embed(
-        self, started: QueueObject
-    ) -> Optional[discord.Embed]:
+        return _up_next_context(head)
+
+    def build_resume_notice_embed(self) -> Optional[discord.Embed]:
         """Heads-up that `-play` on a disconnected bot woke a persisted queue.
 
-        `started` is the song this `-play` is starting, and it has to be named
-        here: this response hosts no Now Playing block. The playback gate is
-        held shut across the enqueue, so current_song is still None and
-        MusicContext._np_player() returns None — the real Now Playing message
-        only lands seconds later, once extraction and the voice handshake
-        finish. Leave the title out and the first thing the user sees after
-        `-play` is an embed about a *different* song.
+        Everything here is context only the restore knows: which song the
+        previous session left off on (or, failing that, what plays after the
+        requested one), and how much queue is waiting behind it.
 
-        What the embed adds on top is the context only the restore knows:
-        which song the previous session left off on and how much queue is
-        waiting behind the one starting now.
+        The song being started is deliberately *not* named — hence no
+        parameter for it. It used to lead the description ("Playing now:
+        {title} - ({url})") because the playback gate is held shut across the
+        enqueue, so current_song is still None and this response hosts no Now
+        Playing block of its own. But the real Now Playing message lands
+        seconds later with that same title, link and thumbnail, which made
+        this embed a preview of the next one instead of a report on the
+        restore. The description says the requested song comes first without
+        repeating what it is.
 
         Returns None when nothing was restored, which is the common case (a
         first `-play` in a fresh guild): there is no resumption to announce,
@@ -732,20 +788,20 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
-                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
                 f"**{count}** {songs} from the previous session "
-                f"{verb} after it."
+                f"{verb} after the song you just queued."
             ),
             color=discord.Color.orange(),
         )
-        # The song being started, not the one being resumed from: the thumbnail
-        # sits next to "Playing now" and has to match it.
-        if started.thumbnail:
-            embed.set_thumbnail(url=started.thumbnail)
 
-        left_off = self._resume_left_off_field()
-        if left_off is not None:
-            embed.add_field(name=left_off[0], value=left_off[1], inline=True)
+        context = self._resume_context_field()
+        if context is not None:
+            embed.add_field(name=context.label, value=context.value, inline=True)
+            # Matches the song this embed names, which is never the one being
+            # started — that song's own thumbnail arrives on its Now Playing
+            # embed moments later.
+            if context.thumbnail:
+                embed.set_thumbnail(url=context.thumbnail)
 
         embed.add_field(name="Queued", value=f"**{count}** {songs}", inline=True)
         total_secs, partial = _queue_runtime(items)
