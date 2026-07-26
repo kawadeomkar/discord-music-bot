@@ -1,6 +1,7 @@
 import os
 import subprocess
 import warnings
+from enum import Enum
 
 
 def _git_branch() -> str:
@@ -49,3 +50,46 @@ ENVIRONMENT: str = _parse()
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
+
+
+def spotify_enabled() -> bool:
+    """True when Spotify-link support should be active — i.e. both Spotify
+    credentials are present in the environment.
+
+    Read at call time (not cached as a module constant) so the value tracks
+    the live environment: tests monkeypatch these vars per case, and the bot
+    process only ever reads them once at startup, so there is no hot path to
+    optimise. Presence, not validity, is the gate here — credentials that are
+    set but wrong still count as "enabled" and fail at the first Spotify API
+    call with a clear error, rather than silently disabling the feature.
+    """
+    return bool(
+        os.environ.get("SPOTIFY_CLIENT_ID") and os.environ.get("SPOTIFY_CLIENT_SECRET")
+    )
+
+
+# Spotify ID for Rick Astley — "Never Gonna Give You Up". A well-known, permanent
+# public track used purely as a probe: on startup, if Spotify credentials are
+# present, the bot fetches this track once to confirm the credentials actually
+# authenticate against the live API (see MusicBot.cog_load). Any real track ID
+# would do; this one is memorable and unlikely to ever be removed.
+# Source URL: https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8
+SPOTIFY_TEST_TRACK_ID = "4PTG3Z6ehGkBFwjybzWkR8"
+
+
+class SpotifyStatus(Enum):
+    """Runtime state of the Spotify source, resolved once at startup.
+
+    `spotify_enabled()` answers only "are credentials present?". This goes a step
+    further and records whether those credentials actually work, so both the
+    play-time gate (`MusicBot._require_spotify`) and `-ping` can tell a user
+    *why* Spotify links are unavailable.
+    """
+
+    # No credentials configured — Spotify support was never turned on.
+    DISABLED = "disabled"
+    # Credentials are present but Spotify rejected them (or the startup probe
+    # failed): links are declined with an "invalid credentials" message.
+    INVALID = "invalid"
+    # Credentials are present and validated against the live API at startup.
+    ENABLED = "enabled"

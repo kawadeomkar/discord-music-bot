@@ -102,6 +102,17 @@ def fmt_duration(secs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
+    """The noun form matching `count`: `pluralize(1, "song")` → "song",
+    `pluralize(3, "song")` → "songs". `plural` overrides the default `+ "s"`
+    for irregulars. Collapses the `"song" if n == 1 else "songs"` /
+    `f"song{'s' if n != 1 else ''}"` idioms scattered across the command and
+    embed builders into one spelling."""
+    if count == 1:
+        return singular
+    return plural if plural is not None else singular + "s"
+
+
 # Discord's hard limit on an embed title is 256 characters; an over-length
 # title makes the whole send() 400 — silently no-opping -history, or failing
 # the now-playing send/edit outright.

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 import discord
 import yt_dlp as youtube_dl
-from yt_dlp.utils import YoutubeDLError
+from yt_dlp.utils import UnsupportedError, YoutubeDLError
 
 import redis.asyncio as aioredis
 from opentelemetry import trace
@@ -56,6 +56,7 @@ class ExtractionError(Exception):
         expected: bool = False,
         video_id: str = "",
         cause_type: str = "",
+        unsupported: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -63,6 +64,12 @@ class ExtractionError(Exception):
         self.expected = expected
         self.video_id = video_id
         self.cause_type = cause_type
+        # True when yt-dlp rejected the URL as coming from a site it does not support
+        # (UnsupportedError). Classified in the worker where the original exception
+        # structure still exists; yt_source reads it to surface the actionable
+        # "not a site I can play" message instead of the generic extractor error.
+        # Defaulted like every other field so the pickle round-trip stays intact (§12.1).
+        self.unsupported = unsupported
 
     @property
     def user_message(self) -> str:
@@ -92,12 +99,18 @@ def _classify_ytdlp_error(e: BaseException) -> ExtractionError:
     if isinstance(exc_info, tuple) and len(exc_info) == 3:
         inner = exc_info[1]
     cause = getattr(inner, "cause", None) or getattr(e, "cause", None)
+    # An unsupported-site rejection reaches here as an UnsupportedError, but extract_info
+    # wraps it in a DownloadError carrying the original in exc_info — so check both the
+    # outer error and its wrapped inner. Recorded as a flat bool because the UnsupportedError
+    # type itself cannot cross the process boundary; yt_source keys off this flag.
+    unsupported = isinstance(e, UnsupportedError) or isinstance(inner, UnsupportedError)
     return ExtractionError(
         message=str(e),
         original_type=type(e).__name__,
         expected=bool(getattr(inner, "expected", False)),
         video_id=str(getattr(inner, "video_id", "") or ""),
         cause_type=type(cause).__name__ if cause is not None else "",
+        unsupported=unsupported,
     )
 
 
@@ -263,11 +276,43 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     return cast(YTDLExtractResult, info)
 
 
-def _ytdlp_extract(
-    url: str, opts: Any, download: bool, process: bool
-) -> Optional[YTDLExtractResult]:
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExtractRequest:
+    """Everything one yt-dlp extraction needs, as a single picklable payload.
+
+    kw_only is the load-bearing part, not frozen: `download` and `process` are
+    both bool, so a positional pair could be transposed silently — the same
+    value, the wrong meaning, invisible to pyright and to every reader. Keyword
+    construction makes that unexpressible. (A plain frozen dataclass does NOT
+    give this: `ExtractRequest("u", opts, True, False)` would be accepted.)
+
+    It is one object rather than four arguments because extraction options are
+    expected to grow: a new knob is a new field with a default, set only at the
+    call site that wants it — no edit to _run_extract, _ytdlp_extract, or the
+    pool plumbing in between. Use dataclasses.replace() to derive a variant.
+
+    Frozen + slots because it crosses a process boundary: it must be picklable
+    (verified against a real spawn pool) and must not be mutated by a worker in
+    a way the parent would never see. Every field must stay picklable — `opts`
+    is a plain yt-dlp options dict today, and it must remain one.
+    """
+
+    url: str
+    opts: Any
+    download: bool = False
+    # Always True at every current call site. yt-dlp's `process=False` returns
+    # flat metadata with no format selection, which is why the direct-URL play
+    # path stopped using it (see yt_source). Kept because it is one of
+    # extract_info's own two switches, not because anything sets it today.
+    process: bool = True
+
+
+def _ytdlp_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
     """Extraction worker run in the process pool. Top-level so it's picklable to a
-    worker and named in tracebacks."""
+    worker and named in tracebacks. Takes the whole request as one argument so no
+    call in the chain depends on the order of two interchangeable bools."""
+    url, opts = req.url, req.opts
+    download, process = req.download, req.process
     # YoutubeDL.__init__ keeps the params dict by reference and writes into it
     # (js_runtimes, http_headers, ...); the copy keeps the (unpickled) opts profile
     # immutable across repeated extractions within a worker.
@@ -283,6 +328,24 @@ def _ytdlp_extract(
     # Slimmed in the worker, not the parent: the point is to keep the unpicklable /
     # oversized payload from ever entering the pool's result queue.
     return _slim_info(result)
+
+
+async def _run_extract(req: ExtractRequest) -> Optional[YTDLExtractResult]:
+    """Await a yt-dlp extraction on the shared process pool. The single call
+    site for _ytdlp_extract — every extraction path (prefetch_stream,
+    _resolve_playable_stream, yt_source, yt_playlist) routes through here so
+    the pool binding lives in one place.
+
+    Takes the request whole rather than spreading it: that is what keeps a new
+    extraction option from rippling through this signature and the pool call
+    below on its way to the worker.
+
+    Note that both module-level names it reads — `ytdlp_pool` and
+    `_ytdlp_extract` — are resolved per call, not captured, which is what keeps
+    the two seams the test suite patches (`src.youtube.ytdlp_pool` in
+    tests/conftest.py, `src.youtube._ytdlp_extract` in ~29 tests) working
+    through this indirection."""
+    return await ytdlp_pool.run(_ytdlp_extract, req)
 
 
 class _YtdlpLogger:
@@ -516,6 +579,8 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
             expire = int(match.group(1)) if match else 0
         ttl = min(expire - int(time.time()) - 1800, _STREAM_URL_MAX_TTL)
         return ttl if ttl > 60 else None
+    # Bare `except A, B:` is PEP 758 (3.14+) tuple-catch syntax, not the py2
+    # form — see guild_state._b_float's note on ruff's py314 normalization.
     except ValueError, IndexError:
         return None
 
@@ -777,12 +842,13 @@ class YTDL(discord.FFmpegOpusAudio):
             return
         try:
             # cast to the single-video shape: _YTDL_STREAM_OPTS on a watch URL never
-            # yields a search/playlist wrapper, so the YTDLExtractResult run() returns is
-            # always a lone video here (see YTDLExtractResult / the `grep cast(` convention).
+            # yields a search/playlist wrapper, so the YTDLExtractResult _run_extract
+            # returns is always a lone video here (see YTDLExtractResult / the
+            # `grep cast(` convention).
             data = cast(
                 Optional[YTDLVideoInfo],
-                await ytdlp_pool.run(
-                    _ytdlp_extract, qo.webpage_url, _YTDL_STREAM_OPTS, False, True
+                await _run_extract(
+                    ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
                 ),
             )
             trace.get_current_span().set_attribute(
@@ -829,12 +895,8 @@ class YTDL(discord.FFmpegOpusAudio):
                 # URL cannot return a search/playlist wrapper.
                 data = cast(
                     Optional[YTDLVideoInfo],
-                    await ytdlp_pool.run(
-                        _ytdlp_extract,
-                        qo.webpage_url,
-                        _YTDL_STREAM_OPTS,
-                        False,
-                        True,
+                    await _run_extract(
+                        ExtractRequest(url=qo.webpage_url, opts=_YTDL_STREAM_OPTS)
                     ),
                 )
                 span.set_attribute("ytdl.extracted_fresh", True)
@@ -966,9 +1028,30 @@ class YTDL(discord.FFmpegOpusAudio):
         # with process=False). For a single watch URL the page + player fetch is paid
         # either way; processing adds only format-selection CPU (~tens of ms), no
         # extra network, and it eliminates prefetch_stream's second extraction.
-        data = await ytdlp_pool.run(
-            _ytdlp_extract, search, _YTDL_STREAM_SEARCH_OPTS, download, True
-        )
+        try:
+            data = await _run_extract(
+                ExtractRequest(
+                    url=search, opts=_YTDL_STREAM_SEARCH_OPTS, download=download
+                )
+            )
+        except ExtractionError as e:
+            # We no longer whitelist domains in parse_url — any dotted host is handed
+            # here for yt-dlp to accept or reject. yt-dlp rejects an unrecognised site
+            # with UnsupportedError; extraction now runs in a worker process, so that
+            # error is flattened to an ExtractionError before it crosses back (its
+            # .unsupported flag is set in _classify_ytdlp_error, where the original
+            # structure still exists). Surface a clear message the user can act on
+            # instead of the generic extractor error. Any other ExtractionError is a
+            # real extraction failure and is re-raised untouched for _command_error to
+            # render via user_message.
+            if e.unsupported:
+                trace.get_current_span().set_attribute("ytdl.unsupported_url", True)
+                raise Exception(
+                    f"This link isn't from a site I can play: {search}. Try a "
+                    "YouTube, Spotify, or SoundCloud link, another yt-dlp-supported "
+                    "site, or just search by name."
+                ) from e
+            raise
         if data is None:
             # TODO: Replace the bare Exception on yt-dlp failure with typed errors.
             # Every failure mode raises the same untyped Exception("Could not find
@@ -1058,9 +1141,7 @@ class YTDL(discord.FFmpegOpusAudio):
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist."""
         trace.get_current_span().set_attribute("ytdl.url", url)
-        data = await ytdlp_pool.run(
-            _ytdlp_extract, url, _YTDL_PLAYLIST_OPTS, False, True
-        )
+        data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
             raise Exception(f"Could not fetch YouTube playlist: {url}")
         # Optional in the element type, not re-annotated on the loop target: yt-dlp

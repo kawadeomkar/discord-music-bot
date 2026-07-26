@@ -29,6 +29,32 @@ _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h
 
 
+def _track_search_title(track: dict[str, Any]) -> str:
+    """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify
+    track object resolves to. Shared by track() and playlist() so a single
+    track and a playlist entry render their search titles identically."""
+    return track["name"] + "".join(f" {a['name']}" for a in track["artists"])
+
+
+class SpotifyAuthError(Exception):
+    """Spotify rejected the configured client credentials.
+
+    Raised for the two responses that actually indicate bad credentials: a
+    non-2xx from the token endpoint (the client-credentials grant failed) and a
+    401/403 from an API call (the resulting token was refused). Deliberately
+    NOT raised for network errors, timeouts, or other HTTP codes (404, 5xx) —
+    those say nothing about credential validity. Startup validation keys off
+    this distinction: only this error disables the Spotify source.
+    """
+
+    def __init__(self, status: int, detail: str = "") -> None:
+        self.status = status
+        super().__init__(
+            f"Spotify rejected the credentials (HTTP {status})"
+            + (f": {detail}" if detail else "")
+        )
+
+
 class Spotify:
     """Thin async client for the Spotify Web API: handles client-credentials
     auth (with auto-refresh) and Redis-backed caching of track/playlist/artist/
@@ -55,9 +81,20 @@ class Spotify:
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
-    async def _refresh_token(self) -> None:
-        """Fetch a fresh access token via the client-credentials flow and update expiry."""
-        if self._redis is not None:
+    async def _refresh_token(
+        self, use_cache: bool = True, strict: bool = False
+    ) -> None:
+        """Fetch a fresh access token via the client-credentials flow and update expiry.
+
+        `use_cache=False` skips the Redis-cached token and always hits the auth
+        endpoint, so the configured client_id/secret are genuinely exercised
+        rather than a token minted from earlier credentials — used by validate().
+
+        `strict=True` raises SpotifyAuthError on a non-2xx grant response instead
+        of letting the missing-`access_token` KeyError surface. Off by default so
+        the runtime path (and its tests) are unchanged; validate() opts in so it
+        can distinguish rejected credentials from other failures."""
+        if use_cache and self._redis is not None:
             cached = await spotify_token_get_with_ttl(self._redis)
             if cached is not None:
                 token, ttl = cached
@@ -73,6 +110,8 @@ class Spotify:
         }
         async with self._session_factory(json_serialize=ujson.dumps) as session:
             resp = await session.post(self.auth_endpoint, data=data)
+            if strict and resp.status not in (200, 201):
+                raise SpotifyAuthError(resp.status, "client-credentials grant failed")
             resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
         expires_in: int = resp_data["expires_in"]
@@ -114,8 +153,36 @@ class Spotify:
             )
             if resp.status in (200, 201):
                 return await resp.json(content_type=None)
+            if resp.status in (401, 403):
+                # Credential/token rejection — distinct from other non-2xx codes
+                # so validate() can tell "bad credentials" from "request failed".
+                raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
             raise Exception(
                 f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+            )
+
+    async def validate(self, track_id: str) -> None:
+        """Exercise the configured credentials against the live Spotify API.
+
+        Forces a fresh client-credentials token (bypassing any Redis-cached one,
+        so the client_id/secret themselves are tested — not a token minted from
+        earlier credentials), then fetches a known track.
+
+        Raises SpotifyAuthError *only* when Spotify rejects the credentials
+        themselves: a non-2xx token grant (`strict=True`) or a 401/403 on the
+        track call. Every other failure propagates as its own type — a network
+        error, a timeout, a non-auth HTTP code, or an unexpected response shape
+        (ValueError) — and means "could not verify", not "invalid". The caller
+        keys its enable/disable decision off that distinction.
+
+        Intended for a one-shot startup probe; it mutates no feature flag itself."""
+        async with self._auth_lock:
+            await self._refresh_token(use_cache=False, strict=True)
+        endpoint = self.spotify_endpoint + f"v1/tracks/{track_id}"
+        resp = await self.http_call(endpoint)
+        if not resp.get("name"):
+            raise ValueError(
+                f"Spotify returned no track name for probe id {track_id!r}: {resp!r}"
             )
 
     # ── Cached API methods ────────────────────────────────────────────────────
@@ -144,7 +211,7 @@ class Spotify:
         async def fetch() -> str:
             endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
             resp = await self.http_call(endpoint)
-            return resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+            return _track_search_title(resp)
 
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
@@ -167,9 +234,7 @@ class Spotify:
                 endpoint, params={"fields": "items(track(name,artists(name)))"}
             )
             track_titles = [
-                item["track"]["name"]
-                + "".join(f" {a['name']}" for a in item["track"]["artists"])
-                for item in resp.get("items", [])
+                _track_search_title(item["track"]) for item in resp.get("items", [])
             ]
             trace.get_current_span().set_attribute(
                 "spotify.track_count", len(track_titles)

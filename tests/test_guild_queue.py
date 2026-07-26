@@ -153,6 +153,96 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+class TestDrainPending:
+    """`_drain_pending` — the shared first step of put_front(), clear(),
+    shuffle() and remove(). All four drain the whole pending leg under the mutex
+    and rebuild it, so a bug here corrupts four commands at once.
+
+    Its non-obvious contract is the task_done() balance: each drained item must
+    be balanced, or the asyncio queue's unfinished counter drifts and join()
+    hangs forever. Tests assert via join() rather than only reading the counter,
+    because join() is what the bulk mutations actually depend on.
+    """
+
+    async def test_returns_every_item_in_queue_order(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        items = [_qobj(n, mock_author) for n in range(1, 4)]
+        await gq_no_redis.put(items)
+
+        drained = gq_no_redis._drain_pending()
+
+        assert drained == items  # FIFO, not reversed or arbitrary
+
+    async def test_leaves_the_pending_leg_empty(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq_no_redis.put([_qobj(n, mock_author) for n in range(1, 4)])
+        gq_no_redis._drain_pending()
+        assert gq_no_redis.qsize() == 0
+        assert gq_no_redis.empty()
+
+    async def test_empty_queue_returns_empty_list(
+        self, gq_no_redis: GuildQueue
+    ) -> None:
+        assert gq_no_redis._drain_pending() == []
+
+    async def test_every_drained_item_is_balanced_with_task_done(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The counter must return to zero so join() completes.
+
+        Omitting the task_done() would leave unfinished tasks pending and hang
+        the next join() — the failure would surface as a frozen bulk mutation,
+        not as an exception here.
+        """
+        await gq_no_redis.put([_qobj(n, mock_author) for n in range(1, 6)])
+        assert gq_no_redis._pending._unfinished_tasks == 5  # pyright: ignore[reportAttributeAccessIssue]
+
+        gq_no_redis._drain_pending()
+
+        assert gq_no_redis._pending._unfinished_tasks == 0  # pyright: ignore[reportAttributeAccessIssue]
+        await asyncio.wait_for(gq_no_redis._pending.join(), timeout=1)
+
+    async def test_drain_is_idempotent(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """A second drain must be a no-op, not an over-balanced task_done().
+
+        `_pending.task_done()` raises ValueError once called more times than
+        there were items, so an unguarded re-drain would crash the caller.
+        """
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        assert len(gq_no_redis._drain_pending()) == 1
+        assert gq_no_redis._drain_pending() == []
+        await asyncio.wait_for(gq_no_redis._pending.join(), timeout=1)
+
+    async def test_drained_items_can_be_put_back(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The drain/rebuild round-trip all four callers perform: re-putting the
+        drained items must restore order and leave the counter consistent."""
+        items = [_qobj(n, mock_author) for n in range(1, 4)]
+        await gq_no_redis.put(items)
+
+        drained = gq_no_redis._drain_pending()
+        for item in reversed(drained):
+            gq_no_redis._pending.put_nowait(item)
+
+        assert [gq_no_redis.get_nowait() for _ in range(3)] == list(reversed(items))
+
+    async def test_mixed_item_types_survive_the_drain(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The pending leg holds unresolved YTSource entries alongside
+        QueueObjects. The drain is type-agnostic and must not filter or coerce."""
+        qobj = _qobj(1, mock_author)
+        ytsrc = YTSource(url="https://yt.com/watch?v=lazy")
+        await gq_no_redis.put([qobj, ytsrc])
+
+        assert gq_no_redis._drain_pending() == [qobj, ytsrc]
+
+
 # ── put_front (-playnow interjection) ─────────────────────────────────────────
 
 
