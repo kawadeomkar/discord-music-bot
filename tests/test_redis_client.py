@@ -1,6 +1,8 @@
 """Tests for src/redis_client.py — connection lifecycle, cache helpers, and GuildRedisStore."""
 
-from typing import Any
+import ast
+import inspect
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import orjson
@@ -387,6 +389,119 @@ class TestGetHistory:
     ) -> None:
         result = await broken_store.get_history()
         assert result == []
+
+    async def test_error_fallback_is_a_fresh_list_per_guild(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        """Two failing reads must not share one list object.
+
+        A decorator argument is evaluated once at class-body execution, so
+        `@_guild_op(default=[])` would return the *same* list to every guild on
+        every failure — one in-place mutation would poison "empty history"
+        process-wide, and a guild that never played a song would start
+        reporting another guild's songs. `default_factory=list` builds one per
+        failure.
+        """
+        other = GuildRedisStore(broken_store.redis, guild_id=1234)
+
+        first = await broken_store.get_history()
+        second = await other.get_history()
+
+        assert first == [] and second == []
+        assert first is not second, (
+            "both guilds got the same list object — the fallback is a shared "
+            "mutable default, not a per-call factory"
+        )
+
+        first.append(_hentry(99))  # in-place mutation, the poisoning case
+        assert await other.get_history() == []
+
+
+class TestGuildOpDefaults:
+    """Structural guard over every @_guild_op default in GuildRedisStore.
+
+    The decorator takes its fallback as an argument, which makes two mistakes
+    cheap and invisible: a mutable literal (shared across guilds for the
+    process lifetime) and a default that contradicts the declared return type
+    (e.g. None from a `-> bool`). Neither is caught by pyright — `default` is
+    typed Any on purpose so `default=None` cannot collapse the return TypeVar.
+    """
+
+    @staticmethod
+    def _decorated() -> list[tuple[str, ast.Call, Optional[str]]]:
+        """(method name, the _guild_op call node, return annotation) per method."""
+        import src.redis_client as rc_module
+
+        tree = ast.parse(inspect.getsource(rc_module))
+        cls = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.ClassDef) and n.name == "GuildRedisStore"
+        )
+        out: list[tuple[str, ast.Call, Optional[str]]] = []
+        for node in cls.body:
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            for dec in node.decorator_list:
+                if (
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Name)
+                    and dec.func.id == "_guild_op"
+                ):
+                    returns = (
+                        ast.unparse(node.returns) if node.returns is not None else None
+                    )
+                    out.append((node.name, dec, returns))
+        return out
+
+    def test_finds_every_decorated_method(self) -> None:
+        """Guard against the guard silently matching nothing."""
+        assert len(self._decorated()) >= 24
+
+    def test_mutable_defaults_use_a_factory(self) -> None:
+        """No `default=` may be a mutable literal — those need default_factory."""
+        offenders = []
+        for name, call, _ in self._decorated():
+            for kw in call.keywords:
+                if kw.arg == "default" and isinstance(
+                    kw.value, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp)
+                ):
+                    offenders.append(f"{name}: default={ast.unparse(kw.value)}")
+        assert not offenders, (
+            "mutable @_guild_op default(s) shared across every guild for the "
+            f"process lifetime: {offenders}. Use default_factory=... instead."
+        )
+
+    def test_every_default_matches_its_return_type(self) -> None:
+        """A fallback that contradicts the annotation is a silent type lie."""
+        mismatches = []
+        for name, call, returns in self._decorated():
+            kwargs = {kw.arg: kw.value for kw in call.keywords}
+            factory = kwargs.get("default_factory")
+            default = kwargs.get("default")
+            rendered = ast.unparse(default) if default is not None else None
+
+            if returns is None:
+                mismatches.append(f"{name}: no return annotation")
+            elif factory is not None:
+                # A factory implies a concrete container return, never Optional.
+                if returns.startswith("Optional[") or returns == "None":
+                    mismatches.append(
+                        f"{name}: default_factory with Optional return {returns}"
+                    )
+            elif returns == "bool":
+                if rendered != "False":
+                    mismatches.append(f"{name}: -> bool but default={rendered}")
+            elif returns == "None" or returns.startswith("Optional["):
+                if rendered not in (None, "None"):
+                    mismatches.append(f"{name}: -> {returns} but default={rendered}")
+            elif rendered == "None":
+                # Non-Optional, non-bool returning a None fallback: the caller's
+                # annotation promises a value the error path does not deliver.
+                mismatches.append(
+                    f"{name}: -> {returns} (not Optional) but default=None"
+                )
+        assert not mismatches, "\n".join(mismatches)
 
 
 # ── State operations ──────────────────────────────────────────────────────────
