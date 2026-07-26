@@ -237,8 +237,15 @@ def _remaining_secs(item: QueueObject) -> Optional[int]:
 def _search_label(item: YTSource) -> str:
     """Display text for a queue entry still awaiting YouTube resolution — the
     search terms it will be resolved from, with the `ytsearch:` scheme stripped.
-    Shared by _format_queue_line() and the resume notice's "Up next"."""
-    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+    Shared by _format_queue_line(), queue_clear() and the resume notice's
+    "Up next".
+
+    Never empty. `ytsearch:` with nothing after it survives the `or "?"` chain
+    (it is a truthy string) and strips to "", which the resume notice would
+    render as a bolded nothing — `****`. Reachable: a Spotify track with no
+    name and no artists makes _track_search_title() return "".
+    """
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:") or "?"
 
 
 def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
@@ -270,12 +277,22 @@ def _up_next_context(head: Optional[QueueItem]) -> Optional[ResumeContext]:
     what is queued next is the point, and "resolving..." is the same thing the
     queue embed says about it. None when the queue is empty or its head can't
     name itself, which leaves the notice's queue summary to stand alone.
+
+    A -playnow resume tail (is_resume, persisted, and restorable as the head)
+    gets the same position/duration pair the "Left off on" branch renders,
+    because a bare duration would be a lie the rest of the embed contradicts:
+    only `duration - ts` of it will play, which is what _queue_runtime()
+    counted into "Runtime" and what -queue's "⏮ resumes at" note says.
     """
     if isinstance(head, QueueObject):
         if not head.title:
             return None
         value = f"**{truncate_embed_title(head.title)}**"
-        if head.duration:
+        if head.is_resume and head.ts:
+            value += f"\n⏮ `{fmt_duration(head.ts)}`"
+            if head.duration:
+                value += f" / `{fmt_duration(head.duration)}`"
+        elif head.duration:
             value += f"\n`{fmt_duration(head.duration)}`"
         return ResumeContext("Up next", value, head.thumbnail or "")
     if isinstance(head, YTSource):
@@ -1040,11 +1057,7 @@ class MusicPlayer:
         await self._cancel_prefetch()  # before the drain — see _cancel_prefetch
         cleared_items = await self.queue.clear()
         return [
-            (
-                item.title
-                if isinstance(item, QueueObject)
-                else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-            )
+            item.title if isinstance(item, QueueObject) else _search_label(item)
             for item in cleared_items
         ]
 
@@ -2036,15 +2049,25 @@ class MusicPlayer:
                             source, context="failed-song pop"
                         )
                         dequeue_owed = False
+                        # Name the song. On the -play-on-a-disconnected-bot
+                        # path this notice is the ONLY message that can: the
+                        # song never reached playback, so no Now Playing embed
+                        # was ever sent, and the resume notice deliberately
+                        # doesn't repeat the requested song. Without this, a
+                        # `-play <search terms>` that fails to stream leaves
+                        # the user unable to tell which video it even matched.
+                        title = (
+                            truncate_embed_title(source.title)
+                            if isinstance(source, QueueObject) and source.title
+                            else "the next song"
+                        )
+                        message = f"Failed to load {title}, skipping."
                         failure = self._last_stream_error
                         if failure is not None:
-                            message = (
-                                "Failed to load the next song, skipping.\n"
-                                f"**Reason:** `{failure.detail}`\n"
+                            message += (
+                                f"\n**Reason:** `{failure.detail}`\n"
                                 f"**Trace ID:** `{failure.trace_id}`"
                             )
-                        else:
-                            message = "Failed to load the next song, skipping."
                         try:
                             await self.send_with_np(
                                 embed=notice_embed(message, discord.Color.red())

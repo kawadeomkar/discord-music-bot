@@ -951,18 +951,37 @@ class TestResumeNoticeEmbed:
         assert embed is not None
         assert embed.thumbnail.url == "https://img/old.jpg"
 
-    def test_no_thumbnail_when_the_named_song_has_none(
+    def test_no_thumbnail_when_the_last_played_song_has_none(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
-        """A crash-recovered entry is rebuilt from state fields that never held
-        a thumbnail. Falling back to the started song's would put a picture of
-        one song next to the name of another."""
+        """A history entry stored before thumbnails were recorded has none.
+        Falling back to the started song's would put a picture of one song next
+        to the name of another."""
         music_player.queue._display.append(queue_obj)
         music_player.history.restore([HistoryEntry(title="Old Song")])
 
         embed = music_player.build_resume_notice_embed()
 
         assert embed is not None
+        assert embed.thumbnail.url is None
+
+    def test_crash_recovered_head_does_not_borrow_a_thumbnail(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The commonest resume case, and the one with nothing to show: a
+        crash-recovered entry is rebuilt by SongQueueEntry.from_crashed_state()
+        from state fields that never held a thumbnail, so it always renders
+        thumbnail-less. History's picture sitting next to the crashed song's
+        name would be a different song's."""
+        music_player.queue._display.append(_crashed(mock_author))
+        music_player.history.restore(
+            [HistoryEntry(title="Finished Earlier", thumbnail="https://img/old.jpg")]
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert "Interrupted Song" in _fields(embed)["Left off on"]
         assert embed.thumbnail.url is None
 
     def test_reports_count_and_runtime(
@@ -1227,6 +1246,63 @@ class TestResumeNoticeEmbed:
 
         assert embed is not None
         assert _fields(embed)["Up next"] == "**Father - Look At Wrist**\n*resolving...*"
+
+    def test_next_song_for_a_search_entry_with_no_terms(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """ "ytsearch:" with nothing after it is truthy, so it survives
+        _search_label's `or "?"` chain and strips to "" — which this field
+        would render as a bolded nothing, `****`. A Spotify track with no name
+        and no artists produces exactly that search string."""
+        music_player.queue._display.append(YTSource(ytsearch="ytsearch:", process=True))
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Up next"] == "**?**\n*resolving...*"
+
+    def test_next_song_resume_tail_shows_where_it_resumes(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """A -playnow resume tail persists (is_resume + ts) and comes back as
+        the restored head. Its full duration is not what plays: Runtime counts
+        only the tail, and -queue labels it "⏮ resumes at". Printing a bare
+        `5:00` here made the same embed contradict itself."""
+        music_player.queue._display.append(
+            QueueObject(
+                "https://yt.com/v=r",
+                "Interrupted Song",
+                mock_author,
+                ts=150,
+                duration=300,
+                is_resume=True,
+            )
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        fields = _fields(embed)
+        assert fields["Up next"] == "**Interrupted Song**\n⏮ `2:30` / `5:00`"
+        assert fields["Runtime"] == "2m 30s"
+
+    def test_next_song_resume_tail_without_a_known_duration(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player.queue._display.append(
+            QueueObject(
+                "https://yt.com/v=r",
+                "Interrupted Song",
+                mock_author,
+                ts=150,
+                is_resume=True,
+            )
+        )
+
+        embed = music_player.build_resume_notice_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Up next"] == "**Interrupted Song**\n⏮ `2:30`"
 
     def test_history_outranks_the_next_song_in_queue(
         self, music_player: MusicPlayer, queue_obj: QueueObject
@@ -4842,6 +4918,32 @@ class TestLoop:
             await music_player.loop()
 
         sent_embeds = mocked(music_player._channel.send).call_args.kwargs["embeds"]
+        assert sent_embeds[0].description == "Failed to load Test Song, skipping."
+
+    async def test_skip_notice_falls_back_when_the_song_has_no_title(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Nothing to name — a queue entry restored without a title. "the next
+        song" keeps the sentence grammatical instead of rendering a hole."""
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        untitled = QueueObject("https://yt.com/v=1", "", mock_author)
+        await music_player.queue._pending.put(untitled)
+        music_player.queue._display.append(untitled)
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=untitled)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=None)
+            ),
+        ):
+            await music_player.loop()
+
+        sent_embeds = mocked(music_player._channel.send).call_args.kwargs["embeds"]
         assert sent_embeds[0].description == "Failed to load the next song, skipping."
 
     async def test_skip_notice_includes_reason_and_trace_id(
@@ -4874,7 +4976,7 @@ class TestLoop:
         description = (
             mocked(music_player._channel.send).call_args.kwargs["embeds"][0].description
         )
-        assert "Failed to load the next song, skipping." in description
+        assert "Failed to load Test Song, skipping." in description
         assert failure.detail in description
         assert failure.trace_id in description
 
