@@ -2001,87 +2001,90 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    if not await self.queue.try_commit_dequeue():
-                        # The queue was cleared while this song was being resolved
-                        # (e.g. during the async yt_stream call). Discard without
-                        # playing; task_done() balances the queue.get() above.
-                        # cleanup() terminates the FFmpeg subprocess that yt_stream
-                        # already spawned — omitting it would leak the process.
-                        self.queue.task_done()
-                        dequeue_owed = False
-                        self.current_song.cleanup()
-                        self.current_song = None
-                        continue
+                    async with self.queue.commit_dequeue() as committed:
+                        if not committed:
+                            # The queue was cleared while this song was being resolved
+                            # (e.g. during the async yt_stream call). Discard without
+                            # playing; task_done() balances the queue.get() above.
+                            # cleanup() terminates the FFmpeg subprocess that yt_stream
+                            # already spawned — omitting it would leak the process.
+                            self.queue.task_done()
+                            dequeue_owed = False
+                            self.current_song.cleanup()
+                            self.current_song = None
+                            continue
 
-                    # Safe to assert rather than await readiness: the playback
-                    # gate above is only opened once a voice connection is
-                    # established (channel.connect() awaits the full handshake),
-                    # so loop() cannot reach vc.play() mid-handshake — the race
-                    # that used to drop the restored head with "Playback error —
-                    # skipping song". See docs/PLAYBACK_GATE_PLAN.md.
-                    vc = self._guild.voice_client
-                    assert isinstance(vc, discord.VoiceClient)
-                    assert self.current_song is not None
-                    # Local binding: pyright's attribute narrowing doesn't survive
-                    # the awaits below, and it keeps every write in this iteration
-                    # referring to the same song even if current_song is reassigned.
-                    song = self.current_song
+                        # Safe to assert rather than await readiness: the playback
+                        # gate above is only opened once a voice connection is
+                        # established (channel.connect() awaits the full handshake),
+                        # so loop() cannot reach vc.play() mid-handshake — the race
+                        # that used to drop the restored head with "Playback error —
+                        # skipping song". See docs/PLAYBACK_GATE_PLAN.md.
+                        vc = self._guild.voice_client
+                        assert isinstance(vc, discord.VoiceClient)
+                        assert self.current_song is not None
+                        # Local binding: pyright's attribute narrowing doesn't survive
+                        # the awaits below, and it keeps every write in this iteration
+                        # referring to the same song even if current_song is reassigned.
+                        song = self.current_song
 
-                    # Written from the player thread, read after play_next.wait();
-                    # call_soon_threadsafe orders the write before the wait returns.
-                    play_error: list[Optional[Exception]] = [None]
+                        # Written from the player thread, read after play_next.wait();
+                        # call_soon_threadsafe orders the write before the wait returns.
+                        play_error: list[Optional[Exception]] = [None]
 
-                    def _after_play(
-                        error: Optional[Exception], _title: str = song.title or ""
-                    ) -> None:
-                        # discord.py hands ffmpeg's failure here and nowhere else; the
-                        # previous `lambda _:` dropped it, so a stream that never opened
-                        # was indistinguishable from a song that ended. A deliberate
-                        # vc.stop() (skip/interject) arrives as error=None.
-                        if error is not None:
-                            play_error[0] = error
-                            log.error(f"playback error for {_title}: {error}")
-                        self.bot.loop.call_soon_threadsafe(self.play_next.set)
+                        def _after_play(
+                            error: Optional[Exception], _title: str = song.title or ""
+                        ) -> None:
+                            # discord.py hands ffmpeg's failure here and nowhere else; the
+                            # previous `lambda _:` dropped it, so a stream that never opened
+                            # was indistinguishable from a song that ended. A deliberate
+                            # vc.stop() (skip/interject) arrives as error=None.
+                            if error is not None:
+                                play_error[0] = error
+                                log.error(f"playback error for {_title}: {error}")
+                            self.bot.loop.call_soon_threadsafe(self.play_next.set)
 
-                    vc.play(song, after=_after_play)
-                    if song.start_paused:
-                        # Park the player thread SYNCHRONOUSLY — before any
-                        # await — so a song returning paused leaks at most a
-                        # frame or two of audio, not a Redis round-trip's
-                        # worth. Idempotent with the full pause() below, which
-                        # runs after the start transaction so its
-                        # pause_start_epoch write isn't clobbered by the
-                        # transaction's HDEL.
-                        vc.pause()
-                    play_start = time.time()  # capture immediately before any awaits
+                        vc.play(song, after=_after_play)
+                        if song.start_paused:
+                            # Park the player thread SYNCHRONOUSLY — before any
+                            # await — so a song returning paused leaks at most a
+                            # frame or two of audio, not a Redis round-trip's
+                            # worth. Idempotent with the full pause() below, which
+                            # runs after the start transaction so its
+                            # pause_start_epoch write isn't clobbered by the
+                            # transaction's HDEL.
+                            vc.pause()
+                        play_start = (
+                            time.time()
+                        )  # capture immediately before any awaits
 
-                    # Mirror now-playing song to Redis state. For a real queue item
-                    # (should_pop_queue=True), atomically LPOP the Redis queue and
-                    # write all now-playing state fields (including duration/uploader/
-                    # requester) plus the now_playing display snapshot in a single
-                    # MULTI/EXEC, eliminating the at-most-once window. A crash-
-                    # recovered "current song" (should_pop_queue=False) was never on
-                    # the Redis queue list, so only the state fields are written —
-                    # LPOPing here would erroneously drop an unrelated, still-queued
-                    # song.
-                    if self.store is not None:
-                        # play_start_epoch is backdated by the FFmpeg -ss start
-                        # offset so the recovery position math
-                        # (now - play_start_epoch - pauses) yields the true audio
-                        # position, not merely time-since-vc.play(). Without this,
-                        # ?t= songs and double-crash recoveries resume
-                        # start_offset seconds early.
-                        backdated_start = play_start - song.start_offset
-                        current = SongQueueEntry.from_song(song)
-                        now_playing = NowPlayingData.from_song(song)
-                        if should_pop_queue:
-                            await self.store.pop_queue_and_start_song(
-                                current, backdated_start, now_playing=now_playing
-                            )
-                        else:
-                            await self.store.set_current_song_state(
-                                current, backdated_start, now_playing=now_playing
-                            )
+                        # Mirror now-playing song to Redis state. For a real queue item
+                        # (should_pop_queue=True), atomically LPOP the Redis queue and
+                        # write all now-playing state fields (including duration/uploader/
+                        # requester) plus the now_playing display snapshot in a single
+                        # MULTI/EXEC, eliminating the at-most-once window. A crash-
+                        # recovered "current song" (should_pop_queue=False) was never on
+                        # the Redis queue list, so only the state fields are written —
+                        # LPOPing here would erroneously drop an unrelated, still-queued
+                        # song.
+                        if self.store is not None:
+                            # play_start_epoch is backdated by the FFmpeg -ss start
+                            # offset so the recovery position math
+                            # (now - play_start_epoch - pauses) yields the true audio
+                            # position, not merely time-since-vc.play(). Without this,
+                            # ?t= songs and double-crash recoveries resume
+                            # start_offset seconds early.
+                            backdated_start = play_start - song.start_offset
+                            current = SongQueueEntry.from_song(song)
+                            now_playing = NowPlayingData.from_song(song)
+                            if should_pop_queue:
+                                await self.store.pop_queue_and_start_song(
+                                    current, backdated_start, now_playing=now_playing
+                                )
+                            else:
+                                await self.store.set_current_song_state(
+                                    current, backdated_start, now_playing=now_playing
+                                )
 
                     if song.start_paused:
                         # -playnow interrupted this song while it was paused —
