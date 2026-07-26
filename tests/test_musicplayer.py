@@ -6515,3 +6515,109 @@ class TestPlaynowLoopStart:
         self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
+
+
+# ── HeartbeatUpdater ──────────────────────────────────────────────────────────
+
+
+class TestHeartbeatUpdater:
+    """Records the playback position so recovery never infers it from a clock."""
+
+    @staticmethod
+    def _make_sleep(n_ticks: int) -> Callable[[Any], Awaitable[None]]:
+        calls = 0
+
+        async def _sleep(_secs: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > n_ticks:
+                raise asyncio.CancelledError()
+
+        return _sleep
+
+    async def test_writes_the_current_position(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        # position_secs is derived (start_offset + elapsed_secs) on the fixture,
+        # mirroring the real YTDL property — set the inputs, not the result.
+        mock_song.start_offset = 10
+        mock_song.elapsed_secs = 32.5
+        store = AsyncMock()
+        music_player.store = store
+
+        with patch("asyncio.sleep", new=self._make_sleep(1)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        store.heartbeat.assert_awaited_once()
+        assert store.heartbeat.await_args.args[0] == 42.5
+
+    async def test_skips_while_paused(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Frames are frozen, so the position is not moving and pause() already
+        recorded the exact point — writing would rewrite the same value forever."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = True
+        mocked(music_player._guild).voice_client = vc
+        store = AsyncMock()
+        music_player.store = store
+
+        with patch("asyncio.sleep", new=self._make_sleep(2)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        store.heartbeat.assert_not_awaited()
+
+    async def test_returns_when_the_song_changes(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = MagicMock()  # a different song is playing now
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        store = AsyncMock()
+        music_player.store = store
+
+        with patch("asyncio.sleep", new=self._make_sleep(3)):
+            await music_player._heartbeat_updater(mock_song)  # returns, no raise
+
+        store.heartbeat.assert_not_awaited()
+
+    async def test_runs_without_a_now_playing_host_message(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The reason this is a separate task from _progress_updater: that one
+        goes dormant when the host message is gone. A song whose bar a user
+        deleted must still be recoverable."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        music_player._np_host_message = None
+        store = AsyncMock()
+        music_player.store = store
+
+        with patch("asyncio.sleep", new=self._make_sleep(1)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)
+
+        store.heartbeat.assert_awaited_once()
+
+    async def test_tolerates_no_store(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.source = mock_song
+        vc.is_paused.return_value = False
+        mocked(music_player._guild).voice_client = vc
+        music_player.store = None
+
+        with patch("asyncio.sleep", new=self._make_sleep(1)):
+            with pytest.raises(asyncio.CancelledError):
+                await music_player._heartbeat_updater(mock_song)  # must not raise

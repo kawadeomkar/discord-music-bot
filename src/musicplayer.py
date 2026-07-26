@@ -342,6 +342,7 @@ class MusicPlayer:
         "_playback_holds",
         "_background_tasks",
         "_progress_task",
+        "_heartbeat_task",
         "_np_host_message",
         "_np_host_own_embeds",
         "_np_host_dedicated",
@@ -371,6 +372,7 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
+    _heartbeat_task: Optional[asyncio.Task]
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
     _np_host_dedicated: bool
@@ -434,6 +436,7 @@ class MusicPlayer:
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
         # Now-playing host state: the one message currently carrying the NP
         # embed block, its own (cached, static) embeds that follow the block,
         # and whether it's a dedicated NP message (deleted on retire) or a
@@ -1346,6 +1349,13 @@ class MusicPlayer:
         future pause call site can't forget one of the two side effects."""
         vc.pause()
         if self.store is not None:
+            # One final heartbeat captures the exact pause point; the ticking
+            # task skips paused songs, so without this the recorded position
+            # would sit up to one interval behind for the whole pause.
+            if self.current_song is not None:
+                await self.store.heartbeat(self.current_song.position_secs, time.time())
+            # Still written this release: a rollback to the previous build
+            # reads the wall-clock fields (heartbeat plan §6, release 1 of 2).
             await self.store.on_pause(time.time())
         self.mark_paused()
 
@@ -1838,6 +1848,34 @@ class MusicPlayer:
         except asyncio.CancelledError:
             raise
 
+    async def _heartbeat_updater(self, song: YTDL) -> None:
+        """Record the playback position to Redis on a fixed cadence.
+
+        Deliberately a separate task from _progress_updater rather than a
+        piggyback. That one is a *display* concern and carries display-shaped
+        conditions that are wrong for persistence: it only runs for songs long
+        enough to warrant a bar, and it goes dormant when the now-playing host
+        message is missing. A song with no visible bar must still be
+        recoverable — coupling them would make crash-recovery correctness
+        depend on whether a user happened to delete a message.
+        """
+        while True:
+            await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
+            vc = self._guild.voice_client
+            if not isinstance(vc, discord.VoiceClient) or vc.source is not song:
+                return  # song changed under us; loop() owns cancellation
+            if vc.is_paused():
+                # Frames are frozen, so the position is not moving and pause()
+                # already recorded the exact point. Writing here would only
+                # rewrite the same value once per interval, forever.
+                continue
+            if self.store is not None:
+                await self.store.heartbeat(song.position_secs, time.time())
+
+    async def _cancel_heartbeat_task(self) -> None:
+        await cancel_task(self._heartbeat_task)
+        self._heartbeat_task = None
+
     async def _cancel_progress_task(self) -> None:
         """Must be awaited before the next song's _send_now_playing() to prevent a
         concurrent message.edit() for the old song from racing the new message send."""
@@ -2083,6 +2121,13 @@ class MusicPlayer:
                                 current, backdated_start, now_playing=now_playing
                             )
 
+                    # Started here rather than beside the progress bar: the bar
+                    # lives in _send_now_playing, which is display-gated, and a
+                    # song with no visible bar must still be recoverable.
+                    self._heartbeat_task = asyncio.create_task(
+                        self._heartbeat_updater(song)
+                    )
+
                     if song.start_paused:
                         # -playnow interrupted this song while it was paused —
                         # it returns parked at the same spot (the player thread
@@ -2123,6 +2168,7 @@ class MusicPlayer:
                     # this song could still be resolving concurrently with the new
                     # message being sent (see Design §4 of the progress-bar plan).
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
 
                     # Song has actually ended (naturally or via -skip) — capture
@@ -2215,6 +2261,7 @@ class MusicPlayer:
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     await self.update_activity(None)
                     raise
@@ -2230,6 +2277,7 @@ class MusicPlayer:
                         self._prefetch_task.cancel()
                     self._prefetch_task = None
                     await self._cancel_progress_task()
+                    await self._cancel_heartbeat_task()
                     await self._cancel_pause_debounce()
                     # No finalize for a song that errored — the host is simply
                     # released so the next song starts from a clean slate.
