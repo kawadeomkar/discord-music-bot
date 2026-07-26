@@ -26,6 +26,7 @@ from src.musicbot import (
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
+    _typing_keepalive,
     background_typing,
 )
 from src.util import latency_color
@@ -227,6 +228,126 @@ class TestBackgroundTyping:
                 await asyncio.wait_for(entered.wait(), timeout=1)
                 raise ValueError("command body blew up")
         await asyncio.wait_for(exited.wait(), timeout=1)
+
+
+class TestTypingKeepaliveCancellation:
+    """_typing_keepalive must catch Exception only and let CancelledError propagate.
+
+    The distinction is invisible to statement coverage — one `except` line serves
+    both arms, so a handler that also swallows CancelledError reports as covered
+    while silently completing the task *normally*. These assert on
+    task.cancelled(), the only observable that separates the two.
+    """
+
+    async def test_cancelled_keepalive_ends_cancelled_not_completed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """cancel() must leave the task CANCELLED, not merely done().
+
+        Swallowing CancelledError here makes cooperative cancellation a lie:
+        task.cancelled() is False, and a cancellation aimed at an enclosing
+        scope (shutdown, an outer timeout) stops propagating at this frame.
+        """
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.sleep(0)  # let it reach the sleep(3600)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled(), (
+            "keepalive completed normally instead of ending cancelled — "
+            "the handler is swallowing CancelledError"
+        )
+        # done() alone cannot tell the two apart; that is why it is not the assert.
+        assert task.done()
+
+    async def test_cancellation_still_exits_the_typing_cm(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Letting CancelledError propagate must not skip Typing.__aexit__.
+
+        The indicator is dropped by the `async with` unwind. If __aexit__ were
+        skipped the bot would appear to type forever after every command.
+        """
+        exited = asyncio.Event()
+        entered = asyncio.Event()
+        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
+            return_value=None, side_effect=lambda: entered.set()
+        )
+        # return_value=None is load-bearing for any test that asserts on
+        # cancellation through this CM: __aexit__ returning a *truthy* value
+        # SUPPRESSES the exception being unwound, so a bare AsyncMock() would
+        # eat the CancelledError inside the `async with` and make the assert
+        # below fail for a reason that has nothing to do with the handler.
+        # Real discord.py Typing.__aexit__ returns None — keep it that way.
+        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
+            return_value=None, side_effect=lambda *a: exited.set()
+        )
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        await asyncio.wait_for(exited.wait(), timeout=1)
+        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
+        assert task.cancelled()
+
+    async def test_cosmetic_typing_failure_is_still_swallowed(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The Exception arm must survive: typing failures stay invisible."""
+        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        await task  # must not raise
+
+        assert task.done() and not task.cancelled()
+        assert task.exception() is None
+
+    async def test_base_exception_is_not_swallowed(self, mock_ctx: MagicMock) -> None:
+        """Only Exception is cosmetic; a BaseException must propagate.
+
+        CancelledError is itself a BaseException, so this pins the general rule
+        the handler now follows. Uses a custom subclass rather than SystemExit:
+        asyncio special-cases SystemExit/KeyboardInterrupt by re-raising them
+        into the event loop, which would escape pytest.raises for reasons that
+        have nothing to do with this handler.
+        """
+
+        class Shutdown(BaseException):
+            pass
+
+        mock_ctx.typing.side_effect = Shutdown("shutting down")
+
+        task = asyncio.create_task(_typing_keepalive(mock_ctx))
+        with pytest.raises(Shutdown):
+            await task
+
+    async def test_background_typing_leaves_its_keepalive_cancelled(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """End-to-end: the task background_typing() spawns and cancels on exit
+        must settle as CANCELLED. background_typing does not await it, so this
+        is the only place the contract is observable from outside."""
+        spawned: list[asyncio.Task[Any]] = []
+        real_create_task = asyncio.create_task
+
+        def capture(coro: Any, **kw: Any) -> asyncio.Task[Any]:
+            task = real_create_task(coro, **kw)
+            spawned.append(task)
+            return task
+
+        with patch("src.musicbot.asyncio.create_task", side_effect=capture):
+            async with background_typing(mock_ctx):
+                await asyncio.sleep(0)
+
+        assert len(spawned) == 1
+        keepalive = spawned[0]
+        with contextlib.suppress(asyncio.CancelledError):
+            await keepalive
+        assert keepalive.cancelled()
 
 
 class TestLatencyColor:

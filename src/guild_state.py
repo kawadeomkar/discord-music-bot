@@ -64,6 +64,14 @@ class NowPlayingField:
 
 
 # ── Parsing helpers (module-level; shared by both from_redis constructors) ───
+#
+# The bare `except A, B:` clauses below are PEP 758 (Python 3.14+)
+# unparenthesized multi-exception syntax, NOT the old Python-2
+# catch-one/bind-name form: they catch the tuple (A, B) and let unlisted types
+# propagate. This is the concise style ruff's formatter normalizes to at
+# `target-version = "py314"` (documented, intended behavior since ruff v0.15.0)
+# — not a bug. requires-python is >=3.14, so it is valid on every interpreter
+# this project runs on; do not re-parenthesize (ruff would strip it back).
 
 
 def _b_str(raw: dict[bytes, bytes], key: str, default: str = "") -> str:

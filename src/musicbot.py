@@ -43,6 +43,7 @@ from src.util import (
     fmt_duration,
     history_embeds,
     notice_embed,
+    pluralize,
     queue_message,
     record_span_error,
     send_embed,
@@ -122,16 +123,14 @@ async def _typing_keepalive(ctx: commands.Context) -> None:
     try:
         async with ctx.typing():
             await asyncio.sleep(3600)  # held open until cancelled
-    # FIXME: this swallows CancelledError, defeating cooperative cancellation.
-    # background_typing() cancels this task on the way out, and catching
-    # CancelledError here makes the task complete *normally* instead of ending
-    # cancelled — task.cancelled() is False, and a cancellation aimed at the
-    # enclosing scope (shutdown, an outer timeout) stops propagating at this
-    # frame. Only the `Exception` half is wanted: typing failures are cosmetic
-    # and must not surface. Not fixed here because this is a behaviour change,
-    # not a typing one, and this branch is scoped to typing.
-    # Fix: catch Exception only, and let CancelledError propagate.
-    except asyncio.CancelledError, Exception:
+    # Catch Exception only — NOT CancelledError. This task is cancelled by
+    # background_typing() on the way out, and letting that CancelledError
+    # propagate is what marks the task genuinely cancelled (task.cancelled()
+    # True) instead of completing normally; swallowing it here would defeat
+    # cooperative cancellation and stop a shutdown/outer-timeout cancellation
+    # at this frame. Typing failures, on the other hand, are purely cosmetic
+    # and must never surface — hence the Exception catch.
+    except Exception:
         pass  # cosmetic — never let typing failures surface
 
 
@@ -383,6 +382,14 @@ class MusicBot(commands.Cog):
         e: Exception,
         title: str = "Command failed",
     ) -> None:
+        # The command's own failure log, folded in here so the 15 command
+        # bodies don't each repeat the identical `log.error(f"<cmd> failed:
+        # ...")` line before calling this. exc_info=True still captures the
+        # live traceback: this runs inside the command's `except` block, so
+        # sys.exc_info() is `e`. The command name comes from ctx (the canonical
+        # name, matching the literals it replaces) rather than being hand-typed.
+        cmd = ctx.command.name if ctx.command else "command"
+        log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
         if isinstance(e, ExtractionError):
@@ -418,11 +425,8 @@ class MusicBot(commands.Cog):
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
             return ResolvedYoutubePlaylist(
-                await YTDL.yt_playlist(playlist_url, ctx.author)
+                await YTDL.yt_playlist(source.playlist_url, ctx.author)
             )
         else:
             ts: Optional[int] = None
@@ -482,9 +486,7 @@ class MusicBot(commands.Cog):
             # changes a dataclass's constructor and its test call sites, which is
             # more than this typing branch should move.
             assert isinstance(source, YTSource)
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
+            playlist_url = source.playlist_url
             # Mirror of the Spotify branch above: a YTSource playlist resolves
             # via YTDL.yt_playlist() to fully-formed QueueObjects.
             tracks = qobj.tracks
@@ -493,7 +495,7 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    f"Queued playlist — {count} song{'s' if count != 1 else ''}",
+                    f"Queued playlist — {count} {pluralize(count, 'song')}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
@@ -673,7 +675,6 @@ class MusicBot(commands.Cog):
                         await self._enqueue_playlist(ctx, source, qobj, mp, front=front)
 
             except Exception as e:
-                log.error(f"play failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to queue song")
 
     async def _resolve_playnow_source(
@@ -699,10 +700,7 @@ class MusicBot(commands.Cog):
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-            playlist_url = (
-                source.url or f"https://www.youtube.com/playlist?list={source.list_id}"
-            )
-            tracks = await YTDL.yt_playlist(playlist_url, ctx.author)
+            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
             if not tracks:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
@@ -760,7 +758,6 @@ class MusicBot(commands.Cog):
 
                 await self._interject_flow(ctx, url, mp, vc)
             except Exception as e:
-                log.error(f"playnow failed: {type(e).__name__}: {e}", exc_info=True)
                 await self._command_error(ctx, e, title="Failed to play song now")
 
     @_tracer.start_as_current_span("bot.interject_flow")
@@ -943,7 +940,6 @@ class MusicBot(commands.Cog):
             if coros:
                 await asyncio.gather(*coros)
         except Exception as e:
-            log.error(f"skip failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -972,7 +968,6 @@ class MusicBot(commands.Cog):
                 await ctx.message.add_reaction("👋")
                 await self.cleanup(ctx.guild)
         except Exception as e:
-            log.error(f"stop failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -999,7 +994,6 @@ class MusicBot(commands.Cog):
                 if embed is not None:
                     await ctx.send(embed=embed)
         except Exception as e:
-            log.error(f"pause failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1031,7 +1025,6 @@ class MusicBot(commands.Cog):
                 # beneath a live, advancing bar for the rest of the song.
                 await mp.rehost_np_after_resume()
         except Exception as e:
-            log.error(f"resume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1057,7 +1050,6 @@ class MusicBot(commands.Cog):
                 await ctx.message.add_reaction("🔀")
                 await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
         except Exception as e:
-            log.error(f"shuffle failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1109,7 +1101,6 @@ class MusicBot(commands.Cog):
                 send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
-            log.error(f"join failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1141,13 +1132,12 @@ class MusicBot(commands.Cog):
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
                     ctx,
-                    f"Queue cleared — {len(cleared)} song{'s' if len(cleared) != 1 else ''} removed",
+                    f"Queue cleared — {len(cleared)} {pluralize(len(cleared), 'song')} removed",
                     description,
                     discord.Color.red(),
                 ),
             )
         except Exception as e:
-            log.error(f"clear failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1186,8 +1176,8 @@ class MusicBot(commands.Cog):
             )
             return
         count = len(positions)
-        noun = "song" if count == 1 else "songs"
-        pos_label = "Position" if count == 1 else "Positions"
+        noun = pluralize(count, "song")
+        pos_label = pluralize(count, "Position")
         pos_str = ", ".join(str(p) for p in positions)
         await send_embed(
             ctx,
@@ -1253,7 +1243,6 @@ class MusicBot(commands.Cog):
                     )
                 )
         except Exception as e:
-            log.error(f"now failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1303,7 +1292,6 @@ class MusicBot(commands.Cog):
                     embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
                 )
         except Exception as e:
-            log.error(f"history failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1332,7 +1320,6 @@ class MusicBot(commands.Cog):
                 embed=notice_embed("currently in development", discord.Color.blue())
             )
         except Exception as e:
-            log.error(f"jump failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1353,7 +1340,6 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             await ctx.send(embed=mp.queue_embed())
         except Exception as e:
-            log.error(f"queue failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1401,7 +1387,6 @@ class MusicBot(commands.Cog):
                 )
             )
         except Exception as e:
-            log.error(f"volume failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     @commands.command(
@@ -1431,7 +1416,6 @@ class MusicBot(commands.Cog):
                 pg_pool=getattr(self, "pg_pool", None),
             )
         except Exception as e:
-            log.error(f"ping failed: {type(e).__name__}: {e}", exc_info=True)
             await self._command_error(ctx, e)
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────

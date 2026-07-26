@@ -55,6 +55,14 @@ class YTSource:
     type: YTType = YTType.TRACK
     list_id: Optional[str] = None
 
+    @property
+    def playlist_url(self) -> str:
+        """The canonical playlist URL for a type=PLAYLIST source: the original
+        URL if one was pasted, else rebuilt from list_id. The single spelling
+        of the `url or ".../playlist?list={list_id}"` fallback the enqueue,
+        playnow, and resolve paths all need."""
+        return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
+
 
 @dataclass(frozen=True)
 class SoundcloudSource:

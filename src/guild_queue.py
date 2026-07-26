@@ -156,6 +156,22 @@ class GuildQueue:
     def qsize(self) -> int:
         return self._pending.qsize()
 
+    def _drain_pending(self) -> list[QueueItem]:
+        """Remove and return every item currently in _pending, in queue order,
+        each balanced with task_done(). The shared first step of put_front(),
+        clear(), shuffle(), and remove() — all four drain the whole queue under
+        the mutex before rebuilding it. Must be called holding _mutex (or in
+        __init__-adjacent setup): the drain must not race a concurrent consumer.
+        """
+        drained: list[QueueItem] = []
+        for _ in range(self._pending.qsize()):
+            try:
+                drained.append(self._pending.get_nowait())
+                self._pending.task_done()
+            except asyncio.QueueEmpty:
+                break
+        return drained
+
     def consume_cleared_flag(self) -> bool:
         """Read-and-reset the queue-was-cleared flag.
 
@@ -221,13 +237,7 @@ class GuildQueue:
             return
         new_items = list(items)
         async with self._mutex:
-            drained: list[QueueItem] = []
-            for _ in range(self._pending.qsize()):
-                try:
-                    drained.append(self._pending.get_nowait())
-                    self._pending.task_done()
-                except asyncio.QueueEmpty:
-                    break
+            drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
             for item in new_items + drained:
                 self._pending.put_nowait(item)
@@ -270,12 +280,7 @@ class GuildQueue:
         """
         async with self._mutex:
             self._cleared = True
-            for _ in range(self._pending.qsize()):
-                try:
-                    self._pending.get_nowait()
-                    self._pending.task_done()
-                except asyncio.QueueEmpty:
-                    break
+            self._drain_pending()
             cleared_items = list(self._display)
             self._display.clear()
             if self._store is not None:
@@ -300,15 +305,8 @@ class GuildQueue:
         if self._pending.qsize() < 4:
             return ShuffleOutcome.TOO_FEW_SONGS
 
-        shuffled: list[QueueItem] = []
         async with self._mutex:
-            for _ in range(self._pending.qsize()):
-                try:
-                    song = self._pending.get_nowait()
-                    self._pending.task_done()
-                    shuffled.append(song)
-                except asyncio.QueueEmpty:
-                    break
+            shuffled = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(shuffled))
             random.shuffle(shuffled)
             kept: list[QueueItem] = []
@@ -348,14 +346,7 @@ class GuildQueue:
 
         async with self._mutex:
             # Drain everything first so positions are numbered before partitioning.
-            drained: list[QueueItem] = []
-            for _ in range(self._pending.qsize()):
-                try:
-                    item = self._pending.get_nowait()
-                    self._pending.task_done()
-                    drained.append(item)
-                except asyncio.QueueEmpty:
-                    break
+            drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
 
             for pos, item in enumerate(drained, start=1 + len(in_flight)):
