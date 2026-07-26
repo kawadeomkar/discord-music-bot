@@ -878,18 +878,98 @@ class TestRecoveryLock:
         result = await broken_store.acquire_recovery_lock()
         assert result is False
 
-    async def test_release_deletes_lock_key(
+    async def test_release_deletes_a_lock_this_store_acquired(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await fake_redis.set(store._recovery_lock_key(), "1", nx=True, ex=60)
+        assert await store.acquire_recovery_lock() is True
         await store.release_recovery_lock()
-        val = await fake_redis.get(store._recovery_lock_key())
-        assert val is None
+        assert await fake_redis.get(store._recovery_lock_key()) is None
+
+    async def test_acquire_stores_a_unique_token_per_acquisition(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.acquire_recovery_lock()
+        first = store._recovery_lock_token
+        assert first is not None
+        assert await fake_redis.get(store._recovery_lock_key()) == first.encode()
+
+        await store.release_recovery_lock()
+        await store.acquire_recovery_lock()
+        assert store._recovery_lock_token != first
+
+    async def test_release_does_not_delete_another_instances_lock(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The whole point of the change. Instance A acquires; A's lock expires
+        mid-recovery; B acquires; A finishes and releases. A must NOT delete B's
+        lock — doing so lets C acquire while B is still restoring, which is the
+        double-restore the lock exists to prevent."""
+        store_a = store
+        assert await store_a.acquire_recovery_lock() is True
+
+        # A's lock expires and B takes it (simulated: overwrite with B's value).
+        await fake_redis.delete(store_a._recovery_lock_key())
+        store_b = GuildRedisStore(fake_redis, guild_id=store_a.guild_id)
+        assert await store_b.acquire_recovery_lock() is True
+        b_token = store_b._recovery_lock_token
+        assert b_token is not None
+
+        await store_a.release_recovery_lock()  # A finishes, late
+
+        assert await fake_redis.get(store_a._recovery_lock_key()) == b_token.encode()
+        # ...and B can still release its own lock afterwards.
+        await store_b.release_recovery_lock()
+        assert await fake_redis.get(store_a._recovery_lock_key()) is None
+
+    async def test_release_without_acquire_is_a_noop(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A store that never won the lock has no business deleting it — that is
+        the cross-instance delete, just arriving by a different route."""
+        other = GuildRedisStore(fake_redis, guild_id=store.guild_id)
+        assert await other.acquire_recovery_lock() is True
+
+        await store.release_recovery_lock()  # never acquired
+
+        assert await fake_redis.get(store._recovery_lock_key()) is not None
+
+    async def test_release_is_idempotent(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The token is consumed on release, so a second release cannot delete a
+        lock a later acquirer has since taken."""
+        assert await store.acquire_recovery_lock() is True
+        await store.release_recovery_lock()
+
+        later = GuildRedisStore(fake_redis, guild_id=store.guild_id)
+        assert await later.acquire_recovery_lock() is True
+
+        await store.release_recovery_lock()  # second release from the old owner
+
+        assert await fake_redis.get(store._recovery_lock_key()) is not None
+
+    async def test_release_tolerates_a_lock_that_simply_expired(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await store.acquire_recovery_lock() is True
+        await fake_redis.delete(store._recovery_lock_key())  # TTL elapsed
+        await store.release_recovery_lock()  # must not raise
 
     async def test_release_swallows_redis_error(
         self, broken_store: GuildRedisStore
     ) -> None:
+        # Set the token directly: broken_store's acquire raises, so it would
+        # otherwise return early and never reach the code under test.
+        broken_store._recovery_lock_token = "deadbeef"
         await broken_store.release_recovery_lock()  # must not raise
+
+    async def test_ttl_exceeds_the_guarded_critical_section(
+        self, store: GuildRedisStore
+    ) -> None:
+        """_restore_guild does a connect(timeout=30.0) plus notifications and
+        several Redis reads. 60s could expire underneath that; the TTL must sit
+        comfortably above it."""
+        assert store._RECOVERY_LOCK_TTL >= 120
 
     async def test_lock_key_includes_guild_id(self, store: GuildRedisStore) -> None:
         assert "123456789" in store._recovery_lock_key()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from functools import wraps
 from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
@@ -8,6 +9,7 @@ from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
+from redis.exceptions import WatchError
 from redis.typing import EncodableT, FieldT
 
 from src.guild_state import (
@@ -247,6 +249,11 @@ class GuildRedisStore:
     def __init__(self, redis: aioredis.Redis, guild_id: int) -> None:
         self.redis = redis
         self.guild_id = guild_id
+        # Set by acquire_recovery_lock, consumed by release_recovery_lock. Held
+        # per store instance, which is the acquire/release scope: _restore_guild
+        # builds one store and does both. A release from a *different* store
+        # instance finds None and correctly declines to delete.
+        self._recovery_lock_token: Optional[str] = None
 
     # Key helpers
 
@@ -677,19 +684,71 @@ class GuildRedisStore:
 
     # Recovery lock (distributed, for rolling-restart safety)
 
-    _RECOVERY_LOCK_TTL = 60  # seconds
+    # Sized against the critical section it guards, not against a round trip:
+    # _restore_guild does voice_channel.connect(timeout=30.0, reconnect=True)
+    # plus channel notifications and several Redis reads, so 60s could plausibly
+    # expire mid-recovery. The tradeoff runs the other way too — an instance that
+    # dies holding the lock blocks recovery of that guild for the full TTL — so
+    # this is "comfortably above the worst realistic section", not "as long as
+    # possible". Expiry is no longer *unsafe* (see release_recovery_lock), just
+    # wasteful: it lets a second instance start a duplicate restore.
+    _RECOVERY_LOCK_TTL = 180  # seconds
 
     def _recovery_lock_key(self) -> str:
         return f"lock:guild:{self.guild_id}:recovery"
 
     @_guild_op(default=False)
     async def acquire_recovery_lock(self) -> bool:
-        """SET NX EX — True if this instance won the lock, False if another holds it."""
+        """SET NX EX — True if this instance won the lock, False if another holds it.
+
+        The value is a per-acquisition random token rather than a constant, so
+        the release below can prove the lock it deletes is still the one this
+        store acquired.
+        """
+        token = secrets.token_hex(16)
         result = await self.redis.set(
-            self._recovery_lock_key(), "1", nx=True, ex=self._RECOVERY_LOCK_TTL
+            self._recovery_lock_key(), token, nx=True, ex=self._RECOVERY_LOCK_TTL
         )
-        return result is True
+        if result is True:
+            self._recovery_lock_token = token
+            return True
+        return False
 
     @_guild_op(default=None)
     async def release_recovery_lock(self) -> None:
-        await self.redis.delete(self._recovery_lock_key())
+        """Delete the lock only if this store still owns it (compare-and-delete).
+
+        An unconditional DEL was unsafe on a lock that can expire. Sequence:
+        instance A's lock expires mid-recovery → B acquires → A finishes and
+        DELs *B's* lock → C acquires while B is still restoring, producing
+        exactly the double-restore the lock exists to prevent. That is not
+        hypothetical in the rolling-restart case this was built for, which is
+        the only case it runs in.
+
+        WATCH/MULTI rather than the more usual Lua CAS script: it is equally
+        atomic (EXEC aborts if the value changed after WATCH) and needs no Lua
+        interpreter, which fakeredis lacks — so this path is covered by real
+        tests instead of mocks. It costs a few extra round trips, once per
+        guild per restart.
+        """
+        token = self._recovery_lock_token
+        if token is None:
+            # Never held it (or a different store instance acquired it) — deleting
+            # would be exactly the cross-instance delete this method exists to stop.
+            return
+        self._recovery_lock_token = None
+        key = self._recovery_lock_key()
+        async with self.redis.pipeline() as pipe:
+            try:
+                await pipe.watch(key)
+                if await pipe.get(key) != token.encode():
+                    # Expired, or already re-acquired by someone else. Not ours
+                    # to delete; leave it alone and let its owner or its TTL end it.
+                    await pipe.unwatch()
+                    return
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+            except WatchError:
+                # Changed hands between the read and EXEC — same conclusion.
+                pass
