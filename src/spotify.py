@@ -29,6 +29,13 @@ _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h
 
 
+def _track_search_title(track: dict[str, Any]) -> str:
+    """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify
+    track object resolves to. Shared by track() and playlist() so a single
+    track and a playlist entry render their search titles identically."""
+    return track["name"] + "".join(f" {a['name']}" for a in track["artists"])
+
+
 class Spotify:
     """Thin async client for the Spotify Web API: handles client-credentials
     auth (with auto-refresh) and Redis-backed caching of track/playlist/artist/
@@ -144,7 +151,7 @@ class Spotify:
         async def fetch() -> str:
             endpoint = self.spotify_endpoint + f"v1/tracks/{tid}"
             resp = await self.http_call(endpoint)
-            return resp["name"] + "".join(f" {a['name']}" for a in resp["artists"])
+            return _track_search_title(resp)
 
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
@@ -167,9 +174,7 @@ class Spotify:
                 endpoint, params={"fields": "items(track(name,artists(name)))"}
             )
             track_titles = [
-                item["track"]["name"]
-                + "".join(f" {a['name']}" for a in item["track"]["artists"])
-                for item in resp.get("items", [])
+                _track_search_title(item["track"]) for item in resp.get("items", [])
             ]
             trace.get_current_span().set_attribute(
                 "spotify.track_count", len(track_titles)

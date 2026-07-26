@@ -6138,6 +6138,96 @@ class TestNeutralizePrefetch:
         await music_player._neutralize_prefetch()  # must not raise
         assert music_player.queue.qsize() == 0
 
+    async def test_already_cancelled_done_task_is_treated_as_no_song(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """A *done and cancelled* prefetch reaches .result() as CancelledError.
+
+        This is the arm of `except asyncio.CancelledError, Exception` that no
+        other test exercises. Statement coverage cannot see the gap: the
+        RuntimeError test above marks the same `except` line covered, so
+        dropping CancelledError from the handler would report 100% while
+        raising straight out of _neutralize_prefetch.
+
+        Reached when something cancels _prefetch_task without clearing it and
+        the task settles before interject() runs — the task is done(), so the
+        `not task.done()` cancel-and-return path above does not apply.
+        """
+        task = asyncio.create_task(asyncio.sleep(30))
+        await asyncio.sleep(0)  # let it start so cancel() lands on a live task
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert task.done() and task.cancelled()
+
+        music_player._prefetch_task = task
+        await music_player._neutralize_prefetch()  # must not raise
+
+        # "no song" — nothing to requeue and nothing to clean up.
+        assert music_player.queue.qsize() == 0
+        assert music_player._prefetch_task is None
+
+    def test_cancellederror_catch_stays_unreachable_by_own_cancellation(self) -> None:
+        """Structural guard: no `await` may follow the CancelledError handler.
+
+        Catching CancelledError is safe here for exactly one reason — the tail
+        of _neutralize_prefetch is fully synchronous (`.result()`,
+        `requeue_front()` and `cleanup()` are all sync), so this coroutine's
+        own cancellation can never be *delivered* inside or after the handler.
+        The only CancelledError the handler can observe is the one .result()
+        raises for an already-cancelled prefetch.
+
+        That invariant is invisible and easy to break: making requeue_front
+        async, or awaiting a Redis/display call in the rebuild, would silently
+        turn the handler into a cancellation sink — the exact defect that was
+        fixed in _typing_keepalive. No runtime test can catch it (there is no
+        suspension point to cancel at today), so assert on the AST instead.
+        """
+        import ast
+        import inspect
+
+        import src.musicplayer as mp_module
+
+        tree = ast.parse(inspect.getsource(mp_module))
+        func = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_neutralize_prefetch"
+        )
+
+        def catches_cancelled(node: ast.stmt) -> bool:
+            if not isinstance(node, ast.Try):
+                return False
+            for h in node.handlers:
+                if h.type is None:
+                    continue
+                caught = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+                if any(ast.unparse(e).endswith("CancelledError") for e in caught):
+                    return True
+            return False
+
+        try_node = next((n for n in func.body if catches_cancelled(n)), None)
+        if try_node is None:
+            # Nothing catches CancelledError any more, so there is no
+            # cancellation sink to guard. That is a behaviour change owned by
+            # test_already_cancelled_done_task_is_treated_as_no_song, which
+            # fails loudly on it — this guard is simply vacuous.
+            return
+        idx = func.body.index(try_node)
+
+        offenders = [
+            ast.unparse(node)
+            for stmt in func.body[idx:]
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Await)
+        ]
+        assert not offenders, (
+            "an `await` now sits at or after the CancelledError handler in "
+            f"_neutralize_prefetch: {offenders}. The handler can now swallow "
+            "this coroutine's own cancellation. Narrow the try/except to the "
+            "bare .result() call, or split CancelledError into its own handler."
+        )
+
 
 class TestAnnounceResume:
     async def test_playing_wording(
