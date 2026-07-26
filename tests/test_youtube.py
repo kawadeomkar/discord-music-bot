@@ -2,6 +2,7 @@
 
 import redis.asyncio as aioredis
 import pickle
+from dataclasses import FrozenInstanceError, replace
 import threading
 import time
 from typing import Any, Optional, cast
@@ -28,6 +29,7 @@ from src.youtube import (
     _enrich_queueobject,
     _record_serving_format,
     _run_extract,
+    ExtractRequest,
     _slim_info,
     _stream_url_playable,
     _stream_url_ttl,
@@ -624,9 +626,9 @@ class TestYTSource:
             result = await YTDL.yt_source(
                 mock_ctx.author, "https://yt.com/v=dl", download=True
             )
-        # download=True is passed as the 3rd positional arg to _ytdlp_extract
-        call_args = mock_extract.call_args[0]
-        assert call_args[2] is True
+        # download rides on the request object, not a positional bool
+        req = mock_extract.call_args[0][0]
+        assert req.download is True
         assert result.title == "Download Song"
 
 
@@ -646,9 +648,9 @@ class TestYTSourceUnifiedExtraction:
             "src.youtube._ytdlp_extract", return_value=fake_data
         ) as mock_extract:
             await YTDL.yt_source(mock_ctx.author, "https://yt.com/watch?v=direct")
-        opts, process = mock_extract.call_args[0][1], mock_extract.call_args[0][3]
-        assert opts is _YTDL_STREAM_SEARCH_OPTS
-        assert process is True
+        req = mock_extract.call_args[0][0]
+        assert req.opts is _YTDL_STREAM_SEARCH_OPTS
+        assert req.process is True
 
     async def test_fresh_extraction_writes_both_caches(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
@@ -1523,7 +1525,7 @@ class TestExtractionErrorClassification:
 
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
             with pytest.raises(ExtractionError) as caught:
-                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+                _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
 
         err = caught.value
         assert err.original_type == "DownloadError"
@@ -1545,7 +1547,7 @@ class TestExtractionErrorClassification:
 
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
             with pytest.raises(KeyError):
-                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+                _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert not isinstance(KeyError("bug"), ExtractionError)
 
     def test_extractionerror_survives_pickle_round_trip(self) -> None:
@@ -1590,7 +1592,7 @@ class TestExtractionErrorClassification:
         fake_ydl.extract_info.side_effect = wrapped
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
             with pytest.raises(ExtractionError) as caught:
-                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+                _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is True
 
     def test_non_unsupported_error_is_not_flagged_unsupported(self) -> None:
@@ -1602,7 +1604,7 @@ class TestExtractionErrorClassification:
         fake_ydl.extract_info.side_effect = self._real_downloaderror()
         with patch("src.youtube.youtube_dl.YoutubeDL", return_value=fake_ydl):
             with pytest.raises(ExtractionError) as caught:
-                _ytdlp_extract("http://x", _YTDL_STREAM_OPTS, False, True)
+                _ytdlp_extract(ExtractRequest(url="http://x", opts=_YTDL_STREAM_OPTS))
         assert caught.value.unsupported is False
 
     def test_user_message_shows_the_reason_for_an_expected_error(self) -> None:
@@ -1641,28 +1643,94 @@ class TestExtractionErrorClassification:
         )
 
 
+class TestExtractRequest:
+    """The request object that crosses the process boundary.
+
+    Its whole purpose is that `download` and `process` — two interchangeable
+    bools — cannot be transposed. kw_only is what provides that; frozen and
+    slots are for the boundary crossing. Each is asserted separately because a
+    future `@dataclass(frozen=True)` that drops kw_only would still look
+    correct in review while silently restoring the original defect.
+    """
+
+    def test_flags_cannot_be_passed_positionally(self) -> None:
+        """The defect this type exists to prevent.
+
+        Without kw_only, `ExtractRequest("u", opts, True, False)` is accepted
+        and means download=True, process=False — the exact silent swap.
+        """
+        with pytest.raises(TypeError):
+            ExtractRequest("http://x", {}, True, False)  # pyright: ignore[reportCallIssue]
+
+    def test_is_frozen(self) -> None:
+        """A worker must not mutate a request in a way the parent never sees."""
+        req = ExtractRequest(url="http://x", opts={})
+        with pytest.raises(FrozenInstanceError):
+            req.download = True  # pyright: ignore[reportAttributeAccessIssue]
+
+    def test_defaults_are_download_false_process_true(self) -> None:
+        req = ExtractRequest(url="http://x", opts={})
+        assert req.download is False
+        assert req.process is True
+
+    def test_survives_a_pickle_round_trip(self) -> None:
+        """It is submitted to a ProcessPoolExecutor, so it must pickle. A field
+        added later that is not picklable would break every extraction at once
+        — and, per §12.1, can break the pool permanently.
+
+        Asserted field-by-field rather than with `==`, because a real opts
+        profile carries a live `_YtdlpLogger` instance which has no __eq__ and
+        so compares by identity: the unpickled request holds the worker's own
+        logger, which is correct and expected. Equality would fail for a reason
+        that has nothing to do with picklability.
+        """
+        req = ExtractRequest(
+            url="http://x", opts=dict(_YTDL_STREAM_OPTS), download=True
+        )
+
+        back = pickle.loads(pickle.dumps(req))
+
+        assert (back.url, back.download, back.process) == (
+            req.url,
+            req.download,
+            req.process,
+        )
+        assert sorted(back.opts) == sorted(req.opts)
+
+    def test_pickles_with_a_plain_opts_dict(self) -> None:
+        """With no live objects in opts the round-trip is fully equal — this is
+        the assertion the test above would make if opts were plain data."""
+        req = ExtractRequest(url="http://x", opts={"quiet": True}, process=False)
+        assert pickle.loads(pickle.dumps(req)) == req
+
+    def test_replace_derives_a_variant(self) -> None:
+        """dataclasses.replace is how a caller varies one option without
+        respelling the rest — the ergonomic that keeps growth cheap."""
+        base = ExtractRequest(url="http://x", opts={})
+        assert replace(base, download=True) == ExtractRequest(
+            url="http://x", opts={}, download=True
+        )
+        assert base.download is False  # original untouched
+
+
 class TestRunExtract:
     """`_run_extract` — the single call site for _ytdlp_extract. Every extraction
     path (prefetch_stream, _resolve_playable_stream, yt_source, yt_playlist)
-    routes through it, so its argument order and defaults are load-bearing four
-    times over.
+    routes through it.
 
-    _ytdlp_extract takes (url, opts, download, process) POSITIONALLY across the
-    process boundary. _run_extract's own download/process are keyword-only, so a
-    transposition here is invisible at the call sites and at type-check time —
-    both are bool — and would silently swap "download this" with "process this".
+    It now forwards one opaque request rather than four positional arguments, so
+    these assert the plumbing (request reaches the worker unchanged, both seams
+    stay patchable) rather than argument order, which the type system enforces.
     """
 
-    async def test_forwards_arguments_in_ytdlp_extract_positional_order(self) -> None:
+    async def test_forwards_the_request_unchanged(self) -> None:
+        req = ExtractRequest(url="https://yt.com/v=x", opts={"quiet": True})
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value={"title": "T"})
-            await _run_extract("https://yt.com/v=x", {"quiet": True})
+            await _run_extract(req)
 
-        fn, url, opts, download, process = mock_pool.run.call_args[0]
-        assert url == "https://yt.com/v=x"
-        assert opts == {"quiet": True}
-        assert download is False
-        assert process is True
+        fn, forwarded = mock_pool.run.call_args[0]
+        assert forwarded is req  # not rebuilt, not copied, not spread
 
     async def test_submits_the_module_level_ytdlp_extract(self) -> None:
         """The callable must be resolved per call, not captured at def time.
@@ -1675,56 +1743,60 @@ class TestRunExtract:
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value=None)
             with patch("src.youtube._ytdlp_extract", sentinel):
-                await _run_extract("https://yt.com/v=x", {})
+                await _run_extract(ExtractRequest(url="https://yt.com/v=x", opts={}))
 
         assert mock_pool.run.call_args[0][0] is sentinel
 
     async def test_uses_the_pool_bound_at_call_time(self) -> None:
         """Same seam for the pool itself — conftest swaps in a thread pool."""
+        req = ExtractRequest(url="https://yt.com/v=x", opts={})
         with patch("src.youtube.ytdlp_pool") as first:
             first.run = AsyncMock(return_value=None)
-            await _run_extract("https://yt.com/v=x", {})
+            await _run_extract(req)
         with patch("src.youtube.ytdlp_pool") as second:
             second.run = AsyncMock(return_value=None)
-            await _run_extract("https://yt.com/v=y", {})
+            await _run_extract(req)
 
         first.run.assert_awaited_once()
         second.run.assert_awaited_once()
 
     @pytest.mark.parametrize("download", [True, False])
     @pytest.mark.parametrize("process", [True, False])
-    async def test_both_flags_forwarded_independently(
+    async def test_both_flags_reach_the_worker_independently(
         self, download: bool, process: bool
     ) -> None:
-        """Guards the transposition case: with both flags exercised in all four
-        combinations, swapping the two positions fails two of them."""
+        """All four combinations still asserted: the type system stops a swap at
+        construction, but nothing stops _run_extract from dropping or defaulting
+        a field on the way to the pool."""
+        req = ExtractRequest(
+            url="https://yt.com/v=x", opts={}, download=download, process=process
+        )
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value=None)
-            await _run_extract(
-                "https://yt.com/v=x", {}, download=download, process=process
-            )
+            await _run_extract(req)
 
-        assert mock_pool.run.call_args[0][3] is download
-        assert mock_pool.run.call_args[0][4] is process
-
-    async def test_flags_are_keyword_only(self) -> None:
-        """`*` in the signature is deliberate: `_run_extract(url, opts, True)`
-        must not silently mean download=True."""
-        with pytest.raises(TypeError):
-            await _run_extract("https://yt.com/v=x", {}, True)  # pyright: ignore[reportCallIssue]
+        forwarded = mock_pool.run.call_args[0][1]
+        assert forwarded.download is download
+        assert forwarded.process is process
 
     async def test_returns_the_pool_result_unchanged(self) -> None:
         """No post-processing here — _slim_info already ran in the worker."""
         payload = {"webpage_url": "https://yt.com/v=x", "title": "Song"}
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value=payload)
-            assert await _run_extract("https://yt.com/v=x", {}) is payload
+            result = await _run_extract(
+                ExtractRequest(url="https://yt.com/v=x", opts={})
+            )
+        assert result is payload
 
     async def test_none_result_is_passed_through(self) -> None:
         """A None extraction is a normal "nothing found" outcome, not an error."""
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value=None)
-            assert await _run_extract("https://yt.com/v=x", {}) is None
+            assert (
+                await _run_extract(ExtractRequest(url="https://yt.com/v=x", opts={}))
+                is None
+            )
 
     async def test_pool_exception_propagates(self) -> None:
         """_classify_ytdlp_error already ran in the worker; _run_extract must not
@@ -1732,4 +1804,4 @@ class TestRunExtract:
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(side_effect=DownloadError("boom"))
             with pytest.raises(DownloadError):
-                await _run_extract("https://yt.com/v=x", {})
+                await _run_extract(ExtractRequest(url="https://yt.com/v=x", opts={}))
