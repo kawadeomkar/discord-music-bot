@@ -2,10 +2,41 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Union
+from urllib.parse import parse_qs, urlsplit
 
 from src.util import get_logger
 
 log = get_logger(__name__)
+
+# YouTube's older share format: ?t=1m30s, ?t=90s, ?t=1h2m3s. Still widely
+# present in the wild — every "copy link at current time" from an older client
+# emits it, and old messages are re-pasted for years.
+_HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+
+
+def parse_timestamp(raw: str) -> Optional[int]:
+    """Seconds from a YouTube `t`/`ts` value, or None if it isn't one.
+
+    Accepts both shapes YouTube has shipped: bare seconds ("90") and the
+    colon-free HMS form ("1m30s", "90s", "1h2m3s"). Returns None rather than
+    raising, because a timestamp is an optional refinement of a URL — an
+    unparseable one must degrade to "play from the start", never to "this
+    wasn't a URL at all" (which is what `int(v)` raising used to cause: the
+    ValueError escaped parse_url and parse_input converted the whole link into
+    a YouTube *search* for the URL text).
+    """
+    raw = raw.strip().lower()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    match = _HMS_RE.fullmatch(raw)
+    # `fullmatch` on an all-optional pattern also matches the empty string and
+    # any leftover garbage matches nothing, so require at least one group.
+    if match is None or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
 
 
 class URLSource(Enum):
@@ -33,7 +64,6 @@ class YTType(Enum):
 class SpotifySource:
     type: SpotifyType
     id: str
-    si: Optional[str] = None
     process: bool = True
     stype: URLSource = URLSource.SPOTIFY
 
@@ -81,40 +111,52 @@ def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
     return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
 
 
-def parse_url(
-    url: str, message: str
-) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """
     Parse a URL into a source dataclass. Raises ValueError if no domain is matched.
 
-    domain regex (4 groups):
+    domain regex (3 groups):
         group 1/2: http/www prefix
         group 3: domain
         group 4: path
 
     :param url: URL to be parsed
-    :param message: full message content (used for Spotify si param extraction)
     :return: source
     """
-    domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
-    args_re = r"(\?|\&)([^=]+)\=([^&]+)"
+    # `[\w.]+`, not `[\w+|\.]+`: inside a character class `+` and `|` are
+    # literals, so the old spelling accepted "you+tube|com" as a hostname.
+    domain_re = r"(https:\/\/)?(www\.)?([\w.]+)\/([^?]*)"
 
     domain_match = re.search(domain_re, url)
-    args_match = re.findall(args_re, url)
 
     if not domain_match:
         raise ValueError(f"Not a recognised URL: {url!r}")
 
     domain = domain_match.group(3)
+    # Query parsing via urllib rather than a hand-rolled regex: it handles
+    # percent-encoding and repeated keys correctly, and it works on scheme-less
+    # input ("youtu.be/x?t=90") because urlsplit only needs the "?" to find the
+    # query — which is exactly the shape users paste.
+    args = parse_qs(urlsplit(url).query)
 
     if domain in ("youtube.com", "youtu.be"):
         ts: Optional[int] = None
         list_id: Optional[str] = None
-        for _, k, v in args_match:
-            if k == "ts" or k == "t":
-                ts = int(v)
-            elif k == "list":
-                list_id = v
+        # `t` and `ts` are the same parameter under two names; last one wins,
+        # matching the old left-to-right loop.
+        for key in ("t", "ts"):
+            for raw in args.get(key, []):
+                parsed = parse_timestamp(raw)
+                if parsed is None:
+                    # Keep the URL and start from 0:00. Previously this raised
+                    # out of parse_url and the link degraded into a *search*
+                    # for its own text — which usually still played, but paid a
+                    # full search extraction and dropped the seek silently.
+                    log.info(f"Ignoring unparseable timestamp {raw!r} in {url!r}")
+                else:
+                    ts = parsed
+        list_ids = args.get("list", [])
+        list_id = list_ids[0] if list_ids else None
         if list_id is not None:
             return YTSource(
                 url, ts=ts, process=False, type=YTType.PLAYLIST, list_id=list_id
@@ -165,7 +207,7 @@ def parse_input(
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:
-            return parse_url(user_input, message)
+            return parse_url(user_input)
         except ValueError:
             pass
     ytsearch = " ".join(args)
