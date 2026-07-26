@@ -342,6 +342,8 @@ class MusicPlayer:
         "_playback_holds",
         "_background_tasks",
         "_progress_task",
+        "_np_last_rendered",
+        "_np_last_id",
         "_np_host_message",
         "_np_host_own_embeds",
         "_np_host_dedicated",
@@ -371,6 +373,13 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
+    # Last payload actually pushed, and the host it went to — the
+    # no-op-edit guard in _push_np_edit. Reset whenever the host changes.
+    # `list[Any]`, not `list[dict]`: Embed.to_dict() returns a TypedDict, and
+    # list is invariant, so the narrower annotation rejects the assignment.
+    # The value is opaque here — it is only ever compared for equality.
+    _np_last_rendered: Optional[list[Any]]
+    _np_last_id: Optional[int]
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
     _np_host_dedicated: bool
@@ -434,6 +443,8 @@ class MusicPlayer:
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
+        self._np_last_rendered: Optional[list[Any]] = None
+        self._np_last_id: Optional[int] = None
         # Now-playing host state: the one message currently carrying the NP
         # embed block, its own (cached, static) embeds that follow the block,
         # and whether it's a dedicated NP message (deleted on retire) or a
@@ -1241,6 +1252,11 @@ class MusicPlayer:
         self._np_host_message = None
         self._np_host_own_embeds = []
         self._np_host_dedicated = False
+        # Drop the no-op-edit cache with the host. Retiring can strip-edit the
+        # message by a path that never goes through _push_np_edit, so a stale
+        # entry could suppress a genuinely needed edit later.
+        self._np_last_rendered = None
+        self._np_last_id = None
 
     async def retire_np_host_on_stop(self) -> None:
         """-stop / alone-disconnect teardown: dispose of the host so no message
@@ -1720,7 +1736,25 @@ class MusicPlayer:
             # own-embeds tail, never the block (parity with MusicContext.send's
             # attach guard; unreachable with current commands, max own = 1).
             embeds = embeds[:10]
+            # Skip the PATCH when nothing rendered differently. The bar advances
+            # one cell at a time, so at a 3s tick most ticks re-render an
+            # identical payload: a 4-minute song costs ~80 edits to display a
+            # bar that only changes ~10 times. Per channel that is inside
+            # Discord's edit budget, but per *bot* this is the dominant REST
+            # rate-limit cost and the thing that bounds concurrent-guild scale.
+            #
+            # Keyed on the rendered payload rather than on position, so every
+            # reason an embed can change (pause state, next-up, volume, a
+            # swapped-in own embed) is covered without enumerating them. Same
+            # approach as ping.py's _ping_embed_changed.
+            rendered = [e.to_dict() for e in embeds]
+            if rendered == self._np_last_rendered and message.id == self._np_last_id:
+                return True
             await message.edit(embeds=embeds)
+            # Recorded only after a successful edit: caching a payload we failed
+            # to push would suppress the retry that fixes it.
+            self._np_last_rendered = rendered
+            self._np_last_id = message.id
             return True
         except discord.NotFound:
             return False
