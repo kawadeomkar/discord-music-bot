@@ -37,6 +37,12 @@ _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317
 
 _tracer_provider: Optional["TracerProvider"] = None
 _log_provider: Optional["LoggerProvider"] = None
+# Separate from _tracer_provider: with OTEL_SDK_DISABLED=true no provider is ever
+# built, so guarding on that global made "a second call is a no-op" true only in
+# the enabled path. Repeat calls then re-ran _configure_structlog — idempotent
+# today, but the guard should match what the docstring promises rather than
+# depend on structlog staying idempotent.
+_setup_done = False
 
 # discord.py makes these HTTP calls during startup with no user-visible parent.
 # Suppress them to avoid cluttering Tempo with orphaned root spans.
@@ -80,13 +86,15 @@ class _DiscordGatewayFilter(Sampler):
 def setup_telemetry() -> None:
     """Initialize OTel SDK and structlog. No-op when OTEL_SDK_DISABLED=true.
 
-    Guarded against double-call: a second call is a no-op. This matters because
-    calling setup_telemetry() twice would add a second LoggingHandler to the root
-    logger (duplicate Loki records) and orphan the first TracerProvider's exporter.
+    Guarded against double-call: a second call is a no-op, in BOTH the enabled
+    and disabled paths. This matters because calling setup_telemetry() twice
+    would add a second LoggingHandler to the root logger (duplicate Loki
+    records) and orphan the first TracerProvider's exporter.
     """
-    global _tracer_provider
-    if _tracer_provider is not None:
+    global _setup_done
+    if _setup_done:
         return
+    _setup_done = True
     _configure_structlog()
     if os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true":
         return
