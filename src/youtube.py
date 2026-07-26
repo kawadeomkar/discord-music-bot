@@ -484,6 +484,36 @@ _STREAM_URL_MAX_TTL = 1800  # 30 minutes
 # short enough that it never adds a noticeable pause before a song starts.
 _STREAM_PROBE_TIMEOUT = 5.0  # seconds
 
+# One session for every stream probe, created lazily on the running loop.
+# The probe runs before EVERY song, and a per-call ClientSession discards the
+# connection pool and DNS cache each time — so each probe paid a fresh TCP +
+# TLS handshake to googlevideo. Module-level rather than per-player: the hosts
+# are shared across guilds, so one pool serves all of them.
+_probe_session: Optional[aiohttp.ClientSession] = None
+
+
+def _get_probe_session() -> aiohttp.ClientSession:
+    global _probe_session
+    if _probe_session is None or _probe_session.closed:
+        _probe_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
+        )
+    return _probe_session
+
+
+async def close_probe_session() -> None:
+    """Close the shared probe session. Called from MusicBotApp.close()."""
+    global _probe_session
+    session = _probe_session
+    _probe_session = None
+    if session is None or session.closed:
+        return
+    try:
+        await session.close()
+    except Exception as e:
+        log.warning(f"Failed to close stream-probe session: {e}")
+
+
 # Fields to persist in the stream URL cache — strips ephemeral/large fields.
 _STREAM_CACHE_FIELDS = frozenset(
     {
@@ -602,10 +632,9 @@ async def _stream_url_playable(stream_url: str) -> bool:
     if not stream_url:
         return False
     try:
-        timeout = aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(stream_url) as response:
-                return response.status < 400
+        session = _get_probe_session()
+        async with session.get(stream_url) as response:
+            return response.status < 400
     except Exception as e:
         # A probe that never completed is evidence about the network, not about the
         # URL. Assume playable and let ffmpeg be the judge — a probe failure must

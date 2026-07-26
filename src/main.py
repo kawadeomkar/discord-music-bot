@@ -154,9 +154,10 @@ class MusicBotApp(commands.AutoShardedBot):
         loop = asyncio.get_running_loop()
         # aclose() owns its own off-loop join — only it knows which half blocks, and it
         # bounds the wait so a stuck extraction can't hang the process's exit.
-        from src.youtube import ytdlp_pool
+        from src.youtube import close_probe_session, ytdlp_pool
 
         await ytdlp_pool.aclose()
+        await close_probe_session()
         # shutdown_telemetry has no async form and blocks flushing spans for up to 30s,
         # so it still needs the executor hop.
         from src.telemetry import shutdown_telemetry

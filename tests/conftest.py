@@ -18,6 +18,53 @@ from tests.helpers import noop_ffmpeg_init
 
 
 @pytest.fixture(autouse=True)
+async def close_shared_http_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[None]:
+    """Close the module-global stream-probe session after every test.
+
+    Both the stream-probe session (a src.youtube module global) and each
+    Spotify client's session now live for the life of the process, closed in
+    production by MusicBotApp.close() and the cog's unload. In tests nothing
+    calls those, so a leaked ClientSession raises a ResourceWarning from
+    aiohttp's __del__ — which pytest turns into a PytestUnraisableExceptionWarning
+    attributed to whatever test happens to be running when the collector fires,
+    failing tests that have nothing to do with the leak.
+
+    Spotify sessions are tracked by wrapping _session_or_create rather than by
+    collecting fixtures, so an instance built ad-hoc inside a test is covered
+    too. Same reasoning as the fresh-pool fixture below: a process-lifetime
+    resource needs per-test scoping in tests.
+    """
+    import aiohttp
+
+    import src.spotify as spotify_mod
+
+    created: list[Any] = []
+    original = spotify_mod.Spotify._session_or_create
+
+    def tracked(self: Any) -> Any:
+        session = original(self)
+        if session not in created:
+            created.append(session)
+        return session
+
+    monkeypatch.setattr(spotify_mod.Spotify, "_session_or_create", tracked)
+
+    yield
+
+    for session in created:
+        # Only real sessions: a test-injected factory usually returns a mock,
+        # whose close() is not awaitable.
+        if isinstance(session, aiohttp.ClientSession) and not session.closed:
+            await session.close()
+
+    from src.youtube import close_probe_session
+
+    await close_probe_session()
+
+
+@pytest.fixture(autouse=True)
 def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
 
