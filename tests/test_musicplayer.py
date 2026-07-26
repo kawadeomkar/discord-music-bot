@@ -17,6 +17,7 @@ import pytest
 from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.musicplayer import (
     MusicPlayer,
+    StreamFailure,
     _BAR_WIDTH,
     _build_progress_bar,
     _reached_end,
@@ -26,7 +27,7 @@ from src.musicplayer import (
 )
 from src.sources import YTSource
 from src.util import fmt_duration
-from src.youtube import QueueObject
+from src.youtube import QueueObject, YTDL
 from tests.helpers import described, mocked, queue_object, stub_create_task
 
 
@@ -4741,6 +4742,56 @@ class TestLoop:
 
         sent_embeds = mocked(music_player._channel.send).call_args.kwargs["embeds"]
         assert sent_embeds[0].description == "Failed to load the next song, skipping."
+
+    async def test_skip_notice_includes_reason_and_trace_id(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        failure = StreamFailure(
+            detail="RuntimeError: YouTube refused the audio stream",
+            trace_id="4b1e1b9c4f66d48943f7aae9b413ee81",
+        )
+
+        async def _fail(self_inner: Any, source: Any) -> None:
+            self_inner._last_stream_error = failure
+            return None
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(MusicPlayer, "_stream_source", new=_fail),
+        ):
+            await music_player.loop()
+
+        description = (
+            mocked(music_player._channel.send).call_args.kwargs["embeds"][0].description
+        )
+        assert "Failed to load the next song, skipping." in description
+        assert failure.detail in description
+        assert failure.trace_id in description
+
+    async def test_stream_source_captures_failure(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        boom = RuntimeError("YouTube refused the audio stream")
+        with patch.object(YTDL, "yt_stream", new=AsyncMock(side_effect=boom)):
+            result = await music_player._stream_source(queue_obj)
+
+        assert result is None
+        assert music_player._last_stream_error is not None
+        assert (
+            music_player._last_stream_error.detail
+            == "RuntimeError: YouTube refused the audio stream"
+        )
+        # 32-hex trace id, or the "unavailable" sentinel when no span is active.
+        assert music_player._last_stream_error.trace_id
 
     async def test_resolve_failure_balances_queue_and_redis(
         self,
