@@ -339,11 +339,18 @@ jobs:
       # contents:read; a job-level block replaces it wholesale rather than adding.
       contents: write
     steps:
-      # No checkout: the version is a resolve-env output and `gh` talks to the API
-      # via GH_TOKEN + GITHUB_REPOSITORY, so this job never touches the tree.
+      # No checkout: the version is a resolve-env output and `gh` talks to the API,
+      # so this job never touches the tree. That makes GH_REPO mandatory — see below.
       - name: Create release if the version is new
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `gh` resolves which repo to act on from the checked-out git remote, or
+          # from GH_REPO — it does NOT read GITHUB_REPOSITORY. With no checkout and
+          # no GH_REPO it has neither, and every gh call dies with "failed to run
+          # git: fatal: not a git repository" (which is how v1.2.0 went untagged).
+          # Setting it here keeps the no-checkout design instead of paying a clone
+          # just to give gh a remote to look at.
+          GH_REPO: ${{ github.repository }}
           # `v` prefix here, bare in the image tag: git tags conventionally carry it,
           # image tags conventionally do not. Same version string, one source.
           TAG: v${{ needs.resolve-env.outputs.version }}
