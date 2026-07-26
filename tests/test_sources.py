@@ -6,6 +6,7 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSourceError,
     URLSource,
     YTSource,
     YTType,
@@ -117,8 +118,53 @@ class TestParseUrlSpotify:
 
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
-        with pytest.raises(Exception, match="Unknown Spotify track type"):
+        with pytest.raises(UnsupportedSourceError, match="Unsupported Spotify link"):
             parse_url(url, f"-play {url}")
+
+    def test_album_url_is_supported(self) -> None:
+        url = "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "1DFixLWuPkv3KT3TnV35m3"
+
+    @pytest.mark.parametrize(
+        "locale,expected_type",
+        [
+            ("intl-de", SpotifyType.TRACK),
+            ("intl-pt", SpotifyType.TRACK),
+            ("intl-ja", SpotifyType.TRACK),
+        ],
+    )
+    def test_intl_locale_segment_is_stripped(
+        self, locale: str, expected_type: SpotifyType
+    ) -> None:
+        """Spotify's share sheet emits these for most non-US clients; before the
+        strip, every such TRACK link — a supported feature — failed outright."""
+        url = f"https://open.spotify.com/{locale}/track/4cOdK2wGLETKBW3PvgPWqT"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == expected_type
+        assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
+
+    def test_intl_locale_on_playlist(self) -> None:
+        url = "https://open.spotify.com/intl-fr/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.PLAYLIST
+        assert result.id == "37i9dQZF1DXcBWIGoYBM5M"
+
+    def test_spotify_link_without_id_raises(self) -> None:
+        url = "https://open.spotify.com/track"
+        with pytest.raises(UnsupportedSourceError, match="missing an ID"):
+            parse_url(url, f"-play {url}")
+
+    def test_unsupported_spotify_link_does_not_fall_back_to_search(self) -> None:
+        """parse_input must re-raise rather than silently searching YouTube for
+        the raw URL text — the old behaviour played something arbitrary."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSourceError):
+            parse_input(url, f"-play {url}")
 
 
 class TestParseUrlSoundcloud:

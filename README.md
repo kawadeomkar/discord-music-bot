@@ -16,7 +16,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 ## Features
 
 - **Multi-source playback** — YouTube URLs and playlists, plain-text YouTube search,
-  Spotify tracks and playlists (expanded to YouTube searches), SoundCloud links, and
+  Spotify tracks, albums and playlists (expanded to YouTube searches), SoundCloud links, and
   any other site yt-dlp supports (TikTok, Vimeo, Bandcamp, Twitch clips, …)
 - **Near-zero inter-song latency** — a three-phase yt-dlp pipeline resolves metadata
   instantly at enqueue time, prefetches stream URLs in the background while the current
@@ -86,7 +86,9 @@ https://www.youtube.com/watch?v=VIDEO_ID&t=90    # start at timestamp
 https://youtu.be/VIDEO_ID?t=90
 https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
 https://open.spotify.com/track/TRACK_ID
+https://open.spotify.com/album/ALBUM_ID          # whole album
 https://open.spotify.com/playlist/PLAYLIST_ID
+https://open.spotify.com/intl-de/track/TRACK_ID  # locale share links work too
 https://soundcloud.com/artist/track
 https://www.tiktok.com/@user/video/VIDEO_ID      # any other yt-dlp-supported site
 never gonna give you up                          # plain text searches YouTube

@@ -19,9 +19,23 @@ class URLSource(Enum):
     OTHER = "other"
 
 
+class UnsupportedSourceError(ValueError):
+    """A URL we recognised the host of, but cannot play.
+
+    Subclasses ValueError deliberately: parse_input treats ValueError as
+    "not a URL, fall back to a YouTube search", which is the right behaviour
+    for a dotless host but NOT for this — so parse_input catches this type
+    FIRST and re-raises. Making it a ValueError anyway keeps every existing
+    `except ValueError` caller (and any future one) from letting an
+    unsupported link escape as a bare, untyped Exception the way
+    `Exception("Unknown Spotify track type: …")` used to.
+    """
+
+
 class SpotifyType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"
+    ALBUM = "album"
 
 
 class YTType(Enum):
@@ -122,10 +136,27 @@ def parse_url(
         return YTSource(url, ts=ts, process=False)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
+        # Spotify's share sheet emits a locale segment for most non-US clients:
+        # open.spotify.com/intl-de/track/<id>. It is presentational only — the
+        # type and ID that follow are identical — but it lands in path[0], so
+        # every such link failed the type lookup below. That broke *track*
+        # links, a supported feature, for much of the world.
+        if path and path[0].startswith("intl-"):
+            path = path[1:]
         try:
             spotify_type = SpotifyType(path[0])
-        except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
+        except ValueError, IndexError:
+            # Typed, not a bare Exception: this reaches the user as a command
+            # error, and "Unknown Spotify track type: ['episode', '4rOo…']"
+            # told them nothing they could act on.
+            raise UnsupportedSourceError(
+                f"Unsupported Spotify link type {path[0]!r} — "
+                "tracks, albums and playlists are supported."
+                if path
+                else f"Not a recognisable Spotify link: {url!r}"
+            )
+        if len(path) < 2 or not path[1]:
+            raise UnsupportedSourceError(f"Spotify link is missing an ID: {url!r}")
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):
@@ -166,6 +197,12 @@ def parse_input(
     if len(args) == 1:
         try:
             return parse_url(user_input, message)
+        except UnsupportedSourceError:
+            # Ordered before the ValueError arm below (which this subclasses):
+            # a recognised-but-unplayable link must surface its own message, not
+            # be silently retried as `ytsearch:https://open.spotify.com/...`,
+            # which spends a full search extraction to play something arbitrary.
+            raise
         except ValueError:
             pass
     ytsearch = " ".join(args)

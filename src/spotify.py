@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 from collections.abc import Awaitable, Callable
 
@@ -28,12 +29,72 @@ _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
 _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h
 
+# Spotify's own maximum for these endpoints; asking for more is rejected, and
+# asking for less only multiplies round-trips.
+_PAGE_SIZE = 100
+# Our cap, not Spotify's. Public playlists run to 10k+ tracks, and every title
+# here becomes a separate yt-dlp search plus a queue entry — so the ceiling
+# exists to bound queue explosions and extraction load, not the API. Hitting it
+# is reported to the user rather than silently swallowed (see PagedTracks).
+_TRACK_CAP = 1000
+# Defence against a malformed/looping `next` cursor: even at the cap above,
+# _PAGE_SIZE-sized pages can never legitimately need more than this many
+# requests. Without it a server-side bug becomes an unbounded request loop.
+_MAX_PAGES = (_TRACK_CAP // _PAGE_SIZE) + 2
+
 
 def _track_search_title(track: dict[str, Any]) -> str:
     """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify
     track object resolves to. Shared by track() and playlist() so a single
     track and a playlist entry render their search titles identically."""
     return track["name"] + "".join(f" {a['name']}" for a in track["artists"])
+
+
+@dataclass(frozen=True)
+class PagedTracks:
+    """Track search titles walked off a paged Spotify endpoint.
+
+    `truncated` is True when _TRACK_CAP stopped the walk before the collection
+    ran out — the caller is expected to tell the user, because the whole point
+    of this type is that "we queued fewer tracks than you asked for" must never
+    again be invisible.
+    """
+
+    titles: list[str]
+    truncated: bool = False
+
+    # Cached as a plain dict rather than as this dataclass: _cached_call stores
+    # values through orjson, and while orjson *serializes* a dataclass fine, it
+    # deserializes to a dict — so a cache hit and a cache miss would return
+    # different types from the same method. Converting at both boundaries keeps
+    # the round-trip symmetric.
+    def to_cache(self) -> dict[str, Any]:
+        return {"titles": self.titles, "truncated": self.truncated}
+
+    @classmethod
+    def from_cache(cls, raw: Any) -> "PagedTracks":
+        # Tolerates the pre-migration cache shape (a bare list of titles) so a
+        # deploy doesn't have to wait out the 1h playlist TTL to stop erroring.
+        if isinstance(raw, list):
+            return cls(titles=raw, truncated=False)
+        return cls(
+            titles=raw.get("titles", []), truncated=bool(raw.get("truncated", False))
+        )
+
+
+def _playlist_item_track(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Unwrap a /playlists/{id}/tracks item, which nests the track under `track`."""
+    return item.get("track")
+
+
+def _album_item_track(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Unwrap an /albums/{id}/tracks item, which IS the (simplified) track.
+
+    The two endpoints differ here and the difference is easy to miss: album
+    pages return SimplifiedTrackObjects directly in `items`, playlist pages
+    wrap each in a PlaylistTrackObject.
+    """
+    return item
 
 
 class SpotifyAuthError(Exception):
@@ -203,6 +264,63 @@ class Spotify:
         await cache_set(self._redis, key, result, ttl)
         return result
 
+    async def _paged_track_titles(
+        self,
+        endpoint: str,
+        fields: str,
+        extract: Callable[[dict[str, Any]], Optional[dict[str, Any]]],
+    ) -> PagedTracks:
+        """Walk a paged Spotify tracks endpoint to exhaustion (or _TRACK_CAP).
+
+        `fields` must include `next` — it is the cursor this loop follows, and
+        omitting it from the mask is exactly how playlists came to be truncated
+        at one page. `extract` adapts the two item shapes; see the two module
+        level unwrappers.
+        """
+        titles: list[str] = []
+        truncated = False
+        # Only the FIRST request takes params: `next` is a fully-formed URL that
+        # already carries limit/offset/fields, and re-passing them would fight it.
+        params: Optional[dict[str, Union[str, int]]] = {
+            "fields": fields,
+            "limit": _PAGE_SIZE,
+        }
+        url: Optional[str] = endpoint
+
+        for _ in range(_MAX_PAGES):
+            if url is None:
+                break
+            resp = await self.http_call(url, params=params)
+            items = resp.get("items") or []
+            for i, item in enumerate(items):
+                track = extract(item) if item else None
+                # A playlist item can legitimately be `{"track": null}` (the
+                # track was removed from Spotify or is unavailable in this
+                # market), and a podcast episode arrives with a name but no
+                # `artists`. Both used to reach _track_search_title and raise,
+                # failing the whole playlist over one bad entry — skip them.
+                if not track or not track.get("name") or track.get("artists") is None:
+                    continue
+                titles.append(_track_search_title(track))
+                if len(titles) >= _TRACK_CAP:
+                    # At the cap. Only truncated if something is genuinely left:
+                    # more items after this one on THIS page, or another page.
+                    return PagedTracks(
+                        titles=titles,
+                        truncated=i + 1 < len(items) or bool(resp.get("next")),
+                    )
+            url, params = resp.get("next"), None
+        else:
+            # Loop ran out of pages rather than out of cursor — treat as truncation
+            # rather than silently reporting a complete playlist.
+            truncated = url is not None
+            log.warning(
+                f"spotify: stopped paging {endpoint} after {_MAX_PAGES} pages "
+                f"({len(titles)} titles); cursor still non-null"
+            )
+
+        return PagedTracks(titles=titles, truncated=truncated)
+
     @_tracer.start_as_current_span("spotify.track")
     async def track(self, tid: str) -> str:
         """Return "<title> <artist1> <artist2> ..." for a track ID, cached for 24h."""
@@ -216,32 +334,53 @@ class Spotify:
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
     @_tracer.start_as_current_span("spotify.playlist")
-    async def playlist(self, pid: str) -> list[str]:
+    async def playlist(self, pid: str) -> PagedTracks:
         """Return "<title> <artist1> <artist2> ..." for every track in a playlist, cached for 1h."""
         trace.get_current_span().set_attribute("spotify.playlist_id", pid)
 
-        async def fetch() -> list[str]:
-            # FIXME: Spotify playlists over 100 tracks are silently truncated.
-            # /v1/playlists/{id}/tracks is a paged endpoint returning 100 items per
-            # page. This call reads the first page only and never follows the `next`
-            # cursor, so a 300-track playlist queues its first 100 tracks and the user
-            # is told the playlist was queued — no error, no warning, no indication that
-            # two thirds of it is missing.
-            # Fix: add `next` to the fields mask (it is excluded by the mask today) and
-            # follow the cursor until it comes back null.
+        async def fetch() -> dict[str, Any]:
             endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-            resp = await self.http_call(
-                endpoint, params={"fields": "items(track(name,artists(name)))"}
+            paged = await self._paged_track_titles(
+                endpoint,
+                # `next` is what makes this paged rather than first-page-only.
+                "next,items(track(name,artists(name)))",
+                _playlist_item_track,
             )
-            track_titles = [
-                _track_search_title(item["track"]) for item in resp.get("items", [])
-            ]
             trace.get_current_span().set_attribute(
-                "spotify.track_count", len(track_titles)
+                "spotify.track_count", len(paged.titles)
             )
-            return track_titles
+            trace.get_current_span().set_attribute("spotify.truncated", paged.truncated)
+            return paged.to_cache()
 
-        return await self._cached_call(f"spotify:playlist:{pid}", _PLAYLIST_TTL, fetch)
+        raw = await self._cached_call(f"spotify:playlist:{pid}", _PLAYLIST_TTL, fetch)
+        return PagedTracks.from_cache(raw)
+
+    @_tracer.start_as_current_span("spotify.album_tracks")
+    async def album_tracks(self, aid: str) -> PagedTracks:
+        """Return "<title> <artist1> <artist2> ..." for every track on an album, cached for 24h.
+
+        Albums are immutable once released (unlike playlists, which users edit),
+        hence the 24h TTL rather than 1h. Deliberately separate from `albums()`,
+        which returns raw album *objects* for a different, caller-chosen shape.
+        """
+        trace.get_current_span().set_attribute("spotify.album_id", aid)
+
+        async def fetch() -> dict[str, Any]:
+            endpoint = self.spotify_endpoint + f"v1/albums/{aid}/tracks"
+            paged = await self._paged_track_titles(
+                endpoint,
+                # No `track(...)` wrapper here — album items ARE the track.
+                "next,items(name,artists(name))",
+                _album_item_track,
+            )
+            trace.get_current_span().set_attribute(
+                "spotify.track_count", len(paged.titles)
+            )
+            trace.get_current_span().set_attribute("spotify.truncated", paged.truncated)
+            return paged.to_cache()
+
+        raw = await self._cached_call(f"spotify:album_tracks:{aid}", _ALBUM_TTL, fetch)
+        return PagedTracks.from_cache(raw)
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[list[str], str]) -> Any:

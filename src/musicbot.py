@@ -31,7 +31,7 @@ from src.sources import (
     parse_input,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import PagedTracks, Spotify, SpotifyAuthError
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -102,12 +102,22 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
+# The Spotify link types that resolve to a LIST of tracks rather than one song.
+# Named once so the resolve path and the -playnow path branch on the same set —
+# they drifted apart when only PLAYLIST existed and albums were added.
+_SPOTIFY_COLLECTIONS = frozenset({SpotifyType.PLAYLIST, SpotifyType.ALBUM})
+
+
 @dataclass
 class ResolvedSpotifyPlaylist:
-    """A Spotify playlist resolved to track titles — still needs per-title
-    YouTube search resolution before it can be queued."""
+    """A Spotify playlist or album resolved to track titles — still needs
+    per-title YouTube search resolution before it can be queued."""
 
     titles: list[str]
+    # True when Spotify had more tracks than we are willing to queue. Carried
+    # this far so the "Queued playlist" embed can say so: the whole point of
+    # tracking it is that the user finds out from the bot, not by counting.
+    truncated: bool = False
 
 
 @dataclass
@@ -488,14 +498,17 @@ class MusicBot(commands.Cog):
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable.
 
+        A Spotify album resolves exactly like a playlist — both are just an
+        ordered list of tracks to search YouTube for — so they share the
+        ResolvedSpotifyPlaylist shape and every path downstream of it.
+
         Returns a ResolvedSpotifyPlaylist for a Spotify playlist (titles still
         needing per-title YouTube resolution), a ResolvedYoutubePlaylist for a
         YouTube playlist (already resolved), or a bare QueueObject otherwise.
         """
-        if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            return ResolvedSpotifyPlaylist(
-                await self._require_spotify().playlist(source.id)
-            )
+        if isinstance(source, SpotifySource) and source.type in _SPOTIFY_COLLECTIONS:
+            paged = await self._spotify_collection(source)
+            return ResolvedSpotifyPlaylist(paged.titles, truncated=paged.truncated)
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -515,6 +528,15 @@ class MusicBot(commands.Cog):
             else:
                 assert_never(source)
             return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+
+    async def _spotify_collection(self, source: SpotifySource) -> PagedTracks:
+        """Track titles for a Spotify playlist or album — the one place that
+        maps a collection type onto its Spotify endpoint, so the resolve path
+        and the -playnow path can never disagree about which is which."""
+        spotify = self._require_spotify()
+        if source.type == SpotifyType.ALBUM:
+            return await spotify.album_tracks(source.id)
+        return await spotify.playlist(source.id)
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -538,11 +560,20 @@ class MusicBot(commands.Cog):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
+            # Say it in the embed, not just the logs: queueing fewer tracks than
+            # the user linked is exactly the failure this branch used to hide.
+            truncation_note = (
+                f"\n\n⚠️ Only the first {len(titles)} tracks were queued — "
+                "the collection is longer than this bot will queue at once."
+                if qobj.truncated
+                else ""
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
                     "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    f"Requested by: [{ctx.author.mention}]\n\n"
+                    f"{queue_message(titles)}{truncation_note}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -764,12 +795,14 @@ class MusicBot(commands.Cog):
             "Use `-play` for the full playlist.",
             discord.Color.orange(),
         )
-        if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            titles = await self._require_spotify().playlist(source.id)
-            if not titles:
+        if isinstance(source, SpotifySource) and source.type in _SPOTIFY_COLLECTIONS:
+            paged = await self._spotify_collection(source)
+            if not paged.titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1])[0]
+            # Only the first track is played, so a truncated tail is irrelevant
+            # here — no notice, unlike the full-queue path in _enqueue_playlist.
+            yts = spotify_playlist_to_ytsearch(paged.titles[:1])[0]
             return await YTDL.yt_source(
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )

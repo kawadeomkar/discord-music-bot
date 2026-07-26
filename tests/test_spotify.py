@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from redis.asyncio import Redis
 
-from src.spotify import Spotify, SpotifyAuthError
+import src.spotify as spotify_mod
+from src.spotify import PagedTracks, Spotify, SpotifyAuthError
 
 
 @pytest.fixture
@@ -341,9 +342,10 @@ class TestSpotifyPlaylist:
         ):
             result = await spotify.playlist("playlist_id_123")
 
-        assert len(result) == 2
-        assert result[0] == "Track One Artist X"
-        assert result[1] == "Track Two Artist Y"
+        assert len(result.titles) == 2
+        assert result.titles[0] == "Track One Artist X"
+        assert result.titles[1] == "Track Two Artist Y"
+        assert result.truncated is False
 
     async def test_playlist_empty_items_returns_empty_list(
         self, spotify: Spotify
@@ -354,7 +356,8 @@ class TestSpotifyPlaylist:
         ):
             result = await spotify.playlist("empty_playlist_id")
 
-        assert result == []
+        assert result.titles == []
+        assert result.truncated is False
 
     async def test_playlist_calls_correct_endpoint(self, spotify: Spotify) -> None:
         mock_response = {"items": []}
@@ -382,7 +385,172 @@ class TestSpotifyPlaylist:
         ):
             result = await spotify.playlist("pid")
 
-        assert result[0] == "Collab A B C"
+        assert result.titles[0] == "Collab A B C"
+
+    async def test_playlist_requests_next_in_fields_mask(
+        self, spotify: Spotify
+    ) -> None:
+        """The `next` cursor must be in the mask — omitting it is precisely how
+        playlists came to be truncated at one page."""
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value={"items": []})
+        ) as mock_call:
+            await spotify.playlist("pl_abc")
+
+        assert "next" in mock_call.call_args.kwargs["params"]["fields"]
+
+
+class TestSpotifyPagination:
+    """The 100-track truncation fix: follow `next` until it comes back null."""
+
+    async def test_playlist_follows_next_cursor_across_pages(
+        self, spotify: Spotify
+    ) -> None:
+        pages = [
+            {
+                "items": [
+                    {"track": {"name": f"P1-{i}", "artists": []}} for i in range(3)
+                ],
+                "next": "https://api.spotify.com/v1/playlists/pid/tracks?offset=3",
+            },
+            {
+                "items": [
+                    {"track": {"name": f"P2-{i}", "artists": []}} for i in range(2)
+                ],
+                "next": None,
+            },
+        ]
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(side_effect=pages)
+        ) as mock_call:
+            result = await spotify.playlist("pid")
+
+        assert result.titles == ["P1-0", "P1-1", "P1-2", "P2-0", "P2-1"]
+        assert result.truncated is False
+        assert mock_call.await_count == 2
+        # The `next` URL already encodes limit/offset/fields; re-passing params
+        # would fight it, so only the first request carries them.
+        assert mock_call.await_args_list[1].args[0] == pages[0]["next"]
+        assert mock_call.await_args_list[1].kwargs["params"] is None
+
+    async def test_walk_stops_at_track_cap_and_reports_truncation(
+        self, spotify: Spotify
+    ) -> None:
+        page = {
+            "items": [
+                {"track": {"name": f"T{i}", "artists": []}}
+                for i in range(spotify_mod._TRACK_CAP + 5)
+            ],
+            "next": None,
+        }
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            result = await spotify.playlist("pid")
+
+        assert len(result.titles) == spotify_mod._TRACK_CAP
+        assert result.truncated is True
+
+    async def test_cap_landing_exactly_on_the_end_is_not_truncated(
+        self, spotify: Spotify
+    ) -> None:
+        """Exactly _TRACK_CAP tracks with no `next` is a COMPLETE playlist —
+        reporting it as truncated would cry wolf on the boundary."""
+        page = {
+            "items": [
+                {"track": {"name": f"T{i}", "artists": []}}
+                for i in range(spotify_mod._TRACK_CAP)
+            ],
+            "next": None,
+        }
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            result = await spotify.playlist("pid")
+
+        assert len(result.titles) == spotify_mod._TRACK_CAP
+        assert result.truncated is False
+
+    async def test_runaway_cursor_is_bounded(self, spotify: Spotify) -> None:
+        """A `next` that never goes null must not become an infinite loop."""
+        forever = {
+            "items": [{"track": {"name": "T", "artists": []}}],
+            "next": "https://api.spotify.com/loop",
+        }
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=forever)
+        ) as mock_call:
+            result = await spotify.playlist("pid")
+
+        assert mock_call.await_count == spotify_mod._MAX_PAGES
+        assert result.truncated is True
+
+    async def test_null_track_and_episode_entries_are_skipped(
+        self, spotify: Spotify
+    ) -> None:
+        """A removed track (`{"track": null}`) and a podcast episode (name but
+        no `artists`) used to raise and fail the ENTIRE playlist."""
+        page = {
+            "items": [
+                {"track": None},
+                {"track": {"name": "Episode 42"}},  # episode: no artists key
+                {"track": {"name": "Real Song", "artists": [{"name": "Band"}]}},
+            ],
+            "next": None,
+        }
+        with patch.object(spotify, "http_call", new=AsyncMock(return_value=page)):
+            result = await spotify.playlist("pid")
+
+        assert result.titles == ["Real Song Band"]
+
+
+class TestSpotifyAlbumTracks:
+    async def test_album_tracks_uses_album_endpoint_and_flat_items(
+        self, spotify: Spotify
+    ) -> None:
+        """Album items ARE the track — they are NOT wrapped in `track`, which
+        is the one way the two paged endpoints differ."""
+        page = {
+            "items": [
+                {"name": "Side A", "artists": [{"name": "Band"}]},
+                {"name": "Side B", "artists": [{"name": "Band"}]},
+            ],
+            "next": None,
+        }
+        with patch.object(
+            spotify, "http_call", new=AsyncMock(return_value=page)
+        ) as mock_call:
+            result = await spotify.album_tracks("alb123")
+
+        assert result.titles == ["Side A Band", "Side B Band"]
+        called_endpoint = mock_call.call_args.args[0]
+        assert "v1/albums/alb123/tracks" in called_endpoint
+        fields = mock_call.call_args.kwargs["params"]["fields"]
+        assert "next" in fields and "track(" not in fields
+
+    async def test_album_tracks_paginates(self, spotify: Spotify) -> None:
+        pages = [
+            {
+                "items": [{"name": "A", "artists": []}],
+                "next": "https://api.spotify.com/v1/albums/alb/tracks?offset=1",
+            },
+            {"items": [{"name": "B", "artists": []}], "next": None},
+        ]
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=pages)):
+            result = await spotify.album_tracks("alb")
+
+        assert result.titles == ["A", "B"]
+
+
+class TestPagedTracksCacheRoundTrip:
+    def test_cache_round_trip_is_symmetric(self) -> None:
+        """_cached_call stores through orjson, which deserializes a dataclass
+        to a dict — so a cache HIT and a cache MISS must still agree."""
+        original = PagedTracks(titles=["a", "b"], truncated=True)
+        assert PagedTracks.from_cache(original.to_cache()) == original
+
+    def test_from_cache_tolerates_legacy_bare_list(self) -> None:
+        """Entries written before this change are a bare list of titles; a
+        deploy must not error until the 1h playlist TTL expires."""
+        assert PagedTracks.from_cache(["x", "y"]) == PagedTracks(
+            titles=["x", "y"], truncated=False
+        )
 
 
 class TestSpotifyHttpCall:

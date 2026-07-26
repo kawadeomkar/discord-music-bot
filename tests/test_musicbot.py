@@ -33,7 +33,7 @@ from src.musicbot import (
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
-from src.spotify import SpotifyAuthError
+from src.spotify import PagedTracks, SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -381,9 +381,36 @@ class TestQueueSource:
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=PagedTracks(titles=["Song A", "Song B"])
+        )
         result = await music_bot.queue_source(mock_ctx, source)
         assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
+
+    async def test_spotify_album_resolves_like_a_playlist(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="alb123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.album_tracks = AsyncMock(
+            return_value=PagedTracks(titles=["Side A", "Side B"])
+        )
+        result = await music_bot.queue_source(mock_ctx, source)
+        assert result == ResolvedSpotifyPlaylist(titles=["Side A", "Side B"])
+        # The album endpoint, not the playlist one — they are different shapes.
+        music_bot.spotify.album_tracks.assert_awaited_once_with("alb123")
+
+    async def test_truncation_flag_is_carried_through_resolution(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=PagedTracks(titles=["A"], truncated=True)
+        )
+        result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedSpotifyPlaylist)
+        assert result.truncated is True
 
     async def test_spotify_track_calls_yt_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -651,6 +678,26 @@ class TestEnqueuePlaylist:
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist" in embed.title
         assert "Song A" in embed.description
+        # Nothing was dropped, so no warning should be manufactured.
+        assert "Only the first" not in embed.description
+
+    async def test_truncated_playlist_warns_in_the_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Queueing fewer tracks than the user linked must be visible to them —
+        this used to be silent data loss."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await music_bot._enqueue_playlist(
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=["Song A", "Song B"], truncated=True),
+            mp,
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Only the first 2 tracks were queued" in embed.description
 
     async def test_spotify_calls_queue_put_with_prefetch_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3659,7 +3706,9 @@ class TestPlaynow:
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         mock_ctx.message.content = f"-playnow {url}"
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
+        music_bot.spotify.playlist = AsyncMock(
+            return_value=PagedTracks(titles=["First Song", "Second"])
+        )
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 
         with patch(
