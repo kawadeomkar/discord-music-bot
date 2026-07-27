@@ -40,7 +40,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.ping import run_health_dashboard, send_latency_line
+from src.ping import ArchiveHealth, run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -175,6 +175,7 @@ class MusicBot(commands.Cog):
         "spotify",
         "_spotify_status",
         "redis",
+        "history_archive",
         "_active_spans",
         "_alone_timers",
         "_restore_tasks",
@@ -191,8 +192,19 @@ class MusicBot(commands.Cog):
         # of failing at startup or at type-check time. Nothing here would go red.
         # Fix: type `bot` as "MusicBotApp" under `if TYPE_CHECKING` (src/main.py already
         # uses that idiom to break this exact import cycle), or declare a two-line
-        # Protocol carrying `redis: Optional[aioredis.Redis]`.
+        # Protocol carrying `redis: Optional[aioredis.Redis]`. That fix now covers two
+        # attributes: history_archive below is the same HACK for the same reason, and
+        # is spelled the same way deliberately — one idiom and one FIXME beats two.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
+        # The play-history archive, read only by -ping's Postgres row. Always present
+        # in a real bot: setup_hook builds it (refusing to start without POSTGRES_URL)
+        # BEFORE load_extension constructs this cog, so the None branch is reachable
+        # only from tests and a cog built outside MusicBotApp. Typed as the narrow
+        # ArchiveHealth protocol, not PostgresHistoryArchive — the Postgres row is all
+        # this class does with it, so that is all it should be able to do with it.
+        self.history_archive: Optional[ArchiveHealth] = getattr(
+            bot, "history_archive", None
+        )
         # Spotify is optional: only build the client when credentials are present.
         # When None, playing a Spotify link raises SpotifyDisabledError; every other
         # source (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
@@ -1493,7 +1505,7 @@ class MusicBot(commands.Cog):
                 # it lets the Spotify row say *why* the source is unusable
                 # without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
-                pg_pool=getattr(self, "pg_pool", None),
+                archive=self.history_archive,
             )
         except Exception as e:
             await self._command_error(ctx, e)

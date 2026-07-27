@@ -225,14 +225,38 @@ class TestDedupAndPrecision:
 
 
 class TestClose:
-    async def test_close_then_reuse_lazily_rebuilds(
-        self, archive: PostgresHistoryArchive
+    async def test_close_is_final_and_data_outlives_the_instance(
+        self, archive: PostgresHistoryArchive, pg_dsn: str
     ) -> None:
+        """close() is terminal for the instance, not for the data.
+
+        This used to assert the opposite — that a post-close op lazily rebuilt
+        the pool and still read its rows. That reuse was incidental (close() is
+        only ever called from MusicBotApp.close(), at shutdown) and became unsafe
+        once health_check() gave -ping a path into _ensure() that shutdown does
+        not sequence: a probe racing close() would have built a pool nothing was
+        left to close. What actually mattered in the old test — the rows survive
+        — is asserted here through a fresh archive on the same DSN.
+        """
         await archive.insert_batch([_entry(1)])
         await archive.close()
-        # A subsequent op rebuilds the pool via _ensure and still sees the data.
-        [got] = await archive.recent(42, 10)
-        assert got.title == "Song 1"
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.recent(42, 10)
+
+        reopened = PostgresHistoryArchive(pg_dsn)
+        try:
+            [got] = await reopened.recent(42, 10)
+            assert got.title == "Song 1"
+        finally:
+            await reopened.close()
+
+    async def test_health_check_against_a_live_server(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # -ping's Postgres row, end to end against a real server: connects on
+        # first use (nothing has touched the archive yet in this test) and
+        # returns without raising, which is what probe_postgres times.
+        await archive.health_check()
 
     async def test_close_is_idempotent(self, archive: PostgresHistoryArchive) -> None:
         await archive._ensure()

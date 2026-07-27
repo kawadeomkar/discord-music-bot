@@ -10,6 +10,7 @@ server (early-outs, row mapping, close-before-connect).
 
 import asyncio
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -306,6 +307,75 @@ class TestPostgresArchiveWithoutServer:
 
     async def test_close_before_connect_is_safe(self) -> None:
         await PostgresHistoryArchive("postgresql://nope:1/nope").close()
+
+    async def test_health_check_runs_select_1_on_the_pool(self) -> None:
+        # Stubs the lazy pool so the query path is covered without a server; the
+        # real thing is exercised by the pg tier (test_pg_integration.py).
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        conn = MagicMock()
+        conn.execute = AsyncMock()
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        # return_value=None, not a bare AsyncMock: a truthy __aexit__ would
+        # swallow any exception raised inside the block.
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.health_check()
+        conn.execute.assert_awaited_once_with("SELECT 1")
+
+    async def test_health_check_propagates_failure(self) -> None:
+        # probe_postgres relies on this: it turns the exception into a red row,
+        # so a swallowed error here would render an unreachable database green.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        with patch.object(
+            archive, "_ensure", AsyncMock(side_effect=OSError("unreachable"))
+        ):
+            with pytest.raises(OSError):
+                await archive.health_check()
+
+
+class TestPostgresArchiveClosedGuard:
+    """close() nulls _pool without holding the init lock, so a later _ensure()
+    would build a pool that nothing is left to close. Only reachable now that
+    health_check() gives -ping a path into _ensure() that shutdown does not
+    sequence — hence the guard rather than the ordering assumption alone.
+    """
+
+    async def test_ensure_refuses_after_close(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        await archive.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive._ensure()
+
+    async def test_health_check_after_close_fails_instead_of_reconnecting(
+        self,
+    ) -> None:
+        # A -ping probe in flight while the bot shuts down: it must fail (the row
+        # goes red on a bot that is going away anyway), never resurrect a pool.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        await archive.close()
+        with patch("src.history_archive.asyncpg.create_pool", AsyncMock()) as create:
+            with pytest.raises(RuntimeError, match="closed"):
+                await archive.health_check()
+        create.assert_not_awaited()
+
+    async def test_insert_and_recent_also_refuse_after_close(self) -> None:
+        # The guard lives in _ensure, so every connecting path inherits it —
+        # asserted here so a future refactor that inlines _ensure cannot quietly
+        # reopen the hole for the drainer's paths too.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        await archive.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.insert_batch([_entry(1)])
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.recent(42, 10)
+
+    async def test_close_is_idempotent(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        await archive.close()
+        await archive.close()
 
 
 class TestDrainerSupervision:

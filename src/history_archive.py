@@ -125,10 +125,18 @@ class PostgresHistoryArchive:
         self._url = url
         self._pool: Optional[asyncpg.Pool] = None
         self._init_lock = asyncio.Lock()
+        self._closed = False
 
     async def _ensure(self) -> asyncpg.Pool:
         """Lazy pool + idempotent DDL, double-checked under the lock. First
-        successful call wins; a failed attempt leaves no half-open pool."""
+        successful call wins; a failed attempt leaves no half-open pool.
+
+        Refuses after close() so a late caller cannot resurrect a pool that
+        nothing will ever close again — see close() for why that matters now
+        that health_check() makes -ping a second, user-triggered caller.
+        """
+        if self._closed:
+            raise RuntimeError("PostgresHistoryArchive is closed")
         if self._pool is not None:
             return self._pool
         async with self._init_lock:
@@ -166,12 +174,39 @@ class PostgresHistoryArchive:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
 
+    async def health_check(self) -> None:
+        """Prove the archive's database is reachable and answering. Raises on
+        any failure — the caller (-ping's probe_postgres) times it and turns an
+        exception into a red row.
+
+        Connects if nothing has yet: the pool is lazy, so before the first
+        song-end it is simply absent, and reporting "not configured" for a
+        REQUIRED tier would be a lie an operator acts on. That makes this the
+        second _ensure() caller after the drainer, which is what the closed
+        guard above exists for. Pool creation is bounded by _ensure's
+        timeout=10; -ping's own deadline (PING_DEADLINE_SECS, 3s) is shorter,
+        so a hung first connect renders as FAILED rather than DOWN — both red.
+
+        SELECT 1 rather than a table read: this asks "is the server up and
+        answering on a real connection", not "is the schema right" (the DDL in
+        _ensure already settled that).
+        """
+        pool = await self._ensure()
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+
     async def close(self) -> None:
-        # _pool is nulled before the await deliberately. This is safe ONLY
-        # because MusicBotApp.close() runs drainer.stop() (which finishes or
-        # cancels all draining) strictly before archive.close(), so no _ensure()
-        # can race a second pool into existence during the await. Do not reorder
-        # those two closes, or shutdown could leak a freshly-built pool.
+        # _closed is set FIRST, and _pool nulled before the await: together
+        # they make this safe against a late _ensure() rather than merely
+        # unlikely. The ordering guarantee it used to rely on — MusicBotApp.close()
+        # runs drainer.stop() strictly before archive.close(), so no _ensure()
+        # can race a second pool into existence during the await — still holds
+        # for the drainer, but health_check() added a caller that shutdown does
+        # NOT sequence: a -ping probe in flight while the bot is closing. The
+        # guard makes that probe fail cleanly instead of leaking a fresh pool.
+        # Keep the two closes in that order anyway; it is what lets the
+        # drainer's final drain still reach Postgres.
+        self._closed = True
         pool = self._pool
         self._pool = None
         if pool is not None:

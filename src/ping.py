@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 from importlib import metadata
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 from urllib.parse import urlparse
 
 import discord
@@ -76,6 +76,28 @@ class ProbeState(Enum):
     OFF = "off"  # deliberately disabled              (⚪)
     DOWN = "down"  # errored before the deadline        (🔴)
     FAILED = "failed"  # still pending at the deadline      (🔴)
+
+
+class ArchiveHealth(Protocol):
+    """The only thing the Postgres row needs from the play-history archive: a
+    way to prove its database answers.
+
+    Declared structurally here rather than imported from history_archive.py so
+    this module keeps its "no dependency on the tiers it reports on" shape —
+    probe_redis takes a bare Redis handle for the same reason, and ping.py stays
+    out of asyncpg's import graph. PostgresHistoryArchive satisfies it by
+    having the method; nothing has to inherit anything.
+
+    It is deliberately NOT the raw asyncpg.Pool this parameter used to be typed
+    for. The pool is created lazily on first archive use, so a just-started bot
+    has none, and a pool-shaped probe would have to report the required
+    Postgres tier as "not configured" — or force the caller to open a
+    connection before the dashboard's skeleton embed could send. Asking the
+    archive instead moves both problems inside the probe task, where the
+    timing already belongs.
+    """
+
+    async def health_check(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,17 +200,17 @@ async def probe_spotify(
     return await _timed("Spotify API", _do)
 
 
-async def probe_postgres(pg_pool: Optional[object]) -> ProbeResult:
-    # Typed `object`: asyncpg is not a dependency on main. When the Postgres tier
-    # lands, narrow to asyncpg.Pool (docs/PING_METADATA_PLAN.md §11).
-    if pg_pool is None:
+async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
+    """The play-history archive's Postgres row.
+
+    None means the bot was built without an archive — only reachable in tests
+    and in a cog constructed outside MusicBotApp, since the tier is required
+    (MusicBotApp.setup_hook refuses to start without POSTGRES_URL).
+    """
+    if archive is None:
         return ProbeResult("Postgres", ProbeState.NA)
 
-    async def _do() -> None:
-        async with pg_pool.acquire() as conn:  # type: ignore[attr-defined]
-            await conn.execute("SELECT 1")
-
-    return await _timed("Postgres", _do)
+    return await _timed("Postgres", archive.health_check)
 
 
 async def probe_otel() -> ProbeResult:
@@ -447,7 +469,12 @@ async def run_health_dashboard(
     redis: Optional[aioredis.Redis],
     spotify: Optional[Spotify],
     spotify_status: SpotifyStatus = SpotifyStatus.ENABLED,
-    pg_pool: Optional[object] = None,
+    # No default, unlike spotify_status: `redis` and `spotify` are also
+    # required-but-Optional, and for the same reason. A default of None would let
+    # a new caller silently render the required Postgres tier as "n/a" by simply
+    # forgetting the argument — which is exactly the bug this parameter had while
+    # it was a pool nobody passed.
+    archive: Optional[ArchiveHealth],
 ) -> None:
     """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md §5).
 
@@ -477,7 +504,7 @@ async def run_health_dashboard(
         tasks = {
             "Redis": asyncio.create_task(probe_redis(redis)),
             "Spotify API": asyncio.create_task(probe_spotify(spotify, spotify_status)),
-            "Postgres": asyncio.create_task(probe_postgres(pg_pool)),
+            "Postgres": asyncio.create_task(probe_postgres(archive)),
             "OTEL collector": asyncio.create_task(probe_otel()),
         }
         results = {label: ProbeResult(label, ProbeState.PENDING) for label in tasks}
