@@ -60,7 +60,7 @@ def sent_embed(ctx: MagicMock) -> discord.Embed:
 class TestSendDestination:
     """Help output must route through MusicContext.send so the Now Playing block
     stays glued to the bottom of the channel — a bare context.channel.send()
-    would bury it (docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md).
+    would bury it.
 
     Asserted on behaviour, not on the mechanism: the base HelpCommand's
     inherited get_destination() returns context.channel, so any send path that

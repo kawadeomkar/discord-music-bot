@@ -69,7 +69,7 @@ repos:
         stages: [pre-commit]
       - id: check-toml
       - id: check-yaml
-        # deploy/k8s/ manifests (docs/K8S_DEPLOYMENT_PLAN.md) are multi-document
+        # deploy/k8s/ manifests are multi-document
         # YAML, and Kustomize output routinely is. Set now so the hook does not
         # start failing the day those land.
         args: [--allow-multiple-documents]

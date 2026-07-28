@@ -1290,7 +1290,7 @@ class TestBuildProgressBar:
         assert bar.count("⬜") == 0
 
     def test_head_clamped_to_start_when_elapsed_negative(self) -> None:
-        """elapsed_secs is never negative in practice (Design §1's read()-counter
+        """elapsed_secs is never negative in practice (the read()-counter
         starts at 0 and only increments), but ratio clamping must not crash or
         push the head off the bar if it ever were."""
         bar = _build_progress_bar(-5.0, 200, width=10)
@@ -1455,9 +1455,8 @@ class TestBuildNowPlayingEmbed:
     def test_estimated_finish_appears_after_requester_on_same_line(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The requester/finish-time line stays on one line — the progress bar
-        (Design §2 of the progress-bar plan) sits above it as its own line, not
-        interleaved with it."""
+        """The requester/finish-time line stays on one line — the progress bar sits
+        above it as its own line, not interleaved with it."""
         embed = music_player._build_now_playing_embed(mock_song)
         requester_line = described(embed).split("\n")[-1]
         assert re.search(
@@ -1786,7 +1785,7 @@ class TestUpdateActivity:
     ) -> None:
         """start must be backdated by elapsed time, not always "now" — otherwise
         resuming a song already 60s in would make `end` land a full duration_secs
-        in the future instead of the correct remaining time (Design §6)."""
+        in the future instead of the correct remaining time."""
         music_player.bot.change_presence = AsyncMock()
         mock_song.elapsed_secs = 60.0
         await music_player.update_activity(mock_song)
@@ -1848,7 +1847,7 @@ class TestUpdateActivityPause:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         """On resume, elapsed_secs already reflects time played before the pause
-        (Design §1 — YTDL.read() counting freezes during a pause), so a normal
+        (YTDL.read() counting freezes during a pause), so a normal
         (non-paused) update_activity() call after resume must still backdate
         `start` by that elapsed time rather than restarting the countdown."""
         music_player.bot.change_presence = AsyncMock()
@@ -1892,7 +1891,7 @@ class TestRedisHelpers:
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         # Full history retention: the Redis list must never be trimmed
-        # (docs/HISTORY_OVERHAUL_PLAN.md §4).
+        # .
         assert music_player.store is not None
         for i in range(55):
             await music_player.store.push_history(
@@ -1937,7 +1936,7 @@ class TestRedisHelpers:
 class TestReachedEnd:
     """_reached_end decides whether the Now Playing bar is finalized to 100%.
     Answering by position covers every early-termination cause at once — -skip,
-    interjection, and mid-song stream death (docs/PLAY_WHILE_PAUSED_PLAN.md §5)."""
+    interjection, and mid-song stream death."""
 
     def _song(self, position: float, duration: int) -> MagicMock:
         song = MagicMock()
@@ -2022,8 +2021,7 @@ class TestFinalizeCompletion:
 
 
 class TestPlaybackGate:
-    """Restoring the persisted queue and playing it are separate concerns —
-    docs/PLAYBACK_GATE_PLAN.md."""
+    """Restoring the persisted queue and playing it are separate concerns —"""
 
     async def test_gate_closed_at_construction(
         self,
@@ -2165,8 +2163,8 @@ class TestPlaybackGate:
 
 class TestQueuePutFront:
     """MusicPlayer.queue_put_front — the -play-on-a-disconnected-bot path
-    (docs/PLAYBACK_GATE_PLAN.md §3.5). The list branch is the playlist case,
-    which front-inserts in full rather than collapsing to one track."""
+    . The list branch is the playlist case,
+        which front-inserts in full rather than collapsing to one track."""
 
     @pytest.fixture(autouse=True)
     def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3143,7 +3141,7 @@ class TestSendNowPlaying:
     async def _cleanup_progress_task(
         self, music_player: MusicPlayer
     ) -> AsyncGenerator[None]:
-        """_send_now_playing() may spawn a real _progress_task (Design §4). Tests
+        """_send_now_playing() may spawn a real _progress_task. Tests
         in this class don't drive loop() to retire it themselves, so clean it up
         here rather than leaking a pending asyncio.sleep() task past the test."""
         yield
@@ -3277,7 +3275,7 @@ class TestSendNowPlaying:
         assert music_player._progress_task is not None
 
 
-# ── Now-playing host primitives (embed-attach plan §1–§4) ─────────────────────
+# ── Now-playing host primitives ─────────────────────
 
 
 class TestNpEmbedBlock:
@@ -3403,7 +3401,7 @@ class TestNpHostAdoptRetire:
     async def test_retire_waits_for_lock_holder(
         self, music_player: MusicPlayer
     ) -> None:
-        """Plan §4 lock ordering: a retire serializes behind _np_edit_lock, so
+        """Lock ordering: a retire serializes behind _np_edit_lock, so
         an in-flight tick edit (which holds the lock across its await) always
         completes before the retire's strip/delete — the retire is the final
         write and a late tick can't resurrect the NP block on the old host."""
@@ -4016,7 +4014,7 @@ class TestProgressUpdater:
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         """loop() owns cancellation on song transition, but this guard protects
-        against a stray tick landing after the song changed (Design §4)."""
+        against a stray tick landing after the song changed."""
         vc = MagicMock(spec=discord.VoiceClient)
         vc.source = MagicMock()  # a different song than the one passed in
         vc.is_paused.return_value = False
@@ -5831,8 +5829,8 @@ class TestInterject:
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
-        interrupted song comes back PLAYING at its pause position
-        (docs/PLAY_WHILE_PAUSED_PLAN.md §3.1)."""
+                interrupted song comes back PLAYING at its pause position
+        ."""
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
         mock_vc.is_paused.return_value = True

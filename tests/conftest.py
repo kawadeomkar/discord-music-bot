@@ -36,7 +36,7 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     asserted directly and cheaply by TestProcessBoundaryContract (tests/test_youtube.py),
     and one dedicated test in tests/test_ytdlp_pool.py spawns a real worker end-to-end.
     Everything else about the process path — orphan reaping, live playback — is the
-    manual gate in docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
+    manual gate in
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -184,7 +184,7 @@ def music_player(
     exercise that race explicitly should clear it again before calling loop().
 
     loop() then blocks on the playback gate until a voice connection is
-    established (docs/PLAYBACK_GATE_PLAN.md). start() and the -join/-play call
+    established. start and the -join/-play call
     sites that open it never run here either, so it is opened for the same
     reason — tests that exercise the gate itself should clear it again.
     """

@@ -38,7 +38,7 @@ class StateField:
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
     # "1" when the playing song was queued via -playnow — preserves replace
-    # semantics across a crash mid-interjection (docs/PLAYNOW_PROPOSAL.md §4.1).
+    # semantics across a crash mid-interjection.
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
@@ -76,13 +76,13 @@ class NowPlayingField:
 
 def _b_str(raw: dict[bytes, bytes], key: str, default: str = "") -> str:
     v = raw.get(key.encode())
-    # `is None` (not truthiness): a missing key gets the default, but an
-    # explicitly stored empty string b"" stays "".
+    # `is None`, not truthiness: a missing key gets the default, but a stored
+    # empty string b"" stays "".
     #
-    # errors="replace": a corrupt (non-UTF8) byte in any one field must
-    # degrade to a mangled string, not raise — a strict decode would make
-    # from_redis() raise and get_guild_state() return None, misclassifying
-    # corruption as "Redis unavailable" and blocking recovery until TTL expiry.
+    # errors="replace": one corrupt non-UTF8 byte must degrade to a mangled
+    # string, not raise. A strict decode would make from_redis() raise and
+    # get_guild_state() return None, misclassifying corruption as "Redis
+    # unavailable" and blocking recovery until TTL expiry.
     return v.decode(errors="replace") if v is not None else default
 
 
@@ -95,8 +95,8 @@ def _b_float(raw: dict[bytes, bytes], key: str) -> float | None:
     except ValueError, TypeError:
         log.warning(f"guild_state: malformed float for {key!r}: {v!r}")
         return None
-    # nan/inf parse fine but poison downstream arithmetic (int(nan) raises,
-    # inf overflows) — treat them as malformed like any other corrupt value.
+    # nan/inf parse fine but poison downstream arithmetic (int(nan) raises, inf
+    # overflows) — treat them as malformed like any other corrupt value.
     if not math.isfinite(f):
         log.warning(f"guild_state: non-finite float for {key!r}: {v!r}")
         return None
@@ -107,16 +107,16 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
     v = raw.get(key.encode())
     if v is None or v == b"":
         return None
-    # Exact parse first: Discord snowflake IDs exceed float's 53-bit integer
-    # precision, so routing them through float() would silently corrupt them.
+    # Exact parse first: snowflake IDs exceed float's 53-bit integer precision,
+    # so routing them through float() would silently corrupt them.
     try:
         return int(v)
     except ValueError, TypeError:
         pass
     try:
-        # Fallback tolerates values stored as "111.0" (already float-rounded
-        # at write time, so the float round-trip loses nothing further).
-        # OverflowError: int(float(b"inf")) — non-finite is malformed here too.
+        # Tolerates values stored as "111.0" (already float-rounded at write
+        # time, so this round-trip loses nothing further). OverflowError covers
+        # int(float(b"inf")) — non-finite is malformed here too.
         return int(float(v))
     except ValueError, TypeError, OverflowError:
         log.warning(f"guild_state: malformed int for {key!r}: {v!r}")
@@ -130,14 +130,12 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
 class GuildStateData:
     """Typed snapshot of guild:{id}:state deserialized from Redis.
 
-    All fields have Python-native types with zero-value defaults, so
-    GuildStateData() is the canonical "empty hash" snapshot. Callers never
-    deal with bytes or manual float()/int() coercions.
+    Zero-value defaults throughout, so GuildStateData() is the canonical "empty
+    hash" snapshot and callers never handle bytes or manual coercions.
 
-    volume is None when no value is stored (not defaulted to 1.0): the caller
-    must be able to tell "nothing persisted" from "user set 1.0", so a restore
-    can skip the assignment entirely instead of clobbering a concurrently
-    issued -volume command with a fabricated default.
+    volume is None when nothing is stored, NOT 1.0: the caller must tell
+    "nothing persisted" from "user set 1.0" so a restore can skip the assignment
+    instead of clobbering a concurrent -volume with a fabricated default.
     """
 
     volume: float | None = None
@@ -169,32 +167,28 @@ class GuildStateData:
     def was_paused_at_crash(self) -> bool:
         """True when a pause_start_epoch is recorded (bot was paused at crash).
 
-        Named was_paused_at_crash rather than is_paused to avoid confusion with
-        live playback state (vc.is_paused()). This is persisted crash-time
-        state, not a reflection of the current voice client status.
+        Named for the crash, not is_paused, to keep it distinct from live state
+        (vc.is_paused()): this is persisted crash-time state only.
         """
         return self.pause_start_epoch is not None
 
     # FIXME: Crash recovery counts bot downtime as playback position.
-    # `now` is read at RESTART time while play_start_epoch was written when the song
-    # started, so a bot that was down for 10 minutes adds those 10 minutes straight onto
-    # the computed position. A song that crashed 30 seconds in therefore comes back near
-    # its end — landing on the caller's duration−10s EOF cap — instead of at 0:30. Only
-    # a pause that was already active at crash time is subtracted; the crash gap itself
-    # is never tracked at all.
-    # Fix is a periodic playback heartbeat written to Redis, so recovery reads the last
-    # known position instead of extrapolating from the start epoch.
-    # Design: docs/CRASH_RECOVERY_HEARTBEAT_PLAN.md (designed, not implemented).
+    # `now` is read at RESTART time while play_start_epoch dates from when the song
+    # started, so 10 minutes
+    # of downtime lands straight on the computed position: a song that crashed 30s in
+    # comes back near its end, on the caller's duration−10s EOF cap. Only a pause already
+    # active at crash time is subtracted; the crash gap is never tracked.
+    # Fix: a periodic playback heartbeat in Redis, so recovery reads the last known
+    # position instead of extrapolating.
     def crashed_position_at(self, now: float) -> int | None:
-        """Approximate playback position (seconds) at crash time, or None when
-        no play_start_epoch was recorded.
+        """Approximate playback position (seconds) at crash time, or None when no
+        play_start_epoch was recorded.
 
-        Pure function of the snapshot + a caller-supplied clock, so it is unit
-        testable with zero mocks. play_start_epoch is already backdated by the
-        FFmpeg -ss start offset at write time, so no offset handling is needed
-        here. Callers may still cap the result at song duration
-        (current_song_duration, or the cached stream duration) to prevent
-        FFmpeg seeking past EOF.
+        Pure function of the snapshot plus a caller-supplied clock, so it needs no
+        mocks to test. play_start_epoch is already backdated by the FFmpeg -ss
+        offset at write time. Callers may still cap the result at the song duration
+        (current_song_duration, or the cached stream duration) to stop FFmpeg
+        seeking past EOF.
         """
         if self.play_start_epoch is None:
             return None
@@ -206,10 +200,10 @@ class GuildStateData:
 
     @classmethod
     def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
-        """Deserialize raw HGETALL output. All byte coercions are centralised
-        here; an empty dict yields the zero-value snapshot."""
-        # Avoid `_b_float(...) or 0.0`-style coalescing — that would elevate a
-        # stored 0.0 because 0.0 is falsy. Explicit None checks instead.
+        """Deserialize raw HGETALL output. All byte coercions are centralised here;
+        an empty dict yields the zero-value snapshot."""
+        # No `_b_float(...) or 0.0` coalescing — 0.0 is falsy, so that would
+        # elevate a stored 0.0 to the default. Explicit None checks instead.
         total_pause = _b_float(raw, StateField.TOTAL_PAUSE_SECONDS)
         return cls(
             volume=_b_float(raw, StateField.VOLUME),
@@ -235,9 +229,9 @@ class GuildStateData:
 class NowPlayingData:
     """Typed snapshot of guild:{id}:now_playing.
 
-    Used in both directions: from_song() builds it from a live YTDL for the
-    atomic start-song write, and from_redis() rebuilds it during crash
-    recovery. One type, so the live embed and the recovered embed can't drift.
+    Bidirectional: from_song() builds it from a live YTDL for the atomic
+    start-song write, from_redis() rebuilds it during crash recovery. One type,
+    so the live and recovered embeds can't drift.
     """
 
     title: str = ""
@@ -255,17 +249,16 @@ class NowPlayingData:
 
     @classmethod
     def from_song(cls, song: YTDL) -> Self:
-        """Canonical field extraction from a live song — the single source of
-        truth for both the live embed and the Redis now_playing snapshot, so
-        the two can't drift out of sync."""
+        """Canonical field extraction from a live song — one source of truth for
+        the live embed and the Redis snapshot, so the two can't drift."""
         return cls(
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             uploader=song.uploader or "",
-            # Empty when the duration is unknown (livestream, missing metadata)
-            # rather than the "0:00" fmt_duration renders for zero — mirrors the
-            # live embed, which draws no progress bar when duration_secs <= 0.
-            # The recovered embed keys its Duration line off this being truthy.
+            # Empty for unknown duration (livestream, missing metadata) rather
+            # than the "0:00" fmt_duration renders — mirrors the live embed, which
+            # draws no bar when duration_secs <= 0. The recovered embed keys its
+            # Duration line off this being truthy.
             duration=song.duration if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
@@ -301,12 +294,11 @@ class NowPlayingData:
         )
 
     def to_redis_mapping(self) -> dict[str, str]:
-        """Serialize to a flat string dict suitable for Redis HSET mapping.
+        """Serialize to a flat string dict for Redis HSET mapping.
 
-        Spelled out rather than dataclasses.asdict(): asdict() would bind the
-        wire schema to Python attribute names, so renaming an attribute would
-        silently rename the Redis hash field. The explicit table pins the wire
-        schema to the NowPlayingField constants.
+        Spelled out rather than dataclasses.asdict(), which would bind the wire
+        schema to Python attribute names — renaming an attribute would silently
+        rename the hash field. This table pins it to the NowPlayingField constants.
         """
         return {
             NowPlayingField.TITLE: self.title,
@@ -363,12 +355,11 @@ class SongQueueEntry:
     """A resolved song at rest ("qobj" on the wire) — the pure-data twin of
     src.youtube.QueueObject.
 
-    requester is stored as an ID because a live discord.Member cannot exist at
-    rest; rehydration back to a QueueObject (which needs a guild for member
-    resolution) happens in GuildQueue. requester_id is None only for the
-    crashed-head entry derived from state via from_crashed_state() — wire
-    entries always carry a real int, and snowflakes stay exact end-to-end
-    (orjson native ints; never a float path).
+    requester is an ID because a live discord.Member cannot exist at rest;
+    rehydration (which needs a guild to resolve members) happens in GuildQueue.
+    requester_id is None only for the crashed-head entry from
+    from_crashed_state() — wire entries always carry a real int, and snowflakes
+    stay exact end-to-end (orjson native ints, never a float path).
     """
 
     webpage_url: str
@@ -405,11 +396,9 @@ class SongQueueEntry:
 
     @classmethod
     def from_song(cls, song: YTDL) -> Self:
-        """The queue-entry view of a now-playing song — the write-side twin of
-        from_crashed_state(). The playback loop hands this to the atomic
-        start-song transaction, which parks these fields in the state hash as
-        current_song_*; a crash then rebuilds the same entry via
-        from_crashed_state(), closing the loop:
+        """The queue-entry view of a now-playing song — write-side twin of
+        from_crashed_state(). The loop hands this to the atomic start-song
+        transaction, which parks the fields in the state hash as current_song_*:
 
             from_song → HSET state → crash → from_crashed_state → re-queue
         """
@@ -426,16 +415,15 @@ class SongQueueEntry:
     def from_crashed_state(
         cls, state: GuildStateData, *, position: int | None
     ) -> Self | None:
-        """The crashed "current song" reborn as a queue entry — the typed
-        inverse of pop_queue_and_start_song(): the current_song_* state fields
-        are the fields of the entry that transaction atomically LPOPed when
-        the song started. Returns None when no crashed song is recorded.
+        """The crashed "current song" reborn as a queue entry — the typed inverse
+        of pop_queue_and_start_song(), whose current_song_* fields ARE the entry
+        it LPOPed. None when no crashed song is recorded.
 
-        persisted=False: the LPOP already committed, so this entry is not on
-        the Redis list and the playback loop must not LPOP again for it.
+        persisted=False: that LPOP already committed, so this entry is not on the
+        Redis list and the loop must not LPOP again for it.
 
-        position is the caller-computed resume offset (crashed_position_at()
-        plus its duration cap) — passed in so this stays a pure field mapping.
+        `position` is the caller-computed resume offset (crashed_position_at()
+        plus its duration cap), passed in so this stays a pure field mapping.
         """
         if not state.has_crashed_song:
             return None
@@ -448,15 +436,15 @@ class SongQueueEntry:
             uploader=state.current_song_uploader,
             persisted=False,
             # A crash mid-interjection must not demote the recovered song to a
-            # "normal" song: a -playnow after recovery still replaces it
-            # (no resume entry) instead of stacking one.
+            # normal one: a -playnow after recovery still replaces it (no resume
+            # entry) instead of stacking one.
             interjected=state.current_song_interjected,
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out (same
-        rationale as NowPlayingData.to_redis_mapping): the wire schema is
-        pinned to QueueEntryField, not to Python attribute names."""
+        """Serialize to the wire format. Field table spelled out for the same
+        reason as NowPlayingData.to_redis_mapping: the wire schema is pinned to
+        QueueEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
                 QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
@@ -479,9 +467,8 @@ class SongQueueEntry:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SearchQueueEntry:
     """An unresolved search at rest ("ytsource" on the wire) — e.g. a Spotify
-    playlist track awaiting yt-dlp resolution. Mirrors exactly the four
-    YTSource fields the wire format persists; the remaining YTSource fields
-    are reconstructed as defaults on rehydration."""
+    playlist track awaiting yt-dlp resolution. Holds exactly the four YTSource
+    fields the wire persists; the rest default on rehydration."""
 
     ytsearch: str | None = None
     url: str | None = None
@@ -512,16 +499,15 @@ class SearchQueueEntry:
 QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 
 
-# `bytes | str`, matching orjson.loads() and what redis-py declares LRANGE to return.
-# Narrowing this to bytes only forced every caller to cast for a call that was always
-# fine at runtime (see parse_history_entry for the sibling).
+# `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return.
+# Narrowing to bytes forced every caller to cast for a call always fine at runtime
+# (parse_history_entry is the sibling).
 def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
     """Deserialize one queue-list entry into a value object.
 
-    The "type" field discriminates search entries from songs. Corrupt
-    entries (bad JSON, missing required fields) return None with a warning —
-    the entry is dropped and the rest of the queue survives, matching the
-    original _deserialize_queue_item behavior.
+    The "type" field discriminates searches from songs. Corrupt entries (bad
+    JSON, missing required fields) return None with a warning, so one bad entry
+    is dropped and the rest of the queue survives.
     """
     try:
         d = orjson.loads(data)
@@ -571,10 +557,9 @@ class HistoryEntryField:
 class HistoryEntry:
     """One played song at rest — an element of guild:{id}:history.
 
-    Zero-values mean "unknown": fields absent on the wire default on parse,
-    and the display layer degrades accordingly. The field set deliberately
-    matches the future Postgres play_history row
-    (docs/HISTORY_OVERHAUL_PLAN.md §8).
+    Zero-values mean "unknown": fields absent on the wire default on parse and
+    the display layer degrades accordingly. The field set deliberately matches
+    the future Postgres play_history row.
     """
 
     title: str = ""
@@ -589,15 +574,15 @@ class HistoryEntry:
 
     @classmethod
     def from_song(cls, song: YTDL, *, played_at: float) -> Self:
-        """Canonical extraction from a finished song. played_at is a
-        caller-supplied clock (same pattern as crashed_position_at) so this
-        stays a pure field mapping.
+        """Canonical extraction from a finished song. `played_at` is a
+        caller-supplied clock (as in crashed_position_at) so this stays a pure
+        field mapping.
 
-        played_secs is position reached (start_offset + audio delivered),
-        capped at the song's duration when known: for a -playnow-interrupted
-        song recorded once at its resume tail's end, the tail's position spans
-        the full listened range — the desirable answer. A ?t=-started song
-        reports position including the skip; accepted (plan §3).
+        played_secs is the position reached (start_offset + audio delivered),
+        capped at duration when known. For a -playnow-interrupted song recorded
+        once at its resume tail's end, the tail's position spans the full
+        listened range — the desirable answer. A ?t= song includes the skip;
+        accepted.
         """
         played = round(song.position_secs)
         duration = song.duration_secs or 0
@@ -616,9 +601,9 @@ class HistoryEntry:
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out (same
-        rationale as NowPlayingData.to_redis_mapping): the wire schema is
-        pinned to HistoryEntryField, not to Python attribute names."""
+        """Serialize to the wire format. Field table spelled out for the same
+        reason as NowPlayingData.to_redis_mapping: the wire schema is pinned to
+        HistoryEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
                 HistoryEntryField.TITLE: self.title,
@@ -639,11 +624,10 @@ def serialize_history_entry(entry: HistoryEntry) -> bytes:
 
 
 def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
-    """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong
-    JSON type, malformed fields) return None with a warning — the entry is
-    dropped and the rest of the history survives, matching parse_queue_entry.
-    Unknown dict keys are ignored and missing keys default, so mixed-build
-    readers stay tolerant in both directions."""
+    """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong type,
+    malformed fields) return None with a warning and are dropped, as in
+    parse_queue_entry. Unknown keys are ignored and missing keys default, so
+    mixed-build readers stay tolerant in both directions."""
     try:
         entry = orjson.loads(data)
     except Exception as e:
@@ -676,14 +660,13 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildPlaybackSnapshot:
-    """A guild's complete persisted playback aggregate — the state hash, the
-    pending queue, the now-playing display snapshot, and the played-song
-    history — read together in one pipelined round-trip
-    (GuildRedisStore.get_playback_snapshot).
+    """A guild's complete persisted playback aggregate — state hash, pending
+    queue, now-playing snapshot, played-song history — read together in one
+    pipelined round-trip (GuildRedisStore.get_playback_snapshot).
 
-    This is the "a guild owns a queue (and a history)" relationship as a
-    type: recovery decisions that span the halves live here as named
-    properties instead of boolean expressions at call sites.
+    The "a guild owns a queue (and a history)" relationship as a type: recovery
+    decisions spanning the halves live here as named properties rather than as
+    boolean expressions at call sites.
     """
 
     state: GuildStateData
@@ -710,12 +693,11 @@ class GuildRecoveryGate:
     """The minimal read `_restore_guild` needs to decide whether to reconnect:
     the state hash plus the pending queue's *length* — never its contents.
 
-    `_restore_guild` only ever consults the connection gate (state), the
-    channel IDs (state), and whether there is anything to resume; it does not
-    replay the queue, now-playing, or history — `_restore_state` re-reads the
-    full GuildPlaybackSnapshot after a successful voice connect. Reading only
-    the length here keeps a `-stop`ped guild's (possibly long) leftover queue
-    off the wire on every `on_ready` (see GuildRedisStore.get_recovery_gate).
+    _restore_guild consults only the connection gate, the channel IDs, and
+    whether there is anything to resume; _restore_state re-reads the full
+    GuildPlaybackSnapshot after a successful voice connect. Reading only the
+    length keeps a -stopped guild's (possibly long) leftover queue off the wire
+    on every on_ready (see GuildRedisStore.get_recovery_gate).
     """
 
     state: GuildStateData
@@ -723,7 +705,7 @@ class GuildRecoveryGate:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """True when a restart has anything to resume — pending queue entries
-        or a song that was mid-play at crash time. Mirrors
+        """True when a restart has anything to resume — pending entries or a song
+        mid-play at crash time. Mirrors
         GuildPlaybackSnapshot.has_restorable_playback, over the queue length."""
         return self.pending_count > 0 or self.state.has_crashed_song

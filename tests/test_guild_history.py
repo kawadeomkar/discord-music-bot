@@ -3,7 +3,7 @@
 The property under test mirrors test_guild_queue's: after every operation the
 in-memory display cache and the Redis leg agree on their shared window. The
 cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
-truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
+truth for all played songs —).
 """
 
 import redis.asyncio as aioredis

@@ -328,7 +328,7 @@ class TestPushHistory:
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         # The Redis list is the source of truth for ALL played songs — a trim
-        # here would silently discard history (docs/HISTORY_OVERHAUL_PLAN.md §4).
+        # here would silently discard history.
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await store.push_history(_hentry(i))
         items = await fake_redis.lrange(store.history_key(), 0, -1)

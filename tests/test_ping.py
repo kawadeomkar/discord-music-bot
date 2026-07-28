@@ -223,7 +223,7 @@ class TestPingCommand:
     async def test_join_uses_latency_line_not_the_dashboard(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Regression for §2.3 / C1: -join must post the cheap latency line and
+        """Regression: -join must post the cheap latency line and
         must NOT run the dependency probes."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel

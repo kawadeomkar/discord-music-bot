@@ -46,7 +46,7 @@ def _double_in_worker(value: int) -> tuple[int, int]:
 
 class _UnpicklableError(Exception):
     """A *required* positional and no default — serialises but fails to *unpickle*, exactly
-    the trap that bricks the pool if it reaches the result queue (§12.1). Module-level so
+    the trap that bricks the pool if it reaches the result queue. Module-level so
     dumps() can resolve the class by reference and get far enough to fail on loads()."""
 
     def __init__(self, message: str, extra: object) -> None:
@@ -153,7 +153,7 @@ class TestLazyCreation:
         try:
             assert executor is sentinel
             # Wiring, not multiprocessing: the hardened initializer plus the worker-log
-            # queue handed to it via initargs (§12.2 Option B).
+            # queue handed to it via initargs (Option B).
             ctor.assert_called_once_with(
                 max_workers=3,
                 initializer=_worker_init,
@@ -184,7 +184,7 @@ class TestLazyCreation:
 
         The pool this class replaced justified skipping a lock by asserting all mutation
         happened on the event-loop thread; that was untrue of its shutdown path
-        (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.4 D2). The lock is the fix, and a
+        ( D2). The lock is the fix, and a
         barrier is how you prove it: every thread is released into _acquire() at once.
         """
         threads = 8
@@ -262,11 +262,11 @@ class TestRun:
     async def test_run_resolves_the_callable_at_call_time(self) -> None:
         """The constraint the whole API shape exists to satisfy.
 
-        29 tests in test_youtube.py patch src.youtube._ytdlp_extract with a MagicMock.
-        That only works because run() takes the callable as a *parameter*, resolved from
-        the caller's module at call time — capturing it in __init__ would bind the real
-        function once at construction and every one of those patches would silently miss
-        (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.5).
+                29 tests in test_youtube.py patch src.youtube._ytdlp_extract with a MagicMock.
+                That only works because run() takes the callable as a *parameter*, resolved from
+                the caller's module at call time — capturing it in __init__ would bind the real
+                function once at construction and every one of those patches would silently miss
+        .
         """
         import src.ytdlp_pool as module
 
@@ -433,7 +433,7 @@ class TestAclose:
         """The shape borrowed from asyncio's loop.shutdown_default_executor(): the state
         change happens on the event-loop thread, and only the blocking join goes to a
         worker thread. That is what makes the cross-thread mutation the old module global
-        performed (§2.4 D2) structurally impossible rather than merely locked."""
+        performed structurally impossible rather than merely locked."""
         executor, started, release = self._blocking_executor()
         pool = YtdlpPool(executor_factory=lambda: executor)
         pool._acquire()
@@ -478,7 +478,7 @@ class TestAclose:
     ) -> None:
         """A ProcessPoolExecutor must be actively terminated on timeout: shutdown(wait=False)
         does NOT bound interpreter exit (the abandoned join is re-joined by _python_exit at
-        exit; measured 61s → 3.4s once workers are SIGTERMed, §12.3). The isinstance guard
+        exit; measured 61s → 3.4s once workers are SIGTERMed). The isinstance guard
         picks terminate_workers() for a real pool and the shutdown(wait=False) fallback for
         the thread-pool seam."""
         started = threading.Event()
@@ -508,7 +508,7 @@ class TestAclose:
             release.set()
 
     async def test_worker_termination_precedes_the_log_listener_stop(self) -> None:
-        """The §12.2 ordering rule: terminate_workers() THEN listener.stop(). Reversed,
+        """Ordering rule: terminate_workers() THEN listener.stop(). Reversed,
         stop() drains and closes the queue while the dying workers are still emitting, so
         their final records — the reason a shutdown-time extraction failed — are lost.
         """
@@ -566,7 +566,7 @@ class TestAclose:
 
 class TestPicklableCall:
     """_picklable_call — the generic net that keeps an un-shippable worker exception from
-    breaking the pool (§12.1)."""
+    breaking the pool."""
 
     def test_a_picklable_exception_passes_through_unchanged(self) -> None:
         def boom() -> None:
@@ -621,7 +621,7 @@ class TestPicklableCall:
 class TestRemoteCallError:
     def test_survives_pickle_round_trip_with_its_fields(self) -> None:
         """loads(dumps(...)): a multi-arg __init__ needs an explicit __reduce__ or it
-        unpickles into a TypeError on the parent side (§12.1)."""
+        unpickles into a TypeError on the parent side."""
         err = RemoteCallError("boom", "SomeWorkerError")
         back = pickle.loads(pickle.dumps(err))
 
@@ -673,15 +673,15 @@ class TestRealWorkerProcess:
     Kept to the minimum, deliberately. Under `spawn` each worker re-imports the pytest
     entry point, conftest and this module (discord, fakeredis, structlog, OTel), which
     costs ~1 s per test here. Each of the three asserts something no cheap tier can, and
-    that Option B (§12.2) made worth the spawn:
+    that Option B made worth the spawn:
       * the callable runs across a real boundary and a late submit is refused (D1);
-      * a worker's ExtractionError survives pickling with its fields and cause (§12.1) —
+      * a worker's ExtractionError survives pickling with its fields and cause —
         the exact thing the autouse thread-pool seam can never exercise, because it never
         pickles an exception;
       * a worker's log record reaches a parent handler carrying worker_id and the
-        propagated trace_id (§12.2).
+        propagated trace_id.
     Picklability of *arguments* stays with TestProcessBoundaryContract; orphan reaping
-    stays a manual gate (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7).
+    stays a manual gate.
     """
 
     async def test_a_real_worker_process_runs_the_submitted_callable(self) -> None:
@@ -703,7 +703,7 @@ class TestRealWorkerProcess:
             await pool.run(_double, 21)
 
     async def test_a_worker_extraction_error_survives_the_real_boundary(self) -> None:
-        """The defect the branch shipped (§12.1): a worker's yt-dlp error reaches the
+        """The defect the branch shipped: a worker's yt-dlp error reaches the
         parent as a flat ExtractionError with its fields, not an opaque pickling error,
         and the original is preserved as __cause__ (a _RemoteTraceback once it crosses).
         """
@@ -728,7 +728,7 @@ class TestRealWorkerProcess:
     async def test_the_returned_info_dict_survives_the_real_boundary_only_slimmed(
         self,
     ) -> None:
-        """The success-path return value (§ Finding 1): a raw process=True info dict
+        """The success-path return value: a raw process=True info dict
         carries live/oversized values the pool cannot pickle back, so returning it fails
         the call with a pickling error — while _slim_info's result crosses intact. Both on
         one pool, which also proves a result-queue pickling failure does not brick it (the
@@ -753,7 +753,7 @@ class TestRealWorkerProcess:
     async def test_worker_logs_reach_the_parent_with_worker_id_and_trace_id(
         self,
     ) -> None:
-        """Option B (§12.2): worker records travel the queue to a parent handler carrying
+        """Option B: worker records travel the queue to a parent handler carrying
         worker_id (bound in _worker_init) and the trace_id run() propagated from the active
         span — so a failed -play's worker diagnostics land in Loki, correlated."""
         import logging

@@ -45,7 +45,7 @@ from tests.helpers import (
 
 
 class TestCommandErrorRendering:
-    """_command_error must not leak yt-dlp's raw error text to the user (§12.5)."""
+    """_command_error must not leak yt-dlp's raw error text to the user."""
 
     async def test_extraction_error_renders_its_user_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -146,7 +146,7 @@ class TestCheckVoicePermissions:
 
 
 class TestBackgroundTyping:
-    """docs/PERFORMANCE_PLAN.md §2.2 — typing indicator must never delay the command body."""
+    """Typing indicator must never delay the command body."""
 
     async def test_body_runs_while_first_typing_post_is_in_flight(
         self, mock_ctx: MagicMock
@@ -2180,8 +2180,8 @@ class TestPlayCommand:
 
 class TestPlayWhilePaused:
     """-play on a paused song interjects instead of appending
-    (docs/PLAY_WHILE_PAUSED_PLAN.md §3). Appending would leave the bot silent
-    with the request buried behind a paused song."""
+    . Appending would leave the bot silent
+        with the request buried behind a paused song."""
 
     def _paused_mp(self) -> MagicMock:
         mp = _mock_mp()
@@ -2282,7 +2282,7 @@ class TestPlayWhilePaused:
     ) -> None:
         """A -resume landing during the 1-4s extraction removes the reason to
         interject, so the resolved track is appended rather than interrupting a
-        song the user just chose to keep playing (§3.3)."""
+        song the user just chose to keep playing."""
         vc = _paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
@@ -2375,7 +2375,7 @@ class TestPlayWhilePaused:
 class TestPlayFrontInsertion:
     """-play on a disconnected bot means "play this", not "play whatever was
     left over": the requested song jumps ahead of the queue persisted by a
-    previous -stop, which resumes behind it. docs/PLAYBACK_GATE_PLAN.md."""
+    previous -stop, which resumes behind it."""
 
     async def test_cold_path_enqueues_at_front(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2580,7 +2580,7 @@ class TestPlayFrontInsertion:
         song leads, the persisted entries follow in their original order, and
         the in-memory and Redis legs agree.
 
-        Also the double-queue regression (docs/PLAYBACK_GATE_PLAN.md §5.8): the
+        Also the double-queue regression: the
         new song must appear exactly ONCE. put_front LPUSHes it onto the same
         Redis list restore_entries replays from, so an insert sequenced before
         the snapshot read lands in both legs and gets queued twice.
@@ -3561,7 +3561,7 @@ class TestPlaynow:
         live_vc: MagicMock,
     ) -> None:
         """The one outcome-wording branch with no coverage. Worth pinning now:
-        docs/PLAY_WHILE_PAUSED_PLAN.md §4.2 re-keys these branches off
+        re-keys these branches off
         returns_paused, and an unpinned branch could silently change text."""
         from src.musicplayer import InterjectOutcome
 

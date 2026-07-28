@@ -1,16 +1,15 @@
 """Lifecycle for the process pool that runs yt-dlp extraction.
 
-yt-dlp extraction is only half I/O — JSON parsing, signature decryption and format
-selection are all GIL-bound Python. Running it in a ProcessPoolExecutor (not threads)
-gives concurrent extractions across guilds true parallelism instead of GIL contention
-that also steals time from the event loop serving voice heartbeats. Worker count is
-env-tunable (YTDLP_POOL_WORKERS); each worker holds a full CPython + yt-dlp import
-(~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild
-extraction bursts become the bottleneck. Design: docs/ARCHITECTURE_PLAN.md §3.1.
+Extraction is only half I/O — JSON parsing, signature decryption and format selection
+are GIL-bound, so processes (not threads) give concurrent extractions real parallelism
+instead of contention that also starves the voice-heartbeat loop. Worker count is
+env-tunable (YTDLP_POOL_WORKERS — raise it if multi-guild extraction bursts become
+the bottleneck); each worker costs a full CPython + yt-dlp import (~80–120 MB RSS),
+hence the conservative default.
 
-This module owns the pool's *lifecycle* only and knows nothing about yt-dlp: the
-callable is supplied per call (see run()). That separation is load-bearing for tests —
-see docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.5.
+This module owns the *lifecycle* only and knows nothing about yt-dlp — the callable is
+supplied per call (run()). That separation is load-bearing for tests: they can swap in
+a thread-pool-backed instance without touching extraction code.
 """
 
 import asyncio
@@ -40,32 +39,28 @@ log = get_logger(__name__)
 T = TypeVar("T")
 
 _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
-# How long shutdown waits for in-flight extractions before abandoning the join. yt-dlp
-# carries socket_timeout=30 and retries=10, so an unlucky extraction can outlive any
-# reasonable shutdown; waiting for it would hang the bot's exit. Mirrors the timeout
-# asyncio added to loop.shutdown_default_executor() for the same reason.
+# How long shutdown waits before abandoning the join. yt-dlp's socket_timeout=30 with
+# retries=10 lets an unlucky extraction outlive any reasonable shutdown, and waiting
+# would hang exit. Mirrors asyncio's own loop.shutdown_default_executor() timeout.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
 
 
 def _warmup_noop() -> None:
-    """Submitted by prewarm() only to force a worker to spawn and import yt-dlp before
-    the first real extraction has to pay that cost. Module-level so it is picklable to
-    a worker."""
+    """Submitted by prewarm() to force a worker to spawn and import yt-dlp before the
+    first real extraction pays that cost. Module-level so it is picklable."""
     return None
 
 
 def _worker_init(log_queue: Optional[Any] = None) -> None:
     """Per-worker setup, hardened so it can never raise.
 
-    The stdlib contract is unforgiving: "Should initializer raise an exception, all
-    currently pending jobs will raise a BrokenProcessPool, as well as any attempt to
-    submit more jobs to the pool." Verified against 3.14.6 — and because a rebuilt pool
-    runs the same initializer, run()'s heal-once retry is futile for this failure class:
-    it would double the failure latency and log a misleading "a worker died".
+    Per the stdlib contract (verified on 3.14.6), an initializer that raises makes every
+    pending AND future submit raise BrokenProcessPool. run()'s heal-once retry cannot
+    help — a rebuilt pool runs the same initializer — so it would only double the
+    latency and log a misleading "a worker died".
 
-    Degrading to unstructured worker logs is strictly better than bricking every
-    extraction in the process. Reported via stderr rather than log.*, because the thing
-    that just failed is the logging configuration.
+    Unstructured worker logs beat bricking all extraction. Reported on stderr, not
+    log.*, because the thing that just failed is the logging configuration.
     """
     try:
         configure_worker_logging(log_queue)
@@ -75,11 +70,11 @@ def _worker_init(log_queue: Optional[Any] = None) -> None:
 
 
 def _trace_carrier() -> dict[str, str]:
-    """The parent's current trace context, as picklable strings for a worker to rebind.
+    """The parent's trace context as picklable strings for a worker to rebind.
 
-    A worker has no TracerProvider under Option B, so trace.get_current_span() there is
-    always invalid — the correlation has to be carried in explicitly. Empty when there is
-    no active span (prewarm, tests without a span)."""
+    Workers have no TracerProvider under Option B, so get_current_span() is always
+    invalid there and correlation must be carried explicitly. Empty when no span is
+    active (prewarm, tests without a span)."""
     ctx = trace.get_current_span().get_span_context()
     if not ctx.is_valid:
         return {}
@@ -90,22 +85,21 @@ def _trace_carrier() -> dict[str, str]:
 
 
 def _call_with_context(carrier: dict[str, str], fn: Callable[..., T], *args: Any) -> T:
-    """Bind the parent's trace context for the duration of the call, then run fn through
-    the picklable-error net. Runs in the worker (or the test thread). bound_contextvars
-    resets on exit, so a worker serving its next job does not inherit a stale trace_id."""
+    """Bind the parent's trace context, then run fn through the picklable-error net.
+    Runs in the worker (or the test thread). bound_contextvars resets on exit, so the
+    worker's next job does not inherit a stale trace_id."""
     with structlog.contextvars.bound_contextvars(**carrier):
         return _picklable_call(fn, *args)
 
 
 class RemoteCallError(Exception):
-    """Generic picklable stand-in for a worker exception that cannot cross the boundary.
+    """Generic picklable stand-in for a worker exception that can't cross the boundary.
 
-    Every field MUST have a default (see ExtractionError in src/youtube.py for the full
-    reasoning): the default BaseException.__reduce__ reconstructs the exception as
-    `cls(*args)` and restores the rest from __dict__ state, so a required positional would
-    *serialise* fine in the worker and then fail to *unpickle* in the parent's
+    Every field MUST have a default: the default BaseException.__reduce__ rebuilds as
+    `cls(*args)` and restores the rest from __dict__ state, so a required positional
+    *serialises* fine in the worker and then fails to *unpickle* in the parent's
     executor-manager thread, killing it and breaking the pool permanently — the exact
-    failure this class exists to prevent.
+    failure this class prevents. Same rule applies to ExtractionError in src/youtube.py.
     """
 
     def __init__(self, message: str = "", original_type: str = "") -> None:
@@ -137,30 +131,26 @@ def _picklable_call(fn: Callable[..., T], *args: Any) -> T:
 class PoolClosedError(RuntimeError):
     """Raised when work is submitted after shutdown().
 
-    Deliberately an error rather than a silent rebuild: a submit during shutdown means a
-    background task outlived close(), and spawning four fresh worker processes to serve it
-    would leave them orphaned (nothing joins a pool created after the join). Callers on the
-    extraction path already handle exceptions — prefetch_stream logs and swallows, the
-    command paths surface an error embed.
+    An error rather than a silent rebuild: a submit during shutdown means a background
+    task outlived close(), and fresh workers spawned to serve it would be orphaned
+    (nothing joins a pool created after the join). Extraction callers already handle
+    exceptions — prefetch_stream logs and swallows, commands surface an error embed.
 
-    Subclasses RuntimeError to match the stdlib exactly: Executor.submit() after
-    shutdown() "will raise RuntimeError", so any handler written against the underlying
-    executor's contract keeps working.
+    Subclasses RuntimeError to match the stdlib, where submit-after-shutdown "will raise
+    RuntimeError", so handlers written against the executor's contract keep working.
     """
 
 
 class YtdlpPool:
     """The process's yt-dlp extraction pool: lazy creation, break-healing, shutdown.
 
-    One instance per process, held by src.youtube. Not a singleton by construction —
-    tests build their own with a thread-pool factory, which is the whole point (a
-    ProcessPoolExecutor pickles the submitted callable, and the MagicMock that tests
-    patch onto _ytdlp_extract is unpicklable; a real patch would never reach a worker
-    anyway).
+    One instance per process, held by src.youtube. Deliberately not a singleton — tests
+    build their own with a thread-pool factory, since a ProcessPoolExecutor pickles the
+    submitted callable and the MagicMock patched onto _ytdlp_extract is unpicklable.
 
-    The executor is created lazily so importing this module never spawns children:
-    under the 3.14 spawn/forkserver start method each worker re-imports the parent's
-    modules, and an eager pool would have every worker construct a nested one.
+    The executor is lazy so importing this module never spawns children: under
+    spawn/forkserver each worker re-imports the parent's modules, and an eager pool
+    would have every worker construct a nested one.
     """
 
     def __init__(
@@ -172,33 +162,29 @@ class YtdlpPool:
         self._executor_factory = executor_factory or self._spawn_process_pool
         self._executor: Optional[Executor] = None
         self._closed = False
-        # Monotonic, incremented per executor built. Without it, "the pool broke" logs
-        # from before and after a rebuild are indistinguishable, and a pool breaking
-        # repeatedly looks identical to one breaking once.
+        # Monotonic per executor built, so "the pool broke" logs from before and after a
+        # rebuild are distinguishable and repeated breaks don't look like one break.
         self._generation = 0
-        # Guards _executor, _closed and _generation. aclose() keeps every mutation on
-        # the event-loop thread, so this is defence in depth rather than load-bearing —
-        # but shutdown() is public and will eventually be called from an atexit hook or
-        # a signal handler, and the class should be correct when it is. Never held
-        # across a join.
+        # Guards _executor, _closed and _generation. Defence in depth — aclose() keeps
+        # every mutation on the event-loop thread — but shutdown() is public and may be
+        # called from an atexit hook or signal handler. Never held across a join.
         self._lock = threading.Lock()
-        # Option B worker-log plumbing (§12.2). Pool-scoped, not executor-scoped: built
-        # once on the first real spawn and reused across break-heal rebuilds, since the
-        # listener forwards to the parent's root handlers regardless of which executor
-        # generation produced the record. None under the thread-pool test seam.
+        # Option B worker-log plumbing. Pool-scoped, not executor-scoped: built
+        # on the first real spawn and reused across break-heal rebuilds, since the
+        # listener forwards to the parent's root handlers regardless of generation.
+        # None under the thread-pool test seam.
         self._log_queue: Optional[Any] = None
         self._log_listener: Optional[QueueListener] = None
 
     def _spawn_process_pool(self) -> Executor:
-        # initializer runs _worker_init() once per worker so yt-dlp's warnings (emitted
-        # from inside extract_info, now in a worker) reach the parent structured.
-        # ProcessPoolExecutor.__init__ does not spawn — workers start on first submit —
-        # so constructing this under the lock is cheap.
+        # initializer runs _worker_init() per worker so yt-dlp's warnings (emitted inside
+        # extract_info, now in a worker) reach the parent structured. Cheap under the
+        # lock: __init__ does not spawn — workers start on first submit.
         if self._log_listener is None:
             # respect_handler_level=True so a worker DEBUG record is not force-emitted by
-            # an INFO handler. Started with the root handlers live at spawn time — in
-            # production that is after setup_telemetry(), so the OTel LoggingHandler is
-            # among them and worker records reach Loki by the same path as the parent's.
+            # an INFO handler. Takes the root handlers live at spawn time — in production
+            # that is post-setup_telemetry(), so the OTel LoggingHandler is among them
+            # and worker records reach Loki by the parent's own path.
             self._log_queue = multiprocessing.Queue()
             self._log_listener = QueueListener(
                 self._log_queue, *logging.root.handlers, respect_handler_level=True
@@ -238,11 +224,10 @@ class YtdlpPool:
     def _replace(self, broken: Executor) -> None:
         """Drop `broken` so the next _acquire() builds a fresh executor.
 
-        Identity-checked: if two concurrent extractions both hit BrokenProcessPool, only
-        the first discards — the second would otherwise throw away the healthy
-        replacement the first just built. The broken executor is best-effort shut down
-        without waiting, to release its manager thread (a broken pool never accepts new
-        work, so waiting would be pointless).
+        Identity-checked: when two concurrent extractions both hit BrokenProcessPool,
+        only the first discards — the second would throw away the healthy replacement
+        the first just built. Shut down without waiting, to release the manager thread;
+        a broken pool never accepts work, so waiting is pointless.
         """
         with self._lock:
             if self._executor is not broken:
@@ -256,17 +241,13 @@ class YtdlpPool:
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """Run `fn(*args)` in the pool, healing a broken pool once.
 
-        A ProcessPoolExecutor becomes permanently broken if a worker dies abnormally —
-        most plausibly the OOM killer reaping one under memory pressure — after which
-        every submit raises BrokenProcessPool for the life of the process. Rebuild and
-        retry once so a single worker death doesn't brick all extraction across every
-        guild (the old ThreadPoolExecutor had no equivalent all-or-nothing failure mode).
-        A second failure is a real problem and propagates to the caller's existing error
-        handling.
+        A ProcessPoolExecutor breaks permanently when a worker dies abnormally (most
+        plausibly the OOM killer), after which every submit raises BrokenProcessPool for
+        the life of the process. Rebuild and retry once so one worker death doesn't
+        brick extraction for every guild; a second failure propagates to the caller.
 
-        `fn` is a parameter, never stored: it is looked up in the caller's module at call
-        time, which is what keeps `patch("src.youtube._ytdlp_extract")` working in the 29
-        tests that rely on it.
+        `fn` is a parameter, never stored — it is looked up in the caller's module at
+        call time, which keeps `patch("src.youtube._ytdlp_extract")` working.
         """
         loop = asyncio.get_running_loop()
         carrier = _trace_carrier()
@@ -298,10 +279,9 @@ class YtdlpPool:
     def _close(self) -> Optional[Executor]:
         """Mark the pool closed and unpublish its executor, returning it to be joined.
 
-        The join is the caller's business precisely because it blocks: the lock is
-        released before it happens. Holding it across a join would stall every concurrent
-        run() for no benefit — the executor is already unpublished and _closed is already
-        set, so there is nothing left to race over.
+        The join is the caller's business because it blocks: the lock is released first.
+        Holding it across a join would stall every concurrent run() for nothing — the
+        executor is already unpublished and _closed already set.
         """
         with self._lock:
             self._closed = True
@@ -311,16 +291,14 @@ class YtdlpPool:
     async def aclose(self, timeout: float = _SHUTDOWN_TIMEOUT_SECS) -> None:
         """Close the pool from the event loop: flip the flag here, join off-thread.
 
-        The production shutdown path. Modelled on asyncio's own
-        loop.shutdown_default_executor(): the state change happens synchronously on the
-        event-loop thread, and only the blocking join is handed to a worker thread. That
-        is what makes cross-thread mutation of this object's state structurally
-        impossible rather than merely locked.
+        The production shutdown path, modelled on loop.shutdown_default_executor(): the
+        state change happens synchronously on the event-loop thread and only the join is
+        handed off, which makes cross-thread mutation structurally impossible rather
+        than merely locked.
 
-        A join that outruns `timeout` is abandoned, not awaited: yt-dlp's own retry
-        budget can keep an extraction alive far longer than a bot shutdown should take.
-        The abandoned thread is still running — nothing can cancel a thread mid-join —
-        but the process is exiting, and the workers are killed with it.
+        A join that outruns `timeout` is abandoned, not awaited — yt-dlp's retry budget
+        can outlast any reasonable shutdown. The abandoned thread keeps running (nothing
+        can cancel a thread mid-join), but the process is exiting and takes it along.
         """
         executor = self._close()
         if executor is not None:
@@ -335,37 +313,31 @@ class YtdlpPool:
                     f"{timeout}s — terminating its workers"
                 )
                 # shutdown(wait=False) does NOT bound exit: the abandoned join keeps the
-                # executor-manager thread alive, and concurrent.futures registers
-                # _python_exit (via threading._register_atexit) to join that thread at
-                # interpreter exit. Measured: 61s to exit with an in-flight extraction,
-                # 3.4s once the workers are actually SIGTERMed.
+                # manager thread alive and concurrent.futures' _python_exit atexit hook
+                # joins it at interpreter exit. Measured: 61s to exit with an in-flight
+                # extraction, 3.4s once the workers are actually SIGTERMed.
                 if isinstance(executor, ProcessPoolExecutor):
                     executor.terminate_workers()
                 else:
                     executor.shutdown(wait=False, cancel_futures=True)
-        # Unconditional, even when _close() returned None: a concurrent _replace() during
-        # a break-heal can null the executor out from under _close() while leaving the log
-        # listener running, so an early return here would leak that listener thread (and
-        # its multiprocessing.Queue feeder) for the life of the process. When there IS an
-        # executor, this still runs only after its workers are gone — join or terminate
-        # above — never before (see _stop_log_listener).
+        # Unconditional even when _close() returned None: a concurrent _replace() during
+        # a break-heal can null the executor out while leaving the listener running, so
+        # an early return would leak that thread (and its Queue feeder) for the life of
+        # the process. When there IS an executor this still runs only after its workers
+        # are gone — join or terminate above (see _stop_log_listener).
         self._stop_log_listener()
 
     def shutdown(self, wait: bool = True) -> None:
-        """Synchronous close — the counterpart to aclose() for a caller with no event loop
-        to await. Used by the test suite; production shutdown flows through aclose()
-        (MusicBotApp.close() -> ytdlp_pool.aclose()).
+        """Synchronous close, for a caller with no event loop to await. Used by tests;
+        production flows through aclose() (MusicBotApp.close() -> ytdlp_pool.aclose()).
 
-        No atexit or signal handler is registered onto this, despite the shape inviting
-        it: discord.py already routes SIGTERM/KeyboardInterrupt through the bot's close(),
-        and ProcessPoolExecutor's own _python_exit atexit hook reaps any worker-manager
-        thread that outlives the process. It is exposed for a no-loop caller that wants an
-        explicit join rather than relying on that reaping.
+        Deliberately NOT registered as an atexit or signal handler despite the shape
+        inviting it: discord.py already routes SIGTERM/KeyboardInterrupt through the
+        bot's close(), and _python_exit reaps any manager thread that outlives it.
 
         Blocking by default (joins worker processes). Idempotent, and safe when no
-        executor was ever created. After this, submits raise PoolClosedError rather than
-        silently spawning a fresh pool that nothing will ever join. Prefer aclose() from
-        async code.
+        executor was created. After this, submits raise PoolClosedError rather than
+        spawning a pool nothing joins. Prefer aclose() from async code.
         """
         executor = self._close()
         if executor is not None:

@@ -1,10 +1,10 @@
-"""The `-ping` health dashboard: dependency probes, rendering, and the live-edit loop.
+"""The `-ping` health dashboard: dependency probes, rendering, live-edit loop.
 
-One feature, one module. The three sections below are separated by rules rather
-than by files: an earlier split put the probes in src/diagnostics.py so a healthz
-endpoint could reuse them, but src/healthz.py is deliberately a dumb liveness probe
-(it must NOT fail on dependency health, or a Redis blip becomes a pod restart loop),
-so that second consumer never existed. Full design: docs/PING_METADATA_PLAN.md.
+One feature, one module — the sections below are separated by rules, not files.
+An earlier split put the probes in src/diagnostics.py so a healthz endpoint could
+reuse them, but healthz must stay a dumb liveness probe (failing it on dependency
+health turns a Redis blip into a pod restart loop), so that consumer never
+existed.
 
 src/musicbot.py holds only the command registration and delegates in here.
 """
@@ -46,19 +46,17 @@ log = get_logger(__name__)
 # SECTION 1 · PROBES & VERSIONS — infrastructure, no Discord message concepts
 # ════════════════════════════════════════════════════════════════════════════
 # Nothing below this rule until SECTION 2 knows about embeds, channels or ctx. Each
-# probe is an ``async def`` returning a ProbeResult and never raising out: a dead
-# dependency becomes DOWN, so the caller's loop can always render. The one exception
-# it lets through is CancelledError — the live-edit loop cancels still-pending probes
-# at its deadline and flips them to FAILED itself.
+# probe returns a ProbeResult and never raises out — a dead dependency becomes DOWN so
+# the caller can always render. CancelledError is the one exception let through: the
+# live-edit loop cancels still-pending probes at its deadline and flips them to FAILED.
 
-# Live-edit loop tunables (see run_health_dashboard). Env-overridable
-# for slow/remote deployments. See docs/PING_METADATA_PLAN.md §5.2/§8.
+# Live-edit loop tunables (run_health_dashboard), env-overridable for slow/remote
+# deployments.
 PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
 PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
 
-# Throwaway key the Redis probe writes to prove the write path is open (see
-# probe_redis). Namespaced away from guild:* / spotify:* and self-expiring, so it
-# never accumulates and can't collide with real state.
+# Throwaway key proving the write path is open (see probe_redis). Namespaced away
+# from guild:*/spotify:* and self-expiring, so it never accumulates or collides.
 _REDIS_HEALTH_KEY = "health:ping"
 _REDIS_HEALTH_TTL_SECS = 30
 
@@ -90,9 +88,8 @@ def _error_detail(e: Exception) -> str:
     """A short, renderable reason for a failed probe.
 
     Server-side Redis errors lead with an uppercase code — MISCONF (persistence
-    broken), OOM (maxmemory + noeviction), READONLY (replica) — which says far
-    more to an operator than the redis-py exception class ("ResponseError").
-    Falls back to the exception class name for everything else.
+    broken), OOM, READONLY (replica) — which tells an operator far more than the
+    redis-py class name ("ResponseError"). Falls back to the class name.
     """
     head = str(e).split(maxsplit=1)[0] if str(e) else ""
     if head.isalpha() and head.isupper() and 2 < len(head) <= 12:
@@ -101,10 +98,9 @@ def _error_detail(e: Exception) -> str:
 
 
 async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResult:
-    """Run a probe body, time it, and classify the outcome.
-
-    Never raises except for CancelledError (which the deadline path relies on to
-    flip a cancelled probe to FAILED). Any other failure becomes a DOWN result.
+    """Run a probe body, time it, classify the outcome. Never raises except
+    CancelledError, which the deadline path relies on to flip a cancelled probe to
+    FAILED; every other failure becomes DOWN.
     """
     start = time.perf_counter()
     try:
@@ -125,11 +121,10 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
     """PING *and* a throwaway write.
 
     PING alone is misleading: Redis keeps serving reads while refusing writes —
-    MISCONF after a failed bgsave (observed live: full disk → every guild's state
-    write failing while -ping still showed green), OOM under maxmemory+noeviction,
-    READONLY on a replica. The bot writes guild state, queues and history
-    constantly, so a probe that never writes isn't measuring what the bot needs.
-    One short-TTL key, self-expiring, is enough to exercise the write path.
+    MISCONF after a failed bgsave (observed live: full disk failed every guild's
+    state write while -ping stayed green), OOM under maxmemory+noeviction,
+    READONLY on a replica. The bot writes constantly, so a probe that never writes
+    isn't measuring what it needs. One short-TTL key exercises the write path.
     """
     if redis is None:
         return ProbeResult("Redis", ProbeState.NA)
@@ -144,17 +139,15 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
 async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
-    """Spotify's row, which reports the *source's* usability, not just reachability.
+    """Spotify's row: the *source's* usability, not just reachability.
 
-    `status` is the outcome of the startup credential probe (MusicBot._spotify_status):
-    it is the only thing that can tell "configured but Spotify rejected the
-    credentials" apart from "reachable but slow", and it does so without spending a
-    doomed API call. It defaults to ENABLED so a caller that has no status to offer
+    `status` (from MusicBot._spotify_status' startup probe) is the only thing that
+    separates "configured but rejected" from "reachable but slow", without
+    spending a doomed API call. Defaults to ENABLED so a caller with no status
     still gets the plain reachability probe.
     """
-    # spotify is None when the bot was started without Spotify credentials (the
-    # feature is off entirely); a non-None client with empty creds is the same story
-    # from a probe's point of view. Both are "not configured" → N/A, not a failure.
+    # None client (started without credentials) and a client with empty creds are
+    # the same story here: "not configured" → N/A, not a failure.
     if (
         spotify is None
         or status is SpotifyStatus.DISABLED
@@ -162,15 +155,14 @@ async def probe_spotify(
     ):
         return ProbeResult("Spotify API", ProbeState.NA, detail="not configured")
     if status is SpotifyStatus.INVALID:
-        # Credentials were present at startup and Spotify rejected them. Probing
-        # would only re-earn the same 401 a second time, so report the known cause.
+        # Rejected at startup — probing would only re-earn the same 401.
         return ProbeResult(
             "Spotify API", ProbeState.DOWN, detail="credentials rejected"
         )
 
     async def _do() -> None:
         # Reachability without spending quota: a tiny authenticated GET that also
-        # exercises the token-refresh path. Confirms auth + data plane.
+        # exercises the token-refresh path, confirming auth + data plane.
         await spotify.http_call(
             spotify.spotify_endpoint + "v1/browse/categories", params={"limit": 1}
         )
@@ -180,7 +172,7 @@ async def probe_spotify(
 
 async def probe_postgres(pg_pool: Optional[object]) -> ProbeResult:
     # Typed `object`: asyncpg is not a dependency on main. When the Postgres tier
-    # lands, narrow to asyncpg.Pool (docs/PING_METADATA_PLAN.md §11).
+    # lands, narrow to asyncpg.Pool.
     if pg_pool is None:
         return ProbeResult("Postgres", ProbeState.NA)
 
@@ -194,19 +186,19 @@ async def probe_postgres(pg_pool: Optional[object]) -> ProbeResult:
 async def probe_otel() -> ProbeResult:
     if telemetry._tracer_provider is None:
         return ProbeResult("OTEL collector", ProbeState.OFF)
-    # urlparse only fills .hostname/.port when a scheme is present. Operators
-    # often set OTEL_EXPORTER_OTLP_ENDPOINT scheme-less ("collector:4317"), which
-    # would parse to hostname=None and silently probe localhost. Prepend "//" when
-    # no scheme is present so we connect to the endpoint they actually configured.
+    # urlparse fills .hostname/.port only with a scheme present, and operators often
+    # set OTEL_EXPORTER_OTLP_ENDPOINT scheme-less ("collector:4317"), which parses to
+    # hostname=None and silently probes localhost. Prepend "//" so we connect to the
+    # endpoint they actually configured.
     raw = telemetry._OTLP_ENDPOINT
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
     host, port = parsed.hostname or "localhost", parsed.port or 4317
 
     async def _do() -> None:
-        # gRPC OTLP has no cheap app-level ping; a TCP connect proves the port is
-        # accepting connections. Liveness signal only (not a real OTLP handshake),
-        # and — unlike the auto-instrumented Redis/aiohttp probes — it emits no
-        # child span, so this row won't appear in the ping's fan-out trace.
+        # gRPC OTLP has no cheap app-level ping, so a TCP connect proves only that
+        # the port accepts connections — not a real OTLP handshake. Unlike the
+        # auto-instrumented Redis/aiohttp probes it emits no child span, so this
+        # row never appears in the ping's fan-out trace.
         _, writer = await asyncio.open_connection(host, port)
         writer.close()
         await writer.wait_closed()
@@ -220,11 +212,11 @@ async def probe_otel() -> ProbeResult:
 def bot_version() -> str:
     """The bot's own version, cached for process lifetime.
 
-    Read from pyproject.toml (copied into the runtime image), not installed dist
-    metadata: the container installs deps with `poetry install --no-root`, so the
-    project itself is never a metadata-bearing distribution and
-    importlib.metadata.version() would raise PackageNotFoundError. Falls back to
-    dist metadata for a wheel install that ships no pyproject.toml, then "unknown".
+    From pyproject.toml (copied into the runtime image), not dist metadata: the
+    container installs with `poetry install --no-root`, so the project is never a
+    metadata-bearing distribution and metadata.version() would raise
+    PackageNotFoundError. Falls back to dist metadata for a wheel install that ships
+    no pyproject.toml, then "unknown".
     """
     global _bot_version_cache
     if _bot_version_cache is not None:
@@ -271,11 +263,10 @@ def ffmpeg_version() -> str:
 
 
 async def collect_versions() -> dict[str, str]:
-    """All versions for the embed's Versions block. ffmpeg's first (uncached) call
-    shells out, so it runs in the default executor to keep the loop unblocked;
-    every other value is a dict lookup. The single await here also gives the
-    already-scheduled immediate probes (NA/OFF) a chance to complete so the
-    skeleton send can pre-drain them (docs/PING_METADATA_PLAN.md §6 step 2)."""
+    """All versions for the embed's Versions block. ffmpeg's first call shells out,
+    so it goes to the default executor to keep the loop unblocked; the rest are dict
+    lookups. This single await also lets the already-scheduled immediate probes
+    (NA/OFF) complete so the skeleton send can pre-drain them."""
     loop = asyncio.get_running_loop()
     ffmpeg = await loop.run_in_executor(None, ffmpeg_version)
     return {
@@ -290,12 +281,12 @@ async def collect_versions() -> dict[str, str]:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 · RENDERING — ProbeResults to a Discord embed
 # ════════════════════════════════════════════════════════════════════════════
-# docs/PING_METADATA_PLAN.md §6.2. Pure presentation: takes the values SECTION 1
-# produces and decides dots, colours and layout. No I/O.
+# Pure presentation: takes the values SECTION 1 produces and decides dots, colours
+# and layout. No I/O.
 
-# One band table drives BOTH the status dot and the embed accent so a probe can't
-# show, say, a green dot under a yellow accent. These bands (≤100/≤200) differ on
-# purpose from util.latency_color's (≤50/≤100/≤200), which backs the lighter
+# One band table drives BOTH the status dot and the embed accent, so a green dot
+# can't appear under a yellow accent. These bands (≤100/≤200) differ on purpose
+# from util.latency_color's (≤50/≤100/≤200), which backs the lighter
 # send_latency_line reply — don't swap one for the other.
 _LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
     (100, "🟢", 0x44FF44),
@@ -314,10 +305,9 @@ _PING_PROBING = 0x5865F2  # blurple: at least one row still pending
 
 
 def _latency_band(ms: float) -> tuple[str, int]:
-    # Total over every float, INCLUDING nan (nan <= cap is always False): fall back
-    # to the worst band so an unknown latency can never StopIteration. discord.py's
-    # Client.latency is nan whenever the gateway ws is down (reconnect window), which
-    # is exactly when -ping is most likely to be run.
+    # Total over every float INCLUDING nan (nan <= cap is always False): fall back to
+    # the worst band so an unknown latency can never StopIteration. discord.py's
+    # Client.latency is nan while the gateway ws is down — exactly when -ping runs.
     return next(
         ((dot, hue) for cap, dot, hue in _LATENCY_BANDS if ms <= cap),
         _LATENCY_BANDS[-1][1:],
@@ -340,10 +330,9 @@ def _ping_value(r: ProbeResult) -> str:
         ProbeState.DOWN: "down",
         ProbeState.FAILED: "failed",
     }[r.state]
-    # A bare "down" makes an operator go read logs; the reason (MISCONF, OOM,
-    # ConnectionError) is the actionable half and costs one short parenthetical.
-    # An n/a row gets the same treatment when it has a reason to give — "not
-    # configured" is why an optional dependency is dark, and it costs nothing.
+    # A bare "down" sends an operator to the logs; the reason (MISCONF, OOM,
+    # ConnectionError) is the actionable half and costs one parenthetical. n/a rows
+    # get the same treatment when they have a reason to give.
     if r.state in (ProbeState.DOWN, ProbeState.NA) and r.detail:
         return f"{word} ({r.detail})"
     return word
@@ -363,8 +352,8 @@ def render_ping_embed(
 
     Accent: any down/failed → red; else any still-pending → blurple; else the
     worst OK latency's band colour (same bands as the dots)."""
-    # discord.py reports nan latency while the gateway ws is reconnecting — show it
-    # as down (red) rather than a bogus number, matching the old latency_color(nan).
+    # nan latency means the gateway ws is reconnecting — show down (red) rather
+    # than a bogus number.
     disc = (
         ProbeResult("Discord gateway", ProbeState.DOWN, detail="reconnecting")
         if math.isnan(discord_ms)
@@ -404,8 +393,8 @@ def render_ping_embed(
 
 
 def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
-    """True when a re-render actually differs — the only things that move are the
-    two field values, the colour, and the footer, all captured by to_dict()."""
+    """True when a re-render actually differs. Only the two field values, the
+    colour and the footer move, and to_dict() captures all of them."""
     return new.to_dict() != old.to_dict()
 
 
@@ -427,10 +416,9 @@ async def _safe_edit(
 
 
 async def send_latency_line(ctx: commands.Context, bot_latency: float) -> None:
-    """The lightweight one-line WS-latency reply. Used by -join (and cold -play,
-    via join) so the common connect path never pays for the full health dashboard
-    — see docs/PING_METADATA_PLAN.md §2.3. Sent through ctx.send so it still
-    honours the Now Playing host machinery."""
+    """The lightweight one-line WS-latency reply. Used by -join (and cold -play via
+    join) so the common connect path never pays for the full dashboard. Sent through
+    ctx.send, so it still honours the Now Playing host machinery."""
     ms = bot_latency * 1000
     await send_embed(
         ctx,
@@ -449,20 +437,20 @@ async def run_health_dashboard(
     spotify_status: SpotifyStatus = SpotifyStatus.ENABLED,
     pg_pool: Optional[object] = None,
 ) -> None:
-    """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md §5).
+    """Optimistic-send + live-edit health dashboard.
 
-    Fires a skeleton embed immediately, then edits it in place each tick as probes
-    return; a hard deadline fails any straggler. Runs inside the caller's span.
-    Exceptions propagate — the command owns the user-facing error reply.
+    Sends a skeleton embed immediately, then edits in place each tick as probes
+    return; a hard deadline fails any straggler. Runs inside the caller's span and
+    lets exceptions propagate — the command owns the user-facing error reply.
     """
     span = trace.get_current_span()
     loop = asyncio.get_running_loop()
     tasks: dict[str, asyncio.Task[ProbeResult]] = {}
 
     def _drain() -> bool:
-        """Fold every finished probe task into `results`; True if a row moved.
-        Only genuinely-completed tasks are done() here (cancellation happens at
-        the deadline/finally), so .result() never re-raises."""
+        """Fold every finished probe into `results`; True if a row moved. Only
+        genuinely-completed tasks are done() here (cancellation happens at the
+        deadline/finally), so .result() never re-raises."""
         changed = False
         for label in [lbl for lbl in pending if tasks[lbl].done()]:
             results[label] = tasks[label].result()
@@ -471,9 +459,9 @@ async def run_health_dashboard(
         return changed
 
     try:
-        # 1. launch probes INSIDE try so `finally` cancels them no matter where
-        #    a later await raises. create_task copies the otel context, so child
-        #    probe spans (auto-instrumented Redis/aiohttp) nest under bot.ping.
+        # 1. launch INSIDE try so `finally` cancels them wherever a later await
+        #    raises. create_task copies the otel context, so child probe spans
+        #    nest under bot.ping.
         tasks = {
             "Redis": asyncio.create_task(probe_redis(redis)),
             "Spotify API": asyncio.create_task(probe_spotify(spotify, spotify_status)),
@@ -483,14 +471,14 @@ async def run_health_dashboard(
         results = {label: ProbeResult(label, ProbeState.PENDING) for label in tasks}
         pending = set(tasks)
 
-        # 2. instant data + skeleton. collect_versions() awaits (executor hop),
-        #    which lets the immediate NA/OFF probes complete; pre-drain them so
-        #    those rows never flash "pending…" for a tick.
+        # 2. instant data + skeleton. collect_versions()'s executor hop lets the
+        #    immediate NA/OFF probes complete; pre-drain them so those rows never
+        #    flash "pending…" for a tick.
         versions = await collect_versions()
         _drain()
         discord_ms = bot_latency * 1000
         last = render_ping_embed(results, versions, discord_ms, span)
-        message = await ctx.channel.send(embed=last)  # bypass NP host (§5.3)
+        message = await ctx.channel.send(embed=last)  # bypass NP host
 
         # 3. live-edit loop: tick, drain, edit-on-change; exit early when done.
         deadline = loop.time() + PING_DEADLINE_SECS
@@ -501,9 +489,9 @@ async def run_health_dashboard(
                 if _ping_embed_changed(embed, last):
                     last = await _safe_edit(message, embed) or last
 
-        # 4. deadline: fail only what is STILL pending. Re-check done() first —
-        #    a probe can finish during step 3's final edit await, and flipping
-        #    it to FAILED unconditionally would report a healthy dep as red.
+        # 4. deadline: fail only what is STILL pending. Re-check done() first — a
+        #    probe can finish during step 3's final edit await, and flipping it to
+        #    FAILED unconditionally would report a healthy dep as red.
         if pending:
             for label in pending:
                 if tasks[label].done():

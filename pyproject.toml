@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "1.2.1"
+version = "1.2.2"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -16,8 +16,7 @@ pynacl = "1.6.2"
 davey = "^0.1.5"
 # `default` brings yt-dlp-ejs (JS challenge solver scripts, exact-pinned by yt-dlp);
 # `deno` brings the Deno binary as a PyPI wheel, discovered via the venv scripts dir —
-# together they make web_safari a working fallback client behind android_vr
-# (docs/PO_TOKEN_SIDECAR_PLAN.md).
+# together they make web_safari a working fallback client behind android_vr.
 yt-dlp = { version = "2026.7.4", extras = ["default", "deno"] }
 # Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in
 # docker-compose.yml are released in lockstep — bump both together.
@@ -158,8 +157,8 @@ extend-select = ["ANN"]
 # ANN401 (`Any` in a signature) is the one ANN rule that is not mechanical: the
 # `Any`s in this repo are load-bearing at the yt-dlp and discord.py boundaries,
 # where the upstream types are genuinely dynamic. Narrowing the ones that *can*
-# be narrowed is tracked separately (see docs/TYPING_BRANCH_REVIEW_FIXES_PLAN.md
-# Phase 2); enabling the rule now would bury the 4 real return-type gaps under
+# be narrowed is tracked separately; enabling the rule now would bury the 4 real
+# return-type gaps under
 # 94 judgement calls.
 ignore = ["ANN401"]
 
