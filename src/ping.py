@@ -11,7 +11,6 @@ src/musicbot.py holds only the command registration and delegates in here.
 
 import asyncio
 import math
-import os
 import platform
 import subprocess
 import time
@@ -35,7 +34,17 @@ from opentelemetry.trace import Span
 from yt_dlp.version import __version__ as _YTDLP_VERSION
 
 from src import telemetry
-from src.config import ENVIRONMENT, SpotifyStatus
+
+# Live-edit loop tunables (see run_health_dashboard), env-overridable for
+# slow/remote deployments. Defined in config.py rather than here so there is
+# one answer to "what does this bot read from the environment?" — see
+# docs/PING_METADATA_PLAN.md §5.2/§8.
+from src.config import (
+    ENVIRONMENT,
+    PING_DEADLINE_SECS,
+    PING_TICK_SECS,
+    SpotifyStatus,
+)
 from src.spotify import Spotify
 from src.util import get_logger, latency_color, send_embed, trace_footer
 
@@ -50,11 +59,6 @@ log = get_logger(__name__)
 # dependency becomes DOWN, so the caller's loop can always render. The one exception
 # it lets through is CancelledError — the live-edit loop cancels still-pending probes
 # at its deadline and flips them to FAILED itself.
-
-# Live-edit loop tunables (see run_health_dashboard). Env-overridable
-# for slow/remote deployments. See docs/PING_METADATA_PLAN.md §5.2/§8.
-PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
-PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
 
 # Throwaway key the Redis probe writes to prove the write path is open (see
 # probe_redis). Namespaced away from guild:* / spotify:* and self-expiring, so it

@@ -6,6 +6,8 @@ cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
 truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
 """
 
+import asyncio
+
 import redis.asyncio as aioredis
 from typing import Any, cast
 from redis.asyncio import Redis
@@ -37,6 +39,28 @@ def store(fake_redis: aioredis.Redis) -> GuildRedisStore:
     return GuildRedisStore(fake_redis, guild_id=42)
 
 
+class StubArchive:
+    """An archive holding exactly what it is told to hold.
+
+    The default stand-in used to be a bare `object()`, which was fine while
+    the archive was write-only. recent() reads it now (Phase B), so the
+    default has to be something with the protocol's shape — an EMPTY one, so
+    every test written against the Redis/cache tiers keeps exercising those
+    tiers by falling through.
+    """
+
+    def __init__(self, entries: list[HistoryEntry] | None = None) -> None:
+        self.entries = entries or []
+        self.calls: list[tuple[int, int]] = []
+
+    async def insert_batch(self, entries: Any) -> None:
+        self.entries.extend(entries)
+
+    async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
+        self.calls.append((guild_id, limit))
+        return self.entries[:limit]
+
+
 def _history(
     store: Any,
     *,
@@ -47,12 +71,13 @@ def _history(
     """GuildHistory with the required archive/notify wiring defaulted.
 
     Both are mandatory on the real constructor (the Postgres tier is not
-    optional), but most tests here exercise the display legs and do not care
-    which archive object is behind them — a sentinel is enough, since add()
-    only ever checks that one exists. Tests that DO care pass their own."""
+    optional). Most tests here exercise the display legs, so the default
+    archive is an empty StubArchive: recent() consults it, finds nothing, and
+    falls through to exactly the tier the test is about. Tests that DO care
+    pass their own."""
     return GuildHistory(
         store,
-        archive=cast(Any, archive if archive is not None else object()),
+        archive=cast(Any, archive if archive is not None else StubArchive()),
         guild_id=guild_id,
         on_outbox_push=on_outbox_push if on_outbox_push is not None else (lambda: None),
     )
@@ -98,7 +123,7 @@ class TestAddOutboxRouting:
     """Postgres archive wiring (docs/POSTGRES_HISTORY_PLAN.md §5.4): every
     add() pushes to the outbox and nudges the drainer. Unconditional — the
     archive is a required tier, so there is no no-archive shape to gate on.
-    Write path only: recent() is untouched until the Phase C read flip."""
+    Write path only — the read path is TestRecentReadsPostgresFirst."""
 
     async def test_add_routes_entry_to_outbox_too(
         self, store: GuildRedisStore, fake_redis: Redis
@@ -177,6 +202,112 @@ class TestRecent:
 
     async def test_falls_back_to_cache_without_store(self) -> None:
         h = _history(None)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+
+
+class TestRecentReadsPostgresFirst:
+    """Phase B. Postgres holds every play, including ones no Redis window can
+    still show — so it has to be the first tier asked, and every failure has to
+    fall THROUGH rather than surface, because -history is a display command."""
+
+    async def test_a_full_archive_result_short_circuits_redis(
+        self, store: GuildRedisStore
+    ) -> None:
+        # >= limit rows means the archive can answer on its own; Redis is not
+        # read at all. This is the steady state after the backfill.
+        h = _history(store, archive=StubArchive([_entry(9), _entry(8)]))
+        await h.add(_entry(1))
+        assert await h.recent(2) == [_entry(9), _entry(8)]
+
+    async def test_short_archive_result_is_merged_with_redis(
+        self, store: GuildRedisStore
+    ) -> None:
+        """REGRESSION: a non-empty-but-SHORT archive result used to be returned
+        as-is, so -history went silently shallow for the whole window between
+        deploying the archive and finishing the backfill — a guild with 50
+        pre-deploy plays showed 1 as soon as one song drained. The window is
+        structural (the backfill cannot run before the schema and outbox exist),
+        so it hit every guild on every deploy. It also covers the steady state,
+        where the newest plays are still in the outbox and only Redis has them.
+        """
+        h = _history(store, archive=StubArchive([_entry(9), _entry(8)]))
+        await h.add(_entry(1))  # in Redis and the cache, not in the archive
+        assert await h.recent(10) == [_entry(9), _entry(8), _entry(1)]
+
+    async def test_merge_dedups_entries_present_in_both(
+        self, store: GuildRedisStore
+    ) -> None:
+        # The overlap is the normal case: an entry is on the Redis list AND
+        # archived. Identity is (played_at, webpage_url) — the archive's own
+        # dedup key — so it must appear exactly once.
+        h = _history(store, archive=StubArchive([_entry(1)]))
+        await h.add(_entry(1))
+        assert await h.recent(10) == [_entry(1)]
+
+    async def test_merge_still_honours_the_limit(self, store: GuildRedisStore) -> None:
+        h = _history(store, archive=StubArchive([_entry(9)]))
+        for n in (1, 2, 3):
+            await h.add(_entry(n))
+        assert await h.recent(2) == [_entry(9), _entry(3)]
+
+    async def test_archive_is_scoped_to_this_guild_and_limit(self) -> None:
+        stub = StubArchive([_entry(9)])
+        h = _history(None, archive=stub, guild_id=777)
+        await h.recent(5)
+        assert stub.calls == [(777, 5)]
+
+    async def test_empty_archive_falls_through_to_redis(
+        self, store: GuildRedisStore
+    ) -> None:
+        # A guild whose plays are all still in the outbox has no archive rows
+        # yet — rendering "no history" there would be wrong.
+        h = _history(store, archive=StubArchive([]))
+        await h.add(_entry(1))
+        assert await h.recent(10) == [_entry(1)]
+
+    async def test_archive_failure_falls_through_and_warns(
+        self, store: GuildRedisStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class BrokenArchive:
+            async def insert_batch(self, entries: Any) -> None: ...
+
+            async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
+                raise OSError("pg unreachable")
+
+        h = _history(store, archive=BrokenArchive())
+        await h.add(_entry(1))
+        assert await h.recent(10) == [_entry(1)]
+        assert "fell back to redis" in caplog.text
+
+    async def test_slow_archive_is_bounded_and_falls_through(
+        self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import src.guild_history as guild_history
+
+        monkeypatch.setattr(guild_history, "_ARCHIVE_READ_TIMEOUT_SECS", 0.02)
+
+        class SlowArchive:
+            async def insert_batch(self, entries: Any) -> None: ...
+
+            async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
+                await asyncio.Event().wait()
+                return []
+
+        h = _history(store, archive=SlowArchive())
+        await h.add(_entry(1))
+        assert await h.recent(10) == [_entry(1)]
+
+    async def test_archive_failure_with_no_store_still_reaches_the_cache(
+        self,
+    ) -> None:
+        class BrokenArchive:
+            async def insert_batch(self, entries: Any) -> None: ...
+
+            async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
+                raise OSError("pg unreachable")
+
+        h = _history(None, archive=BrokenArchive())
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
 

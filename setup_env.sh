@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Bootstrap .env and derive POSTGRES_PASSWORD from DISCORD_TOKEN.
+# Bootstrap .env and generate POSTGRES_PASSWORD.
 #
-#   ./setup_env.sh            # create/patch .env, derive the password if unset
-#   ./setup_env.sh --force    # re-derive even if a password is already set
+#   ./setup_env.sh            # create/patch .env, generate the password if unset
+#   ./setup_env.sh --force    # regenerate even if a password is already set
 #
-# Creates .env from .env.example when it doesn't exist, then writes a
-# POSTGRES_PASSWORD derived as sha256("<domain>:" + DISCORD_TOKEN). Deriving
-# rather than prompting means the archive needs no extra secret to manage: the
-# one credential you already had to configure produces it.
+# Creates .env from .env.example when it doesn't exist, then writes a random
+# 128-bit POSTGRES_PASSWORD.
+#
+# The password used to be DERIVED as sha256("<domain>:" + DISCORD_TOKEN), which
+# saved managing one secret at the cost of tying two unrelated ones together:
+# the database credential became a function of the Discord token, so anyone who
+# obtained the token could compute it, rotating the token silently invalidated
+# a live database credential, and one leaked secret compromised two systems.
+# Generating instead removes the coupling entirely — the password now depends
+# on nothing else, and DISCORD_TOKEN no longer has to be set before this runs.
 #
 # Hex output is deliberate — the password is interpolated into a DSN
 # (postgresql://user:PASS@host/db) by docker-compose.yml, and hex has no
 # characters that would need URL-escaping there.
 #
-# IDEMPOTENT BY DEFAULT, and that is a safety property, not politeness: the
-# password is a function of DISCORD_TOKEN, so rotating the token would derive a
-# DIFFERENT password. Postgres only reads POSTGRES_PASSWORD when it initializes
-# an empty data directory — an existing postgres-data volume keeps the old
-# credential, and a silently-rewritten .env would leave the bot unable to
-# authenticate against its own database. So an already-set password is left
-# alone unless you pass --force (and --force warns about exactly this).
+# IDEMPOTENT BY DEFAULT, and that is a safety property, not politeness:
+# Postgres only reads POSTGRES_PASSWORD when it initializes an empty data
+# directory. An existing postgres-data volume keeps whatever password it was
+# created with, so silently rewriting .env would leave the bot unable to
+# authenticate against its own database. An already-set password is left alone
+# unless you pass --force (and --force warns about exactly this).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -29,9 +34,6 @@ source ./build_common.sh
 
 ENV_FILE=".env"
 TEMPLATE=".env.example"
-# Domain separation: the stored value is not a bare sha256 of the token, so this
-# password and the token are not interchangeable if one is ever seen in isolation.
-DOMAIN="discord-music-bot:postgres"
 FORCE=0
 
 while [ $# -gt 0 ]; do
@@ -44,16 +46,17 @@ done
 
 die() { printf 'Error: %s\n' "$1" >&2; shift; for l in "$@"; do printf '       %s\n' "$l" >&2; done; exit 1; }
 
-_sha256_hex() {
-    # printf '%s' (no trailing newline) so the digest is stable across tools.
-    if command -v sha256sum >/dev/null 2>&1; then
-        printf '%s' "$1" | sha256sum | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
-    elif command -v openssl >/dev/null 2>&1; then
-        printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'
+_random_hex() {
+    # 16 bytes = 128 bits, hex-encoded. openssl first because it is the one
+    # tool present on essentially every developer machine; /dev/urandom is the
+    # fallback for a stripped container. Both are CSPRNGs — do NOT substitute
+    # $RANDOM or a timestamp, which would make the password guessable.
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 16
+    elif [ -r /dev/urandom ]; then
+        head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
     else
-        die "no sha256 tool found (need sha256sum, shasum, or openssl)."
+        die "no source of randomness found (need openssl or /dev/urandom)."
     fi
 }
 
@@ -75,7 +78,15 @@ _set_env_var() {
     fi
     # Preserve the original mode (a .env is often 600); mktemp creates 600 anyway,
     # but an existing stricter/looser mode should survive the rewrite.
-    if [ -f "$file" ]; then chmod --reference="$file" "$tmp" 2>/dev/null || chmod 600 "$tmp"; fi
+    #
+    # `chmod --reference` is GNU-only — on macOS, this project's primary dev
+    # platform, it always failed and silently fell through to 600, so the
+    # preserve-the-mode intent never actually applied there. Read the mode with
+    # stat instead, trying the BSD spelling first and then the GNU one.
+    if [ -f "$file" ]; then
+        mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null || echo '')"
+        if [ -n "$mode" ]; then chmod "$mode" "$tmp"; else chmod 600 "$tmp"; fi
+    fi
     mv "$tmp" "$file"
 }
 
@@ -90,49 +101,40 @@ else
     CREATED=0
 fi
 
-# ── 2. DISCORD_TOKEN must be real ────────────────────────────────────────────
-token="$(_env_value DISCORD_TOKEN "$ENV_FILE")"
-# The "unchanged default" is whatever the template ships, read from the template
-# rather than hardcoded here, so the two can never drift apart.
-placeholder=""
-[ -f "$TEMPLATE" ] && placeholder="$(_env_value DISCORD_TOKEN "$TEMPLATE")"
-
-if [ -z "$token" ]; then
-    die "DISCORD_TOKEN is not set in $ENV_FILE." \
-        "At minimum, DISCORD_TOKEN must be populated — POSTGRES_PASSWORD is" \
-        "derived from it, so there is nothing to derive from until you set it." \
-        "Edit $ENV_FILE, then re-run ./setup_env.sh"
-fi
-
-if [ -n "$placeholder" ] && [ "$token" = "$placeholder" ]; then
-    die "DISCORD_TOKEN is still the placeholder from $TEMPLATE ('$placeholder')." \
-        "At minimum, DISCORD_TOKEN must be populated with your real bot token —" \
-        "POSTGRES_PASSWORD is derived from it, and deriving from the shared" \
-        "placeholder would give every checkout the same database password." \
-        "Edit $ENV_FILE, then re-run ./setup_env.sh"
-fi
-
-# ── 3. derive + write (idempotent unless --force) ────────────────────────────
+# ── 2. generate + write (idempotent unless --force) ──────────────────────────
 existing="$(_env_value POSTGRES_PASSWORD "$ENV_FILE")"
 if [ -n "$existing" ] && [ "$FORCE" -eq 0 ]; then
     echo "POSTGRES_PASSWORD is already set in $ENV_FILE — leaving it untouched."
-    echo "  (Re-derive with --force. Only do that if no postgres-data volume has"
+    echo "  (Regenerate with --force. Only do that if no postgres-data volume has"
     echo "   been initialized yet: Postgres reads this only on first init, so an"
     echo "   existing volume would keep the old password and reject the new one.)"
 else
     if [ -n "$existing" ] && [ "$FORCE" -eq 1 ]; then
         echo "WARNING: overwriting an existing POSTGRES_PASSWORD (--force)."
         echo "  If a postgres-data volume already exists it was initialized with the"
-        echo "  OLD password and will reject this one. Recreate it with:"
+        echo "  OLD password and will reject this one. Either change it in place with"
+        echo "    docker compose exec postgres psql -U musicbot -c \"ALTER USER musicbot PASSWORD '<new>'\""
+        echo "  or recreate the volume:"
         echo "    docker compose down && docker volume rm discord-music-bot_postgres-data"
     fi
-    password="$(_sha256_hex "${DOMAIN}:${token}")"
+    password="$(_random_hex)"
     _set_env_var POSTGRES_PASSWORD "$password" "$ENV_FILE"
-    # Masked: the full value is in $ENV_FILE; no reason to put a credential in
-    # terminal scrollback or CI logs.
-    echo "Set POSTGRES_PASSWORD in $ENV_FILE (sha256-derived, ${password:0:8}…)."
+    # No prefix, not even a masked one: printing the first 8 hex characters put
+    # a third of a 32-character credential into terminal scrollback and CI logs,
+    # which is the thing this comment used to claim it was avoiding. The value
+    # is in $ENV_FILE; nothing here needs to echo any part of it.
+    echo "Set POSTGRES_PASSWORD in $ENV_FILE (32 random hex characters)."
 fi
 
-# ── 4. next step ─────────────────────────────────────────────────────────────
+# ── 3. next steps ────────────────────────────────────────────────────────────
+# Advisory, not a gate: nothing this script writes depends on DISCORD_TOKEN any
+# more, so an unset token is a reminder rather than an error.
+token="$(_env_value DISCORD_TOKEN "$ENV_FILE")"
+placeholder=""
+[ -f "$TEMPLATE" ] && placeholder="$(_env_value DISCORD_TOKEN "$TEMPLATE")"
+if [ -z "$token" ] || { [ -n "$placeholder" ] && [ "$token" = "$placeholder" ]; }; then
+    echo "Note: DISCORD_TOKEN in $ENV_FILE is still unset or the template placeholder."
+    echo "  The bot will not start until you replace it with your real bot token."
+fi
 [ "$CREATED" -eq 1 ] && echo "Remember to fill in the other required values in $ENV_FILE."
 exit 0

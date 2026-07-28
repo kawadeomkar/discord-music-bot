@@ -9,6 +9,7 @@ import orjson
 import pytest
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
+from redis.asyncio.client import Pipeline
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
@@ -19,20 +20,30 @@ from src.guild_state import (
     SongQueueEntry,
 )
 from tests.helpers import mocked
+from src import redis_client
 from src.redis_client import (
+    DRAINER_LEASE_KEY,
+    DRAINER_LEASE_MS,
+    GUILD_TTL,
     HISTORY_CACHE_LIMIT,
+    HISTORY_DLQ_KEY,
     HISTORY_OUTBOX_KEY,
     GuildRedisStore,
     cache_get,
     cache_set,
     close_redis_pool,
     create_redis_pool,
+    dead_letter_outbox,
+    dlq_depth,
     get_redis,
+    hold_drainer_lease,
     outbox_depth,
     peek_outbox_oldest,
+    release_drainer_lease,
     retire_outbox,
     spotify_token_get_with_ttl,
     spotify_token_set,
+    trim_outbox_oldest,
 )
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -474,6 +485,254 @@ class TestOutboxDrainHelpers:
             await retire_outbox(dead, 1)
         with pytest.raises(aioredis.ConnectionError):
             await outbox_depth(dead)
+
+    async def test_trim_drops_oldest(self, fake_redis: Redis) -> None:
+        # The opt-in cap's mechanism. Same shape as retire, different meaning:
+        # these entries never reached Postgres.
+        await self._push(fake_redis, 1, 2, 3)
+        await trim_outbox_oldest(fake_redis, 2)
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_trim_zero_is_noop(self, fake_redis: Redis) -> None:
+        await self._push(fake_redis, 1)
+        await trim_outbox_oldest(fake_redis, 0)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_trim_pops_in_bounded_slices(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REGRESSION: one `RPOP key <count>` for the whole drop. RPOP with a
+        count returns what it popped, so at 490k entries the 206 MB / 5.3s
+        reply blew redis-py's default socket timeout and retry_on_timeout
+        re-issued the destructive pop — emptying a 500k outbox while logging
+        "dropped 490,000". Each command must stay bounded no matter how far
+        the backlog ran."""
+        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
+        await self._push(fake_redis, *range(1, 8))  # 7 entries
+        calls: list[int] = []
+        real_rpop = fake_redis.rpop
+
+        async def counting_rpop(name: str, count: int) -> Any:
+            calls.append(count)
+            return await real_rpop(name, count)
+
+        monkeypatch.setattr(fake_redis, "rpop", counting_rpop)
+        await trim_outbox_oldest(fake_redis, 5)
+        assert calls == [2, 2, 1]  # never one 5-wide pop
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        # And it dropped the OLDEST 5, leaving the two newest.
+        assert await peek_outbox_oldest(fake_redis, 10) == [
+            _hentry(6).to_redis(),
+            _hentry(7).to_redis(),
+        ]
+
+    async def test_trim_stops_when_the_outbox_empties_underneath_it(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A concurrent drain can retire the tail between slices; the loop must
+        # notice the short/empty reply rather than spinning on a gone key.
+        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
+        await self._push(fake_redis, 1, 2)
+        await trim_outbox_oldest(fake_redis, 1000)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+
+
+class TestDeadLetterQueue:
+    async def test_dead_letter_stores_wire_bytes_and_counts(
+        self, fake_redis: Redis
+    ) -> None:
+        assert await dlq_depth(fake_redis) == 0
+        await dead_letter_outbox(fake_redis, b"poison")
+        assert await dlq_depth(fake_redis) == 1
+        assert await fake_redis.lrange(HISTORY_DLQ_KEY, 0, -1) == [b"poison"]
+
+    async def test_dlq_carries_no_ttl(self, fake_redis: Redis) -> None:
+        # Same non-evictable rationale as the outbox: a dead-lettered entry is
+        # still an un-archived play, and evicting it destroys the only record
+        # that it could not be stored.
+        await dead_letter_outbox(fake_redis, b"poison")
+        assert await fake_redis.ttl(HISTORY_DLQ_KEY) == -1
+
+    async def test_dlq_is_separate_from_the_outbox(self, fake_redis: Redis) -> None:
+        await dead_letter_outbox(fake_redis, b"poison")
+        assert await outbox_depth(fake_redis) == 0
+
+
+class TestDrainerLease:
+    async def test_acquire_then_renew_by_the_same_holder(
+        self, fake_redis: Redis
+    ) -> None:
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        assert await hold_drainer_lease(fake_redis, "a") is True  # renew
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+
+    async def test_second_holder_is_refused(self, fake_redis: Redis) -> None:
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        assert await hold_drainer_lease(fake_redis, "b") is False
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+
+    async def test_renew_extends_the_ttl(self, fake_redis: Redis) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await fake_redis.pexpire(DRAINER_LEASE_KEY, 50)
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        ttl = await fake_redis.pttl(DRAINER_LEASE_KEY)
+        assert ttl > DRAINER_LEASE_MS // 2
+
+    async def test_lapsed_lease_is_reacquirable_by_anyone(
+        self, fake_redis: Redis
+    ) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await fake_redis.delete(DRAINER_LEASE_KEY)  # stand-in for expiry
+        assert await hold_drainer_lease(fake_redis, "b") is True
+
+    async def test_release_only_by_the_owner(self, fake_redis: Redis) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await release_drainer_lease(fake_redis, "b")  # not ours
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+        await release_drainer_lease(fake_redis, "a")
+        assert await fake_redis.get(DRAINER_LEASE_KEY) is None
+
+    async def test_release_on_a_missing_lease_is_safe(self, fake_redis: Redis) -> None:
+        await release_drainer_lease(fake_redis, "a")
+
+    async def test_an_aborted_watch_is_retried_and_re_reads(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The WATCH-abort branch, forced.
+
+        It cannot be reached naturally under fakeredis: measured against real
+        redis:7-alpine, TTL-expiry of a WATCHed key DOES abort EXEC, and under
+        fakeredis it does NOT. That divergence hid the one branch that makes
+        renewal safe — a drainer stalled past DRAINER_LEASE_MS whose lease
+        lapses between our GET and our EXEC. On real Redis the transaction
+        aborts and only the retry re-reads and reports the truth; without the
+        retry the caller is told it still owns a lease somebody else can now
+        take, which is the two-drainers state the lease exists to prevent.
+        """
+        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
+        calls = {"n": 0}
+        real_execute_transaction = Pipeline._execute_transaction
+
+        # Patched BELOW execute(), not over it: execute() ends in
+        # `finally: await self.reset()`, and that reset is exactly what lets the
+        # retry re-WATCH — without it the second lap dies on "Cannot issue a
+        # WATCH after a MULTI". Replacing execute() outright would skip it and
+        # test a pipeline redis-py never actually hands us.
+        async def aborting_transaction(self: Any, *args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # What real Redis does when the watched key changed under us —
+                # plus the lapse that made it change.
+                await fake_redis.delete(DRAINER_LEASE_KEY)
+                raise aioredis.WatchError("watched key changed")
+            return await real_execute_transaction(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "_execute_transaction", aborting_transaction)
+        # Must NOT report continued ownership of a lease that is now gone.
+        assert await hold_drainer_lease(fake_redis, "a") is False
+        assert calls["n"] == 1  # retry short-circuited at the re-read, no 2nd EXEC
+
+    async def test_not_the_owner_releases_the_watch(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Leaving a WATCH set on the connection would make the NEXT transaction
+        # on it abort for a key this call had no business watching.
+        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
+        unwatched = MagicMock()
+        real_unwatch = Pipeline.unwatch
+
+        async def counting_unwatch(self: Any) -> Any:
+            unwatched()
+            return await real_unwatch(self)
+
+        monkeypatch.setattr(Pipeline, "unwatch", counting_unwatch)
+        assert await hold_drainer_lease(fake_redis, "b") is False
+        unwatched.assert_called_once()
+
+
+class TestPushHistoryAtomicity:
+    """The display push and the outbox push must ride ONE transactional
+    pipeline. Every existing test checks only end state, which is identical
+    whether they share a pipeline or not."""
+
+    async def test_both_pushes_ride_a_single_transaction(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failure mode if they split: the connection drops between the two
+        round-trips, the display list gains the play and the outbox does not,
+        and no drainer ever sees it — absent from Postgres forever. -history
+        still shows it from Redis, so nobody notices until the Phase C cutover
+        trims the list."""
+        queued: list[str] = []
+        direct: list[str] = []
+        real_pipeline = fake_redis.pipeline
+
+        def spy_pipeline(*args: Any, **kwargs: Any) -> Any:
+            pipe = real_pipeline(*args, **kwargs)
+            for name in ("lpush", "persist", "ltrim", "expire"):
+                original = getattr(pipe, name)
+
+                def record(
+                    *a: Any, _n: str = name, _o: Any = original, **k: Any
+                ) -> Any:
+                    queued.append(_n)
+                    return _o(*a, **k)
+
+                monkeypatch.setattr(pipe, name, record)
+            return pipe
+
+        monkeypatch.setattr(fake_redis, "pipeline", spy_pipeline)
+
+        async def record_direct(*a: Any, **k: Any) -> Any:
+            direct.append("lpush")
+
+        monkeypatch.setattr(fake_redis, "lpush", record_direct)
+
+        store = GuildRedisStore(fake_redis, guild_id=1)
+        await store.push_history(_hentry(1))
+
+        # Two LPUSHes (display + outbox), both on the pipeline, none direct.
+        assert queued.count("lpush") == 2
+        assert direct == []
+
+
+class TestHistoryRedisCutover:
+    """Phase C of the Postgres plan: once Postgres is the source of truth, the
+    Redis history list demotes from unbounded source-of-truth to a bounded
+    display cache. Off by default — flipping it before the backfill has run
+    destroys the only copy of every play older than the cache window."""
+
+    async def test_default_persists_and_never_trims(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT + 5
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_cutover_trims_and_applies_the_idle_ttl(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert 0 < await fake_redis.ttl(store.history_key()) <= GUILD_TTL
+
+    async def test_cutover_never_affects_the_outbox(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The outbox is what makes entries durable; trimming the DISPLAY list
+        # must not drop anything on its way to Postgres.
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await outbox_depth(fake_redis) == HISTORY_CACHE_LIMIT + 5
+        assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
 
 class TestGetHistory:

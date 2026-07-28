@@ -1,5 +1,6 @@
 """Tests for src/main.py — MusicBotApp lifecycle (setup_hook, close, on_ready)."""
 
+import asyncio
 from collections.abc import Iterator
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -193,6 +194,66 @@ class TestClose:
         ):
             await app.close()
         assert order == ["drainer", "archive", "pool"]
+
+    @pytest.mark.parametrize("sick", ["drainer", "archive"])
+    async def test_teardown_completes_when_a_step_raises(
+        self, app: MusicBotApp, sick: str
+    ) -> None:
+        """REGRESSION: drainer.stop() and archive.close() were both unguarded,
+        and both can raise — a hung Postgres made archive.close() raise
+        TimeoutError after 30s, and a drainer task that died with an exception
+        made stop() re-raise it. Because _teardown_started is already set, the
+        retry path short-circuits to super().close(), so every step AFTER the
+        raiser was skipped permanently: Redis pool left open, discord.py never
+        closed, the yt-dlp pool left to its 61s atexit join, and no spans
+        flushed — which hid the very failure that caused it.
+        """
+        boom = AsyncMock(side_effect=RuntimeError(f"{sick} is wedged"))
+        app.history_drainer = MagicMock(stop=boom if sick == "drainer" else AsyncMock())
+        app.history_archive = MagicMock(
+            close=boom if sick == "archive" else AsyncMock()
+        )
+        app._redis_pool = MagicMock()
+        with (
+            patch("src.main.close_redis_pool", new=AsyncMock()) as mock_pool_close,
+            patch.object(
+                commands.AutoShardedBot, "close", new=AsyncMock()
+            ) as mock_super,
+        ):
+            await app.close()  # must not raise
+        # Everything downstream of the sick participant still ran.
+        mock_pool_close.assert_awaited_once()
+        mock_super.assert_awaited_once()
+
+    async def test_teardown_runs_only_once(self, app: MusicBotApp) -> None:
+        # discord.py calls close() from run()'s finally as well as on demand,
+        # and its own idempotence check lives inside super().close() — which
+        # this override only reaches at the END. Without the guard, a second
+        # close() re-runs drainer.stop(), and two concurrent final drains each
+        # peek → insert → retire (H2: 6 pushed, 3 archived, outbox empty).
+        app.history_drainer = MagicMock(stop=AsyncMock())
+        app.history_archive = MagicMock(close=AsyncMock())
+        app._redis_pool = MagicMock()
+        with (
+            patch("src.main.close_redis_pool", new=AsyncMock()) as mock_pool_close,
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()) as sup,
+        ):
+            await app.close()
+            await app.close()
+        app.history_drainer.stop.assert_awaited_once()
+        app.history_archive.close.assert_awaited_once()
+        mock_pool_close.assert_awaited_once()
+        # super().close() still runs on the second call — discord.py's own
+        # teardown is idempotent and expects to be reached.
+        assert sup.await_count == 2
+
+    async def test_concurrent_closes_teardown_once(self, app: MusicBotApp) -> None:
+        app.history_drainer = MagicMock(stop=AsyncMock())
+        app.history_archive = MagicMock(close=AsyncMock())
+        app._redis_pool = None
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await asyncio.gather(app.close(), app.close())
+        app.history_drainer.stop.assert_awaited_once()
 
     async def test_shuts_down_the_ytdlp_pool(self, app: MusicBotApp) -> None:
         """The extraction workers are child processes — a clean close must join them

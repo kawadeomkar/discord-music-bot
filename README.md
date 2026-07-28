@@ -119,9 +119,23 @@ bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 Postgres is the durable home of play history and is **required** — the bot refuses to
 start without `POSTGRES_URL`, rather than quietly buffering history into a Redis
 outbox nothing would ever drain. `POSTGRES_PASSWORD` is mandatory and has no
-fallback; run [`./setup_env.sh`](#install-and-configure) to derive one. To use a
+fallback; run [`./setup_env.sh`](#install-and-configure) to generate one. To use a
 Postgres you already run instead of the bundled service, set `POSTGRES_URL` in `.env`
-and comment out the `POSTGRES_URL` line in `docker-compose.yml`.
+and comment out the `POSTGRES_URL` line in `docker-compose.yml`. If port 5432 is
+already taken on your machine, set `POSTGRES_HOST_PORT` — the bot uses host
+networking, so it reaches the database through the published port.
+
+The schema is applied by a migration runner, not by the bot. `docker compose up`
+runs it for you as a one-shot `db-migrate` service the bot waits on; against an
+external Postgres, run it yourself:
+
+```bash
+just db-migrate            # apply pending migrations
+```
+
+The bot verifies the schema version on its first connection and refuses to serve an
+unmigrated database with a message naming that command. See
+[Operating the play-history archive](#operating-the-play-history-archive).
 
 **To contribute**, add:
 
@@ -166,18 +180,19 @@ SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 ```
 
-Or start from the template and let the helper fill in the derived values:
+Or start from the template and let the helper fill in the generated values:
 
 ```bash
-./setup_env.sh     # copies .env.example -> .env, derives POSTGRES_PASSWORD
+./setup_env.sh     # copies .env.example -> .env, generates POSTGRES_PASSWORD
 ```
 
-It requires `DISCORD_TOKEN` to be set to your real token first — `POSTGRES_PASSWORD`
-is derived from it (`sha256`), so there is nothing to derive from while the
-placeholder is still in place. Re-running is safe: an existing password is left
-alone, because Postgres only reads it when it first initializes its data volume and
-a silently-changed value would lock the bot out of its own database. `--force`
-re-derives anyway and warns about exactly that.
+`POSTGRES_PASSWORD` is a fresh 128-bit random value, independent of every other
+secret — it is deliberately *not* derived from `DISCORD_TOKEN`, so rotating the token
+cannot invalidate a live database credential and one leaked secret does not
+compromise two systems. Re-running is safe: an existing password is left alone,
+because Postgres only reads it when it first initializes its data volume and a
+silently-changed value would lock the bot out of its own database. `--force`
+regenerates anyway and warns about exactly that.
 
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its
@@ -196,11 +211,19 @@ to when something is missing; `just --evaluate` prints it directly.
 ### 3. Run
 
 ```bash
-# Start Redis if you don't have one running
-docker compose up -d redis
+# Backing services: Redis, Postgres, and the one-shot that applies the schema.
+# db-migrate exits 0 when the database is up to date — the bot refuses to start
+# against an unmigrated one.
+docker compose up -d redis postgres db-migrate
 
-poetry run bot
+just run
 ```
+
+`just run` loads `.env` and derives `POSTGRES_URL` from the same
+`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/`POSTGRES_HOST_PORT` values
+Compose uses. The bot process itself reads only the environment — it has no
+`.env` support — so `poetry run bot` works too, but only once you have exported
+`POSTGRES_URL` (and `DISCORD_TOKEN`) yourself.
 
 ## Just recipes
 <a id="just-recipes"></a>
@@ -274,6 +297,23 @@ just test --maxfail=1              # stop at the first failure
 (`./build_docker.sh`). Use `just image` when you want the artifact and have already
 run `just check`.
 
+**Database** — see [Operating the play-history archive](#operating-the-play-history-archive)
+
+| Recipe | Does |
+|---|---|
+| `just db-migrate` | Apply pending play-history schema migrations |
+| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres |
+| `just db-dlq [count]` | List quarantined (dead-lettered) history entries |
+| `just db-backup` | Dump the play-history database to `backups/` |
+| `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
+
+These resolve `POSTGRES_URL` from the environment first, then `.env`, and finally by
+building a host DSN from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
+`POSTGRES_HOST_PORT` — Compose builds the bot's URL internally, so it never appears in
+`.env`. They therefore work the same against the bundled Compose Postgres and an
+external one. A value already exported in your shell wins over `.env`, so
+`POSTGRES_URL=…staging just db-migrate` targets staging.
+
 **Deploy**
 
 | Recipe | Does |
@@ -315,6 +355,8 @@ The Compose stack runs the bot plus its supporting services:
 |---|---|
 | `discord-music-bot` | The bot itself (host networking) |
 | `redis` | Redis 7 with AOF persistence — queue/state/cache storage |
+| `postgres` | Postgres 18 — the durable play-history archive (required) |
+| `db-migrate` | One-shot schema migration, run to completion before the bot starts |
 | `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works ([details](docs/PO_TOKEN_SIDECAR_PLAN.md)); optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
@@ -378,9 +420,14 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
 | `POSTGRES_URL` | ✅ | built by Compose from the three vars below | Play-history archive connection URL. The bot refuses to start without it — Postgres is the durable home of play history, not an optional tier. To point at a Postgres you already run, set this in `.env` and comment out the `POSTGRES_URL` line in `docker-compose.yml` |
-| `POSTGRES_PASSWORD` | ✅ | — | Password for the bundled Postgres service. Deliberately has no fallback: Compose fails the command outright rather than initializing a database with a credential nobody chose. `./setup_env.sh` derives one from `DISCORD_TOKEN` |
+| `POSTGRES_PASSWORD` | ✅ | — | Password for the bundled Postgres service. Deliberately has no fallback: Compose fails the command outright rather than initializing a database with a credential nobody chose. Generated once by `./setup_env.sh`, independent of every other secret |
 | `POSTGRES_USER` | | `musicbot` | Role owning the bundled Postgres service's database |
 | `POSTGRES_DB` | | `musicbot` | Database name on the bundled Postgres service |
+| `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the bot runs on host networking and connects through this port |
+| `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
+| `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
+| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. See [Operating the play-history archive](#operating-the-play-history-archive) |
+| `HISTORY_REDIS_CUTOVER` | | `false` | Phase C switch: demote the Redis history list from unbounded source-of-truth to a bounded display cache (`LTRIM` + 24h TTL). **Only enable after `just db-backfill` has run** — otherwise it trims away the only copy of every older play |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
@@ -390,6 +437,118 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Operating the play-history archive
+
+Play history is written twice on every song end, in one Redis pipeline: to the guild's
+display list, and to a global **outbox** the background drainer moves into Postgres.
+The playback loop never waits on Postgres — an unreachable database just means the
+outbox grows and drains later.
+
+### Schema
+
+```bash
+just db-migrate            # apply pending migrations (idempotent, concurrency-safe)
+```
+
+Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. On its first
+connection it reads `schema_migrations` and refuses to serve a database older than the
+version it was built for, naming this command. A *newer* database is accepted with a
+warning — migrations are additive, so rolling the bot back must not become an outage.
+
+### Backlog and sizing
+
+The outbox is deliberately **not** evictable (Redis runs `volatile-lru`, and the
+outbox key carries no TTL): an entry in it is a play that is not durable yet. Normally
+it is empty within seconds. It only grows while Postgres is unreachable, at a measured
+**≈ 410 B per entry** (`MEMORY USAGE` on real Redis, for an entry with a full title,
+a YouTube URL, a thumbnail URL and a snowflake requester):
+
+| Backlog | Redis memory |
+|---|---|
+| 10 000 entries | ≈ 4 MB |
+| 100 000 entries | ≈ 41 MB |
+| 1 000 000 entries | ≈ 410 MB |
+
+**The bundled Compose Redis runs `--maxmemory 256mb`**, and that budget is shared with
+every guild's state, queue mirror and the `ytdl:*`/`spotify:*` caches — so the practical
+outbox ceiling there is a few hundred thousand entries, not a million. Past it, Redis has
+nothing evictable left (the outbox and DLQ carry no TTL by design) and starts refusing
+**every** write in the process, not just history's. Either raise `maxmemory` for the
+backlog you want to survive, or set `HISTORY_OUTBOX_MAX` and accept the loss. A backlog
+past 10 000 escalates the drainer's
+retry log from WARNING to ERROR; each drain cycle is also an OTEL span
+(`history.drain`) carrying batch size, so drain latency and throughput are visible in
+Grafana. If you would rather bound the memory than keep every play, set
+`HISTORY_OUTBOX_MAX` — the drainer then drops the oldest entries above the cap and
+logs each drop at ERROR.
+
+Entries Postgres will never accept (the drainer isolates them one at a time rather
+than letting one bad row block the batch) are parked, never deleted:
+
+```bash
+just db-dlq                # list quarantined entries; expected to print nothing
+```
+
+### Growth and retention
+
+Nothing prunes `play_history` — keeping every play is the point of the tier. Measured on
+`postgres:18`, 1 000 000 rows is **≈ 373 MB of table plus ≈ 146 MB of indexes**, so a
+busy server accumulates on the order of a gigabyte per few million plays. There is no
+action to take at current scale; the thresholds worth revisiting are **10 M rows or
+5 GB**, at which point monthly range partitions on `played_at`, or swapping the b-tree
+for BRIN, are the obvious next steps. Migration `0002` added an `inserted_at` column
+that a future retention job can key off; nothing reads it today.
+
+### Backups
+
+```bash
+just db-backup                              # -> backups/play_history_<timestamp>.dump
+just db-restore backups/play_history_...    # -> <db>_restore_check, live untouched
+```
+
+`db-restore` targets a **scratch** database by default. Overwriting the live one is
+deliberately awkward, because it drops and replaces every row — including every play
+since the dump:
+
+```bash
+CONFIRM=1 just db-restore backups/play_history_... musicbot
+```
+
+A nightly dump gives an **RPO of ≤ 24 h** for archived history. Plays newer than the
+last dump survive only in the Redis history list (`guild:{id}:history`) — *not* in the
+outbox, which is emptied within seconds of each batch committing. Note that
+`HISTORY_REDIS_CUTOVER=1` trims that list to the display cache, so after cutover the
+nightly dump is the only copy and the 24 h window is real exposure. Schedule it with
+cron or a systemd timer and prune old files:
+
+```cron
+0 4 * * *  cd /srv/discord-music-bot && /usr/local/bin/just db-backup && ls -1t backups/*.dump | tail -n +15 | xargs rm -f
+```
+
+Two details that bite in cron specifically: it runs with a minimal `PATH`, so `just`
+needs its absolute path (`command -v just` to find yours), and `xargs -r` is a GNU
+extension — `xargs rm -f` is the portable way to tolerate an empty list.
+
+Test the restore quarterly — an untested backup is a hypothesis. `just db-restore
+<file>` already restores into `<db>_restore_check` rather than the live database, so
+the drill is just that command followed by `SELECT count(*) FROM play_history` against
+that scratch database. WAL archiving / PITR is
+out of scope for the bundled Compose stack; on a managed Postgres, use the platform's
+own PITR.
+
+### Backfill and the Redis cutover
+
+Plays recorded before the archive existed live only on the Redis history lists. Move
+them across once, then (optionally) let Redis demote to a cache:
+
+```bash
+just db-backfill --dry-run   # report what would move
+just db-backfill             # idempotent and resumable
+```
+
+Order is load-bearing: **backfill → verify → `HISTORY_REDIS_CUTOVER=1`**. Enabling the
+cutover first trims away exactly the entries the backfill exists to preserve.
 
 ## Architecture
 

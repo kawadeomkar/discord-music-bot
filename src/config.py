@@ -2,6 +2,7 @@ import os
 import subprocess
 import warnings
 from enum import Enum
+from typing import Optional
 
 
 def _git_branch() -> str:
@@ -50,6 +51,53 @@ ENVIRONMENT: str = _parse()
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
+
+# -ping's live-edit loop tunables. Constants (not call-time reads) because the
+# dashboard reads them every tick and they are deployment-shape settings, not
+# feature switches. They live here rather than in ping.py so this module stays
+# the one place to answer "what does the bot read from the environment?".
+# See docs/PING_METADATA_PLAN.md §5.2/§8.
+PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
+PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
+
+# Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default)
+# means unbounded, which IS the durability contract: an entry only leaves the
+# outbox once Postgres has it. Operators who would rather lose the oldest
+# un-archived plays than let a long Postgres outage grow the non-evictable list
+# toward Redis' maxmemory can set a cap; the drainer logs every drop at ERROR.
+# Sizing math is in the README's Postgres section (~350 B/entry).
+HISTORY_OUTBOX_MAX: int = int(os.environ.get("HISTORY_OUTBOX_MAX", "0"))
+
+# asyncpg's prepared-statement cache size, per connection. The default matches
+# asyncpg's own. Set to 0 behind PgBouncer in transaction-pooling mode:
+# prepared statements are per-connection state, and transaction pooling hands a
+# different backend to each transaction, so a cached statement handle refers to
+# something the new backend has never seen.
+POSTGRES_STATEMENT_CACHE: int = int(os.environ.get("POSTGRES_STATEMENT_CACHE", "100"))
+
+
+def postgres_url() -> Optional[str]:
+    """The play-history archive's DSN, or None when unset.
+
+    Read at call time (same rationale as spotify_enabled): the bot reads it
+    once at startup, so there is no hot path to optimise, and tests can
+    monkeypatch the environment per case instead of reloading the module.
+    """
+    return os.environ.get("POSTGRES_URL")
+
+
+def history_redis_cutover() -> bool:
+    """True once Postgres is the source of truth for play history and the
+    Redis history list may demote to a bounded display cache (Phase C of
+    docs/POSTGRES_HISTORY_PLAN.md).
+
+    Off by default and deliberately a separate switch from POSTGRES_URL: the
+    archive being *configured* is not the same as the archive being *complete*.
+    Flipping this before `just db-backfill` has run trims away the only copy of
+    every play older than HISTORY_CACHE_LIMIT. Runbook order is
+    backfill → Phase B reads → this flag.
+    """
+    return os.environ.get("HISTORY_REDIS_CUTOVER", "").lower() in ("1", "true", "yes")
 
 
 def spotify_enabled() -> bool:

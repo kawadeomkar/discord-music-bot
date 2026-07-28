@@ -54,6 +54,14 @@ pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
 fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
+# A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
+# several guards in this codebase are asyncio.timeout() calls, and a regression
+# that removes one makes the test HANG rather than fail — three such mutations
+# were measured hanging pytest indefinitely. On GitHub Actions that burns the
+# job's full timeout and reports a cancellation, not a failure, so the signal
+# is lost. `filterwarnings = error` offers no protection here: a hang is not a
+# warning.
+pytest-timeout = "^2.3"
 # Opt-in Postgres integration tier (tests/test_pg_integration.py, marker `pg`).
 # Only imported when RUN_PG_TESTS=1; needs Docker.
 testcontainers = ">=4.8"
@@ -172,6 +180,11 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing"
+# Per-test deadline. Generous relative to the whole suite (~50s for 1400+ tests)
+# because it exists to convert HANGS into failures, not to police slow tests —
+# and it has to leave room for the pg tier's container startup. See the
+# pytest-timeout entry in the test group for why a hang is otherwise invisible.
+timeout = 120
 markers = [
     # Integration tier against a real Postgres, excluded from the default run.
     # Locally it starts postgres:18-alpine via testcontainers (needs Docker);

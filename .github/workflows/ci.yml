@@ -190,10 +190,11 @@ jobs:
 
   # The Postgres tier the default suite skips. A separate job, not a service
   # container bolted onto `test`: that job runs 1200+ tests that never touch
-  # Postgres behind a coverage gate and a PR comment, and this one runs 13 that
-  # do, with --no-cov. Splitting them keeps a Postgres failure legible as a
-  # Postgres failure, and costs no wall-clock time because the jobs run in
-  # parallel.
+  # Postgres behind a coverage gate and a PR comment, and this one runs the pg
+  # tests, with --no-cov. (Not a count — one drifts every time a case is added
+  # and then documents nothing.) Splitting them keeps a Postgres failure
+  # legible as a Postgres failure, and costs no wall-clock time because the
+  # jobs run in parallel.
   #
   # Postgres is a REQUIRED tier for this bot (MusicBotApp.setup_hook refuses to
   # start without POSTGRES_URL), so leaving its SQL validated only by a local

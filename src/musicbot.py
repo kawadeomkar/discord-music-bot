@@ -1339,7 +1339,9 @@ class MusicBot(commands.Cog):
         help=(
             "Lists the songs already played in this server, most recent first.\n\n"
             "`--limit N` controls how many are shown (1-50, default 10). History "
-            "is stored per server and survives a bot restart."
+            "is stored per server, survives a bot restart, and is kept "
+            "permanently — the limit here is a display cap (Discord renders one "
+            "embed per song), not how much is retained."
         ),
         extras={
             "category": "Queue",

@@ -1,5 +1,7 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import os
+import sys
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -15,6 +17,38 @@ from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init
+
+
+def pytest_collection_modifyitems(
+    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Refuse a `-m pg` run that would skip the entire tier.
+
+    An all-skipped tier is otherwise a GREEN job:
+
+        $ env -u RUN_PG_TESTS -u POSTGRES_TEST_URL pytest -m pg -q
+        25 skipped, 1465 deselected      EXIT=0
+
+    `just test-pg` hardcodes RUN_PG_TESTS=1 so this cannot happen through
+    workflow env alone, and CI's `build` needs: pg-integration — but nothing
+    ASSERTED that any pg test actually ran, and three invariants are covered
+    ONLY here (ON CONFLICT dedup, the -history tie-break, and insert_batch's
+    call to _sanitize_entry). A tier that silently stops running is worse than
+    one that was never wired up.
+
+    The env check mirrors test_pg_integration._PG_ENABLED; keep them in step.
+    """
+    if config.option.markexpr != "pg":
+        return
+    if os.getenv("RUN_PG_TESTS") or os.getenv("POSTGRES_TEST_URL"):
+        return
+    print(
+        "\nERROR: `-m pg` selected but the tier is disabled, so every test "
+        "would skip.\n       Set RUN_PG_TESTS=1 (needs Docker) or "
+        "POSTGRES_TEST_URL.",
+        file=sys.stderr,
+    )
+    raise pytest.UsageError("pg tier selected but not enabled")
 
 
 @pytest.fixture(autouse=True)

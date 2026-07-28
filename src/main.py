@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 import discord
 from discord.ext import commands
 
+from src import config
 from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
@@ -108,6 +109,9 @@ class MusicBotApp(commands.AutoShardedBot):
         # event loop exists to start the drainer on.
         self.history_archive: PostgresHistoryArchive
         self.history_drainer: HistoryOutboxDrainer
+        # See close(): teardown runs at most once, no matter how many times
+        # discord.py or a signal handler calls close().
+        self._teardown_started = False
 
     async def setup_hook(self) -> None:
         self._redis_pool = create_redis_pool()
@@ -117,12 +121,16 @@ class MusicBotApp(commands.AutoShardedBot):
         # LPUSHed onto an outbox nobody drains — the failure would surface
         # days later as an un-evictable Redis list, not at the moment of
         # misconfiguration.
-        postgres_url = os.getenv("POSTGRES_URL")
+        postgres_url = config.postgres_url()
         if not postgres_url:
+            # The remedy has to be something that actually works: this process
+            # reads the ENVIRONMENT and has no .env support, so pointing at
+            # setup_env.sh (which only writes .env) sent operators in a circle.
             raise RuntimeError(
                 "POSTGRES_URL is not set. The play-history archive is a required "
-                "tier, not an optional one — run ./setup_env.sh to populate .env, "
-                "or set POSTGRES_URL to an external Postgres "
+                "tier, not an optional one. Under docker compose it is supplied "
+                "for you; for a local run use `just run`, which loads .env and "
+                "derives the URL from it. Otherwise export POSTGRES_URL yourself "
                 "(postgresql://user:password@host:5432/dbname)."
             )
         # Lazy inside: no connection is made here, so startup never blocks on
@@ -177,6 +185,23 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
+        # Reentrancy guard, ahead of everything. discord.py's own close() is
+        # idempotent, but its check lives in super().close() — which this
+        # override only reaches at the END of teardown, so a second close()
+        # would re-run the whole sequence first. That matters most for
+        # drainer.stop(): two concurrent final drains each peek → insert →
+        # retire, and the second retires entries the first never inserted
+        # (H2). The drainer now defends itself as well; this is the belt over
+        # those braces, and it also spares the archive/Redis pools a redundant
+        # second close.
+        #
+        # getattr for the same reason the two reads below use it: close() must
+        # be the one method that cannot itself raise, or it masks whatever
+        # actually went wrong.
+        if getattr(self, "_teardown_started", False):
+            await super().close()
+            return
+        self._teardown_started = True
         # Drainer first (its final drain still needs Redis and the archive),
         # then the archive pool, then the Redis pool they both sat on.
         #
@@ -187,14 +212,33 @@ class MusicBotApp(commands.AutoShardedBot):
         # "POSTGRES_URL is not set" message above, which is the one the
         # operator actually needs to see. This is a lifecycle guard, not the
         # feature being optional.
+        #
+        # Each step is individually guarded, for the same reason the getattr is
+        # there: teardown must run to completion even when one participant is
+        # sick. Both of these CAN raise — a hung Postgres made archive.close()
+        # raise TimeoutError after 30s, and a drainer task that died with an
+        # exception made stop() re-raise it — and because _teardown_started is
+        # already set, the retry path short-circuits to super().close(), so
+        # every step after the raiser was skipped for good: Redis pool left
+        # open, discord.py never closed, the yt-dlp pool left to its 61s atexit
+        # join, and no spans flushed, which hid the very failure that caused it.
         drainer = getattr(self, "history_drainer", None)
         if drainer is not None:
-            await drainer.stop()
+            try:
+                await drainer.stop()
+            except Exception as e:
+                log.warning(f"history drainer shutdown failed: {e}")
         archive = getattr(self, "history_archive", None)
         if archive is not None:
-            await archive.close()
+            try:
+                await archive.close()
+            except Exception as e:
+                log.warning(f"history archive shutdown failed: {e}")
         if self._redis_pool is not None:
-            await close_redis_pool(self._redis_pool)
+            try:
+                await close_redis_pool(self._redis_pool)
+            except Exception as e:
+                log.warning(f"redis pool shutdown failed: {e}")
         await super().close()
         loop = asyncio.get_running_loop()
         # aclose() owns its own off-loop join — only it knows which half blocks, and it

@@ -70,7 +70,13 @@ VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } e
 # venv and every tool below would vanish. pyproject.toml is mounted read-only so
 # ruff/pytest/pyright read the working tree's config rather than the copy baked into
 # the image.
-DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tests" -v "' + REPO + '/pyproject.toml:/app/pyproject.toml:ro"'
+# migrations/ is mounted alongside src/ and tests/ because db_migrate.discover()
+# reads that directory at RUNTIME and a test asserts it agrees with
+# EXPECTED_SCHEMA_VERSION. Baked-in only, adding migrations/0004_*.sql plus the
+# constant bump passed `just test` and failed `DOCKER=1 just test` against the
+# stale copy in the image — and dep_hash() only covers poetry.lock/pyproject.toml,
+# so no rebuild would have been triggered to explain it.
+DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tests" -v "' + REPO + '/migrations:/app/migrations:ro" -v "' + REPO + '/pyproject.toml:/app/pyproject.toml:ro"'
 
 # Two run modes, and the difference is not cosmetic:
 #
@@ -302,9 +308,24 @@ pins:
     # that differs between majors would pass in one place and fail in the other,
     # with nothing pointing at the version as the cause.
     py_pg="$(sed -n 's/^_PG_IMAGE = "\(.*\)"$/\1/p' tests/test_pg_integration.py)"
-    ci_pg="$(sed -n 's|^ *image: \(postgres:.*\)$|\1|p' .github/workflows/ci.yml | head -1)"
+    # Anchored to the pg-integration job, not `head -1`: the first
+    # `image: postgres:*` in the file happens to be that job's today, and a
+    # second postgres service added anywhere above it would silently start
+    # comparing the wrong one.
+    ci_pg="$(awk '/^  pg-integration:/{f=1} f && /image: postgres:/{print $2; exit}' .github/workflows/ci.yml)"
     if [ -z "$py_pg" ] || [ "$py_pg" != "$ci_pg" ]; then
         echo "postgres image drift: test_pg_integration.py=[$py_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    # ...and compose, which is the copy that holds real data. Checking only the
+    # two test-side copies left the deployed server free to drift to another
+    # major while `just pins` and CI stayed green — exactly the scenario above,
+    # but validated against a server nobody runs in production.
+    compose_pg="$(awk '/^  postgres:/{f=1} f && /image: postgres:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$compose_pg" ] || [ "$compose_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: docker-compose.yml=[$compose_pg] ci.yml=[$ci_pg]" >&2
         echo "  Bump both in the same commit." >&2
         fail=1
     fi
@@ -368,8 +389,178 @@ container-test: test-image-rebuild
 # test-pg is here because CI's pg-integration job is a merge gate (`build`
 # needs it), so a green `ci` that skipped it would not mean what it says. It
 # needs Docker, which `container-test` already required of this recipe.
+#
+# [doc(...)] because `just --list` shows only the LAST comment line, so the
+# multi-line reasoning above would otherwise replace this recipe's description
+# with "needs Docker, which `container-test` already required of this recipe."
+[doc('Full local mirror of the CI workflow (check + container-test + test-pg)')]
 [group('check')]
 ci: check container-test test-pg
+
+# ── Play-history database (Postgres) ─────────────────────────────────────────
+#
+# All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
+# the environment, which for a compose deployment means `.env`. They run the
+# LOCAL venv's python against whatever that URL points at — they are operator
+# tools, not container commands, so they work the same against the bundled
+# compose Postgres and an external one. Never routed through DOCKER=1: that
+# switch exists to run the *checks* without a Python toolchain, and pointing a
+# migration at a database is not a check.
+#
+# Load .env when it exists so `just db-migrate` needs no manual export.
+#
+# A value already in the environment WINS over .env, which is why this reads the
+# file itself instead of `set -a; . ./.env`. Sourcing assigns unconditionally,
+# so `.env` silently overrode the caller — `POSTGRES_URL=…staging just
+# db-migrate` migrated the LOCAL database and reported success. Every recipe
+# below picks its target database from these variables, so the one escape hatch
+# a careful operator reaches for has to actually work.
+#
+# The reader is deliberately conservative: first `=` splits (so DSN query
+# strings survive), `#`/blank lines and non-identifier keys are skipped, a
+# trailing CR is stripped (CRLF .env files), and one layer of matched quotes is
+# removed to match what sourcing would have done.
+_dotenv := '''
+    set -euo pipefail
+    if [ -f .env ]; then
+        while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+            case "$_k" in ''|'#'*) continue ;; esac
+            case "$_k" in *[!A-Za-z0-9_]*) continue ;; esac
+            [ -n "${!_k+x}" ] && continue
+            _v="${_v%$'\r'}"
+            case "$_v" in
+                \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+                \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+            esac
+            export "$_k=$_v"
+        done < .env
+    fi
+    # Build a HOST dsn from the compose parts when POSTGRES_URL is unset. The
+    # bundled stack synthesises the bot's URL inside compose (docker-compose.yml
+    # builds it from POSTGRES_USER/PASSWORD/DB), so it never lands in .env — and
+    # without this every recipe below died with "POSTGRES_URL is not set" on the
+    # exact stack the README tells you to run, including db-backfill, which is
+    # the mandatory step before HISTORY_REDIS_CUTOVER=1.
+    if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
+        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
+    fi
+'''
+
+# Bootstrap .env with a generated POSTGRES_PASSWORD. Indexed here because the
+# justfile is meant to be the index of every dev command, and this is the first
+# one a new contributor runs.
+[doc('Create/refresh .env with a generated Postgres password')]
+[group('dev')]
+setup *ARGS:
+    ./setup_env.sh {{ ARGS }}
+
+# Run the bot against the compose-backed services.
+#
+# `poetry run bot` alone does NOT work from a fresh clone: the bot reads its
+# configuration from the ENVIRONMENT and has no .env support, but POSTGRES_URL
+# is now a hard startup requirement — so the documented local-run flow ended at
+# "POSTGRES_URL is not set", pointing at a setup_env.sh that cannot fix it.
+# This recipe supplies the same environment the db-* recipes use (.env, then a
+# host DSN built from the compose parts), which is the piece that was missing.
+# Bring the services up first: docker compose up -d redis postgres db-migrate
+[doc('Run the bot locally with .env loaded (services must already be up)')]
+[group('dev')]
+run:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    if [ -z "${POSTGRES_URL:-}" ]; then
+        echo "POSTGRES_URL is unset and could not be derived from .env." >&2
+        echo "Run ./setup_env.sh, or export POSTGRES_URL yourself." >&2
+        exit 1
+    fi
+    exec {{ quote(VENV_BIN / 'python') }} -m src.main
+
+# Apply pending schema migrations — the bot refuses to start against an
+# unmigrated database (PostgresHistoryArchive._assert_schema_version).
+[doc('Apply pending play-history schema migrations')]
+[group('database')]
+db-migrate:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
+
+# Copy pre-archive history off the Redis lists into Postgres. Idempotent and
+# resumable (ON CONFLICT DO NOTHING). MUST run before HISTORY_REDIS_CUTOVER=1.
+[doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
+[group('database')]
+db-backfill *ARGS:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
+
+# Show entries the drainer could not archive. Expected to print nothing; each
+# line is one play Postgres refused, kept verbatim so it can be replayed.
+[doc('List quarantined (dead-lettered) history entries')]
+[group('database')]
+db-dlq COUNT='10':
+    docker compose exec -T redis redis-cli lrange history:outbox:dlq 0 {{ COUNT }}
+
+# Custom-format dump (-Fc): compressed and restorable selectively, unlike plain
+# SQL. Writes into backups/, which is gitignored.
+[doc('Dump the play-history database to backups/')]
+[group('database')]
+db-backup:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    mkdir -p backups
+    out="backups/play_history_$(date +%F_%H%M%S).dump"
+    # Dump to a temp file and rename only on success. Redirecting straight into
+    # "$out" creates it BEFORE pg_dump runs, so a failed dump left a 0-byte
+    # .dump behind — which the README's prune (`ls -1t | tail -n +15`) then
+    # keeps as the newest backup while deleting a real older one.
+    tmp="$out.partial"
+    # -T: no TTY, or the dump arrives with \r\n line endings and is unusable.
+    if docker compose exec -T postgres pg_dump -U "${POSTGRES_USER:-musicbot}" -Fc \
+        "${POSTGRES_DB:-musicbot}" > "$tmp"; then
+        mv "$tmp" "$out"
+        echo "wrote $out"
+    else
+        rm -f "$tmp"
+        echo "pg_dump failed; no backup written" >&2
+        exit 1
+    fi
+
+# Restore a dump produced by db-backup.
+#
+# Defaults to a SCRATCH database, not the live one. The README asks for a
+# quarterly restore drill "into a scratch database", and the only tool it offers
+# is this recipe — which used to DROP and reload the live tables unconditionally,
+# destroying every play since the dump. Overwriting live now takes both an
+# explicit name and CONFIRM=1.
+#
+# --clean --if-exists: replace objects rather than collide with existing ones.
+# --single-transaction: a failed restore rolls back instead of leaving the
+# target with its tables dropped and half its rows reloaded.
+[doc('Restore a dump into a scratch DB (or DB=<name> CONFIRM=1 for the live one)')]
+[group('database')]
+db-restore FILE DB='':
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    test -f {{ quote(FILE) }} || { echo "no such dump: {{ FILE }}" >&2; exit 1; }
+    live="${POSTGRES_DB:-musicbot}"
+    target={{ quote(DB) }}
+    target="${target:-${live}_restore_check}"
+    if [ "$target" = "$live" ] && [ "${CONFIRM:-}" != "1" ]; then
+        echo "refusing to overwrite the live database '$live'." >&2
+        echo "  drill:    just db-restore {{ FILE }}" >&2
+        echo "            (restores into '${live}_restore_check', live untouched)" >&2
+        echo "  for real: CONFIRM=1 just db-restore {{ FILE }} $live" >&2
+        exit 1
+    fi
+    user="${POSTGRES_USER:-musicbot}"
+    if [ "$target" != "$live" ]; then
+        docker compose exec -T postgres createdb -U "$user" "$target" 2>/dev/null \
+            || true  # already exists: --clean below replaces its contents
+    fi
+    echo "restoring {{ FILE }} -> $target"
+    docker compose exec -T postgres pg_restore -U "$user" -d "$target" \
+        --clean --if-exists --single-transaction < {{ quote(FILE) }}
+    echo "restored into '$target'"
 
 # ── Image and deployment ─────────────────────────────────────────────────────
 #

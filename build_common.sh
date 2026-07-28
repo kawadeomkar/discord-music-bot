@@ -216,7 +216,7 @@ require_postgres_password() {
         echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
         echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
         echo "       built from it, and it has no fallback by design." >&2
-        echo "       Run ./setup_env.sh to derive one from DISCORD_TOKEN." >&2
+        echo "       Run ./setup_env.sh to generate one." >&2
         exit 1
     fi
 }
