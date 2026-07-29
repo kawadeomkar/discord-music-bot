@@ -211,3 +211,54 @@ class TestArchiveTunables:
         monkeypatch.setenv("HISTORY_OUTBOX_MAX", "-1")
         with pytest.raises(ValueError, match="HISTORY_OUTBOX_MAX must be >= 0"):
             self._reload(monkeypatch)
+
+
+class TestHistoryRedisCutoverParsing:
+    """The only destructive switch in the system, so it refuses to guess.
+
+    Every other boolean read in this repo silently treats an unrecognized value
+    as false. That is the right default for a feature toggle and the wrong one
+    here: `HISTORY_REDIS_CUTOVER=on` reading as OFF leaves an operator believing
+    the migration shipped while the key keeps growing unbounded, and nothing at
+    runtime contradicts them. Failing at the moment they are watching is the
+    cheapest signal available.
+    """
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " 1 "])
+    def test_accepted_on_spellings(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", value)
+        assert src.config.history_redis_cutover() is True
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", " off "])
+    def test_accepted_off_spellings(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", value)
+        assert src.config.history_redis_cutover() is False
+
+    def test_unset_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        assert src.config.history_redis_cutover() is False
+
+    @pytest.mark.parametrize("value", ["enabled", "y", "nope", "2", "True!"])
+    def test_unrecognized_values_raise_rather_than_read_as_off(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The failure this closes: a plausible-looking value that silently does
+        # nothing. `y` and `enabled` are exactly what someone types when they
+        # have not read the docs, and the old parser read both as OFF.
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", value)
+        with pytest.raises(ValueError, match="HISTORY_REDIS_CUTOVER"):
+            src.config.history_redis_cutover()
+
+    def test_the_error_lists_the_values_that_work(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An operator who mistyped needs to be told what IS accepted, in the
+        # same message — not sent to the source to find out.
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "enabled")
+        with pytest.raises(ValueError) as exc:
+            src.config.history_redis_cutover()
+        assert "'1'" in str(exc.value) and "'true'" in str(exc.value)

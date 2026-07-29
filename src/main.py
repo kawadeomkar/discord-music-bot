@@ -12,6 +12,8 @@ from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
+    GUILD_TTL,
+    HISTORY_CACHE_LIMIT,
     close_redis_pool,
     create_redis_pool,
     ensure_outbox_group,
@@ -176,6 +178,33 @@ class MusicBotApp(commands.AutoShardedBot):
         self.history_archive = PostgresHistoryArchive(postgres_url)
         self.history_drainer = HistoryOutboxDrainer(self.redis, self.history_archive)
         self.history_drainer.start()
+        # Say which side of the cutover this process is on, every start. It is
+        # the only destructive switch in the system and it had NO runtime signal
+        # at all — no log, no -ping row, no metric — so both ways of being wrong
+        # were silent: a misspelled value ("on", "enabled", a stray space) read
+        # as off while the operator believed the migration had shipped, and a
+        # stale HISTORY_REDIS_CUTOVER=1 in a .env copied to a deployment that
+        # was never backfilled began trimming at each guild's first song end,
+        # logging exactly what a safe run logs. config.history_redis_cutover now
+        # refuses to guess at an unrecognized value, and this line makes the
+        # value it did accept visible without an operator running
+        # `TTL guild:{id}:history` against production by hand.
+        #
+        # WARNING rather than INFO for the destructive side: it is a one-way
+        # step, and a line an operator can grep for after the fact ("when did
+        # this host start trimming?") is worth more than tidy levels.
+        if config.history_redis_cutover():
+            log.warning(
+                "HISTORY_REDIS_CUTOVER=1: guild history lists are a bounded "
+                f"display cache ({HISTORY_CACHE_LIMIT} entries, {GUILD_TTL}s "
+                "idle TTL). Postgres is the only durable record of play history "
+                "on this host."
+            )
+        else:
+            log.info(
+                "HISTORY_REDIS_CUTOVER is off: guild history lists stay "
+                "unbounded and PERSISTed alongside Postgres."
+            )
         for extension in EXTENSIONS:
             await self.load_extension(extension)
         # Spawn the yt-dlp extraction workers before the first -play so it doesn't

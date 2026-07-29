@@ -582,6 +582,51 @@ class TestCli:
         assert "hunter2" not in out  # password never printed
         assert "bot:***@" in out  # …but the user is, so the DSN is identifiable
 
+    async def test_running_after_the_cutover_warns_and_exits_nonzero(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The ordering violation five documents call unrecoverable, and which
+        nothing detected.
+
+        An operator who flipped HISTORY_REDIS_CUTOVER first previously saw 50
+        entries per guild scanned, "N guild(s) backfilled", exit 0 — byte-
+        indistinguishable from a completed migration, at the one moment that
+        distinction is irreversible.
+
+        It still RUNS: whatever survived the trim is worth moving, and refusing
+        would leave someone who made the mistake with no tool at all. What it
+        must not do is let the run pass for a clean one.
+        """
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+
+        assert await backfill_history._run(dry_run=False) == 1
+
+        err = capsys.readouterr().err
+        assert "already enabled" in err
+        assert "CANNOT recover" in err
+        assert "INCOMPLETE" in err
+        # …and it did the salvage work rather than bailing.
+        assert len(wired.rows) == 1
+
+    async def test_the_ordering_check_does_not_fire_when_the_flag_is_off(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The other side: the normal path must stay quiet and exit 0, or the
+        # warning becomes noise an operator learns to skip past.
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        assert await backfill_history._run(dry_run=False) == 0
+        assert "already enabled" not in capsys.readouterr().err
+
     async def test_an_unreachable_database_fails_before_the_walk(
         self,
         fake_redis: Redis,

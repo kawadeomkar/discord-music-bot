@@ -1,8 +1,11 @@
 """Tests for src/main.py — MusicBotApp lifecycle (setup_hook, close, on_ready)."""
 
 import asyncio
+import contextlib
+import logging
 from collections.abc import Iterator
 from typing import Optional
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -244,6 +247,66 @@ class TestOutboxGroupBootstrap:
         mock_pg.assert_called_once()
         mock_drainer.start.assert_called_once()
         mock_load.assert_awaited()
+
+
+class TestCutoverStartupSignal:
+    """The only destructive switch in the system had NO runtime signal at all.
+
+    Both ways of being wrong were silent: a misspelled value read as off while
+    the operator believed the migration shipped (config now refuses to guess),
+    and a stale =1 in a copied .env began trimming at each guild's first song
+    end, logging exactly what a safe run logs. This line is the difference
+    between "grep the logs" and "run TTL against production by hand".
+    """
+
+    def _wire(self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch) -> Any:
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
+        return (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.ensure_outbox_group", new=AsyncMock()),
+            patch("src.main.PostgresHistoryArchive"),
+            patch("src.main.HistoryOutboxDrainer"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        )
+
+    async def test_the_destructive_side_logs_a_warning(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        with contextlib.ExitStack() as stack:
+            for cm in self._wire(app, monkeypatch):
+                stack.enter_context(cm)
+            await app.setup_hook()
+        assert "HISTORY_REDIS_CUTOVER=1" in caplog.text
+        assert "only durable record" in caplog.text
+        # WARNING, not INFO: it is one-way, and an operator asking "when did
+        # this host start trimming?" should find it at a level they grep.
+        assert any(
+            r.levelname == "WARNING" and "HISTORY_REDIS_CUTOVER" in r.message
+            for r in caplog.records
+        )
+
+    async def test_the_safe_side_still_says_so(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Silence on the default path would leave "no line" meaning both "off"
+        # and "this build predates the flag".
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        # INFO, so caplog's default WARNING threshold has to be lowered — the
+        # safe side is deliberately quieter than the destructive one.
+        caplog.set_level(logging.INFO)
+        with contextlib.ExitStack() as stack:
+            for cm in self._wire(app, monkeypatch):
+                stack.enter_context(cm)
+            await app.setup_hook()
+        assert "HISTORY_REDIS_CUTOVER is off" in caplog.text
 
 
 class TestClose:

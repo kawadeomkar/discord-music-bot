@@ -124,6 +124,24 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     pool.shutdown(wait=False)
 
 
+@pytest.fixture(autouse=True)
+def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset the environment switches the suite asserts defaults for.
+
+    `just test` does not load .env, so the exposure is an EXPORTED variable —
+    and the shell most likely to have HISTORY_REDIS_CUTOVER exported belongs to
+    whoever is performing the cutover, i.e. the person who most needs a green
+    suite to mean something. Without this, exporting it turned 14 tests red on
+    assertions about the default (unbounded, PERSISTed) retention.
+
+    Scrubbed at setup, so a test that wants a value still just calls
+    monkeypatch.setenv and wins. Same shape as the ytdlp seam and the structlog
+    contextvar reset above: make the suite mean what it says regardless of the
+    shell it runs in.
+    """
+    monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.

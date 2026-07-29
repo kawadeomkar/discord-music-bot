@@ -16,6 +16,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
 from redis.typing import EncodableT, FieldT
 
+from src.config import history_redis_cutover
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -73,14 +74,19 @@ HISTORY_OUTBOX_CONSUMER = "drainer"
 # clamping and every wire-compatibility rule in guild_state.py are untouched by
 # the transport: R1 changed how entries move, not what they are.
 OUTBOX_FIELD = b"e"
-# 24h idle expiry, never applied to the history key: push_history PERSISTs that
-# list and every TTL path below excludes it unconditionally.
+# 24h idle expiry. Applied to the history key ONLY after the cutover
+# (HISTORY_REDIS_CUTOVER=1 — see push_history, which PERSISTs it before that and
+# EXPIREs it after); every other TTL path excludes that key unconditionally.
 GUILD_TTL = 86400
-# In-memory/display cap only — NOT a retention cap. The Redis history list is
-# unbounded (it holds every played song, and now also feeds the Postgres outbox
-# — see push_history and docs/POSTGRES_HISTORY_PLAN.md); this bounds the
-# GuildHistory deque and every history read so startup stays O(50) against an
-# unbounded list.
+# Display cap — and, after the Phase C cutover, a RETENTION cap too.
+#
+# Pre-cutover it bounds only the GuildHistory deque and each history read, so
+# startup stays O(50) against a Redis list that is still unbounded and holds
+# every play. With HISTORY_REDIS_CUTOVER=1, push_history also LTRIMs the list to
+# this many entries, so raising it to show longer -history changes how much
+# history Redis keeps. That is safe by then — Postgres is the durable copy and
+# -history merges both (guild_history.recent) — but it is no longer a
+# display-only knob, so change it knowing which side of the cutover you are on.
 HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields cleared together on song end / disconnect, and the
@@ -864,36 +870,55 @@ class GuildRedisStore:
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
     # Two keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
-    # eviction candidates: guild:{id}:history and HISTORY_OUTBOX_KEY. Once they fill
-    # the 256mb maxmemory and no TTL-bearing key is left to evict, Redis rejects
+    # eviction candidates: guild:{id}:history (pre-cutover only) and HISTORY_OUTBOX_KEY.
+    # (It was three until the schema lock removed the DLQ — rows Postgres refuses now go
+    # to the play_history_rejected TABLE, which cannot pressure Redis at all.) Once they
+    # fill the 256mb maxmemory and no TTL-bearing key is left to evict, Redis rejects
     # EVERY write with OOM — not just history: state, queue and cache writes all start
     # failing (each store method swallows the error and logs, so persistence silently
     # degrades rather than crashing).
     #
     # Two arrival routes, and the fast one is newer than this comment. History itself
-    # is the slow burn (~1M+ entries) that the migration to Postgres exists to close
-    # (docs/POSTGRES_HISTORY_PLAN.md). The OUTBOX is the fast one: it is near-empty
-    # whenever the drainer is keeping up, but it grows for the whole duration of a
-    # Postgres outage, at ~487 bytes of Redis memory per play (MEMORY USAGE against
-    # the bundled server — README "Sizing"), and it does not need years to matter.
-    # HISTORY_OUTBOX_MAX (config.py) is the opt-in bound on it, and dropping entries
-    # there is real data loss; a Redis memory/eviction alarm is still owed.
+    # is the slow burn (~1M+ entries), and HISTORY_REDIS_CUTOVER is what finally closes
+    # it: post-cutover push_history LTRIMs the list to a bounded cache, so it stops
+    # growing at all (docs/POSTGRES_HISTORY_PLAN.md). The OUTBOX is the fast one and no
+    # flag bounds it: near-empty whenever the drainer is keeping up, but it grows for the
+    # whole duration of a Postgres outage, at ~487 bytes of Redis memory per play (MEMORY
+    # USAGE against the bundled server — README "Sizing"), and it does not need years to
+    # matter. HISTORY_OUTBOX_MAX (config.py) is the opt-in bound on it, and dropping
+    # entries there is real data loss; a Redis memory/eviction alarm is still owed.
     #
     # Do NOT switch to allkeys-lru as a workaround: it would make the outbox evictable,
-    # and an evicted outbox entry is a play that vanishes with no error and no log line
-    # (see docker-compose.yml redis command).
+    # and an evicted outbox entry is a play that vanishes with no error, no rejected-table
+    # row and no log line (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry, mirror it to the Postgres outbox, and PERSIST the
-        history key — no trim, no TTL: the list is an unbounded SECOND copy of
-        every played song. It stopped being the source of truth when the archive
-        landed — Postgres is that now, and -history reads it first — but it
-        stays complete and non-evictable, because the merge behind that read
-        leans on it for everything the archive has not caught up on
+        """LPUSH one entry, mirror it to the Postgres outbox, and set the
+        history key's retention according to how durable the archive already is.
+
+        The list stopped being the source of truth when the archive landed —
+        Postgres is that now, and -history reads it first — but WHAT IT IS FOR
+        changes at the cutover, and so does its retention.
+
+        Pre-cutover (default): PERSIST, no trim. The list stays an unbounded,
+        non-evictable SECOND copy of every played song, because the merge behind
+        -history leans on it for everything the archive has not caught up on:
+        plays still in the outbox, and everything predating the backfill
         (write-per-song-end is the durability boundary; cadence analysis in
-        docs/HISTORY_OVERHAUL_PLAN.md §4). The
-        PERSIST also self-heals pre-migration keys still carrying the old 24h
-        idle expiry.
+        docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
+        pre-migration keys still carrying the old 24h idle expiry.
+
+        Post-cutover (HISTORY_REDIS_CUTOVER=1): Postgres holds everything, so
+        the list demotes to a bounded display cache — LTRIM to
+        HISTORY_CACHE_LIMIT and re-apply the ordinary 24h idle TTL. ONLY flip
+        this after `just db-backfill` has run and reported zero failures:
+        trimming first destroys the only copy of every play older than the cache
+        window. Read per call rather than captured at import so the flag is
+        flippable without an image rebuild (and monkeypatchable in tests).
+
+        The outbox is unaffected either way. It never becomes evictable and
+        never gains a TTL, before or after the cutover — see the eviction note
+        above and docker-compose.yml's volatile-lru comment.
 
         The same wire bytes are also XADDed onto the HISTORY_OUTBOX_KEY stream
         in the same (transactional) pipeline, for the Postgres drainer.
@@ -924,7 +949,11 @@ class GuildRedisStore:
         wire = serialize_history_entry(entry)
         pipe = self.redis.pipeline()
         pipe.lpush(self.history_key(), wire)
-        pipe.persist(self.history_key())
+        if history_redis_cutover():
+            pipe.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            pipe.expire(self.history_key(), GUILD_TTL)
+        else:
+            pipe.persist(self.history_key())
         pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 

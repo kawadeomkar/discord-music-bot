@@ -150,6 +150,53 @@ def postgres_url() -> Optional[str]:
     return os.environ.get("POSTGRES_URL") or None
 
 
+# Accepted spellings for HISTORY_REDIS_CUTOVER. Module-level so the error
+# message below can list them rather than describe them — an operator reading
+# "not a recognized value" needs to be told what IS one, in the same breath.
+# "" is the unset case and belongs with the off set: absent means off.
+_CUTOVER_ON = frozenset({"1", "true", "yes", "on"})
+_CUTOVER_OFF = frozenset({"", "0", "false", "no", "off"})
+
+
+def history_redis_cutover() -> bool:
+    """True once Postgres is the source of truth for play history and the
+    Redis history list may demote to a bounded display cache (Phase C of
+    docs/POSTGRES_HISTORY_PLAN.md).
+
+    Off by default and deliberately a separate switch from POSTGRES_URL: the
+    archive being *configured* is not the same as the archive being *complete*.
+    Flipping this before `just db-backfill` has run trims away the only copy of
+    every play older than HISTORY_CACHE_LIMIT. Runbook order is
+    `just db-backfill` → verify it reports zero failures → this flag.
+
+    STRICT, like _int_env and for the same reason: an unrecognized value raises
+    a named error instead of reading as off. This is the only destructive switch
+    in the system, and a silent misread is invisible in the direction that
+    matters most — `HISTORY_REDIS_CUTOVER=on`, `=enabled`, or `=1` with a
+    leading space (all trivially produced by hand-editing .env) previously read
+    as OFF while the operator believed the cutover had shipped. Nothing reports
+    the effective state at runtime, so the only way to notice was to run
+    `TTL guild:{id}:history` against production by hand. Failing loudly at the
+    one moment the operator is watching is the cheapest possible signal.
+
+    Whitespace is stripped before comparison for the same reason `_int_env`
+    strips: `.env` values reach us verbatim, trailing spaces are invisible in an
+    editor, and "the value looks right but does nothing" is the failure this
+    module exists to prevent.
+    """
+    raw = os.environ.get("HISTORY_REDIS_CUTOVER", "").strip().lower()
+    if raw in _CUTOVER_ON:
+        return True
+    if raw in _CUTOVER_OFF:
+        return False
+    raise ValueError(
+        f"HISTORY_REDIS_CUTOVER={raw!r} is not a recognized value. "
+        f"Enable with one of {sorted(_CUTOVER_ON)}; disable with one of "
+        f"{sorted(_CUTOVER_OFF - {''})} or leave it unset. This flag trims the "
+        f"Redis history lists, so it is never guessed at."
+    )
+
+
 def spotify_enabled() -> bool:
     """True when Spotify-link support should be active — i.e. both Spotify
     credentials are present in the environment.

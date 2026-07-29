@@ -20,10 +20,10 @@ Safe to re-run and safe to interrupt: ON CONFLICT DO NOTHING makes every insert
 idempotent, so a run that dies half-way is resumed simply by running it again.
 Order within a guild does not matter — reads sort on played_at.
 
-This must run BEFORE the cutover that demotes the Redis lists to a capped
-cache (HISTORY_REDIS_CUTOVER=1 — the flag arrives with that change and does not
-exist yet). Trimming those lists first destroys the only copy of exactly the
-entries this exists to move.
+This must run BEFORE HISTORY_REDIS_CUTOVER=1, which demotes the Redis lists to
+a capped cache. Trimming those lists first destroys the only copy of exactly
+the entries this exists to move — so _run refuses to report success if the flag
+is already on, and says what was lost.
 """
 
 import argparse
@@ -40,6 +40,7 @@ from src.guild_state import parse_history_entry
 from src.history_archive import HistoryArchive, PostgresHistoryArchive
 from src.redis_client import (
     GUILD_HISTORY_KEY,
+    HISTORY_CACHE_LIMIT,
     close_redis_pool,
     create_redis_pool,
     get_redis,
@@ -357,6 +358,30 @@ async def _run(dry_run: bool) -> int:
     # the same. This is the only line that tells them apart.
     print(f"source (Redis):     {_redacted(os.getenv('REDIS_URL', _DEFAULT_REDIS))}")
     print(f"destination (PG):   {_redacted(url)}")
+    # THE ORDERING CHECK. Five places state "backfill before cutover or the data
+    # is gone" and, until this line, nothing noticed when it had already
+    # happened: an operator who flipped the flag first saw 50 entries per guild
+    # scanned, "N guild(s) backfilled", exit 0 — byte-indistinguishable from a
+    # completed migration. That is the same class of silence as an unset
+    # REDIS_URL above, which is why the two live together.
+    #
+    # It RUNS ANYWAY rather than refusing. Whatever survived the trim is still
+    # worth moving, and refusing would leave an operator who made the mistake
+    # with no tool at all. What it must not do is let the run be mistaken for a
+    # clean one — hence the warning here, and the non-zero exit below whatever
+    # the report says.
+    cut_over = config.history_redis_cutover()
+    if cut_over:
+        print(
+            "\nWARNING: HISTORY_REDIS_CUTOVER is already enabled on this host.\n"
+            "         The Redis history lists have been trimmed to "
+            f"{HISTORY_CACHE_LIMIT} entries per guild, so anything older than\n"
+            "         that is already gone and this backfill CANNOT recover it. "
+            "Running anyway to move what\n"
+            "         survives, but this run cannot be treated as a completed "
+            "migration.\n",
+            file=sys.stderr,
+        )
     try:
         # PREFLIGHT, and it is what makes --dry-run mean anything. The archive
         # pool is lazy — _ensure() (connect + schema-version check) is reached
@@ -416,7 +441,17 @@ async def _run(dry_run: bool) -> int:
             "reports 0 failures.",
             file=sys.stderr,
         )
-    return 0 if report.ok else 1
+    if cut_over:
+        print(
+            "INCOMPLETE: this ran AFTER HISTORY_REDIS_CUTOVER was enabled, so "
+            "it moved only what the trim left behind. Exiting non-zero because "
+            "a green backfill here does not mean the history was migrated.",
+            file=sys.stderr,
+        )
+    # `cut_over` is part of the verdict, not just the narration: report.ok can
+    # be perfectly true for a run that moved 50 entries out of a guild's former
+    # 40,000, and the exit code is what a script or a careful operator checks.
+    return 0 if report.ok and not cut_over else 1
 
 
 # Operator-facing help. NOT the module docstring: argparse's default formatter

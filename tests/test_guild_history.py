@@ -499,6 +499,74 @@ class TestRecentReadsPostgresFirst:
         assert await h.recent(limit) == []
 
 
+class TestRecentAfterTheCutover:
+    """The property the whole migration exists to deliver, and it only becomes
+    true at this commit.
+
+    Before the cutover the Redis list is a complete second copy, so -history is
+    correct even if the archive is empty. HISTORY_REDIS_CUTOVER=1 demotes that
+    list to the newest HISTORY_CACHE_LIMIT entries — from then on ANY depth
+    beyond the cache window exists only in Postgres, and the merge is the only
+    thing keeping the command whole.
+
+    Neither branch could test this alone: the read path landed one branch
+    earlier, the trim lands here. That gap is exactly where a stacked migration
+    loses invariants.
+    """
+
+    async def test_depth_beyond_the_trimmed_window_comes_from_postgres(
+        self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REGRESSION — this test used to be unable to see either half of what
+        it claims, and the commit that added it said both were mutation-verified.
+
+        Two independent reasons, each sufficient. `get_history()` is itself
+        `LRANGE key 0 HISTORY_CACHE_LIMIT-1`, so `len(...) == HISTORY_CACHE_LIMIT`
+        holds whether the raw list has 50 entries or 60 — asserting on it cannot
+        observe a trim, and the raw `llen` must be read instead. And
+        `recent(HISTORY_MAX_LIMIT)` can never request depth past the Redis
+        window, because HISTORY_MAX_LIMIT *equals* HISTORY_CACHE_LIMIT — the
+        pinning musicbot.py documents as load-bearing is exactly what makes this
+        property unobservable through the command's own ceiling. So the archive
+        leg is asked for depth BELOW that ceiling here, which no `-history`
+        invocation can do but the merge must still handle.
+        """
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        # More plays than the cache window, all archived (as the backfill plus
+        # the drainer would leave them), pushed through the real write path so
+        # the LTRIM actually happens.
+        total = HISTORY_CACHE_LIMIT + 10
+        archived = [_entry(n) for n in range(total)]
+        h = _history(store, archive=QuantizingArchive(list(reversed(archived))))
+        for entry in archived:
+            await h.add(entry)
+
+        # The RAW list, not get_history()'s capped read: this is the assertion
+        # that can tell 50 from 60.
+        assert await store.redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+
+        # Depth the trimmed Redis window cannot supply, so every entry past the
+        # newest 50 can only have come from the archive.
+        deeper = HISTORY_CACHE_LIMIT + 5
+        got = await h.recent(deeper)
+        assert [e.title for e in got] == [
+            f"Song {n}" for n in range(total - 1, total - 1 - deeper, -1)
+        ]
+        assert len(got) > HISTORY_CACHE_LIMIT
+
+    async def test_the_newest_play_survives_the_trim_before_it_is_drained(
+        self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The window the outbox covers: post-cutover the just-played song is in
+        # the trimmed list and the outbox but NOT yet in Postgres. The merge has
+        # to show it, or every -history is one song stale after the cutover.
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        h = _history(store, archive=QuantizingArchive([_entry(1)]))
+        await h.add(_entry(2))  # drained nowhere yet
+        got = await h.recent(10)
+        assert [e.title for e in got] == ["Song 2", "Song 1"]
+
+
 class TestSequenceProtocol:
     def test_len_iter_getitem(self) -> None:
         # The -history command and tests read the cache as a plain sequence.

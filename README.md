@@ -424,6 +424,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
 | `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. See [Operating the play-history archive](#operating-the-play-history-archive) |
+| `HISTORY_REDIS_CUTOVER` | | `false` | Phase C switch: demote the Redis history list from unbounded source-of-truth to a bounded display cache (`LTRIM` + 24h TTL). **Only enable after `just db-backfill` has run** — otherwise it trims away the only copy of every older play |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
@@ -588,7 +589,9 @@ CONFIRM=1 just db-restore backups/play_history_... musicbot
 
 A nightly dump gives an **RPO of ≤ 24 h** for archived history. Plays newer than the
 last dump survive only in the Redis history list (`guild:{id}:history`) — *not* in the
-outbox, which is emptied within seconds of each batch committing. Schedule it with
+outbox, which is emptied within seconds of each batch committing. Note that
+`HISTORY_REDIS_CUTOVER=1` trims that list to the display cache, so after cutover the
+nightly dump is the only copy and the 24 h window is real exposure. Schedule it with
 cron or a systemd timer and prune old files:
 
 ```cron
@@ -605,6 +608,19 @@ the drill is just that command followed by `SELECT count(*) FROM play_history` a
 that scratch database. WAL archiving / PITR is
 out of scope for the bundled Compose stack; on a managed Postgres, use the platform's
 own PITR.
+
+### Backfill and the Redis cutover
+
+Plays recorded before the archive existed live only on the Redis history lists. Move
+them across once, then (optionally) let Redis demote to a cache:
+
+```bash
+just db-backfill --dry-run   # report what would move
+just db-backfill             # idempotent and resumable
+```
+
+Order is load-bearing: **backfill → verify → `HISTORY_REDIS_CUTOVER=1`**. Enabling the
+cutover first trims away exactly the entries the backfill exists to preserve.
 
 ## Architecture
 
