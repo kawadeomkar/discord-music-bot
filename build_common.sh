@@ -200,23 +200,29 @@ _env_value() {
 # not .env), so it is called only from build_docker.sh, never build_common's
 # other callers.
 #
-# The play-history archive is a required tier, so this is unconditional: both
-# the postgres service and the bot's POSTGRES_URL interpolate the same
-# `${POSTGRES_PASSWORD:?}` in docker-compose.yml. Compose would catch an unset
-# password on its own, but only at `docker compose up` — after the whole image
-# build. Fail here instead, with a message that says what to do. (Ported from
-# the preflight the pre-restructure build.sh carried; see 2827fcd.)
+# The play-history archive is a required tier, but the password is NOT: compose
+# falls back to a known default so `docker compose up` works with nothing
+# configured but DISCORD_TOKEN. So this warns rather than exits — a build that
+# refused to proceed would put back the first-run cliff the default removed.
+#
+# The bot repeats the warning at startup and on every -ping, which are the
+# surfaces an operator actually watches; this one just catches it earlier, at
+# build time, with the same remedy.
 require_postgres_password() {
     local env_file=".env"
     if [ ! -f "$env_file" ]; then
-        echo "Error: $env_file not found — run ./setup_env.sh to create it." >&2
-        exit 1
+        echo "Note: $env_file not found — compose will use its built-in defaults." >&2
+        echo "      Run ./setup_env.sh to generate a real POSTGRES_PASSWORD." >&2
+        return 0
     fi
-    if [ -z "$(_env_value POSTGRES_PASSWORD "$env_file")" ]; then
-        echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
-        echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
-        echo "       built from it, and it has no fallback by design." >&2
-        echo "       Run ./setup_env.sh to generate one." >&2
-        exit 1
+    local value
+    value="$(_env_value POSTGRES_PASSWORD "$env_file")"
+    if [ -z "$value" ] || [ "$value" = "password" ]; then
+        echo "WARNING: POSTGRES_PASSWORD is unset or still the default in $env_file." >&2
+        echo "         The play-history database will accept 'password' from" >&2
+        echo "         anything that can reach the host's published port." >&2
+        echo "         Run ./setup_env.sh --force to generate one, then recreate" >&2
+        echo "         the volume or ALTER USER — Postgres only reads the variable" >&2
+        echo "         when initializing an empty data directory." >&2
     fi
 }

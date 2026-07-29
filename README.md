@@ -118,8 +118,10 @@ bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 
 Postgres is the durable home of play history and is **required** — the bot refuses to
 start without `POSTGRES_URL`, rather than quietly buffering history into a Redis
-outbox nothing would ever drain. `POSTGRES_PASSWORD` is mandatory and has no
-fallback; run [`./setup_env.sh`](#install-and-configure) to generate one. To use a
+outbox nothing would ever drain. `POSTGRES_PASSWORD` falls back to `password` so
+`docker compose up` works with nothing configured but `DISCORD_TOKEN`; the bot logs an
+ERROR at startup and shows a warning on every `-ping` until you replace it with
+[`./setup_env.sh`](#install-and-configure). To use a
 Postgres you already run instead of the bundled service, set `POSTGRES_URL` in `.env`
 and comment out the `POSTGRES_URL` line in `docker-compose.yml`. If port 5432 is
 already taken on your machine, set `POSTGRES_HOST_PORT` — the bot uses host
@@ -420,7 +422,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
 | `POSTGRES_URL` | ✅ | built by Compose from the three vars below | Play-history archive connection URL. The bot refuses to start without it — Postgres is the durable home of play history, not an optional tier. To point at a Postgres you already run, set this in `.env` and comment out the `POSTGRES_URL` line in `docker-compose.yml` |
-| `POSTGRES_PASSWORD` | ✅ | — | Password for the bundled Postgres service. Deliberately has no fallback: Compose fails the command outright rather than initializing a database with a credential nobody chose. Generated once by `./setup_env.sh`, independent of every other secret |
+| `POSTGRES_PASSWORD` | — | `password` | Password for the bundled Postgres service. The default exists so a first `docker compose up` needs no setup; while it is in use the bot logs an ERROR at startup and renders a warning embed on every `-ping`. Replace it with `./setup_env.sh` (a fresh 128-bit value, independent of every other secret). **Changing it later needs two steps** — Postgres reads this only when initializing an empty data directory, so an existing volume keeps its old password: after editing `.env`, either `docker compose down -v` (destroys play history) or `ALTER USER <user> PASSWORD '<new>'` |
 | `POSTGRES_USER` | | `musicbot` | Role owning the bundled Postgres service's database |
 | `POSTGRES_DB` | | `musicbot` | Database name on the bundled Postgres service |
 | `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the bot runs on host networking and connects through this port |

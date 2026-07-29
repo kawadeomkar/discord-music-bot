@@ -16,7 +16,12 @@ from redis.exceptions import ResponseError
 
 from src import ping, telemetry
 from src.config import SpotifyStatus
-from src.ping import ProbeResult, ProbeState, render_ping_embed
+from src.ping import (
+    ProbeResult,
+    ProbeState,
+    default_password_embed,
+    render_ping_embed,
+)
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
 
@@ -65,6 +70,17 @@ def _ping_message(mock_ctx: MagicMock) -> MagicMock:
     return message
 
 
+def _health_embed(call: Any) -> discord.Embed:
+    """The health card out of a send/edit call.
+
+    The dashboard sends a LIST now — a standing default-password advisory can
+    ride in front of the health card (see default_password_embed) — and the
+    health card is always last, which is also what _safe_edit returns for the
+    change-diffing loop.
+    """
+    return call.kwargs["embeds"][-1]
+
+
 def _latency_field(embed: discord.Embed) -> str:
     return next(f.value for f in embed.fields if f.name == "Latency") or ""
 
@@ -88,7 +104,7 @@ class TestPingCommand:
         with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         mock_ctx.channel.send.assert_awaited_once()
-        assert "embed" in mock_ctx.channel.send.call_args.kwargs
+        assert "embeds" in mock_ctx.channel.send.call_args.kwargs
         mock_ctx.send.assert_not_awaited()
 
     async def test_all_resolved_settles_in_the_send_embed(
@@ -104,7 +120,7 @@ class TestPingCommand:
             otel=_probe(ProbeState.OK, 3.0),
         ):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        sent = _health_embed(mock_ctx.channel.send.await_args)
         latency = _latency_field(sent)
         assert "120 ms" in latency and "pending" not in latency
         message.edit.assert_not_awaited()
@@ -117,7 +133,7 @@ class TestPingCommand:
         _ping_message(mock_ctx)
         with _patch_probes(otel=_probe(ProbeState.OFF)):  # redis None → NA on music_bot
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        latency = _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        latency = _latency_field(_health_embed(mock_ctx.channel.send.await_args))
         assert "n/a" in latency and "off" in latency and "pending" not in latency
 
     async def test_deadline_marks_straggler_failed(
@@ -143,7 +159,7 @@ class TestPingCommand:
                 await command_callback(MusicBot.ping)(music_bot, mock_ctx)
 
         message.edit.assert_awaited()  # the deadline edit
-        assert "failed" in _latency_field(message.edit.await_args.kwargs["embed"])
+        assert "failed" in _latency_field(_health_embed(message.edit.await_args))
 
     async def test_probe_resolving_mid_loop_edits_in_place(
         self,
@@ -170,14 +186,14 @@ class TestPingCommand:
                 )
                 await _until(lambda: mock_ctx.channel.send.await_count == 1)
                 # skeleton: Spotify still pending, nothing edited yet
-                skeleton = mock_ctx.channel.send.await_args.kwargs["embed"]
+                skeleton = _health_embed(mock_ctx.channel.send.await_args)
                 assert "pending" in _latency_field(skeleton)
                 message.edit.assert_not_awaited()
                 gate.set()  # Spotify returns → next tick must edit
                 await task
 
         message.edit.assert_awaited()
-        final = _latency_field(message.edit.await_args.kwargs["embed"])
+        final = _latency_field(_health_embed(message.edit.await_args))
         assert "42 ms" in final and "pending" not in final
 
     async def test_edit_on_deleted_message_is_tolerated(
@@ -216,7 +232,7 @@ class TestPingCommand:
         mocked(music_bot.bot).latency = float("nan")
         with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        sent = _health_embed(mock_ctx.channel.send.await_args)
         assert sent.color is not None and sent.color.value == 0x990000
         assert "down" in _latency_field(sent)  # gateway row, not a crash
 
@@ -275,7 +291,7 @@ class TestPingReportsSpotifySource:
         _ping_message(mock_ctx)
         with self._patch_everything_but_spotify():
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        return _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        return _latency_field(_health_embed(mock_ctx.channel.send.await_args))
 
     async def test_no_credentials_row_says_not_configured(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -343,7 +359,7 @@ class TestPingReportsPostgres:
         _ping_message(mock_ctx)
         with self._patch_everything_but_postgres():
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        field = _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        field = _latency_field(_health_embed(mock_ctx.channel.send.await_args))
         return next(line for line in field.splitlines() if "Postgres" in line)
 
     async def test_healthy_archive_row_is_a_live_latency(
@@ -669,3 +685,52 @@ class TestVersions:
             versions = await ping.collect_versions()
         assert set(versions) == {"bot", "yt-dlp", "ffmpeg", "python", "discord.py"}
         assert all(versions.values())
+
+
+class TestDefaultPasswordEmbed:
+    """The standing advisory. Rendered on EVERY -ping rather than once at
+    startup: the startup log is seen once, usually by whoever already knows,
+    while -ping is the surface an operator returns to."""
+
+    def test_none_when_the_password_is_real(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        assert default_password_embed() is None
+
+    def test_none_when_postgres_is_unconfigured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert default_password_embed() is None
+
+    def test_warns_and_says_how_to_fix_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        embed = default_password_embed()
+        assert embed is not None
+        assert "Default database password" in (embed.title or "")
+        body = (embed.description or "") + "".join(f.value or "" for f in embed.fields)
+        # The two-step remedy is the whole point: editing .env alone leaves an
+        # initialized volume on its old password and locks the bot out.
+        assert "setup_env.sh" in body
+        assert "ALTER USER" in body
+        assert "down -v" in body
+
+    def test_is_static_so_the_edit_loop_still_diffs_only_health(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # run_health_dashboard computes it once and re-attaches the same embed on
+        # every edit; if it varied per call the dashboard would either flicker or
+        # edit on every tick.
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        first, second = default_password_embed(), default_password_embed()
+        assert first is not None and second is not None
+        assert first.to_dict() == second.to_dict()

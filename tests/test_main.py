@@ -175,6 +175,51 @@ class TestClose:
             await app.close()
         mock_super.assert_awaited_once()
 
+    async def test_default_postgres_password_logs_an_error_but_starts(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Loud, not fatal. compose defaults the password so `docker compose up`
+        works with only a Discord token — refusing to start would put the
+        first-run cliff straight back, so the bot runs and complains instead."""
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        with (
+            patch("src.main.create_redis_pool"),
+            patch("src.main.get_redis"),
+            patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.PostgresHistoryArchive"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+        assert "still the default" in caplog.text
+        # The remedy has to be the one that works: an .env edit alone leaves an
+        # initialized volume on its old password and locks the bot out.
+        assert "ALTER USER" in caplog.text
+
+    async def test_a_real_postgres_password_logs_nothing(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        with (
+            patch("src.main.create_redis_pool"),
+            patch("src.main.get_redis"),
+            patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.PostgresHistoryArchive"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert "still the default" not in caplog.text
+
     async def test_teardown_order_is_drainer_archive_disconnect_pool(
         self, app: MusicBotApp
     ) -> None:

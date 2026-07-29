@@ -2,7 +2,8 @@ import os
 import subprocess
 import warnings
 from enum import Enum
-from typing import Optional
+from typing import Final, Optional
+from urllib.parse import unquote, urlsplit
 
 
 def _git_branch() -> str:
@@ -84,6 +85,42 @@ def postgres_url() -> Optional[str]:
     monkeypatch the environment per case instead of reloading the module.
     """
     return os.environ.get("POSTGRES_URL")
+
+
+# The password docker-compose.yml falls back to when .env does not set one, so
+# that `docker compose up` works with nothing configured but DISCORD_TOKEN. It
+# is a convenience for first-run and a liability everywhere else, which is why
+# the bot detects it and complains loudly rather than silently accepting it.
+#
+# It is only defensible because the compose postgres service publishes on
+# 127.0.0.1 — an unauthenticated-in-practice database reachable from the network
+# would not be an acceptable default at any level of warning.
+DEFAULT_POSTGRES_PASSWORD: Final[str] = "password"
+
+
+def using_default_postgres_password() -> bool:
+    """True when the archive DSN still carries DEFAULT_POSTGRES_PASSWORD.
+
+    Parsed out of POSTGRES_URL rather than read from POSTGRES_PASSWORD directly:
+    the bot only ever sees the assembled DSN (compose builds it, and `just run`
+    derives it), so the password variable is frequently absent from the bot's own
+    environment even when it is set for compose. Reading the DSN is therefore the
+    only check that sees what the bot will actually authenticate with.
+
+    Never raises — it feeds a startup warning and a -ping row, and a malformed
+    DSN is the archive's problem to report, not this function's.
+    """
+    url = postgres_url()
+    if not url:
+        return False
+    try:
+        password = urlsplit(url).password
+    except ValueError:
+        return False
+    # unquote because SplitResult.password does NOT percent-decode, so a DSN
+    # carrying %70assword would otherwise read as a different credential than
+    # the identical one written literally.
+    return password is not None and unquote(password) == DEFAULT_POSTGRES_PASSWORD
 
 
 def history_redis_cutover() -> bool:
