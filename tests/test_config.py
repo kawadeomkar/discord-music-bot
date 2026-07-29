@@ -1,7 +1,10 @@
-"""Tests for src/config.py — the Spotify feature toggle and archive tunables."""
+"""Tests for src/config.py — the Spotify toggle, the Postgres knobs, and the
+default-credential detector."""
 
 import importlib
 import os
+import re
+from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
 
@@ -9,11 +12,13 @@ import pytest
 
 import src.config
 from src.config import (
+    DEFAULT_POSTGRES_PASSWORD,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     _int_env,
     postgres_url,
     spotify_enabled,
+    using_default_postgres_password,
 )
 
 
@@ -262,3 +267,159 @@ class TestHistoryRedisCutoverParsing:
         with pytest.raises(ValueError) as exc:
             src.config.history_redis_cutover()
         assert "'1'" in str(exc.value) and "'true'" in str(exc.value)
+
+
+class TestDefaultPostgresPassword:
+    """compose defaults POSTGRES_PASSWORD so `docker compose up` works with only
+    a Discord token. The bot has to be able to tell that it did."""
+
+    def test_true_when_the_dsn_carries_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL",
+            f"postgresql://musicbot:{DEFAULT_POSTGRES_PASSWORD}@127.0.0.1:5432/musicbot",
+        )
+        assert using_default_postgres_password() is True
+
+    def test_false_for_a_real_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        assert using_default_postgres_password() is False
+
+    def test_false_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Nothing configured is not the same as configured badly — and the
+        # missing-URL case has its own, louder failure in setup_hook.
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert using_default_postgres_password() is False
+
+    def test_reads_the_dsn_not_the_password_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The bot only ever sees the assembled DSN: compose builds it and the
+        # password variable is usually absent from the bot's own environment.
+        # A check that read POSTGRES_PASSWORD would report "fine" for a stack
+        # that is in fact running on the default.
+        monkeypatch.setenv("POSTGRES_PASSWORD", "a-real-secret")
+        monkeypatch.setenv(
+            "POSTGRES_URL",
+            f"postgresql://musicbot:{DEFAULT_POSTGRES_PASSWORD}@127.0.0.1:5432/musicbot",
+        )
+        assert using_default_postgres_password() is True
+
+    def test_url_encoded_default_is_still_recognised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # urlsplit percent-decodes, so an escaped form cannot slip past.
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:%70assword@127.0.0.1:5432/musicbot"
+        )
+        assert using_default_postgres_password() is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not-a-url",
+            "postgresql://",
+            "postgresql://user@host/db",
+            "://[bad",
+            # The one that actually reaches the except arm. urlsplit only raises
+            # on a malformed IPv6 literal in the NETLOC — and "://[bad" has no
+            # "//" prefix, so its bracket lands in the path and the check never
+            # runs. Every other case above returns normally, which meant the
+            # `except ValueError` branch was dead to the whole suite: deleting
+            # it, and making it `return True`, both passed 1,681 tests.
+            "postgresql://[::1@h/db",
+        ],
+    )
+    def test_never_raises_on_a_malformed_dsn(
+        self, monkeypatch: pytest.MonkeyPatch, url: str
+    ) -> None:
+        # It feeds a startup warning and a -ping row; a malformed DSN is the
+        # archive's problem to report, not this function's.
+        monkeypatch.setenv("POSTGRES_URL", url)
+        assert using_default_postgres_password() is False
+
+
+# ── The compose contract ──────────────────────────────────────────────────────
+#
+# Nothing else in CI or tests/ reads docker-compose.yml, which is how a missed
+# `${POSTGRES_PASSWORD:?}` on the db-backfill service shipped: it broke
+# `docker compose up` for a token-only stack — the exact thing the default
+# exists to enable — while every test, ruff and pyright stayed green.
+_COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
+
+
+def _compose_directives() -> str:
+    """docker-compose.yml with comment lines removed.
+
+    Comments matter here: the file DESCRIBES the old mandatory form
+    (`${VAR:?}`) while explaining why the default replaced it, so a naive scan
+    of the raw text reports a violation that does not exist. Stripping whole
+    comment lines is enough — Compose has no inline-comment-after-value form
+    that would need finer handling in this file.
+    """
+    return "\n".join(
+        line
+        for line in _COMPOSE.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+class TestComposeMatchesTheDefault:
+    """The two halves of the first-run promise, asserted against the real file.
+
+    `docker compose up` must work with nothing configured but DISCORD_TOKEN, and
+    the password it falls back to must be the one the bot warns about. Both are
+    invisible to every other check in the repo.
+    """
+
+    def test_no_postgres_password_interpolation_is_mandatory(self) -> None:
+        """REGRESSION: db-backfill kept `:?` when the other three services moved.
+
+        Compose interpolates the WHOLE document before profile filtering, so an
+        `ops`-profiled service with a mandatory variable fails `up`, `ps`,
+        `logs` and `config` alike. Reproduced under `env -u POSTGRES_PASSWORD`:
+        "required variable POSTGRES_PASSWORD is missing a value".
+        """
+        mandatory = re.findall(
+            r"\$\{POSTGRES_PASSWORD:\?[^}]*\}", _compose_directives()
+        )
+        assert mandatory == []
+
+    def test_every_fallback_is_the_password_the_bot_warns_about(self) -> None:
+        """The drift check. DEFAULT_POSTGRES_PASSWORD is duplicated across
+        config.py, build_common.sh and three compose services with nothing
+        holding them together — and drift here fails OPEN: change compose's
+        fallback alone and the detector goes permanently silent while the
+        deployment still runs on a known credential.
+        """
+        fallbacks = set(
+            re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", _compose_directives())
+        )
+        # Non-empty guard: a regex that matched nothing would make the equality
+        # below trivially true, which is how this kind of test rots.
+        assert len(fallbacks) >= 1
+        assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
+
+    def test_the_build_preflight_checks_for_the_same_password(self) -> None:
+        """build_common.sh hardcodes the literal too, and it is the fifth copy.
+
+        Nothing sourced it from anywhere, so drifting compose's fallback would
+        leave the build-time warning checking for a value no deployment uses —
+        silently, and in the fail-open direction, exactly like the detector.
+        A shell script cannot import config.py, so the coupling is asserted here
+        instead of enforced there.
+        """
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert f'= "{DEFAULT_POSTGRES_PASSWORD}"' in preflight
+
+    def test_the_bot_and_the_migration_tiers_all_carry_a_default(self) -> None:
+        # Count rather than merely "none mandatory": a service whose
+        # POSTGRES_URL was deleted outright would also pass the first test.
+        # Three interpolations = the bot, the postgres service, and the two
+        # one-shots' DSNs.
+        assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4

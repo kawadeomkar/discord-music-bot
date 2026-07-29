@@ -309,6 +309,72 @@ class TestCutoverStartupSignal:
         assert "HISTORY_REDIS_CUTOVER is off" in caplog.text
 
 
+class TestDefaultPostgresPassword:
+    """compose falls back to a known password so `docker compose up` works with
+    only a Discord token. The bot pays for that convenience with noise: an ERROR
+    at every startup and a standing -ping warning, until it is changed.
+
+    These live in their own class rather than in TestClose, where the
+    cherry-pick's context happened to place them — they exercise setup_hook, not
+    teardown, and TestClose's autouse telemetry stub is unrelated to them.
+    """
+
+    async def test_default_postgres_password_logs_an_error_but_starts(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Loud, not fatal. compose defaults the password so `docker compose up`
+        works with only a Discord token — refusing to start would put the
+        first-run cliff straight back, so the bot runs and complains instead."""
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        with (
+            patch("src.main.create_redis_pool"),
+            patch("src.main.get_redis"),
+            patch("src.main.ensure_outbox_group", new=AsyncMock()),
+            patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.PostgresHistoryArchive"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+        assert "still the default" in caplog.text
+        # The remedy has to be the one that works: an .env edit alone leaves an
+        # initialized volume on its old password and locks the bot out.
+        assert "ALTER USER" in caplog.text
+        assert "up -d" in caplog.text  # the container recreate, or the DSN is stale
+
+        # And in the ORDER that works. This check reads the bot's DSN, so
+        # `setup_env.sh --force` silences it while the server still accepts the
+        # old password — running that first walks the operator through the one
+        # window where they are exposed and nothing says so.
+        assert caplog.text.index("ALTER USER") < caplog.text.index("setup_env.sh")
+        assert "IN THIS ORDER" in caplog.text
+
+    async def test_a_real_postgres_password_logs_nothing(
+        self,
+        app: MusicBotApp,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        with (
+            patch("src.main.create_redis_pool"),
+            patch("src.main.get_redis"),
+            patch("src.main.ensure_outbox_group", new=AsyncMock()),
+            patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.PostgresHistoryArchive"),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert "still the default" not in caplog.text
+
+
 class TestClose:
     @pytest.fixture(autouse=True)
     def stub_telemetry_shutdown(self) -> Iterator[None]:

@@ -40,10 +40,12 @@ from src import telemetry
 # one answer to "what does this bot read from the environment?" — see
 # docs/PING_METADATA_PLAN.md §5.2/§8.
 from src.config import (
+    DEFAULT_POSTGRES_PASSWORD,
     ENVIRONMENT,
     PING_DEADLINE_SECS,
     PING_TICK_SECS,
     SpotifyStatus,
+    using_default_postgres_password,
 )
 from src.spotify import Spotify
 from src.util import get_logger, latency_color, send_embed, trace_footer
@@ -337,6 +339,9 @@ _STATE_DOT = {
 }
 _PING_RED = 0x990000
 _PING_PROBING = 0x5865F2  # blurple: at least one row still pending
+# Amber: the bot works, but something about the deployment needs attention.
+# Distinct from _PING_RED so a standing advisory never reads as an outage.
+_PING_WARN = 0xE67E22
 
 
 def _latency_band(ms: float) -> tuple[str, int]:
@@ -429,6 +434,63 @@ def render_ping_embed(
     return embed
 
 
+def default_password_embed() -> Optional[discord.Embed]:
+    """A standing warning that the Postgres password is still the compose
+    default, or None when it is not.
+
+    Rendered on EVERY -ping rather than once at startup, deliberately. The
+    startup log is seen once and usually by whoever already knows; this is the
+    surface an operator looks at repeatedly, so it is the one that keeps the
+    problem visible until it is fixed.
+
+    Static — nothing here changes between ticks — so the dashboard's
+    edit-on-change loop is unaffected: it still diffs only the health embed.
+
+    IT READS THE DSN, NOT THE SERVER, and the remedy below is ordered around
+    that limit. `setup_env.sh --force` changes only the DSN, so performing it
+    first clears this warning while Postgres still accepts the old password —
+    the control switching itself off mid-remedy, in the window where it is most
+    needed. Changing the server first means the warning survives until the fix
+    is genuinely complete. A detector that could not be fooled would attempt a
+    connection with DEFAULT_POSTGRES_PASSWORD instead of parsing a string.
+    """
+    if not using_default_postgres_password():
+        return None
+    embed = discord.Embed(
+        title="⚠️ Default database password in use",
+        description=(
+            f"`POSTGRES_PASSWORD` is still `{DEFAULT_POSTGRES_PASSWORD}`, "
+            "the fallback compose uses so the stack starts with nothing "
+            "configured but a Discord token. Anything that can reach this host's "
+            "published Postgres port can read every play this bot has recorded."
+        ),
+        color=discord.Color(_PING_WARN),
+    )
+    embed.add_field(
+        name="Changing it — in this order",
+        value=(
+            "1. **The server first:** `docker compose exec postgres psql -U "
+            "<user> -c \"ALTER USER <user> PASSWORD '<new>'\"`\n"
+            "2. Then `.env`: `./setup_env.sh --force`, and set the same value\n"
+            "3. Then `docker compose up -d` — the bot's DSN is baked at "
+            "container-create time, so a restart alone keeps the old one\n"
+            "To start clean instead: `docker compose down && docker volume rm "
+            "discord-music-bot_postgres-data` — **not** `down -v`, which also "
+            "drops the Redis volume holding plays not yet in Postgres.\n\n"
+            "**The order is the point.** This warning reads the bot's DSN, not "
+            "the server, so doing step 2 first makes it disappear while the "
+            "database still accepts the old password — the one window where you "
+            "are exposed and nothing says so.\n"
+            "Editing `.env` alone never changes the server: Postgres reads the "
+            "variable only when initializing an empty data directory, so an "
+            "existing volume keeps its original password and the bot is simply "
+            "locked out of its own database."
+        ),
+        inline=False,
+    )
+    return embed
+
+
 def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
     """True when a re-render actually differs — the only things that move are the
     two field values, the colour, and the footer, all captured by to_dict()."""
@@ -436,13 +498,17 @@ def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
 
 
 async def _safe_edit(
-    message: discord.Message, embed: discord.Embed
+    message: discord.Message, embeds: list[discord.Embed]
 ) -> Optional[discord.Embed]:
     """Edit a message, tolerating a host the user deleted mid-loop (mirrors
-    musicplayer._progress_updater). Returns the embed on success, None if gone."""
+    musicplayer._progress_updater). Returns the HEALTH embed on success (the
+    caller diffs against that one alone), None if the message is gone.
+
+    Takes the full embed list because the warning above rides along on every
+    edit; dropping it would make it flicker away on the first tick."""
     try:
-        await message.edit(embed=embed)
-        return embed
+        await message.edit(embeds=embeds)
+        return embeds[-1]
     except discord.NotFound:
         return None
 
@@ -521,7 +587,27 @@ async def run_health_dashboard(
         _drain()
         discord_ms = bot_latency * 1000
         last = render_ping_embed(results, versions, discord_ms, span)
-        message = await ctx.channel.send(embed=last)  # bypass NP host (§5.3)
+        # Computed once: it is static, so it costs nothing per tick and cannot
+        # make _ping_embed_changed see a difference that is not there.
+        #
+        # OWNER ONLY. -ping has no permission gate and answers to `-status`,
+        # `-health`, `-l` — so this advisory, which names the credential and
+        # confirms that THIS host is running on it, was being handed to every
+        # member of every guild the bot is in, and left in Discord's retained
+        # history. The value is a public constant in a GPL repo, so the leak was
+        # never the string; it was the free confirmation of which hosts are
+        # worth trying, delivered to exactly the population most likely to try.
+        #
+        # Restricting it costs nothing the design relied on: the advisory exists
+        # for the person who can act on it, and for a self-hosted bot the
+        # application owner IS that person. The startup ERROR still fires on
+        # every boot for anyone reading logs.
+        warning = (
+            default_password_embed() if await ctx.bot.is_owner(ctx.author) else None
+        )
+        message = await ctx.channel.send(  # bypass NP host (§5.3)
+            embeds=[e for e in (warning, last) if e is not None]
+        )
 
         # 3. live-edit loop: tick, drain, edit-on-change; exit early when done.
         deadline = loop.time() + PING_DEADLINE_SECS
@@ -530,7 +616,10 @@ async def run_health_dashboard(
             if _drain():
                 embed = render_ping_embed(results, versions, discord_ms, span)
                 if _ping_embed_changed(embed, last):
-                    last = await _safe_edit(message, embed) or last
+                    edited = await _safe_edit(
+                        message, [e for e in (warning, embed) if e is not None]
+                    )
+                    last = edited or last
 
         # 4. deadline: fail only what is STILL pending. Re-check done() first —
         #    a probe can finish during step 3's final edit await, and flipping
@@ -543,7 +632,15 @@ async def run_health_dashboard(
                     tasks[label].cancel()
                     results[label] = ProbeResult(label, ProbeState.FAILED)
             await _safe_edit(
-                message, render_ping_embed(results, versions, discord_ms, span)
+                message,
+                [
+                    e
+                    for e in (
+                        warning,
+                        render_ping_embed(results, versions, discord_ms, span),
+                    )
+                    if e is not None
+                ],
             )
 
         for r in results.values():  # self-documenting trace

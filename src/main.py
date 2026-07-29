@@ -142,6 +142,38 @@ class MusicBotApp(commands.AutoShardedBot):
                 "derives the URL from it. Otherwise export POSTGRES_URL yourself "
                 "(postgresql://user:password@host:5432/dbname)."
             )
+        # Loud, but NOT fatal. compose defaults POSTGRES_PASSWORD to a known
+        # value so `docker compose up` works with nothing configured but
+        # DISCORD_TOKEN — refusing to start would take that away and put the
+        # first-run cliff straight back. So the bot runs and complains instead,
+        # here and on every -ping, until it is changed.
+        #
+        # Changing it is not just an .env edit, and the message says so: Postgres
+        # reads POSTGRES_PASSWORD only when it INITIALIZES an empty data
+        # directory, so an existing postgres-data volume keeps the password it
+        # was created with. Editing .env alone against an initialized volume
+        # leaves the bot unable to authenticate against its own database — the
+        # confusing failure this warning exists to pre-empt.
+        if config.using_default_postgres_password():
+            log.error(
+                "POSTGRES_PASSWORD is still the default "
+                f"({config.DEFAULT_POSTGRES_PASSWORD!r}). The play-history "
+                "database accepts it from anything that can reach the host's "
+                "published port. Fix it IN THIS ORDER: (1) change the server "
+                'itself — `docker compose exec postgres psql -U <user> -c "ALTER '
+                "USER <user> PASSWORD '<new>'\"`; (2) put the same value in "
+                ".env via `./setup_env.sh --force`; (3) `docker compose up -d` "
+                "to recreate the bot with the new DSN. To start clean instead, "
+                "drop ONLY the database volume — `docker compose down && docker "
+                "volume rm discord-music-bot_postgres-data` — not `down -v`, "
+                "which also removes the Redis volume holding plays that are not "
+                "durable in Postgres yet. The order matters: this "
+                "warning reads the bot's DSN, so doing (2) first silences it "
+                "while the database still accepts the old password. And "
+                "Postgres reads POSTGRES_PASSWORD only when initializing an "
+                "EMPTY data directory, so editing .env alone never changes the "
+                "server — it just locks the bot out of its own database."
+            )
         # Create the outbox consumer group before anything can write to it. The
         # SECOND fail-fast, and it has to be here rather than in the drainer,
         # because the loud signal is only available at startup: push_history is
