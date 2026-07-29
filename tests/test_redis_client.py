@@ -366,14 +366,60 @@ class TestPushHistory:
         await broken_store.push_history(_hentry(1))  # must not raise
 
 
+class TestPushHistoryOutbox:
+    async def test_every_push_reaches_the_outbox(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        # Unconditional: the archive is a required tier, so there is always a
+        # drainer behind the outbox and no shape of push_history that skips it.
+        await store.push_history(_hentry(1))
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_outbox_gets_same_wire_bytes(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        await store.push_history(_hentry(1))
+        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
+            _hentry(1).to_redis()
+        ]
+
+    async def test_display_leg_unchanged_by_outbox_flag(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        # Phase A: the display list still gets the entry, untrimmed, PERSISTed.
+        await store.push_history(_hentry(1))
+        assert await fake_redis.lrange(store.history_key(), 0, -1) == [
+            _hentry(1).to_redis()
+        ]
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_outbox_is_global_and_interleaves_guilds(
+        self, fake_redis: Redis
+    ) -> None:
+        # One outbox for all guilds — entries carry guild_id on the wire.
+        a = GuildRedisStore(fake_redis, guild_id=1)
+        b = GuildRedisStore(fake_redis, guild_id=2)
+        await a.push_history(_hentry(1))
+        await b.push_history(_hentry(2))
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+
+    async def test_outbox_key_has_no_ttl(
+        self, store: GuildRedisStore, fake_redis: Redis
+    ) -> None:
+        # Not-yet-durable entries must never be eviction candidates under
+        # volatile-lru — the same property that protects history today.
+        await store.push_history(_hentry(1))
+        assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        await broken_store.push_history(_hentry(1))  # must not raise
+
+
 class TestOutboxDrainHelpers:
     async def _push(self, fake_redis: Redis, *ns: int) -> None:
-        # Seeded by hand, one LPUSH of the wire bytes per play (newest at the
-        # head) — the shape the write path will produce. These are the DRAIN
-        # side and have to be exercisable on their own: nothing writes the
-        # outbox yet, because that leg lands with the drainer that consumes it.
+        store = GuildRedisStore(fake_redis, guild_id=42)
         for n in ns:
-            await fake_redis.lpush(HISTORY_OUTBOX_KEY, _hentry(n).to_redis())
+            await store.push_history(_hentry(n))
 
     async def test_peek_returns_oldest_first(self, fake_redis: Redis) -> None:
         await self._push(fake_redis, 1, 2, 3)
@@ -577,6 +623,52 @@ class TestDrainerLease:
         monkeypatch.setattr(Pipeline, "unwatch", counting_unwatch)
         assert await hold_drainer_lease(fake_redis, "b") is False
         unwatched.assert_called_once()
+
+
+class TestPushHistoryAtomicity:
+    """The display push and the outbox push must ride ONE transactional
+    pipeline. Every existing test checks only end state, which is identical
+    whether they share a pipeline or not."""
+
+    async def test_both_pushes_ride_a_single_transaction(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failure mode if they split: the connection drops between the two
+        round-trips, the display list gains the play and the outbox does not,
+        and no drainer ever sees it — absent from Postgres forever. -history
+        still shows it from Redis, so nobody notices until the Phase C cutover
+        trims the list."""
+        queued: list[str] = []
+        direct: list[str] = []
+        real_pipeline = fake_redis.pipeline
+
+        def spy_pipeline(*args: Any, **kwargs: Any) -> Any:
+            pipe = real_pipeline(*args, **kwargs)
+            for name in ("lpush", "persist", "ltrim", "expire"):
+                original = getattr(pipe, name)
+
+                def record(
+                    *a: Any, _n: str = name, _o: Any = original, **k: Any
+                ) -> Any:
+                    queued.append(_n)
+                    return _o(*a, **k)
+
+                monkeypatch.setattr(pipe, name, record)
+            return pipe
+
+        monkeypatch.setattr(fake_redis, "pipeline", spy_pipeline)
+
+        async def record_direct(*a: Any, **k: Any) -> Any:
+            direct.append("lpush")
+
+        monkeypatch.setattr(fake_redis, "lpush", record_direct)
+
+        store = GuildRedisStore(fake_redis, guild_id=1)
+        await store.push_history(_hentry(1))
+
+        # Two LPUSHes (display + outbox), both on the pipeline, none direct.
+        assert queued.count("lpush") == 2
+        assert direct == []
 
 
 class TestGetHistory:

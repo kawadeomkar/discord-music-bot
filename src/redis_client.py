@@ -32,17 +32,13 @@ GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
 # Global (not per-guild) write-ahead buffer for the Postgres history archive:
-# entries from all guilds will interleave here (each carries its guild_id on
-# the wire), oldest-first. Deliberately NO TTL — it is meant to hold
-# not-yet-durable entries, so under maxmemory-policy volatile-lru it must never
-# be an eviction candidate. See docs/POSTGRES_HISTORY_PLAN.md §3.
-#
-# NOTHING WRITES TO THIS KEY YET, and that is the point of where this branch
-# stops. Only the drain-side helpers below exist here. A producer without a
-# consumer would grow a non-evictable key at ~412 bytes per play with nothing
-# ever popping it — golden rule 12's exact failure mode, and OOM against the
-# compose Redis' 256mb in under two weeks. So push_history's outbox leg and the
-# drainer that empties it land together, in the branch that adds the archive.
+# entries from all guilds interleave (each carries its guild_id on the wire),
+# LPUSHed alongside the display list and drained oldest-first by the single
+# HistoryOutboxDrainer task (history_archive.py). Deliberately NO TTL — it
+# holds not-yet-durable entries, so under maxmemory-policy volatile-lru it
+# must never be an eviction candidate; normally near-empty (drained within
+# seconds), it only grows while Postgres is unreachable.
+# See docs/POSTGRES_HISTORY_PLAN.md §3.
 HISTORY_OUTBOX_KEY = "history:outbox"
 # Cross-process drainer ownership (H2). peek → INSERT → retire is only safe
 # with a single drainer, and the structure it guards lives in this same Redis,
@@ -59,9 +55,10 @@ _TRIM_SLICE = 1000
 # list and every TTL path below excludes it unconditionally.
 GUILD_TTL = 86400
 # In-memory/display cap only — NOT a retention cap. The Redis history list is
-# unbounded (source of truth for all played songs; Postgres eventually — see
-# docs/HISTORY_OVERHAUL_PLAN.md §4/§8); this bounds the GuildHistory deque and
-# every history read so startup stays O(50) against an unbounded list.
+# unbounded (it holds every played song, and now also feeds the Postgres outbox
+# — see push_history and docs/POSTGRES_HISTORY_PLAN.md); this bounds the
+# GuildHistory deque and every history read so startup stays O(50) against an
+# unbounded list.
 HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields cleared together on song end / disconnect, and the
@@ -211,12 +208,10 @@ async def spotify_token_get_with_ttl(
 
 
 # ── History outbox (drain side) ───────────────────────────────────────────────
-# The mechanics, ahead of the tier that uses them: these are the operations the
-# archive's drainer will run, with their own tests, and nothing in the bot calls
-# them yet (see HISTORY_OUTBOX_KEY above for why the producer waits). Unlike the
-# cache helpers above, they deliberately DO raise on Redis failure — the
-# drainer's backoff loop is the error handler, and a swallowed error here would
-# look like an empty outbox and silently stall the drain. Raw bytes in/out: wire
+# Consumed only by HistoryOutboxDrainer (history_archive.py). Unlike the cache
+# helpers above, these deliberately DO raise on Redis failure — the drainer's
+# backoff loop is the error handler, and a swallowed error here would look
+# like an empty outbox and silently stall the drain. Raw bytes in/out: wire
 # parsing stays in guild_state.py (parse_history_entry), per the schema rule.
 #
 # Single-consumer assumption: peek → INSERT → retire is only safe with one
@@ -585,32 +580,44 @@ class GuildRedisStore:
 
     # History operations
 
-    # ISSUE: Unbounded, non-evictable history can exhaust Redis and stall all writes.
-    # History keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
-    # eviction candidates. Once history fills the 256mb maxmemory and no TTL-bearing key
-    # is left to evict, Redis rejects EVERY write with OOM — not just history: state,
-    # queue, and cache writes all start failing (each store method swallows the error and
-    # logs, so persistence silently degrades rather than crashing). Small entries make
-    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The fix in
-    # progress is migrating full history to Postgres and demoting the Redis list to a
-    # bounded cache (docs/POSTGRES_HISTORY_PLAN.md); until then this needs a Redis
-    # memory/eviction alarm. Do NOT switch back to allkeys-lru as a workaround — that
-    # would make history itself an eviction candidate and defeat the whole
-    # persistent-history design (see docker-compose.yml redis command).
+    # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
+    # Two keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
+    # eviction candidates: guild:{id}:history and HISTORY_OUTBOX_KEY. Once they fill
+    # the 256mb maxmemory and no TTL-bearing key is left to evict, Redis rejects
+    # EVERY write with OOM — not just history: state, queue and cache writes all start
+    # failing (each store method swallows the error and logs, so persistence silently
+    # degrades rather than crashing).
     #
-    # HISTORY_OUTBOX_KEY is declared with the same no-TTL contract and will be the
-    # second, faster route into this same failure — but nothing writes to it in this
-    # branch, so today history is the only non-evictable key under memory pressure.
+    # Two arrival routes, and the fast one is newer than this comment. History itself
+    # is the slow burn (~1M+ entries) that the migration to Postgres exists to close
+    # (docs/POSTGRES_HISTORY_PLAN.md). The OUTBOX is the fast one: it is near-empty
+    # whenever the drainer is keeping up, but it grows for the whole duration of a
+    # Postgres outage, at ~412 bytes per play, and it does not need years to matter.
+    # HISTORY_OUTBOX_MAX (config.py) is the opt-in bound on it, and dropping entries
+    # there is real data loss; a Redis memory/eviction alarm is still owed.
+    #
+    # Do NOT switch to allkeys-lru as a workaround: it would make the outbox evictable,
+    # and an evicted outbox entry is a play that vanishes with no error and no log line
+    # (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
-        the unbounded source of truth for all played songs (write-per-song-end
-        is the durability boundary; cadence analysis in
-        docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
-        pre-migration keys still carrying the old 24h idle expiry."""
+        """LPUSH one entry, mirror it to the Postgres outbox, and PERSIST the
+        history key — no trim, no TTL: the list is the unbounded source of
+        truth for all played songs (write-per-song-end is the durability
+        boundary; cadence analysis in docs/HISTORY_OVERHAUL_PLAN.md §4). The
+        PERSIST also self-heals pre-migration keys still carrying the old 24h
+        idle expiry.
+
+        The same wire bytes are also LPUSHed onto HISTORY_OUTBOX_KEY in the
+        same (transactional) pipeline, for the Postgres drainer. Unconditional:
+        the archive is a required tier, so there is always a drainer behind the
+        outbox. The two legs share one serialize_history_entry call so they
+        cannot drift and song-end pays only one orjson.dumps."""
+        wire = serialize_history_entry(entry)
         pipe = self.redis.pipeline()
-        pipe.lpush(self.history_key(), serialize_history_entry(entry))
+        pipe.lpush(self.history_key(), wire)
         pipe.persist(self.history_key())
+        pipe.lpush(HISTORY_OUTBOX_KEY, wire)
         await pipe.execute()
 
     @_guild_op(default_factory=list)
