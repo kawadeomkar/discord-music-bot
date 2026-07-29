@@ -107,6 +107,31 @@ class TestClose:
             await app.close()
         mock_super.assert_awaited_once()
 
+    async def test_disconnects_before_closing_redis(self, app: MusicBotApp) -> None:
+        """super().close() disconnects voice clients and can still dispatch
+        events; anything reaching cleanup() in that window writes to Redis. With
+        the pool already closed those writes are swallowed as warnings, so a
+        CLEAN shutdown leaves state looking like a crash and the next start runs
+        spurious recovery. The ordering is the whole fix — assert it directly."""
+        order: list[str] = []
+
+        async def record_super_close() -> None:
+            order.append("disconnect")
+
+        async def record_redis_close(_pool: object) -> None:
+            order.append("redis")
+
+        app._redis_pool = MagicMock()
+        with (
+            patch("src.main.close_redis_pool", new=record_redis_close),
+            patch.object(
+                commands.AutoShardedBot, "close", new=lambda self: record_super_close()
+            ),
+        ):
+            await app.close()
+
+        assert order == ["disconnect", "redis"]
+
     async def test_shuts_down_the_ytdlp_pool(self, app: MusicBotApp) -> None:
         """The extraction workers are child processes — a clean close must join them
         rather than leave them orphaned. Asserts the real pool's state rather than a
