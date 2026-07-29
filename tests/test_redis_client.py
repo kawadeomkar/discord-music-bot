@@ -10,6 +10,9 @@ import pytest
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
@@ -53,6 +56,41 @@ class TestCreateRedisPool:
     def test_pool_has_expected_max_connections(self) -> None:
         pool = create_redis_pool()
         assert pool.max_connections == 20
+
+    def test_redis_errors_are_not_builtin_subclasses(self) -> None:
+        """The invariant that made the old config a silent no-op, pinned here
+        because nothing else can catch it: redis-py's ConnectionError and
+        TimeoutError derive from RedisError, NOT from the builtins of the same
+        name — so `retry_on_error=[ConnectionError, TimeoutError]` (the
+        builtins) matched nothing redis-py ever raises."""
+        assert not issubclass(RedisConnectionError, ConnectionError)
+        assert not issubclass(RedisTimeoutError, TimeoutError)
+
+    def test_retry_on_error_uses_redis_exception_classes(self) -> None:
+        pool = create_redis_pool()
+        configured = pool.connection_kwargs["retry_on_error"]
+        assert RedisConnectionError in configured
+        assert RedisTimeoutError in configured
+        # The builtins are what made this ineffective; they must not come back.
+        assert ConnectionError not in configured
+
+    def test_connections_actually_retry_connection_errors(self) -> None:
+        """End of the chain: a connection built by this pool must treat a
+        redis-py ConnectionError as retryable. Asserted on a real Connection
+        rather than on kwargs, because redis-py merges `retry_on_error` into
+        the Retry object at construction time — that merge is the step the old
+        config silently no-opped."""
+        conn = create_redis_pool().make_connection()
+        assert conn.retry.get_retries() == 3
+        # _supported_errors is private but is the only readable surface for the
+        # merged set; the assertions above cover the public config either way.
+        assert RedisConnectionError in conn.retry._supported_errors
+
+    def test_backoff_is_not_the_synthesised_no_backoff(self) -> None:
+        """Without an explicit Retry, redis-py synthesises Retry(NoBackoff(), 1)
+        — one immediate reattempt, which a restarting Redis outlives."""
+        conn = create_redis_pool().make_connection()
+        assert isinstance(conn.retry._backoff, ExponentialBackoff)
 
 
 class TestGetRedis:
