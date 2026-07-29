@@ -7,7 +7,7 @@ import contextlib
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1050,6 +1050,22 @@ class TestMusicBotInit:
         mock_bot.redis = mock_redis
         assert MusicBot(mock_bot).redis is mock_redis
 
+    def test_reads_history_archive_from_bot(self, mock_bot: MagicMock) -> None:
+        # -ping's Postgres row reads this. MusicBotApp.setup_hook builds the
+        # archive before load_extension constructs the cog, so it is always set
+        # on a real bot.
+        archive = MagicMock()
+        mock_bot.history_archive = archive
+        assert MusicBot(mock_bot).history_archive is archive
+
+    def test_missing_history_archive_is_none_not_an_error(
+        self, mock_bot: MagicMock
+    ) -> None:
+        # A bot without the attribute (tests, or a cog built outside MusicBotApp)
+        # must still construct — the Postgres row degrades to n/a instead.
+        del mock_bot.history_archive
+        assert MusicBot(mock_bot).history_archive is None
+
 
 class TestGetMp:
     def test_returns_existing_player_and_sets_context(
@@ -1782,7 +1798,9 @@ def _flags(limit: int = 10) -> SimpleNamespace:
 class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
-        history = GuildHistory(None)
+        history = GuildHistory(
+            None, archive=cast(Any, object()), on_outbox_push=lambda: None
+        )
         history.restore(list(reversed(entries)))  # restore takes newest-first
         mp.history = history
         music_bot.get_mp = MagicMock(return_value=mp)
