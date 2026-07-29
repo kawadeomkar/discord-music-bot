@@ -10,6 +10,7 @@ import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
 from redis.typing import EncodableT, FieldT
 
+from src.config import history_redis_cutover
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -51,14 +52,18 @@ DRAINER_LEASE_MS = 90_000
 # size and the time Redis spends inside one command, so capping a backlog of
 # any size stays incremental; see that function for what one unbounded pop did.
 _TRIM_SLICE = 1000
-# 24h idle expiry, never applied to the history key: push_history PERSISTs that
-# list and every TTL path below excludes it unconditionally.
+# 24h idle expiry. Applied to the history key ONLY after the Phase C cutover
+# (see push_history); every other TTL path still excludes it unconditionally.
 GUILD_TTL = 86400
-# In-memory/display cap only — NOT a retention cap. The Redis history list is
-# unbounded (it holds every played song, and now also feeds the Postgres outbox
-# — see push_history and docs/POSTGRES_HISTORY_PLAN.md); this bounds the
-# GuildHistory deque and every history read so startup stays O(50) against an
-# unbounded list.
+# Display cap — and, after the Phase C cutover, a RETENTION cap too.
+#
+# Pre-cutover it bounds only the GuildHistory deque and each history read, so
+# startup stays O(50) against a Redis list that is still unbounded and holds
+# every play. With HISTORY_REDIS_CUTOVER=1, push_history also LTRIMs the list to
+# this many entries, so raising it to show longer -history changes how much
+# history Redis keeps. That is safe by then — Postgres is the durable copy and
+# -history merges both (guild_history.recent) — but it is no longer a
+# display-only knob, so change it knowing which side of the cutover you are on.
 HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields cleared together on song end / disconnect, and the
@@ -582,31 +587,43 @@ class GuildRedisStore:
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
     # Two keys carry no TTL, so under `maxmemory-policy volatile-lru` they are never
-    # eviction candidates: guild:{id}:history and HISTORY_OUTBOX_KEY. Once they fill
-    # the 256mb maxmemory and no TTL-bearing key is left to evict, Redis rejects
+    # eviction candidates: guild:{id}:history (pre-cutover only) and HISTORY_OUTBOX_KEY.
+    # (It was three until the schema lock removed the DLQ — rows Postgres refuses now go
+    # to the play_history_rejected TABLE, which cannot pressure Redis at all.) Once they
+    # fill the 256mb maxmemory and no TTL-bearing key is left to evict, Redis rejects
     # EVERY write with OOM — not just history: state, queue and cache writes all start
     # failing (each store method swallows the error and logs, so persistence silently
     # degrades rather than crashing).
     #
-    # Two arrival routes, and the fast one is newer than this comment. History itself
-    # is the slow burn (~1M+ entries) that the migration to Postgres exists to close
-    # (docs/POSTGRES_HISTORY_PLAN.md). The OUTBOX is the fast one: it is near-empty
-    # whenever the drainer is keeping up, but it grows for the whole duration of a
-    # Postgres outage, at ~412 bytes per play, and it does not need years to matter.
-    # HISTORY_OUTBOX_MAX (config.py) is the opt-in bound on it, and dropping entries
-    # there is real data loss; a Redis memory/eviction alarm is still owed.
+    # Two arrival routes, and the fast one is newer than this comment. History itself is
+    # the slow burn (~1M+ entries) that HISTORY_REDIS_CUTOVER now closes — the migration
+    # to Postgres shipped, see push_history below. The OUTBOX is the fast one: it is
+    # normally near-empty but grows for the whole duration of a Postgres outage, at
+    # ~412 bytes per play, and it does not need years to matter. HISTORY_OUTBOX_MAX
+    # bounds it (opt-in, and dropping entries there is real data loss); a Redis
+    # memory/eviction alarm is still owed.
     #
     # Do NOT switch to allkeys-lru as a workaround: it would make the outbox evictable,
-    # and an evicted outbox entry is a play that vanishes with no error and no log line
-    # (see docker-compose.yml redis command).
+    # and an evicted outbox entry is a play that vanishes with no error, no rejected-table
+    # row and no log line (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry, mirror it to the Postgres outbox, and PERSIST the
-        history key — no trim, no TTL: the list is the unbounded source of
-        truth for all played songs (write-per-song-end is the durability
-        boundary; cadence analysis in docs/HISTORY_OVERHAUL_PLAN.md §4). The
-        PERSIST also self-heals pre-migration keys still carrying the old 24h
-        idle expiry.
+        """LPUSH one entry, mirror it to the Postgres outbox, and set the
+        history key's retention according to which tier is the source of truth.
+
+        Pre-cutover (default): PERSIST, no trim — the list is the unbounded
+        source of truth for all played songs (write-per-song-end is the
+        durability boundary; cadence analysis in
+        docs/HISTORY_OVERHAUL_PLAN.md §4). The PERSIST also self-heals
+        pre-migration keys still carrying the old 24h idle expiry.
+
+        Post-cutover (HISTORY_REDIS_CUTOVER=1, docs/POSTGRES_HISTORY_PLAN.md
+        Phase C): Postgres holds everything, so the list demotes to a bounded
+        display cache — LTRIM to HISTORY_CACHE_LIMIT and re-apply the ordinary
+        24h idle TTL. ONLY flip this after `just db-backfill` has run: trimming
+        first destroys the only copy of every play older than the cache window.
+        Read per call rather than captured at import so the flag is flippable
+        without an image rebuild (and monkeypatchable in tests).
 
         The same wire bytes are also LPUSHed onto HISTORY_OUTBOX_KEY in the
         same (transactional) pipeline, for the Postgres drainer. Unconditional:
@@ -616,7 +633,11 @@ class GuildRedisStore:
         wire = serialize_history_entry(entry)
         pipe = self.redis.pipeline()
         pipe.lpush(self.history_key(), wire)
-        pipe.persist(self.history_key())
+        if history_redis_cutover():
+            pipe.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            pipe.expire(self.history_key(), GUILD_TTL)
+        else:
+            pipe.persist(self.history_key())
         pipe.lpush(HISTORY_OUTBOX_KEY, wire)
         await pipe.execute()
 

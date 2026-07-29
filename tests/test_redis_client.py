@@ -24,6 +24,7 @@ from src import redis_client
 from src.redis_client import (
     DRAINER_LEASE_KEY,
     DRAINER_LEASE_MS,
+    GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_KEY,
     GuildRedisStore,
@@ -669,6 +670,45 @@ class TestPushHistoryAtomicity:
         # Two LPUSHes (display + outbox), both on the pipeline, none direct.
         assert queued.count("lpush") == 2
         assert direct == []
+
+
+class TestHistoryRedisCutover:
+    """Phase C of the Postgres plan: once Postgres is the source of truth, the
+    Redis history list demotes from unbounded source-of-truth to a bounded
+    display cache. Off by default — flipping it before the backfill has run
+    destroys the only copy of every play older than the cache window."""
+
+    async def test_default_persists_and_never_trims(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT + 5
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_cutover_trims_and_applies_the_idle_ttl(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert 0 < await fake_redis.ttl(store.history_key()) <= GUILD_TTL
+
+    async def test_cutover_never_affects_the_outbox(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The outbox is what makes entries durable; trimming the DISPLAY list
+        # must not drop anything on its way to Postgres.
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await outbox_depth(fake_redis) == HISTORY_CACHE_LIMIT + 5
+        assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
 
 class TestGetHistory:

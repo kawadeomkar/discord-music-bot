@@ -86,6 +86,20 @@ def postgres_url() -> Optional[str]:
     return os.environ.get("POSTGRES_URL")
 
 
+def history_redis_cutover() -> bool:
+    """True once Postgres is the source of truth for play history and the
+    Redis history list may demote to a bounded display cache (Phase C of
+    docs/POSTGRES_HISTORY_PLAN.md).
+
+    Off by default and deliberately a separate switch from POSTGRES_URL: the
+    archive being *configured* is not the same as the archive being *complete*.
+    Flipping this before `just db-backfill` has run trims away the only copy of
+    every play older than HISTORY_CACHE_LIMIT. Runbook order is
+    backfill → Phase B reads → this flag.
+    """
+    return os.environ.get("HISTORY_REDIS_CUTOVER", "").lower() in ("1", "true", "yes")
+
+
 def spotify_enabled() -> bool:
     """True when Spotify-link support should be active — i.e. both Spotify
     credentials are present in the environment.

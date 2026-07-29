@@ -10,10 +10,11 @@ cache of the newest HISTORY_CACHE_LIMIT entries, sized to the most
 move together: every add() lands on the cache and the Redis list in one step,
 and restore() refills the cache from the newest slice of the list.
 
-The Redis list is still unbounded and PERSISTed, so it remains a complete
-second copy of everything the archive holds — which is what makes the merge
-below safe to lean on while the archive is still filling up
-(docs/POSTGRES_HISTORY_PLAN.md).
+Until HISTORY_REDIS_CUTOVER is set the Redis list is still unbounded and
+PERSISTed, so it remains a complete second copy; the cutover demotes it to a
+capped, TTL'd cache once the backfill has been verified
+(docs/POSTGRES_HISTORY_PLAN.md, and config.history_redis_cutover for the
+ordering that makes that safe).
 
 The at-rest wire format is owned by guild_state.py (HistoryEntry +
 serialize_history_entry/parse_history_entry); the store surface is

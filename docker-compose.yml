@@ -93,10 +93,13 @@ services:
     #                       pushed. It is normally near-empty and grows precisely
     #                       during a Postgres outage, i.e. exactly when eviction
     #                       pressure is highest.
-    #   guild:{id}:history  the full per-guild list, PERSISTed. Nothing trims
-    #                       it and nothing gives it a TTL, so every play it
-    #                       holds is a primary copy — one lost to eviction is
-    #                       lost outright.
+    #   guild:{id}:history  the full per-guild list, PERSISTed. NOTE: this one
+    #                       is conditional — HISTORY_REDIS_CUTOVER=1 demotes it
+    #                       to a capped, TTL'd display cache once the backfill
+    #                       is verified, at which point it IS evictable by
+    #                       design. history:outbox is not, ever, and it is the
+    #                       reason this setting cannot be relaxed after the
+    #                       cutover.
     #
     # There used to be a third, history:outbox:dlq. The schema lock retired it:
     # rows Postgres refuses now land in the play_history_rejected TABLE, which
