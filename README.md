@@ -436,7 +436,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 ## Operating the play-history archive
 
 Play history is written twice on every song end, in one Redis pipeline: to the guild's
-history list, and to a global **outbox** the background drainer moves into Postgres.
+display list, and to a global **outbox** the background drainer moves into Postgres.
 The playback loop never waits on Postgres — an unreachable database just means the
 outbox grows and drains later.
 

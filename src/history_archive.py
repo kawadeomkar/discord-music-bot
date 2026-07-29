@@ -161,18 +161,41 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
     )
 
 
-# NOTE for the -history read path, when it starts merging Redis and Postgres:
-# timestamptz is microsecond-granular, but a raw time.time() float is finer than
-# that near 2026 (~2.4e-7 s ULP), so a value and its round trip are UNEQUAL for
-# roughly a third of real timestamps (measured: 37.7%). Any Python-side identity
-# built from both sides of this boundary — a (played_at, webpage_url) dedup key,
-# say — must put BOTH sides through the same
-# datetime.fromtimestamp(t, tz=utc).timestamp() the row conversion above uses, or
-# it compares a quantized float against a raw one and never matches. NOT
-# round(t * 1e6) / 1e6: the two disagree by 1us at ~0.125-ULP boundaries and only
-# the datetime pair is what the database actually does. No such identity exists
-# yet — nothing reads Postgres for -history today — so the helper that did this
-# lives with its caller rather than here, unused.
+def quantized_played_at(played_at: float) -> float:
+    """`played_at` as it will read back out of Postgres.
+
+    timestamptz is microsecond-granular, but a raw time.time() float is finer
+    than that near 2026 (~2.4e-7 s ULP), so a value and its round trip are
+    UNEQUAL for roughly a third of real timestamps (measured: 37.7%). Any
+    Python-side identity built from both sides of the archive boundary must put
+    BOTH through this, or it compares a quantized float against a raw one and
+    never matches. The one such identity today is the (played_at, webpage_url)
+    dedup key in GuildHistory.recent()'s merge; getting it wrong there showed
+    every affected play twice AND, because the merge slices to `limit`
+    afterwards, silently dropped a real song per duplicate.
+
+    Deliberately the same datetime pair _entry_to_row/_row_to_entry use, NOT
+    round(t * 1e6) / 1e6: those disagree by 1us at ~0.125-ULP boundaries, and
+    only this one is what the database actually does. Idempotent, so applying
+    it to a value already read from a row is a no-op.
+
+    Total by construction. HistoryEntry.__post_init__ already clamps played_at
+    into the timestamptz domain, so the guard below is unreachable through any
+    entry — but this takes a bare float, and it runs on the -history read path,
+    which must degrade rather than error. All THREE caught types are things
+    fromtimestamp actually raises, and the third is not padding: ValueError for
+    NaN and for years outside 1..9999, OverflowError for values past platform
+    time_t, and OSError because macOS raises `[Errno 84] Invalid or incomplete
+    multibyte or wide character` for far-future epochs where Linux raises
+    ValueError. Catching what the conversion raises on every platform this runs
+    on is more honest than re-deriving the bound.
+    """
+    try:
+        return datetime.fromtimestamp(played_at, tz=timezone.utc).timestamp()
+    except ValueError, OverflowError, OSError:
+        return played_at
+
+
 def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
     return HistoryEntry(
         guild_id=row["guild_id"],
