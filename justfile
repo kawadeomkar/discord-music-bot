@@ -439,7 +439,8 @@ _dotenv := '''
     # bundled stack synthesises the bot's URL inside compose (docker-compose.yml
     # builds it from POSTGRES_USER/PASSWORD/DB), so it never lands in .env — and
     # without this every recipe below died with "POSTGRES_URL is not set" on the
-    # exact stack the README tells you to run.
+    # exact stack the README tells you to run, including db-backfill, which is
+    # the mandatory step before HISTORY_REDIS_CUTOVER=1.
     if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
         export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
     fi
@@ -482,6 +483,15 @@ db-migrate:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
+
+# Copy pre-archive history off the Redis lists into Postgres. Idempotent and
+# resumable (ON CONFLICT DO NOTHING). MUST run before HISTORY_REDIS_CUTOVER=1.
+[doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
+[group('database')]
+db-backfill *ARGS:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
 
 # Rows Postgres refused, parked by record_rejection. Expected to print NOTHING:
 # every entry reaching the drainer is insertable by construction, so a row here
