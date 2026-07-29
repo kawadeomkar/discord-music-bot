@@ -148,9 +148,16 @@ class MusicBotApp(commands.AutoShardedBot):
         log.info(f"Bot commands: {self.intents.voice_states}")
 
     async def close(self) -> None:
+        # Order is load-bearing. super().close() disconnects voice clients and can
+        # still dispatch events in flight — an on_voice_state_update landing in that
+        # window runs cleanup(), which calls store.clear_connection()/refresh_ttl().
+        # With Redis already closed those writes hit a dead pool and are swallowed as
+        # warnings, so an ORDERLY shutdown persists state as if the bot had crashed
+        # and the next start runs spurious crash recovery for cleanly-stopped guilds.
+        # Disconnect first, then tear down what the disconnect path depends on.
+        await super().close()
         if self._redis_pool is not None:
             await close_redis_pool(self._redis_pool)
-        await super().close()
         loop = asyncio.get_running_loop()
         # aclose() owns its own off-loop join — only it knows which half blocks, and it
         # bounds the wait so a stuck extraction can't hang the process's exit.
