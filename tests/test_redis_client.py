@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 import orjson
 import pytest
 import redis.asyncio as aioredis
+from redis.asyncio import Redis
+from redis.asyncio.client import Pipeline
 
 from src.guild_state import (
     GuildPlaybackSnapshot,
@@ -18,16 +20,26 @@ from src.guild_state import (
     SongQueueEntry,
 )
 from tests.helpers import mocked
+from src import redis_client
 from src.redis_client import (
+    DRAINER_LEASE_KEY,
+    DRAINER_LEASE_MS,
     HISTORY_CACHE_LIMIT,
+    HISTORY_OUTBOX_KEY,
     GuildRedisStore,
     cache_get,
     cache_set,
     close_redis_pool,
     create_redis_pool,
     get_redis,
+    hold_drainer_lease,
+    outbox_depth,
+    peek_outbox_oldest,
+    release_drainer_lease,
+    retire_outbox,
     spotify_token_get_with_ttl,
     spotify_token_set,
+    trim_outbox_oldest,
 )
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -352,6 +364,219 @@ class TestPushHistory:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.push_history(_hentry(1))  # must not raise
+
+
+class TestOutboxDrainHelpers:
+    async def _push(self, fake_redis: Redis, *ns: int) -> None:
+        # Seeded by hand, one LPUSH of the wire bytes per play (newest at the
+        # head) — the shape the write path will produce. These are the DRAIN
+        # side and have to be exercisable on their own: nothing writes the
+        # outbox yet, because that leg lands with the drainer that consumes it.
+        for n in ns:
+            await fake_redis.lpush(HISTORY_OUTBOX_KEY, _hentry(n).to_redis())
+
+    async def test_peek_returns_oldest_first(self, fake_redis: Redis) -> None:
+        await self._push(fake_redis, 1, 2, 3)
+        raw = await peek_outbox_oldest(fake_redis, 10)
+        assert raw == [
+            _hentry(1).to_redis(),
+            _hentry(2).to_redis(),
+            _hentry(3).to_redis(),
+        ]
+
+    async def test_peek_caps_at_count_and_leaves_entries_in_place(
+        self, fake_redis: Redis
+    ) -> None:
+        await self._push(fake_redis, 1, 2, 3)
+        raw = await peek_outbox_oldest(fake_redis, 2)
+        assert raw == [_hentry(1).to_redis(), _hentry(2).to_redis()]
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3  # non-destructive
+
+    async def test_peek_empty_outbox(self, fake_redis: Redis) -> None:
+        assert await peek_outbox_oldest(fake_redis, 10) == []
+
+    async def test_retire_drops_oldest_only(self, fake_redis: Redis) -> None:
+        await self._push(fake_redis, 1, 2, 3)
+        await retire_outbox(fake_redis, 2)
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_retire_zero_is_noop(self, fake_redis: Redis) -> None:
+        await self._push(fake_redis, 1)
+        await retire_outbox(fake_redis, 0)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_retire_never_touches_concurrent_head_pushes(
+        self, fake_redis: Redis
+    ) -> None:
+        # A push landing between peek and retire goes to the HEAD; RPOP from
+        # the tail must retire only what was peeked.
+        await self._push(fake_redis, 1, 2)
+        peeked = await peek_outbox_oldest(fake_redis, 10)
+        await self._push(fake_redis, 3)  # concurrent new entry
+        await retire_outbox(fake_redis, len(peeked))
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_depth(self, fake_redis: Redis) -> None:
+        assert await outbox_depth(fake_redis) == 0
+        await self._push(fake_redis, 1, 2)
+        assert await outbox_depth(fake_redis) == 2
+
+    async def test_helpers_raise_on_redis_error(self) -> None:
+        # Unlike the cache helpers, errors must PROPAGATE — the drainer's
+        # backoff loop is the handler, and a swallowed error would read as an
+        # empty outbox and silently stall the drain.
+        dead = MagicMock()
+        dead.lrange = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        dead.rpop = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        dead.llen = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        with pytest.raises(aioredis.ConnectionError):
+            await peek_outbox_oldest(dead, 10)
+        with pytest.raises(aioredis.ConnectionError):
+            await retire_outbox(dead, 1)
+        with pytest.raises(aioredis.ConnectionError):
+            await outbox_depth(dead)
+
+    async def test_trim_drops_oldest(self, fake_redis: Redis) -> None:
+        # The opt-in cap's mechanism. Same shape as retire, different meaning:
+        # these entries never reached Postgres.
+        await self._push(fake_redis, 1, 2, 3)
+        await trim_outbox_oldest(fake_redis, 2)
+        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+
+    async def test_trim_zero_is_noop(self, fake_redis: Redis) -> None:
+        await self._push(fake_redis, 1)
+        await trim_outbox_oldest(fake_redis, 0)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_trim_pops_in_bounded_slices(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REGRESSION: one `RPOP key <count>` for the whole drop. RPOP with a
+        count returns what it popped, so at 490k entries the 206 MB / 5.3s
+        reply blew redis-py's default socket timeout and retry_on_timeout
+        re-issued the destructive pop — emptying a 500k outbox while logging
+        "dropped 490,000". Each command must stay bounded no matter how far
+        the backlog ran."""
+        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
+        await self._push(fake_redis, *range(1, 8))  # 7 entries
+        calls: list[int] = []
+        real_rpop = fake_redis.rpop
+
+        async def counting_rpop(name: str, count: int) -> Any:
+            calls.append(count)
+            return await real_rpop(name, count)
+
+        monkeypatch.setattr(fake_redis, "rpop", counting_rpop)
+        await trim_outbox_oldest(fake_redis, 5)
+        assert calls == [2, 2, 1]  # never one 5-wide pop
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        # And it dropped the OLDEST 5, leaving the two newest.
+        assert await peek_outbox_oldest(fake_redis, 10) == [
+            _hentry(6).to_redis(),
+            _hentry(7).to_redis(),
+        ]
+
+    async def test_trim_stops_when_the_outbox_empties_underneath_it(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A concurrent drain can retire the tail between slices; the loop must
+        # notice the short/empty reply rather than spinning on a gone key.
+        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
+        await self._push(fake_redis, 1, 2)
+        await trim_outbox_oldest(fake_redis, 1000)
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+
+
+class TestDrainerLease:
+    async def test_acquire_then_renew_by_the_same_holder(
+        self, fake_redis: Redis
+    ) -> None:
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        assert await hold_drainer_lease(fake_redis, "a") is True  # renew
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+
+    async def test_second_holder_is_refused(self, fake_redis: Redis) -> None:
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        assert await hold_drainer_lease(fake_redis, "b") is False
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+
+    async def test_renew_extends_the_ttl(self, fake_redis: Redis) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await fake_redis.pexpire(DRAINER_LEASE_KEY, 50)
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        ttl = await fake_redis.pttl(DRAINER_LEASE_KEY)
+        assert ttl > DRAINER_LEASE_MS // 2
+
+    async def test_lapsed_lease_is_reacquirable_by_anyone(
+        self, fake_redis: Redis
+    ) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await fake_redis.delete(DRAINER_LEASE_KEY)  # stand-in for expiry
+        assert await hold_drainer_lease(fake_redis, "b") is True
+
+    async def test_release_only_by_the_owner(self, fake_redis: Redis) -> None:
+        await hold_drainer_lease(fake_redis, "a")
+        await release_drainer_lease(fake_redis, "b")  # not ours
+        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
+        await release_drainer_lease(fake_redis, "a")
+        assert await fake_redis.get(DRAINER_LEASE_KEY) is None
+
+    async def test_release_on_a_missing_lease_is_safe(self, fake_redis: Redis) -> None:
+        await release_drainer_lease(fake_redis, "a")
+
+    async def test_an_aborted_watch_is_retried_and_re_reads(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The WATCH-abort branch, forced.
+
+        It cannot be reached naturally under fakeredis: measured against real
+        redis:7-alpine, TTL-expiry of a WATCHed key DOES abort EXEC, and under
+        fakeredis it does NOT. That divergence hid the one branch that makes
+        renewal safe — a drainer stalled past DRAINER_LEASE_MS whose lease
+        lapses between our GET and our EXEC. On real Redis the transaction
+        aborts and only the retry re-reads and reports the truth; without the
+        retry the caller is told it still owns a lease somebody else can now
+        take, which is the two-drainers state the lease exists to prevent.
+        """
+        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
+        calls = {"n": 0}
+        real_execute_transaction = Pipeline._execute_transaction
+
+        # Patched BELOW execute(), not over it: execute() ends in
+        # `finally: await self.reset()`, and that reset is exactly what lets the
+        # retry re-WATCH — without it the second lap dies on "Cannot issue a
+        # WATCH after a MULTI". Replacing execute() outright would skip it and
+        # test a pipeline redis-py never actually hands us.
+        async def aborting_transaction(self: Any, *args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # What real Redis does when the watched key changed under us —
+                # plus the lapse that made it change.
+                await fake_redis.delete(DRAINER_LEASE_KEY)
+                raise aioredis.WatchError("watched key changed")
+            return await real_execute_transaction(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "_execute_transaction", aborting_transaction)
+        # Must NOT report continued ownership of a lease that is now gone.
+        assert await hold_drainer_lease(fake_redis, "a") is False
+        assert calls["n"] == 1  # retry short-circuited at the re-read, no 2nd EXEC
+
+    async def test_not_the_owner_releases_the_watch(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Leaving a WATCH set on the connection would make the NEXT transaction
+        # on it abort for a key this call had no business watching.
+        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
+        unwatched = MagicMock()
+        real_unwatch = Pipeline.unwatch
+
+        async def counting_unwatch(self: Any) -> Any:
+            unwatched()
+            return await real_unwatch(self)
+
+        monkeypatch.setattr(Pipeline, "unwatch", counting_unwatch)
+        assert await hold_drainer_lease(fake_redis, "b") is False
+        unwatched.assert_called_once()
 
 
 class TestGetHistory:

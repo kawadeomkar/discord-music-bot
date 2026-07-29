@@ -31,7 +31,33 @@ GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
-GUILD_TTL = 86400  # 24h idle expiry (never applied to the history key — see below)
+# Global (not per-guild) write-ahead buffer for the Postgres history archive:
+# entries from all guilds will interleave here (each carries its guild_id on
+# the wire), oldest-first. Deliberately NO TTL — it is meant to hold
+# not-yet-durable entries, so under maxmemory-policy volatile-lru it must never
+# be an eviction candidate. See docs/POSTGRES_HISTORY_PLAN.md §3.
+#
+# NOTHING WRITES TO THIS KEY YET, and that is the point of where this branch
+# stops. Only the drain-side helpers below exist here. A producer without a
+# consumer would grow a non-evictable key at ~412 bytes per play with nothing
+# ever popping it — golden rule 12's exact failure mode, and OOM against the
+# compose Redis' 256mb in under two weeks. So push_history's outbox leg and the
+# drainer that empties it land together, in the branch that adds the archive.
+HISTORY_OUTBOX_KEY = "history:outbox"
+# Cross-process drainer ownership (H2). peek → INSERT → retire is only safe
+# with a single drainer, and the structure it guards lives in this same Redis,
+# so a single-instance lease is the correct failure domain (no Redlock).
+DRAINER_LEASE_KEY = "history:drainer"
+# INVARIANT: must exceed HistoryOutboxDrainer.DRAIN_DEADLINE_SECS * 1000, so a
+# batch can never outlive the ownership it was started under. A test asserts it.
+DRAINER_LEASE_MS = 90_000
+# How many entries trim_outbox_oldest() drops per RPOP. Bounds both the reply
+# size and the time Redis spends inside one command, so capping a backlog of
+# any size stays incremental; see that function for what one unbounded pop did.
+_TRIM_SLICE = 1000
+# 24h idle expiry, never applied to the history key: push_history PERSISTs that
+# list and every TTL path below excludes it unconditionally.
+GUILD_TTL = 86400
 # In-memory/display cap only — NOT a retention cap. The Redis history list is
 # unbounded (source of truth for all played songs; Postgres eventually — see
 # docs/HISTORY_OVERHAUL_PLAN.md §4/§8); this bounds the GuildHistory deque and
@@ -182,6 +208,141 @@ async def spotify_token_get_with_ttl(
     except Exception as e:
         log.warning(f"spotify_token_get_with_ttl failed: {e}")
         return None
+
+
+# ── History outbox (drain side) ───────────────────────────────────────────────
+# The mechanics, ahead of the tier that uses them: these are the operations the
+# archive's drainer will run, with their own tests, and nothing in the bot calls
+# them yet (see HISTORY_OUTBOX_KEY above for why the producer waits). Unlike the
+# cache helpers above, they deliberately DO raise on Redis failure — the
+# drainer's backoff loop is the error handler, and a swallowed error here would
+# look like an empty outbox and silently stall the drain. Raw bytes in/out: wire
+# parsing stays in guild_state.py (parse_history_entry), per the schema rule.
+#
+# Single-consumer assumption: peek → INSERT → retire is only safe with one
+# drainer per outbox (two would both peek the same tail, then the second
+# retire would pop *unprocessed* entries — reproduced as 6 pushed / 3 archived
+# / outbox empty). One bot process per Redis is already the deployment's
+# operating rule (see the recovery lock and docs/K8S_DEPLOYMENT_PLAN.md), but
+# "already the rule" is not an enforcement mechanism, and the rolling deploys
+# on that same roadmap break it by construction for the length of a handoff.
+# hold_drainer_lease() below turns the assumption into a guarantee.
+
+
+async def peek_outbox_oldest(redis: aioredis.Redis, count: int) -> list[bytes]:
+    """The oldest ≤count outbox entries, oldest first, left in place.
+    LPUSH writes at the head, so the tail slice LRANGE -count..-1 is the
+    oldest run; Redis returns it in list order (newer→older), hence the
+    reversal."""
+    # cast, not a bare annotation: decode_responses=False on the pool, so the
+    # list is bytes — same convention as the HGETALL readers below.
+    raw = cast(list[bytes], await redis.lrange(HISTORY_OUTBOX_KEY, -count, -1))
+    raw.reverse()
+    return raw
+
+
+async def retire_outbox(redis: aioredis.Redis, count: int) -> None:
+    """Drop the oldest `count` entries — call only after their Postgres
+    INSERT committed (crash between insert and retire redelivers; the
+    archive's unique index dedups). RPOP pops from the tail (oldest), so
+    concurrent LPUSHes at the head are never touched."""
+    if count > 0:
+        await redis.rpop(HISTORY_OUTBOX_KEY, count)
+
+
+async def outbox_depth(redis: aioredis.Redis) -> int:
+    """Current outbox length — the drainer's backlog watchdog metric."""
+    return await redis.llen(HISTORY_OUTBOX_KEY)
+
+
+async def trim_outbox_oldest(redis: aioredis.Redis, count: int) -> None:
+    """Drop the oldest `count` entries WITHOUT archiving them — the opt-in
+    HISTORY_OUTBOX_MAX cap only (history_archive.py). Same end of the list as
+    retire_outbox; a separate name so `grep retire_outbox` still means
+    "entries that reached Postgres" and this one always reads as data loss.
+
+    Popped in _TRIM_SLICE-sized slices, NOT as one `RPOP key <count>`. Unlike
+    retire_outbox — whose count is bounded by BATCH_SIZE at its only call
+    site — this count is `depth - HISTORY_OUTBOX_MAX`, i.e. however far a
+    Postgres outage ran. RPOP with a count *returns what it popped*, so a
+    single call carries the whole dropped set back over the socket: measured
+    5.3s and 206 MB for 490k entries. That is bad twice over. Redis is
+    single-threaded, so it head-of-line-blocks every other guild for the
+    duration (a concurrent `SET guild:state` measured 1.46s), and it exceeds
+    redis-py's default 5s socket timeout, whereupon retry_on_timeout re-issues
+    this DESTRUCTIVE pop against a list Redis has already popped — silently
+    emptying a 500k outbox while logging "dropped 490,000". Slicing keeps each
+    reply small and each command short regardless of how large the backlog got.
+    """
+    while count > 0:
+        popped = await redis.rpop(HISTORY_OUTBOX_KEY, min(count, _TRIM_SLICE))
+        if not popped:
+            # Raced to empty by a concurrent push/drain; nothing left to drop.
+            return
+        count -= len(cast(list[bytes], popped))
+
+
+async def _if_still_owner(
+    redis: aioredis.Redis,
+    lease_id: str,
+    act: Callable[[Pipeline], object],
+) -> bool:
+    """Run `act` on the lease key iff `lease_id` still owns it, atomically.
+
+    Renew and release are both compare-and-act, which a bare GET-then-PEXPIRE
+    cannot be: between the two, our lease can lapse and another process can
+    take it, and we would then extend or delete a lease we no longer hold —
+    the exact two-drainers state the lease exists to prevent.
+
+    WATCH/MULTI rather than a Lua script, deliberately: EVAL needs a real Lua
+    interpreter, which fakeredis only has with an extra dependency, and a lease
+    whose correctness cannot be tested is not worth having. The optimistic
+    retry closes the window — if the key changed after WATCH, EXEC aborts
+    (WatchError) and we re-read. Key expiry needs no special handling either
+    way: an expired-and-untaken key reads as None below, and an
+    expired-and-retaken one reads as somebody else's id.
+    """
+    async with redis.pipeline() as pipe:
+        while True:
+            try:
+                await pipe.watch(DRAINER_LEASE_KEY)
+                # decode_responses=False on the pool, so this is bytes (same
+                # cast convention as the HGETALL readers).
+                current = cast(Optional[bytes], await pipe.get(DRAINER_LEASE_KEY))
+                if current is None or current.decode() != lease_id:
+                    await pipe.unwatch()
+                    return False
+                pipe.multi()
+                act(pipe)
+                await pipe.execute()
+                return True
+            except aioredis.WatchError:
+                continue
+
+
+async def hold_drainer_lease(redis: aioredis.Redis, lease_id: str) -> bool:
+    """True when `lease_id` owns the drain right for the next DRAINER_LEASE_MS.
+
+    Acquire-or-renew in one call: SET NX PX takes a free lease, and the
+    compare-and-renew above extends one we already hold. False means somebody
+    else owns it — the caller must not touch the outbox this cycle.
+
+    The TTL is what makes a dead holder recoverable: a process that dies
+    mid-batch never releases, and the lease simply lapses ≤90s later, at which
+    point any survivor's next SET NX takes over.
+    """
+    if await redis.set(DRAINER_LEASE_KEY, lease_id, nx=True, px=DRAINER_LEASE_MS):
+        return True
+    return await _if_still_owner(
+        redis, lease_id, lambda pipe: pipe.pexpire(DRAINER_LEASE_KEY, DRAINER_LEASE_MS)
+    )
+
+
+async def release_drainer_lease(redis: aioredis.Redis, lease_id: str) -> None:
+    """Hand the lease back at shutdown so the next instance starts draining
+    immediately instead of waiting out the TTL. Compare-and-delete: a lease
+    that already lapsed and was retaken belongs to someone else now."""
+    await _if_still_owner(redis, lease_id, lambda pipe: pipe.delete(DRAINER_LEASE_KEY))
 
 
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
@@ -430,12 +591,16 @@ class GuildRedisStore:
     # is left to evict, Redis rejects EVERY write with OOM — not just history: state,
     # queue, and cache writes all start failing (each store method swallows the error and
     # logs, so persistence silently degrades rather than crashing). Small entries make
-    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The planned
-    # fix is migrating full history to Postgres and demoting the Redis list to a bounded
-    # cache (docs/HISTORY_OVERHAUL_PLAN.md §8, architecture plan §3.11); until then this
-    # needs a Redis memory/eviction alarm. Do NOT switch back to allkeys-lru as a
-    # workaround — that would make history itself an eviction candidate and defeat the
-    # whole persistent-history design (see docker-compose.yml redis command).
+    # this a slow burn (~1M+ entries), but "unbounded" means it does arrive. The fix in
+    # progress is migrating full history to Postgres and demoting the Redis list to a
+    # bounded cache (docs/POSTGRES_HISTORY_PLAN.md); until then this needs a Redis
+    # memory/eviction alarm. Do NOT switch back to allkeys-lru as a workaround — that
+    # would make history itself an eviction candidate and defeat the whole
+    # persistent-history design (see docker-compose.yml redis command).
+    #
+    # HISTORY_OUTBOX_KEY is declared with the same no-TTL contract and will be the
+    # second, faster route into this same failure — but nothing writes to it in this
+    # branch, so today history is the only non-evictable key under memory pressure.
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
         """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is
