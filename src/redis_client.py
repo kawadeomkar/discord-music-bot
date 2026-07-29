@@ -8,6 +8,10 @@ from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.retry import Retry
 from redis.typing import EncodableT, FieldT
 
 from src.config import history_redis_cutover
@@ -107,7 +111,23 @@ def create_redis_pool() -> aioredis.ConnectionPool:
         socket_keepalive=True,
         health_check_interval=30,
         retry_on_timeout=True,
-        retry_on_error=[ConnectionError, TimeoutError],
+        # redis-py's OWN exception classes, not the builtins of the same name.
+        # `redis.exceptions.ConnectionError` does not subclass builtins.ConnectionError
+        # (it derives from RedisError), so listing the builtin here matched nothing
+        # redis-py ever raises and connection errors got no retry at all — while every
+        # store method logs-and-swallows, so the missing retry surfaced as persistence
+        # quietly degrading rather than as an error. See test_redis_client.py, which
+        # asserts the non-subclass relationship that makes this easy to get wrong.
+        #
+        # (The builtin TimeoutError was harmless but redundant: retry_on_timeout=True
+        # already appends socket.timeout, which IS builtins.TimeoutError on 3.10+.)
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        # Without an explicit Retry, redis-py synthesises `Retry(NoBackoff(), 1)` for a
+        # non-empty retry_on_error: one immediate reattempt, no backoff. A restarting
+        # Redis is usually gone for longer than that, and a hammering reconnect is what
+        # backoff exists to avoid. 3 attempts over ExponentialBackoff's default 8ms→512ms
+        # ceiling covers an ordinary restart without stalling a command for long.
+        retry=Retry(ExponentialBackoff(), 3),
         socket_connect_timeout=5,
     )
 
