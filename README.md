@@ -113,8 +113,26 @@ Credentials *must* be set in a `.env` file at the project root before starting a
 `docker-compose.yml` declares `env_file: .env`, and Compose treats a missing one as
 an error rather than a warning. The format is under [step 2](#install-and-configure).
 
-`docker compose up` starts the whole stack, not just the bot: Redis, the bgutil POT
-provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
+`docker compose up` starts the whole stack, not just the bot: Redis, Postgres, the
+bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
+
+Postgres is the future durable home of play history. The server, its schema and the
+operator tooling land ahead of the code that uses them — **no bot code reads or writes
+Postgres yet**, so the service is inert and the bot starts with or without it.
+`POSTGRES_PASSWORD` is still mandatory and has no fallback, because Compose refuses to
+initialize a database with a credential nobody chose; run
+[`./setup_env.sh`](#install-and-configure) to generate one. If port 5432 is already
+taken on your machine, set `POSTGRES_HOST_PORT`.
+
+The schema is applied by a migration runner, never by the bot. `docker compose up`
+runs it for you as a one-shot `db-migrate` service; against an external Postgres, run
+it yourself:
+
+```bash
+just db-migrate            # apply pending migrations
+```
+
+See [Operating the play-history archive](#operating-the-play-history-archive).
 
 **To contribute**, add:
 
@@ -159,6 +177,20 @@ SPOTIFY_CLIENT_ID=your_spotify_client_id
 SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 ```
 
+Or start from the template and let the helper fill in the generated values:
+
+```bash
+./setup_env.sh     # copies .env.example -> .env, generates POSTGRES_PASSWORD
+```
+
+`POSTGRES_PASSWORD` is a fresh 128-bit random value, independent of every other
+secret — it is deliberately *not* derived from `DISCORD_TOKEN`, so rotating the token
+cannot invalidate a live database credential and one leaked secret does not
+compromise two systems. Re-running is safe: an existing password is left alone,
+because Postgres only reads it when it first initializes its data volume and a
+silently-changed value would lock the bot out of its own database. `--force`
+regenerates anyway and warns about exactly that.
+
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its
 bundled Node runtime.
@@ -178,6 +210,10 @@ to when something is missing; `just --evaluate` prints it directly.
 ```bash
 # Start Redis if you don't have one running
 docker compose up -d redis
+
+# Optional for now: Postgres plus the one-shot that applies the schema. No bot
+# code touches them yet, but `just db-migrate` and the backup recipes do.
+docker compose up -d postgres db-migrate
 
 poetry run bot
 ```
@@ -254,6 +290,21 @@ just test --maxfail=1              # stop at the first failure
 (`./build_docker.sh`). Use `just image` when you want the artifact and have already
 run `just check`.
 
+**Database** — see [Operating the play-history archive](#operating-the-play-history-archive)
+
+| Recipe | Does |
+|---|---|
+| `just db-migrate` | Apply pending play-history schema migrations |
+| `just db-backup` | Dump the play-history database to `backups/` |
+| `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
+
+These resolve `POSTGRES_URL` from the environment first, then `.env`, and finally by
+building a host DSN from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
+`POSTGRES_HOST_PORT` — Compose builds the one-shot's URL internally, so it never
+appears in `.env`. They therefore work the same against the bundled Compose Postgres
+and an external one. A value already exported in your shell wins over `.env`, so
+`POSTGRES_URL=…staging just db-migrate` targets staging.
+
 **Deploy**
 
 | Recipe | Does |
@@ -295,6 +346,8 @@ The Compose stack runs the bot plus its supporting services:
 |---|---|
 | `discord-music-bot` | The bot itself (host networking) |
 | `redis` | Redis 7 with AOF persistence — queue/state/cache storage |
+| `postgres` | Postgres 18 — the play-history database (no bot code reads it yet) |
+| `db-migrate` | One-shot schema migration; exits 0 once the database is up to date |
 | `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works ([details](docs/PO_TOKEN_SIDECAR_PLAN.md)); optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
@@ -357,12 +410,71 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `SPOTIFY_CLIENT_ID` | | — | Spotify app client ID (Client Credentials flow). Enables Spotify links; omit both Spotify vars to run without Spotify support |
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
+| `POSTGRES_PASSWORD` | ✅ | — | Password for the bundled Postgres service. Required by the Compose stack, which fails the command outright rather than initializing a database with a credential nobody chose. Generated once by `./setup_env.sh`, independent of every other secret |
+| `POSTGRES_URL` | | built by Compose for the `db-migrate` one-shot | Play-history database URL. Read by `just db-migrate` and the other `db-*` recipes; **no bot code reads it yet**. Set it in `.env` to point the recipes at a Postgres you already run |
+| `POSTGRES_USER` | | `musicbot` | Role owning the bundled Postgres service's database |
+| `POSTGRES_DB` | | `musicbot` | Database name on the bundled Postgres service |
+| `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the `db-*` recipes run on the host and connect through this port |
+| `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
+
+## Operating the play-history archive
+
+Postgres is the durable home play history is moving to. This is the infrastructure
+half: the server, the `play_history` schema and the operator tooling. **Nothing writes
+to it yet** — play history still lives entirely on the Redis lists, and the bot never
+opens a Postgres connection. Setting the tier up first means the schema is already
+applied, backed up and restorable by the time the code that fills it arrives.
+
+### Schema
+
+```bash
+just db-migrate            # apply pending migrations (idempotent, concurrency-safe)
+```
+
+Migrations live in `migrations/NNNN_name.sql` and are applied in numeric order by
+`src/db_migrate.py`; the bot never runs DDL. Each one runs in its own transaction
+holding an advisory lock, so two runners racing during a deploy is safe and a
+half-applied migration is not a state the database can be left in. The runner records
+what it applied in a `schema_migrations` ledger and re-running is a no-op.
+
+### Backups
+
+```bash
+just db-backup                              # -> backups/play_history_<timestamp>.dump
+just db-restore backups/play_history_...    # -> <db>_restore_check, live untouched
+```
+
+`db-restore` targets a **scratch** database by default. Overwriting the live one is
+deliberately awkward, because it drops and replaces every row — including every play
+since the dump:
+
+```bash
+CONFIRM=1 just db-restore backups/play_history_... musicbot
+```
+
+A nightly dump gives an **RPO of ≤ 24 h** for whatever the database holds. Schedule it
+with cron or a systemd timer and prune old files:
+
+```cron
+0 4 * * *  cd /srv/discord-music-bot && /usr/local/bin/just db-backup && ls -1t backups/*.dump | tail -n +15 | xargs rm -f
+```
+
+Two details that bite in cron specifically: it runs with a minimal `PATH`, so `just`
+needs its absolute path (`command -v just` to find yours), and `xargs -r` is a GNU
+extension — `xargs rm -f` is the portable way to tolerate an empty list.
+
+Test the restore quarterly — an untested backup is a hypothesis. `just db-restore
+<file>` already restores into `<db>_restore_check` rather than the live database, so
+the drill is just that command followed by `SELECT count(*) FROM play_history` against
+that scratch database. WAL archiving / PITR is
+out of scope for the bundled Compose stack; on a managed Postgres, use the platform's
+own PITR.
 
 ## Architecture
 
