@@ -187,7 +187,7 @@ class MusicBotApp(commands.AutoShardedBot):
     async def close(self) -> None:
         # Reentrancy guard, ahead of everything. discord.py's own close() is
         # idempotent, but its check lives in super().close() — which this
-        # override only reaches at the END of teardown, so a second close()
+        # override only reaches partway through teardown, so a second close()
         # would re-run the whole sequence first. That matters most for
         # drainer.stop(): two concurrent final drains each peek → insert →
         # retire, and the second retires entries the first never inserted
@@ -202,8 +202,24 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
-        # Drainer first (its final drain still needs Redis and the archive),
-        # then the archive pool, then the Redis pool they both sat on.
+        # Order is load-bearing in BOTH directions, and the two constraints
+        # order different pairs, so they compose:
+        #
+        #   drainer BEFORE archive and Redis — its final drain reads the outbox
+        #     and writes Postgres, so both have to still be alive for it.
+        #   super().close() BEFORE the Redis pool — it disconnects voice clients
+        #     and can still dispatch events in flight, and an
+        #     on_voice_state_update landing in that window runs cleanup(), which
+        #     calls store.clear_connection()/refresh_ttl(). With Redis already
+        #     closed those writes hit a dead pool and are swallowed as warnings,
+        #     so an ORDERLY shutdown persists state as if the bot had crashed and
+        #     the next start runs spurious crash recovery for cleanly-stopped
+        #     guilds.
+        #
+        # The archive can close before the disconnect: the cleanup path that the
+        # disconnect can trigger touches Redis only. A song ending in that window
+        # still lands on the outbox and drains on the next start — at-least-once
+        # delivery is what makes that safe.
         #
         # getattr, not a plain attribute read: discord.py calls close() from
         # run()'s finally even when setup_hook RAISED, and setup_hook is where
@@ -215,13 +231,14 @@ class MusicBotApp(commands.AutoShardedBot):
         #
         # Each step is individually guarded, for the same reason the getattr is
         # there: teardown must run to completion even when one participant is
-        # sick. Both of these CAN raise — a hung Postgres made archive.close()
-        # raise TimeoutError after 30s, and a drainer task that died with an
-        # exception made stop() re-raise it — and because _teardown_started is
-        # already set, the retry path short-circuits to super().close(), so
-        # every step after the raiser was skipped for good: Redis pool left
-        # open, discord.py never closed, the yt-dlp pool left to its 61s atexit
-        # join, and no spans flushed, which hid the very failure that caused it.
+        # sick. These CAN raise — a hung Postgres made archive.close() raise
+        # TimeoutError after 30s, and a drainer task that died with an exception
+        # made stop() re-raise it — and because _teardown_started is already set,
+        # the retry path short-circuits, so every step after the raiser was
+        # skipped for good: Redis pool left open, discord.py never closed, the
+        # yt-dlp pool left to its 61s atexit join, and no spans flushed, which hid
+        # the very failure that caused it. super().close() is guarded too now
+        # that a step follows it — the rule is that no step may skip a later one.
         drainer = getattr(self, "history_drainer", None)
         if drainer is not None:
             try:
@@ -234,12 +251,15 @@ class MusicBotApp(commands.AutoShardedBot):
                 await archive.close()
             except Exception as e:
                 log.warning(f"history archive shutdown failed: {e}")
+        try:
+            await super().close()
+        except Exception as e:
+            log.warning(f"discord client shutdown failed: {e}")
         if self._redis_pool is not None:
             try:
                 await close_redis_pool(self._redis_pool)
             except Exception as e:
                 log.warning(f"redis pool shutdown failed: {e}")
-        await super().close()
         loop = asyncio.get_running_loop()
         # aclose() owns its own off-loop join — only it knows which half blocks, and it
         # bounds the wait so a stuck extraction can't hang the process's exit.
