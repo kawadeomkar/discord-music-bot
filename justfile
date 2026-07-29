@@ -249,6 +249,24 @@ test *ARGS: (_tools 'pytest')
     set -euo pipefail
     {{ PYTEST }} --tb=short -q "$@"
 
+# The real-Postgres tier, excluded from `test` by its `pg` marker.
+#
+# Server comes from one of two places, decided by the tests themselves: with
+# POSTGRES_TEST_URL set it uses that server (how CI's pg-integration job points
+# at its service container), otherwise testcontainers starts postgres:18-alpine
+# and Docker must be running. RUN_PG_TESTS=1 is set here so the local invocation
+# is just `just test-pg`; the tests also accept POSTGRES_TEST_URL alone.
+#
+# --no-cov, and not as a shortcut: this tier drives SQL against a real server
+# rather than exercising src/ branches, so measuring it under the 80% gate would
+# fail the run on a coverage number that means nothing for what it tests.
+[doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
+[group('check')]
+test-pg *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:
@@ -282,6 +300,33 @@ pins:
     sh_image="$(sed -n 's/^IMAGE_NAME="\(.*\)"$/\1/p' build_common.sh)"
     if [ -z "$just_image" ] || [ "$just_image" != "$sh_image" ]; then
         echo "image name drift: justfile IMAGE=[$just_image] build_common.sh IMAGE_NAME=[$sh_image]" >&2
+        fail=1
+    fi
+
+    # The pg tier runs against testcontainers locally and a CI service container
+    # on GitHub, and the two must be the same server: a schema or type behaviour
+    # that differs between majors would pass in one place and fail in the other,
+    # with nothing pointing at the version as the cause.
+    py_pg="$(sed -n 's/^_PG_IMAGE = "\(.*\)"$/\1/p' tests/test_pg_integration.py)"
+    # Anchored to the pg-integration job, not `head -1`: the first
+    # `image: postgres:*` in the file happens to be that job's today, and a
+    # second postgres service added anywhere above it would silently start
+    # comparing the wrong one.
+    ci_pg="$(awk '/^  pg-integration:/{f=1} f && /image: postgres:/{print $2; exit}' .github/workflows/ci.yml)"
+    if [ -z "$py_pg" ] || [ "$py_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: test_pg_integration.py=[$py_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    # ...and compose, which is the copy that holds real data. Checking only the
+    # two test-side copies left the deployed server free to drift to another
+    # major while `just pins` and CI stayed green — exactly the scenario above,
+    # but validated against a server nobody runs in production.
+    compose_pg="$(awk '/^  postgres:/{f=1} f && /image: postgres:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$compose_pg" ] || [ "$compose_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: docker-compose.yml=[$compose_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
         fail=1
     fi
 
@@ -340,8 +385,17 @@ container-test: test-image-rebuild
     docker run --rm "{{ IMAGE }}:test"
 
 # Full local mirror of the CI workflow
+#
+# test-pg is here because CI's pg-integration job is a merge gate (`build`
+# needs it), so a green `ci` that skipped it would not mean what it says. It
+# needs Docker, which `container-test` already required of this recipe.
+#
+# [doc(...)] because `just --list` shows only the LAST comment line, so the
+# multi-line reasoning above would otherwise replace this recipe's description
+# with "needs Docker, which `container-test` already required of this recipe."
+[doc('Full local mirror of the CI workflow (check + container-test + test-pg)')]
 [group('check')]
-ci: check container-test
+ci: check container-test test-pg
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #
@@ -382,10 +436,10 @@ _dotenv := '''
         done < .env
     fi
     # Build a HOST dsn from the compose parts when POSTGRES_URL is unset. The
-    # bundled stack synthesises its URL inside compose (docker-compose.yml's
-    # db-migrate service builds it from POSTGRES_USER/PASSWORD/DB), so it never
-    # lands in .env — and without this every recipe below died with
-    # "POSTGRES_URL is not set" on the exact stack the README tells you to run.
+    # bundled stack synthesises the bot's URL inside compose (docker-compose.yml
+    # builds it from POSTGRES_USER/PASSWORD/DB), so it never lands in .env — and
+    # without this every recipe below died with "POSTGRES_URL is not set" on the
+    # exact stack the README tells you to run.
     if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
         export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
     fi
@@ -399,14 +453,55 @@ _dotenv := '''
 setup *ARGS:
     ./setup_env.sh {{ ARGS }}
 
-# Apply pending schema migrations. Nothing in the bot reads Postgres yet — this
-# lands the schema and its runner ahead of the code that will.
+# Run the bot against the compose-backed services.
+#
+# `poetry run bot` alone does NOT work from a fresh clone: the bot reads its
+# configuration from the ENVIRONMENT and has no .env support, but POSTGRES_URL
+# is now a hard startup requirement — so the documented local-run flow ended at
+# "POSTGRES_URL is not set", pointing at a setup_env.sh that cannot fix it.
+# This recipe supplies the same environment the db-* recipes use (.env, then a
+# host DSN built from the compose parts), which is the piece that was missing.
+# Bring the services up first: docker compose up -d redis postgres db-migrate
+[doc('Run the bot locally with .env loaded (services must already be up)')]
+[group('dev')]
+run:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    if [ -z "${POSTGRES_URL:-}" ]; then
+        echo "POSTGRES_URL is unset and could not be derived from .env." >&2
+        echo "Run ./setup_env.sh, or export POSTGRES_URL yourself." >&2
+        exit 1
+    fi
+    exec {{ quote(VENV_BIN / 'python') }} -m src.main
+
+# Apply pending schema migrations — the bot refuses to start against an
+# unmigrated database (PostgresHistoryArchive._assert_schema_version).
 [doc('Apply pending play-history schema migrations')]
 [group('database')]
 db-migrate:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
+
+# Rows Postgres refused, parked by record_rejection. Expected to print NOTHING:
+# every entry reaching the drainer is insertable by construction, so a row here
+# means the HistoryEntry validator regressed or this build is talking to a schema
+# it was not written for. Treat any output as a code defect, not a data problem.
+#
+# encode(payload, 'escape') rather than convert_from(payload, 'UTF8'): payload is
+# bytea precisely because it may hold a NUL or invalid UTF-8, and convert_from
+# raises on exactly those (migrations/0005 has the reasoning).
+[doc('List play_history rows Postgres refused (expected: nothing)')]
+[group('database')]
+db-rejects COUNT='10':
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    docker compose exec -T postgres psql -U "${POSTGRES_USER:-musicbot}" \
+        -d "${POSTGRES_DB:-musicbot}" -x -c \
+        "SELECT id, rejected_at, guild_id, error_type, error_detail, trace_id,
+                encode(payload, 'escape') AS payload
+         FROM play_history_rejected
+         ORDER BY rejected_at DESC LIMIT {{ COUNT }}"
 
 # Custom-format dump (-Fc): compressed and restorable selectively, unlike plain
 # SQL. Writes into backups/, which is gitignored.

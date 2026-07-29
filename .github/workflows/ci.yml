@@ -188,6 +188,75 @@ jobs:
           title: Test Coverage Report
           badge-title: Coverage
 
+  # The Postgres tier the default suite skips. A separate job, not a service
+  # container bolted onto `test`: that job runs 1200+ tests that never touch
+  # Postgres behind a coverage gate and a PR comment, and this one runs the pg
+  # tests, with --no-cov. (Not a count — one drifts every time a case is added
+  # and then documents nothing.) Splitting them keeps a Postgres failure
+  # legible as a Postgres failure, and costs no wall-clock time because the
+  # jobs run in parallel.
+  #
+  # Postgres is a REQUIRED tier for this bot (MusicBotApp.setup_hook refuses to
+  # start without POSTGRES_URL), so leaving its SQL validated only by a local
+  # opt-in run meant the one thing CI could not see was the thing that must
+  # always work.
+  pg-integration:
+    name: Postgres Integration
+    runs-on: ubuntu-latest
+    needs: resolve-env
+    env:
+      ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+      # Points the tier at the service container below instead of letting
+      # testcontainers start its own. Setting this is ALSO what enables the tier
+      # (tests/test_pg_integration.py), so this job cannot half-configure itself
+      # into skipping every test and still reporting green.
+      #
+      # localhost, not the `postgres` hostname: steps run on the runner host, not
+      # inside a job container, so the service is reachable only via its published
+      # port. The hostname form works exclusively for container-based jobs.
+      POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/test
+    services:
+      postgres:
+        # `just pins` asserts this matches _PG_IMAGE in tests/test_pg_integration.py.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        # Without a health check the runner considers the service ready as soon
+        # as the container is created, and the first asyncpg connect races
+        # Postgres' own init — which restarts the server partway through, so it
+        # is not even a fixed sleep away. GitHub gates the job's first step on
+        # these probes instead, which is why no retry logic is needed in the
+        # fixtures.
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-python-env
+        with:
+          # Same group set AND same cache-prefix as the `test` job, deliberately:
+          # identical groups produce an identical venv, so sharing the key means
+          # this job restores the cache that job already paid for instead of
+          # building and storing a byte-identical second copy.
+          groups: main,test,dev
+          cache-prefix: test
+
+      # Via the recipe, like every other CI step here, so "how to run the pg
+      # tier" has one definition that local runs and CI share.
+      - name: Run Postgres integration tier
+        run: .venv/bin/just test-pg
+
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
+
   container-test:
     name: Container Test
     runs-on: ubuntu-latest
@@ -220,7 +289,7 @@ jobs:
   build:
     name: Build Image
     runs-on: ubuntu-latest
-    needs: [resolve-env, lint, test, container-test]
+    needs: [resolve-env, lint, test, pg-integration, container-test]
     permissions:
       contents: read
       packages: write
