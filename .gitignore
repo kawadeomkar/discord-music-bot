@@ -152,3 +152,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macOS Finder metadata and the JSON coverage report `just test-report` writes.
+# Both were tracked before this line existed.
+.DS_Store
+coverage.json
+backups/

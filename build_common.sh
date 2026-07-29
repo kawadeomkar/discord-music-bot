@@ -181,3 +181,42 @@ build_runtime_image() {
     docker build --build-arg ENVIRONMENT="$ENVIRONMENT" \
         ${tag_args[@]+"${tag_args[@]}"} --target runtime -f Dockerfile .
 }
+
+# _env_value <NAME> <file> — the effective value of NAME in a .env file: the last
+# uncommented assignment (compose is last-wins), with an optional `export ` prefix,
+# surrounding quotes and trailing whitespace stripped. Empty output means unset,
+# commented out, or explicitly empty — compose treats all three identically, and
+# so does every caller here.
+_env_value() {
+    local name="$1" file="$2"
+    grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$file" 2>/dev/null \
+        | tail -n1 \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?'"${name}"'=//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/' \
+        || true
+}
+
+# require_postgres_password — compose-path preflight. NOT part of the fixed API
+# the k8s build contract depends on (that path gets its secret from a Secret,
+# not .env), so it is called only from build_docker.sh, never build_common's
+# other callers.
+#
+# The play-history archive is a required tier, so this is unconditional: both
+# the postgres service and the bot's POSTGRES_URL interpolate the same
+# `${POSTGRES_PASSWORD:?}` in docker-compose.yml. Compose would catch an unset
+# password on its own, but only at `docker compose up` — after the whole image
+# build. Fail here instead, with a message that says what to do. (Ported from
+# the preflight the pre-restructure build.sh carried; see 2827fcd.)
+require_postgres_password() {
+    local env_file=".env"
+    if [ ! -f "$env_file" ]; then
+        echo "Error: $env_file not found — run ./setup_env.sh to create it." >&2
+        exit 1
+    fi
+    if [ -z "$(_env_value POSTGRES_PASSWORD "$env_file")" ]; then
+        echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
+        echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
+        echo "       built from it, and it has no fallback by design." >&2
+        echo "       Run ./setup_env.sh to generate one." >&2
+        exit 1
+    fi
+}
