@@ -72,7 +72,7 @@ VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } e
 # the image.
 # migrations/ is mounted alongside src/ and tests/ because db_migrate.discover()
 # reads that directory at RUNTIME and a test asserts it agrees with
-# EXPECTED_SCHEMA_VERSION. Baked-in only, adding migrations/0004_*.sql plus the
+# EXPECTED_SCHEMA_VERSION. Baked-in only, adding a migration file plus the
 # constant bump passed `just test` and failed `DOCKER=1 just test` against the
 # stale copy in the image — and dep_hash() only covers poetry.lock/pyproject.toml,
 # so no rebuild would have been triggered to explain it.

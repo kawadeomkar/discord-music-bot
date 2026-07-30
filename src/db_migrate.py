@@ -46,7 +46,7 @@ log = get_logger(__name__)
 # migrations directory being present in the image — but a test asserts the two
 # agree, so adding a file and forgetting this line fails the suite rather than
 # shipping a bot that rejects its own schema.
-EXPECTED_SCHEMA_VERSION = 5
+EXPECTED_SCHEMA_VERSION = 1
 
 # src/db_migrate.py → src/ → project root.
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
