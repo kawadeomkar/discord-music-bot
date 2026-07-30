@@ -13,6 +13,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# Fail before the test gate + image build if the compose secret is missing —
+# compose's own `:?` guard would only catch it at `up`, after all that work.
+require_postgres_password
 run_test_gate
 
 # Split from the export deliberately: `export FOO="$(cmd)"` returns export's own

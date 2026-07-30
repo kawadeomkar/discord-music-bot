@@ -70,7 +70,12 @@ VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } e
 # venv and every tool below would vanish. pyproject.toml is mounted read-only so
 # ruff/pytest/pyright read the working tree's config rather than the copy baked into
 # the image.
-DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tests" -v "' + REPO + '/pyproject.toml:/app/pyproject.toml:ro"'
+# migrations/ is mounted because db_migrate.discover() reads that directory at
+# RUNTIME and a test asserts it agrees with EXPECTED_SCHEMA_VERSION. Baked in
+# only, a schema change passes `just test` and fails `DOCKER=1 just test`
+# against the stale copy — and dep_hash() covers only poetry.lock/pyproject.toml,
+# so no rebuild is triggered to explain it.
+DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tests" -v "' + REPO + '/migrations:/app/migrations:ro" -v "' + REPO + '/pyproject.toml:/app/pyproject.toml:ro"'
 
 # Two run modes, and the difference is not cosmetic:
 #
@@ -336,6 +341,127 @@ container-test: test-image-rebuild
 # Full local mirror of the CI workflow
 [group('check')]
 ci: check container-test
+
+# ── Play-history database (Postgres) ─────────────────────────────────────────
+#
+# All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
+# the environment, which for a compose deployment means `.env`. They run the
+# LOCAL venv's python against whatever that URL points at — operator tools, not
+# container commands, so they work the same against the bundled compose Postgres
+# and an external one. Never routed through DOCKER=1: that switch exists to run
+# the *checks* without a Python toolchain, and pointing a migration at a
+# database is not a check.
+#
+# A value already in the environment WINS over .env, which is why this reads the
+# file itself instead of `set -a; . ./.env` — sourcing assigns unconditionally,
+# so `POSTGRES_URL=…staging just db-migrate` would migrate the LOCAL database
+# and report success.
+#
+# The reader is deliberately conservative: first `=` splits (so DSN query
+# strings survive), `#`/blank lines and non-identifier keys are skipped, a
+# trailing CR is stripped (CRLF .env files), and one layer of matched quotes is
+# removed to match what sourcing would have done.
+_dotenv := '''
+    set -euo pipefail
+    if [ -f .env ]; then
+        while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+            case "$_k" in ''|'#'*) continue ;; esac
+            case "$_k" in *[!A-Za-z0-9_]*) continue ;; esac
+            [ -n "${!_k+x}" ] && continue
+            _v="${_v%$'\r'}"
+            case "$_v" in
+                \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+                \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+            esac
+            export "$_k=$_v"
+        done < .env
+    fi
+    # Build a HOST dsn from the compose parts when POSTGRES_URL is unset. The
+    # bundled stack synthesises its URL inside compose (docker-compose.yml's
+    # db-migrate service builds it from POSTGRES_USER/PASSWORD/DB), so it never
+    # lands in .env — and without this every recipe below died with
+    # "POSTGRES_URL is not set" on the exact stack the README tells you to run.
+    if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
+        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
+    fi
+'''
+
+# Bootstrap .env with a generated POSTGRES_PASSWORD — the first command a new
+# contributor runs.
+[doc('Create/refresh .env with a generated Postgres password')]
+[group('dev')]
+setup *ARGS:
+    ./setup_env.sh {{ ARGS }}
+
+# Apply pending schema migrations. Nothing in the bot reads Postgres yet — this
+# lands the schema and its runner ahead of the code that will.
+[doc('Apply pending play-history schema migrations')]
+[group('database')]
+db-migrate:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
+
+# Custom-format dump (-Fc): compressed and restorable selectively, unlike plain
+# SQL. Writes into backups/, which is gitignored.
+[doc('Dump the play-history database to backups/')]
+[group('database')]
+db-backup:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    mkdir -p backups
+    out="backups/play_history_$(date +%F_%H%M%S).dump"
+    # Dump to a temp file and rename only on success. Redirecting straight into
+    # "$out" creates it BEFORE pg_dump runs, so a failed dump left a 0-byte
+    # .dump behind — which the README's prune (`ls -1t | tail -n +15`) then
+    # keeps as the newest backup while deleting a real older one.
+    tmp="$out.partial"
+    # -T: no TTY, or the dump arrives with \r\n line endings and is unusable.
+    if docker compose exec -T postgres pg_dump -U "${POSTGRES_USER:-musicbot}" -Fc \
+        "${POSTGRES_DB:-musicbot}" > "$tmp"; then
+        mv "$tmp" "$out"
+        echo "wrote $out"
+    else
+        rm -f "$tmp"
+        echo "pg_dump failed; no backup written" >&2
+        exit 1
+    fi
+
+# Restore a dump produced by db-backup.
+#
+# Defaults to a SCRATCH database, not the live one — this is the tool the README's
+# quarterly restore drill reaches for, and a restore over live drops and reloads
+# every row, losing every play since the dump. Overwriting live takes both an
+# explicit name and CONFIRM=1.
+#
+# --clean --if-exists: replace objects rather than collide with existing ones.
+# --single-transaction: a failed restore rolls back instead of leaving the
+# target with its tables dropped and half its rows reloaded.
+[doc('Restore a dump into a scratch DB (or DB=<name> CONFIRM=1 for the live one)')]
+[group('database')]
+db-restore FILE DB='':
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    test -f {{ quote(FILE) }} || { echo "no such dump: {{ FILE }}" >&2; exit 1; }
+    live="${POSTGRES_DB:-musicbot}"
+    target={{ quote(DB) }}
+    target="${target:-${live}_restore_check}"
+    if [ "$target" = "$live" ] && [ "${CONFIRM:-}" != "1" ]; then
+        echo "refusing to overwrite the live database '$live'." >&2
+        echo "  drill:    just db-restore {{ FILE }}" >&2
+        echo "            (restores into '${live}_restore_check', live untouched)" >&2
+        echo "  for real: CONFIRM=1 just db-restore {{ FILE }} $live" >&2
+        exit 1
+    fi
+    user="${POSTGRES_USER:-musicbot}"
+    if [ "$target" != "$live" ]; then
+        docker compose exec -T postgres createdb -U "$user" "$target" 2>/dev/null \
+            || true  # already exists: --clean below replaces its contents
+    fi
+    echo "restoring {{ FILE }} -> $target"
+    docker compose exec -T postgres pg_restore -U "$user" -d "$target" \
+        --clean --if-exists --single-transaction < {{ quote(FILE) }}
+    echo "restored into '$target'"
 
 # ── Image and deployment ─────────────────────────────────────────────────────
 #

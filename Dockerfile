@@ -53,6 +53,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# The migration runner discovers .sql files at run time, and a test asserts the
+# directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
+# them present, not just the module.
+COPY migrations/ ./migrations/
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
@@ -79,6 +83,10 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/
 COPY pyproject.toml ./
+# Required by the compose `db-migrate` one-shot, which runs `python -m
+# src.db_migrate` out of THIS image so the runner and the schema it applies can
+# never be different versions.
+COPY migrations/ ./migrations/
 
 ARG ENVIRONMENT=production
 ENV PATH="/app/.venv/bin:$PATH" \
