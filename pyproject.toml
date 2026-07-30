@@ -55,15 +55,13 @@ pytest-asyncio = ">=0.25"
 fakeredis = ">=2.26.0"
 pytest-cov = "^7.1.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
-# several guards in this codebase are asyncio.timeout() calls, and a regression
-# that removes one makes the test HANG rather than fail — three such mutations
-# were measured hanging pytest indefinitely. On GitHub Actions that burns the
-# job's full timeout and reports a cancellation, not a failure, so the signal
-# is lost. `filterwarnings = error` offers no protection here: a hang is not a
-# warning.
+# several guards here are asyncio.timeout() calls, and a regression that removes
+# one makes the test HANG rather than fail — three such mutations were measured
+# hanging pytest indefinitely. On CI that burns the job's full timeout and
+# reports a cancellation, not a failure, so the signal is lost.
 pytest-timeout = "^2.3"
-# Opt-in Postgres integration tier (tests/test_pg_integration.py, marker `pg`).
-# Only imported when RUN_PG_TESTS=1; needs Docker.
+# For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
+# code; needs Docker.
 testcontainers = ">=4.8"
 
 [tool.poetry.group.lint]
@@ -186,11 +184,9 @@ addopts = "--cov=src --cov-report=term-missing"
 # pytest-timeout entry in the test group for why a hang is otherwise invisible.
 timeout = 120
 markers = [
-    # Integration tier against a real Postgres, excluded from the default run.
-    # Locally it starts postgres:18-alpine via testcontainers (needs Docker);
-    # CI's pg-integration job points it at a service container instead. Both go
-    # through one recipe:
-    #   just test-pg
+    # Integration tier against a real Postgres, excluded from the default run:
+    # postgres:18-alpine via testcontainers locally, a service container in CI.
+    # Nothing carries it yet — the tier arrives with the archive code.
     "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
 ]
 filterwarnings = [
