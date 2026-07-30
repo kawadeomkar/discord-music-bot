@@ -183,13 +183,10 @@ Or start from the template and let the helper fill in the generated values:
 ./setup_env.sh     # copies .env.example -> .env, generates POSTGRES_PASSWORD
 ```
 
-`POSTGRES_PASSWORD` is a fresh 128-bit random value, independent of every other
-secret — it is deliberately *not* derived from `DISCORD_TOKEN`, so rotating the token
-cannot invalidate a live database credential and one leaked secret does not
-compromise two systems. Re-running is safe: an existing password is left alone,
-because Postgres only reads it when it first initializes its data volume and a
-silently-changed value would lock the bot out of its own database. `--force`
-regenerates anyway and warns about exactly that.
+`POSTGRES_PASSWORD` is a fresh 128-bit random value. Re-running is safe: an existing
+password is left alone, because Postgres reads it only when it first initializes its
+data volume, and a silently-changed value would lock the bot out of its own database.
+`--force` regenerates anyway and warns about exactly that.
 
 `poetry install` installs the bot's runtime dependencies only. The `test`, `lint`
 and `dev` groups are optional, so running the bot does not pull in pyright and its

@@ -55,9 +55,8 @@ services:
       retries: 5
 
   postgres:
-    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). The server
-    # and its schema land ahead of the code that will use them — nothing in the
-    # bot reads or writes Postgres yet, so this service is inert for now.
+    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). Inert for
+    # now — nothing in the bot reads or writes Postgres yet.
     image: postgres:18-alpine
     container_name: discord-postgres
     restart: always
@@ -69,11 +68,9 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?}
       - POSTGRES_DB=${POSTGRES_DB:-musicbot}
     ports:
-      # Loopback-bound, and the host side is overridable: the `just db-*`
-      # recipes run on the host and reach the database through this published
-      # port, and 5432 is the port a developer's own local Postgres already
-      # holds. Set POSTGRES_HOST_PORT in .env to move it — those recipes build
-      # their host DSN from the same variable, so the two cannot drift.
+      # Loopback-bound. The host side is overridable because 5432 is the port a
+      # developer's own local Postgres already holds; the `just db-*` recipes
+      # build their host DSN from the same variable, so the two cannot drift.
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       # 18+ image layout: the declared volume moved to /var/lib/postgresql
@@ -89,19 +86,14 @@ services:
       retries: 5
 
   db-migrate:
-    # One-shot schema migration. Nothing depends on it yet — the bot does not
-    # touch Postgres — but `docker compose up` runs it, so a fresh volume comes
-    # up already migrated rather than waiting for someone to remember.
+    # One-shot schema migration, so a fresh volume comes up already migrated
+    # rather than waiting for someone to remember.
     #
     # The bot image, not a postgres client image: the runner is src/db_migrate.py
     # and the migrations ship in that image, so there is exactly one definition
     # of "what schema this build expects" and no way for a sidecar image to
-    # drift from it.
-    #
-    # `restart: "no"` is explicit and load-bearing — the default here would
-    # inherit nothing, but a copy-paste of `restart: always` from the services
-    # above would turn a successful one-shot into a crash loop of successful
-    # exits.
+    # drift from it. `restart: "no"` is spelled out because `always` on a
+    # one-shot is a crash loop of successful exits.
     image: discord-music-bot:${GIT_SHA:-latest}
     build:
       context: .
