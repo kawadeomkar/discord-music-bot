@@ -2197,6 +2197,17 @@ class MusicPlayer:
                                     self.current_song,
                                     guild_id=self._guild.id,
                                     played_at=time.time(),
+                                    # The host captured at song end, NOT
+                                    # _np_host_message — released above, and by
+                                    # now it may already point at the next
+                                    # song's message. 0 when nothing hosted the
+                                    # block (the NP send failed), which is the
+                                    # column's "unknown" and is what happened.
+                                    message_id=(
+                                        finished_host.id
+                                        if finished_host is not None
+                                        else 0
+                                    ),
                                 )
                             )
 

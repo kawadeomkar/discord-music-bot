@@ -51,9 +51,10 @@ CREATE TABLE IF NOT EXISTS play_history (
     inserted_at    timestamptz NOT NULL DEFAULT now(),
 
     -- The Discord message id of the Now Playing embed that hosted this song, so
-    -- a history row can be joined back to the message a listener saw. 0 =
-    -- unknown, and for now that is the only value it holds: nothing writes this
-    -- table yet, and HistoryEntry carries no message_id.
+    -- a history row can be joined back to the message a listener saw. Stamped by
+    -- HistoryEntry.from_song from the host the playback loop captured at song
+    -- end. 0 = unknown, and it is a real value, not just a default: a song whose
+    -- NP send failed was never hosted by any message.
     --
     -- Kept out of play_history_dedup, and not a foreign key, for the same
     -- reason: the NP host is not stable or permanent. It migrates across
