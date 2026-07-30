@@ -195,17 +195,13 @@ _env_value() {
         || true
 }
 
-# require_postgres_password — compose-path preflight. NOT part of the fixed API
-# the k8s build contract depends on (that path gets its secret from a Secret,
-# not .env), so it is called only from build_docker.sh, never build_common's
-# other callers.
+# require_postgres_password — compose-path preflight, called only from
+# build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #
-# The play-history archive is a required tier, so this is unconditional: both
-# the postgres service and the bot's POSTGRES_URL interpolate the same
-# `${POSTGRES_PASSWORD:?}` in docker-compose.yml. Compose would catch an unset
-# password on its own, but only at `docker compose up` — after the whole image
-# build. Fail here instead, with a message that says what to do. (Ported from
-# the preflight the pre-restructure build.sh carried; see 2827fcd.)
+# docker-compose.yml interpolates `${POSTGRES_PASSWORD:?}` for both the postgres
+# service and the bot's POSTGRES_URL, so compose would catch an unset password on
+# its own — but only at `up`, after the whole image build. Fail here instead,
+# with a message that says what to do.
 require_postgres_password() {
     local env_file=".env"
     if [ ! -f "$env_file" ]; then

@@ -2,14 +2,9 @@
 
     just db-migrate            # or: python -m src.db_migrate
 
-Why a runner at all: the schema used to be a `CREATE TABLE IF NOT EXISTS` blob
-executed by the application on its first connection. That can only ever create
-the schema, never evolve it — an ALTER has no idempotent "if not exists" shape
-for most changes, and running DDL from the bot means the bot's database role
-must hold DDL rights forever. So the app no longer writes DDL at all: it reads
-`schema_migrations` and refuses to run against a version it wasn't built for
-(PostgresHistoryArchive._ensure), and this module is the only thing that
-applies changes.
+The app never applies DDL: it reads `schema_migrations` and refuses to run
+against a version it was not built for, so its database role needs no DDL
+rights and this module is the only thing that changes the schema.
 
 Ordering and safety properties:
 
@@ -107,11 +102,9 @@ async def migrate(url: str, directory: Path = MIGRATIONS_DIR) -> int:
         # hit a catalog race and all but one die with
         #   UniqueViolationError: duplicate key value violates unique
         #   constraint "pg_type_typname_nsp_index"
-        # Measured on postgres:18 with 4 concurrent runners against a virgin
-        # database: 8 of 15 trials killed at least one runner, usually 3 of 4.
-        # Harmless for the single compose one-shot, fatal for a K8s
-        # init-container per pod — most pods CrashLoopBackOff, and the bot's
-        # `depends_on: service_completed_successfully` sits behind a failed job.
+        # Measured on postgres:18, 4 concurrent runners against a virgin
+        # database: 8 of 15 trials killed at least one runner. Harmless for the
+        # single compose one-shot, fatal for a K8s init-container per pod.
         #
         # A session-level lock (not xact) because this is outside any
         # transaction; released explicitly below so the per-migration
@@ -124,8 +117,8 @@ async def migrate(url: str, directory: Path = MIGRATIONS_DIR) -> int:
         applied_count = 0
         for version, path in migrations:
             # One transaction per migration, not one for the whole run: a
-            # failure at 0007 keeps 0001-0006 applied, so the retry is short
-            # and the recorded version always describes the real schema.
+            # failure keeps every earlier migration applied, so the retry is
+            # short and the recorded version always describes the real schema.
             async with conn.transaction():
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock($1)", _ADVISORY_LOCK_ID

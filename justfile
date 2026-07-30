@@ -70,12 +70,11 @@ VENV_BIN := if env('VIRTUAL_ENV', '') != '' { env('VIRTUAL_ENV', '') / "bin" } e
 # venv and every tool below would vanish. pyproject.toml is mounted read-only so
 # ruff/pytest/pyright read the working tree's config rather than the copy baked into
 # the image.
-# migrations/ is mounted alongside src/ and tests/ because db_migrate.discover()
-# reads that directory at RUNTIME and a test asserts it agrees with
-# EXPECTED_SCHEMA_VERSION. Baked-in only, adding a migration file plus the
-# constant bump passed `just test` and failed `DOCKER=1 just test` against the
-# stale copy in the image — and dep_hash() only covers poetry.lock/pyproject.toml,
-# so no rebuild would have been triggered to explain it.
+# migrations/ is mounted because db_migrate.discover() reads that directory at
+# RUNTIME and a test asserts it agrees with EXPECTED_SCHEMA_VERSION. Baked in
+# only, a schema change passes `just test` and fails `DOCKER=1 just test`
+# against the stale copy — and dep_hash() covers only poetry.lock/pyproject.toml,
+# so no rebuild is triggered to explain it.
 DOCKER_MOUNTS := '-v "' + REPO + '/src:/app/src" -v "' + REPO + '/tests:/app/tests" -v "' + REPO + '/migrations:/app/migrations:ro" -v "' + REPO + '/pyproject.toml:/app/pyproject.toml:ro"'
 
 # Two run modes, and the difference is not cosmetic:
@@ -347,20 +346,16 @@ ci: check container-test
 #
 # All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
 # the environment, which for a compose deployment means `.env`. They run the
-# LOCAL venv's python against whatever that URL points at — they are operator
-# tools, not container commands, so they work the same against the bundled
-# compose Postgres and an external one. Never routed through DOCKER=1: that
-# switch exists to run the *checks* without a Python toolchain, and pointing a
-# migration at a database is not a check.
-#
-# Load .env when it exists so `just db-migrate` needs no manual export.
+# LOCAL venv's python against whatever that URL points at — operator tools, not
+# container commands, so they work the same against the bundled compose Postgres
+# and an external one. Never routed through DOCKER=1: that switch exists to run
+# the *checks* without a Python toolchain, and pointing a migration at a
+# database is not a check.
 #
 # A value already in the environment WINS over .env, which is why this reads the
-# file itself instead of `set -a; . ./.env`. Sourcing assigns unconditionally,
-# so `.env` silently overrode the caller — `POSTGRES_URL=…staging just
-# db-migrate` migrated the LOCAL database and reported success. Every recipe
-# below picks its target database from these variables, so the one escape hatch
-# a careful operator reaches for has to actually work.
+# file itself instead of `set -a; . ./.env` — sourcing assigns unconditionally,
+# so `POSTGRES_URL=…staging just db-migrate` would migrate the LOCAL database
+# and report success.
 #
 # The reader is deliberately conservative: first `=` splits (so DSN query
 # strings survive), `#`/blank lines and non-identifier keys are skipped, a
@@ -391,9 +386,8 @@ _dotenv := '''
     fi
 '''
 
-# Bootstrap .env with a generated POSTGRES_PASSWORD. Indexed here because the
-# justfile is meant to be the index of every dev command, and this is the first
-# one a new contributor runs.
+# Bootstrap .env with a generated POSTGRES_PASSWORD — the first command a new
+# contributor runs.
 [doc('Create/refresh .env with a generated Postgres password')]
 [group('dev')]
 setup *ARGS:
@@ -435,10 +429,9 @@ db-backup:
 
 # Restore a dump produced by db-backup.
 #
-# Defaults to a SCRATCH database, not the live one. The README asks for a
-# quarterly restore drill "into a scratch database", and the only tool it offers
-# is this recipe — which used to DROP and reload the live tables unconditionally,
-# destroying every play since the dump. Overwriting live now takes both an
+# Defaults to a SCRATCH database, not the live one — this is the tool the README's
+# quarterly restore drill reaches for, and a restore over live drops and reloads
+# every row, losing every play since the dump. Overwriting live takes both an
 # explicit name and CONFIRM=1.
 #
 # --clean --if-exists: replace objects rather than collide with existing ones.
