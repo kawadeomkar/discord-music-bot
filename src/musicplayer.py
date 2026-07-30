@@ -2194,7 +2194,9 @@ class MusicPlayer:
                         if not skip_history and not stream_failed:
                             await self.history.add(
                                 HistoryEntry.from_song(
-                                    self.current_song, played_at=time.time()
+                                    self.current_song,
+                                    guild_id=self._guild.id,
+                                    played_at=time.time(),
                                 )
                             )
 
