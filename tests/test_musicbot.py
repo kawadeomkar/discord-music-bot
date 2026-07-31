@@ -1799,7 +1799,7 @@ class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
         history = GuildHistory(
-            None, archive=cast(Any, object()), on_outbox_push=lambda: None
+            None, archive=cast(Any, object()), guild_id=1, on_outbox_push=lambda: None
         )
         history.restore(list(reversed(entries)))  # restore takes newest-first
         mp.history = history

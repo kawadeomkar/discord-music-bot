@@ -54,16 +54,23 @@ class GuildHistory:
         store: Optional[GuildRedisStore],
         *,
         archive: "HistoryArchive",
-        guild_id: int = 0,
+        guild_id: int,
         on_outbox_push: Callable[[], None],
     ) -> None:
-        # archive and on_outbox_push are REQUIRED: the Postgres tier is not
-        # optional, so there is no shape of this object that writes history
-        # without an outbox consumer behind it. on_outbox_push is the drainer's
-        # notify — a sync callable so add() stays Redis-only. archive and
-        # guild_id are the read side, which nothing below uses yet; they arrive
-        # with the constructor because the signature change and the outbox write
-        # path are one indivisible change.
+        # archive, guild_id and on_outbox_push are all REQUIRED: the Postgres
+        # tier is not optional, so there is no shape of this object that writes
+        # history without an outbox consumer behind it. on_outbox_push is the
+        # drainer's notify — a sync callable so add() stays Redis-only. archive
+        # and guild_id are the read side, which nothing below uses yet; they
+        # arrive with the constructor because the signature change and the
+        # outbox write path are one indivisible change.
+        #
+        # guild_id carries no default on purpose, matching HistoryEntry.from_song
+        # one layer down ("a forgotten stamp would silently write unattributable
+        # outbox entries"). A default of 0 here would be worse than there: it
+        # cannot even be caught downstream, because 0 is the one guild_id
+        # play_history's CHECK refuses, so a forgotten stamp would dead-letter
+        # every play of that guild rather than raising anywhere.
         #
         # store IS still Optional, and that is a different axis: Redis may be
         # unconfigured, in which case there is no wire to push to at all.

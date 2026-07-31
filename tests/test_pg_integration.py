@@ -25,6 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 import pytest
+from redis.asyncio import Redis
 
 from src.db_migrate import EXPECTED_SCHEMA_VERSION, migrate
 from src.guild_state import HistoryEntry, parse_history_entry
@@ -41,12 +42,14 @@ from src.redis_client import (
     ensure_outbox_group,
 )
 
+from tests.helpers import tier_enabled
+
 # POSTGRES_TEST_URL enables the tier on its own, deliberately. If it only
 # *selected the provider* and RUN_PG_TESTS still had to be set as well, a CI job
 # that supplied the server but forgot the flag would skip every test in this
 # file and report green — a blind job that looks covered is worse than a
 # missing one. One variable is enough to say "there is a Postgres here".
-_PG_ENABLED = bool(os.getenv("RUN_PG_TESTS") or os.getenv("POSTGRES_TEST_URL"))
+_PG_ENABLED = tier_enabled("RUN_PG_TESTS", "POSTGRES_TEST_URL")
 
 pytestmark = [
     pytest.mark.pg,
@@ -487,7 +490,8 @@ def _boundary_entries() -> list[HistoryEntry]:
 
 
 class TestSchemaLock:
-    """migrations/0004 plus HistoryEntry.__post_init__ — both directions of the
+    """The play_history CHECK constraints plus HistoryEntry.__post_init__ — both
+    directions of the
     claim that possessing a HistoryEntry is the proof Postgres accepts it."""
 
     async def test_every_constructible_entry_is_insertable(
@@ -504,17 +508,62 @@ class TestSchemaLock:
         )
         assert landed == len(entries)
 
+    @pytest.mark.parametrize(
+        ("field", "value", "constraint"),
+        [
+            ("guild_id", 0, "play_history_guild_id_valid"),
+            ("requester_id", -1, "play_history_requester_valid"),
+            ("played_secs", -1, "play_history_played_secs_valid"),
+            ("duration_secs", -1, "play_history_duration_valid"),
+            ("message_id", -1, "play_history_message_id_valid"),
+        ],
+    )
     async def test_constraints_catch_a_validator_regression(
-        self, archive: PostgresHistoryArchive
+        self,
+        archive: PostgresHistoryArchive,
+        field: str,
+        value: int,
+        constraint: str,
     ) -> None:
-        # Backward: bypass the validator and the database still refuses.
-        # object.__setattr__ is how a regression would present — a future edit
+        # Backward: bypass the validator and the database still refuses. Every
+        # CHECK gets its own case — only guild_id was exercised, so the other
+        # four were asserted to exist by reading the migration and nothing more.
+        # object.__setattr__ is how a regression would present: a future edit
         # dropping a clamp, or a field added to the dataclass but not to a
         # domain tuple.
+        #
+        # The constraint NAME is asserted, not just the class. A row can violate
+        # several CHECKs at once and the server reports whichever it evaluates
+        # first, so a bare `raises(CheckViolationError)` would pass even if the
+        # constraint under test had been dropped from the schema entirely.
         bad = HistoryEntry(guild_id=1, webpage_url="https://x", played_at=0.0)
-        object.__setattr__(bad, "guild_id", 0)
-        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+        object.__setattr__(bad, field, value)
+        with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
             await archive.insert_batch([bad])
+        # as_dict() rather than .constraint_name: asyncpg sets the message
+        # fields dynamically, so the attribute is real at runtime but invisible
+        # to pyright, and the dict is the documented way in.
+        assert exc.value.as_dict()["constraint_name"] == constraint
+
+    async def test_guild_id_zero_is_constructible_and_refused(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """The one deliberate hole in "constructible implies insertable".
+
+        __post_init__ floors every integer at 0 while play_history's CHECK is
+        strictly `> 0`, so this entry is built WITHOUT bypassing the validator —
+        no object.__setattr__ — and Postgres still refuses it. Both halves are
+        asserted here because both are choices: clamping up to 1 would file an
+        unattributable play into a real guild's history, and relaxing the CHECK
+        would make guild 0 a bucket of orphans no read path excludes. Refusing
+        sends it to play_history_rejected, where `just db-rejects` shows an
+        operator the actual defect — a producer that stopped stamping guild_id.
+        """
+        orphan = HistoryEntry(guild_id=0, webpage_url="https://x", played_at=0.0)
+        assert orphan.guild_id == 0  # constructed, not clamped away
+        with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
+            await archive.insert_batch([orphan])
+        assert exc.value.as_dict()["constraint_name"] == "play_history_guild_id_valid"
 
     async def test_a_check_violation_is_classified_as_poison(self) -> None:
         # The ordering fix: CheckViolationError is SQLSTATE 23514 under
@@ -571,7 +620,7 @@ class TestSchemaLock:
 
 
 class TestRejectsTable:
-    """migrations/0005 against a real server. The column-type choice is a claim
+    """play_history_rejected against a real server. The column-type choice is a claim
     about Postgres, so it can only be settled here."""
 
     async def test_a_nul_bearing_payload_round_trips_through_bytea(
@@ -607,7 +656,7 @@ class TestRejectsTable:
         self, pg_dsn: str
     ) -> None:
         # The counterfactual, asserted rather than argued in a comment: this is
-        # what makes migrations/0005's column choice evidence instead of opinion.
+        # what makes the bytea column choice evidence instead of opinion.
         # Built with chr(0) rather than written as a literal — a source file
         # containing a real NUL byte cannot be compiled at all.
         nul = chr(0)
@@ -774,20 +823,20 @@ class TestDrainerEndToEnd:
     Redis outbox → drainer → Postgres. Every layer real except Discord."""
 
     async def test_entries_reach_postgres_through_the_drainer(
-        self, archive: PostgresHistoryArchive, fake_redis: object
+        self, archive: PostgresHistoryArchive, fake_redis: Redis
     ) -> None:
-        await ensure_outbox_group(fake_redis)  # type: ignore[arg-type]
-        store = GuildRedisStore(fake_redis, guild_id=42)  # type: ignore[arg-type]
+        await ensure_outbox_group(fake_redis)
+        store = GuildRedisStore(fake_redis, guild_id=42)
         entries = [_entry(i) for i in range(3)]
         for entry in entries:
             await store.push_history(entry)
 
-        drainer = HistoryOutboxDrainer(fake_redis, archive)  # type: ignore[arg-type]
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
         drainer.start()
         try:
             drainer.notify()
             async with asyncio.timeout(10):
-                while await fake_redis.xlen(HISTORY_OUTBOX_KEY):  # type: ignore[attr-defined]
+                while await fake_redis.xlen(HISTORY_OUTBOX_KEY):
                     await asyncio.sleep(0.05)
         finally:
             await drainer.stop()
@@ -798,7 +847,7 @@ class TestDrainerEndToEnd:
     async def test_the_former_poison_classes_all_land_untouched(
         self,
         archive: PostgresHistoryArchive,
-        fake_redis: object,
+        fake_redis: Redis,
     ) -> None:
         """The former poison classes, against a real server, after the schema
         lock — ALL FIVE land and nothing is dead-lettered.
@@ -814,8 +863,8 @@ class TestDrainerEndToEnd:
         Postgres accepts (NUL in text, an out-of-range timestamptz), which is
         precisely what fakes cannot answer.
         """
-        await ensure_outbox_group(fake_redis)  # type: ignore[arg-type]
-        store = GuildRedisStore(fake_redis, guild_id=42)  # type: ignore[arg-type]
+        await ensure_outbox_group(fake_redis)
+        store = GuildRedisStore(fake_redis, guild_id=42)
         for entry in (
             _entry(1),
             _entry(2, title="bad\x00title"),  # was a server-side DataError
@@ -825,7 +874,7 @@ class TestDrainerEndToEnd:
         ):
             await store.push_history(entry)
 
-        drainer = HistoryOutboxDrainer(fake_redis, archive)  # type: ignore[arg-type]
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
         assert await drainer._drain_once() == 5
 
         landed = await archive.recent(42, 10)
@@ -835,4 +884,4 @@ class TestDrainerEndToEnd:
         # on the unknown sentinel, exactly as __post_init__ promised.
         assert by_url["https://yt.com/v=2"].title == "badtitle"
         assert by_url["https://yt.com/v=4"].played_at == 0.0
-        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0  # type: ignore[attr-defined]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0

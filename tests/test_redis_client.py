@@ -29,6 +29,7 @@ from src.redis_client import (
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
     GuildRedisStore,
+    _prev_stream_id,
     ack_outbox,
     cache_get,
     cache_set,
@@ -891,6 +892,32 @@ class TestOutboxPendingBelow:
             await outbox_pending_below(fake_redis, b"5-0")
 
 
+class TestPrevStreamId:
+    """The inclusive→exclusive conversion behind outbox_pending_below.
+
+    XPENDING's range is inclusive at both ends, MINID's lower bound is
+    exclusive, so "everything the trim will destroy" is the set below the ID one
+    step down. Stepping is exact rather than epsilon-based because both halves
+    of a stream ID are integers — which is also why the borrow and the floor are
+    separate arms worth pinning individually.
+    """
+
+    def test_steps_the_sequence_when_it_can(self) -> None:
+        assert _prev_stream_id(b"1700000000000-5") == b"1700000000000-4"
+
+    def test_borrows_from_the_millisecond_half_at_sequence_zero(self) -> None:
+        # 2^64-1, not 0: the sequence half is 64-bit, so the predecessor of
+        # <ms>-0 is the LAST id of the previous millisecond. Borrowing to
+        # <ms-1>-0 instead would leave every other entry of that millisecond
+        # above the bound and silently outside the range.
+        assert _prev_stream_id(b"7-0") == b"6-%d" % ((1 << 64) - 1)
+
+    def test_zero_zero_is_its_own_floor(self) -> None:
+        # b"0-0" has nothing below it, and Redis rejects a negative id outright.
+        # Returning it unchanged makes the range empty, which is the truth.
+        assert _prev_stream_id(b"0-0") == b"0-0"
+
+
 class TestAckOutbox:
     async def test_clears_the_pel_without_deleting_the_body(
         self, fake_redis: Redis
@@ -978,14 +1005,14 @@ class TestTrimOutboxBelow:
         assert "maxlen" not in seen[0]
 
     async def test_trim_does_not_clear_the_pel(self, fake_redis: Redis) -> None:
-        """The reason outbox_trim_watermark exists at all.
+        """The reason the cap must XACK what it destroys BEFORE it trims.
 
         XTRIM IS BLIND TO THE PEL. Deleting a delivered-but-unacked entry
         destroys a play that a drainer is holding — no Postgres row, no
         play_history_rejected row, no error naming it — and leaves the pending
         record behind as a tombstone. This asserts the hazard itself, so that
-        the clamp is protecting against something demonstrated rather than
-        assumed.
+        _enforce_cap's ack-before-trim rule is protecting against something
+        demonstrated rather than assumed.
         """
         await ensure_outbox_group(fake_redis)
         await _push(fake_redis, 1, 2, 3)

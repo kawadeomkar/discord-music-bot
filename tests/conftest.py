@@ -1,6 +1,6 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
-import os
+import re
 import sys
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -16,7 +16,7 @@ from src.config import SpotifyStatus
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, tier_enabled
 
 
 def pytest_collection_modifyitems(
@@ -46,22 +46,42 @@ def pytest_collection_modifyitems(
     all, so a silently-skipped job leaves the suite asserting the fake's
     behaviour and nothing else.
 
-    The env checks mirror test_pg_integration._PG_ENABLED and
-    test_redis_integration._REDIS_ENABLED; keep them in step.
+    Shares tier_enabled() with test_pg_integration._PG_ENABLED and
+    test_redis_integration._REDIS_ENABLED rather than re-deriving the check:
+    the two used to be hand-kept in step, and a gate that disagrees with the
+    skipif it gates is worse than no gate at all.
+
+    Matches the marker as a WORD in the expression, not as the whole string.
+    `-m pg` was the only spelling that reached this check, so the moment anyone
+    narrowed a run — `-m "pg and not slow"`, `-m "pg or redis"` — the gate went
+    silent and the all-skipped-green hole reopened under the exact command a
+    developer reaches for when triaging.
     """
     enablers = {
         "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
         "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
     }
-    tier = config.option.markexpr
-    if tier not in enablers:
+    markexpr = config.option.markexpr
+    selected = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", markexpr)) - {
+        "and",
+        "or",
+        "not",
+    }
+    tiers = [t for t in enablers if t in selected]
+    if len(tiers) != 1:
+        # Zero tiers: an ordinary run, nothing to gate. More than one: the
+        # expression selects a mix, so "every test would skip" is not what a
+        # disabled tier means any more and the per-module skipif is the honest
+        # reporter.
         return
+    tier = tiers[0]
     flag, url = enablers[tier]
-    if os.getenv(flag) or os.getenv(url):
+    if tier_enabled(flag, url):
         return
     print(
-        f"\nERROR: `-m {tier}` selected but the tier is disabled, so every test "
-        f"would skip.\n       Set {flag}=1 (needs Docker) or {url}.",
+        f"\nERROR: `-m {markexpr}` selects the {tier} tier but it is disabled, "
+        f"so every test would skip.\n       Set {flag}=1 (needs Docker) or "
+        f"{url}.",
         file=sys.stderr,
     )
     raise pytest.UsageError(f"{tier} tier selected but not enabled")

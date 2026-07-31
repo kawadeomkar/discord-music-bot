@@ -520,9 +520,9 @@ nil whenever a deletion leaves a gap it cannot reconcile — including after a m
 **Resetting it destroys plays, and there is one safe way to do it:**
 
 ```bash
-docker compose stop bot
+docker compose stop discord-music-bot
 redis-cli DEL history:outbox
-docker compose start bot
+docker compose start discord-music-bot
 ```
 
 Stop the bot first. `DEL` removes the consumer group along with the key, and the next

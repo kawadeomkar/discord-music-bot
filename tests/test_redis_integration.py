@@ -70,11 +70,13 @@ from src.redis_client import (
     trim_outbox_below,
 )
 
+from tests.helpers import tier_enabled
+
 # REDIS_TEST_URL enables the tier on its own, for the same reason
 # POSTGRES_TEST_URL does in the pg tier: a CI job that supplied the server but
 # forgot a second flag would skip every test here and report green, and a blind
 # job that looks covered is worse than a missing one.
-_REDIS_ENABLED = bool(os.getenv("RUN_REDIS_TESTS") or os.getenv("REDIS_TEST_URL"))
+_REDIS_ENABLED = tier_enabled("RUN_REDIS_TESTS", "REDIS_TEST_URL")
 
 pytestmark = [
     pytest.mark.redis,

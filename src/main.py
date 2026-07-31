@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
 from discord.ext import commands
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
 from src.config import ENVIRONMENT, spotify_enabled
@@ -151,11 +153,22 @@ class MusicBotApp(commands.AutoShardedBot):
         # out of setup_hook exactly as the missing-POSTGRES_URL check above
         # does. The remedy is `DEL history:outbox` with the bot stopped.
         #
-        # Unlike Postgres, Redis must actually be reachable for this. That is
-        # not a new coupling: the pool above is already created here, and a bot
-        # that cannot reach Redis at startup has no persistence, no recovery and
-        # no outbox regardless.
-        await ensure_outbox_group(self.redis)
+        # An UNREACHABLE Redis is the opposite case and must not abort startup.
+        # create_redis_pool above connects lazily, so before this line a Redis
+        # outage cost the bot only its persistence — it still served commands
+        # and still played music. Making the group probe fatal would have turned
+        # every Redis blip during a deploy into a bot that refuses to boot, which
+        # is a strictly worse outage than the degraded mode this file is built
+        # around everywhere else — the same degrade-don't-die rule every
+        # GuildRedisStore method follows. Degrading is safe here for one
+        # specific reason: _read_batch heals NOGROUP once by calling this same
+        # function, so the drainer creates the group itself on its first tick
+        # after Redis returns. Nothing is lost in between either — push_history
+        # cannot reach Redis during the outage either way.
+        try:
+            await ensure_outbox_group(self.redis)
+        except (RedisConnectionError, RedisTimeoutError) as e:
+            log.warning(f"outbox group probe could not reach Redis: {e}")
         # Lazy inside: no connection is made here, so startup never blocks on
         # Postgres — the drainer's backoff loop absorbs an unreachable database.
         # That is what keeps "required" from meaning "Postgres must be up before
@@ -288,7 +301,14 @@ class MusicBotApp(commands.AutoShardedBot):
         # bounds the wait so a stuck extraction can't hang the process's exit.
         from src.youtube import ytdlp_pool
 
-        await ytdlp_pool.aclose()
+        try:
+            await ytdlp_pool.aclose()
+        except Exception as e:
+            # Guarded like every step above it. aclose() already swallows its
+            # own join timeout, so this arm is for the unexpected — but the
+            # unexpected here costs the span flush below, which is the record of
+            # the shutdown that went wrong.
+            log.warning(f"yt-dlp pool shutdown failed: {e}")
         # shutdown_telemetry has no async form and blocks flushing spans for up to 30s,
         # so it still needs the executor hop.
         from src.telemetry import shutdown_telemetry

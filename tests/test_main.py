@@ -8,6 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 import discord
 import pytest
 from discord.ext import commands
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.main import EXTENSIONS, MusicBotApp
 from tests.helpers import mocked
@@ -144,6 +147,103 @@ class TestSetupHook:
         mock_drainer.start.assert_called_once()
         assert app.history_archive is mock_archive
         assert app.history_drainer is mock_drainer
+
+
+class TestOutboxGroupBootstrap:
+    """The setup_hook leg of ensure_outbox_group — the wiring, not the helper.
+
+    The helper's own discrimination (BUSYGROUP tolerated, WRONGTYPE raised) is
+    asserted in test_redis_client and against real Redis in the redis tier;
+    these pin what setup_hook does with it: that it runs, that it runs BEFORE
+    the drainer exists, and that a WRONGTYPE aborts startup. That abort is
+    load-bearing (golden rule 5): push_history is @_guild_op, so a pre-R1 LIST
+    at history:outbox would otherwise be swallowed into one warning per song —
+    total history loss reported at debug volume. Startup is the only place the
+    signal can be loud, so startup failing IS the feature under test."""
+
+    async def test_wrongtype_aborts_startup_before_anything_starts(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
+        wrongtype = ResponseError(
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
+        mock_load = AsyncMock()
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.ensure_outbox_group", new=AsyncMock(side_effect=wrongtype)),
+            patch("src.main.PostgresHistoryArchive") as mock_pg,
+            patch("src.main.HistoryOutboxDrainer") as mock_dr,
+            patch.object(app, "load_extension", new=mock_load),
+            pytest.raises(ResponseError, match="WRONGTYPE"),
+        ):
+            await app.setup_hook()
+        # Aborted BEFORE the archive tier or the cogs: a drainer started
+        # against a mis-typed key would raise on every read, and a loaded cog
+        # would accept plays whose history has nowhere to go.
+        mock_pg.assert_not_called()
+        mock_dr.assert_not_called()
+        mock_load.assert_not_awaited()
+
+    async def test_group_exists_before_the_drainer_starts(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order, not just occurrence: a drainer started first would XREADGROUP
+        against a group that does not exist yet and burn its NOGROUP
+        heal-once on a plain startup race."""
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
+        order: list[str] = []
+        ensure = AsyncMock(side_effect=lambda *_: order.append("group"))
+        mock_drainer = MagicMock()
+        mock_drainer.start = MagicMock(side_effect=lambda: order.append("drainer"))
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.ensure_outbox_group", new=ensure),
+            patch("src.main.PostgresHistoryArchive"),
+            patch("src.main.HistoryOutboxDrainer", return_value=mock_drainer),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert order == ["group", "drainer"]
+        ensure.assert_awaited_once_with(app.redis)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            RedisConnectionError("Error 111 connecting to localhost:6379"),
+            RedisTimeoutError("Timeout connecting to server"),
+        ],
+        ids=["connection-refused", "timeout"],
+    )
+    async def test_unreachable_redis_degrades_instead_of_aborting(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch, exc: Exception
+    ) -> None:
+        """The other side of the WRONGTYPE abort, and the reason the two are
+        told apart. Redis being DOWN is the case this bot is built to survive
+        everywhere else: create_redis_pool connects lazily, so before this probe
+        existed an unreachable Redis cost only persistence. Making the probe
+        fatal would turn a Redis blip during a deploy into a bot that refuses to
+        boot. Safe because _read_batch heals NOGROUP by calling
+        ensure_outbox_group itself, so the drainer creates the group on its
+        first tick after Redis returns."""
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://x")
+        mock_load = AsyncMock()
+        mock_drainer = MagicMock()
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.ensure_outbox_group", new=AsyncMock(side_effect=exc)),
+            patch("src.main.PostgresHistoryArchive") as mock_pg,
+            patch("src.main.HistoryOutboxDrainer", return_value=mock_drainer),
+            patch.object(app, "load_extension", new=mock_load),
+        ):
+            await app.setup_hook()
+        # Everything downstream still came up — that is the whole claim.
+        mock_pg.assert_called_once()
+        mock_drainer.start.assert_called_once()
+        mock_load.assert_awaited()
 
 
 class TestClose:

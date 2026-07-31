@@ -280,7 +280,8 @@ class OutboxEntry:
     corrupt entry and must not be routed to parse_history_entry: the bytes are
     gone from Redis and nothing can reproduce them. The drainer acks it
     unconditionally and logs a lost play — leaving it pending replays it every
-    cycle forever, on a key golden rule 12 makes non-evictable.
+    cycle forever, on a key the volatile-lru eviction policy can never reclaim
+    (it carries no TTL, by design — see push_history).
     """
 
     id: bytes
@@ -388,8 +389,8 @@ async def retire_outbox(redis: aioredis.Redis, ids: Sequence[bytes]) -> None:
 
     XACK clears the pending record but does NOT remove the entry: a stream is a
     log, not a queue. Ack-without-delete would grow this key forever, which is
-    strictly worse than the list design because golden rule 12 makes it
-    non-evictable. XDEL frees the memory and is idempotent (missing ID → 0).
+    strictly worse than the list design because this key carries no TTL and so is
+    never an eviction candidate. XDEL frees the memory and is idempotent (missing ID → 0).
 
     Written this way — transactionally, XACK strictly first — a crash between
     them leaves an acked-but-undeleted entry: invisible to XREADGROUP, harmless,
@@ -419,9 +420,10 @@ async def outbox_depth(redis: aioredis.Redis) -> int:
     reconciled by the MINID trim). It UNDER-reports when entries were trimmed
     or XDELed while still pending, because the bodies are gone while the PEL
     records survive — i.e. it reads low at exactly the moment plays are being
-    lost. The trim clamp in outbox_trim_watermark() is what keeps that case
-    rare; without it, DEPTH_ALARM would go quiet during the incident it exists
-    to catch.
+    lost. The cap's ack-before-trim rule (_enforce_cap in history_archive.py)
+    is what keeps that case rare — everything a trim destroys is XACKed first,
+    so no pending record outlives its body; without that rule, DEPTH_ALARM
+    would go quiet during the incident it exists to catch.
 
     XINFO GROUPS' `lag` is NOT a usable exact alternative: it is nil whenever
     entries have been deleted in a way Redis cannot reconcile, and retire_outbox
@@ -536,8 +538,9 @@ async def trim_outbox_below(redis: aioredis.Redis, minid: bytes) -> int:
     difference. The same default sits on xadd(maxlen=...).
 
     The caller returns THIS value in its log rather than a derived
-    `depth - cap`: XLEN over-counts acked-but-undeleted entries, and the
-    watermark clamp may legitimately trim fewer than asked.
+    `depth - cap`: XLEN over-counts acked-but-undeleted entries, and a retire
+    racing the cap can settle part of the doomed range first, so the trim may
+    legitimately remove fewer than the caller computed.
 
     No slicing. The previous list implementation popped in 1000-entry batches
     because one `RPOP key 490000` carried 206 MB back over the socket in 5.3s
@@ -871,7 +874,8 @@ class GuildRedisStore:
     # is the slow burn (~1M+ entries) that the migration to Postgres exists to close
     # (docs/POSTGRES_HISTORY_PLAN.md). The OUTBOX is the fast one: it is near-empty
     # whenever the drainer is keeping up, but it grows for the whole duration of a
-    # Postgres outage, at ~412 bytes per play, and it does not need years to matter.
+    # Postgres outage, at ~487 bytes of Redis memory per play (MEMORY USAGE against
+    # the bundled server — README "Sizing"), and it does not need years to matter.
     # HISTORY_OUTBOX_MAX (config.py) is the opt-in bound on it, and dropping entries
     # there is real data loss; a Redis memory/eviction alarm is still owed.
     #
@@ -897,7 +901,7 @@ class GuildRedisStore:
         docs/POSTGRES_HISTORY_PLAN.md calls the single most important one in the
         design.
 
-        This method stays on the swallowing side of golden rule 5 (@_guild_op),
+        This method stays on the SWALLOWING side of the split (@_guild_op),
         unlike the module-level drain helpers, which raise. The playback loop
         must never die because Redis blinked. The consequence is that the
         producer can never be the thing that reports a mis-shaped outbox — a

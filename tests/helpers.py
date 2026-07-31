@@ -113,3 +113,23 @@ def make_mock_task() -> MagicMock:
     task.done.return_value = False
     task.cancel = MagicMock()
     return task
+
+
+def tier_enabled(*env_vars: str) -> bool:
+    """Is an opt-in integration tier turned on by its environment?
+
+    One definition for all three readers — conftest's gate hook and the two
+    tier modules' own skipif — because a gate that disagrees with the thing it
+    gates is worse than no gate: it either refuses a run that would have worked
+    or waves through one that skips everything.
+
+    "0", "false" and "" are DISABLED. `bool(os.getenv(...))` reads all three as
+    enabled, so `RUN_PG_TESTS=0` started a testcontainer — the opposite of what
+    an operator writing 0 asked for.
+    """
+    import os
+
+    return any(
+        os.getenv(name, "").strip().lower() not in ("", "0", "false", "no")
+        for name in env_vars
+    )

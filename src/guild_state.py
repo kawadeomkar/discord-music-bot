@@ -633,6 +633,22 @@ class HistoryEntry:
         parse_history_entry, _row_to_entry, dataclasses.replace, the backfill — so
         no consumer re-proves it and the archive holds no opinion about data.
 
+        ONE FIELD IS DELIBERATELY EXEMPT, and it is the only place the sentence
+        above is not literally true: the clamp floors every integer at 0, but
+        play_history's CHECK on guild_id is strictly `> 0`, so a HistoryEntry
+        holding guild_id 0 is constructible and NOT insertable. That asymmetry
+        is the lesser evil rather than an oversight. Clamping up to 1 would
+        satisfy the constraint by filing an unattributable play into a real
+        guild's history, where it is indistinguishable from a genuine play and
+        `just db-rejects` would never mention it. Relaxing the CHECK to `>= 0`
+        would make guild 0 a permanent bucket of orphans no read path knows to
+        exclude. Refusing at the database instead sends exactly those entries to
+        play_history_rejected, which is what that table is for: a row there says
+        "a producer stopped stamping guild_id", which is the actual defect. No
+        real producer can reach it today (from_song takes guild_id keyword-only
+        and Discord snowflakes are positive), and the pg tier asserts both
+        halves — that 0 is constructible, and that Postgres refuses it.
+
         The four vectors closed here are the ONLY ways a wire-parseable entry
         could fail an INSERT (docs/HISTORY_SCHEMA_FIRST_FINDINGS.md §3.2, with
         measurements). Everything else the column types could refuse — lone

@@ -161,37 +161,18 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
     )
 
 
-def quantized_played_at(played_at: float) -> float:
-    """`played_at` as it will read back out of Postgres.
-
-    timestamptz is microsecond-granular, but a raw time.time() float is finer
-    than that near 2026 (~2.4e-7 s ULP), so a value and its round trip are
-    UNEQUAL for roughly a third of real timestamps (measured: 37.7%). Any
-    Python-side identity built from both sides of the archive boundary must put
-    BOTH through this, or it compares a quantized float against a raw one and
-    never matches. The one such identity today is the (played_at, webpage_url)
-    dedup key in GuildHistory.recent()'s merge; getting it wrong there showed
-    every affected play twice AND, because the merge slices to `limit`
-    afterwards, silently dropped a real song per duplicate.
-
-    Deliberately the same datetime pair _entry_to_row/_row_to_entry use, NOT
-    round(t * 1e6) / 1e6: those disagree by 1us at ~0.125-ULP boundaries, and
-    only this one is what the database actually does. Idempotent, so applying
-    it to a value already read from a row is a no-op.
-
-    Total by construction. HistoryEntry.__post_init__ already clamps played_at
-    into the timestamptz domain, so the guard below is unreachable through any
-    entry — but this takes a bare float, and it runs on the -history read path,
-    which must degrade rather than error. Catching what the conversion actually
-    raises (ValueError for NaN and for years outside 1..9999, OverflowError for
-    values past platform time_t) is more honest than re-deriving the bound.
-    """
-    try:
-        return datetime.fromtimestamp(played_at, tz=timezone.utc).timestamp()
-    except ValueError, OverflowError, OSError:
-        return played_at
-
-
+# NOTE for the -history read path, when it starts merging Redis and Postgres:
+# timestamptz is microsecond-granular, but a raw time.time() float is finer than
+# that near 2026 (~2.4e-7 s ULP), so a value and its round trip are UNEQUAL for
+# roughly a third of real timestamps (measured: 37.7%). Any Python-side identity
+# built from both sides of this boundary — a (played_at, webpage_url) dedup key,
+# say — must put BOTH sides through the same
+# datetime.fromtimestamp(t, tz=utc).timestamp() the row conversion above uses, or
+# it compares a quantized float against a raw one and never matches. NOT
+# round(t * 1e6) / 1e6: the two disagree by 1us at ~0.125-ULP boundaries and only
+# the datetime pair is what the database actually does. No such identity exists
+# yet — nothing reads Postgres for -history today — so the helper that did this
+# lives with its caller rather than here, unused.
 def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
     return HistoryEntry(
         guild_id=row["guild_id"],
@@ -217,7 +198,11 @@ class HistoryArchive(Protocol):
     async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]: ...
 
     async def record_rejection(
-        self, entry: HistoryEntry, error: BaseException, trace_id: str = ""
+        self,
+        entry: HistoryEntry,
+        error: BaseException,
+        trace_id: str = "",
+        wire: Optional[bytes] = None,
     ) -> None: ...
 
 
@@ -363,7 +348,11 @@ class PostgresHistoryArchive:
         return [_row_to_entry(r) for r in rows]
 
     async def record_rejection(
-        self, entry: HistoryEntry, error: BaseException, trace_id: str = ""
+        self,
+        entry: HistoryEntry,
+        error: BaseException,
+        trace_id: str = "",
+        wire: Optional[bytes] = None,
     ) -> None:
         """Park one refused play in play_history_rejected. Best-effort and
         TERMINAL: never retries, never recurses.
@@ -383,13 +372,26 @@ class PostgresHistoryArchive:
         it is NUL-scrubbed and capped: the same poison this table exists to
         record would otherwise fail the insert recording it, one layer up.
         payload is bytea and takes the orjson bytes verbatim, which is what
-        makes replay exact (migrations/0005 documents why neither jsonb nor text
+        makes replay exact (the play_history_rejected block in
+        migrations/0001_play_history.sql documents why neither jsonb nor text
         can hold them).
+
+        `wire` is those DELIVERED bytes, and passing them is what makes
+        "verbatim" true. Re-serializing the parsed entry instead looks
+        equivalent and is not, in the one deployment shape where this table
+        matters: during a mixed-version rollout an entry written by a NEWER
+        build carries fields this build's parser drops, so the dead letter would
+        record a lossy re-encoding of the row that was refused rather than the
+        row itself — and, because the dedup identity is an md5 of payload, the
+        same refused entry seen by two build versions would land as two rows in
+        a table whose whole contract is that a row count is a failure count.
+        Falls back to re-serializing when the caller has no wire bytes (a
+        direct call in tests, or a future producer that never touched Redis).
         """
         detail = str(error).replace("\x00", "")[:_REJECT_DETAIL_MAX]
         # serialize_history_entry cannot raise here: `entry` was constructed, so
         # __post_init__ already proved it orjson-encodable (findings §3.1).
-        payload = serialize_history_entry(entry)
+        payload = wire if wire is not None else serialize_history_entry(entry)
         try:
             pool = await self._ensure()
             async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
@@ -419,6 +421,16 @@ class PostgresHistoryArchive:
         guard above exists for. Pool creation is bounded by _ensure's
         timeout=10; -ping's own deadline (PING_DEADLINE_SECS, 3s) is shorter,
         so a hung first connect renders as FAILED rather than DOWN — both red.
+
+        That gap has a benign case worth knowing before someone "fixes" it: the
+        very first -ping of a bot that has not finished a song yet pays the
+        whole connect here, so a healthy-but-slow first connect (cold container,
+        DNS, TLS) can render ONE red row for a database that is fine. It
+        self-corrects — the dashboard live-edits every PING_TICK_SECS and the
+        pool persists, so the next tick is a plain SELECT 1 on an established
+        connection. Widening the probe deadline to cover the connect instead
+        would delay every OTHER row's first render by the same amount, which is
+        a worse trade for a condition that lasts one second.
 
         SELECT 1 rather than a table read: this asks "is the server up and
         answering on a real connection", not "is the schema right" — _ensure's
@@ -488,11 +500,12 @@ class PostgresHistoryArchive:
 #                        NumericValueOutOfRangeError, …
 #   CheckViolationError  SQLSTATE 23514, and NOT a DataError — verified: it
 #   NotNullViolationError inherits from IntegrityConstraintViolationError.
-#                        migrations/0004 adds the CHECK constraints that are the
-#                        enforced half of the schema lock, and without these two
-#                        arms a violation would propagate straight past the
-#                        quarantine path and wedge the drain head permanently on
-#                        a non-evictable list, rather than dead-lettering one row.
+#                        migrations/0001_play_history.sql carries the CHECK
+#                        constraints that are the enforced half of the schema
+#                        lock, and without these two arms a violation would
+#                        propagate straight past the quarantine path and wedge
+#                        the drain head permanently on a non-evictable list,
+#                        rather than dead-lettering one row.
 #
 # Deliberately NOT here:
 #   - UniqueViolationError. play_history_dedup is the ON CONFLICT target, so it
@@ -541,6 +554,10 @@ class HistoryOutboxDrainer:
     # error path — which is what makes DEPTH_ALARM fire for hangs and not only
     # for errors.
     DRAIN_DEADLINE_SECS: float = 60.0
+    # Rate limit for the depth watchdog on the productive path — see
+    # _sample_depth_if_due. Matched to TICK_SECS so a busy drain reports a
+    # growing backlog on the same cadence an idle one does.
+    DEPTH_SAMPLE_INTERVAL_SECS: float = 30.0
     # PEL sweep (reclaim_outbox_stale). Cadence is deliberately much slower than
     # TICK_SECS: everything it catches is rare by construction, and it costs an
     # XAUTOCLAIM scan.
@@ -562,6 +579,13 @@ class HistoryOutboxDrainer:
     RESTART_MAX: float = 300.0
     # 0 = unbounded, the durability default. See config.HISTORY_OUTBOX_MAX.
     OUTBOX_MAX: int = config.HISTORY_OUTBOX_MAX
+    # Bounds one _enforce_cap pass's XRANGE. The minid discovery needs the ID
+    # of the (page+1)-th oldest entry and XRANGE has no ID-only form, so the
+    # reply carries bodies: uncapped, enabling the cap against a 500k backlog
+    # would haul the entire overage over the socket in one ~240 MB reply — the
+    # stream re-creation of the `RPOP key 490000` incident (206 MB, 5.3s,
+    # 1.46s head-of-line block). 10k entries ≈ 5 MB at the measured ~487 B.
+    CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0
 
@@ -578,6 +602,8 @@ class HistoryOutboxDrainer:
         self._respawn_handle: Optional[asyncio.TimerHandle] = None
         # Monotonic deadline for the next PEL sweep. None = due now (start()).
         self._next_sweep: Optional[float] = None
+        # Same, for the depth watchdog's productive-path rate limit.
+        self._next_depth_sample: Optional[float] = None
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -585,8 +611,9 @@ class HistoryOutboxDrainer:
         self._stopping = False
         # _stopped too: stop() latches it forever, so a start-after-stop used to
         # spawn a live _run that the next stop() returned early from without
-        # cancelling — a leaked task still draining after teardown, holding a
-        # lease it never releases. No caller does this today, but stop()'s
+        # cancelling — a leaked task still draining after teardown, and one
+        # whose reads keep claiming entries into a PEL nothing will ack until
+        # the sweep reclaims them. No caller does this today, but stop()'s
         # reentrancy is documented as a correctness property.
         self._stopped = False
         self._restart_delay = self.RESTART_BASE
@@ -674,8 +701,10 @@ class HistoryOutboxDrainer:
                     # at the failed task while a respawn is pending, so awaiting
                     # it re-raises whatever killed it. Catching only
                     # CancelledError let that escape stop(), which skipped the
-                    # final drain AND the lease release — the successor in a
-                    # rolling deploy then idled out the full 90s TTL.
+                    # final drain below. Under the lease that also skipped the
+                    # release, stranding a successor for the full 90s TTL; the
+                    # consumer group has nothing to strand, so what is left is
+                    # simply a shutdown that ships nothing it could have.
                     log.warning(f"history drainer task ended in error: {e}")
             try:
                 async with asyncio.timeout(timeout):
@@ -706,13 +735,16 @@ class HistoryOutboxDrainer:
                 #
                 # This used to be gated on holding the lease, "so a cycle that
                 # never won the lease cannot trim entries the real holder is
-                # mid-insert on". The gate is gone, but that hazard is NOT —
-                # this is the failure arm, i.e. precisely the state where a
-                # batch is delivered and unacked, so it is the site most likely
-                # to trim in-flight entries. What replaces the gate is the
-                # watermark clamp inside _enforce_cap, which refuses to trim at
-                # or above the group's oldest pending ID no matter which
-                # process is holding it.
+                # mid-insert on". The gate is gone and the hazard is ACCEPTED,
+                # not clamped away: this is the failure arm, i.e. precisely the
+                # state where a batch is delivered and unacked, and
+                # _enforce_cap deliberately trims across the PEL — its
+                # docstring explains why refusing to (a clamp at the oldest
+                # pending ID) would make the cap a no-op exactly here, where
+                # the oldest entries are permanently in flight. What replaces
+                # the gate is settlement: everything the cap destroys is
+                # XACKed first, so a trimmed in-flight batch becomes
+                # dropped-and-logged, never a tombstone that replays forever.
                 await self._enforce_cap_quietly()
                 await self._log_retry(e, backoff)
                 await asyncio.sleep(backoff)
@@ -723,6 +755,13 @@ class HistoryOutboxDrainer:
                 # A cycle that actually delivered proves the drainer is healthy,
                 # so the respawn damping starts over from the base delay.
                 self._restart_delay = self.RESTART_BASE
+                # Sample here too, or the alarm cannot fire in the case its own
+                # message describes. "Postgres is keeping up but not catching
+                # up" IS a succeeding drain, and a succeeding drain takes this
+                # branch every time — so with the sample only below, a backlog
+                # that grows faster than BATCH_SIZE per cycle produced no log
+                # line at all, forever. Rate-limited; see _sample_depth_if_due.
+                await self._sample_depth_if_due()
                 continue  # backlog: keep draining without waiting
             # Idle — the drain reached the end of what it can settle. Sample the
             # backlog here, on the SUCCESS path: _log_retry only fires in the
@@ -830,10 +869,12 @@ class HistoryOutboxDrainer:
         No poison taxonomy. Every entry that reaches this outbox was produced by
         HistoryEntry.__post_init__, which clamps into the play_history column
         domain, so a batch cannot contain a row Postgres refuses on the grounds
-        of its DATA (docs/HISTORY_SCHEMA_FIRST_FINDINGS.md §3.2, §5). A refusal
-        here therefore means a validator regression or schema drift — a bug —
-        and is handled as one: recorded to play_history_rejected, dropped, batch
-        continues.
+        of its DATA (docs/HISTORY_SCHEMA_FIRST_FINDINGS.md §3.2, §5) — with one
+        deliberate exception, guild_id 0, which __post_init__'s docstring
+        explains it declines to fix up. A refusal here therefore means a
+        validator regression, schema drift, or an unstamped guild_id — all bugs
+        — and is handled as one: recorded to play_history_rejected, dropped,
+        batch continues.
 
         Corrupt entries — bytes that do not parse at all — are still dropped and
         still settled, exactly as before. Leaving them would wedge the queue head
@@ -944,7 +985,9 @@ class HistoryOutboxDrainer:
                 try:
                     await self._archive.insert_batch([entry])
                 except _POISON as e:
-                    await self._archive.record_rejection(entry, e, trace_id)
+                    # item.wire, not the re-serialized entry — see
+                    # record_rejection's docstring on mixed-version rollouts.
+                    await self._archive.record_rejection(entry, e, trace_id, item.wire)
                     rejected += 1
                     log.error(
                         f"play_history refused a row ({type(e).__name__}) — the "
@@ -967,7 +1010,8 @@ class HistoryOutboxDrainer:
 
         NEVER RUNS WHILE SHUTTING DOWN. A departing process has the least
         information about what a live peer is doing and no reason to be
-        trimming at all.
+        trimming at all. Checked once per pass, so stop() also halts a
+        convergence loop already in progress.
 
         ACK BEFORE TRIM, and this ordering is the whole reason the method is
         not a one-liner. XTRIM does not consult the PEL: on real Redis 7.4.9,
@@ -989,47 +1033,60 @@ class HistoryOutboxDrainer:
         their drainer already holds the parsed rows in memory, so an insert that
         subsequently succeeds still archives them.
 
-        The trim is one MINID command however large the backlog; only the ack
-        names individual IDs, and that set is bounded by BATCH_SIZE x live
-        drainers because the drain cycle never reads `>` with a non-empty PEL.
+        PAGED, then it loops until depth is back at the cap. The trim itself is
+        one MINID command however large the tranche, and the ack names
+        individual IDs but that set is bounded by BATCH_SIZE x live drainers
+        because the drain cycle never reads `>` with a non-empty PEL. The minid
+        discovery is the leg that scales with the backlog: XRANGE has no
+        ID-only form, so its reply carries bodies, and a single COUNT=overage
+        fetch against a deep backlog is the 206 MB `RPOP key 490000` incident
+        re-created on the stream — worse, from the failure arm it would run
+        outside DRAIN_DEADLINE_SECS with nothing bounding it. Hence CAP_PAGE:
+        each pass fetches at most one bounded page, trims that tranche, and
+        re-checks depth, so no single reply scales with the backlog and
+        convergence is spread across passes that each yield to the event loop.
         """
-        if not self.OUTBOX_MAX or self._stopping:
+        if not self.OUTBOX_MAX:
             return
-        depth = await outbox_depth(self._redis)
-        if depth <= self.OUTBOX_MAX:
-            return
-        over = depth - self.OUTBOX_MAX
-        # The ID of the (over+1)-th oldest entry: everything strictly below it
-        # is what the cap wants gone. Asking for one extra and taking the last
-        # is what turns a COUNT into an exclusive lower bound.
-        oldest = cast(
-            list[tuple[bytes, dict[bytes, bytes]]],
-            await self._redis.xrange(HISTORY_OUTBOX_KEY, count=over + 1),
-        )
-        if len(oldest) <= over:
-            # Raced to shorter than the cap by a concurrent drain; nothing to do.
-            return
-        minid = cast(bytes, oldest[-1][0])
-        in_flight = await outbox_pending_below(self._redis, minid)
-        await ack_outbox(self._redis, in_flight)
-        dropped = await trim_outbox_below(self._redis, minid)
-        if not dropped:
-            return
-        # XTRIM's RETURNED count, never the derived depth - OUTBOX_MAX: XLEN
-        # over-counts acked-but-undeleted entries, and under redis-py's
-        # approximate=True default a derived figure would claim drops while
-        # removing nothing.
-        log.error(
-            f"history outbox over cap (depth={depth}, HISTORY_OUTBOX_MAX="
-            f"{self.OUTBOX_MAX}); dropped {dropped} oldest entries — those "
-            f"plays are lost and will not reach Postgres"
-        )
-        if in_flight:
-            log.error(
-                f"{len(in_flight)} of those entries were already delivered to a "
-                f"drainer; their pending records were cleared so the trim could "
-                f"not leave them replaying forever"
+        while not self._stopping:
+            depth = await outbox_depth(self._redis)
+            if depth <= self.OUTBOX_MAX:
+                return
+            over = depth - self.OUTBOX_MAX
+            page = min(over, self.CAP_PAGE)
+            # The ID of the (page+1)-th oldest entry: everything strictly below
+            # it is this pass's tranche. Asking for one extra and taking the
+            # last is what turns a COUNT into an exclusive lower bound.
+            oldest = cast(
+                list[tuple[bytes, dict[bytes, bytes]]],
+                await self._redis.xrange(HISTORY_OUTBOX_KEY, count=page + 1),
             )
+            if len(oldest) <= page:
+                # Raced to shorter than the page by a concurrent drain; the
+                # next invocation's depth check settles whether anything is
+                # genuinely left over the cap.
+                return
+            minid = cast(bytes, oldest[-1][0])
+            in_flight = await outbox_pending_below(self._redis, minid)
+            await ack_outbox(self._redis, in_flight)
+            dropped = await trim_outbox_below(self._redis, minid)
+            if not dropped:
+                return
+            # XTRIM's RETURNED count, never the derived depth - OUTBOX_MAX:
+            # XLEN over-counts acked-but-undeleted entries, and under redis-py's
+            # approximate=True default a derived figure would claim drops while
+            # removing nothing.
+            log.error(
+                f"history outbox over cap (depth={depth}, HISTORY_OUTBOX_MAX="
+                f"{self.OUTBOX_MAX}); dropped {dropped} oldest entries — those "
+                f"plays are lost and will not reach Postgres"
+            )
+            if in_flight:
+                log.error(
+                    f"{len(in_flight)} of those entries were already delivered "
+                    f"to a drainer; their pending records were cleared so the "
+                    f"trim could not leave them replaying forever"
+                )
 
     async def _enforce_cap_quietly(self) -> None:
         """_enforce_cap for the failure path, where Redis may itself be what
@@ -1041,6 +1098,20 @@ class HistoryOutboxDrainer:
         except Exception as e:
             log.warning(f"history outbox cap check failed: {e}")
 
+    async def _sample_depth_if_due(self) -> None:
+        """_sample_depth for the PRODUCTIVE path, rate-limited.
+
+        The idle path can sample every cycle because a cycle there costs a
+        TICK_SECS wait. A cycle that drained `continue`s straight into the next
+        batch, so sampling unconditionally there would add two Redis round trips
+        per BATCH_SIZE entries for the whole length of a catch-up — on the Redis
+        that also serves playback.
+        """
+        now = asyncio.get_running_loop().time()
+        if self._next_depth_sample is not None and now < self._next_depth_sample:
+            return
+        await self._sample_depth()
+
     async def _sample_depth(self) -> None:
         """Report a backlog on the SUCCESS path too.
 
@@ -1049,7 +1120,15 @@ class HistoryOutboxDrainer:
         nonetheless behind — or one sitting on a stranded PEL — reported
         nothing at all. Best-effort and silent when the outbox is shallow;
         this is a watchdog, not a metric.
+
+        Stamps the rate-limit deadline itself rather than leaving that to
+        _sample_depth_if_due, so an idle sample and a productive one share one
+        clock: otherwise a drain that alternates idle and busy cycles samples on
+        both paths and doubles the round trips it was rate-limited to avoid.
         """
+        self._next_depth_sample = (
+            asyncio.get_running_loop().time() + self.DEPTH_SAMPLE_INTERVAL_SECS
+        )
         try:
             depth = await outbox_depth(self._redis)
             pending = await outbox_pending_count(self._redis)

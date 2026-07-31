@@ -70,19 +70,14 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- below, not before it, so the wire format does not grow a second field
     -- nothing reads.
     --
-    -- NOT POPULATED YET. HistoryEntry carries the value on the Redis wire —
-    -- HistoryEntry.from_song stamps it from the host the playback loop captured
-    -- at song end — but the archive's INSERT does not list this column, so the
-    -- default fills every row and the stamped value is dropped when the outbox
-    -- entry is retired. Until _INSERT_SQL / _RECENT_SQL / _entry_to_row /
-    -- _row_to_entry in history_archive.py carry it, a 0 here means "the archive
-    -- does not write this column", NOT "this song had no host" — do not read a
-    -- table of zeroes as a fleet-wide Now Playing failure.
-    --
-    -- Once that lands, 0 becomes a real value rather than only a default, but
-    -- an ambiguous one: it also covers a song whose NP send failed, a host a
-    -- listener deleted mid-song (released on discord.NotFound), an entry from a
-    -- build older than the field, and anything the backfill inserts.
+    -- Populated by the archive: _INSERT_SQL / _RECENT_SQL / _entry_to_row /
+    -- _row_to_entry in history_archive.py all carry this column. HistoryEntry
+    -- carries the value on the Redis wire — HistoryEntry.from_song stamps it
+    -- from the host the playback loop captured at song end — and the drainer
+    -- writes it through unchanged. 0 is a real recorded value, but an
+    -- ambiguous one: it covers a song whose NP send failed, a host a listener
+    -- deleted mid-song (released on discord.NotFound), and any entry written
+    -- by a build older than the field.
     --
     -- Kept out of play_history_dedup, and not a foreign key, for the same
     -- reason: the NP host is not stable or permanent. It migrates across

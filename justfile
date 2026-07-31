@@ -271,6 +271,12 @@ test-pg *ARGS: (_tools 'pytest')
 # fakeredis executes every stream command the outbox uses and gets FIVE of them
 # wrong — all in the safe-looking direction, so the default suite stays green
 # while production breaks. See tests/test_redis_integration.py's docstring.
+#
+# [doc] is not decoration here: without it `just --list` shows the LAST line of
+# the comment block above as this recipe's description, which is a docs pointer
+# rather than a description. Its sibling test-pg carries both attributes.
+[doc('Run the real-Redis integration tier (needs Docker, or REDIS_TEST_URL)')]
+[group('check')]
 test-redis *ARGS: (_tools 'pytest')
     #!/usr/bin/env bash
     set -euo pipefail
@@ -517,7 +523,8 @@ db-migrate:
 #
 # encode(payload, 'escape') rather than convert_from(payload, 'UTF8'): payload is
 # bytea precisely because it may hold a NUL or invalid UTF-8, and convert_from
-# raises on exactly those (migrations/0005 has the reasoning).
+# raises on exactly those (the play_history_rejected block in
+# migrations/0001_play_history.sql has the reasoning).
 [doc('List play_history rows Postgres refused (expected: nothing)')]
 [group('database')]
 db-rejects COUNT='10':

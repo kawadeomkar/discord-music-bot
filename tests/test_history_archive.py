@@ -41,6 +41,7 @@ from src.redis_client import (
     GuildRedisStore,
     ensure_outbox_group,
     outbox_pending_count,
+    read_outbox_new,
 )
 
 
@@ -79,10 +80,24 @@ class RecordsRejections:
             self._rejections: list[tuple[HistoryEntry, BaseException]] = []
         return self._rejections
 
+    @property
+    def rejected_wires(self) -> list[Optional[bytes]]:
+        if not hasattr(self, "_rejected_wires"):
+            self._rejected_wires: list[Optional[bytes]] = []
+        return self._rejected_wires
+
     async def record_rejection(
-        self, entry: HistoryEntry, error: BaseException, trace_id: str = ""
+        self,
+        entry: HistoryEntry,
+        error: BaseException,
+        trace_id: str = "",
+        wire: Optional[bytes] = None,
     ) -> None:
+        # wire is captured, not dropped: it is the DELIVERED bytes, and the
+        # whole reason the parameter exists is that they can differ from a
+        # re-serialization of `entry`.
         self.rejections.append((entry, error))
+        self.rejected_wires.append(wire)
 
 
 class FakeArchive(RecordsRejections):
@@ -472,6 +487,27 @@ class TestPostgresArchiveClosedGuard:
         await archive.close()
         await archive.close()
 
+    async def test_close_winning_the_race_to_the_lock_still_refuses(self) -> None:
+        """The re-check INSIDE _init_lock, which the pre-lock one cannot cover.
+
+        _ensure reads _closed, then awaits the lock. A close() landing in that
+        window passes the first check and would otherwise go on to build a pool
+        with nothing left to close it — the exact leak the guard exists for, and
+        the only arm of it no test reached.
+        """
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        await archive._init_lock.acquire()  # _ensure will block here
+        ensure = asyncio.ensure_future(archive._ensure())
+        await asyncio.sleep(0)  # let it get past the pre-lock check
+        archive._closed = True  # close() wins while _ensure waits
+        archive._init_lock.release()
+        with (
+            patch("src.history_archive.asyncpg.create_pool", AsyncMock()) as create,
+            pytest.raises(RuntimeError, match="closed"),
+        ):
+            await ensure
+        create.assert_not_awaited()
+
 
 class TestDrainerSupervision:
     """The done-callback is what makes a drainer that dies outside its inner
@@ -602,7 +638,8 @@ class PoisonArchive(RecordsRejections):
         self._poison = poison_titles
         # Which refusal to raise. DataError by default (SQLSTATE 22xxx, how a
         # NUL or an out-of-range value used to present); CheckViolationError is
-        # the 23514 arm migrations/0004 makes reachable, and the two live on
+        # the 23514 arm the play_history CHECK constraints make reachable, and the
+        # two live on
         # different branches of asyncpg's hierarchy — which is the entire reason
         # _POISON names both.
         self._exc = exc or asyncpg.exceptions.DataError("invalid byte sequence")
@@ -655,13 +692,17 @@ class PushDuringInsert(RecordsRejections):
         return await self._inner.recent(guild_id, limit)
 
     async def record_rejection(
-        self, entry: HistoryEntry, error: BaseException, trace_id: str = ""
+        self,
+        entry: HistoryEntry,
+        error: BaseException,
+        trace_id: str = "",
+        wire: Optional[bytes] = None,
     ) -> None:
         # Forwarded, not inherited from RecordsRejections: a wrapper that
         # swallowed rejections into its own list would make the inner archive
         # look like nothing was ever refused, which is precisely what these
         # tests assert on.
-        await self._inner.record_rejection(entry, error, trace_id)
+        await self._inner.record_rejection(entry, error, trace_id, wire)
 
 
 class TestRejectionIsolation:
@@ -692,7 +733,8 @@ class TestRejectionIsolation:
     async def test_a_check_violation_routes_to_record_rejection(
         self, fake_redis: Redis
     ) -> None:
-        # The arm migrations/0004 makes reachable. CheckViolationError is
+        # The arm the play_history CHECK constraints make reachable.
+        # CheckViolationError is
         # SQLSTATE 23514 and NOT a DataError, so before _POISON was widened this
         # propagated instead of being isolated — a permanent drain wedge.
         archive = PoisonArchive(
@@ -720,6 +762,35 @@ class TestRejectionIsolation:
         await _push(fake_redis, 2)
         await drainer._drain_once()
         assert [e for e, _ in archive.rejections] == [_entry(2)]
+
+    async def test_the_delivered_wire_bytes_are_what_get_parked(
+        self, fake_redis: Redis
+    ) -> None:
+        """payload must be the bytes that were REFUSED, not a re-encoding.
+
+        The distinction is invisible while every build agrees on the schema and
+        decisive during a rollout: an entry written by a newer build carries
+        fields this parser drops, so re-serializing would park a lossy copy of
+        the row Postgres rejected. It also splits the md5 dedup identity across
+        build versions, and this table's contract is that one row means one
+        failure.
+        """
+        archive = PoisonArchive({"Song 2"})
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await _push(fake_redis, 2)
+        delivered = await _outbox_wires(fake_redis)
+        await drainer._drain_once()
+        assert archive.rejected_wires == delivered
+
+    async def test_a_direct_call_without_wire_bytes_still_records(self) -> None:
+        # The fallback arm: a caller holding only an entry (a test, or any
+        # future producer that never went through Redis) must still be able to
+        # park it rather than lose it to a TypeError.
+        archive = PostgresHistoryArchive("postgresql://unused")
+        entry = _entry(1)
+        # No server, so the insert fails and the terminal handler logs — which
+        # is the point: it reaches the insert at all, with a payload.
+        await archive.record_rejection(entry, RuntimeError("refused"))
 
     async def test_rejection_logs_the_offending_entry(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
@@ -1414,6 +1485,73 @@ class TestSuccessPathDepthSampling:
         ):
             await drainer._sample_depth()  # must not raise
 
+    async def test_the_alarm_fires_from_the_loop_while_the_drain_succeeds(
+        self,
+        fake_redis: Redis,
+        archive: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """REGRESSION: the sample sat below `if drained: continue`.
+
+        Every test above calls _sample_depth directly, so all of them passed
+        while the loop could not reach it. "Postgres is keeping up but not
+        catching up" IS a succeeding drain, and a succeeding drain takes the
+        productive branch every cycle — so the one condition the alarm exists to
+        report was the one condition that produced no log line, forever.
+        """
+        monkeypatch.setattr(HistoryOutboxDrainer, "DEPTH_ALARM", 2)
+        monkeypatch.setattr(HistoryOutboxDrainer, "BATCH_SIZE", 1)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await _push(fake_redis, *range(6))  # 6 deep, drained one per cycle
+        drainer.start()
+        try:
+            async with asyncio.timeout(5):
+                while not any(
+                    "while the drain is SUCCEEDING" in r.message for r in caplog.records
+                ):
+                    await asyncio.sleep(0.01)
+            # …and it really was succeeding, not erroring into _log_retry.
+            assert archive.batches
+            assert not any("drain failed" in r.message for r in caplog.records)
+        finally:
+            await drainer.stop(timeout=0.5)
+
+    async def test_the_productive_path_sample_is_rate_limited(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        """A backlogged drain `continue`s straight into the next batch, so an
+        ungated sample would add two Redis round trips per BATCH_SIZE entries
+        for the whole length of a catch-up — on the Redis serving playback."""
+        calls = 0
+
+        async def counting(self: HistoryOutboxDrainer) -> None:
+            nonlocal calls
+            calls += 1
+
+        with patch.object(HistoryOutboxDrainer, "_sample_depth", counting):
+            await drainer._sample_depth_if_due()  # deadline unset → due now
+            assert calls == 1
+            # The real _sample_depth stamps the deadline; the stub above did
+            # not, so do it here and prove the gate then holds.
+            drainer._next_depth_sample = (
+                asyncio.get_running_loop().time() + drainer.DEPTH_SAMPLE_INTERVAL_SECS
+            )
+            await drainer._sample_depth_if_due()
+            await drainer._sample_depth_if_due()
+            assert calls == 1
+
+    async def test_sampling_stamps_its_own_deadline(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # _sample_depth stamps rather than leaving it to the _if_due wrapper, so
+        # an idle sample and a productive one share one clock. Without this a
+        # loop alternating idle and busy cycles samples on both paths and
+        # doubles the round trips the rate limit exists to avoid.
+        assert drainer._next_depth_sample is None
+        await drainer._sample_depth()
+        assert drainer._next_depth_sample is not None
+
 
 class TestStopIdempotence:
     """H2, in-process half. Two concurrent stop()s each ran their own
@@ -1498,6 +1636,145 @@ class TestOutboxCap:
         assert await _outbox_wires(fake_redis) == [
             serialize_history_entry(_entry(n)) for n in (5, 6, 7)
         ]
+
+    async def test_cap_acks_the_doomed_in_flight_set_before_the_trim(
+        self,
+        fake_redis: Redis,
+        archive: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MUTATION GUARD: XACK must precede XTRIM inside _enforce_cap.
+
+        Deleting the ack passes every state-based assertion in this class,
+        because the end state self-heals later through the sweep and
+        _settle_tombstones — so, exactly as with
+        test_retire_acks_before_it_deletes, the order has to be asserted by
+        command sequence. Trim-first (or trim-only) leaves the doomed delivered
+        entries as tombstones: IDs pending with no body, replaying every cycle
+        forever on a non-evictable key.
+        """
+        monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 2)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(5))
+        # Deliver the oldest three so the PEL holds exactly what the cap will
+        # destroy (depth 5, cap 2 → the trim wants the oldest 3 gone).
+        delivered = await read_outbox_new(fake_redis, 3)
+        doomed = {e.id for e in delivered}
+        assert len(doomed) == 3
+        seen: list[tuple[str, tuple[Any, ...]]] = []
+        real_exec = type(fake_redis).execute_command
+
+        async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append((str(args[0]), args[1:]))
+            return await real_exec(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(fake_redis), "execute_command", recording)
+        await drainer._enforce_cap()
+        names = [name for name, _ in seen]
+        assert "XACK" in names, "the doomed pending set was never acked"
+        assert "XTRIM" in names
+        assert names.index("XACK") < names.index("XTRIM")
+        # The ack named exactly the delivered-and-doomed IDs…
+        acked = next(args for name, args in seen if name == "XACK")
+        assert set(acked[2:]) == doomed
+        # …so no pending record outlived its body.
+        assert await outbox_pending_count(fake_redis) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
+
+    async def test_cap_minid_discovery_is_paged_and_converges(
+        self,
+        fake_redis: Redis,
+        archive: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REGRESSION: the minid discovery used to be one XRANGE COUNT=over+1.
+
+        XRANGE replies carry bodies, so that single fetch scaled with the
+        backlog — enabling the cap against a 500k-entry outbox would haul
+        ~240 MB over the socket in one reply, the stream re-creation of the
+        206 MB `RPOP key 490000` incident trim_outbox_below documents as
+        closed. The fetch must stay bounded by CAP_PAGE per pass and the cap
+        must converge across passes instead.
+        """
+        monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 3)
+        monkeypatch.setattr(HistoryOutboxDrainer, "CAP_PAGE", 2)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(10))  # over = 7, pages of 2
+        counts: list[int] = []
+        real_exec = type(fake_redis).execute_command
+
+        async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+            # Guard on the keyword (bytes on the wire): the assertion helpers
+            # below also XRANGE, count-less, and their args[-1] is the "+"
+            # max bound.
+            if str(args[0]) == "XRANGE" and args[-2] in (b"COUNT", "COUNT"):
+                counts.append(int(args[-1]))
+            return await real_exec(self, *args, **kwargs)
+
+        monkeypatch.setattr(type(fake_redis), "execute_command", recording)
+        await drainer._enforce_cap()
+        assert counts, "no XRANGE ran"
+        assert max(counts) <= drainer.CAP_PAGE + 1
+        assert len(counts) >= 2  # it actually paged, not one overage-sized fetch
+        # And still converged fully in one invocation, dropping the OLDEST.
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
+        assert await _outbox_wires(fake_redis) == [
+            serialize_history_entry(_entry(n)) for n in (7, 8, 9)
+        ]
+
+    async def test_cap_does_nothing_while_shutting_down(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A departing process has the least information about what a live peer
+        is doing and no reason to be destroying plays at all. The check is per
+        PASS, not per call, so it also halts a convergence loop already running
+        — which is what keeps stop()'s final drain from racing a long trim."""
+        monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 2)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(6))
+        drainer._stopping = True
+        await drainer._enforce_cap()
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 6
+
+    async def test_cap_returns_when_the_page_comes_back_short(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Depth and the XRANGE are two round trips, so a concurrent drain can
+        settle the stream shorter in between. The page then cannot name a
+        (page+1)-th ID, and inventing a minid from the entries it DID get would
+        trim live entries the depth check never authorised."""
+        monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 2)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(3))
+        # Depth lies high (as a drain that lands mid-pass makes it): the cap
+        # believes 9 entries exist and asks for a page the stream cannot fill.
+        monkeypatch.setattr(
+            "src.history_archive.outbox_depth", AsyncMock(return_value=9)
+        )
+        await drainer._enforce_cap()
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
+
+    async def test_cap_gives_up_when_a_trim_removes_nothing(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The convergence loop's termination guard. Depth is XLEN, which
+        over-counts acked-but-undeleted entries, so a depth permanently above
+        the cap with a trim that can no longer remove anything is reachable —
+        and without the zero-dropped exit the loop would spin on it forever,
+        inside the drain cycle, logging an ERROR per pass."""
+        monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 2)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(6))
+        trim = AsyncMock(return_value=0)
+        monkeypatch.setattr("src.history_archive.trim_outbox_below", trim)
+        async with asyncio.timeout(5):  # a spin here HANGS rather than fails
+            await drainer._enforce_cap()
+        trim.assert_awaited_once()
 
     async def test_cap_is_enforced_while_postgres_is_down(
         self,
@@ -1621,34 +1898,195 @@ class TestDrainerLoopInvariants:
     ) -> None:
         """_wake.clear() after the idle wait. Without it the event stays set
         once notify() has fired, wait() returns instantly every iteration, and
-        the loop spins at full speed issuing a lease round-trip plus an LRANGE
-        per pass — forever, on an empty outbox. One pegged core and a permanent
-        Redis load floor, on the Redis that also serves playback."""
+        the loop spins at full speed issuing an XREADGROUP per pass — forever,
+        on an empty outbox. One pegged core and a permanent Redis load floor, on
+        the Redis that also serves playback.
+
+        Two things about the measurement, both learned by mutating _wake.clear()
+        away and watching what the test did:
+
+        It counts XREADGROUP. The test was written against the LIST outbox and
+        kept its LRANGE instrument across the switch to a stream, where the
+        drain path never issues one — so its assertion had become 0 == 0,
+        proving nothing about the loop it names.
+
+        It samples event-loop TURNS against an absolute ceiling, not two timed
+        windows compared to each other. Both of those matter. Wall-clock windows
+        get starved by the very spin they are measuring, so the old shape never
+        reached its assertion and reported the regression as a 120s
+        pytest-timeout — a cancellation that burns a CI job's deadline instead
+        of naming the defect. And a window-to-window comparison is defeated by
+        the spin's own consequences: measured against the real mutant, the loop
+        issued 57,600 reads in the first window and exactly 0 in the second,
+        because by then it had died and entered the supervisor's 5s respawn
+        damping. Both windows agreed, and the test passed.
+
+        The absolute form has neither weakness: an idle loop parked in
+        _wake.wait() issues at most the one follow-up backlog check, whatever
+        else is happening on the loop."""
         monkeypatch.setattr(HistoryOutboxDrainer, "TICK_SECS", 5.0)
         peeks = {"n": 0}
-        real_lrange = fake_redis.lrange
+        real_exec = type(fake_redis).execute_command
 
-        async def counting_lrange(*args: Any, **kwargs: Any) -> Any:
-            peeks["n"] += 1
-            return await real_lrange(*args, **kwargs)
+        async def counting_exec(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if str(args[0]) == "XREADGROUP":
+                peeks["n"] += 1
+            return await real_exec(self, *args, **kwargs)
 
-        monkeypatch.setattr(fake_redis, "lrange", counting_lrange)
+        async def turns(n: int) -> None:
+            for _ in range(n):
+                await asyncio.sleep(0)
+
+        monkeypatch.setattr(type(fake_redis), "execute_command", counting_exec)
         drainer = HistoryOutboxDrainer(fake_redis, archive)
         drainer.start()
         try:
             await _push(fake_redis, 1)
             drainer.notify()
             await _eventually(lambda: archive.inserted == [_entry(1)])
-            # A productive cycle `continue`s and peeks again to check for more
-            # backlog; let that settle before sampling.
-            await asyncio.sleep(0.1)
-            settled = peeks["n"]
-            # TICK_SECS is 5s and the outbox is empty, so a correctly-idling
-            # loop peeks ZERO times in this window. A hot spin does thousands.
-            await asyncio.sleep(0.2)
-            assert peeks["n"] == settled
+            peeks["n"] = 0
+            await turns(400)
+            # TICK_SECS is 5s and the outbox is now empty, so an idling loop
+            # spends this window parked in _wake.wait(). The allowance covers
+            # the follow-up cycle a productive one runs to check for more
+            # backlog, at two reads each (pending replay, then new). Measured:
+            # 4 idle against 111,614 spinning, so the exact ceiling is not
+            # load-bearing — only its order of magnitude.
+            assert peeks["n"] <= 8
+        finally:
+            # Bounded, and cancelled outright if it overruns: a drainer that is
+            # actually spinning cannot be joined by a graceful stop, so an
+            # unbounded teardown here would swallow the assertion above and
+            # re-report the defect as a 120s deadline expiry.
+            task = drainer._task
+            try:
+                async with asyncio.timeout(1):
+                    await drainer.stop(timeout=0.5)
+            except TimeoutError:
+                if task is not None:
+                    task.cancel()
+
+    async def test_the_tick_timeout_wakes_a_loop_nobody_notified(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the idle wait: TICK_SECS expiring, not notify().
+
+        Everything else here pushes AND notifies, so the timeout arm was never
+        taken. It is the only thing that moves an entry pushed by a process
+        whose notify never landed — a second bot instance on the same Redis, or
+        a notify dropped in the window the clear() comment describes.
+        """
+        monkeypatch.setattr(HistoryOutboxDrainer, "TICK_SECS", 0.05)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        drainer.start()
+        try:
+            await _eventually(lambda: drainer._task is not None)
+            await asyncio.sleep(0.1)  # let the loop reach its idle wait
+            await _push(fake_redis, 1)  # NO notify() — the timeout must do it
+            await _eventually(lambda: archive.inserted == [_entry(1)])
         finally:
             await drainer.stop(timeout=0.5)
+
+    async def test_a_respawn_that_lands_after_stop_does_not_restart(
+        self, fake_redis: Redis, archive: Any
+    ) -> None:
+        # _respawn is a call_later callback, so it can fire between stop()
+        # cancelling the handle and the loop actually running it. Restarting
+        # there resurrects a drainer nothing will ever stop again.
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        drainer._stopping = True
+        drainer._respawn()
+        assert drainer._task is None
+
+    async def test_retry_logs_an_unknowable_depth_when_redis_is_down(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer, caplog: Any
+    ) -> None:
+        # Redis being the thing that broke is the common case for this arm —
+        # the drain failed because Redis failed — so the retry line must still
+        # be emitted, with the backlog reported as unknown rather than as 0.
+        # A 0 there reads as "nothing is waiting", the opposite of the truth.
+        with patch.object(
+            fake_redis, "xlen", AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        ):
+            await drainer._log_retry(RuntimeError("pg down"), backoff=1.0)
+        assert "backlog=-1" in caplog.text
+
+    async def test_retry_backoff_doubles_then_holds_at_the_ceiling(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ladder itself, which no test read. Every existing failure-path
+        test asserts only THAT a retry happened, so both halves of
+        `min(backoff * 2, _BACKOFF_MAX)` were free to regress silently: a
+        constant backoff turns a Postgres outage into a hot retry loop against
+        the Redis that also serves playback, and a missing ceiling walks the
+        delay past any useful recovery time (2^20 s is 12 days).
+
+        Reads the delay off _log_retry, which receives the same value the sleep
+        gets and is the number the operator sees in the log line."""
+        monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_START", 0.01)
+        monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_MAX", 0.04)
+        delays: list[float] = []
+        real_log_retry = HistoryOutboxDrainer._log_retry
+
+        async def recording(
+            self: HistoryOutboxDrainer, error: Exception, backoff: float
+        ) -> None:
+            delays.append(backoff)
+            await real_log_retry(self, error, backoff)
+
+        monkeypatch.setattr(HistoryOutboxDrainer, "_log_retry", recording)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        archive.fail = True  # every cycle raises, forever
+        await _push(fake_redis, 1)
+        drainer.start()
+        try:
+            async with asyncio.timeout(5):
+                while len(delays) < 5:
+                    await asyncio.sleep(0.01)
+        finally:
+            await drainer.stop(timeout=0.5)
+        # Doubling from the base, then pinned at the ceiling — not merely
+        # non-decreasing, which a constant ladder also satisfies.
+        assert delays[:5] == [0.01, 0.02, 0.04, 0.04, 0.04]
+
+    async def test_a_successful_cycle_resets_the_backoff(
+        self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half: the ladder must fall back to the base once the
+        archive recovers, or the first blip of a long-lived process permanently
+        slows every later retry."""
+        monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_START", 0.01)
+        monkeypatch.setattr(HistoryOutboxDrainer, "_BACKOFF_MAX", 0.08)
+        delays: list[float] = []
+        real_log_retry = HistoryOutboxDrainer._log_retry
+
+        async def recording(
+            self: HistoryOutboxDrainer, error: Exception, backoff: float
+        ) -> None:
+            delays.append(backoff)
+            if len(delays) == 3:
+                archive.fail = False  # Postgres comes back
+            await real_log_retry(self, error, backoff)
+
+        monkeypatch.setattr(HistoryOutboxDrainer, "_log_retry", recording)
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        archive.fail = True
+        await _push(fake_redis, 1)
+        drainer.start()
+        try:
+            await _eventually(lambda: archive.inserted == [_entry(1)])
+            assert delays == [0.01, 0.02, 0.04]
+            # Fail again after the recovery: the ladder must restart at the
+            # base, not resume from 0.08.
+            archive.fail = True
+            await _push(fake_redis, 2)
+            drainer.notify()
+            async with asyncio.timeout(5):
+                while len(delays) < 4:
+                    await asyncio.sleep(0.01)
+        finally:
+            await drainer.stop(timeout=0.5)
+        assert delays[3] == 0.01
 
 
 class TestCloseNeverEscalates:
@@ -1807,7 +2245,8 @@ class TestPoolConfiguration:
 
 
 class TestRecordRejection:
-    """play_history_rejected (migrations/0005). Expected to stay empty forever,
+    """play_history_rejected (migrations/0001_play_history.sql). Expected to stay
+    empty forever,
     which is exactly why the path has to be tested — nothing in production will
     exercise it before the day it matters."""
 
@@ -1909,8 +2348,8 @@ class TestPoisonClassification:
 
     def test_check_violation_is_poison(self) -> None:
         # SQLSTATE 23514, and NOT a DataError: it inherits from
-        # IntegrityConstraintViolationError. migrations/0004 makes this
-        # reachable, and without the arm a violation would propagate past the
+        # IntegrityConstraintViolationError. The play_history CHECK
+        # constraints make this reachable, and without the arm a violation would propagate past the
         # quarantine path and wedge the drain head on a non-evictable list.
         assert not issubclass(
             asyncpg.exceptions.CheckViolationError, asyncpg.exceptions.DataError
