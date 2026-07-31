@@ -1,8 +1,15 @@
-"""Tests for src/config.py — the Spotify feature toggle."""
+"""Tests for src/config.py — the Spotify feature toggle and archive tunables."""
 
 import pytest
 
-from src.config import SPOTIFY_TEST_TRACK_ID, SpotifyStatus, spotify_enabled
+from src.config import (
+    HISTORY_OUTBOX_MAX,
+    POSTGRES_STATEMENT_CACHE,
+    SPOTIFY_TEST_TRACK_ID,
+    SpotifyStatus,
+    postgres_url,
+    spotify_enabled,
+)
 
 
 class TestSpotifyEnabled:
@@ -62,3 +69,41 @@ class TestSpotifyConfigConstants:
 
     def test_status_has_three_distinct_states(self) -> None:
         assert {s.value for s in SpotifyStatus} == {"disabled", "invalid", "enabled"}
+
+
+class TestPostgresUrl:
+    def test_returns_none_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert postgres_url() is None
+
+    def test_returns_the_dsn_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
+        assert postgres_url() == "postgresql://u@h/db"
+
+    def test_empty_string_counts_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exported-but-empty `POSTGRES_URL=` must read as absent, same rule
+        as the Spotify credentials above. `""` is not None, so without the guard
+        setup_hook's required-DSN check passes and the real failure surfaces
+        later as an asyncpg connect error instead of a startup refusal."""
+        monkeypatch.setenv("POSTGRES_URL", "")
+        assert postgres_url() is None
+
+    def test_read_at_call_time_not_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert postgres_url() is None
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
+        assert postgres_url() == "postgresql://u@h/db"
+
+
+class TestArchiveTunables:
+    def test_outbox_cap_defaults_to_unbounded(self) -> None:
+        # 0 is the durability contract: an entry only leaves the outbox once
+        # Postgres has it. A non-zero default would silently discard plays.
+        assert HISTORY_OUTBOX_MAX == 0
+
+    def test_statement_cache_defaults_to_asyncpg_default(self) -> None:
+        assert POSTGRES_STATEMENT_CACHE == 100

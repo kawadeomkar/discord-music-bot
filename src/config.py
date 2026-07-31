@@ -52,20 +52,15 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
-# -ping's live-edit loop tunables. Constants (not call-time reads) because the
-# dashboard reads them every tick and they are deployment-shape settings, not
-# feature switches. They live here rather than in ping.py so this module stays
-# the one place to answer "what does the bot read from the environment?".
-# See docs/PING_METADATA_PLAN.md §5.2/§8.
-PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
-PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
-
 # Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default)
 # means unbounded, which IS the durability contract: an entry only leaves the
 # outbox once Postgres has it. Operators who would rather lose the oldest
 # un-archived plays than let a long Postgres outage grow the non-evictable list
 # toward Redis' maxmemory can set a cap; the drainer logs every drop at ERROR.
-# Sizing math is in the README's Postgres section (~350 B/entry).
+# Sizing: a played-song entry measures ~410 bytes on the wire (measured against
+# real Redis with MEMORY USAGE at 100k entries — 413.9 B/entry stored), so the
+# compose Redis' 256mb budget holds roughly 650k un-archived plays before the
+# non-evictable key becomes the thing that fills it.
 HISTORY_OUTBOX_MAX: int = int(os.environ.get("HISTORY_OUTBOX_MAX", "0"))
 
 # asyncpg's prepared-statement cache size, per connection. The default matches
@@ -82,8 +77,14 @@ def postgres_url() -> Optional[str]:
     Read at call time (same rationale as spotify_enabled): the bot reads it
     once at startup, so there is no hot path to optimise, and tests can
     monkeypatch the environment per case instead of reloading the module.
+
+    `or None` for the same reason spotify_enabled() wraps in bool(): an
+    exported-but-empty `POSTGRES_URL=` must read as absent. Otherwise a blank
+    line in .env yields "", which is not None, so setup_hook's required-DSN
+    check passes and the failure resurfaces later as an asyncpg connect error
+    instead of the startup refusal it is supposed to be.
     """
-    return os.environ.get("POSTGRES_URL")
+    return os.environ.get("POSTGRES_URL") or None
 
 
 def spotify_enabled() -> bool:
