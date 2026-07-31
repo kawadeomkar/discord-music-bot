@@ -60,20 +60,67 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
 PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
 PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
 
+def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    """Parse an integer knob from the environment, or raise a named error.
+
+    Three behaviors, each bought by a specific failure:
+
+    Empty reads as unset. `HISTORY_OUTBOX_MAX=` — the bare `KEY=` shape
+    .env.example already models for POSTGRES_PASSWORD — otherwise raises
+    ValueError here at IMPORT time, which is before main() has run
+    setup_telemetry(), so structlog and OTel are not configured yet. Under
+    compose (`env_file: .env`, `restart: always`) that is an unstructured
+    traceback on stderr and an infinite restart loop with nothing in Loki.
+    Same rule postgres_url() applies to a blank DSN.
+
+    Negatives are refused rather than passed through. `-1` is the near-universal
+    idiom for "no limit", so it is exactly what an operator reaches for to spell
+    out HISTORY_OUTBOX_MAX's default unbounded behavior — and it means the
+    opposite downstream: the drainer's cap check is `if not OUTBOX_MAX: return`
+    (-1 is truthy) followed by `if depth <= OUTBOX_MAX: return` (never true for
+    a negative), so `dropped = depth - OUTBOX_MAX` = depth + 1 and the trim pops
+    until the list is empty. That runs on the drain success path too, so a
+    healthy system would wipe every un-archived play roughly every 30s, and the
+    only signal would be an ERROR line claiming a cap was exceeded.
+
+    The message names the variable because it surfaces with no logger attached:
+    a bare `invalid literal for int() with base 10: ''` does not say which of
+    the environment's variables is at fault.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    return value
+
+
 # Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default)
 # means unbounded, which IS the durability contract: an entry only leaves the
 # outbox once Postgres has it. Operators who would rather lose the oldest
 # un-archived plays than let a long Postgres outage grow the non-evictable list
 # toward Redis' maxmemory can set a cap; the drainer logs every drop at ERROR.
-# Sizing math is in the README's Postgres section (~350 B/entry).
-HISTORY_OUTBOX_MAX: int = int(os.environ.get("HISTORY_OUTBOX_MAX", "0"))
+# An outage is not the only thing that trips it: the cap is enforced on the
+# drain SUCCESS path too, evaluated after each 100-entry batch, so a healthy
+# drainer working through a burst backlog also trims — discarding rows the very
+# next cycle would have inserted milliseconds later. Set a cap well above
+# BATCH_SIZE x your peak burst, not just above steady-state depth.
+# Sizing: a played-song entry measures ~410 bytes on the wire (measured against
+# real Redis with MEMORY USAGE at 100k entries — 413.9 B/entry stored), so the
+# compose Redis' 256mb budget holds roughly 650k un-archived plays before the
+# non-evictable key becomes the thing that fills it.
+HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
 # asyncpg's prepared-statement cache size, per connection. The default matches
 # asyncpg's own. Set to 0 behind PgBouncer in transaction-pooling mode:
 # prepared statements are per-connection state, and transaction pooling hands a
 # different backend to each transaction, so a cached statement handle refers to
 # something the new backend has never seen.
-POSTGRES_STATEMENT_CACHE: int = int(os.environ.get("POSTGRES_STATEMENT_CACHE", "100"))
+POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
 
 def postgres_url() -> Optional[str]:
@@ -82,8 +129,17 @@ def postgres_url() -> Optional[str]:
     Read at call time (same rationale as spotify_enabled): the bot reads it
     once at startup, so there is no hot path to optimise, and tests can
     monkeypatch the environment per case instead of reloading the module.
+
+    `or None` collapses "unset" and "exported but empty" into one sentinel, so
+    the Optional[str] above is honest and every caller has exactly one
+    absent-case to handle. A blank line in .env yields "", which is not None but
+    is not a DSN either; without this, whether that is caught depends on each
+    caller spelling its check as truthiness rather than `is None`. It is not
+    load-bearing for any caller today — setup_hook's required-DSN guard is
+    `if not postgres_url:` and rejects "" on its own — and that is the point:
+    the type should not depend on remembering which form the caller used.
     """
-    return os.environ.get("POSTGRES_URL")
+    return os.environ.get("POSTGRES_URL") or None
 
 
 def spotify_enabled() -> bool:

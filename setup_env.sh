@@ -5,26 +5,16 @@
 #   ./setup_env.sh --force    # regenerate even if a password is already set
 #
 # Creates .env from .env.example when it doesn't exist, then writes a random
-# 128-bit POSTGRES_PASSWORD.
+# 128-bit POSTGRES_PASSWORD. Hex output is deliberate: the value is interpolated
+# into a DSN (postgresql://user:PASS@host/db) by docker-compose.yml, and hex has
+# no characters that would need URL-escaping there.
 #
-# The password used to be DERIVED as sha256("<domain>:" + DISCORD_TOKEN), which
-# saved managing one secret at the cost of tying two unrelated ones together:
-# the database credential became a function of the Discord token, so anyone who
-# obtained the token could compute it, rotating the token silently invalidated
-# a live database credential, and one leaked secret compromised two systems.
-# Generating instead removes the coupling entirely — the password now depends
-# on nothing else, and DISCORD_TOKEN no longer has to be set before this runs.
-#
-# Hex output is deliberate — the password is interpolated into a DSN
-# (postgresql://user:PASS@host/db) by docker-compose.yml, and hex has no
-# characters that would need URL-escaping there.
-#
-# IDEMPOTENT BY DEFAULT, and that is a safety property, not politeness:
-# Postgres only reads POSTGRES_PASSWORD when it initializes an empty data
+# Idempotent by default, and that is a safety property rather than politeness:
+# Postgres reads POSTGRES_PASSWORD only when it initializes an empty data
 # directory. An existing postgres-data volume keeps whatever password it was
 # created with, so silently rewriting .env would leave the bot unable to
-# authenticate against its own database. An already-set password is left alone
-# unless you pass --force (and --force warns about exactly this).
+# authenticate against its own database. --force overrides and warns about
+# exactly that.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -47,10 +37,10 @@ done
 die() { printf 'Error: %s\n' "$1" >&2; shift; for l in "$@"; do printf '       %s\n' "$l" >&2; done; exit 1; }
 
 _random_hex() {
-    # 16 bytes = 128 bits, hex-encoded. openssl first because it is the one
-    # tool present on essentially every developer machine; /dev/urandom is the
-    # fallback for a stripped container. Both are CSPRNGs — do NOT substitute
-    # $RANDOM or a timestamp, which would make the password guessable.
+    # 16 bytes = 128 bits. openssl first (present on essentially every dev
+    # machine), /dev/urandom as the fallback for a stripped container. Both are
+    # CSPRNGs — do NOT substitute $RANDOM or a timestamp; that makes the
+    # password guessable.
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 16
     elif [ -r /dev/urandom ]; then
@@ -76,13 +66,9 @@ _set_env_var() {
         cp "$file" "$tmp"
         printf '%s=%s\n' "$name" "$value" >> "$tmp"
     fi
-    # Preserve the original mode (a .env is often 600); mktemp creates 600 anyway,
-    # but an existing stricter/looser mode should survive the rewrite.
-    #
-    # `chmod --reference` is GNU-only — on macOS, this project's primary dev
-    # platform, it always failed and silently fell through to 600, so the
-    # preserve-the-mode intent never actually applied there. Read the mode with
-    # stat instead, trying the BSD spelling first and then the GNU one.
+    # Preserve the original mode (a .env is often 600) across the rewrite. Read
+    # it with stat, BSD spelling first then GNU: `chmod --reference` is GNU-only
+    # and fails silently on macOS, this project's primary dev platform.
     if [ -f "$file" ]; then
         mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null || echo '')"
         if [ -n "$mode" ]; then chmod "$mode" "$tmp"; else chmod 600 "$tmp"; fi
@@ -119,16 +105,14 @@ else
     fi
     password="$(_random_hex)"
     _set_env_var POSTGRES_PASSWORD "$password" "$ENV_FILE"
-    # No prefix, not even a masked one: printing the first 8 hex characters put
-    # a third of a 32-character credential into terminal scrollback and CI logs,
-    # which is the thing this comment used to claim it was avoiding. The value
-    # is in $ENV_FILE; nothing here needs to echo any part of it.
+    # Never echo any part of the credential, not even a masked prefix — that
+    # puts it in terminal scrollback and CI logs. It is in $ENV_FILE.
     echo "Set POSTGRES_PASSWORD in $ENV_FILE (32 random hex characters)."
 fi
 
 # ── 3. next steps ────────────────────────────────────────────────────────────
-# Advisory, not a gate: nothing this script writes depends on DISCORD_TOKEN any
-# more, so an unset token is a reminder rather than an error.
+# Advisory, not a gate: nothing this script writes depends on DISCORD_TOKEN, so
+# an unset token is a reminder rather than an error.
 token="$(_env_value DISCORD_TOKEN "$ENV_FILE")"
 placeholder=""
 [ -f "$TEMPLATE" ] && placeholder="$(_env_value DISCORD_TOKEN "$TEMPLATE")"
