@@ -9,11 +9,13 @@ server (early-outs, row mapping, close-before-connect).
 """
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 import pytest
+import redis.asyncio as aioredis
 
 from collections.abc import Callable, Sequence
 from typing import Any, Optional, cast
@@ -22,7 +24,9 @@ from redis.asyncio import Redis
 
 from src.guild_state import HistoryEntry, serialize_history_entry
 from src.history_archive import (
+    _INSERT_SQL,
     _POISON,
+    _RECENT_SQL,
     HistoryArchive,
     HistoryOutboxDrainer,
     PostgresHistoryArchive,
@@ -31,11 +35,12 @@ from src.history_archive import (
     _row_to_entry,
 )
 from src.redis_client import (
-    DRAINER_LEASE_KEY,
-    DRAINER_LEASE_MS,
+    HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
+    OUTBOX_FIELD,
     GuildRedisStore,
-    hold_drainer_lease,
+    ensure_outbox_group,
+    outbox_pending_count,
 )
 
 
@@ -116,7 +121,12 @@ def archive() -> FakeArchive:
 
 
 @pytest.fixture
-def drainer(fake_redis: Redis, archive: Any) -> HistoryOutboxDrainer:
+async def drainer(fake_redis: Redis, archive: Any) -> HistoryOutboxDrainer:
+    # Bootstrapping here mirrors production: setup_hook calls
+    # ensure_outbox_group before the drainer ever runs. Without it every test
+    # would silently exercise the NOGROUP heal path instead of the ordinary
+    # one, and that path has its own test.
+    await ensure_outbox_group(fake_redis)
     return HistoryOutboxDrainer(fake_redis, archive)
 
 
@@ -124,6 +134,29 @@ async def _push(fake_redis: Redis, *ns: int) -> None:
     store = GuildRedisStore(fake_redis, guild_id=42)
     for n in ns:
         await store.push_history(_entry(n))
+
+
+async def _outbox_wires(fake_redis: Redis) -> list[bytes]:
+    """Every payload still in the outbox, oldest first.
+
+    The list-era assertions used `lrange(key, 0, -1)`, which returned
+    NEWEST-first because the producer LPUSHed. XRANGE is oldest-first, so
+    expectations that were reversed under the list read forward here.
+    """
+    return [fields[OUTBOX_FIELD] for _id, fields in await _stream_entries(fake_redis)]
+
+
+async def _stream_entries(fake_redis: Redis) -> list[tuple[bytes, dict[bytes, bytes]]]:
+    """The outbox stream, oldest first, narrowed to the ordinary-entry shape.
+
+    redis-py types XRANGE's reply as a union wide enough to cover XAUTOCLAIM's
+    4-tuple rows and RESP3 dict forms, so every unpack would otherwise need its
+    own ignore. One cast here says "one stream, ordinary entries" once.
+    """
+    return cast(
+        list[tuple[bytes, dict[bytes, bytes]]],
+        await fake_redis.xrange(HISTORY_OUTBOX_KEY),
+    )
 
 
 async def _eventually(cond: Callable[[], bool], timeout: float = 2.0) -> None:
@@ -139,7 +172,7 @@ class TestDrainOnce:
         await _push(fake_redis, 1, 2, 3)
         assert await drainer._drain_once() == 3
         assert archive.batches == [[_entry(1), _entry(2), _entry(3)]]
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_display_list_untouched(
         self, fake_redis: Redis, drainer: HistoryOutboxDrainer
@@ -163,7 +196,7 @@ class TestDrainOnce:
         assert len(archive.inserted) == drainer.BATCH_SIZE
         # The oldest BATCH_SIZE went first; the newest 7 remain.
         assert archive.inserted[0] == _entry(0)
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 7
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 7
 
     async def test_corrupt_entry_retired_not_inserted(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
@@ -171,10 +204,12 @@ class TestDrainOnce:
         # Corrupt bytes must be consumed (or they'd wedge the queue head
         # forever) while the surviving entries still make it to the archive.
         await _push(fake_redis, 1)
-        await fake_redis.lpush(HISTORY_OUTBOX_KEY, b"not json")  # newer than entry 1
+        await fake_redis.xadd(
+            HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: b"not json"}
+        )  # newer than entry 1
         assert await drainer._drain_once() == 2
         assert archive.inserted == [_entry(1)]
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_archive_failure_leaves_outbox_intact(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
@@ -185,7 +220,7 @@ class TestDrainOnce:
         archive.fail = True
         with pytest.raises(RuntimeError):
             await drainer._drain_once()
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
 
     async def test_redelivery_after_failure(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
@@ -208,7 +243,7 @@ class TestDrainerLoop:
             await _push(fake_redis, 1)
             drainer.notify()
             await _eventually(lambda: archive.inserted == [_entry(1)])
-            assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+            assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
         finally:
             await drainer.stop()
 
@@ -240,7 +275,7 @@ class TestDrainerLoop:
             await _push(fake_redis, 1)
             drainer.notify()
             await _eventually(lambda: "outbox drain failed" in caplog.text)
-            assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1  # nothing lost
+            assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 1  # nothing lost
             archive.fail = False
             await _eventually(lambda: archive.inserted == [_entry(1)])
         finally:
@@ -284,49 +319,72 @@ class TestDrainerLoop:
         archive.fail = True
         drainer.start()
         await drainer.stop()
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 1
+
+
+# The play_history column order, once. _entry_to_row emits a positional tuple
+# against _INSERT_SQL and _row_to_entry reads a Record by name, so a column
+# added to one and not the other is exactly the drift these tests catch — and a
+# per-test literal list is how that drift stays invisible.
+_COLUMNS = (
+    "guild_id",
+    "title",
+    "webpage_url",
+    "duration_secs",
+    "played_secs",
+    "requester_id",
+    "requester_name",
+    "thumbnail",
+    "uploader",
+    "played_at",
+    "message_id",
+)
 
 
 class TestRowMapping:
+    def test_row_width_matches_the_insert_statement(self) -> None:
+        """A column added to _entry_to_row but not to _INSERT_SQL (or vice
+        versa) is a runtime asyncpg error on the first real insert, and the
+        fakeredis-backed drainer tests cannot see it. message_id landed exactly
+        this way: the wire carried it for two branches while every INSERT still
+        listed ten columns, so the value was silently discarded."""
+        assert len(_entry_to_row(_entry(1))) == len(_COLUMNS)
+        assert _INSERT_SQL.count("$") == len(_COLUMNS)
+        for column in _COLUMNS:
+            assert column in _INSERT_SQL
+            assert column in _RECENT_SQL
+
+    def test_message_id_round_trips(self) -> None:
+        # The NP host id is a snowflake; it must survive as a native int, and
+        # it must actually reach the row rather than defaulting to 0.
+        entry = HistoryEntry(guild_id=1, title="x", message_id=1234567890123456789)
+        row = _entry_to_row(entry)
+        assert row[_COLUMNS.index("message_id")] == 1234567890123456789
+        assert _row_to_entry(_as_record(dict(zip(_COLUMNS, row)))).message_id == (
+            1234567890123456789
+        )
+
     def test_round_trip(self) -> None:
         entry = _entry(1, guild_id=222222222222222222)
         row = _entry_to_row(entry)
-        keys = (
-            "guild_id",
-            "title",
-            "webpage_url",
-            "duration_secs",
-            "played_secs",
-            "requester_id",
-            "requester_name",
-            "thumbnail",
-            "uploader",
-            "played_at",
-        )
+        keys = _COLUMNS
         assert _row_to_entry(_as_record(dict(zip(keys, row)))) == entry
 
     def test_played_at_maps_to_utc_datetime(self) -> None:
         row = _entry_to_row(_entry(1))
-        assert row[-1] == datetime.fromtimestamp(1001.0, tz=timezone.utc)
+        assert row[_COLUMNS.index("played_at")] == datetime.fromtimestamp(
+            1001.0, tz=timezone.utc
+        )
 
     def test_epoch_zero_unknown_sentinel_survives(self) -> None:
         # played_at 0.0 = "unknown" — carried into Postgres as to_timestamp(0),
         # not NULL (docs/POSTGRES_HISTORY_PLAN.md §4).
         entry = HistoryEntry(guild_id=1, title="x")
         row = _entry_to_row(entry)
-        assert row[-1] == datetime.fromtimestamp(0, tz=timezone.utc)
-        keys = (
-            "guild_id",
-            "title",
-            "webpage_url",
-            "duration_secs",
-            "played_secs",
-            "requester_id",
-            "requester_name",
-            "thumbnail",
-            "uploader",
-            "played_at",
+        assert row[_COLUMNS.index("played_at")] == datetime.fromtimestamp(
+            0, tz=timezone.utc
         )
+        keys = _COLUMNS
         assert _row_to_entry(_as_record(dict(zip(keys, row)))).played_at == 0.0
 
 
@@ -629,7 +687,7 @@ class TestRejectionIsolation:
         assert [e.title for e in archive.inserted] == ["Song 1", "Song 3", "Song 5"]
         assert [e.title for e, _ in archive.rejections] == ["Song 2", "Song 4"]
         # The head is retired either way — that is the whole point.
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_a_check_violation_routes_to_record_rejection(
         self, fake_redis: Redis
@@ -649,7 +707,7 @@ class TestRejectionIsolation:
         [(entry, error)] = archive.rejections
         assert entry.title == "Song 2"
         assert isinstance(error, asyncpg.exceptions.CheckViolationError)
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_the_recorded_entry_is_the_whole_play(
         self, fake_redis: Redis
@@ -688,7 +746,7 @@ class TestRejectionIsolation:
         archive.transient_failures = 2  # batch insert, then the first isolate
         with pytest.raises(OSError):
             await drainer._drain_once()
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
         assert archive.rejections == []
 
     async def test_transient_errors_are_never_recorded_as_rejections(
@@ -702,7 +760,7 @@ class TestRejectionIsolation:
         with pytest.raises(RuntimeError):
             await drainer._drain_once()
         assert archive.rejections == []
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
 
     async def test_an_unforeseen_error_type_still_wedges_rather_than_drops(
         self, fake_redis: Redis
@@ -733,7 +791,7 @@ class TestRejectionIsolation:
             with pytest.raises(RuntimeError):
                 await drainer._drain_once()
         # Nothing lost, nothing recorded as rejected: it redelivers forever.
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
         assert archive.rejections == []
 
 
@@ -764,9 +822,7 @@ class TestRetireAccounting:
         assert [e.title for e in archive.inserted] == ["Song 1", "Song 2", "Song 3"]
         # Song 99 arrived after the peek and was never inserted, so it must
         # still be queued.
-        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
-            serialize_history_entry(_entry(99))
-        ]
+        assert await _outbox_wires(fake_redis) == [serialize_history_entry(_entry(99))]
 
     async def test_isolation_does_not_retire_the_batch_a_second_time(
         self, fake_redis: Redis
@@ -786,9 +842,9 @@ class TestRetireAccounting:
         assert [e.title for e, _ in poison.rejections] == ["Song 2"]
         # Both arrivals survive. A second retire here pops from the tail and
         # takes them instead — inserted nowhere, recorded nowhere.
-        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
-            serialize_history_entry(_entry(98)),
+        assert await _outbox_wires(fake_redis) == [
             serialize_history_entry(_entry(97)),
+            serialize_history_entry(_entry(98)),
         ]
 
     async def test_isolation_retires_corrupt_elements_too(
@@ -806,7 +862,7 @@ class TestRetireAccounting:
         passed the whole suite before this test existed.
         """
         await _push(fake_redis, 1)
-        await fake_redis.lpush(HISTORY_OUTBOX_KEY, b"not json")
+        await fake_redis.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: b"not json"})
         await _push(fake_redis, 2)  # the refused row, newest
         archive = PoisonArchive({"Song 2"})
         drainer = HistoryOutboxDrainer(fake_redis, archive)
@@ -817,7 +873,7 @@ class TestRetireAccounting:
         assert [e.title for e, _ in archive.rejections] == ["Song 2"]
         # All three settled: inserted, dropped-as-corrupt, recorded. Nothing is
         # left to wedge the head.
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_a_blip_mid_isolation_records_the_refused_row_once(
         self, fake_redis: Redis
@@ -843,9 +899,7 @@ class TestRetireAccounting:
         assert [e.title for e in archive.inserted] == ["Song 1"]
         assert [e.title for e, _ in archive.rejections] == ["Song 2"]
         # Only the unsettled tail is left behind — the progress is kept.
-        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
-            serialize_history_entry(_entry(3))
-        ]
+        assert await _outbox_wires(fake_redis) == [serialize_history_entry(_entry(3))]
 
         # Redelivery settles Song 3 without replaying Songs 1 and 2.
         assert await drainer._drain_once() == 1
@@ -872,7 +926,7 @@ class TestDrainDeadline:
         await _push(fake_redis, 1)
         with pytest.raises(TimeoutError):
             await drainer._drain_once()
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1  # nothing retired
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 1  # nothing retired
 
     async def test_hang_reaches_the_retry_log_and_reports_depth(
         self,
@@ -902,38 +956,54 @@ class TestDrainDeadline:
         finally:
             await drainer.stop(timeout=0.2)
 
-    def test_deadline_stays_below_the_lease_ttl(self) -> None:
-        # INVARIANT: a batch must never outlive the ownership it started under.
-        assert HistoryOutboxDrainer.DRAIN_DEADLINE_SECS * 1000 < DRAINER_LEASE_MS
 
+class TestConcurrentDrainers:
+    """H2, cross-process half — now enforced by the SERVER, not by a lease.
 
-class TestDrainerLease:
-    """H2, cross-process half. peek → insert → retire is single-consumer; a
-    second drainer retires entries the first never inserted."""
+    Under the list transport this needed `history:drainer`: two drainers both
+    peeked the same tail and the second's positional retire dropped entries the
+    first had not inserted. The stream consumer group removes the mechanism —
+    `>` delivers disjoint sets, `0` replays a shared set that ON CONFLICT
+    collapses, and settling is by ID — so concurrency costs duplicated work
+    instead of destroyed plays.
 
-    async def test_a_second_drainer_cannot_touch_the_holders_batch(
+    Read the limits of this honestly. These tests assert a property of Redis,
+    not of our code: disjointness survives deleting the XACK, deleting the XDEL,
+    reversing the 0/> order, or switching to a per-process consumer name. They
+    are regression guards against a transport change, and the actual evidence
+    that the drainer is correct is in the mutation-guard tests elsewhere in this
+    file and in test_redis_client.py.
+    """
+
+    async def test_a_second_drainer_duplicates_work_but_destroys_nothing(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REGRESSION: this test used to start two drainers and assert a single
-        batch, which the scheduler satisfied for free — with 3 entries against
-        fakeredis the first drainer always finished before the second peeked, so
-        the assertion held whether or not the lease was consulted. Weakening the
-        gate in _run to `... or True` passed the entire suite, and so did making
-        _lease_id a shared constant, while a forced overlap loses entries
-        permanently: the second drainer retires the batch the first is still
-        inserting, and those plays end up neither archived nor queued.
+        """The C1 scenario, forced — and note what the outcome actually is.
 
-        So park the holder *inside* insert_batch and drive the second drainer's
-        full cycle, lease check included, while it is parked.
+        A short-tick second drainer runs many full cycles while the first is
+        parked mid-insert holding all three entries. Under the list transport
+        its positional RPOP destroyed them: inserted nowhere, queued nowhere.
+
+        Here it REPLAYS them. Sharing the consumer name means the pending read
+        hands the peer the same in-flight set, so it inserts them a second time
+        and settles them by ID. That is the designed trade and it is worth
+        stating rather than discovering: concurrency costs duplicated work, and
+        `ON CONFLICT DO NOTHING` is what makes the duplicate free in production.
+        The FakeArchive here has no unique index, so the duplicate is visible —
+        hence the assertions are on the set of titles, not the sequence.
+
+        The property under test is that nothing is LOST and that the parked
+        drainer's own settle, arriving late against IDs a peer already
+        destroyed, is a harmless no-op rather than an error.
         """
         entered = asyncio.Event()
         release = asyncio.Event()
 
         class GatedArchive(FakeArchive):
             """Blocks the FIRST insert only. Later calls run straight through,
-            so a drainer that wrongly ignores the lease actually completes its
-            retire and the damage becomes observable — a gate that blocked
-            everyone would hide the very bug this test is for."""
+            so a drainer that wrongly proceeds actually completes its settle and
+            the damage becomes observable — a gate that blocked everyone would
+            hide the very bug this test is for."""
 
             def __init__(self) -> None:
                 super().__init__()
@@ -947,9 +1017,8 @@ class TestDrainerLease:
                 await super().insert_batch(entries)
 
         archive = GatedArchive()
-        # Short tick so the second drainer takes many laps inside the window
-        # below rather than one lucky one.
         monkeypatch.setattr(HistoryOutboxDrainer, "TICK_SECS", 0.01)
+        await ensure_outbox_group(fake_redis)
         await _push(fake_redis, 1, 2, 3)
         first = HistoryOutboxDrainer(fake_redis, archive)
         second = HistoryOutboxDrainer(fake_redis, archive)
@@ -957,81 +1026,393 @@ class TestDrainerLease:
         try:
             async with asyncio.timeout(2):
                 await entered.wait()
-            # The holder is now parked mid-insert with all 3 entries still on
-            # the outbox, its lease held.
-            assert not await hold_drainer_lease(fake_redis, second._lease_id)
+            # The holder is parked mid-insert; all three are delivered to the
+            # shared consumer name and none are acked.
+            assert await outbox_pending_count(fake_redis) == 3
             second.start()
-            await asyncio.sleep(0.1)  # ~10 laps of second's loop
-            assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3
-            assert archive.batches == []  # second inserted nothing
+            await _eventually(lambda: len(archive.inserted) == 3)
         finally:
             release.set()
             await second.stop()
             await first.stop()
-        # And the holder still delivers: nothing was lost to the standoff.
-        assert archive.inserted == [_entry(1), _entry(2), _entry(3)]
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        # Every entry reached the archive exactly once as a DISTINCT play, and
+        # the parked drainer's late settle of already-destroyed IDs neither
+        # raised nor resurrected anything.
+        assert {e.title for e in archive.inserted} == {"Song 1", "Song 2", "Song 3"}
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+        assert await outbox_pending_count(fake_redis) == 0
 
-    async def test_each_drainer_gets_its_own_lease_id(self, fake_redis: Redis) -> None:
-        # A restarted process must not inherit the lease of the process it
-        # replaced: _if_still_owner compares ids, so a shared/derived id would
-        # let a successor RENEW a dead predecessor's lease and drain alongside
-        # a still-live one. Cheap to assert, and the failure is invisible until
-        # it costs history.
-        a = HistoryOutboxDrainer(fake_redis, FakeArchive())
-        b = HistoryOutboxDrainer(fake_redis, FakeArchive())
-        assert a._lease_id != b._lease_id
-
-    async def test_lease_is_taken_over_after_it_lapses(
-        self, fake_redis: Redis, archive: Any
+    async def test_new_entries_are_split_between_live_drainers(
+        self, fake_redis: Redis
     ) -> None:
-        # A drainer that died without releasing must not block its replacement
-        # forever — the TTL is what makes a dead holder recoverable.
-        dead = HistoryOutboxDrainer(fake_redis, archive)
-        await fake_redis.set(DRAINER_LEASE_KEY, dead._lease_id, px=DRAINER_LEASE_MS)
+        # The property that replaced the lease: `>` never hands the same entry
+        # to two consumers, so two drainers complement rather than collide.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3, 4)
+        a = FakeArchive()
+        b = FakeArchive()
+        da = HistoryOutboxDrainer(fake_redis, a)
+        db = HistoryOutboxDrainer(fake_redis, b)
+        monkeypatch_batch = 2
+        da.BATCH_SIZE = monkeypatch_batch  # instance attr, not the class
+        db.BATCH_SIZE = monkeypatch_batch
+        assert await da._drain_once() == 2
+        assert await db._drain_once() == 2
+        titles = [e.title for e in a.inserted] + [e.title for e in b.inserted]
+        assert sorted(titles) == ["Song 1", "Song 2", "Song 3", "Song 4"]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
+    async def test_a_dead_drainers_batch_is_inherited_not_stranded(
+        self, fake_redis: Redis
+    ) -> None:
+        """The stable-consumer-name payoff, at the drainer level.
+
+        A process that dies mid-batch leaves entries delivered and unacked. Its
+        successor recovers them on its very next cycle by reading `0` under the
+        same name — no lease TTL to wait out, no XAUTOCLAIM needed. With a
+        per-process name the successor's PEL is empty and those plays wait for
+        the periodic sweep instead.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        dead_archive = FakeArchive()
+        dead_archive.fail = True
+        dead = HistoryOutboxDrainer(fake_redis, dead_archive)
+        with pytest.raises(RuntimeError):
+            await dead._drain_once()  # delivered, then "crashed"
+        assert await outbox_pending_count(fake_redis) == 2
+
+        archive = FakeArchive()
         successor = HistoryOutboxDrainer(fake_redis, archive)
-        assert await successor._drain_once() == 0  # drain itself is unblocked
-        await fake_redis.delete(DRAINER_LEASE_KEY)  # simulate the lapse
-        successor.start()
-        try:
-            await _push(fake_redis, 1)
-            successor.notify()
-            await _eventually(lambda: archive.inserted == [_entry(1)])
-        finally:
-            await successor.stop()
+        assert await successor._drain_once() == 2
+        assert archive.inserted == [_entry(1), _entry(2)]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
-    async def test_stop_releases_the_lease(
+    async def test_stop_drains_without_any_gate(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
     ) -> None:
-        # Released rather than left to expire, so the next instance in a
-        # rolling deploy starts draining immediately instead of idling out the
-        # 90s TTL.
-        drainer.start()
-        async with asyncio.timeout(2.0):  # wait for the loop to take it
-            while await fake_redis.get(DRAINER_LEASE_KEY) is None:
-                await asyncio.sleep(0.01)
-        await drainer.stop()
-        assert await fake_redis.get(DRAINER_LEASE_KEY) is None
+        """stop()'s final flush used to be gated on holding the lease, because
+        without it shutdown WAS the concurrent second drainer. That gate is gone
+        and nothing replaces it: a concurrent drain is safe by design now, so
+        the final drain is an ordinary drain that happens to be the last one.
 
-    async def test_a_foreign_lease_is_never_released(
-        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
-    ) -> None:
-        # Compare-and-delete: stopping must not hand away a lease that lapsed
-        # and was retaken by someone else in the meantime.
-        await fake_redis.set(DRAINER_LEASE_KEY, "someone-else", px=DRAINER_LEASE_MS)
-        await drainer.stop()
-        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"someone-else"
-
-    async def test_final_drain_is_skipped_without_the_lease(
-        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
-    ) -> None:
-        # stop()'s final flush is a drain like any other, so it needs the same
-        # gate — otherwise shutdown IS the concurrent second drainer.
-        await fake_redis.set(DRAINER_LEASE_KEY, "someone-else", px=DRAINER_LEASE_MS)
+        The behaviour change worth naming: under a shared consumer name the
+        final drain's pending read returns a live peer's in-flight batch, so a
+        departing process duplicates the survivor's work rather than
+        complementing it. Harmless — dedup plus an idempotent ack — but it means
+        shutdown does more work than before, not less.
+        """
         await _push(fake_redis, 1)
         await drainer.stop()
-        assert archive.inserted == []
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+        assert archive.inserted == [_entry(1)]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
+
+class TestPendingBeforeNew:
+    async def test_a_cycle_never_reads_new_while_the_pel_is_dirty(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MEMORY INVARIANT, not a FIFO preference.
+
+        The PEL is bounded by BATCH_SIZE x concurrent readers only while a cycle
+        never reads `>` with a non-empty PEL. The natural shape of a future
+        head-of-line-blocking fix — "keep draining new entries while the stuck
+        batch retries" — breaks that bound, so the ordering is asserted by
+        command sequence rather than left to the happy path.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        archive = FakeArchive()
+        archive.fail = True
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        with pytest.raises(RuntimeError):
+            await drainer._drain_once()  # 2 entries now pending
+
+        await _push(fake_redis, 3)  # new arrival, must NOT be read this cycle
+        seen: list[str] = []
+        real_xreadgroup = fake_redis.xreadgroup
+
+        async def recording(*args: Any, **kwargs: Any) -> Any:
+            seen.append(args[2][HISTORY_OUTBOX_KEY])
+            return await real_xreadgroup(*args, **kwargs)
+
+        monkeypatch.setattr(fake_redis, "xreadgroup", recording)
+        archive.fail = False
+        assert await drainer._drain_once() == 2  # the pending pair only
+        assert seen == ["0"]  # `>` was never issued
+        assert [e.title for e in archive.inserted] == ["Song 1", "Song 2"]
+
+    async def test_new_entries_are_read_once_the_pel_is_clean(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        await _push(fake_redis, 1)
+        assert await drainer._drain_once() == 1
+        await _push(fake_redis, 2)
+        assert await drainer._drain_once() == 1
+        assert [e.title for e in archive.inserted] == ["Song 1", "Song 2"]
+
+
+class TestTombstones:
+    """P1. An entry delivered, then deleted while still pending.
+
+    XTRIM and any operator XDEL both produce this, because neither consults the
+    PEL. The ID replays with an empty field map, and a literal fields[b"e"] is a
+    KeyError — neither a ResponseError nor a parse failure, so it escapes every
+    handler the drain path has, reaches the generic backoff, and replays the
+    same entry every cycle. Forever: the drainer never dies, so the respawn
+    supervision never fires and nothing escalates past the 60s ceiling, while
+    the outbox grows unbounded on a key that cannot be evicted.
+    """
+
+    async def _tombstone(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        archive = FakeArchive()
+        archive.fail = True
+        stuck = HistoryOutboxDrainer(fake_redis, archive)
+        with pytest.raises(RuntimeError):
+            await stuck._drain_once()  # deliver, do not ack
+        ids = [i for i, _ in await _stream_entries(fake_redis)]
+        await fake_redis.xdel(HISTORY_OUTBOX_KEY, ids[0])  # body gone, ID pending
+
+    async def test_a_tombstone_is_acked_and_does_not_stall_the_drain(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        await _push(fake_redis, 1, 2)
+        await self._tombstone(fake_redis, drainer)
+        assert await drainer._drain_once() == 2  # tombstone + the live entry
+        assert [e.title for e in archive.inserted] == ["Song 2"]
+        assert await outbox_pending_count(fake_redis) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+        # And the next cycle is genuinely idle rather than replaying it.
+        assert await drainer._drain_once() == 0
+
+    async def test_a_tombstone_is_logged_as_a_lost_play(
+        self,
+        fake_redis: Redis,
+        drainer: HistoryOutboxDrainer,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # ERROR, and worded as loss: the bytes are gone from Redis and nothing
+        # can reproduce them. Counted separately from a parse failure, which is
+        # a different and recoverable-in-principle fault.
+        await _push(fake_redis, 1)
+        await self._tombstone(fake_redis, drainer)
+        await drainer._drain_once()
+        assert any(
+            r.levelname == "ERROR" and "payload had already been deleted" in r.message
+            for r in caplog.records
+        )
+
+    async def test_an_all_tombstone_batch_still_makes_progress(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # The loop condition is forward progress, not "batch was empty". A
+        # cycle that reads only tombstones must still count as progress, or the
+        # drain loop stops with entries left to settle.
+        await _push(fake_redis, 1)
+        await self._tombstone(fake_redis, drainer)
+        assert await drainer._drain_once() == 1
+        assert await outbox_pending_count(fake_redis) == 0
+
+    async def test_a_tombstone_does_not_reach_the_parser(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        """MUTATION GUARD: routing a tombstone through parse_history_entry.
+
+        A tombstone is not corrupt data — there is no data. Treating it as a
+        parse failure would log the wrong thing (recoverable corruption rather
+        than an unrecoverable lost play) and, worse, would mean the empty-payload
+        case had to survive orjson, which it does only by accident.
+        """
+        await _push(fake_redis, 1)
+        await self._tombstone(fake_redis, drainer)
+        with patch(
+            "src.history_archive.parse_history_entry", side_effect=AssertionError
+        ) as parser:
+            await drainer._drain_once()
+        parser.assert_not_called()
+
+
+class TestNogroupHealing:
+    async def test_a_deleted_key_is_healed_in_the_drain_cycle(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        """The upgrade note tells operators to `DEL history:outbox`, and DEL
+        destroys the consumer group along with the key. XADD then recreates the
+        key with NO group, after which every XREADGROUP returns NOGROUP —
+        identically, forever, if the bootstrap only ran at startup.
+
+        Under the list transport a DEL merely emptied the outbox and the drainer
+        kept working, so this is a foot-gun the stream introduces in the one
+        operation we ask operators to perform.
+        """
+        await fake_redis.delete(HISTORY_OUTBOX_KEY)
+        await _push(fake_redis, 1)  # recreates the key, still no group
+        assert await drainer._drain_once() == 1
+        assert archive.inserted == [_entry(1)]
+
+    async def test_the_heal_is_attempted_once_not_in_a_loop(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # Rebuild-and-retry-ONCE, the same shape ytdlp_pool uses for a
+        # BrokenProcessPool. A persistent NOGROUP must reach the backoff loop
+        # rather than spinning inside one cycle.
+        with patch(
+            "src.history_archive.ensure_outbox_group", new=AsyncMock()
+        ) as ensure:
+            with pytest.raises(aioredis.ResponseError, match="NOGROUP"):
+                with patch.object(
+                    fake_redis,
+                    "xreadgroup",
+                    AsyncMock(side_effect=aioredis.ResponseError("NOGROUP nope")),
+                ):
+                    await drainer._drain_once()
+        assert ensure.await_count == 1
+
+    async def test_other_response_errors_are_not_healed(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # Only NOGROUP is recoverable. Healing the class would paper over a
+        # WRONGTYPE — a pre-R1 list at the key — by pointlessly recreating a
+        # group that cannot exist.
+        with patch(
+            "src.history_archive.ensure_outbox_group", new=AsyncMock()
+        ) as ensure:
+            with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
+                with patch.object(
+                    fake_redis,
+                    "xreadgroup",
+                    AsyncMock(side_effect=aioredis.ResponseError("WRONGTYPE nope")),
+                ):
+                    await drainer._drain_once()
+        ensure.assert_not_awaited()
+
+
+class TestPelSweep:
+    async def test_first_cycle_sweeps(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        with patch(
+            "src.history_archive.reclaim_outbox_stale",
+            new=AsyncMock(return_value=(0, 0)),
+        ) as sweep:
+            await drainer._sweep_if_due()
+        sweep.assert_awaited_once()
+
+    async def test_second_cycle_within_the_interval_does_not(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # Everything the sweep catches is rare by construction and it costs an
+        # XAUTOCLAIM scan, so it must not ride every TICK_SECS.
+        with patch(
+            "src.history_archive.reclaim_outbox_stale",
+            new=AsyncMock(return_value=(0, 0)),
+        ) as sweep:
+            await drainer._sweep_if_due()
+            await drainer._sweep_if_due()
+        assert sweep.await_count == 1
+
+    async def test_a_sweep_failure_does_not_stop_the_drain(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # Housekeeping must never cost the drain. The entries it moves are the
+        # exception; the entries the drain moves are the whole point.
+        await _push(fake_redis, 1)
+        with patch(
+            "src.history_archive.reclaim_outbox_stale",
+            new=AsyncMock(side_effect=RuntimeError("xautoclaim exploded")),
+        ):
+            await drainer._sweep_if_due()
+        assert await drainer._drain_once() == 1
+        assert archive.inserted == [_entry(1)]
+
+    async def test_reclaimed_work_is_logged(
+        self,
+        fake_redis: Redis,
+        drainer: HistoryOutboxDrainer,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # _log_retry runs only on the failure path, so without this a healthy
+        # drainer reclaiming a stranded PEL leaves no trace at all. INFO, so
+        # caplog's default WARNING threshold has to be lowered.
+        caplog.set_level(logging.INFO)
+        with patch(
+            "src.history_archive.reclaim_outbox_stale",
+            new=AsyncMock(return_value=(3, 1)),
+        ):
+            await drainer._sweep_if_due()
+        assert "reclaimed 3" in caplog.text and "purged 1" in caplog.text
+
+    async def test_min_idle_exceeds_the_drain_deadline(self) -> None:
+        """INVARIANT, and the reason it moved rather than disappeared.
+
+        Under a shared consumer name "idle" is measured from last DELIVERY, so a
+        sweep whose min_idle_time is below the drain deadline reclaims a live
+        sibling's batch while it is still inserting. This is the same cross-file
+        coupling the deleted `DRAIN_DEADLINE_SECS < DRAINER_LEASE_MS` invariant
+        had: removing the lease did not remove the constraint.
+        """
+        assert (
+            HistoryOutboxDrainer.SWEEP_MIN_IDLE_MS
+            > HistoryOutboxDrainer.DRAIN_DEADLINE_SECS * 1000
+        )
+
+    async def test_sweep_reclaims_a_stranded_foreign_pel_end_to_end(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # The case the shared-name pending read cannot reach: entries left under
+        # a consumer name nothing live reads, which a deploy that renamed the
+        # consumer produces.
+        await _push(fake_redis, 1)
+        await fake_redis.xreadgroup(
+            HISTORY_OUTBOX_GROUP, "renamed-in-a-past-deploy", {HISTORY_OUTBOX_KEY: ">"}
+        )
+        assert await drainer._drain_once() == 0  # invisible to us
+        drainer.SWEEP_MIN_IDLE_MS = 0
+        await drainer._sweep_if_due()
+        assert await drainer._drain_once() == 1
+        assert archive.inserted == [_entry(1)]
+
+
+class TestSuccessPathDepthSampling:
+    async def test_a_healthy_but_deep_backlog_is_reported(
+        self,
+        fake_redis: Redis,
+        drainer: HistoryOutboxDrainer,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # _log_retry is the only other reader of depth and it runs exclusively
+        # in the except arm, so a drainer that is succeeding while falling
+        # behind used to report nothing at all.
+        monkeypatch.setattr(HistoryOutboxDrainer, "DEPTH_ALARM", 2)
+        await _push(fake_redis, 1, 2, 3)
+        await drainer._sample_depth()
+        assert any(
+            r.levelname == "ERROR" and "while the drain is SUCCEEDING" in r.message
+            for r in caplog.records
+        )
+
+    async def test_a_shallow_backlog_is_silent(
+        self,
+        fake_redis: Redis,
+        drainer: HistoryOutboxDrainer,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        await _push(fake_redis, 1)
+        await drainer._sample_depth()
+        assert caplog.records == []
+
+    async def test_a_redis_failure_here_is_swallowed(
+        self, fake_redis: Redis, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # A watchdog, not a metric: it must never be the thing that breaks the
+        # loop it is watching.
+        with patch.object(
+            fake_redis, "xlen", AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        ):
+            await drainer._sample_depth()  # must not raise
 
 
 class TestStopIdempotence:
@@ -1069,7 +1450,7 @@ class TestStopIdempotence:
         # calls == 2 is the loud failure signal for a second concurrent drain.
         assert archive.calls == 1
         assert len(archive.inserted) == 6
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_second_stop_is_a_noop(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
@@ -1095,7 +1476,7 @@ class TestOutboxCap:
         archive.fail = True
         with pytest.raises(RuntimeError):
             await drainer._drain_once()
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 5
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 5
 
     async def test_cap_drops_oldest_and_logs_an_error(
         self,
@@ -1110,12 +1491,13 @@ class TestOutboxCap:
         await _push(fake_redis, *range(8))  # 8 queued, batch of 2 drains first
         await drainer._drain_once()
         # 6 left, cap 3 → the 3 oldest remaining are dropped.
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
         assert "over cap" in caplog.text
         assert any(r.levelname == "ERROR" for r in caplog.records)
         # The dropped ones are the OLDEST: entries 2,3,4 go, 5,6,7 stay.
-        remaining = await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1)
-        assert remaining[-1] == serialize_history_entry(_entry(5))
+        assert await _outbox_wires(fake_redis) == [
+            serialize_history_entry(_entry(n)) for n in (5, 6, 7)
+        ]
 
     async def test_cap_is_enforced_while_postgres_is_down(
         self,
@@ -1138,7 +1520,7 @@ class TestOutboxCap:
             # Depth converges to the cap purely on failing cycles — nothing is
             # ever archived, so before the fix this stayed at 9 forever.
             async with asyncio.timeout(2):
-                while await fake_redis.llen(HISTORY_OUTBOX_KEY) != 3:
+                while await fake_redis.xlen(HISTORY_OUTBOX_KEY) != 3:
                     await asyncio.sleep(0.01)
             assert archive.batches == []
         finally:
@@ -1318,10 +1700,12 @@ class TestCloseNeverEscalates:
     ) -> None:
         """_on_task_done leaves _task pointing at the FAILED task while a
         respawn is pending, so awaiting it re-raises whatever killed it.
-        Catching only CancelledError let that escape stop(), which skipped both
-        the final drain and the lease release — the successor in a rolling
-        deploy then idled out the full 90s TTL instead of taking over."""
+        Catching only CancelledError let that escape stop(), which skipped the
+        final drain — every entry the departing process was holding then waited
+        for whenever something started again."""
         drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
 
         async def boom() -> None:
             raise RuntimeError("drainer blew up")
@@ -1330,12 +1714,12 @@ class TestCloseNeverEscalates:
         await asyncio.sleep(0)  # let it run and fail
         assert task.done() and not task.cancelled()
         drainer._task = task
-        await hold_drainer_lease(fake_redis, drainer._lease_id)
 
         await drainer.stop()  # must not raise
 
-        # The lease was still released, so a successor starts draining at once.
-        assert await fake_redis.get(DRAINER_LEASE_KEY) is None
+        # And the final drain still ran: catching only CancelledError let the
+        # task's own exception escape stop(), which skipped the flush entirely.
+        assert archive.inserted == [_entry(1)]
 
 
 class TestEnsureCloseRace:

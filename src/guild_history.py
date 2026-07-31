@@ -15,7 +15,7 @@ The at-rest wire format is owned by guild_state.py (HistoryEntry +
 serialize_history_entry/parse_history_entry); the store surface is
 push_history/get_history. This class never sees wire bytes.
 
-add() also LPUSHes every entry onto the global Postgres outbox — in the same
+add() also XADDs every entry onto the global Postgres outbox stream — in the same
 pipeline as the display-list push — and nudges the drainer
 (docs/POSTGRES_HISTORY_PLAN.md). The archive is a required tier, so that leg is
 unconditional. Postgres is never awaited on the WRITE path: the outbox/drainer

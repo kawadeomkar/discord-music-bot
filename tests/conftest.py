@@ -39,19 +39,32 @@ def pytest_collection_modifyitems(
     text both refuse. A tier that silently stops running is worse than one that
     was never wired up.
 
-    The env check mirrors test_pg_integration._PG_ENABLED; keep them in step.
+    The redis tier is here for the same reason and gets the same treatment:
+    its own invariants — that an exact trim actually trims, that WRONGTYPE is a
+    ResponseError, that XAUTOCLAIM's completion cursor is "0-0", that XINFO
+    GROUPS' lag goes nil — are ones fakeredis answers WRONGLY rather than not at
+    all, so a silently-skipped job leaves the suite asserting the fake's
+    behaviour and nothing else.
+
+    The env checks mirror test_pg_integration._PG_ENABLED and
+    test_redis_integration._REDIS_ENABLED; keep them in step.
     """
-    if config.option.markexpr != "pg":
+    enablers = {
+        "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
+        "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
+    }
+    tier = config.option.markexpr
+    if tier not in enablers:
         return
-    if os.getenv("RUN_PG_TESTS") or os.getenv("POSTGRES_TEST_URL"):
+    flag, url = enablers[tier]
+    if os.getenv(flag) or os.getenv(url):
         return
     print(
-        "\nERROR: `-m pg` selected but the tier is disabled, so every test "
-        "would skip.\n       Set RUN_PG_TESTS=1 (needs Docker) or "
-        "POSTGRES_TEST_URL.",
+        f"\nERROR: `-m {tier}` selected but the tier is disabled, so every test "
+        f"would skip.\n       Set {flag}=1 (needs Docker) or {url}.",
         file=sys.stderr,
     )
-    raise pytest.UsageError("pg tier selected but not enabled")
+    raise pytest.UsageError(f"{tier} tier selected but not enabled")
 
 
 @pytest.fixture(autouse=True)

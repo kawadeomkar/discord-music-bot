@@ -48,11 +48,18 @@ class TestSetupHook:
         """POSTGRES_URL is required — setup_hook raises without it. Every test
         in this class that isn't specifically about that refusal needs it set,
         and needs the archive/drainer stubbed so no real pool or task is
-        created. Tests that assert on the constructors re-patch them locally."""
+        created. Tests that assert on the constructors re-patch them locally.
+
+        ensure_outbox_group is stubbed for the same reason: `app.redis` here is
+        a MagicMock, so the real one would await a non-awaitable. Its own
+        behaviour — that it runs, that it runs BEFORE the drainer, and that a
+        WRONGTYPE aborts startup — is asserted in TestOutboxGroupBootstrap,
+        which re-patches it locally."""
         monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
         with (
             patch("src.main.PostgresHistoryArchive"),
             patch("src.main.HistoryOutboxDrainer"),
+            patch("src.main.ensure_outbox_group", new=AsyncMock()),
         ):
             yield
 

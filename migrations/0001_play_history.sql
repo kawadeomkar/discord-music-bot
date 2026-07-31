@@ -146,8 +146,29 @@ CREATE INDEX IF NOT EXISTS play_history_recent
 -- also what makes replay exact. Inspect with encode(payload, 'escape'), never
 -- convert_from(payload, 'UTF8') — that raises on invalid UTF-8.
 --
--- No index: the table is expected to hold zero rows and the only query is
--- ORDER BY rejected_at DESC LIMIT n.
+-- One index, and it is not for querying: the table is expected to hold zero
+-- rows and the only read is ORDER BY rejected_at DESC LIMIT n. It exists to
+-- make the INSERT idempotent.
+--
+-- Why that is needed: the outbox is a stream consumer group under a stable
+-- consumer name, so two drainers can replay the same pending entry, both fail
+-- it, and both land here. Under the drainer lease this path was exactly-once
+-- for free and nothing noticed the dependency. Duplicates matter here more than
+-- ordinary duplicated work do, because the entire diagnostic value of this
+-- table is that it is normally empty — `just db-rejects` printing three rows
+-- must mean three distinct failures, never one failure seen three times.
+--
+-- The key is "the same entry, failing the same way, in the same guild".
+-- payload IS the entry verbatim, so its digest identifies it exactly; a
+-- STORED generated column rather than a bare expression index so the constraint
+-- has a NAME for _REJECT_SQL's ON CONFLICT ON CONSTRAINT to reference, instead
+-- of the app restating the index expression and drifting from it. md5 is
+-- immutable over bytea, which is what a generated column requires — and it is
+-- being used as a content digest, not as a security primitive.
+--
+-- rejected_at is deliberately NOT in the key: the same entry failing again an
+-- hour later is the same defect, and a timestamp in the key would defeat the
+-- whole clause.
 CREATE TABLE IF NOT EXISTS play_history_rejected (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     rejected_at  timestamptz NOT NULL DEFAULT now(),
@@ -155,5 +176,9 @@ CREATE TABLE IF NOT EXISTS play_history_rejected (
     error_type   text        NOT NULL DEFAULT '',
     error_detail text        NOT NULL DEFAULT '',
     trace_id     text        NOT NULL DEFAULT '',
-    payload      bytea       NOT NULL
+    payload      bytea       NOT NULL,
+    payload_md5  text        GENERATED ALWAYS AS (md5(payload)) STORED,
+
+    CONSTRAINT play_history_rejected_dedup
+        UNIQUE (guild_id, error_type, payload_md5)
 );

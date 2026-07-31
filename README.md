@@ -274,7 +274,7 @@ The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
 | `just test` | pytest with coverage | ~13s |
 | `just check` | `fmt-check` + `lint` + `types` + `test` — **run this before pushing** | ~24s |
 | `just container-test` | Build the test image and run the suite inside it | ~1min |
-| `just ci` | `check` + `container-test` — full local mirror of CI | ~1.5min |
+| `just ci` | `check` + `container-test` + `test-pg` + `test-redis` — full local mirror of CI | ~2min |
 
 `just test` forwards extra arguments to pytest:
 
@@ -440,6 +440,12 @@ history list, and to a global **outbox** the background drainer moves into Postg
 The playback loop never waits on Postgres — an unreachable database just means the
 outbox grows and drains later.
 
+The outbox is a Redis **stream** with a consumer group, not a list. That is what makes
+running two bot processes against one Redis safe: the server hands each drainer a
+disjoint set of entries, and each settles only the IDs it actually archived. Overlap
+costs duplicated work, which the archive's unique index collapses; it cannot destroy a
+play that was never inserted.
+
 ### Schema
 
 ```bash
@@ -456,19 +462,27 @@ warning — migrations are additive, so rolling the bot back must not become an 
 The outbox is deliberately **not** evictable (Redis runs `volatile-lru`, and the
 outbox key carries no TTL): an entry in it is a play that is not durable yet. Normally
 it is empty within seconds. It only grows while Postgres is unreachable, at a measured
-**≈ 410 B per entry** (`MEMORY USAGE` on real Redis, for an entry with a full title,
-a YouTube URL, a thumbnail URL and a snowflake requester):
+**≈ 487 B per entry** — `MEMORY USAGE ... SAMPLES 0` against the bundled
+`redis:7-alpine` (7.4.9) at 100 000 entries, for a 420-byte wire payload with a full
+title, a YouTube URL, a thumbnail URL and snowflake ids:
 
 | Backlog | Redis memory |
 |---|---|
-| 10 000 entries | ≈ 4 MB |
-| 100 000 entries | ≈ 41 MB |
-| 1 000 000 entries | ≈ 410 MB |
+| 10 000 entries | ≈ 5 MB |
+| 100 000 entries | ≈ 49 MB |
+| 1 000 000 entries | ≈ 487 MB |
 
-**The bundled Compose Redis runs `--maxmemory 256mb`**, and that budget is shared with
-every guild's state, queue mirror and the `ytdl:*`/`spotify:*` caches — so the practical
-outbox ceiling there is a few hundred thousand entries, not a million. Past it, Redis has
-nothing evictable left (the outbox and DLQ carry no TTL by design) and starts refusing
+Measure on the server you actually run. These figures were previously quoted as
+≈ 410 B/entry, which was correct — for Redis 8, where the same payload costs 424 B. The
+stream encoding is ~12% heavier on the 7.x line the bundled image tracks (433 B/entry as
+a plain list there), so a horizon derived from the wrong major is optimistic by about a
+fifth.
+
+**The bundled Compose Redis runs `--maxmemory 256mb`**, which is ≈ 525 000 outbox
+entries on its own, and that budget is shared with every guild's state, queue mirror and
+the `ytdl:*`/`spotify:*` caches — so the practical ceiling is a few hundred thousand,
+not a million. Past it, Redis has nothing evictable left (the outbox carries no TTL by
+design) and starts refusing
 **every** write in the process, not just history's. Either raise `maxmemory` for the
 backlog you want to survive, or set `HISTORY_OUTBOX_MAX` and accept the loss. A backlog
 past 10 000 escalates the drainer's
@@ -484,6 +498,38 @@ than letting one bad row block the batch) are parked, never deleted:
 ```bash
 just db-rejects            # list rows Postgres refused; expected to print nothing
 ```
+
+Each row is page-worthy: `HistoryEntry` clamps every field into the column domain at
+construction, so a refusal means that validator regressed or the build is talking to a
+schema it was not written for. Counts are exact — the insert dedups on
+`(guild_id, error_type, digest of payload)`, so three rows means three distinct
+failures, not one seen three times.
+
+### Inspecting or resetting the outbox
+
+```bash
+redis-cli XLEN history:outbox                        # entries not yet in Postgres
+redis-cli XPENDING history:outbox drainers           # of those, how many are in flight
+redis-cli XINFO GROUPS history:outbox                # consumers, last-delivered id
+```
+
+`XLEN` is the backlog gauge. Prefer it to `XINFO GROUPS`' `lag`, which Redis returns as
+nil whenever a deletion leaves a gap it cannot reconcile — including after a manual
+`XDEL` — so it can go blank exactly when you are looking at it.
+
+**Resetting it destroys plays, and there is one safe way to do it:**
+
+```bash
+docker compose stop bot
+redis-cli DEL history:outbox
+docker compose start bot
+```
+
+Stop the bot first. `DEL` removes the consumer group along with the key, and the next
+`XADD` recreates the key *without* one — every read then fails `NOGROUP`. The drainer
+heals that on its next tick, so doing it live is recoverable rather than fatal, but the
+window costs whatever the drainer was mid-batch on. Never `DEL` this key to "clear a
+backlog": every entry in it is a play that is not in Postgres yet.
 
 ### Growth and retention
 

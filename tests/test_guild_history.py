@@ -16,6 +16,7 @@ from src.guild_state import HistoryEntry
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_KEY,
+    OUTBOX_FIELD,
     GuildRedisStore,
 )
 
@@ -121,7 +122,16 @@ class TestAddOutboxRouting:
     ) -> None:
         h = _history(store)
         await h.add(_entry(1))
-        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
+        # XRANGE, not LRANGE: the outbox is a stream. Asserting the payload
+        # under OUTBOX_FIELD rather than just the entry count is what keeps
+        # this honest about the wire format the drainer reads back.
+        # The cast narrows redis-py's XRANGE union, which is wide enough to
+        # cover XAUTOCLAIM's 4-tuple rows and the RESP3 dict form.
+        entries = cast(
+            list[tuple[bytes, dict[bytes, bytes]]],
+            await fake_redis.xrange(HISTORY_OUTBOX_KEY),
+        )
+        assert [fields[OUTBOX_FIELD] for _id, fields in entries] == [
             _entry(1).to_redis()
         ]
         # The display legs carry the same entry, from the same pipeline.

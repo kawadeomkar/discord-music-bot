@@ -2,7 +2,7 @@
 
 import ast
 import inspect
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import orjson
@@ -23,26 +23,29 @@ from src.guild_state import (
     SongQueueEntry,
 )
 from tests.helpers import mocked
-from src import redis_client
 from src.redis_client import (
-    DRAINER_LEASE_KEY,
-    DRAINER_LEASE_MS,
     HISTORY_CACHE_LIMIT,
+    HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
+    OUTBOX_FIELD,
     GuildRedisStore,
+    ack_outbox,
     cache_get,
     cache_set,
     close_redis_pool,
     create_redis_pool,
+    ensure_outbox_group,
     get_redis,
-    hold_drainer_lease,
     outbox_depth,
-    peek_outbox_oldest,
-    release_drainer_lease,
+    outbox_pending_below,
+    outbox_pending_count,
+    read_outbox_new,
+    read_outbox_pending,
+    reclaim_outbox_stale,
     retire_outbox,
     spotify_token_get_with_ttl,
     spotify_token_set,
-    trim_outbox_oldest,
+    trim_outbox_below,
 )
 
 # ── Connection lifecycle ──────────────────────────────────────────────────────
@@ -411,20 +414,22 @@ class TestPushHistoryOutbox:
         # Unconditional: the archive is a required tier, so there is always a
         # drainer behind the outbox and no shape of push_history that skips it.
         await store.push_history(_hentry(1))
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 1
 
-    async def test_outbox_gets_same_wire_bytes(
+    async def test_outbox_gets_same_wire_bytes_under_the_agreed_field(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
+        # The field name is a contract between push_history and the drainer's
+        # reader. Asserting the payload by name rather than by "the only value
+        # in the dict" is what makes a rename fail here instead of at runtime.
         await store.push_history(_hentry(1))
-        assert await fake_redis.lrange(HISTORY_OUTBOX_KEY, 0, -1) == [
-            _hentry(1).to_redis()
-        ]
+        entries = await _stream_entries(fake_redis)
+        assert [f[OUTBOX_FIELD] for _id, f in entries] == [_hentry(1).to_redis()]
 
     async def test_display_leg_unchanged_by_outbox_flag(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
-        # Phase A: the display list still gets the entry, untrimmed, PERSISTed.
+        # The display list still gets the entry, untrimmed, PERSISTed.
         await store.push_history(_hentry(1))
         assert await fake_redis.lrange(store.history_key(), 0, -1) == [
             _hentry(1).to_redis()
@@ -439,228 +444,635 @@ class TestPushHistoryOutbox:
         b = GuildRedisStore(fake_redis, guild_id=2)
         await a.push_history(_hentry(1))
         await b.push_history(_hentry(2))
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 2
 
     async def test_outbox_key_has_no_ttl(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
         # Not-yet-durable entries must never be eviction candidates under
-        # volatile-lru — the same property that protects history today.
+        # volatile-lru — the same property that protects history today, and it
+        # survives the list→stream change unchanged (golden rule 12).
         await store.push_history(_hentry(1))
         assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        # The producer stays on the SWALLOWING side of golden rule 5, unlike
+        # every drain helper below. The playback loop must not die because
+        # Redis blinked.
         await broken_store.push_history(_hentry(1))  # must not raise
 
 
-class TestOutboxDrainHelpers:
-    async def _push(self, fake_redis: Redis, *ns: int) -> None:
-        store = GuildRedisStore(fake_redis, guild_id=42)
-        for n in ns:
-            await store.push_history(_hentry(n))
+async def _push(fake_redis: Redis, *ns: int) -> None:
+    store = GuildRedisStore(fake_redis, guild_id=42)
+    for n in ns:
+        await store.push_history(_hentry(n))
 
-    async def test_peek_returns_oldest_first(self, fake_redis: Redis) -> None:
-        await self._push(fake_redis, 1, 2, 3)
-        raw = await peek_outbox_oldest(fake_redis, 10)
-        assert raw == [
+
+async def _stream_entries(fake_redis: Redis) -> list[tuple[bytes, dict[bytes, bytes]]]:
+    """The outbox stream, oldest first, narrowed to the ordinary-entry shape.
+
+    redis-py types XRANGE's reply as a union wide enough to cover XAUTOCLAIM's
+    4-tuple rows and RESP3 dict forms, so every unpack would otherwise need its
+    own ignore. One cast here says "one stream, ordinary entries" once.
+    """
+    return cast(
+        list[tuple[bytes, dict[bytes, bytes]]],
+        await fake_redis.xrange(HISTORY_OUTBOX_KEY),
+    )
+
+
+async def _stream_ids(fake_redis: Redis) -> list[bytes]:
+    return [i for i, _ in await _stream_entries(fake_redis)]
+
+
+class TestEnsureOutboxGroup:
+    async def test_creates_the_group_and_the_key(self, fake_redis: Redis) -> None:
+        await ensure_outbox_group(fake_redis)
+        groups = await fake_redis.xinfo_groups(HISTORY_OUTBOX_KEY)
+        assert [g["name"] for g in groups] == [HISTORY_OUTBOX_GROUP.encode()]
+
+    async def test_repeat_call_is_tolerated(self, fake_redis: Redis) -> None:
+        await ensure_outbox_group(fake_redis)
+        await ensure_outbox_group(fake_redis)  # BUSYGROUP, swallowed
+
+    async def test_group_sees_entries_that_predate_it(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: xgroup_create(id="0") → redis-py's default id="$".
+
+        "$" means "deliver only what arrives after this call", so a group
+        created after a crash — or after any window where push_history ran
+        before the bootstrap — would silently skip every entry already in the
+        stream. Those plays are never delivered, never inserted, and never
+        logged. The default is the wrong one, so this must be asserted rather
+        than assumed.
+        """
+        await _push(fake_redis, 1, 2)  # XADD auto-creates the key, no group
+        await ensure_outbox_group(fake_redis)
+        batch = await read_outbox_new(fake_redis, 10)
+        assert [e.wire for e in batch] == [
+            _hentry(1).to_redis(),
+            _hentry(2).to_redis(),
+        ]
+
+    async def test_repeat_call_does_not_rewind_an_existing_group(
+        self, fake_redis: Redis
+    ) -> None:
+        # Bootstrap runs at startup AND from the NOGROUP heal, so a repeat
+        # against a live group must not re-deliver everything already settled.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        await retire_outbox(fake_redis, [e.id for e in batch])
+        await ensure_outbox_group(fake_redis)
+        assert await read_outbox_new(fake_redis, 10) == []
+        assert await read_outbox_pending(fake_redis, 10) == []
+
+    async def test_wrongtype_propagates(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: `except ResponseError: pass` instead of a BUSYGROUP
+        check.
+
+        BUSYGROUP, WRONGTYPE and NOGROUP are all bare ResponseError — redis-py
+        has no subclass for any of them — so a class-level catch swallows the
+        two that mean "this bot cannot record history" along with the one that
+        means "already fine". A pre-R1 LIST at this key must abort startup: the
+        producer would otherwise fail its XADD leg silently (@_guild_op), take
+        guild:{id}:history down with it in the same transaction, and leave XLEN
+        raising so the backlog alarm could never fire either.
+        """
+        await fake_redis.lpush(HISTORY_OUTBOX_KEY, b"pre-R1 list entry")
+        with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
+            await ensure_outbox_group(fake_redis)
+
+
+class TestOutboxDrainHelpers:
+    async def test_new_read_returns_oldest_first(self, fake_redis: Redis) -> None:
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        batch = await read_outbox_new(fake_redis, 10)
+        assert [e.wire for e in batch] == [
             _hentry(1).to_redis(),
             _hentry(2).to_redis(),
             _hentry(3).to_redis(),
         ]
 
-    async def test_peek_caps_at_count_and_leaves_entries_in_place(
+    async def test_new_read_caps_at_count(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: dropping `count` from XREADGROUP.
+
+        Without it the whole backlog is delivered into the PEL in one read, and
+        the PEL's memory bound (BATCH_SIZE x readers) is what keeps a Postgres
+        outage from being paid for twice in Redis.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        batch = await read_outbox_new(fake_redis, 2)
+        assert [e.wire for e in batch] == [
+            _hentry(1).to_redis(),
+            _hentry(2).to_redis(),
+        ]
+        assert await outbox_pending_count(fake_redis) == 2
+
+    async def test_new_read_is_not_repeatable(self, fake_redis: Redis) -> None:
+        # `>` consumes: a second read gets nothing new, which is what makes two
+        # live drainers disjoint rather than duplicating.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        assert len(await read_outbox_new(fake_redis, 10)) == 2
+        assert await read_outbox_new(fake_redis, 10) == []
+
+    async def test_two_consumers_get_disjoint_entries(self, fake_redis: Redis) -> None:
+        # The server-side property the whole design rests on. Named consumers
+        # here rather than the module constant, because this asserts what Redis
+        # guarantees about a group, not what our code chose to call itself.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3, 4)
+
+        async def claim(consumer: str) -> set[bytes]:
+            reply = cast(
+                list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]],
+                await fake_redis.xreadgroup(
+                    HISTORY_OUTBOX_GROUP,
+                    consumer,
+                    {HISTORY_OUTBOX_KEY: ">"},
+                    count=2,
+                ),
+            )
+            return {i for i, _ in reply[0][1]}
+
+        ids_a = await claim("a")
+        ids_b = await claim("b")
+        assert ids_a and ids_b and not (ids_a & ids_b)
+
+    async def test_pending_read_replays_unacked_entries(
         self, fake_redis: Redis
     ) -> None:
-        await self._push(fake_redis, 1, 2, 3)
-        raw = await peek_outbox_oldest(fake_redis, 2)
-        assert raw == [_hentry(1).to_redis(), _hentry(2).to_redis()]
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3  # non-destructive
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        first = await read_outbox_new(fake_redis, 10)
+        replay = await read_outbox_pending(fake_redis, 10)
+        assert [e.id for e in replay] == [e.id for e in first]
+        assert [e.wire for e in replay] == [e.wire for e in first]
 
-    async def test_peek_empty_outbox(self, fake_redis: Redis) -> None:
-        assert await peek_outbox_oldest(fake_redis, 10) == []
-
-    async def test_retire_drops_oldest_only(self, fake_redis: Redis) -> None:
-        await self._push(fake_redis, 1, 2, 3)
-        await retire_outbox(fake_redis, 2)
-        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
-
-    async def test_retire_zero_is_noop(self, fake_redis: Redis) -> None:
-        await self._push(fake_redis, 1)
-        await retire_outbox(fake_redis, 0)
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
-
-    async def test_retire_never_touches_concurrent_head_pushes(
+    async def test_pending_read_inherits_a_dead_predecessors_batch(
         self, fake_redis: Redis
     ) -> None:
-        # A push landing between peek and retire goes to the HEAD; RPOP from
-        # the tail must retire only what was peeked.
-        await self._push(fake_redis, 1, 2)
-        peeked = await peek_outbox_oldest(fake_redis, 10)
-        await self._push(fake_redis, 3)  # concurrent new entry
-        await retire_outbox(fake_redis, len(peeked))
-        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
+        """MUTATION GUARD: a per-process consumer name (uuid4().hex).
+
+        The PEL belongs to the NAME, not the process. A process that dies
+        mid-batch leaves entries pending; its successor recovers them by reading
+        `0` under the SAME name — no lease, no TTL to wait out, no XAUTOCLAIM
+        needed for the ordinary case. With a random name per process the
+        successor's PEL is empty and the predecessor's is orphaned, so this
+        returns nothing and those plays wait for the periodic sweep instead.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        delivered = await read_outbox_new(fake_redis, 10)  # "predecessor" dies here
+        recovered = await read_outbox_pending(fake_redis, 10)  # fresh process
+        assert [e.wire for e in recovered] == [e.wire for e in delivered]
+
+    async def test_pending_read_is_empty_once_everything_is_settled(
+        self, fake_redis: Redis
+    ) -> None:
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        await retire_outbox(fake_redis, [e.id for e in batch])
+        assert await read_outbox_pending(fake_redis, 10) == []
+
+    async def test_reads_on_an_empty_outbox(self, fake_redis: Redis) -> None:
+        # The two empty replies have DIFFERENT shapes — `>` gives [] and `0`
+        # gives [[key, []]] — so both arms of the parser are exercised.
+        await ensure_outbox_group(fake_redis)
+        assert await read_outbox_new(fake_redis, 10) == []
+        assert await read_outbox_pending(fake_redis, 10) == []
+
+    async def test_retire_acks_and_deletes(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: dropping either half of retire_outbox.
+
+        Without XACK the entry stays pending and is redelivered forever, which
+        the archive's dedup index HIDES — every replay is a silent no-op insert,
+        so nothing looks wrong while the PEL grows. Without XDEL the body stays
+        in the stream forever, on a key golden rule 12 makes non-evictable.
+        Asserting XLEN alone would miss the first; asserting XPENDING alone
+        would miss the second.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        batch = await read_outbox_new(fake_redis, 10)
+        await retire_outbox(fake_redis, [e.id for e in batch[:2]])
+        assert await outbox_pending_count(fake_redis) == 1  # XACK ran
+        assert await outbox_depth(fake_redis) == 1  # XDEL ran
+
+    async def test_retire_settles_only_the_named_ids(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: acking only the first ID of the batch.
+
+        The positional retire this replaced meant "drop the oldest N"; the whole
+        point is that this one means "drop exactly these". A push landing
+        between the read and the retire must be untouched.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        await _push(fake_redis, 3)  # concurrent arrival, never delivered to us
+        await retire_outbox(fake_redis, [e.id for e in batch])
+        assert [e.wire for e in await read_outbox_new(fake_redis, 10)] == [
+            _hentry(3).to_redis()
+        ]
+
+    async def test_retire_is_idempotent(self, fake_redis: Redis) -> None:
+        # Re-send safety: this is why the drain path needs no special
+        # no-retry pool. XACK and XDEL both return 0 for an ID already settled.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        ids = [e.id for e in batch]
+        await retire_outbox(fake_redis, ids)
+        await retire_outbox(fake_redis, ids)  # must not raise or disturb anything
+        assert await outbox_depth(fake_redis) == 0
+        assert await outbox_pending_count(fake_redis) == 0
+
+    async def test_retire_of_nothing_is_a_noop(self, fake_redis: Redis) -> None:
+        # XACK/XDEL with zero IDs is a syntax error on real Redis, so the guard
+        # is load-bearing, not defensive.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        await retire_outbox(fake_redis, [])
+        assert await outbox_depth(fake_redis) == 1
+
+    async def test_retire_acks_before_it_deletes(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CONTROL + MUTATION GUARD: the XACK→XDEL order inside the MULTI.
+
+        A crash between the two is only safe in this order: XACK-then-crash
+        leaves an acked-but-undeleted entry, which is invisible to readers and
+        reclaimed by the MINID trim. XDEL-then-crash leaves a TOMBSTONE — an ID
+        pending with no body — which is unrecoverable. Order is asserted by
+        command sequence because both orders produce identical end state.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        seen: list[str] = []
+        real_execute = Pipeline.execute
+
+        async def recording_execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.extend(cmd[0] for cmd, _ in self.command_stack)
+            return await real_execute(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "execute", recording_execute)
+        await retire_outbox(fake_redis, [e.id for e in batch])
+        assert seen == ["XACK", "XDEL"]
+
+    async def test_retire_is_transactional(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Non-transactional, the ack and the delete can be split by a crash in
+        # EITHER direction, which reintroduces the tombstone window the ordering
+        # above exists to close.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        seen: list[bool] = []
+        real_execute = Pipeline.execute
+
+        async def recording_execute(self: Any, *args: Any, **kwargs: Any) -> Any:
+            seen.append(self.is_transaction)
+            return await real_execute(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "execute", recording_execute)
+        await retire_outbox(fake_redis, [e.id for e in batch])
+        assert seen == [True]
+
+    async def test_tombstone_reads_back_with_no_payload(
+        self, fake_redis: Redis
+    ) -> None:
+        """The P1 path: an entry delivered, then deleted while still pending.
+
+        XTRIM and any operator XDEL both produce this, because neither consults
+        the PEL. The reader must surface it as wire=None rather than raising —
+        a literal fields[b"e"] is a KeyError, which is neither a ResponseError
+        nor a parse failure, so it escapes every handler the drain path has and
+        replays the same entry every cycle forever.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        await fake_redis.xdel(HISTORY_OUTBOX_KEY, batch[0].id)  # body only
+        replay = await read_outbox_pending(fake_redis, 10)
+        assert [e.wire for e in replay] == [None, _hentry(2).to_redis()]
+        assert [e.id for e in replay] == [batch[0].id, batch[1].id]
+
+    async def test_a_tombstone_can_be_acked(self, fake_redis: Redis) -> None:
+        # Self-healing depends on this: the drainer acks tombstones
+        # unconditionally, so the PEL record must actually clear.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        batch = await read_outbox_new(fake_redis, 10)
+        await fake_redis.xdel(HISTORY_OUTBOX_KEY, batch[0].id)
+        await retire_outbox(fake_redis, [batch[0].id])
+        assert await outbox_pending_count(fake_redis) == 0
+        assert await read_outbox_pending(fake_redis, 10) == []
 
     async def test_depth(self, fake_redis: Redis) -> None:
         assert await outbox_depth(fake_redis) == 0
-        await self._push(fake_redis, 1, 2)
+        await _push(fake_redis, 1, 2)
         assert await outbox_depth(fake_redis) == 2
 
     async def test_helpers_raise_on_redis_error(self) -> None:
-        # Unlike the cache helpers, errors must PROPAGATE — the drainer's
-        # backoff loop is the handler, and a swallowed error would read as an
-        # empty outbox and silently stall the drain.
+        # Unlike the cache helpers and unlike push_history, errors must
+        # PROPAGATE — the drainer's backoff loop is the handler, and a
+        # swallowed error would read as an empty outbox and silently stall the
+        # drain. This is the "deliberately DO raise" half of golden rule 5, and
+        # R1 replaced every function that rule names, so the split is asserted
+        # rather than inherited.
+        boom = aioredis.ConnectionError("down")
+
+        class _DeadPipeline:
+            def xack(self, *a: Any, **k: Any) -> None: ...
+            def xdel(self, *a: Any, **k: Any) -> None: ...
+
+            async def execute(self) -> Any:
+                raise boom
+
+            async def __aenter__(self) -> "_DeadPipeline":
+                return self
+
+            async def __aexit__(self, *exc: Any) -> None:
+                return None
+
         dead = MagicMock()
-        dead.lrange = AsyncMock(side_effect=aioredis.ConnectionError("down"))
-        dead.rpop = AsyncMock(side_effect=aioredis.ConnectionError("down"))
-        dead.llen = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        for name in (
+            "xreadgroup",
+            "xlen",
+            "xpending",
+            "xtrim",
+            "xautoclaim",
+            "xgroup_create",
+        ):
+            setattr(dead, name, AsyncMock(side_effect=boom))
+        dead.pipeline = MagicMock(return_value=_DeadPipeline())
         with pytest.raises(aioredis.ConnectionError):
-            await peek_outbox_oldest(dead, 10)
+            await read_outbox_new(dead, 10)
         with pytest.raises(aioredis.ConnectionError):
-            await retire_outbox(dead, 1)
+            await read_outbox_pending(dead, 10)
+        with pytest.raises(aioredis.ConnectionError):
+            await retire_outbox(dead, [b"1-0"])
         with pytest.raises(aioredis.ConnectionError):
             await outbox_depth(dead)
+        with pytest.raises(aioredis.ConnectionError):
+            await outbox_pending_count(dead)
+        with pytest.raises(aioredis.ConnectionError):
+            await trim_outbox_below(dead, b"1-0")
+        with pytest.raises(aioredis.ConnectionError):
+            await ensure_outbox_group(dead)
 
-    async def test_trim_drops_oldest(self, fake_redis: Redis) -> None:
-        # The opt-in cap's mechanism. Same shape as retire, different meaning:
-        # these entries never reached Postgres.
-        await self._push(fake_redis, 1, 2, 3)
-        await trim_outbox_oldest(fake_redis, 2)
-        assert await peek_outbox_oldest(fake_redis, 10) == [_hentry(3).to_redis()]
 
-    async def test_trim_zero_is_noop(self, fake_redis: Redis) -> None:
-        await self._push(fake_redis, 1)
-        await trim_outbox_oldest(fake_redis, 0)
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 1
-
-    async def test_trim_pops_in_bounded_slices(
-        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+class TestOutboxPendingBelow:
+    async def test_lists_delivered_ids_older_than_the_cut(
+        self, fake_redis: Redis
     ) -> None:
-        """REGRESSION: one `RPOP key <count>` for the whole drop. RPOP with a
-        count returns what it popped, so at 490k entries the 206 MB / 5.3s
-        reply blew redis-py's default socket timeout and retry_on_timeout
-        re-issued the destructive pop — emptying a 500k outbox while logging
-        "dropped 490,000". Each command must stay bounded no matter how far
-        the backlog ran."""
-        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
-        await self._push(fake_redis, *range(1, 8))  # 7 entries
-        calls: list[int] = []
-        real_rpop = fake_redis.rpop
-
-        async def counting_rpop(name: str, count: int) -> Any:
-            calls.append(count)
-            return await real_rpop(name, count)
-
-        monkeypatch.setattr(fake_redis, "rpop", counting_rpop)
-        await trim_outbox_oldest(fake_redis, 5)
-        assert calls == [2, 2, 1]  # never one 5-wide pop
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 2
-        # And it dropped the OLDEST 5, leaving the two newest.
-        assert await peek_outbox_oldest(fake_redis, 10) == [
-            _hentry(6).to_redis(),
-            _hentry(7).to_redis(),
+        # The set a cap trim is about to destroy while a drainer holds it.
+        # Trimming those bodies without acking leaves tombstones.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3, 4)
+        batch = await read_outbox_new(fake_redis, 3)  # 1..3 delivered, 4 is not
+        cut = batch[2].id
+        assert await outbox_pending_below(fake_redis, cut) == [
+            batch[0].id,
+            batch[1].id,
         ]
 
-    async def test_trim_stops_when_the_outbox_empties_underneath_it(
+    async def test_the_cut_itself_is_excluded(self, fake_redis: Redis) -> None:
+        # MINID keeps entries >= its argument, so the entry AT the cut survives
+        # the trim and must not be acked. XPENDING's range is inclusive at both
+        # ends, which is exactly the off-by-one this guards.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        assert await outbox_pending_below(fake_redis, batch[0].id) == []
+
+    async def test_settled_entries_are_not_listed(self, fake_redis: Redis) -> None:
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        await retire_outbox(fake_redis, [batch[0].id])
+        assert await outbox_pending_below(fake_redis, batch[1].id) == []
+
+    async def test_undelivered_entries_are_not_listed(self, fake_redis: Redis) -> None:
+        # A trim that destroys never-delivered entries needs no ack — there is
+        # no PEL record to leave behind.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        ids = await _stream_ids(fake_redis)
+        assert await outbox_pending_below(fake_redis, ids[1]) == []
+
+    async def test_a_missing_group_lists_nothing(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A concurrent drain can retire the tail between slices; the loop must
-        # notice the short/empty reply rather than spinning on a gone key.
-        monkeypatch.setattr(redis_client, "_TRIM_SLICE", 2)
-        await self._push(fake_redis, 1, 2)
-        await trim_outbox_oldest(fake_redis, 1000)
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0
+        # An operator DEL racing the cap. With no group nothing is pending by
+        # definition, so there is nothing to ack — and the drain cycle's
+        # NOGROUP heal rebuilds it on the next tick.
+        monkeypatch.setattr(
+            fake_redis,
+            "xpending_range",
+            AsyncMock(side_effect=aioredis.ResponseError("NOGROUP gone")),
+        )
+        assert await outbox_pending_below(fake_redis, b"5-0") == []
 
-
-class TestDrainerLease:
-    async def test_acquire_then_renew_by_the_same_holder(
-        self, fake_redis: Redis
-    ) -> None:
-        assert await hold_drainer_lease(fake_redis, "a") is True
-        assert await hold_drainer_lease(fake_redis, "a") is True  # renew
-        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
-
-    async def test_second_holder_is_refused(self, fake_redis: Redis) -> None:
-        assert await hold_drainer_lease(fake_redis, "a") is True
-        assert await hold_drainer_lease(fake_redis, "b") is False
-        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
-
-    async def test_renew_extends_the_ttl(self, fake_redis: Redis) -> None:
-        await hold_drainer_lease(fake_redis, "a")
-        await fake_redis.pexpire(DRAINER_LEASE_KEY, 50)
-        assert await hold_drainer_lease(fake_redis, "a") is True
-        ttl = await fake_redis.pttl(DRAINER_LEASE_KEY)
-        assert ttl > DRAINER_LEASE_MS // 2
-
-    async def test_lapsed_lease_is_reacquirable_by_anyone(
-        self, fake_redis: Redis
-    ) -> None:
-        await hold_drainer_lease(fake_redis, "a")
-        await fake_redis.delete(DRAINER_LEASE_KEY)  # stand-in for expiry
-        assert await hold_drainer_lease(fake_redis, "b") is True
-
-    async def test_release_only_by_the_owner(self, fake_redis: Redis) -> None:
-        await hold_drainer_lease(fake_redis, "a")
-        await release_drainer_lease(fake_redis, "b")  # not ours
-        assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
-        await release_drainer_lease(fake_redis, "a")
-        assert await fake_redis.get(DRAINER_LEASE_KEY) is None
-
-    async def test_release_on_a_missing_lease_is_safe(self, fake_redis: Redis) -> None:
-        await release_drainer_lease(fake_redis, "a")
-
-    async def test_an_aborted_watch_is_retried_and_re_reads(
+    async def test_other_response_errors_propagate(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The WATCH-abort branch, forced.
+        monkeypatch.setattr(
+            fake_redis,
+            "xpending_range",
+            AsyncMock(side_effect=aioredis.ResponseError("WRONGTYPE nope")),
+        )
+        with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
+            await outbox_pending_below(fake_redis, b"5-0")
 
-        It cannot be reached naturally under fakeredis: measured against real
-        redis:7-alpine, TTL-expiry of a WATCHed key DOES abort EXEC, and under
-        fakeredis it does NOT. That divergence hid the one branch that makes
-        renewal safe — a drainer stalled past DRAINER_LEASE_MS whose lease
-        lapses between our GET and our EXEC. On real Redis the transaction
-        aborts and only the retry re-reads and reports the truth; without the
-        retry the caller is told it still owns a lease somebody else can now
-        take, which is the two-drainers state the lease exists to prevent.
+
+class TestAckOutbox:
+    async def test_clears_the_pel_without_deleting_the_body(
+        self, fake_redis: Redis
+    ) -> None:
+        """Deliberately NOT retire_outbox.
+
+        The cap removes bodies with a single MINID trim — one command however
+        large the backlog — so naming every doomed ID in an XDEL would
+        reintroduce the unbounded-command problem the list transport had. This
+        only has to clear the PEL records, and that set is bounded by
+        BATCH_SIZE x live drainers.
         """
-        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
-        calls = {"n": 0}
-        real_execute_transaction = Pipeline._execute_transaction
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        await ack_outbox(fake_redis, [e.id for e in batch])
+        assert await outbox_pending_count(fake_redis) == 0
+        assert await outbox_depth(fake_redis) == 2  # bodies still present
 
-        # Patched BELOW execute(), not over it: execute() ends in
-        # `finally: await self.reset()`, and that reset is exactly what lets the
-        # retry re-WATCH — without it the second lap dies on "Cannot issue a
-        # WATCH after a MULTI". Replacing execute() outright would skip it and
-        # test a pipeline redis-py never actually hands us.
-        async def aborting_transaction(self: Any, *args: Any, **kwargs: Any) -> Any:
-            calls["n"] += 1
-            if calls["n"] == 1:
-                # What real Redis does when the watched key changed under us —
-                # plus the lapse that made it change.
-                await fake_redis.delete(DRAINER_LEASE_KEY)
-                raise aioredis.WatchError("watched key changed")
-            return await real_execute_transaction(self, *args, **kwargs)
+    async def test_acking_nothing_is_a_noop(self, fake_redis: Redis) -> None:
+        # XACK with zero IDs is a syntax error on real Redis.
+        await ensure_outbox_group(fake_redis)
+        await ack_outbox(fake_redis, [])
 
-        monkeypatch.setattr(Pipeline, "_execute_transaction", aborting_transaction)
-        # Must NOT report continued ownership of a lease that is now gone.
-        assert await hold_drainer_lease(fake_redis, "a") is False
-        assert calls["n"] == 1  # retry short-circuited at the re-read, no 2nd EXEC
 
-    async def test_not_the_owner_releases_the_watch(
+class TestTrimOutboxBelow:
+    async def test_trims_strictly_below_the_id(self, fake_redis: Redis) -> None:
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        ids = await _stream_ids(fake_redis)
+        assert await trim_outbox_below(fake_redis, ids[2]) == 2
+        assert await _stream_ids(fake_redis) == [ids[2]]
+
+    async def test_returns_the_number_actually_destroyed(
+        self, fake_redis: Redis
+    ) -> None:
+        # The caller logs THIS, not a derived depth-minus-cap: XLEN over-counts
+        # acked-but-undeleted entries and the clamp may trim fewer than asked.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        ids = await _stream_ids(fake_redis)
+        assert await trim_outbox_below(fake_redis, ids[0]) == 0  # nothing older
+
+    async def test_is_idempotent(self, fake_redis: Redis) -> None:
+        """MUTATION GUARD: XTRIM MINID → XTRIM MAXLEN.
+
+        MINID names an absolute ID, so its effect is a function of its argument
+        and a re-send removes nothing. MAXLEN names a LENGTH, so a re-send after
+        concurrent XADDs destroys a second tranche of un-archived plays —
+        structurally the same destructive-retry defect the positional RPOP had.
+        The drain path runs on the pool with retries ENABLED, so this is not
+        hypothetical.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        ids = await _stream_ids(fake_redis)
+        assert await trim_outbox_below(fake_redis, ids[2]) == 2
+        await _push(fake_redis, 4, 5)  # concurrent arrivals, as after a blip
+        assert await trim_outbox_below(fake_redis, ids[2]) == 0  # re-send: no-op
+        assert await outbox_depth(fake_redis) == 3
+
+    async def test_passes_approximate_false(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Leaving a WATCH set on the connection would make the NEXT transaction
-        # on it abort for a key this call had no business watching.
-        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
-        unwatched = MagicMock()
-        real_unwatch = Pipeline.unwatch
+        """MUTATION GUARD: relying on redis-py's `approximate` default.
 
-        async def counting_unwatch(self: Any) -> Any:
-            unwatched()
-            return await real_unwatch(self)
+        The default is True, which trims to radix-node boundaries — on a small
+        stream that removes NOTHING while returning success. fakeredis models
+        approximate trimming as EXACT, so end-state assertions pass either way
+        and only the call itself can carry this. The same default sits on
+        xadd(maxlen=...).
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        seen: list[Any] = []
+        real_xtrim = fake_redis.xtrim
 
-        monkeypatch.setattr(Pipeline, "unwatch", counting_unwatch)
-        assert await hold_drainer_lease(fake_redis, "b") is False
-        unwatched.assert_called_once()
+        async def recording_xtrim(*args: Any, **kwargs: Any) -> Any:
+            seen.append(kwargs)
+            return await real_xtrim(*args, **kwargs)
+
+        monkeypatch.setattr(fake_redis, "xtrim", recording_xtrim)
+        await trim_outbox_below(fake_redis, b"9999999999999-0")
+        assert seen and seen[0].get("approximate") is False
+        assert "maxlen" not in seen[0]
+
+    async def test_trim_does_not_clear_the_pel(self, fake_redis: Redis) -> None:
+        """The reason outbox_trim_watermark exists at all.
+
+        XTRIM IS BLIND TO THE PEL. Deleting a delivered-but-unacked entry
+        destroys a play that a drainer is holding — no Postgres row, no
+        play_history_rejected row, no error naming it — and leaves the pending
+        record behind as a tombstone. This asserts the hazard itself, so that
+        the clamp is protecting against something demonstrated rather than
+        assumed.
+        """
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2, 3)
+        await read_outbox_new(fake_redis, 10)  # all three delivered, none acked
+        ids = await _stream_ids(fake_redis)
+        await trim_outbox_below(fake_redis, ids[2])
+        assert await outbox_depth(fake_redis) == 1  # bodies gone
+        assert await outbox_pending_count(fake_redis) == 3  # PEL untouched
+
+
+class TestReclaimOutboxStale:
+    async def test_purges_tombstones_from_the_pel(self, fake_redis: Redis) -> None:
+        # Besides XACK, this is the only thing that clears a tombstone on
+        # Redis 7 — which is why the sweep is not optional.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1, 2)
+        batch = await read_outbox_new(fake_redis, 10)
+        await fake_redis.xdel(HISTORY_OUTBOX_KEY, batch[0].id)
+        reclaimed, purged = await reclaim_outbox_stale(
+            fake_redis, min_idle_ms=0, count=10, max_passes=5
+        )
+        assert purged == 1
+        assert reclaimed == 1  # the surviving entry, claimed into our name
+
+    async def test_reclaims_a_foreign_consumers_pel(self, fake_redis: Redis) -> None:
+        # The case the shared-name pending read cannot reach: a consumer name
+        # nothing live reads, which a deploy that renamed it produces.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        await fake_redis.xreadgroup(
+            HISTORY_OUTBOX_GROUP, "some-old-name", {HISTORY_OUTBOX_KEY: ">"}, count=10
+        )
+        assert await read_outbox_pending(fake_redis, 10) == []  # not ours yet
+        reclaimed, _ = await reclaim_outbox_stale(
+            fake_redis, min_idle_ms=0, count=10, max_passes=5
+        )
+        assert reclaimed == 1
+        assert [e.wire for e in await read_outbox_pending(fake_redis, 10)] == [
+            _hentry(1).to_redis()
+        ]
+
+    async def test_min_idle_time_protects_a_live_siblings_batch(
+        self, fake_redis: Redis
+    ) -> None:
+        # Idle is measured from last DELIVERY under a shared name, so a sweep
+        # with too small a min_idle_time reclaims a peer mid-insert. The
+        # drainer's SWEEP_MIN_IDLE_MS is what keeps this from firing.
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, 1)
+        await fake_redis.xreadgroup(
+            HISTORY_OUTBOX_GROUP, "live-peer", {HISTORY_OUTBOX_KEY: ">"}, count=10
+        )
+        reclaimed, purged = await reclaim_outbox_stale(
+            fake_redis, min_idle_ms=600_000, count=10, max_passes=5
+        )
+        assert (reclaimed, purged) == (0, 0)
+
+    async def test_terminates_on_an_empty_sweep(self, fake_redis: Redis) -> None:
+        """The cursor loop must not depend on cursor == b"0-0" alone.
+
+        fakeredis returns the LAST-SCANNED id where real Redis returns "0-0",
+        so a cursor-only termination condition runs correctly in production and
+        spins forever here. Empty-pass termination works on both.
+        """
+        await ensure_outbox_group(fake_redis)
+        assert await reclaim_outbox_stale(
+            fake_redis, min_idle_ms=0, count=10, max_passes=5
+        ) == (0, 0)
+
+    async def test_max_passes_bounds_the_loop(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await ensure_outbox_group(fake_redis)
+        await _push(fake_redis, *range(1, 8))
+        calls = {"n": 0}
+        real_xautoclaim = fake_redis.xautoclaim
+
+        async def counting(*args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            return await real_xautoclaim(*args, **kwargs)
+
+        monkeypatch.setattr(fake_redis, "xautoclaim", counting)
+        await reclaim_outbox_stale(fake_redis, min_idle_ms=0, count=1, max_passes=3)
+        # Bounded above by max_passes; it may also stop early once a pass finds
+        # nothing new, which is the termination condition that works on both
+        # fakeredis' and real Redis' cursor conventions.
+        assert 0 < calls["n"] <= 3
 
 
 class TestPushHistoryAtomicity:
@@ -682,7 +1094,7 @@ class TestPushHistoryAtomicity:
 
         def spy_pipeline(*args: Any, **kwargs: Any) -> Any:
             pipe = real_pipeline(*args, **kwargs)
-            for name in ("lpush", "persist", "ltrim", "expire"):
+            for name in ("lpush", "persist", "xadd", "ltrim", "expire"):
                 original = getattr(pipe, name)
 
                 def record(
@@ -697,15 +1109,17 @@ class TestPushHistoryAtomicity:
         monkeypatch.setattr(fake_redis, "pipeline", spy_pipeline)
 
         async def record_direct(*a: Any, **k: Any) -> Any:
-            direct.append("lpush")
+            direct.append("direct")
 
         monkeypatch.setattr(fake_redis, "lpush", record_direct)
+        monkeypatch.setattr(fake_redis, "xadd", record_direct)
 
         store = GuildRedisStore(fake_redis, guild_id=1)
         await store.push_history(_hentry(1))
 
-        # Two LPUSHes (display + outbox), both on the pipeline, none direct.
-        assert queued.count("lpush") == 2
+        # Display LPUSH and outbox XADD, both on the pipeline, neither direct.
+        assert queued.count("lpush") == 1
+        assert queued.count("xadd") == 1
         assert direct == []
 
 

@@ -19,6 +19,7 @@ sanitizer's premises are validated only by inspection.
 import asyncio
 import itertools
 import os
+from dataclasses import replace
 from collections.abc import AsyncIterator, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
@@ -34,7 +35,11 @@ from src.history_archive import (
     PostgresHistoryArchive,
     SchemaVersionError,
 )
-from src.redis_client import HISTORY_OUTBOX_KEY, GuildRedisStore
+from src.redis_client import (
+    HISTORY_OUTBOX_KEY,
+    GuildRedisStore,
+    ensure_outbox_group,
+)
 
 # POSTGRES_TEST_URL enables the tier on its own, deliberately. If it only
 # *selected the provider* and RUN_PG_TESTS still had to be set as well, a CI job
@@ -662,6 +667,108 @@ class TestRejectsTable:
             await conn.close()
 
 
+class TestMessageIdColumn:
+    """message_id reaches Postgres.
+
+    It landed on the wire two branches before any INSERT carried it, and the
+    column's CHECK is `message_id >= 0` with `DEFAULT 0` — so a missed value
+    inserted cleanly and was permanently indistinguishable from a song that
+    genuinely had no Now Playing host. Nothing short of a real round trip
+    catches that: the fakeredis drainer tests never touch SQL.
+    """
+
+    async def test_a_snowflake_survives_the_round_trip(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        entry = _entry(1)
+        stamped = replace(entry, message_id=1418765432109876543)
+        await archive.insert_batch([stamped])
+        (got,) = await archive.recent(42, 10)
+        # bigint, and read back as a native int — a float route would round it.
+        assert got.message_id == 1418765432109876543
+
+    async def test_an_unstamped_entry_reads_back_as_zero(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch([_entry(2)])
+        (got,) = await archive.recent(42, 10)
+        assert got.message_id == 0
+
+
+class TestRejectionDedup:
+    """play_history_rejected must be exactly-once.
+
+    Under the drainer lease it was, for free — only one process could hold a
+    poisoned batch. A stable stream consumer name lets two drainers replay the
+    same pending entry, fail it identically, and both write here. The whole
+    diagnostic value of this table is that it is normally empty and every row
+    is page-worthy, so `just db-rejects` printing three rows must mean three
+    distinct failures rather than one seen three times.
+    """
+
+    async def test_the_same_refusal_recorded_twice_stores_one_row(
+        self, archive: PostgresHistoryArchive, pg_dsn: str
+    ) -> None:
+        entry = _entry(1)
+        error = asyncpg.exceptions.CheckViolationError("play_history_played_secs_valid")
+        await archive.record_rejection(entry, error, "trace-a")
+        await archive.record_rejection(entry, error, "trace-b")
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            assert (
+                await conn.fetchval("SELECT count(*) FROM play_history_rejected") == 1
+            )
+            # First writer wins, as ON CONFLICT DO NOTHING implies.
+            assert (
+                await conn.fetchval("SELECT trace_id FROM play_history_rejected")
+                == "trace-a"
+            )
+        finally:
+            await conn.close()
+
+    async def test_distinct_failures_are_still_distinct_rows(
+        self, archive: PostgresHistoryArchive, pg_dsn: str
+    ) -> None:
+        # The dedup key is (guild_id, error_type, digest of the payload), so a
+        # different entry, a different error class, or a different guild each
+        # remain separately visible. A key that collapsed those would hide real
+        # failures behind the first one reported.
+        entry = _entry(1)
+        check = asyncpg.exceptions.CheckViolationError("check")
+        await archive.record_rejection(entry, check, "t")
+        await archive.record_rejection(_entry(2), check, "t")  # other payload
+        await archive.record_rejection(
+            entry, asyncpg.exceptions.DataError("data"), "t"
+        )  # other error class
+        await archive.record_rejection(
+            _entry(1, guild_id=77), check, "t"
+        )  # other guild
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            assert (
+                await conn.fetchval("SELECT count(*) FROM play_history_rejected") == 4
+            )
+        finally:
+            await conn.close()
+
+    async def test_a_nul_bearing_payload_still_dedups(
+        self, archive: PostgresHistoryArchive, pg_dsn: str
+    ) -> None:
+        # The digest is md5(bytea), so it works on exactly the payloads text and
+        # jsonb refuse — which are the ones this table exists for.
+        entry = _entry(1, title="bad\x00title")
+        error = asyncpg.exceptions.DataError("nul")
+        await archive.record_rejection(entry, error, "t")
+        await archive.record_rejection(entry, error, "t")
+        conn = await asyncpg.connect(pg_dsn)
+        try:
+            assert (
+                await conn.fetchval("SELECT count(*) FROM play_history_rejected") == 1
+            )
+        finally:
+            await conn.close()
+
+
 class TestDrainerEndToEnd:
     """The full path a played song takes: GuildRedisStore.push_history →
     Redis outbox → drainer → Postgres. Every layer real except Discord."""
@@ -669,6 +776,7 @@ class TestDrainerEndToEnd:
     async def test_entries_reach_postgres_through_the_drainer(
         self, archive: PostgresHistoryArchive, fake_redis: object
     ) -> None:
+        await ensure_outbox_group(fake_redis)  # type: ignore[arg-type]
         store = GuildRedisStore(fake_redis, guild_id=42)  # type: ignore[arg-type]
         entries = [_entry(i) for i in range(3)]
         for entry in entries:
@@ -679,7 +787,7 @@ class TestDrainerEndToEnd:
         try:
             drainer.notify()
             async with asyncio.timeout(10):
-                while await fake_redis.llen(HISTORY_OUTBOX_KEY):  # type: ignore[attr-defined]
+                while await fake_redis.xlen(HISTORY_OUTBOX_KEY):  # type: ignore[attr-defined]
                     await asyncio.sleep(0.05)
         finally:
             await drainer.stop()
@@ -706,6 +814,7 @@ class TestDrainerEndToEnd:
         Postgres accepts (NUL in text, an out-of-range timestamptz), which is
         precisely what fakes cannot answer.
         """
+        await ensure_outbox_group(fake_redis)  # type: ignore[arg-type]
         store = GuildRedisStore(fake_redis, guild_id=42)  # type: ignore[arg-type]
         for entry in (
             _entry(1),
@@ -726,4 +835,4 @@ class TestDrainerEndToEnd:
         # on the unknown sentinel, exactly as __post_init__ promised.
         assert by_url["https://yt.com/v=2"].title == "badtitle"
         assert by_url["https://yt.com/v=4"].played_at == 0.0
-        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 0  # type: ignore[attr-defined]
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0  # type: ignore[attr-defined]

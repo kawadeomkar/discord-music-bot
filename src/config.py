@@ -60,6 +60,7 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
 PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
 PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
 
+
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     """Parse an integer knob from the environment, or raise a named error.
 
@@ -102,17 +103,24 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default)
 # means unbounded, which IS the durability contract: an entry only leaves the
 # outbox once Postgres has it. Operators who would rather lose the oldest
-# un-archived plays than let a long Postgres outage grow the non-evictable list
-# toward Redis' maxmemory can set a cap; the drainer logs every drop at ERROR.
+# un-archived plays than let a long Postgres outage grow the non-evictable
+# stream toward Redis' maxmemory can set a cap; the drainer logs every drop at
+# ERROR.
 # An outage is not the only thing that trips it: the cap is enforced on the
 # drain SUCCESS path too, evaluated after each 100-entry batch, so a healthy
 # drainer working through a burst backlog also trims — discarding rows the very
 # next cycle would have inserted milliseconds later. Set a cap well above
 # BATCH_SIZE x your peak burst, not just above steady-state depth.
-# Sizing: a played-song entry measures ~410 bytes on the wire (measured against
-# real Redis with MEMORY USAGE at 100k entries — 413.9 B/entry stored), so the
-# compose Redis' 256mb budget holds roughly 650k un-archived plays before the
-# non-evictable key becomes the thing that fills it.
+# The cap deliberately destroys entries a drainer is already holding, ACKing
+# them first so the trim cannot leave them replaying forever. It has to: during
+# an outage the drain re-reads the same pending batch every tick, so the OLDEST
+# entries are permanently in flight and a cap that refused to cross them would
+# never fire at all. See HistoryOutboxDrainer._enforce_cap.
+# Sizing: a played-song entry measures ~420 bytes on the wire and ~487 bytes
+# stored (MEMORY USAGE ... SAMPLES 0 against redis:7-alpine at 100k stream
+# entries), so the compose Redis' 256mb budget holds roughly 525k un-archived
+# plays before the non-evictable key becomes the thing that fills it. Redis 8
+# stores the same payload in ~424 bytes; measure on the major you deploy.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 
 # asyncpg's prepared-statement cache size, per connection. The default matches

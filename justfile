@@ -266,6 +266,16 @@ test-pg *ARGS: (_tools 'pytest')
     set -euo pipefail
     RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
 
+# Opt-in real-Redis tier (testcontainers; needs Docker)
+#
+# fakeredis executes every stream command the outbox uses and gets FIVE of them
+# wrong — all in the safe-looking direction, so the default suite stays green
+# while production breaks. See tests/test_redis_integration.py's docstring.
+test-redis *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_REDIS_TESTS=1 {{ PYTEST }} -m redis --no-cov --tb=short -q "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:
@@ -329,6 +339,28 @@ pins:
         fail=1
     fi
 
+    # Same rule for the redis tier, and this one carries live risk rather than
+    # theoretical: `redis:7-alpine` FLOATS (7.4.9 today), Dependabot runs the
+    # docker ecosystem at the repo root so it will bump the compose tag on its
+    # own, and a hardcoded test image left behind would have the suite asserting
+    # one server's behaviour while the bot runs another. That is not
+    # hypothetical here — a memory measurement of this very design was taken
+    # against the wrong major for exactly that reason.
+    py_redis="$(sed -n 's/^_REDIS_IMAGE = "\(.*\)"$/\1/p' tests/test_redis_integration.py)"
+    ci_redis="$(awk '/^  redis-integration:/{f=1} f && /image: redis:/{print $2; exit}' .github/workflows/ci.yml)"
+    if [ -z "$py_redis" ] || [ "$py_redis" != "$ci_redis" ]; then
+        echo "redis image drift: test_redis_integration.py=[$py_redis] ci.yml=[$ci_redis]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    compose_redis="$(awk '/^  redis:/{f=1} f && /image: redis:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$compose_redis" ] || [ "$compose_redis" != "$ci_redis" ]; then
+        echo "redis image drift: docker-compose.yml=[$compose_redis] ci.yml=[$ci_redis]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing
@@ -385,16 +417,17 @@ container-test: test-image-rebuild
 
 # Full local mirror of the CI workflow
 #
-# test-pg is here because CI's pg-integration job is a merge gate (`build`
-# needs it), so a green `ci` that skipped it would not mean what it says. It
-# needs Docker, which `container-test` already required of this recipe.
+# test-pg and test-redis are here because CI's pg-integration and
+# redis-integration jobs are merge gates (`build` needs both), so a green `ci`
+# that skipped them would not mean what it says. They need Docker, which
+# `container-test` already required of this recipe.
 #
 # [doc(...)] because `just --list` shows only the LAST comment line, so the
 # multi-line reasoning above would otherwise replace this recipe's description
 # with "needs Docker, which `container-test` already required of this recipe."
-[doc('Full local mirror of the CI workflow (check + container-test + test-pg)')]
+[doc('Full local mirror of CI (check + container-test + test-pg + test-redis)')]
 [group('check')]
-ci: check container-test test-pg
+ci: check container-test test-pg test-redis
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #

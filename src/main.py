@@ -9,7 +9,12 @@ from src import config
 from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
-from src.redis_client import close_redis_pool, create_redis_pool, get_redis
+from src.redis_client import (
+    close_redis_pool,
+    create_redis_pool,
+    ensure_outbox_group,
+    get_redis,
+)
 from src.util import get_logger
 
 if TYPE_CHECKING:
@@ -118,8 +123,8 @@ class MusicBotApp(commands.AutoShardedBot):
         self.redis = get_redis(self._redis_pool)
         # Fail fast rather than degrade. A bot that silently ran without the
         # archive would keep accepting plays while every song-end quietly
-        # LPUSHed onto an outbox nobody drains — the failure would surface
-        # days later as an un-evictable Redis list, not at the moment of
+        # XADDed onto an outbox nobody drains — the failure would surface
+        # days later as an un-evictable Redis stream, not at the moment of
         # misconfiguration.
         postgres_url = config.postgres_url()
         if not postgres_url:
@@ -133,6 +138,24 @@ class MusicBotApp(commands.AutoShardedBot):
                 "derives the URL from it. Otherwise export POSTGRES_URL yourself "
                 "(postgresql://user:password@host:5432/dbname)."
             )
+        # Create the outbox consumer group before anything can write to it. The
+        # SECOND fail-fast, and it has to be here rather than in the drainer,
+        # because the loud signal is only available at startup: push_history is
+        # a @_guild_op method, so a WRONGTYPE from a pre-R1 LIST at
+        # history:outbox would be swallowed into one warning per song while
+        # BOTH legs of its transaction — the outbox and guild:{id}:history —
+        # silently failed. XLEN would raise too, so the depth alarm could never
+        # fire either. Total history loss, reported as a warning.
+        #
+        # ensure_outbox_group tolerates only BUSYGROUP; WRONGTYPE propagates
+        # out of setup_hook exactly as the missing-POSTGRES_URL check above
+        # does. The remedy is `DEL history:outbox` with the bot stopped.
+        #
+        # Unlike Postgres, Redis must actually be reachable for this. That is
+        # not a new coupling: the pool above is already created here, and a bot
+        # that cannot reach Redis at startup has no persistence, no recovery and
+        # no outbox regardless.
+        await ensure_outbox_group(self.redis)
         # Lazy inside: no connection is made here, so startup never blocks on
         # Postgres — the drainer's backoff loop absorbs an unreachable database.
         # That is what keeps "required" from meaning "Postgres must be up before

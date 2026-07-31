@@ -188,6 +188,12 @@ markers = [
     # postgres:18-alpine via testcontainers locally, a service container in CI.
     # Nothing carries it yet — the tier arrives with the archive code.
     "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
+    # Integration tier against a real Redis, excluded from the default run:
+    # redis:7-alpine via testcontainers locally, a service container in CI.
+    # fakeredis executes every stream command the outbox uses but gets five of
+    # them wrong, all in the safe-looking direction — see the module docstring
+    # of tests/test_redis_integration.py.
+    "redis: real-Redis integration test (needs Docker, or REDIS_TEST_URL)",
 ]
 filterwarnings = [
     "error",
