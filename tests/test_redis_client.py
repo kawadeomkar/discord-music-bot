@@ -92,6 +92,35 @@ class TestCreateRedisPool:
         conn = create_redis_pool().make_connection()
         assert isinstance(conn.retry._backoff, ExponentialBackoff)
 
+    def test_outbox_pool_never_re_sends_a_command(self) -> None:
+        """The drainer's destructive pops ack by POSITION, not identity: a
+        re-sent `RPOP key 100` drops a DIFFERENT 100 entries, i.e. plays that
+        never reached Postgres, with no exception and no log line. Zero retries
+        is what makes the error reach the drainer's backoff loop instead, which
+        re-peeks and redelivers (at-least-once; the unique index dedups).
+
+        Asserted on a real Connection, not on kwargs, because redis-py merges
+        retry_on_error into the Retry object at construction — the same merge
+        step the sibling tests above exist to pin.
+        """
+        conn = create_redis_pool(retry_commands=False).make_connection()
+        assert conn.retry.get_retries() == 0
+
+    def test_outbox_pool_retries_nothing_via_timeout_either(self) -> None:
+        """retry_on_timeout=True appends TimeoutError/socket.timeout to
+        retry_on_error inside the Connection, so it has to follow the flag or
+        the no-retry pool would quietly retry timeouts."""
+        pool = create_redis_pool(retry_commands=False)
+        assert pool.connection_kwargs["retry_on_error"] == []
+        assert pool.connection_kwargs["retry_on_timeout"] is False
+
+    def test_default_pool_still_retries(self) -> None:
+        """The no-retry variant is opt-in and must not change the app-wide
+        pool: every store method logs-and-swallows, so losing retries there
+        degrades persistence silently rather than raising."""
+        assert create_redis_pool().make_connection().retry.get_retries() == 3
+        assert create_redis_pool().connection_kwargs["retry_on_timeout"] is True
+
 
 class TestGetRedis:
     def test_returns_redis_client(self) -> None:
@@ -433,6 +462,18 @@ class TestOutboxDrainHelpers:
     async def test_peek_empty_outbox(self, fake_redis: Redis) -> None:
         assert await peek_outbox_oldest(fake_redis, 10) == []
 
+    async def test_peek_zero_or_negative_returns_nothing(
+        self, fake_redis: Redis
+    ) -> None:
+        """REGRESSION: -0 == 0, so LRANGE -count..-1 became LRANGE 0..-1 and
+        handed back the ENTIRE outbox — the unbounded reply trim_outbox_oldest
+        documents at 206 MB / 5.3s for 490k entries, on the one key that grows
+        without limit while Postgres is down."""
+        await self._push(fake_redis, 1, 2, 3)
+        assert await peek_outbox_oldest(fake_redis, 0) == []
+        assert await peek_outbox_oldest(fake_redis, -1) == []
+        assert await fake_redis.llen(HISTORY_OUTBOX_KEY) == 3  # nothing consumed
+
     async def test_retire_drops_oldest_only(self, fake_redis: Redis) -> None:
         await self._push(fake_redis, 1, 2, 3)
         await retire_outbox(fake_redis, 2)
@@ -462,17 +503,37 @@ class TestOutboxDrainHelpers:
     async def test_helpers_raise_on_redis_error(self) -> None:
         # Unlike the cache helpers, errors must PROPAGATE — the drainer's
         # backoff loop is the handler, and a swallowed error would read as an
-        # empty outbox and silently stall the drain.
+        # empty outbox and silently stall the drain. Golden rule 5 names SIX
+        # helpers that owe this; all six are asserted here, because the two
+        # that report a bool are the dangerous ones to get wrong: a swallowed
+        # error in hold_drainer_lease returning False reads as "somebody else
+        # owns it", which is a permanent stall wearing the costume of a
+        # perfectly normal cycle.
         dead = MagicMock()
         dead.lrange = AsyncMock(side_effect=aioredis.ConnectionError("down"))
         dead.rpop = AsyncMock(side_effect=aioredis.ConnectionError("down"))
         dead.llen = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        dead.set = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        pipe = MagicMock()
+        pipe.watch = AsyncMock(side_effect=aioredis.ConnectionError("down"))
+        pipe.__aenter__ = AsyncMock(return_value=pipe)
+        # return_value=None, NOT a bare AsyncMock: a truthy __aexit__ SUPPRESSES
+        # the exception being asserted and the test passes for the wrong reason.
+        pipe.__aexit__ = AsyncMock(return_value=None)
+        dead.pipeline = MagicMock(return_value=pipe)
+
         with pytest.raises(aioredis.ConnectionError):
             await peek_outbox_oldest(dead, 10)
         with pytest.raises(aioredis.ConnectionError):
             await retire_outbox(dead, 1)
         with pytest.raises(aioredis.ConnectionError):
             await outbox_depth(dead)
+        with pytest.raises(aioredis.ConnectionError):
+            await trim_outbox_oldest(dead, 1)
+        with pytest.raises(aioredis.ConnectionError):
+            await hold_drainer_lease(dead, "a")
+        with pytest.raises(aioredis.ConnectionError):
+            await release_drainer_lease(dead, "a")
 
     async def test_trim_drops_oldest(self, fake_redis: Redis) -> None:
         # The opt-in cap's mechanism. Same shape as retire, different meaning:
@@ -538,6 +599,21 @@ class TestDrainerLease:
         assert await hold_drainer_lease(fake_redis, "b") is False
         assert await fake_redis.get(DRAINER_LEASE_KEY) == b"a"
 
+    async def test_fresh_acquire_sets_the_lease_ttl(self, fake_redis: Redis) -> None:
+        """The TTL on the FIRST acquire is the whole "a dead holder is
+        recoverable" guarantee: a process that dies mid-batch never releases,
+        so without an expiry it holds the lease forever, no survivor's SET NX
+        can ever succeed, the drain stops permanently and history:outbox —
+        non-evictable by golden rule 12 — grows without bound.
+
+        test_renew_extends_the_ttl cannot catch this: it pexpires by hand
+        before renewing, so it only proves the RENEW path sets a TTL. Dropping
+        `px=` from the acquire left the whole suite green.
+        """
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        ttl = await fake_redis.pttl(DRAINER_LEASE_KEY)
+        assert 0 < ttl <= DRAINER_LEASE_MS
+
     async def test_renew_extends_the_ttl(self, fake_redis: Redis) -> None:
         await hold_drainer_lease(fake_redis, "a")
         await fake_redis.pexpire(DRAINER_LEASE_KEY, 50)
@@ -598,6 +674,39 @@ class TestDrainerLease:
         # Must NOT report continued ownership of a lease that is now gone.
         assert await hold_drainer_lease(fake_redis, "a") is False
         assert calls["n"] == 1  # retry short-circuited at the re-read, no 2nd EXEC
+
+    async def test_an_aborted_watch_retries_and_renews_when_still_owner(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sibling above proves the abort is OBSERVED; this proves it is
+        RETRIED, and it is the only shape that can tell those apart.
+
+        There, the key is deleted inside the forced abort, so `continue` and
+        `return False` produce identical observations — False, one EXEC — and
+        swapping the retry for a give-up left the suite green. Here the watched
+        key is UNTOUCHED, so the only way to reach a renewed lease and True is
+        to take a second lap.
+        """
+        await fake_redis.set(DRAINER_LEASE_KEY, "a", px=DRAINER_LEASE_MS)
+        # Knock the TTL down so a renewal back to DRAINER_LEASE_MS is visible.
+        # 5s, not the sibling's 50ms: this test survives an abort and a second
+        # lap first, and an expiry mid-retry would fail it for the wrong reason.
+        await fake_redis.pexpire(DRAINER_LEASE_KEY, 5_000)
+        calls = {"n": 0}
+        real_execute_transaction = Pipeline._execute_transaction
+
+        async def aborting_transaction(self: Any, *args: Any, **kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # A transient abort: unlike the sibling, the watched key does
+                # NOT change, so the re-read finds us still the owner.
+                raise aioredis.WatchError("watched key changed")
+            return await real_execute_transaction(self, *args, **kwargs)
+
+        monkeypatch.setattr(Pipeline, "_execute_transaction", aborting_transaction)
+        assert await hold_drainer_lease(fake_redis, "a") is True
+        assert calls["n"] == 2  # the retry actually re-executed
+        assert await fake_redis.pttl(DRAINER_LEASE_KEY) > DRAINER_LEASE_MS // 2
 
     async def test_not_the_owner_releases_the_watch(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch

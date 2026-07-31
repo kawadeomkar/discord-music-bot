@@ -8,7 +8,7 @@ from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
-from redis.backoff import ExponentialBackoff
+from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
@@ -100,15 +100,34 @@ def _hset_mapping(mapping: dict[str, str]) -> Mapping[FieldT, EncodableT]:
 # ── Connection lifecycle ──────────────────────────────────────────────────────
 
 
-def create_redis_pool() -> aioredis.ConnectionPool:
-    """Create the application-wide connection pool. Call once at startup."""
+def create_redis_pool(*, retry_commands: bool = True) -> aioredis.ConnectionPool:
+    """Create a connection pool. Call once at startup for the app-wide pool.
+
+    `retry_commands=False` builds the variant the outbox drainer MUST use for
+    its destructive pops. redis-py's retry re-SENDS the identical command, and
+    RPOP is not idempotent: if Redis executes `RPOP history:outbox 100` and the
+    connection drops before the reply is read, the retry pops a DIFFERENT 100
+    entries — plays that never reached Postgres, lost with no exception, no
+    play_history_rejected row and no log line. That is golden rule 12's failure
+    mode reached without any eviction, so retries stop at the outbox boundary:
+    the error surfaces to the drainer's backoff loop (their documented handler,
+    golden rule 5), which re-peeks and redelivers, and the archive's unique
+    index collapses the replay. At-least-once is already the contract.
+
+    It has to be a second pool rather than a per-call override: retry config
+    lives on the CONNECTION, and redis-py ignores a client-level `retry=` when
+    an existing pool is passed.
+    """
     return aioredis.ConnectionPool.from_url(
         os.getenv("REDIS_URL", "redis://localhost:6379"),
         max_connections=20,
         decode_responses=False,
         socket_keepalive=True,
         health_check_interval=30,
-        retry_on_timeout=True,
+        # Appends TimeoutError/socket.timeout to retry_on_error inside the
+        # Connection, so it has to follow retry_commands too or the no-retry
+        # pool would still retry timeouts.
+        retry_on_timeout=retry_commands,
         # redis-py's OWN exception classes, not the builtins of the same name.
         # `redis.exceptions.ConnectionError` does not subclass builtins.ConnectionError
         # (it derives from RedisError), so listing the builtin here matched nothing
@@ -119,13 +138,19 @@ def create_redis_pool() -> aioredis.ConnectionPool:
         #
         # (The builtin TimeoutError was harmless but redundant: retry_on_timeout=True
         # already appends socket.timeout, which IS builtins.TimeoutError on 3.10+.)
-        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        retry_on_error=[RedisConnectionError, RedisTimeoutError]
+        if retry_commands
+        else [],
         # Without an explicit Retry, redis-py synthesises `Retry(NoBackoff(), 1)` for a
         # non-empty retry_on_error: one immediate reattempt, no backoff. A restarting
         # Redis is usually gone for longer than that, and a hammering reconnect is what
         # backoff exists to avoid. 3 attempts over ExponentialBackoff's default 8ms→512ms
         # ceiling covers an ordinary restart without stalling a command for long.
-        retry=Retry(ExponentialBackoff(), 3),
+        # Retry(NoBackoff(), 0) is redis-py's own spelling of "never retry" (it is what
+        # Connection installs when no retry is configured at all).
+        retry=Retry(ExponentialBackoff(), 3)
+        if retry_commands
+        else Retry(NoBackoff(), 0),
         socket_connect_timeout=5,
     )
 
@@ -254,6 +279,15 @@ async def peek_outbox_oldest(redis: aioredis.Redis, count: int) -> list[bytes]:
     LPUSH writes at the head, so the tail slice LRANGE -count..-1 is the
     oldest run; Redis returns it in list order (newer→older), hence the
     reversal."""
+    if count <= 0:
+        # -0 == 0 in Python, so an unguarded LRANGE -count..-1 degenerates to
+        # LRANGE 0..-1 — the WHOLE outbox in one reply, which is exactly the
+        # unbounded read trim_outbox_oldest below measures at 206 MB / 5.3s for
+        # 490k entries. Reachable from any caller computing a count
+        # (min(BATCH_SIZE, remaining), a max(0, ...) clamp, a config read of 0),
+        # so it is guarded here rather than trusted to every call site. Both
+        # siblings guard their counts too.
+        return []
     # cast, not a bare annotation: decode_responses=False on the pool, so the
     # list is bytes — same convention as the HGETALL readers below.
     raw = cast(list[bytes], await redis.lrange(HISTORY_OUTBOX_KEY, -count, -1))
@@ -265,7 +299,11 @@ async def retire_outbox(redis: aioredis.Redis, count: int) -> None:
     """Drop the oldest `count` entries — call only after their Postgres
     INSERT committed (crash between insert and retire redelivers; the
     archive's unique index dedups). RPOP pops from the tail (oldest), so
-    concurrent LPUSHes at the head are never touched."""
+    concurrent LPUSHes at the head are never touched.
+
+    MUST run on a `create_redis_pool(retry_commands=False)` client: this pop
+    acks by POSITION, not by identity, so a re-sent RPOP drops entries that
+    were never archived. See that function for the full reasoning."""
     if count > 0:
         await redis.rpop(HISTORY_OUTBOX_KEY, count)
 
@@ -281,18 +319,23 @@ async def trim_outbox_oldest(redis: aioredis.Redis, count: int) -> None:
     retire_outbox; a separate name so `grep retire_outbox` still means
     "entries that reached Postgres" and this one always reads as data loss.
 
-    Popped in _TRIM_SLICE-sized slices, NOT as one `RPOP key <count>`. Unlike
-    retire_outbox — whose count is bounded by BATCH_SIZE at its only call
-    site — this count is `depth - HISTORY_OUTBOX_MAX`, i.e. however far a
-    Postgres outage ran. RPOP with a count *returns what it popped*, so a
-    single call carries the whole dropped set back over the socket: measured
-    5.3s and 206 MB for 490k entries. That is bad twice over. Redis is
-    single-threaded, so it head-of-line-blocks every other guild for the
-    duration (a concurrent `SET guild:state` measured 1.46s), and it exceeds
-    redis-py's default 5s socket timeout, whereupon retry_on_timeout re-issues
-    this DESTRUCTIVE pop against a list Redis has already popped — silently
-    emptying a 500k outbox while logging "dropped 490,000". Slicing keeps each
-    reply small and each command short regardless of how large the backlog got.
+    Same no-retry client contract as retire_outbox, and for the same reason:
+    a re-sent destructive pop drops entries nobody accounted for.
+
+    Popped in _TRIM_SLICE-sized slices, NOT as one `RPOP key <count>`. This
+    count is `depth - HISTORY_OUTBOX_MAX`, i.e. however far a Postgres outage
+    ran, so it is unbounded in a way a drain batch is not. RPOP with a count
+    *returns what it popped*, so a single call carries the whole dropped set
+    back over the socket: measured 5.3s and 206 MB for 490k entries. Redis is
+    single-threaded, so that head-of-line-blocks every other guild for the
+    duration (a concurrent `SET guild:state` measured 1.46s). Slicing keeps
+    each reply small and each command short regardless of backlog size.
+
+    (An earlier version of this comment blamed "redis-py's default 5s socket
+    timeout" for re-issuing the pop. There is no such default — socket_timeout
+    defaults to None and this pool never sets one. The re-issue hazard is real
+    but its trigger is a dropped connection, and it is handled by the no-retry
+    pool above, not by slicing. The blocking argument here stands on its own.)
     """
     while count > 0:
         popped = await redis.rpop(HISTORY_OUTBOX_KEY, min(count, _TRIM_SLICE))
