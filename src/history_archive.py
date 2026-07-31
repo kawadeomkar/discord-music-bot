@@ -182,13 +182,24 @@ def quantized_played_at(played_at: float) -> float:
     Total by construction. HistoryEntry.__post_init__ already clamps played_at
     into the timestamptz domain, so the guard below is unreachable through any
     entry — but this takes a bare float, and it runs on the -history read path,
-    which must degrade rather than error. All THREE caught types are things
-    fromtimestamp actually raises, and the third is not padding: ValueError for
-    NaN and for years outside 1..9999, OverflowError for values past platform
-    time_t, and OSError because macOS raises `[Errno 84] Invalid or incomplete
-    multibyte or wide character` for far-future epochs where Linux raises
-    ValueError. Catching what the conversion raises on every platform this runs
-    on is more honest than re-deriving the bound.
+    which must degrade rather than error.
+
+    All THREE caught types are things fromtimestamp actually raises, and the
+    OSError is NOT a platform quirk to be tidied away — it is the arm that fires
+    on Linux, i.e. in production. Measured, same input each time:
+
+        fromtimestamp(1e18)            macOS  OSError [Errno 84]
+                                       Linux  OSError [Errno 75]
+        fromtimestamp(253402300800.0)  both   ValueError (year 10000)
+        fromtimestamp(1e300)           both   OverflowError (past time_t)
+
+    So the split is by MAGNITUDE, not by platform: years outside 1..9999 raise
+    ValueError, values past platform time_t raise OverflowError, and the wide
+    band between them raises OSError with a per-platform errno (84 on macOS, 75
+    on Linux — both meaning "value too large", neither being EILSEQ, which is 92
+    on macOS). An earlier version of this comment reported the OSError as a
+    macOS accommodation quoting Linux's strerror text for 84, which would have
+    invited deleting the one arm that Linux needs.
     """
     try:
         return datetime.fromtimestamp(played_at, tz=timezone.utc).timestamp()

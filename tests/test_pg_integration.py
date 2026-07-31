@@ -35,6 +35,7 @@ from src.history_archive import (
     HistoryOutboxDrainer,
     PostgresHistoryArchive,
     SchemaVersionError,
+    quantized_played_at,
 )
 from src.redis_client import (
     HISTORY_OUTBOX_KEY,
@@ -331,6 +332,46 @@ class TestDedupAndPrecision:
         await archive.insert_batch([e])
         [got] = await archive.recent(42, 10)
         assert got.played_at == pytest.approx(1752530000.123456, abs=1e-6)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            1785309912.0000014,
+            1785309912.0000026,
+            1785309912.0000045,
+            1785309912.0000055,
+            1785309912.0000074,
+            1785309912.0000086,
+        ],
+    )
+    async def test_quantized_played_at_models_the_real_round_trip(
+        self, archive: PostgresHistoryArchive, raw: float
+    ) -> None:
+        """`quantized_played_at` claims to be what timestamptz does. This is the
+        only place that claim can be settled, and until it existed nothing
+        checked it anywhere.
+
+        Its whole job is to let GuildHistory.recent() build one dedup identity
+        out of a raw time.time() float (Redis leg) and a value that has been
+        through Postgres (archive leg). If the model is wrong the key misses,
+        the play renders twice, and merged[:limit] displaces a genuine older
+        song per duplicate.
+
+        EXACT equality, and adversarial inputs. The sibling test above uses
+        approx(abs=1e-6) — a tolerance the same size as the error class — so it
+        stays green against a wrong model. These six values are ULP-scale
+        neighbours chosen because they are exactly where the rejected
+        alternative `round(t * 1e6) / 1e6` disagrees with the shipped
+        datetime pair; substituting it turns every case here red. Without them
+        that substitution passed the entire unit suite AND this tier, while
+        missing the identity for 12.5% of real timestamps.
+        """
+        # __post_init__ must not clamp these — they are ordinary 2026 epochs.
+        entry = _entry(1, played_at=raw)
+        assert entry.played_at == raw
+        await archive.insert_batch([entry])
+        [got] = await archive.recent(42, 10)
+        assert got.played_at == quantized_played_at(raw)
 
     async def test_epoch_zero_tiebreak_is_stable(
         self, archive: PostgresHistoryArchive

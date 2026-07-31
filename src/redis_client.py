@@ -885,9 +885,13 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
         """LPUSH one entry, mirror it to the Postgres outbox, and PERSIST the
-        history key — no trim, no TTL: the list is the unbounded source of
-        truth for all played songs (write-per-song-end is the durability
-        boundary; cadence analysis in docs/HISTORY_OVERHAUL_PLAN.md §4). The
+        history key — no trim, no TTL: the list is an unbounded SECOND copy of
+        every played song. It stopped being the source of truth when the archive
+        landed — Postgres is that now, and -history reads it first — but it
+        stays complete and non-evictable, because the merge behind that read
+        leans on it for everything the archive has not caught up on
+        (write-per-song-end is the durability boundary; cadence analysis in
+        docs/HISTORY_OVERHAUL_PLAN.md §4). The
         PERSIST also self-heals pre-migration keys still carrying the old 24h
         idle expiry.
 

@@ -2,12 +2,15 @@
 
 The property under test mirrors test_guild_queue's: after every operation the
 in-memory display cache and the Redis leg agree on their shared window. The
-cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
-truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
+cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded — a
+complete second copy of every played song, though no longer the source of
+truth: Postgres is (docs/HISTORY_OVERHAUL_PLAN.md §4). The read path is three
+tiers merged, and TestRecentReadsPostgresFirst is where that lives.
 """
 
 import asyncio
 from dataclasses import replace as dataclasses_replace
+from unittest.mock import AsyncMock, patch
 
 import redis.asyncio as aioredis
 from typing import Any, cast
@@ -240,14 +243,51 @@ class TestRecentReadsPostgresFirst:
     still show — so it has to be the first tier asked, and every failure has to
     fall THROUGH rather than surface, because -history is a display command."""
 
-    async def test_a_full_archive_result_short_circuits_redis(
+    async def test_a_full_archive_result_is_still_merged_with_redis(
         self, store: GuildRedisStore
     ) -> None:
-        # >= limit rows means the archive can answer on its own; Redis is not
-        # read at all. This is the steady state after the backfill.
-        h = _history(store, archive=StubArchive([_entry(9), _entry(8)]))
-        await h.add(_entry(1))
-        assert await h.recent(2) == [_entry(9), _entry(8)]
+        """REGRESSION, and the one this branch shipped with. recent() used to
+        return early when the archive supplied `limit` rows.
+
+        The archive's rows are the newest ARCHIVED plays; anything still in the
+        outbox is NEWER than all of them and lives only on the Redis list. So
+        the shortcut fired exactly when a guild had `limit` archived plays — the
+        steady state at the default limit of 10 — and hid the songs that just
+        finished. Measured with the drainer five behind: plays 94..85 returned
+        when the truth was 99..90, the five newest missing and five older ones
+        displacing them.
+
+        The shape here is the production one, and the reason the defect survived
+        review is that every other merge test has it backwards: the newest plays
+        belong in REDIS (undrained) and the older ones in the archive.
+        """
+        h = _history(store, archive=QuantizingArchive([_entry(2), _entry(1)]))
+        await h.add(_entry(3))  # just played: on Redis + the outbox, not archived
+        assert await h.recent(2) == [_entry(3), _entry(2)]
+
+    async def test_redis_is_read_even_when_the_archive_answered_in_full(
+        self, store: GuildRedisStore
+    ) -> None:
+        # The mechanism behind the test above, asserted directly: a return value
+        # alone cannot distinguish "merged and the archive happened to win" from
+        # "never looked". Spying on the store is what makes the shortcut's
+        # absence observable — the previous test at this position asserted only
+        # the value and survived both re-introducing the shortcut and weakening
+        # its comparison.
+        archive = QuantizingArchive([_entry(9), _entry(8)])
+        h = _history(store, archive=archive)
+        reads = 0
+        real_get = store.get_history
+
+        async def counting() -> list[HistoryEntry]:
+            nonlocal reads
+            reads += 1
+            return await real_get()
+
+        with patch.object(store, "get_history", counting):
+            await h.recent(2)
+        assert archive.calls == [(42, 2)]
+        assert reads == 1
 
     async def test_short_archive_result_is_merged_with_redis(
         self, store: GuildRedisStore
@@ -263,6 +303,24 @@ class TestRecentReadsPostgresFirst:
         h = _history(store, archive=StubArchive([_entry(9), _entry(8)]))
         await h.add(_entry(1))  # in Redis and the cache, not in the archive
         assert await h.recent(10) == [_entry(9), _entry(8), _entry(1)]
+
+    async def test_merge_reorders_newer_redis_entries_ahead_of_archived_ones(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The explicit sort, named. Both legs are newest-first individually, so
+        the concatenation LOOKS ordered — but Redis holds the entries the
+        archive has not caught up on, and those are newer than everything
+        archived, which puts them at the wrong end of the concatenation.
+
+        Deleting the sort used to pass 28/28: every merge test placed the newest
+        plays in the archive, which is inverted from production and happens to
+        be the one arrangement where the concatenation is already sorted.
+        """
+        h = _history(store, archive=QuantizingArchive([_entry(3), _entry(2)]))
+        await h.add(_entry(7))  # newer than anything archived; Redis-only
+        await h.add(_entry(8))
+        got = await h.recent(4)
+        assert [e.title for e in got] == ["Song 8", "Song 7", "Song 3", "Song 2"]
 
     async def test_merge_dedups_entries_present_in_both(
         self, store: GuildRedisStore
@@ -354,14 +412,14 @@ class TestRecentReadsPostgresFirst:
         h = _history(store, archive=BrokenArchive())
         await h.add(_entry(1))
         assert await h.recent(10) == [_entry(1)]
-        assert "fell back to redis" in caplog.text
+        assert "postgres read failed" in caplog.text
 
     async def test_slow_archive_is_bounded_and_falls_through(
         self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import src.guild_history as guild_history
 
-        monkeypatch.setattr(guild_history, "_ARCHIVE_READ_TIMEOUT_SECS", 0.02)
+        monkeypatch.setattr(guild_history, "_READ_TIMEOUT_SECS", 0.02)
 
         class SlowArchive:
             async def insert_batch(self, entries: Any) -> None: ...
@@ -386,6 +444,59 @@ class TestRecentReadsPostgresFirst:
         h = _history(None, archive=BrokenArchive())
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
+
+    async def test_a_single_archived_row_no_longer_suppresses_the_cache(
+        self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REGRESSION: the cache used to be reachable only when BOTH tiers above
+        came back empty, so one archived row hid it entirely.
+
+        The shape is Redis erroring while the archive is shallow — pre-backfill,
+        which is every guild on the deploy that introduces the archive. Before
+        the cache became a third leg this returned 1 entry where the
+        pre-Postgres code returned all 9: a strict loss of depth, in the exact
+        window the merge exists to cover.
+        """
+        monkeypatch.setattr(
+            store, "get_history", AsyncMock(return_value=[])
+        )  # what @_guild_op yields on any Redis error
+        h = _history(store, archive=QuantizingArchive([_entry(9)]))
+        h.restore([_entry(n) for n in range(8, -1, -1)])  # newest-first
+        got = await h.recent(10)
+        assert [e.title for e in got] == [f"Song {n}" for n in range(9, -1, -1)]
+
+    async def test_the_archived_copy_wins_the_dedup(
+        self, store: GuildRedisStore
+    ) -> None:
+        """WHICH copy survives, not just how many. Nothing pinned this: test
+        entries were value-equal on both legs, so either choice passed.
+
+        In production they differ — played_at is µs-truncated on the way through
+        Postgres, and a backfilled row can carry column defaults the wire entry
+        never had — so this decides what the user sees. First leg wins, and the
+        legs are ordered by durability, so the archived copy is the one that
+        renders.
+        """
+        raw = 1000.0000014  # finer than µs; the archive leg truncates it
+        h = _history(store, archive=QuantizingArchive([_entry(1, played_at=raw)]))
+        await h.add(_entry(1, played_at=raw))  # same play, un-truncated, in Redis
+        [got] = await h.recent(10)
+        assert got.played_at == quantized_played_at(raw)
+        assert got.played_at != raw  # i.e. it is the archive's copy, not Redis'
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    async def test_a_nonpositive_limit_yields_nothing(self, limit: int) -> None:
+        """The CONTRACT, not the early-out that implements it.
+
+        recent()'s `limit <= 0` check is an equivalent mutation away from
+        `< 0` — merged[:limit] handles 0 identically — so a test asserting the
+        branch would be theatre. What is worth pinning is that a caller asking
+        for nothing gets nothing, from the arrangement that used to be able to
+        return the whole cache instead: nothing above the cache, cache full.
+        """
+        h = _history(None)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(limit) == []
 
 
 class TestSequenceProtocol:

@@ -606,7 +606,7 @@ src/
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
 ├── guild_queue.py     # GuildQueue — owns the three queue representations
-├── guild_history.py   # GuildHistory — played-song history (Redis + display cache)
+├── guild_history.py   # GuildHistory — play history: Postgres + Redis + cache, merged
 ├── guild_state.py     # Redis schema: frozen value objects + field constants
 ├── redis_client.py    # connection pool, GuildRedisStore, cache helpers
 ├── youtube.py         # yt-dlp integration, YTDL audio source, prefetch pipeline

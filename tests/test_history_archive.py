@@ -33,6 +33,7 @@ from src.history_archive import (
     SchemaVersionError,
     _entry_to_row,
     _row_to_entry,
+    quantized_played_at,
 )
 from src.redis_client import (
     HISTORY_OUTBOX_GROUP,
@@ -354,6 +355,59 @@ _COLUMNS = (
     "played_at",
     "message_id",
 )
+
+
+class TestQuantizedPlayedAt:
+    """The helper GuildHistory.recent()'s dedup identity is built on.
+
+    What it MODELS — that this equals a real timestamptz round trip — can only
+    be settled against a server, and is
+    (test_pg_integration.TestArchive::test_quantized_played_at_models_the_real_round_trip).
+    What lives here is the totality contract: it runs on the -history read path
+    and takes a bare float, so it must degrade rather than raise on anything.
+    """
+
+    def test_idempotent(self) -> None:
+        # The merge applies it to the archive leg too, which has already been
+        # through Postgres. That second application has to be a no-op or the
+        # two legs stop agreeing.
+        t = 1785309912.0000014
+        assert quantized_played_at(quantized_played_at(t)) == quantized_played_at(t)
+
+    @pytest.mark.parametrize(
+        ("value", "raises"),
+        [
+            (1e18, OSError),  # the band between: errno 84 macOS / 75 Linux
+            (253402300800.0, ValueError),  # year 10000
+            (1e300, OverflowError),  # past platform time_t
+            (float("nan"), ValueError),
+        ],
+        ids=["too-large-oserror", "year-10000", "past-time_t", "nan"],
+    )
+    def test_returns_the_input_for_everything_fromtimestamp_refuses(
+        self, value: float, raises: type[BaseException]
+    ) -> None:
+        """MUTATION GUARD for the try/except, which was previously dead code —
+        deleting it outright passed the whole suite.
+
+        Each case also pins the exception the docstring attributes to it. The
+        OSError band is the one worth naming: an earlier comment described it as
+        a macOS quirk, when it is what Linux raises too. Asserting the type here
+        means a future reader who doubts the arm has to make this test lie
+        first.
+        """
+        with pytest.raises(raises):
+            datetime.fromtimestamp(value, tz=timezone.utc)
+        got = quantized_played_at(value)
+        assert got is value or got != got  # NaN is not equal to itself
+
+    def test_unreachable_through_a_real_entry(self) -> None:
+        # Why the arm is a backstop rather than a live path: __post_init__
+        # clamps played_at into the timestamptz domain first, so no HistoryEntry
+        # can carry a value the conversion refuses.
+        for bad in (float("nan"), 1e18, 1e300, -1.0):
+            entry = HistoryEntry(guild_id=1, webpage_url="https://x", played_at=bad)
+            assert quantized_played_at(entry.played_at) == entry.played_at
 
 
 class TestRowMapping:

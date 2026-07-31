@@ -21,6 +21,7 @@ from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
+    HISTORY_MAX_LIMIT,
     HistoryFlags,
     MusicBot,
     ResolvedSpotifyPlaylist,
@@ -30,6 +31,7 @@ from src.musicbot import (
     _typing_keepalive,
     background_typing,
 )
+from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
@@ -1795,13 +1797,47 @@ def _flags(limit: int = 10) -> SimpleNamespace:
     return SimpleNamespace(limit=limit)
 
 
+class _CommandTestArchive:
+    """The archive `-history` actually reads, holding what the test set up.
+
+    This was `object()` while the archive was write-only. recent() reads it
+    now, and `object()` has no `.recent` — so every test here raised
+    AttributeError inside recent(), had it swallowed by the broad `except
+    Exception`, and asserted against the in-memory cache instead. All of them
+    passed while covering none of the read path they exercise, and no wrong
+    double could ever have been detected, because the degradation that makes
+    -history robust is the same mechanism that hides a broken test fixture.
+    Serving the entries from here is what puts these tests on the tier the
+    command really uses; TestHistoryReadsTheArchive below asserts that directly.
+    """
+
+    def __init__(self, entries: list[HistoryEntry]) -> None:
+        self.newest_first = list(reversed(entries))
+
+    async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
+        return self.newest_first[:limit]
+
+    async def insert_batch(self, entries: Any) -> None: ...
+
+    async def record_rejection(self, *args: Any, **kwargs: Any) -> None: ...
+
+
 class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
         history = GuildHistory(
-            None, archive=cast(Any, object()), guild_id=1, on_outbox_push=lambda: None
+            None,
+            archive=cast(Any, _CommandTestArchive(entries)),
+            guild_id=1,
+            on_outbox_push=lambda: None,
         )
-        history.restore(list(reversed(entries)))  # restore takes newest-first
+        # The archive is the ONLY source here, and the cache is deliberately
+        # left cold. Seeding both (which this did, via restore()) reproduces
+        # production but makes these tests blind: the two tiers then serve
+        # identical entries, so a broken archive double falls back to the cache
+        # and every assertion still passes — measured, reverting the double to
+        # `object()` left all 14 green. Sourcing only from the tier -history
+        # actually asks first is what makes that revert fail loudly.
         mp.history = history
         music_bot.get_mp = MagicMock(return_value=mp)
         return mp
@@ -1890,6 +1926,81 @@ class TestHistoryCommand:
     def test_flag_defaults(self) -> None:
         # -h with no flags must parse to limit=10.
         assert HistoryFlags.get_flags()["limit"].default == 10
+
+    def test_max_limit_never_exceeds_the_redis_window(self) -> None:
+        """The merge's completeness argument, pinned rather than commented.
+
+        GuildHistory.recent() merges the newest `limit` archived rows with the
+        newest HISTORY_CACHE_LIMIT Redis holds, and that union contains the true
+        newest `limit` only while the Redis window is at least as deep as
+        anything this command accepts. Raising HISTORY_MAX_LIMIT alone would
+        fail nowhere and raise nothing — it would just start returning short
+        pages — which is precisely the kind of silent shortfall the branch this
+        test was added on already shipped once.
+        """
+        assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
+
+
+class TestHistoryReadsTheArchive:
+    """That `-history` renders the Postgres tier at all, asserted at the command
+    level rather than inferred from GuildHistory's own tests.
+
+    Needed because every failure inside recent() degrades to a lower tier by
+    design, so a command test can render a perfectly correct embed off the
+    in-memory cache while the archive read is raising on every invocation —
+    which is exactly what these tests did until the double above was fixed. The
+    only way to tell the two apart is to make the tiers DISAGREE and assert
+    which one reached the user.
+    """
+
+    async def test_the_rendered_songs_come_from_the_archive_not_the_cache(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archived = _history_entries(2)  # Song 0 (t=1000), Song 1 (t=1001)
+        # Older than both, and present ONLY in the cache — so its position in
+        # the output says which legs ran: absent means the archive never got
+        # read, first means the cache won, last means both legs merged and
+        # sorted, which is the contract.
+        cache_only = HistoryEntry(
+            title="CACHE ONLY",
+            webpage_url="https://yt.com/v=cache",
+            duration_secs=1,
+            played_secs=1,
+            requester_id=1,
+            requester_name="u",
+            played_at=1.0,
+        )
+        mp = MagicMock()
+        history = GuildHistory(
+            None,
+            archive=cast(Any, _CommandTestArchive(archived)),
+            guild_id=1,
+            on_outbox_push=lambda: None,
+        )
+        history.restore([cache_only])
+        mp.history = history
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        titles = [e.title for e in mock_ctx.send.call_args[1]["embeds"]]
+        assert titles == ["1. Song 1", "2. Song 0", "3. CACHE ONLY"]
+
+    async def test_a_broken_archive_double_is_now_visible(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The guard on the guard. `object()` was the previous default here and
+        # produced green tests forever; this pins that the same mistake now
+        # leaves a warning an author can see, so nobody restores a stand-in
+        # without a recent() and concludes the read path is covered.
+        mp = MagicMock()
+        mp.history = GuildHistory(
+            None, archive=cast(Any, object()), guild_id=1, on_outbox_push=lambda: None
+        )
+        mp.history.restore(_history_entries(1))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        assert "postgres read failed" in caplog.text
+        assert "AttributeError" in caplog.text
 
 
 class TestMaxConcurrencyNotice:

@@ -226,6 +226,19 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.latency = 0.05
     bot.is_closed.return_value = False
     bot.wait_until_ready = AsyncMock()
+    # MusicPlayer hands bot.history_archive straight to GuildHistory, which
+    # READS it now (-history asks Postgres first). A bare MagicMock attribute
+    # makes `await archive.recent(...)` raise TypeError, which recent() then
+    # swallows into a warning and a fallback — so every player-level test would
+    # silently exercise the degraded path and no wrong archive could ever be
+    # detected. An empty async recent() is the honest default: tests that do not
+    # care about the archive fall through to the tier they are about, and do so
+    # by design rather than by accident.
+    archive = MagicMock()
+    archive.recent = AsyncMock(return_value=[])
+    archive.insert_batch = AsyncMock()
+    archive.record_rejection = AsyncMock()
+    bot.history_archive = archive
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
 

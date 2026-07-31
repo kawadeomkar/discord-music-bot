@@ -90,8 +90,15 @@ class SpotifyDisabledError(Exception):
 
 
 HISTORY_MIN_LIMIT = 1
-# The ceiling is the display cache depth — -history reads the in-memory cache,
-# or the Redis list when the cache is cold. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+# NOT just a display ceiling any more — this equality is load-bearing.
+# GuildHistory.recent() merges the newest `limit` ARCHIVED rows with the newest
+# HISTORY_CACHE_LIMIT the Redis list holds, and the merge is complete only
+# because the Redis window is at least as deep as anything this command can ask
+# for: every play among the true newest `limit` is then guaranteed to be in one
+# of the two legs. Raising this above HISTORY_CACHE_LIMIT would not fail
+# anywhere — it would silently return a short page, since the merge would be
+# asked for depth neither leg carries. Raise both together or neither.
+# See docs/HISTORY_OVERHAUL_PLAN.md §5 and GuildHistory.recent's docstring.
 HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
 # Discord's per-message cap — so the block always fits and is never shed.
@@ -1349,6 +1356,15 @@ class MusicBot(commands.Cog):
         },
     )
     @commands.before_invoke(validate_commands)
+    # One in flight per guild, like -ping and for the same reason: this is now
+    # the only USER-TRIGGERED consumer of the archive's connection pool, which
+    # is max_size=4 and shared with the drainer. Without the guard a guild can
+    # hold as many connections as it can type commands, and the drainer's
+    # acquire(timeout=10) is what starves — the outbox stops draining because
+    # someone spammed -h. wait=False so the extra invocations are declined
+    # immediately rather than queueing behind the first (cog_command_error
+    # renders MaxConcurrencyReached as a notice).
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.history")
     async def history(self, ctx: commands.Context, *, flags: HistoryFlags) -> None:
         try:
