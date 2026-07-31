@@ -4908,17 +4908,97 @@ class TestLoop:
     async def test_history_entry_records_the_np_host_message_id(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """The history row carries the NP host as of song END, captured before
-        loop() releases it — by the time the entry is built, _np_host_message is
-        already None (and on the next iteration points at another song)."""
+        """The history row carries the host of THIS song, as of song END.
+
+        Two properties, and the decoy below is what separates them. The entry
+        must not read the *released* _np_host_message (None by then), and it
+        must not read a host captured before this song adopted its own — a
+        capture hoisted anywhere earlier in the iteration yields the PREVIOUS
+        song's message and is wrong in a way nothing downstream can detect,
+        since every id is a plausible snowflake.
+
+        _send_now_playing is what adopts this song's host in production, so
+        patching it out with a bare AsyncMock would leave the pre-planted value
+        standing for the whole iteration and make "before release" and "this
+        song's host" indistinguishable. The side effect restores that half.
+        """
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        host = AsyncMock(spec=discord.Message)
-        host.id = 555555555555555555
-        music_player._np_host_message = host
+        # Decoy: the host left over from the PREVIOUS song. Stamping this is the
+        # off-by-one-song failure, so it must not be what lands in history.
+        stale_host = AsyncMock(spec=discord.Message)
+        stale_host.id = 555555555555555555
+        music_player._np_host_message = stale_host
+
+        this_songs_host = AsyncMock(spec=discord.Message)
+        this_songs_host.id = 777777777777777777
+
+        async def adopt_this_songs_host(_song: object) -> None:
+            music_player._np_host_message = this_songs_host
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(
+                MusicPlayer,
+                "_send_now_playing",
+                new=AsyncMock(side_effect=adopt_this_songs_host),
+            ),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            # The completed-bar edit is a separate concern and would PATCH the
+            # mock host from a background task while this assertion runs.
+            patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()),
+        ):
+            await music_player.loop()
+
+        assert music_player._np_host_message is None  # released before the entry
+        assert len(music_player.history) == 1
+        assert music_player.history[0].message_id == 777777777777777777
+
+    async def test_current_song_is_cleared_before_the_prefetch_await(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The song must stop being 'current' before loop() blocks on prefetch.
+
+        MusicContext.send's attach gate is `current_song is not None`, and the
+        prefetch await resolves a whole yt-dlp extraction — seconds, not
+        microseconds. A song left current across it lets a command response in
+        the home channel prepend a block for a song that already ended and adopt
+        ITSELF as host. The next iteration's _send_now_playing() then releases
+        that host without retiring it, orphaning a message with a frozen bar
+        that retire_np_host_on_stop() can no longer reach.
+
+        The prefetch await is loop()'s first suspension point after song-end
+        teardown, so a patched prefetch coroutine observes exactly that instant.
+        """
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        observed: list[object] = []
+
+        async def observe_at_prefetch_await(_self: object) -> None:
+            observed.append(music_player.current_song)
 
         await music_player.queue._pending.put(queue_obj)
         music_player.queue._display.append(queue_obj)
@@ -4938,18 +5018,19 @@ class TestLoop:
             ),
             patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
             patch.object(
-                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+                MusicPlayer, "_prefetch_next_song", new=observe_at_prefetch_await
             ),
             patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
-            # The completed-bar edit is a separate concern and would PATCH the
-            # mock host from a background task while this assertion runs.
-            patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()),
         ):
             await music_player.loop()
 
-        assert music_player._np_host_message is None  # released before the entry
+        assert observed == [None], (
+            "current_song was still set when loop() awaited the prefetch task — "
+            "a command response in that window can adopt an orphan NP host"
+        )
+        # The entry is still built from the iteration's own copy of the song.
         assert len(music_player.history) == 1
-        assert music_player.history[0].message_id == 555555555555555555
+        assert music_player.history[0].title == mock_song.title
 
     async def test_song_that_produced_no_audio_is_not_treated_as_played(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock

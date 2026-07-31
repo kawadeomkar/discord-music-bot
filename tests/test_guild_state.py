@@ -822,17 +822,33 @@ class TestHistoryEntryFromSong:
             message_id=444444444444444444,
         )
 
+    def test_guild_id_and_message_id_are_required_keywords(self) -> None:
+        # Requiredness is the whole protection for message_id: play_history's
+        # CHECK is `message_id >= 0` with DEFAULT 0, so a forgotten stamp inserts
+        # cleanly and is permanently indistinguishable from a song that genuinely
+        # had no host. pyright catches a missing argument today, but only while
+        # no default exists — adding one silently retires the guarantee, and this
+        # is what notices.
+        song = _history_song_stub()
+        with pytest.raises(TypeError):
+            HistoryEntry.from_song(song, guild_id=111, played_at=1.0)  # pyright: ignore[reportCallIssue]
+        with pytest.raises(TypeError):
+            HistoryEntry.from_song(song, played_at=1.0, message_id=0)  # pyright: ignore[reportCallIssue]
+
     def test_message_id_is_caller_supplied(self) -> None:
         # The song object carries no message id — it comes from the NP host the
         # playback loop captured at song end, and 0 means "no message hosted
         # this song's block" rather than "the caller forgot".
+        #
+        # Both arms are needed. 0 is also the dataclass default, so asserting it
+        # alone passes even if from_song hardcodes 0, drops the argument, or
+        # never sets the field — i.e. exactly when the property this test is
+        # named for is broken. The non-zero arm is what makes the zero arm mean
+        # "0 because the caller said 0".
         song = _history_song_stub()
-        assert (
-            HistoryEntry.from_song(
-                song, guild_id=111, played_at=1.0, message_id=0
-            ).message_id
-            == 0
-        )
+        base = {"guild_id": 111, "played_at": 1.0}
+        assert HistoryEntry.from_song(song, **base, message_id=0).message_id == 0
+        assert HistoryEntry.from_song(song, **base, message_id=888).message_id == 888
 
     def test_played_secs_is_position_reached(self) -> None:
         song = _history_song_stub(position_secs=100.4)

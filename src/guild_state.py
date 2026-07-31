@@ -649,7 +649,8 @@ class HistoryEntry:
         predate it: migrations/0001 permits webpage_url = '' on backfilled
         entries. A validator that rejected those would break -history for
         precisely the guilds with the most history. Strictness lives in the DB
-        CHECK constraints instead (migrations/0004), where a violation means
+        CHECK constraints instead (migrations/0001_play_history.sql), where a
+        violation means
         "this validator regressed" and cannot retroactively invalidate durable
         data.
 

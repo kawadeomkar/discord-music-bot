@@ -1,11 +1,17 @@
 -- The play-history schema: the durable long-term home for every played song,
 -- plus the reject table that catches anything the server refuses.
 --
--- Deliberately ONE migration. Nothing has shipped yet, so there is no database
--- whose schema this has to evolve, and a pre-release sequence of ALTER steps
--- would describe upgrades that never happened to anyone. Until the first
--- production release this file is edited IN PLACE. After it, every change
--- becomes a new numbered migration, because from then on the ALTERs are real.
+-- Deliberately ONE migration. No bot has ever opened a Postgres connection, so
+-- there is no database whose schema this has to evolve, and a pre-release
+-- sequence of ALTER steps would describe upgrades that never happened to
+-- anyone. While that holds, this file is edited IN PLACE.
+--
+-- The window closes when the first release whose bot actually reads the archive
+-- ships (the stack/4 durable-tier work — setup_hook requiring POSTGRES_URL and
+-- constructing PostgresHistoryArchive). From then on every change becomes a new
+-- numbered migration, because from then on the ALTERs are real. Note this is
+-- NOT "the first tagged release": v1.3.0 and v1.4.0 already ship this file, and
+-- editing it stayed safe only because their bots never connected to Postgres.
 --
 -- Consequence: IF NOT EXISTS makes this whole file a no-op against a database
 -- that already holds these tables, so a dev box on an earlier shape does NOT
@@ -50,11 +56,33 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- it, and HistoryEntry stays exactly the wire schema.
     inserted_at    timestamptz NOT NULL DEFAULT now(),
 
-    -- The Discord message id of the Now Playing embed that hosted this song, so
-    -- a history row can be joined back to the message a listener saw. Stamped by
-    -- HistoryEntry.from_song from the host the playback loop captured at song
-    -- end. 0 = unknown, and it is a real value, not just a default: a song whose
-    -- NP send failed was never hosted by any message.
+    -- The Discord message id of the Now Playing embed that hosted this song.
+    --
+    -- A CORRELATION TOKEN, not a resolvable pointer. discord.py has no
+    -- guild.fetch_message(id) — resolving a message needs channel.fetch_message,
+    -- and no channel id is stored here. The persisted text-channel id cannot
+    -- stand in either: MusicPlayer.set_context reassigns the home channel on
+    -- every command, so the NP host migrates across text channels within one
+    -- guild and that id only records wherever the last command ran. Match this
+    -- against a log line or a span (song.np_host_id), not against the API. If a
+    -- resolvable pointer is ever wanted, it needs a companion channel_id column
+    -- stamped from the same host — and that should land WITH the archive wiring
+    -- below, not before it, so the wire format does not grow a second field
+    -- nothing reads.
+    --
+    -- NOT POPULATED YET. HistoryEntry carries the value on the Redis wire —
+    -- HistoryEntry.from_song stamps it from the host the playback loop captured
+    -- at song end — but the archive's INSERT does not list this column, so the
+    -- default fills every row and the stamped value is dropped when the outbox
+    -- entry is retired. Until _INSERT_SQL / _RECENT_SQL / _entry_to_row /
+    -- _row_to_entry in history_archive.py carry it, a 0 here means "the archive
+    -- does not write this column", NOT "this song had no host" — do not read a
+    -- table of zeroes as a fleet-wide Now Playing failure.
+    --
+    -- Once that lands, 0 becomes a real value rather than only a default, but
+    -- an ambiguous one: it also covers a song whose NP send failed, a host a
+    -- listener deleted mid-song (released on discord.NotFound), an entry from a
+    -- build older than the field, and anything the backfill inserts.
     --
     -- Kept out of play_history_dedup, and not a foreign key, for the same
     -- reason: the NP host is not stable or permanent. It migrates across
