@@ -254,8 +254,8 @@ class TestBackfill:
     async def test_corrupt_entries_log_their_bytes(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """`corrupt: N` was the entire forensic record of entries the capping
-        change is about to trim away.
+        """`corrupt: N` was the entire forensic record of entries the archive
+        build is about to trim away.
 
         This is where the backfill has to diverge from the drainer, which drops
         corrupt entries just as quietly: an unparseable OUTBOX entry still has
@@ -280,9 +280,9 @@ class TestBackfill:
         window picks up concurrent pushes, which dedup absorbs. Coming up SHORT
         means entries the initial LLEN counted were never read, which only a
         tail-side shrink causes. Nothing shrinks these lists from the tail
-        today; that changes the moment the capping LTRIM ships, and the
-        entries it eats are the OLDEST — exactly the ones this tool exists to
-        save. Simulated here with RPOP between pages.
+        today; the bot's own LTRIM does, and the entries it eats are the
+        OLDEST — exactly the ones this tool exists to save. Simulated here with
+        RPOP between pages.
         """
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
@@ -381,7 +381,7 @@ class TestBackfill:
         pre-archive history. Enumeration is the one primitive with no
         downstream safety net: a guild the scan never yields produces no
         corrupt count, no log line, and no discrepancy in the report — and the
-        capping change then trims the only copy. fakeredis models the cursor
+        bot then trims the only copy. fakeredis models the cursor
         faithfully, so nothing about this needs a real server.
 
         Seeded past `count=100` on purpose; a smaller number proves nothing.
@@ -516,7 +516,7 @@ class TestCli:
         wired.closed.assert_awaited_once()
         cast(Any, backfill_history.close_redis_pool).assert_awaited_once()
 
-    async def test_a_failed_guild_exits_nonzero_and_says_not_to_cut_over(
+    async def test_a_failed_guild_exits_nonzero_and_says_not_to_deploy(
         self,
         fake_redis: Redis,
         monkeypatch: pytest.MonkeyPatch,
@@ -551,7 +551,7 @@ class TestCli:
         # operator to infer it from a count.
         assert "INCOMPLETE" in out.err
         assert "1 guild(s) FAILED" in out.err
-        assert "caps these lists" in out.err
+        assert "Do NOT deploy" in out.err
 
     async def test_it_says_what_it_connected_to_with_the_password_redacted(
         self,
@@ -581,6 +581,29 @@ class TestCli:
         assert "db.internal" in out
         assert "hunter2" not in out  # password never printed
         assert "bot:***@" in out  # …but the user is, so the DSN is identifiable
+
+    async def test_every_run_states_the_ordering_it_cannot_verify(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The ordering violation the docs call unrecoverable, which nothing can
+        detect.
+
+        There is nothing to assert a gate on, because there is no gate: the cap
+        is unconditional, and the state it produces is unobservable after the
+        fact. A guild's list sitting at HISTORY_CACHE_LIMIT is what a trimmed
+        guild AND a healthy migrated guild both look like, so no check here
+        could tell an operator they ran this too late. The notice is therefore
+        printed on every run, including the successful path — which is the one
+        place an operator is still reading.
+        """
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        assert await backfill_history._run(dry_run=False) == 0
+        out = capsys.readouterr().out
+        assert "BEFORE deploying" in out
+        assert str(backfill_history.HISTORY_CACHE_LIMIT) in out
 
     async def test_an_unreachable_database_fails_before_the_walk(
         self,
@@ -650,7 +673,7 @@ class TestCli:
         err = capsys.readouterr().err
         assert "INCOMPLETE" in err
         assert "floor" in err
-        assert "caps these lists" in err
+        assert "Do NOT deploy" in err
 
     async def test_a_failing_close_does_not_hide_the_run(
         self,

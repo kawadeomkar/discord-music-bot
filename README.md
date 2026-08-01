@@ -64,7 +64,7 @@ details, aliases, and examples.
 |---|---|---|
 | `-queue` | `q` | List the songs waiting to play (up to 10) |
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
-| `-history` | `h` | Show recently played songs (persists across restarts) |
+| `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
 | `-shuffle` | — | Randomly reorder the queue (needs 3+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
 | `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
@@ -299,7 +299,7 @@ run `just check`.
 | Recipe | Does |
 |---|---|
 | `just db-migrate` | Apply pending play-history schema migrations |
-| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before the lists are capped** |
+| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before deploying the archive build** |
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
@@ -423,7 +423,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the bot runs on host networking and connects through this port |
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
-| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. See [Operating the play-history archive](#operating-the-play-history-archive) |
+| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. A drop here is unrecoverable: the Redis history list is capped at 50 entries per guild, so anything older that the cap discards existed only in the outbox. See [Operating the play-history archive](#operating-the-play-history-archive) |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | | `4` | Worker processes in the yt-dlp extraction pool. Each holds a full CPython + yt-dlp import (~80–120 MB RSS), so the default is deliberately conservative — raise it if multi-guild extraction bursts become the bottleneck |
@@ -440,6 +440,12 @@ Play history is written twice on every song end, in one Redis pipeline: to the g
 display list, and to a global **outbox** the background drainer moves into Postgres.
 The playback loop never waits on Postgres — an unreachable database just means the
 outbox grows and drains later.
+
+Reads go the other way. `-history` is served from the Redis list alone: it is capped at
+50 entries per guild, which is exactly the command's own `--limit` ceiling, and it is
+written synchronously at song end, so it always holds every play the command can be
+asked for — including plays the drainer has not archived yet. Postgres is the permanent
+record behind it, queried by the commands built on that record rather than by `-history`.
 
 The outbox is a Redis **stream** with a consumer group, not a list. That is what makes
 running two bot processes against one Redis safe: the server hands each drainer a
@@ -481,10 +487,29 @@ It exits non-zero and prints `INCOMPLETE` if any guild failed, so **re-run until
 reports zero failures**.
 
 **Order matters, and one direction is unrecoverable.** This must complete *before* the
-change that caps the Redis history lists (it arrives next) — that cap trims exactly the
-entries this command exists to move, and Postgres is the only other copy.
-Verify with the reported guild count and a `SELECT count(*) FROM play_history` before
-shipping it.
+archive build is deployed. That build caps each guild's Redis history list at 50 entries,
+trimming it at that guild's next song end — exactly the entries this command exists to
+move, with Postgres as the only other copy.
+
+Nothing can detect that you got the order wrong. A list sitting at 50 entries is what a
+trimmed guild and a healthy migrated guild both look like, so `db-backfill` prints the
+ordering notice on every run, including successful ones, and its counts are meaningful
+only when the run preceded the deploy. Verify with the reported guild count and a
+`SELECT count(*) FROM play_history` before you deploy.
+
+#### After the deploy
+
+The trim is **lazy**: a guild's list is capped at that guild's *next song end*, not at
+startup. Dormant guilds — often the ones holding the most history — keep their full lists
+until they play again, or until you `DEL` those keys by hand once the backfill has them.
+
+`docker stats` will not move when they are reclaimed. The saving shows up in Redis'
+`used_memory` (measured: 262 MB → 1.6 MB for a 500k-entry list), which is what `maxmemory`
+and eviction actually gate on. But jemalloc does not return the pages to the OS: RSS stays
+flat and `mem_fragmentation_ratio` climbs (1.27 → 1.49 over three cycles in testing). Check
+`redis-cli info memory | grep used_memory:`, not the container's RSS. Add `--activedefrag
+yes` to the redis command in `docker-compose.yml` if you want the pages back, at some CPU
+cost.
 
 ### Backlog and sizing
 
@@ -600,7 +625,9 @@ CONFIRM=1 just db-restore backups/play_history_... musicbot
 
 A nightly dump gives an **RPO of ≤ 24 h** for archived history. Plays newer than the
 last dump survive only in the Redis history list (`guild:{id}:history`) — *not* in the
-outbox, which is emptied within seconds of each batch committing. Schedule it with
+outbox, which is emptied within seconds of each batch committing. That list holds only the
+newest 50 plays per guild, so for anything older the nightly dump is the only copy and the
+24 h window is real exposure. Schedule it with
 cron or a systemd timer and prune old files:
 
 ```cron
@@ -617,6 +644,18 @@ the drill is just that command followed by `SELECT count(*) FROM play_history` a
 that scratch database. WAL archiving / PITR is
 out of scope for the bundled Compose stack; on a managed Postgres, use the platform's
 own PITR.
+
+### Backfill before the archive build
+
+Order is load-bearing: **backfill → verify zero failures → deploy**. Deploying first caps
+the Redis lists at 50 entries per guild, trimming away exactly the entries the backfill
+exists to preserve, and Postgres is the only other copy.
+
+The full procedure — dry-run rehearsal, the Docker-only path, and what to check before
+deploying — is under
+[Backfilling history that predates the archive](#backfilling-history-that-predates-the-archive).
+Deliberately not repeated here: two copies of an irreversible runbook is how one of them
+ends up missing the step that matters.
 
 ## Architecture
 
@@ -648,7 +687,7 @@ src/
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
 ├── guild_queue.py     # GuildQueue — owns the three queue representations
-├── guild_history.py   # GuildHistory — play history: Redis list + display cache
+├── guild_history.py   # GuildHistory — play history: capped Redis list + cache
 ├── guild_state.py     # Redis schema: frozen value objects + field constants
 ├── redis_client.py    # connection pool, GuildRedisStore, cache helpers
 ├── youtube.py         # yt-dlp integration, YTDL audio source, prefetch pipeline
