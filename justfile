@@ -546,6 +546,7 @@ db-backfill *ARGS:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
+
 # The one Redis-side operator recipe. It exists because XLEN alone cannot tell
 # apart four states that call for four different responses, and working that out
 # by hand during an incident is the wrong time to learn the commands:
