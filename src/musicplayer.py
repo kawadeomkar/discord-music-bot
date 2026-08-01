@@ -908,7 +908,8 @@ class MusicPlayer:
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Enqueue and (optionally) kick off stream pre-fetch.
 
         prefetch=False for bulk playlist enqueues — the Redis mirror is
@@ -916,26 +917,37 @@ class MusicPlayer:
         spawned (N concurrent prefetches saturate the thread pool and produce
         stream URLs that expire before the song reaches playback position;
         _prefetch_next_song handles one-ahead prefetch naturally as songs play).
+
+        expected_generation forwards GuildQueue.put's compare-and-put for
+        streamed collection pages. A refused put returns False having touched
+        nothing — including spawning no prefetch tasks for songs that were
+        never queued. Generation-blind callers ignore the return value.
         """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        await self.queue.put(items, batch=not prefetch)
+        ok = await self.queue.put(
+            items, batch=not prefetch, expected_generation=expected_generation
+        )
+        if not ok:
+            return False
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_put_front(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Insert at the FRONT of the queue, then (optionally) pre-fetch.
 
         Same contract as queue_put() but for the head of the line — used when
@@ -947,19 +959,25 @@ class MusicPlayer:
         same reason queue_put() does: N concurrent prefetches saturate the
         thread pool and mint stream URLs that expire before playback reaches
         them.
+
+        expected_generation: same compare-and-put forwarding as queue_put(),
+        for the buffered front=True collection path.
         """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        await self.queue.put_front(items)
+        ok = await self.queue.put_front(items, expected_generation=expected_generation)
+        if not ok:
+            return False
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()

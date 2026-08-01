@@ -1088,6 +1088,8 @@ class TestCleanup:
         mp._pause_debounce_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
+        # cleanup() awaits this on every teardown (the stream-preemption bump).
+        mp.queue.bump_generation = AsyncMock()
         for attr, val in overrides.items():
             setattr(mp, attr, val)
         music_bot.mps[mock_guild.id] = mp
@@ -1252,6 +1254,20 @@ class TestCleanup:
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)  # must not raise
 
+    async def test_cleanup_bumps_queue_generation(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """cleanup() is the single teardown choke point — -stop, a kick, the
+        alone-disconnect timer, the gate timeout, and play's error path all
+        funnel through it. The generation bump must land here (not in the
+        stop/clear commands alone) so an in-flight collection drain is refused
+        after ANY teardown; without it the drain keeps RPUSHing the Redis
+        mirror of a guild being torn down."""
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        mp.queue.bump_generation.assert_awaited_once()
+
     async def test_cancels_player_task_before_disconnect(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -1278,6 +1294,7 @@ class TestCleanup:
         mp._player = _AwaitableTask()
         mp.store = None
         mp.retire_np_host_on_stop = AsyncMock()
+        mp.queue.bump_generation = AsyncMock()
         music_bot.mps[mock_guild.id] = mp
 
         async def _disconnect(**_kw: Any) -> None:

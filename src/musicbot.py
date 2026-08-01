@@ -304,6 +304,13 @@ class MusicBot(commands.Cog):
             return
         log.info("going to cleanup/disconnect")
         try:
+            # Invalidate any in-flight collection drain FIRST — the drain runs
+            # in a command task this method does not cancel; every page it
+            # commits after this line would land on a guild being torn down.
+            # This is the single teardown choke point (-stop, kick,
+            # alone-timer, gate timeout, play's error path all funnel here),
+            # so one bump covers every door. See GuildQueue.bump_generation.
+            await mp.queue.bump_generation()
             # Cancel tasks before disconnecting so the playback loop cannot
             # wake up and start the next song between voice_client.stop() and
             # the task cancellation. VoiceClient.disconnect() calls stop()

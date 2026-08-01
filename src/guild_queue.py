@@ -98,7 +98,15 @@ class GuildQueue:
     logs and never raises) — the in-memory queue keeps working either way.
     """
 
-    __slots__ = ("_guild", "_store", "_pending", "_display", "_mutex", "_cleared")
+    __slots__ = (
+        "_guild",
+        "_store",
+        "_pending",
+        "_display",
+        "_mutex",
+        "_cleared",
+        "_generation",
+    )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
         self._guild = guild
@@ -107,6 +115,7 @@ class GuildQueue:
         self._display: deque = deque()
         self._mutex = asyncio.Lock()
         self._cleared = False
+        self._generation = 0
 
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
@@ -182,9 +191,70 @@ class GuildQueue:
         self._cleared = False
         return was_cleared
 
+    # ── Stream preemption ─────────────────────────────────────────────────────
+
+    @property
+    def generation(self) -> int:
+        """Monotonic counter of queue invalidations.
+
+        A streamed collection enqueue snapshots this before its first page and
+        passes it back via put(..., expected_generation=...); clear() and
+        bump_generation() increment it, so every later page is refused instead
+        of refilling a queue the user just emptied (or a guild being torn
+        down). The check happens INSIDE put()'s mutex hold — reading this
+        property and then calling put() without expected_generation is a
+        TOCTOU bug, not an alternative."""
+        return self._generation
+
+    async def bump_generation(self) -> None:
+        """Invalidate in-flight streamed enqueues without clearing the queue.
+
+        Called by MusicBot.cleanup() — the single teardown choke point: -stop,
+        a kick (on_voice_state_update), the alone-disconnect timer, the 300s
+        playback-gate timeout (MusicPlayer.stop() delegates to cleanup()), and
+        play's own error path all funnel through it. Without this, an orphaned
+        collection drain (which runs in a *command* task cleanup never
+        cancels) keeps RPUSHing this guild's Redis mirror after teardown; a
+        follow-up -play then restores that mirror mid-drain and the in-memory
+        legs desync from Redis — the ghost-head failure put_front's docstring
+        describes, reached through a different door.
+
+        clear() does not call this — it bumps inline under the same mutex hold
+        that drains the legs, so no page can land between the drain and the
+        bump."""
+        async with self._mutex:
+            self._generation += 1
+
+    async def has_restored_backlog(self) -> bool:
+        """True when anything is queued in memory OR on the Redis mirror.
+
+        The front=True streamed-enqueue path uses this to decide
+        append-vs-buffer: "append to an empty queue is front insertion" is
+        only true when the MIRROR is empty too. qsize() alone lies here — two
+        paths leave Redis longer than memory (parse_queue_entry drops a
+        corrupt entry but the raw entry stays on the list; restore_entries
+        drops entries whose requester can't be resolved), and appending behind
+        such a ghost puts the collection where the next commit-time LPOP
+        retires the wrong entry. Conservative on a failed read (None → True):
+        the buffered put_front path is always correct, just slower."""
+        if self._pending.qsize() > 0:
+            return True
+        if self._store is None:
+            return False  # nothing persists at all — append IS front insertion
+        length = await self._store.queue_length()
+        if length is None:
+            return True  # Redis unreadable — take the safe path
+        return length > 0
+
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
-    async def put(self, items: Sequence[QueueItem], *, batch: bool = False) -> None:
+    async def put(
+        self,
+        items: Sequence[QueueItem],
+        *,
+        batch: bool = False,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Enqueue items on all three legs: in-memory puts for every item
         first, then the Redis mirror.
 
@@ -196,23 +266,44 @@ class GuildQueue:
         batch=False RPUSHes one entry per round-trip (single-song enqueue,
         matching the interleaved per-item pushes it replaces); batch=True
         pushes everything in one round-trip (bulk playlist enqueue).
+
+        expected_generation is the compare-and-put for streamed collection
+        enqueues: pass the generation snapshotted before the stream's first
+        page, and the put refuses (returns False, NO leg touched) if a
+        clear()/bump_generation() has landed since. The check shares this
+        mutex hold with the enqueue itself — checked outside, an entire
+        clear() (which runs wholly under the mutex) fits between check and
+        put, and a full page lands after the clear it should have respected.
+        Generation-blind callers (every non-stream enqueue) omit it and are
+        never refused.
         """
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return False
             for item in items:
                 await self._pending.put(item)
                 self._display.append(item)
             if self._store is None:
-                return
+                return True
             entries = [_to_entry(item) for item in items]
             if not entries:
-                return
+                return True
             if batch:
                 await self._store.push_queue_batch(entries)
             else:
                 for entry in entries:
                     await self._store.push_queue(entry)
+        return True
 
-    async def put_front(self, items: Sequence[QueueItem]) -> None:
+    async def put_front(
+        self,
+        items: Sequence[QueueItem],
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Insert items at the FRONT of the line on all three legs — the
         -playnow interjection path (docs/PLAYNOW_PROPOSAL.md §4.2).
 
@@ -232,11 +323,20 @@ class GuildQueue:
         to yt-dlp's socket timeout), and interject() runs inside that await —
         its neutralize sees no task to take, while the prefetch's dequeued
         item sits uncommitted at the display head.
+
+        expected_generation: same compare-and-put contract as put() — used by
+        the buffered front=True collection path, refused (False, no leg
+        touched) when a clear()/teardown landed after the snapshot.
         """
         if not items:
-            return
+            return True
         new_items = list(items)
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return False
             drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
             for item in new_items + drained:
@@ -244,7 +344,7 @@ class GuildQueue:
             self._display = deque(in_flight + new_items + drained)
 
             if self._store is None:
-                return
+                return True
             if in_flight:
                 entries = [
                     _to_entry(s)
@@ -259,6 +359,7 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
+        return True
 
     # ── Bulk operations ───────────────────────────────────────────────────────
     # Callers with a prefetch task (MusicPlayer) must cancel it BEFORE any of
@@ -277,9 +378,17 @@ class GuildQueue:
         and discards it. The Redis DEL happens under the mutex too — released
         early, a concurrent put() could land its memory+mirror writes between
         the drain and the DEL and have its mirror entries wiped.
+
+        Also bumps the generation under the same hold, so an in-flight
+        streamed collection enqueue (compare-and-put via put(...,
+        expected_generation=...)) is refused from its next page onward —
+        without this, clearing a 716-track playlist at page 3 drains the
+        queue and then watches the stream's tail refill it with the songs
+        the user just deleted.
         """
         async with self._mutex:
             self._cleared = True
+            self._generation += 1
             self._drain_pending()
             cleared_items = list(self._display)
             self._display.clear()

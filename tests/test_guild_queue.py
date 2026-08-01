@@ -8,7 +8,7 @@ operation, the asyncio queue, the display deque, and the Redis mirror agree
 import redis.asyncio as aioredis
 from typing import Any
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1013,3 +1013,152 @@ class TestPutClearMutualExclusion:
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+
+# ── Generation counter (stream preemption) ────────────────────────────────────
+
+
+class TestGenerationCounter:
+    async def test_starts_at_zero_and_bump_increments(self, gq: GuildQueue) -> None:
+        assert gq.generation == 0
+        await gq.bump_generation()
+        assert gq.generation == 1
+
+    async def test_clear_bumps_generation(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        gen = gq.generation
+        await gq.clear()
+        assert gq.generation == gen + 1
+
+    async def test_stale_put_refused_no_leg_touched(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        gen = gq.generation
+        await gq.bump_generation()  # a clear()/teardown landed since the snapshot
+
+        ok = await gq.put([_qobj(1, mock_author)], batch=True, expected_generation=gen)
+
+        assert ok is False
+        assert gq.qsize() == 0
+        assert gq.display_items() == []
+        assert await fake_redis.llen(store.queue_key()) == 0
+
+    async def test_stale_put_front_refused_no_leg_touched(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        gen = gq.generation
+        await gq.bump_generation()
+
+        ok = await gq.put_front([_qobj(1, mock_author)], expected_generation=gen)
+
+        assert ok is False
+        assert gq.qsize() == 0
+        assert await fake_redis.llen(store.queue_key()) == 0
+
+    async def test_fresh_generation_put_succeeds(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        ok = await gq.put(
+            [_qobj(1, mock_author)], batch=True, expected_generation=gq.generation
+        )
+        assert ok is True
+        await _assert_triad_sync(gq, fake_redis, store)
+        assert gq.qsize() == 1
+
+    async def test_generation_blind_put_never_refused(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Every non-stream enqueue omits expected_generation and must be
+        unaffected by bumps — -play single after -clear still queues."""
+        await gq.clear()
+        await gq.bump_generation()
+        assert await gq.put([_qobj(1, mock_author)]) is True
+        assert await gq.put_front([_qobj(2, mock_author)]) is True
+        assert gq.qsize() == 2
+
+    async def test_empty_put_front_reports_success(self, gq: GuildQueue) -> None:
+        assert await gq.put_front([]) is True
+
+    async def test_clear_landing_before_parked_put_refuses_it(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """The compare-and-put TOCTOU guard: a put that snapshotted its
+        generation, then parked on the mutex while a full clear() ran, must
+        resolve False — its page belongs to the collection the clear just
+        deleted. Checked outside the mutex, this page would refill the queue."""
+        await gq.put([_qobj(1, mock_author)])
+        gen = gq.generation
+
+        release = asyncio.Event()
+        real_delete = store.delete_queue
+
+        async def slow_delete() -> None:
+            await release.wait()
+            await real_delete()
+
+        with patch.object(store, "delete_queue", new=slow_delete):
+            clear_task = asyncio.create_task(gq.clear())
+            await asyncio.sleep(0)  # clear holds the mutex, parked in the DEL
+            put_task = asyncio.create_task(
+                gq.put([_qobj(2, mock_author)], batch=True, expected_generation=gen)
+            )
+            await asyncio.sleep(0)  # put is parked on the mutex
+            release.set()
+            await clear_task
+
+        assert await put_task is False
+        assert gq.qsize() == 0
+        assert gq.display_items() == []
+
+
+class TestHasRestoredBacklog:
+    async def test_false_when_all_legs_empty(self, gq: GuildQueue) -> None:
+        assert await gq.has_restored_backlog() is False
+
+    async def test_true_when_memory_nonempty(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        assert await gq.has_restored_backlog() is True
+
+    async def test_false_without_store(self, gq_no_redis: GuildQueue) -> None:
+        """No Redis ⇒ nothing persists ⇒ append IS front insertion."""
+        assert await gq_no_redis.has_restored_backlog() is False
+
+    async def test_true_for_mirror_ghost(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+    ) -> None:
+        """The M1 case: memory empty but the mirror holds an entry (e.g. a
+        corrupt entry parse_queue_entry dropped on restore). qsize() alone
+        would report empty and route an append behind the ghost."""
+        await fake_redis.rpush(store.queue_key(), b"corrupt-ghost-entry")
+        assert gq.qsize() == 0
+        assert await gq.has_restored_backlog() is True
+
+    async def test_unreadable_mirror_is_conservative(
+        self, gq: GuildQueue, store: GuildRedisStore
+    ) -> None:
+        """A failed LLEN (None) must read as non-empty: the buffered path is
+        always correct, just slower."""
+        with patch.object(store, "queue_length", new=AsyncMock(return_value=None)):
+            assert await gq.has_restored_backlog() is True

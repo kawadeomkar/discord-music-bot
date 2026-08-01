@@ -158,7 +158,17 @@ def broken_store() -> GuildRedisStore:
     """Store backed by a Redis mock that raises on every operation."""
     r = MagicMock()
     err = ConnectionError("redis down")
-    for attr in ("rpush", "lpop", "lrange", "delete", "hset", "hgetall", "hdel", "set"):
+    for attr in (
+        "rpush",
+        "lpop",
+        "llen",
+        "lrange",
+        "delete",
+        "hset",
+        "hgetall",
+        "hdel",
+        "set",
+    ):
         setattr(r, attr, AsyncMock(side_effect=err))
     pipe = MagicMock()
     for attr in ("rpush", "expire", "lpush", "ltrim", "hset", "delete", "hdel", "lpop"):
@@ -1371,3 +1381,23 @@ class TestClearSongEndState:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.clear_song_end_state()  # must not raise
+
+
+class TestQueueLength:
+    async def test_empty_queue_is_zero(self, store: GuildRedisStore) -> None:
+        assert await store.queue_length() == 0
+
+    async def test_counts_mirror_entries(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        for n in range(3):
+            await store.push_queue(_entry(n))
+        assert await store.queue_length() == 3
+
+    async def test_redis_error_returns_none_not_zero(
+        self, broken_store: GuildRedisStore
+    ) -> None:
+        """None ⇒ unreadable, 0 ⇒ truly empty. Collapsing the two would route
+        a collection enqueue onto the append path behind possible ghosts
+        (GuildQueue.has_restored_backlog treats None as non-empty)."""
+        assert await broken_store.queue_length() is None
