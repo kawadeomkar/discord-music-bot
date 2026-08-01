@@ -569,6 +569,7 @@ class HistoryEntryField:
     THUMBNAIL: Final[str] = "thumbnail"
     UPLOADER: Final[str] = "uploader"
     PLAYED_AT: Final[str] = "played_at"
+    MESSAGE_ID: Final[str] = "message_id"
 
 
 # The play_history column domain (migrations/0001_play_history.sql), mirrored
@@ -584,7 +585,7 @@ _TEXT_FIELDS: Final[tuple[str, ...]] = (
     "uploader",
 )
 _INT4_FIELDS: Final[tuple[str, ...]] = ("duration_secs", "played_secs")
-_INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id")
+_INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id", "message_id")
 _INT4_MAX: Final[int] = 2**31 - 1
 _INT8_MAX: Final[int] = 2**63 - 1
 _TS_MAX: Final[float] = 253402300799.0  # 9999-12-31T23:59:59Z, the timestamptz ceiling
@@ -603,6 +604,13 @@ class HistoryEntry:
     guilds interleave and the drainer maps each to a Postgres row. Entries
     written before the field existed parse as guild_id=0 (the backfill stamps
     those from their key instead — plan §5.6).
+
+    message_id is a WEAK reference by design, and the column comment in
+    migrations/0001_play_history.sql is the long version: the NP host migrates
+    across messages during one song and a dedicated host is deleted when
+    retired, so this records which message hosted the block when the song
+    ended, not a message guaranteed to still exist. That is why it is neither a
+    foreign key nor part of play_history_dedup.
     """
 
     guild_id: int = 0
@@ -615,6 +623,7 @@ class HistoryEntry:
     thumbnail: str = ""
     uploader: str = ""
     played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
+    message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
 
     def __post_init__(self) -> None:
         """Normalize into the play_history column domain at construction.
@@ -640,7 +649,8 @@ class HistoryEntry:
         predate it: migrations/0001 permits webpage_url = '' on backfilled
         entries. A validator that rejected those would break -history for
         precisely the guilds with the most history. Strictness lives in the DB
-        CHECK constraints instead (migrations/0004), where a violation means
+        CHECK constraints instead (migrations/0001_play_history.sql), where a
+        violation means
         "this validator regressed" and cannot retroactively invalidate durable
         data.
 
@@ -664,12 +674,20 @@ class HistoryEntry:
             object.__setattr__(self, "played_at", 0.0)
 
     @classmethod
-    def from_song(cls, song: YTDL, *, guild_id: int, played_at: float) -> Self:
+    def from_song(
+        cls, song: YTDL, *, guild_id: int, played_at: float, message_id: int
+    ) -> Self:
         """Canonical extraction from a finished song. played_at is a
         caller-supplied clock (same pattern as crashed_position_at) so this
         stays a pure field mapping. guild_id is required (keyword) because the
         song object doesn't carry it and a forgotten stamp would silently
         write unattributable outbox entries.
+
+        message_id is required for the same reason, and more strictly: nothing
+        downstream can catch a forgotten one. play_history's CHECK is
+        `message_id >= 0`, so a missed stamp inserts cleanly as 0 and is
+        permanently indistinguishable from a song that genuinely had no host.
+        Pass 0 explicitly for that case.
 
         played_secs is position reached (start_offset + audio delivered),
         capped at the song's duration when known: for a -playnow-interrupted
@@ -692,6 +710,7 @@ class HistoryEntry:
             thumbnail=song.thumbnail or "",
             uploader=song.uploader or "",
             played_at=played_at,
+            message_id=message_id,
         )
 
     def to_redis(self) -> bytes:
@@ -710,6 +729,7 @@ class HistoryEntry:
                 HistoryEntryField.THUMBNAIL: self.thumbnail,
                 HistoryEntryField.UPLOADER: self.uploader,
                 HistoryEntryField.PLAYED_AT: self.played_at,
+                HistoryEntryField.MESSAGE_ID: self.message_id,
             }
         )
 
@@ -746,6 +766,7 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
             thumbnail=str(entry.get(HistoryEntryField.THUMBNAIL) or ""),
             uploader=str(entry.get(HistoryEntryField.UPLOADER) or ""),
             played_at=float(entry.get(HistoryEntryField.PLAYED_AT) or 0.0),
+            message_id=int(entry.get(HistoryEntryField.MESSAGE_ID) or 0),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt history entry dropped: {e}")
