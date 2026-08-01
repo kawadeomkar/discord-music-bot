@@ -174,6 +174,19 @@ _CUTOVER_OFF = frozenset({"", "0", "false", "no", "off"})
 # It is only defensible because the compose postgres service publishes on
 # 127.0.0.1 — an unauthenticated-in-practice database reachable from the network
 # would not be an acceptable default at any level of warning.
+#
+# `.env` is the ONE supported place the real password is set: written by
+# ./setup_env.sh, read by compose and by `just run`'s DSN derivation. A review
+# proposed replacing this shared default with a per-install secret — a generated
+# file behind POSTGRES_PASSWORD_FILE, or having the db-migrate one-shot run
+# setup_env.sh — which removes the shared credential outright. Declined: it adds
+# a second secret store to a value that is set once at install and effectively
+# never rotated (Postgres reads POSTGRES_PASSWORD only when it initializes an
+# empty data directory, so changing it later already means ALTER USER either
+# way). The exposure the proposal targets is instead carried by the loopback
+# binding above and by the two warnings this constant drives. Recorded so the
+# argument is not re-litigated from scratch — it was a decision, not an
+# oversight.
 DEFAULT_POSTGRES_PASSWORD: Final[str] = "password"
 
 
@@ -183,11 +196,34 @@ def using_default_postgres_password() -> bool:
     Parsed out of POSTGRES_URL rather than read from POSTGRES_PASSWORD directly:
     the bot only ever sees the assembled DSN (compose builds it, and `just run`
     derives it), so the password variable is frequently absent from the bot's own
-    environment even when it is set for compose. Reading the DSN is therefore the
-    only check that sees what the bot will actually authenticate with.
+    environment even when it is set for compose.
+
+    SCOPED, deliberately, to the one shape this project's tooling produces: a
+    password in the DSN's userinfo, assembled from `.env`. `.env` is the single
+    supported place the credential is set — the decision that also declined a
+    per-install POSTGRES_PASSWORD_FILE — so an exhaustive resolver would be
+    machinery for configurations we do not support.
+
+    The cost is recorded rather than discovered, because it is a fail-OPEN cost —
+    the advisory goes silent while the host stays on the shared default. asyncpg
+    accepts three shapes this misses, and all three are hand-written DSNs:
+
+      * `?password=` in the query string. asyncpg honours it; to urlsplit the
+        query is opaque, so this reads as "no password at all".
+      * a password containing an unescaped `@`. asyncpg partitions the netloc on
+        the FIRST `@` and urlsplit on the LAST, so `u:p@ss@host/db` authenticates
+        as `p` but reads here as `p@ss`.
+      * `PGPASSWORD` exported in the environment, asyncpg's fallback when the DSN
+        names no password. Nothing in this repo sets it.
+
+    None is reachable from compose or `just run`. If an external Postgres ever
+    becomes a supported deployment, this is the function that has to grow — the
+    ladder is asyncpg's own: DSN userinfo → DSN query → PGPASSWORD → passfile,
+    in `asyncpg.connect_utils._parse_connect_dsn_and_args`.
 
     Never raises — it feeds a startup warning and a -ping row, and a malformed
-    DSN is the archive's problem to report, not this function's.
+    DSN is the archive's problem to report, not this function's. A crash here
+    would take down startup over an advisory.
     """
     url = postgres_url()
     if not url:
@@ -198,7 +234,7 @@ def using_default_postgres_password() -> bool:
         return False
     # unquote because SplitResult.password does NOT percent-decode, so a DSN
     # carrying %70assword would otherwise read as a different credential than
-    # the identical one written literally.
+    # the identical one written literally. asyncpg decodes it, so we must too.
     return password is not None and unquote(password) == DEFAULT_POSTGRES_PASSWORD
 
 

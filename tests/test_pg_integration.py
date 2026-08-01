@@ -49,7 +49,7 @@ from src.redis_client import (
     ensure_outbox_group,
 )
 
-from tests.helpers import tier_enabled
+from tests.helpers import bind_loopback_only, tier_enabled
 
 # POSTGRES_TEST_URL enables the tier on its own, deliberately. If it only
 # *selected the provider* and RUN_PG_TESTS still had to be set as well, a CI job
@@ -105,7 +105,9 @@ def admin_dsn() -> Iterator[str]:
 
     from testcontainers.postgres import PostgresContainer
 
-    with PostgresContainer(_PG_IMAGE, username="test", password="test") as pg:
+    pg = PostgresContainer(_PG_IMAGE, username="test", password="test")
+    bind_loopback_only(pg, 5432)
+    with pg:
         yield (
             f"postgresql://test:test@{pg.get_container_host_ip()}"
             f":{pg.get_exposed_port(5432)}/{pg.dbname}"

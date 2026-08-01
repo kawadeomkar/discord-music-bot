@@ -575,6 +575,14 @@ db-rejects COUNT='10':
 db-backup:
     #!/usr/bin/env bash
     {{ _dotenv }}
+    # A dump is the whole play_history table — every guild id, user id and song
+    # title the bot has ever recorded — and the shell's redirect below creates it
+    # under the ambient umask, which is 022 on a stock macOS or Ubuntu account.
+    # That published the entire history to every local account, in a directory
+    # (`backups/`) that then accumulates them. Set here rather than chmod'ing
+    # after the fact so the file is never briefly world-readable, and so the
+    # `backups/` mkdir is covered by the same rule.
+    umask 077
     mkdir -p backups
     out="backups/play_history_$(date +%F_%H%M%S).dump"
     # Dump to a temp file and rename only on success. Redirecting straight into

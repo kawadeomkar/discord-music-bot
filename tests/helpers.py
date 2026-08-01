@@ -133,3 +133,26 @@ def tier_enabled(*env_vars: str) -> bool:
         os.getenv(name, "").strip().lower() not in ("", "0", "false", "no")
         for name in env_vars
     )
+
+
+def bind_loopback_only(container: Any, port: int) -> None:
+    """Publish `port` on 127.0.0.1 instead of every interface.
+
+    Docker's default binding is 0.0.0.0, so a plain testcontainer puts its
+    throwaway database on the LAN for the length of a run — `just test-pg` is
+    ~45s of `test`/`test` reachable from any machine on the same coffee-shop
+    wifi, and the redis tier the same with no auth at all. The contents are
+    synthesized fixtures, so the exposure is the surface (an unauthenticated
+    Redis, a Postgres 18 with a two-letter password), not the data.
+
+    This matches what docker-compose.yml already does for every service it
+    publishes — the whole `network_mode: host` / loopback analysis the compose
+    file rests on — so the test tiers agreeing with it is the point.
+
+    Mechanism: testcontainers passes `.ports` straight through to docker-py's
+    `containers.run(ports=...)`, which accepts `(host_ip, host_port)` where a
+    bare port would go. `None` keeps the random-high-port assignment, so
+    `get_exposed_port()` resolves exactly as before. Must be called BEFORE the
+    container starts, since that dict is read once at `run`.
+    """
+    container.ports[port] = ("127.0.0.1", None)

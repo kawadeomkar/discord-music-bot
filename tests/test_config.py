@@ -4,6 +4,8 @@ default-credential detector."""
 import importlib
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from collections.abc import Iterator
 from types import ModuleType
@@ -271,7 +273,15 @@ class TestHistoryRedisCutoverParsing:
 
 class TestDefaultPostgresPassword:
     """compose defaults POSTGRES_PASSWORD so `docker compose up` works with only
-    a Discord token. The bot has to be able to tell that it did."""
+    a Discord token. The bot has to be able to tell that it did.
+
+    Scoped to DSNs this project's tooling assembles from `.env`, which is the
+    only supported place the password is set. Shapes asyncpg accepts but compose
+    and `just run` cannot emit (`?password=`, `PGPASSWORD`, an unescaped `@` in
+    the password) are deliberately undetected — see using_default_postgres_password
+    for the ladder that would have to come back if an external Postgres ever
+    becomes supported.
+    """
 
     def test_true_when_the_dsn_carries_the_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -311,7 +321,10 @@ class TestDefaultPostgresPassword:
     def test_url_encoded_default_is_still_recognised(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # urlsplit percent-decodes, so an escaped form cannot slip past.
+        # asyncpg unquotes the netloc password, so an escaped form is the same
+        # credential and must not slip past. Note the detector has to unquote it
+        # ITSELF: SplitResult.password does not percent-decode, which is the
+        # opposite of what an earlier version of this comment claimed.
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://musicbot:%70assword@127.0.0.1:5432/musicbot"
         )
@@ -423,3 +436,46 @@ class TestComposeMatchesTheDefault:
         # Three interpolations = the bot, the postgres service, and the two
         # one-shots' DSNs.
         assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4
+
+
+class TestSetupEnvTightensTheEnvFile:
+    """setup_env.sh is the escape hatch from the shared default, so the file it
+    writes the replacement into must not be world-readable.
+
+    Run rather than grepped, unlike the drift checks above. The behaviour is an
+    interaction between `stat`, `chmod` and `mv` across two platforms' stat
+    spellings, and a source-text assertion would hold just as well for a
+    `chmod go-rwx` placed on the wrong side of the `mv` (that one dies with a
+    non-zero exit rather than silently, but only because the temp file is gone
+    by then — nothing about the grep would have told you which).
+
+    The script `cd`s to its own directory, so it is copied into a tmpdir first:
+    pointed at the checkout it would rewrite the developer's real .env and mint
+    a password the running Postgres was never initialized with.
+    """
+
+    @staticmethod
+    def _run(mode: int, tmp_path: Path) -> int:
+        root = Path(__file__).resolve().parent.parent
+        for name in ("setup_env.sh", "build_common.sh", ".env.example"):
+            shutil.copy(root / name, tmp_path / name)
+        env = tmp_path / ".env"
+        env.write_text("DISCORD_TOKEN=x\n")
+        env.chmod(mode)
+        subprocess.run(
+            ["bash", str(tmp_path / "setup_env.sh"), "--force"],
+            check=True,
+            capture_output=True,
+        )
+        assert "POSTGRES_PASSWORD=" in env.read_text()
+        return env.stat().st_mode & 0o777
+
+    def test_a_hand_made_world_readable_env_is_narrowed(self, tmp_path: Path) -> None:
+        # `cp .env.example .env` by hand lands at 644 under the usual umask, and
+        # this script is what then writes a freshly generated credential into it.
+        assert self._run(0o644, tmp_path) == 0o600
+
+    def test_a_stricter_mode_survives(self, tmp_path: Path) -> None:
+        # Narrowing only: go-rwx clears bits and never sets them, so an operator
+        # who chose 400 keeps 400.
+        assert self._run(0o400, tmp_path) == 0o400

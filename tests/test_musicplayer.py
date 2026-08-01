@@ -1523,8 +1523,15 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(
             mock_song, position_override=210.0
         )
-        assert fmt_duration(210) in described(embed)
-        assert fmt_duration(30) not in described(embed)
+        # Scoped to the bar line, not the whole description, because the
+        # description also carries "Estimated finish: <wall clock>" — and
+        # fmt_duration(30) is "0:30", a substring of "10:30 PM PST". The
+        # unscoped assertion therefore failed for the two real minutes a day
+        # when the ETA lands at 10:30, on a suite that is otherwise
+        # deterministic. Caught at 10:27 PM PST; it had never fired in CI.
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(210) in bar_line
+        assert fmt_duration(30) not in bar_line
 
     def test_no_override_falls_back_to_live_position(
         self, music_player: MusicPlayer, mock_song: MagicMock
