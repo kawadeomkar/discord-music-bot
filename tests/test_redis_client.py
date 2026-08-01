@@ -14,6 +14,7 @@ from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.guild_state import (
@@ -26,6 +27,7 @@ from src.guild_state import (
 )
 from tests.helpers import mocked
 from src.redis_client import (
+    GUILD_TTL,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
@@ -418,15 +420,19 @@ class TestPushHistory:
         items = await fake_redis.lrange(store.history_key(), 0, -1)
         assert items[0] == _hentry(2).to_redis()  # newest first
 
-    async def test_no_trim_history_is_unbounded(
+    async def test_the_trim_keeps_the_NEWEST_window(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        # The Redis list is the source of truth for ALL played songs — a trim
-        # here would silently discard history (docs/HISTORY_OVERHAUL_PLAN.md §4).
+        # Direction matters and LTRIM's argument order is easy to invert: the
+        # list is newest-first, so `0, LIMIT-1` keeps the head. Keeping the tail
+        # instead would leave -history rendering a guild's oldest 50 plays
+        # forever — bounded, PERSISTed, and wrong, which no length assertion
+        # can see.
         for i in range(HISTORY_CACHE_LIMIT + 5):
             await store.push_history(_hentry(i))
         items = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert len(items) == HISTORY_CACHE_LIMIT + 5
+        assert len(items) == HISTORY_CACHE_LIMIT
+        assert items[0] == _hentry(HISTORY_CACHE_LIMIT + 4).to_redis()
 
     async def test_history_key_is_persistent(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
@@ -1257,11 +1263,119 @@ class TestPushHistoryAtomicity:
         assert direct == []
 
 
+class TestHistoryRetention:
+    """The whole retention policy for guild:{id}:history, which is two commands
+    and no configuration: LTRIM to the window, PERSIST so nothing expires it."""
+
+    """Phase C of the Postgres plan: once Postgres is the source of truth, the
+    Redis history list demotes from unbounded source-of-truth to a bounded
+    display cache. Off by default — flipping it before the backfill has run
+    destroys the only copy of every play older than the cache window."""
+
+    async def test_the_list_is_capped_and_never_expires(
+        self, fake_redis: Redis
+    ) -> None:
+        """Both halves of the retention policy, together, because either one
+        alone is a defect.
+
+        Capped without PERSIST would be a 24h display cache — and -history has
+        no second source, so a guild idle for a day would answer with silence.
+        PERSISTed without the cap would be an unbounded non-evictable key, the
+        OOM shape the ISSUE header above describes. There is no flag: this is
+        the only retention this key has.
+        """
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_an_inherited_ttl_is_cleared_by_the_next_write(
+        self, fake_redis: Redis
+    ) -> None:
+        # A key written by a build that DID expire this list must not keep that
+        # TTL: one song end per guild is the whole migration, and it is the
+        # PERSIST above that performs it.
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        await fake_redis.lpush(store.history_key(), _hentry(0).to_redis())
+        await fake_redis.expire(store.history_key(), GUILD_TTL)
+        assert await fake_redis.ttl(store.history_key()) > 0
+        await store.push_history(_hentry(1))
+        assert await fake_redis.ttl(store.history_key()) == -1
+
+    async def test_an_oom_refusal_trims_then_retries(
+        self,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """REGRESSION: a full Redis could not self-heal.
+
+        LPUSH carries Redis' `denyoom` flag and is queued FIRST, so at the cap
+        the server refuses it at queue time and EXEC aborts: measured on
+        redis:7-alpine, llen unchanged at 386 and TTL still -1, with the LTRIM
+        never running. Reordering inside the MULTI does not help. And because
+        @_guild_op swallows OutOfMemoryError into one warning per song, the
+        dropped play was silent.
+
+        A bare LTRIM is NOT denyoom and frees the memory, so the one command
+        that can make room is exactly what can still run. Simulated here by
+        failing the first pipeline execute the way a real server does.
+        """
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 10):
+            await fake_redis.lpush(store.history_key(), _hentry(n).to_redis())
+
+        # The ORDER is the assertion, not the end state: the retried pipeline
+        # contains an LTRIM of its own, so the list ends at the cap whether or
+        # not the bare trim ran. Only against a real server
+        # does that difference matter — there the retry fails again without it —
+        # so what has to be pinned here is that a standalone LTRIM happened
+        # BETWEEN the refusal and the retry.
+        seq: list[str] = []
+        real_execute = Pipeline.execute
+        real_ltrim = fake_redis.ltrim
+
+        async def failing_once(self: Any, *a: Any, **k: Any) -> Any:
+            seq.append("execute")
+            if seq.count("execute") == 1:
+                raise OutOfMemoryError(
+                    "OOM command not allowed when used memory > 'maxmemory'."
+                )
+            return await real_execute(self, *a, **k)
+
+        async def recording_ltrim(*a: Any, **k: Any) -> Any:
+            seq.append("bare-ltrim")
+            return await real_ltrim(*a, **k)
+
+        monkeypatch.setattr(Pipeline, "execute", failing_once)
+        monkeypatch.setattr(fake_redis, "ltrim", recording_ltrim)
+        await store.push_history(_hentry(999))
+
+        assert seq == ["execute", "bare-ltrim", "execute"]
+        # …and the play landed rather than being lost to the refusal.
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert "at maxmemory" in caplog.text
+
+    async def test_trimming_the_list_never_affects_the_outbox(
+        self, fake_redis: Redis
+    ) -> None:
+        # The outbox is what makes entries durable; trimming the DISPLAY list
+        # must not drop anything on its way to Postgres. With the list capped
+        # this is the only copy an un-drained play has.
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(n))
+        assert await outbox_depth(fake_redis) == HISTORY_CACHE_LIMIT + 5
+        assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
+
+
 class TestGetHistory:
     async def test_returns_up_to_cache_limit_items(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        # The read stays bounded even though the list is unbounded.
+        # The read is bounded independently of the write-side cap, so a list
+        # left long by an older build still reads as one window.
         for i in range(HISTORY_CACHE_LIMIT + 10):
             await fake_redis.lpush(store.history_key(), _hentry(i).to_redis())
         items = await store.get_history()

@@ -1,12 +1,13 @@
 """Tests for src/guild_history.py — the history domain class.
 
 The property under test mirrors test_guild_queue's: after every operation the
-in-memory display cache and the Redis leg agree on their shared window. The
-cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded and PERSISTed.
+in-memory display cache and the Redis leg agree on their shared window. Both are
+capped at HISTORY_CACHE_LIMIT, and the Redis leg carries no TTL — bounded by
+length, retained forever, because it is the only thing -history reads.
 
-Writes fan out to Postgres (TestAddOutboxRouting); reads do not
-(TestRecentIsRedisOnly). TestRecentWindowIsComplete asserts the arithmetic that
-makes reading one leg enough.
+Writes still fan out to Postgres (TestAddOutboxRouting); reads do not
+(TestRecentIsRedisOnly). TestRecentWindowIsTheCap asserts the arithmetic that
+makes reading one leg complete.
 """
 
 import asyncio
@@ -74,7 +75,7 @@ class TestAdd:
         await h.add(_entry(1))
         assert list(h) == [_entry(1)]
 
-    async def test_cache_capped_redis_leg_unbounded(
+    async def test_both_legs_are_capped_at_the_same_window(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         h = _history(store)
@@ -83,10 +84,13 @@ class TestAdd:
         # The cache holds only the newest window…
         assert len(h) == HISTORY_CACHE_LIMIT
         assert h[0] == _entry(5)  # oldest cached = first evicted survivor
-        # …while every entry landed in Redis.
+        # …and so does Redis. The list used to be unbounded here, a complete
+        # second copy of every play; it is now trimmed to the same window on
+        # every write, which is what makes it a bounded, permanently-retained
+        # key rather than one that grows for the life of the guild.
         raw = await fake_redis.lrange(store.history_key(), 0, -1)
-        assert len(raw) == HISTORY_CACHE_LIMIT + 5
-        # Non-evictable: no TTL, because -history has no other source.
+        assert len(raw) == HISTORY_CACHE_LIMIT
+        # Non-evictable, still: no TTL, because -history has no other source.
         assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_cache_matches_newest_slice_of_redis(
@@ -317,15 +321,30 @@ class TestRecentIsRedisOnly:
         assert await h.recent(limit) == []
 
 
-class TestRecentWindowIsComplete:
+class TestRecentWindowIsTheCap:
     """The arithmetic the whole Redis-only read path rests on.
 
-    get_history reads the newest HISTORY_CACHE_LIMIT entries and
-    musicbot.HISTORY_MAX_LIMIT is pinned to the same constant — so the list
-    provably holds every play -history can be asked for. Break either and the
-    command silently starts losing depth, which is why the relationship is
-    asserted rather than left to the comments that state it.
+    push_history trims to HISTORY_CACHE_LIMIT, get_history reads that whole
+    window, and musicbot.HISTORY_MAX_LIMIT is pinned to the same constant — so
+    the list provably holds every play -history can be asked for. Break any of
+    the three and the command silently starts losing depth, which is why the
+    relationship is asserted rather than left to the comments that state it.
     """
+
+    async def test_the_list_is_capped_at_the_cache_limit(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The RAW list, not get_history()'s capped read.
+
+        REGRESSION: the predecessor asserted on `len(get_history())`, which is
+        itself `LRANGE key 0 HISTORY_CACHE_LIMIT-1` and therefore reads 50
+        whether the stored list holds 50 or 60. It could not observe a trim at
+        all. llen is the assertion that can.
+        """
+        h = _history(store)
+        for n in range(HISTORY_CACHE_LIMIT + 10):
+            await h.add(_entry(n))
+        assert await store.redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
 
     async def test_the_command_ceiling_cannot_outrun_the_window(self) -> None:
         # Imported here rather than at module scope: this is the one assertion

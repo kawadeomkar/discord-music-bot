@@ -1,12 +1,12 @@
 """
 GuildHistory — a guild's played-song history for one guild.
 
-The domain twin of GuildQueue, one layer smaller. Two legs: the Redis
-guild:{id}:history list (unbounded and PERSISTed — a complete record of every
-play) and an in-memory deque of the newest HISTORY_CACHE_LIMIT entries. Owning
-both privately means they can only move together: every add() lands on the deque
-and the Redis list in one step, and restore() refills the deque from the newest
-slice of the list.
+The domain twin of GuildQueue, one layer smaller. Two legs, both bounded at
+HISTORY_CACHE_LIMIT and both holding the same thing: the Redis
+guild:{id}:history list (capped and PERSISTed by push_history) and an in-memory
+deque of the same window. Owning both privately means they can only move
+together: every add() lands on the deque and the Redis list in one step, and
+restore() refills the deque from the newest slice of the list.
 
 WRITES fan out to a third place, READS do not, and that asymmetry is the whole
 design. add() also XADDs every entry onto the global Postgres outbox stream — in
@@ -16,13 +16,13 @@ outbox/drainer split keeps the playback loop on Redis-only latency.
 
 But recent() never asks Postgres. -history is a display command with a fixed
 window (musicbot.HISTORY_MAX_LIMIT, pinned to HISTORY_CACHE_LIMIT), and the
-Redis list is guaranteed to hold that window: get_history() returns its newest
-HISTORY_CACHE_LIMIT entries, and the list is written synchronously at song end,
-so it LEADS the archive rather than lagging it. Reading Postgres could only add
-rows older than the window, or duplicates of rows already in it that would have
-to be reconciled across the timestamptz boundary — µs-truncated timestamps
-against raw floats, and an archive leg that looks full while the newest plays
-are still in the outbox.
+Redis list is guaranteed to hold that window: it is written synchronously at
+song end, so it LEADS the archive rather than lagging it, and it is capped at
+exactly the number of entries the command can ask for. Reading Postgres could
+only add rows older than the window or duplicates of rows already in it — which
+is what the deleted three-tier merge spent its complexity reconciling
+(µs-truncated timestamps against raw floats, an archive leg that looked full
+while the newest plays were still in the outbox).
 
 The archive keeps every play regardless, and PostgresHistoryArchive.recent
 stays as the read surface for the commands built on that record. It is simply
@@ -52,8 +52,7 @@ _READ_TIMEOUT_SECS = 2.0
 
 
 class GuildHistory:
-    """Played songs, oldest-first; deque capped at HISTORY_CACHE_LIMIT, the
-    Redis leg unbounded.
+    """Played songs, oldest-first, capped at HISTORY_CACHE_LIMIT on both legs.
 
     Iteration/len/indexing are exposed directly (the -history command and its
     tests read the cache as a plain sequence); mutation goes through add() and
@@ -105,12 +104,14 @@ class GuildHistory:
         """The `limit` most recently played songs, newest first — the
         -history command's read surface.
 
-        Two legs: the Redis list, then the in-memory deque. Postgres is
-        deliberately absent — see the module docstring. The command's ceiling
-        (HISTORY_MAX_LIMIT in musicbot.py) is pinned to HISTORY_CACHE_LIMIT and
-        get_history() reads exactly that many newest entries, so the Redis leg
-        alone provably contains every play this command can be asked for. There
-        is nothing an archive read could add except rows older than the window.
+        Two legs, and both are the same window: the Redis list, then the
+        in-memory deque. Postgres is deliberately absent — see the module
+        docstring. The command's ceiling (HISTORY_MAX_LIMIT in musicbot.py) is
+        pinned to HISTORY_CACHE_LIMIT, push_history LTRIMs the list to exactly
+        that many entries and PERSISTs it, and get_history() reads that whole
+        window, so the Redis leg alone provably contains every play this
+        command can be asked for. There is nothing an archive read could add
+        except rows older than the window.
 
         The deque is not a duplicate of that argument, it is what answers when
         Redis cannot. It covers the two cases the list leg misses: no store
@@ -122,13 +123,12 @@ class GuildHistory:
         reproduced at Redis-erroring / cache-holding-9, where recent(10)
         returned 1 where the pre-archive code returned 9.
 
-        Dedup is exact. Both legs carry the same `time.time()` float — the
-        deque holds the entry add() appended, the list holds the same entry
-        through orjson, which round-trips a double without loss — so equality is
-        identity here. Reconciling against Postgres would not be: timestamptz is
-        µs-granular and a raw float is finer, so a value and its round trip
-        differ for roughly a third of real timestamps. That is a whole class of
-        identity bug this read path does not have to own.
+        Dedup is exact rather than quantized. Both legs carry the same
+        `time.time()` float — the deque holds the entry add() appended, the list
+        holds the same entry through orjson, which round-trips a double without
+        loss — so equality is identity here. The quantization this once needed
+        existed only to reconcile Postgres' µs-truncated timestamptz with that
+        raw float, and went with the Postgres leg.
 
         The Redis read is BOUNDED at _READ_TIMEOUT_SECS even though
         GuildRedisStore swallows its own errors: swallowing turns a FAILURE into

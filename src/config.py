@@ -106,6 +106,11 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # un-archived plays than let a long Postgres outage grow the non-evictable
 # stream toward Redis' maxmemory can set a cap; the drainer logs every drop at
 # ERROR.
+# A drop here is UNRECOVERABLE, and that is worth knowing before setting a cap.
+# The cap destroys the OLDEST outbox entries, and the guild:{id}:history list is
+# capped at HISTORY_CACHE_LIMIT, so only the newest few plays per guild have a
+# second copy at all. Anything older that the cap discards existed only in the
+# outbox and is gone for good — there is no list to re-read it from.
 # An outage is not the only thing that trips it: the cap is enforced on the
 # drain SUCCESS path too, evaluated after each 100-entry batch, so a healthy
 # drainer working through a burst backlog also trims — discarding rows the very
