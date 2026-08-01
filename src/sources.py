@@ -22,6 +22,7 @@ class URLSource(Enum):
 class SpotifyType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"
+    ALBUM = "album"
 
 
 class YTType(Enum):
@@ -77,15 +78,27 @@ class SoundcloudSource:
     stype: URLSource = URLSource.SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
+def spotify_titles_to_ytsearch(titles: list[str]) -> list[YTSource]:
     return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
+
+
+class UnsupportedSpotifyLinkError(Exception):
+    """A Spotify URL naming a type this bot does not queue (/artist/, /show/, …).
+
+    Deliberately NOT a ValueError: parse_input catches ValueError and falls back
+    to a YouTube search, which would turn an /artist/ link into a nonsense
+    `ytsearch:https://open.spotify.com/...` query instead of an error the user
+    can act on.
+    """
 
 
 def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """
-    Parse a URL into a source dataclass. Raises ValueError if no domain is matched.
+    Parse a URL into a source dataclass. Raises ValueError if no domain is
+    matched, and UnsupportedSpotifyLinkError for a Spotify link type the bot
+    does not queue (that one must NOT be a ValueError — see the class docstring).
 
     domain regex (4 groups):
         group 1/2: http/www prefix
@@ -125,7 +138,13 @@ def parse_url(
         try:
             spotify_type = SpotifyType(path[0])
         except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
+            supported = ", ".join(t.value for t in SpotifyType)
+            # `from None`: the ValueError above is an implementation detail of
+            # the enum lookup; chaining it turns the user-facing error into a
+            # two-traceback log entry (the exact noise the incident log shows).
+            raise UnsupportedSpotifyLinkError(
+                f"Spotify {path[0]!r} links aren't supported — try a {supported} link"
+            ) from None
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):

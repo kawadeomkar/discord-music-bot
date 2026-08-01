@@ -26,10 +26,11 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSpotifyLinkError,
     YTSource,
     YTType,
     parse_input,
-    spotify_playlist_to_ytsearch,
+    spotify_titles_to_ytsearch,
 )
 from src.spotify import Spotify, SpotifyAuthError
 from src.youtube import YTDL, ExtractionError, QueueObject
@@ -492,6 +493,15 @@ class MusicBot(commands.Cog):
         needing per-title YouTube resolution), a ResolvedYoutubePlaylist for a
         YouTube playlist (already resolved), or a bare QueueObject otherwise.
         """
+        if isinstance(source, SpotifySource) and source.type is SpotifyType.ALBUM:
+            # Phase-1 tripwire (docs/SPOTIFY_ALBUM_EXECUTION_PLAN.md): the enum
+            # accepts album URLs but no resolution branch exists yet. Without
+            # this, an album id would fall through to the single-track path and
+            # hit /v1/tracks/{album_id} — a garbage request. Phase 4 replaces
+            # this with the streaming branch.
+            raise UnsupportedSpotifyLinkError(
+                "Album support is landing — not wired up yet"
+            )
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             return ResolvedSpotifyPlaylist(
                 await self._require_spotify().playlist(source.id)
@@ -536,7 +546,7 @@ class MusicBot(commands.Cog):
         enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(titles)
+            qobjs_yt = spotify_titles_to_ytsearch(titles)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
                 send_embed(
@@ -769,7 +779,7 @@ class MusicBot(commands.Cog):
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1])[0]
+            yts = spotify_titles_to_ytsearch(titles[:1])[0]
             return await YTDL.yt_source(
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )
