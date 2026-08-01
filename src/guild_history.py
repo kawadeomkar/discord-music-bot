@@ -61,7 +61,7 @@ _READ_TIMEOUT_SECS = 2.0
 
 class GuildHistory:
     """Played songs, oldest-first; cache capped at HISTORY_CACHE_LIMIT, the
-    Redis leg unbounded.
+    Redis leg unbounded until HISTORY_REDIS_CUTOVER demotes it to the same cap.
 
     Iteration/len/indexing are exposed directly (the -history command and its
     tests read the cache as a plain sequence); mutation goes through add() and

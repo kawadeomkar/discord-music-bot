@@ -2,10 +2,11 @@
 
 The property under test mirrors test_guild_queue's: after every operation the
 in-memory display cache and the Redis leg agree on their shared window. The
-cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded — a
-complete second copy of every played song, though no longer the source of
-truth: Postgres is (docs/HISTORY_OVERHAUL_PLAN.md §4). The read path is three
-tiers merged, and TestRecentReadsPostgresFirst is where that lives.
+cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded — a complete
+second copy of every played song, though no longer the source of truth: Postgres
+is (docs/HISTORY_OVERHAUL_PLAN.md §4). HISTORY_REDIS_CUTOVER ends that: it caps
+the Redis leg too, which is what TestRecentAfterTheCutover exists for. The read
+path is three tiers merged, and TestRecentReadsPostgresFirst is where that lives.
 """
 
 import asyncio
@@ -554,12 +555,19 @@ class TestRecentAfterTheCutover:
         ]
         assert len(got) > HISTORY_CACHE_LIMIT
 
-    async def test_the_newest_play_survives_the_trim_before_it_is_drained(
+    async def test_an_undrained_play_still_renders_post_cutover(
         self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The window the outbox covers: post-cutover the just-played song is in
-        # the trimmed list and the outbox but NOT yet in Postgres. The merge has
-        # to show it, or every -history is one song stale after the cutover.
+        """The window the outbox covers: post-cutover the just-played song is on
+        the (now capped) list and in the outbox but NOT yet in Postgres. The
+        merge has to show it, or every -history is one song stale.
+
+        Renamed from `..._survives_the_trim_...`, which claimed more than it
+        did: one entry against `LTRIM 0 49` is a no-op, so no trim is survived
+        here and setting the flag changes nothing about the outcome. The
+        property is real and worth keeping; the trim is tested next door, on a
+        list long enough for it to bite.
+        """
         monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
         h = _history(store, archive=QuantizingArchive([_entry(1)]))
         await h.add(_entry(2))  # drained nowhere yet

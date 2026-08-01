@@ -11,6 +11,7 @@ import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.retry import Retry
@@ -708,9 +709,20 @@ class GuildRedisStore:
 
     def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for the TTL-managed guild keys onto an existing
-        pipeline. The history key is deliberately absent: full history is
-        retained indefinitely (PERSISTed by push_history), so it must never be
-        re-armed with an idle expiry."""
+        pipeline. The history key is deliberately absent, and the reason changed
+        at the cutover without the exclusion changing:
+
+        Pre-cutover it is PERSISTed and holds every play, so re-arming an idle
+        expiry here would put a TTL on the durable second copy.
+
+        Post-cutover push_history OWNS that key's TTL — it EXPIREs on every
+        write — and this must not also refresh it, because the two would then
+        disagree about what the clock measures. The consequence is deliberate
+        and worth stating: the display cache expires 24h after the last SONG
+        END, not after the last guild activity, so a guild that stays connected
+        on a long track past that loses its cache and -history is served from
+        Postgres alone. That is a correct degradation (recent()'s archive leg is
+        unconditional) rather than an oversight."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
@@ -913,8 +925,21 @@ class GuildRedisStore:
         HISTORY_CACHE_LIMIT and re-apply the ordinary 24h idle TTL. ONLY flip
         this after `just db-backfill` has run and reported zero failures:
         trimming first destroys the only copy of every play older than the cache
-        window. Read per call rather than captured at import so the flag is
-        flippable without an image rebuild (and monkeypatchable in tests).
+        window.
+
+        LAZY, and that bounds what the flag can promise: a guild's list is
+        reclaimed only at that guild's NEXT song end, because this is the sole
+        writer to the key and the shared TTL paths deliberately skip it. A guild
+        that never plays again keeps its unbounded, TTL-less list forever — and
+        dormant guilds are exactly where the historic bulk accumulated. Enabling
+        the flag is therefore a bound on future growth plus opportunistic
+        reclamation, not a sweep; reclaiming the rest means DELing those keys by
+        hand once the backfill has them.
+
+        Read per call rather than captured at import for the same reason
+        postgres_url() is: tests monkeypatch the environment per case. Note this
+        one IS on a hot path (every song end) — measured at 928 ns, which is
+        0.2% of the round trip it rides along with, so it stays a call.
 
         The outbox is unaffected either way. It never becomes evictable and
         never gains a TTL, before or after the cutover — see the eviction note
@@ -947,9 +972,60 @@ class GuildRedisStore:
         separately from the drain path's retry story.
         """
         wire = serialize_history_entry(entry)
+        cut_over = history_redis_cutover()
+        try:
+            await self._push_history_pipeline(wire, cut_over=cut_over)
+        except OutOfMemoryError:
+            if not cut_over:
+                raise
+            # THE CUTOVER CANNOT RESCUE AN ALREADY-FULL REDIS WITHOUT THIS, and
+            # that is the state operators reach for it in. LPUSH carries Redis'
+            # `denyoom` flag and is queued FIRST, so once used_memory exceeds
+            # maxmemory with nothing evictable the server refuses it at queue
+            # time, the CAS is dirtied, and EXEC aborts — measured on
+            # redis:7-alpine: llen unchanged at 386, TTL still -1, the LTRIM and
+            # EXPIRE never ran. Reordering inside the MULTI does not help; EXEC
+            # still aborts on the refused LPUSH wherever it sits.
+            #
+            # A bare LTRIM is allowed at the cap (it is not denyoom) and frees
+            # the memory immediately, so the trim this flag exists to perform is
+            # exactly the thing that can still run. Do it, then retry once: the
+            # push now has room and the play is not lost.
+            #
+            # Without this the flag looks inert at the worst possible moment —
+            # @_guild_op swallows OutOfMemoryError into one warning per song,
+            # so an operator enabling the cutover AS REMEDIATION would see no
+            # trim, no error, and no change.
+            log.warning(
+                f"guild {self.guild_id}: Redis is at maxmemory and refused the "
+                f"history write; trimming to {HISTORY_CACHE_LIMIT} entries and "
+                f"retrying"
+            )
+            await self.redis.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            await self._push_history_pipeline(wire, cut_over=cut_over)
+
+    async def _push_history_pipeline(self, wire: bytes, *, cut_over: bool) -> None:
+        """The one transactional write, factored out so the OOM path above can
+        re-issue it verbatim rather than restate it."""
         pipe = self.redis.pipeline()
         pipe.lpush(self.history_key(), wire)
-        if history_redis_cutover():
+        if cut_over:
+            # UNPAGED on purpose, unlike HistoryOutboxDrainer._enforce_cap,
+            # which pages its trim at CAP_PAGE=10_000 against the same hazard
+            # class. The difference is that this one is bounded and happens
+            # once: LTRIM is O(N) in elements removed, so the FIRST push after
+            # the flag flips pays for a guild's whole accumulated list, and
+            # every push after that trims 51→50 in O(1). Measured on
+            # redis:7-alpine 7.4.9 — 0.24 ms at 10k entries, 6.3 ms at 100k,
+            # ~22 ms at 500k, with another guild's playback write seeing head-
+            # of-line blocking equal to that duration. The ceiling is physics
+            # rather than discipline: at the compose maxmemory of 256mb a single
+            # guild's list cannot exceed ~500k entries. Nothing in the codebase
+            # trips on a 30 ms stall (no socket_timeout on the pool, a 5s
+            # healthcheck, a 2s bound on the -history read, and audio is never
+            # Redis-gated), and a plausible guild — 10k plays is ~8 months of
+            # continuous playback — pays 0.24 ms. Paging it would mean carrying
+            # cursor state across song ends to save a quarter of a millisecond.
             pipe.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
             pipe.expire(self.history_key(), GUILD_TTL)
         else:
@@ -1141,7 +1217,8 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def refresh_ttl(self) -> None:
         """Refresh GUILD_TTL on the TTL-managed guild keys. History is excluded
-        for the same reason as in _pipe_expire_all: the key is persistent."""
+        for the reasons _pipe_expire_all gives — which differ either side of the
+        cutover, but leave the exclusion correct in both."""
         pipe = self.redis.pipeline()
         self._pipe_expire_all(pipe)
         await pipe.execute()

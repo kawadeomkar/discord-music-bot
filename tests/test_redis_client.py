@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 import orjson
 import pytest
 import redis.asyncio as aioredis
+from redis.exceptions import OutOfMemoryError
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
 from redis.backoff import ExponentialBackoff
@@ -1176,6 +1177,82 @@ class TestHistoryRedisCutover:
             await store.push_history(_hentry(n))
         assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
         assert 0 < await fake_redis.ttl(store.history_key()) <= GUILD_TTL
+
+    async def test_an_oom_refusal_trims_then_retries(
+        self,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """REGRESSION: the cutover could not rescue an already-full Redis —
+        the one state an operator reaches for it in.
+
+        LPUSH carries Redis' `denyoom` flag and is queued FIRST, so at the cap
+        the server refuses it at queue time and EXEC aborts: measured on
+        redis:7-alpine, llen unchanged at 386 and TTL still -1, with the LTRIM
+        and EXPIRE never running. Reordering inside the MULTI does not help.
+        And because @_guild_op swallows OutOfMemoryError into one warning per
+        song, the flag looked simply inert.
+
+        A bare LTRIM is NOT denyoom and frees the memory, so the trim this flag
+        exists to perform is exactly what can still run. Simulated here by
+        failing the first pipeline execute the way a real server does.
+        """
+        monkeypatch.setenv("HISTORY_REDIS_CUTOVER", "1")
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 10):
+            await fake_redis.lpush(store.history_key(), _hentry(n).to_redis())
+
+        # The ORDER is the assertion, not the end state: with the cutover on,
+        # the retried pipeline contains an LTRIM of its own, so the list ends at
+        # the cap whether or not the bare trim ran. Only against a real server
+        # does that difference matter — there the retry fails again without it —
+        # so what has to be pinned here is that a standalone LTRIM happened
+        # BETWEEN the refusal and the retry.
+        seq: list[str] = []
+        real_execute = Pipeline.execute
+        real_ltrim = fake_redis.ltrim
+
+        async def failing_once(self: Any, *a: Any, **k: Any) -> Any:
+            seq.append("execute")
+            if seq.count("execute") == 1:
+                raise OutOfMemoryError(
+                    "OOM command not allowed when used memory > 'maxmemory'."
+                )
+            return await real_execute(self, *a, **k)
+
+        async def recording_ltrim(*a: Any, **k: Any) -> Any:
+            seq.append("bare-ltrim")
+            return await real_ltrim(*a, **k)
+
+        monkeypatch.setattr(Pipeline, "execute", failing_once)
+        monkeypatch.setattr(fake_redis, "ltrim", recording_ltrim)
+        await store.push_history(_hentry(999))
+
+        assert seq == ["execute", "bare-ltrim", "execute"]
+        # …and the play landed rather than being lost to the refusal.
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
+        assert "at maxmemory" in caplog.text
+
+    async def test_an_oom_refusal_pre_cutover_is_not_swallowed_into_a_trim(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The recovery is cutover-only ON PURPOSE. Pre-cutover the list is the
+        # unbounded second copy of every play, so trimming it to escape an OOM
+        # would destroy exactly the data the flag has not yet made safe to lose.
+        monkeypatch.delenv("HISTORY_REDIS_CUTOVER", raising=False)
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT + 10):
+            await fake_redis.lpush(store.history_key(), _hentry(n).to_redis())
+
+        async def always_oom(self: Any, *a: Any, **k: Any) -> Any:
+            raise OutOfMemoryError("OOM command not allowed")
+
+        monkeypatch.setattr(Pipeline, "execute", always_oom)
+        await store.push_history(_hentry(999))  # @_guild_op swallows
+
+        # Untouched: no trim, nothing lost.
+        assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT + 10
 
     async def test_cutover_never_affects_the_outbox(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch

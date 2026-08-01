@@ -83,8 +83,8 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and
-    # must never become eviction candidates:
+    # volatile-lru, NOT allkeys-lru. One key must NEVER become an eviction
+    # candidate, and a second one must not until the cutover says so:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
     #                       Evicting one loses that play silently — no error,

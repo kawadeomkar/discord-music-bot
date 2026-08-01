@@ -423,7 +423,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the bot runs on host networking and connects through this port |
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
 | `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg prepared-statement cache size per connection. **Set to `0` behind PgBouncer in transaction-pooling mode** — prepared statements are per-connection state, and transaction pooling hands each transaction a different backend |
-| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. See [Operating the play-history archive](#operating-the-play-history-archive) |
+| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Opt-in ceiling on the un-archived history outbox. `0` keeps the durability contract: entries leave only once Postgres has them. A non-zero value drops the oldest entries above the cap — data loss, logged at ERROR — for operators who would rather bound Redis memory. Recoverability depends on `HISTORY_REDIS_CUTOVER`: before it, dropped entries are still on the Redis history list and `just db-backfill` retrieves them; after it, anything past the cache window is gone. See [Operating the play-history archive](#operating-the-play-history-archive) |
 | `HISTORY_REDIS_CUTOVER` | | `false` | Phase C switch: demote the Redis history list from unbounded source-of-truth to a bounded display cache (`LTRIM` + 24h TTL). **Only enable after `just db-backfill` has run** — otherwise it trims away the only copy of every older play |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
@@ -481,12 +481,43 @@ part-way is resumed by running it again — there is no "figure out where it sto
 It exits non-zero and prints `INCOMPLETE` if any guild failed, so **re-run until it
 reports zero failures**.
 
-**Order matters, and one direction is unrecoverable.** This must complete *before* the
-cutover that demotes the Redis lists to a capped cache (`HISTORY_REDIS_CUTOVER=1`, which
-arrives with that change) — it trims exactly the entries this command exists to move, and
-Postgres is the only other copy.
+**Order matters, and one direction is unrecoverable.** This must complete *before*
+`HISTORY_REDIS_CUTOVER=1`, which demotes the Redis lists to a capped cache — it trims
+exactly the entries this command exists to move, and Postgres is the only other copy.
+`db-backfill` refuses to report success if the flag is already on: it still moves whatever
+survived, but warns and exits non-zero, because a green run there does not mean the
+history was migrated.
 Verify with the reported guild count and a `SELECT count(*) FROM play_history` before
 enabling the flag.
+
+#### Enabling the cutover
+
+```bash
+# in .env, then restart the bot
+HISTORY_REDIS_CUTOVER=1
+```
+
+Accepted as **on**: `1`, `true`, `yes`, `on`. Accepted as **off**: unset, `0`, `false`,
+`no`, `off`. Anything else is refused at startup with a message listing these — the flag
+is destructive, so it is never guessed at. Case and surrounding whitespace do not matter.
+
+The bot logs which mode it started in on every boot (a WARNING once the cutover is on), so
+`docker compose logs discord-music-bot | grep HISTORY_REDIS_CUTOVER` answers "is this host
+trimming?" without inspecting Redis.
+
+Two things that surprise people afterwards:
+
+- **It is lazy.** A guild's list is trimmed at that guild's *next song end*, not at
+  startup. Dormant guilds — often the ones holding the most history — keep their full
+  lists until they play again, or until you `DEL` those keys by hand once the backfill has
+  them.
+- **`docker stats` will not move.** The reclaim shows up in Redis' `used_memory` (measured:
+  262 MB → 1.6 MB for a 500k-entry list), which is what `maxmemory` and eviction actually
+  gate on, so the OOM risk really is gone. But jemalloc does not return the pages to the
+  OS: RSS stays flat and `mem_fragmentation_ratio` climbs (1.27 → 1.49 over three cycles in
+  testing). Check `redis-cli info memory | grep used_memory:`, not the container's RSS. Add
+  `--activedefrag yes` to the redis command in `docker-compose.yml` if you want the pages
+  back, at some CPU cost.
 
 ### Backlog and sizing
 
@@ -611,16 +642,15 @@ own PITR.
 
 ### Backfill and the Redis cutover
 
-Plays recorded before the archive existed live only on the Redis history lists. Move
-them across once, then (optionally) let Redis demote to a cache:
+Order is load-bearing: **backfill → verify zero failures → `HISTORY_REDIS_CUTOVER=1`**.
+Enabling the cutover first trims away exactly the entries the backfill exists to preserve,
+and Postgres is the only other copy.
 
-```bash
-just db-backfill --dry-run   # report what would move
-just db-backfill             # idempotent and resumable
-```
-
-Order is load-bearing: **backfill → verify → `HISTORY_REDIS_CUTOVER=1`**. Enabling the
-cutover first trims away exactly the entries the backfill exists to preserve.
+The full procedure — dry-run rehearsal, the Docker-only path, and what to check before
+flipping the flag — is under
+[Backfilling history that predates the archive](#backfilling-history-that-predates-the-archive).
+Deliberately not repeated here: two copies of an irreversible runbook is how one of them
+ends up missing the step that matters.
 
 ## Architecture
 

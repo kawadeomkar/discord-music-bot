@@ -106,6 +106,13 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # un-archived plays than let a long Postgres outage grow the non-evictable
 # stream toward Redis' maxmemory can set a cap; the drainer logs every drop at
 # ERROR.
+# HOW RECOVERABLE a drop is depends on HISTORY_REDIS_CUTOVER, which is not
+# obvious and is worth knowing before setting a cap. The cap destroys the OLDEST
+# outbox entries — and pre-cutover those are still on the complete
+# guild:{id}:history list, so `just db-backfill` retrieves every one. Post-cutover
+# only the newest HISTORY_CACHE_LIMIT per guild survive, and a dropped entry
+# older than that window is gone for good. One flag changes the meaning of the
+# other.
 # An outage is not the only thing that trips it: the cap is enforced on the
 # drain SUCCESS path too, evaluated after each 100-entry batch, so a healthy
 # drainer working through a burst backlog also trims — discarding rows the very

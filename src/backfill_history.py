@@ -241,10 +241,17 @@ async def _backfill_one(
                     # cutover is about to delete.
                     #
                     # This is where the backfill diverges from the drainer,
-                    # which drops corrupt entries just as quietly: an outbox
-                    # entry that fails to parse still has its twin on the
-                    # guild:{id}:history list, so nothing is lost. Here that
-                    # list IS the copy, and the next migration step trims it.
+                    # which drops corrupt entries just as quietly. Pre-cutover
+                    # that asymmetry was the whole story: an outbox entry that
+                    # fails to parse still has its twin on the
+                    # guild:{id}:history list, so the drainer loses nothing,
+                    # while here that list IS the copy.
+                    #
+                    # HISTORY_REDIS_CUTOVER=1 closes the drainer's escape too —
+                    # post-cutover the twin survives only 50 further plays, the
+                    # 24h TTL, or eviction. So this log line is the pattern the
+                    # drainer's corrupt-entry path should follow once anyone
+                    # runs the cutover in anger, not a local quirk of this tool.
                     # Logging is the only durable record left — deliberately
                     # not play_history_rejected, which means "Postgres refused
                     # this row" and whose emptiness `just db-rejects` reports
@@ -306,9 +313,12 @@ async def _backfill_one(
     # and picks up entries pushed during the run, which the dedup index absorbs.
     # Coming up SHORT is the opposite — it means entries the initial LLEN
     # counted were not read back, which only a tail-side shrink can cause.
-    # Nothing shrinks these lists from the tail today, so this is latent; it
-    # goes live the moment the cutover's LTRIM ships, and by then the entries it
-    # would eat are the oldest, i.e. exactly the ones this tool exists to save.
+    # This is LIVE, not latent: HISTORY_REDIS_CUTOVER ships in the same stack,
+    # and post-cutover push_history LTRIMs on every song end — from the tail,
+    # eating the oldest entries, i.e. exactly the ones this tool exists to save.
+    # A backfill racing a live bot on a cut-over host is precisely the ordering
+    # mistake _run refuses to call a success, and this warning is how a single
+    # guild's share of it becomes visible.
     if attempted + corrupt < total:
         log.warning(
             f"guild {guild_id}: read {attempted + corrupt} of {total} entries "
