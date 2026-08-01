@@ -413,6 +413,8 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `POSTGRES_DB` | | `musicbot` | Database name on the bundled Postgres service |
 | `POSTGRES_HOST_PORT` | | `5432` | Host port the bundled Postgres publishes on (loopback only). Change it when something else already owns 5432 — the `db-*` recipes run on the host and connect through this port |
 | `POSTGRES_MIGRATE_URL` | | falls back to `POSTGRES_URL` | DSN used by `just db-migrate`, so the migrating role can be one with DDL rights while the bot's role has only `SELECT`/`INSERT` |
+| `HISTORY_OUTBOX_MAX` | | `0` (unbounded) | Ceiling on the play-history outbox, in entries. `0` is the durability contract — an entry only leaves the outbox once Postgres has it. A cap trades that for a bounded non-evictable Redis key during a long Postgres outage, and the trade is paid in **discarded plays**: the oldest un-archived entries are dropped, each logged at ERROR. Must be `>= 0`; a negative value is refused at startup |
+| `POSTGRES_STATEMENT_CACHE` | | `100` | asyncpg's prepared-statement cache size, per connection. Set to `0` behind PgBouncer in transaction-pooling mode, where a cached statement handle can refer to something the newly-assigned backend never prepared |
 | `ENVIRONMENT` | | derived from git branch (`main` → `production`) | Environment name reported in logs/telemetry |
 | `POT_PROVIDER_URL` | | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
