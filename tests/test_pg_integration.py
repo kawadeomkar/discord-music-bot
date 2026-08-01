@@ -28,7 +28,12 @@ import pytest
 from redis.asyncio import Redis
 
 from src.db_migrate import EXPECTED_SCHEMA_VERSION, migrate
-from src.guild_state import HistoryEntry, parse_history_entry
+from src.backfill_history import backfill
+from src.guild_state import (
+    HistoryEntry,
+    parse_history_entry,
+    serialize_history_entry,
+)
 from src.history_archive import (
     _POISON,
     _RECENT_SQL,
@@ -38,6 +43,7 @@ from src.history_archive import (
     quantized_played_at,
 )
 from src.redis_client import (
+    GUILD_HISTORY_KEY,
     HISTORY_OUTBOX_KEY,
     GuildRedisStore,
     ensure_outbox_group,
@@ -926,3 +932,77 @@ class TestDrainerEndToEnd:
         assert by_url["https://yt.com/v=2"].title == "badtitle"
         assert by_url["https://yt.com/v=4"].played_at == 0.0
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
+
+class TestBackfillAgainstARealArchive:
+    """`src/backfill_history.py` against a real Postgres.
+
+    No tier ran this module at all, and it is the one whose entire safety story
+    is "just run it again — the dedup index absorbs it". That claim composes
+    four things the in-memory double cannot model together: a key-derived
+    guild_id, real int8 columns, the `guild_id > 0` CHECK, and executemany's
+    atomicity. `CollectingArchive` has no unique index, so the unit-tier
+    idempotence test can only observe that the TOOL re-sends the same count —
+    after a rerun it holds two copies and nothing looks.
+    """
+
+    async def test_rerunning_is_idempotent_against_the_dedup_index(
+        self, archive: PostgresHistoryArchive, fake_redis: Redis
+    ) -> None:
+        # Legacy wire shape: guild_id=0 on the entry, real id only in the KEY.
+        key = GUILD_HISTORY_KEY.format(guild_id=42)
+        for n in range(5):
+            await fake_redis.lpush(
+                key, serialize_history_entry(replace(_entry(n), guild_id=0))
+            )
+
+        first = await backfill(fake_redis, archive)
+        second = await backfill(fake_redis, archive)
+
+        assert first.ok and second.ok
+        assert first.attempted == second.attempted == 5
+        # THE assertion the unit tier cannot make: the second run inserted
+        # nothing new, because ON CONFLICT collapsed every row.
+        rows = await archive.recent(42, 100)
+        assert len(rows) == 5
+        # …and the key-derived stamp survived the round trip through int8.
+        assert {r.guild_id for r in rows} == {42}
+
+    async def test_a_refused_row_is_contained_and_reported(
+        self, archive: PostgresHistoryArchive, fake_redis: Redis, pg_dsn: str
+    ) -> None:
+        """One guild refused must not cost the others, and must not report ok.
+
+        Driven through a real CHECK violation rather than a fake exception:
+        `guild_id > 0` is the one constraint HistoryEntry.__post_init__ clamps
+        toward rather than away from, so it is the realistic refusal. The tool
+        skips such keys upstream now, so the violation is injected by dropping
+        the entry's guild through a patched key parser — which is exactly the
+        shape a future regression in that guard would take.
+        """
+        import src.backfill_history as bh
+
+        good = GUILD_HISTORY_KEY.format(guild_id=7)
+        bad = GUILD_HISTORY_KEY.format(guild_id=8)
+        await fake_redis.lpush(good, serialize_history_entry(_entry(1, guild_id=7)))
+        # guild_id=0 on the wire, so the KEY-derived id is what gets stamped —
+        # which is the only route by which a poisoned id reaches the insert.
+        await fake_redis.lpush(
+            bad, serialize_history_entry(replace(_entry(2), guild_id=0))
+        )
+
+        real_parse = bh._guild_id_from_key
+
+        def poisoned(key: bytes) -> object:
+            # Guild 8's key parses to 0 — constructible, and refused by the CHECK.
+            return 0 if b":8:" in key else real_parse(key)
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(bh, "_guild_id_from_key", poisoned)
+            report = await backfill(fake_redis, archive)
+
+        assert report.failed_guilds == 1
+        assert report.guilds == 1  # only the guild that moved in full
+        assert not report.ok
+        # Guild 7 still landed — containment is real, not just counted.
+        assert len(await archive.recent(7, 10)) == 1

@@ -299,6 +299,7 @@ run `just check`.
 | Recipe | Does |
 |---|---|
 | `just db-migrate` | Apply pending play-history schema migrations |
+| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before the cutover** |
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
@@ -456,6 +457,35 @@ Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. On its fi
 connection it reads `schema_migrations` and refuses to serve a database older than the
 version it was built for, naming this command. A *newer* database is accepted with a
 warning — migrations are additive, so rolling the bot back must not become an outage.
+
+### Backfilling history that predates the archive
+
+The archive only records songs played *after* it was deployed. Everything already on the
+`guild:{id}:history` lists needs moving across once:
+
+```bash
+just db-backfill --dry-run   # count what would move, write nothing
+just db-backfill             # do it
+
+# Docker-only host (no local venv):
+docker compose run --rm db-backfill --dry-run
+docker compose run --rm db-backfill
+```
+
+Rehearse with `--dry-run` first: it checks the database is reachable and migrated, then
+walks the same keys and reports the same counts without writing.
+
+**Safe to re-run and safe to interrupt.** Every insert is idempotent, so a run that dies
+part-way is resumed by running it again — there is no "figure out where it stopped" step.
+It exits non-zero and prints `INCOMPLETE` if any guild failed, so **re-run until it
+reports zero failures**.
+
+**Order matters, and one direction is unrecoverable.** This must complete *before* the
+cutover that demotes the Redis lists to a capped cache (`HISTORY_REDIS_CUTOVER=1`, which
+arrives with that change) — it trims exactly the entries this command exists to move, and
+Postgres is the only other copy.
+Verify with the reported guild count and a `SELECT count(*) FROM play_history` before
+enabling the flag.
 
 ### Backlog and sizing
 

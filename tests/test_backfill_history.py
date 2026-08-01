@@ -37,6 +37,7 @@ class CollectingArchive:
     def __init__(self) -> None:
         self.rows: list[HistoryEntry] = []
         self.batches = 0
+        self.health_checks = 0
         # Not part of the HistoryArchive protocol, but _run() owns the archive's
         # lifecycle and must close it — asserted by TestCli.
         self.closed = AsyncMock(return_value=None)
@@ -47,6 +48,14 @@ class CollectingArchive:
 
     async def recent(self, guild_id: int, limit: int) -> list[HistoryEntry]:
         return []
+
+    async def health_check(self) -> None:
+        # Not on the HistoryArchive protocol — _run holds the concrete
+        # PostgresHistoryArchive and preflights it before the walk, so that the
+        # dry run learns whether the destination is reachable at all. A double
+        # without this reports the preflight failing, which is the correct
+        # signal: it means the fake is not modelling what the CLI uses.
+        self.health_checks += 1
 
     async def record_rejection(
         self,
@@ -198,18 +207,97 @@ class TestBackfill:
         second = await backfill(fake_redis, archive)
         assert first.attempted == second.attempted == 1
 
-    async def test_sanitizes_poison_entries(self, fake_redis: Redis) -> None:
-        # Legacy rows have never been through the drainer's sanitizer, so the
-        # backfill has to apply it too — otherwise the first bad historical
-        # entry fails a 500-row batch.
+    async def test_legacy_poison_arrives_already_clamped(
+        self, fake_redis: Redis
+    ) -> None:
+        """The PREMISE this tool relies on, characterised at its boundary.
+
+        Renamed from test_sanitizes_poison_entries, whose comment said "the
+        backfill has to apply it too" — the opposite of what the source says
+        ("No sanitize call"), left over from a revision where `_sanitize_entry`
+        was called here. Nothing in this module sanitizes anything; every
+        assertion below holds before a single line of backfill_history runs,
+        because parse_history_entry constructs a HistoryEntry and
+        __post_init__ clamps.
+
+        Kept rather than deleted, and kept HERE rather than moved to
+        test_guild_state, because it is the assumption that lets this module
+        hand legacy bytes straight to executemany. If the clamp ever moves or
+        weakens, this is the test that should make the backfill's reviewer
+        look — the drainer has _isolate as a backstop and this tool does not.
+        """
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await fake_redis.lpush(
             key, orjson.dumps({"title": "bad\x00title", "played_at": 1e18})
         )
         archive = CollectingArchive()
         await backfill(fake_redis, archive)
-        assert archive.rows[0].title == "badtitle"
-        assert archive.rows[0].played_at == 0.0
+        assert archive.rows[0].title == "badtitle"  # NUL scrubbed
+        assert archive.rows[0].played_at == 0.0  # absurd epoch → sentinel
+
+    async def test_an_all_corrupt_page_writes_nothing(self, fake_redis: Redis) -> None:
+        # The `entries and` half of the write guard: no test produced a page
+        # whose entries were ALL corrupt, so dropping it survived. Harmless
+        # today (insert_batch early-returns on empty), but branch coverage
+        # reports the line as fully branched, so the gap is invisible.
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        for _ in range(3):
+            await fake_redis.lpush(key, b"not json")
+        archive = CollectingArchive()
+
+        report = await backfill(fake_redis, archive, page=3)
+
+        assert report.corrupt == 3
+        assert report.attempted == 0
+        assert archive.batches == 0  # not called with an empty list
+
+    async def test_corrupt_entries_log_their_bytes(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """`corrupt: N` was the entire forensic record of entries the cutover
+        is about to delete.
+
+        This is where the backfill has to diverge from the drainer, which drops
+        corrupt entries just as quietly: an unparseable OUTBOX entry still has
+        its twin on the history list, so nothing is lost. Here that list IS the
+        copy. Logging is the only durable record left.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await fake_redis.lpush(key, b'{"deliberately": "unparseable"')
+        await backfill(fake_redis, CollectingArchive())
+
+        assert "corrupt history entry" in caplog.text
+        assert "deliberately" in caplog.text  # the BYTES, not just a count
+        assert "guild:1:history" in caplog.text  # and where they were
+        assert any(r.levelname == "ERROR" for r in caplog.records)
+
+    async def test_a_list_that_shrinks_from_the_tail_is_flagged(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Reconciliation in the direction that can mean loss.
+
+        `attempted` exceeding `total` is normal — the last page's clamped
+        window picks up concurrent pushes, which dedup absorbs. Coming up SHORT
+        means entries the initial LLEN counted were never read, which only a
+        tail-side shrink causes. Nothing shrinks these lists from the tail
+        today; that changes the moment the cutover's LTRIM ships, and the
+        entries it eats are the OLDEST — exactly the ones this tool exists to
+        save. Simulated here with RPOP between pages.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
+        real_lrange = fake_redis.lrange
+
+        async def shrinking_lrange(name: str, start: int, end: int) -> Any:
+            out = await real_lrange(name, start, end)
+            await fake_redis.rpop(key)  # a trim eats the oldest, mid-run
+            return out
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(fake_redis, "lrange", shrinking_lrange)
+            await backfill(fake_redis, CollectingArchive(), page=2)
+
+        assert "the list shrank from the tail" in caplog.text
 
     async def test_ignores_keys_with_an_unparseable_guild_id(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
@@ -227,6 +315,166 @@ class TestBackfill:
         report = await backfill(fake_redis, CollectingArchive())
         assert report.guilds == 0
         assert report.attempted == 0
+
+    async def test_only_history_keys_are_read(self, fake_redis: Redis) -> None:
+        """The key pattern is a safety predicate, and nothing pinned it — the
+        mutation `_HISTORY_KEY_MATCH = "*"` passed every test, because no test
+        seeded a non-history key.
+
+        It matters more than "it would crash on WRONGTYPE" suggests, because
+        parse_history_entry accepts ANY json object and defaults every field:
+        `guild:{id}:queue` is also a LIST, so a pattern drift in that direction
+        inserts never-played songs, counted as `attempted` rather than
+        `corrupt` — no crash, no signal, wrong rows in the durable record.
+        """
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        # One of every other key family in the Redis schema.
+        await fake_redis.hset("guild:1:state", "volume", "50")
+        await fake_redis.rpush(
+            "guild:1:queue", orjson.dumps({"webpage_url": "https://yt.com/v=q"})
+        )
+        await fake_redis.hset("guild:1:now_playing", "title", "x")
+        await fake_redis.set("ytdl:source:whatever", b"{}")
+        await fake_redis.xadd(HISTORY_OUTBOX_KEY, {b"e": b"{}"})
+        archive = CollectingArchive()
+
+        report = await backfill(fake_redis, archive)
+
+        assert report.guilds == 1
+        assert [e.webpage_url for e in archive.rows] == ["https://yt.com/v=1"]
+
+    @pytest.mark.parametrize("bad_id", ["0", "-1", str(2**63)])
+    async def test_keys_outside_the_guild_id_domain_are_skipped(
+        self, fake_redis: Redis, bad_id: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """This tool is the only place that can manufacture an out-of-domain
+        guild_id, and HistoryEntry.__post_init__ CLAMPS rather than validates:
+        `-1` floors to 0 and 2**63 clamps to int8max. play_history's CHECK is
+        strictly `> 0`, so a stamped 0 is constructible and NOT insertable —
+        and executemany is atomic, so it costs the whole batch.
+
+        The clamp is why parseability was not enough. Skipping beats clamping:
+        a key that cannot be attributed to a guild has no correct destination,
+        and inventing one files real plays under the wrong guild silently.
+        """
+        await fake_redis.lpush(
+            f"guild:{bad_id}:history", serialize_history_entry(_entry(1))
+        )
+        await _seed(fake_redis, 7, _entry(2, guild_id=7))  # a good one alongside
+        archive = CollectingArchive()
+
+        report = await backfill(fake_redis, archive)
+
+        assert report.guilds == 1  # only the good key
+        assert [e.guild_id for e in archive.rows] == [7]
+        assert "outside the play_history domain" in caplog.text
+
+    async def test_every_guild_is_enumerated_past_one_scan_page(
+        self, fake_redis: Redis
+    ) -> None:
+        """SCAN is a CURSOR. Every other test here seeds one or two guilds, so
+        a single non-cursor `scan(...)` page passes all of them — measured: the
+        mutation survived all 18.
+
+        Against 250 guilds one `SCAN COUNT 100` page returns 100 keys and a
+        non-zero cursor, so that regression silently skips 150 guilds' entire
+        pre-archive history. Enumeration is the one primitive with no
+        downstream safety net: a guild the scan never yields produces no
+        corrupt count, no log line, and no discrepancy in the report — and the
+        cutover then trims the only copy. fakeredis models the cursor
+        faithfully, so nothing about this needs a real server.
+
+        Seeded past `count=100` on purpose; a smaller number proves nothing.
+        """
+        seeded = 250
+        for gid in range(1, seeded + 1):
+            await _seed(fake_redis, gid, _entry(1, guild_id=gid))
+        archive = CollectingArchive()
+
+        report = await backfill(fake_redis, archive)
+
+        assert report.guilds == seeded
+        assert len(archive.rows) == seeded
+        assert {e.guild_id for e in archive.rows} == set(range(1, seeded + 1))
+
+
+class FailingArchive(CollectingArchive):
+    """An archive that refuses one guild's rows.
+
+    The real PostgresHistoryArchive raises on everything ("callers own the
+    error policy") and uses executemany, so one bad row costs the whole batch.
+    CollectingArchive cannot fail at all, which left every failure path here
+    unpinned — a mutation swallowing insert_batch errors passed all 18 tests.
+    """
+
+    def __init__(self, fail_guild: int) -> None:
+        super().__init__()
+        self.fail_guild = fail_guild
+
+    async def insert_batch(self, entries: Any) -> None:
+        if any(e.guild_id == self.fail_guild for e in entries):
+            raise RuntimeError(f"insert refused for guild {self.fail_guild}")
+        await super().insert_batch(entries)
+
+
+class TestFailureContainment:
+    """What happens when a guild does not move.
+
+    The tool runs once, by hand, immediately before the step that trims the
+    lists it reads — so "did all of it move?" is the only question, and these
+    pin that it can always be answered.
+    """
+
+    async def test_one_failing_guild_does_not_abort_the_others(
+        self, fake_redis: Redis
+    ) -> None:
+        """REGRESSION: every error propagated out of backfill(), so the first
+        failure ended the run — and because _run's summary print sits after its
+        try/finally, the operator got a bare traceback with no report at all.
+        Which guilds were skipped depended on Redis' hash order, so it differed
+        between runs.
+        """
+        for gid in (1, 2, 3):
+            await _seed(fake_redis, gid, _entry(1, guild_id=gid))
+        archive = FailingArchive(fail_guild=2)
+
+        report = await backfill(fake_redis, archive)
+
+        assert report.failed_guilds == 1
+        assert report.guilds == 2  # the two that moved IN FULL, not all three
+        assert {e.guild_id for e in archive.rows} == {1, 3}
+        assert not report.ok
+
+    async def test_a_failed_guild_is_not_counted_as_backfilled(
+        self, fake_redis: Redis
+    ) -> None:
+        # `guilds` gates the operator's confidence, so a guild whose rows did
+        # not land must never inflate it — even though it was visited.
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        report = await backfill(fake_redis, FailingArchive(fail_guild=1))
+        assert report.guilds == 0
+        assert report.failed_guilds == 1
+
+    async def test_an_aborted_scan_is_reported_not_raised(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Enumeration dying is different in kind from a guild failing: the
+        # population itself is unknown, so the counts become a floor rather
+        # than a total and need their own flag.
+        def exploding_scan_iter(*args: Any, **kwargs: Any) -> Any:
+            raise ConnectionError("redis went away mid-scan")
+
+        monkeypatch.setattr(fake_redis, "scan_iter", exploding_scan_iter)
+        report = await backfill(fake_redis, CollectingArchive())
+        assert report.scan_aborted
+        assert not report.ok
+
+    async def test_a_clean_run_is_ok(self, fake_redis: Redis) -> None:
+        # The other side of the verdict — `ok` must not be vacuously false.
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        report = await backfill(fake_redis, CollectingArchive())
+        assert report.ok
+        assert report.failed_guilds == 0
 
 
 class TestCli:
@@ -267,6 +515,195 @@ class TestCli:
         assert len(wired.rows) == 1
         wired.closed.assert_awaited_once()
         cast(Any, backfill_history.close_redis_pool).assert_awaited_once()
+
+    async def test_a_failed_guild_exits_nonzero_and_says_not_to_cut_over(
+        self,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The operator-facing half of the containment fix.
+
+        A partially-applied run must be impossible to mistake for a complete
+        one — by exit code for anything scripted, and in words for the human
+        reading the terminal. Previously an insert failure produced a traceback
+        and NO summary, because the print sits after the try/finally.
+        """
+        archive = FailingArchive(fail_guild=2)
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
+        monkeypatch.setattr(backfill_history, "create_redis_pool", lambda: MagicMock())
+        monkeypatch.setattr(backfill_history, "get_redis", lambda _pool: fake_redis)
+        monkeypatch.setattr(
+            backfill_history, "close_redis_pool", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            backfill_history, "PostgresHistoryArchive", lambda _url: cast(Any, archive)
+        )
+        for gid in (1, 2):
+            await _seed(fake_redis, gid, _entry(1, guild_id=gid))
+
+        assert await backfill_history._run(dry_run=False) == 1
+
+        out = capsys.readouterr()
+        # The summary still printed — the guild that DID move is accounted for.
+        assert "1 guild(s) backfilled" in out.out
+        # …and the verdict names the consequence rather than leaving the
+        # operator to infer it from a count.
+        assert "INCOMPLETE" in out.err
+        assert "1 guild(s) FAILED" in out.err
+        assert "HISTORY_REDIS_CUTOVER" in out.err
+
+    async def test_it_says_what_it_connected_to_with_the_password_redacted(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """ "0 entries scanned" and "wrong Redis" are otherwise the same output.
+
+        REDIS_URL defaults silently to localhost, so forgetting it produces a
+        clean run, exit 0, and a report that reads as "nothing to migrate" —
+        immediately before the step that destroys the source. Naming both
+        endpoints is the only thing that distinguishes them.
+
+        Redacted because operators paste this output into tickets.
+        """
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://bot:hunter2@db.internal/musicbot"
+        )
+        monkeypatch.setenv("REDIS_URL", "redis://cache.internal:6379")
+
+        assert await backfill_history._run(dry_run=True) == 0
+
+        out = capsys.readouterr().out
+        assert "cache.internal" in out
+        assert "db.internal" in out
+        assert "hunter2" not in out  # password never printed
+        assert "bot:***@" in out  # …but the user is, so the DSN is identifiable
+
+    async def test_an_unreachable_database_fails_before_the_walk(
+        self,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """REGRESSION: --dry-run validated nothing about Postgres.
+
+        The archive pool is lazy — connect and the schema-version check live in
+        _ensure(), reached only from insert_batch, which a dry run never calls.
+        So a rehearsal against a dead host, wrong credentials or an unmigrated
+        schema walked the whole keyspace and reported success with exit 0,
+        which is precisely the thing the rehearsal exists to catch.
+
+        Also asserts it fails BEFORE reading anything: learning this after
+        scanning a million entries teaches the same lesson minutes later.
+        """
+        archive = CollectingArchive()
+        monkeypatch.setattr(
+            archive,
+            "health_check",
+            AsyncMock(side_effect=ConnectionRefusedError("no route to host")),
+        )
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
+        monkeypatch.setattr(backfill_history, "create_redis_pool", lambda: MagicMock())
+        monkeypatch.setattr(backfill_history, "get_redis", lambda _pool: fake_redis)
+        monkeypatch.setattr(
+            backfill_history, "close_redis_pool", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            backfill_history, "PostgresHistoryArchive", lambda _url: cast(Any, archive)
+        )
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+
+        assert await backfill_history._run(dry_run=True) == 1
+
+        assert "cannot reach the play-history database" in capsys.readouterr().err
+        assert archive.batches == 0  # nothing was read or written
+
+    async def test_the_dry_run_preflights_the_database(
+        self, fake_redis: Redis, wired: CollectingArchive
+    ) -> None:
+        # The other half: a healthy dry run really does contact Postgres, so
+        # the flag's promise ("this is the rehearsal") is now backed by
+        # something. Without the probe this counter stays 0.
+        await _seed(fake_redis, 1, _entry(1, guild_id=1))
+        assert await backfill_history._run(dry_run=True) == 0
+        assert wired.health_checks == 1
+        assert wired.rows == []
+
+    async def test_an_aborted_scan_also_exits_nonzero_with_its_own_message(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The other INCOMPLETE verdict, and it has to read differently: with a
+        # failed guild the population is known, whereas here an unknown number
+        # were never looked at, which makes the printed counts a floor.
+        def exploding_scan_iter(*args: Any, **kwargs: Any) -> Any:
+            raise ConnectionError("redis went away mid-scan")
+
+        monkeypatch.setattr(fake_redis, "scan_iter", exploding_scan_iter)
+        assert await backfill_history._run(dry_run=False) == 1
+        err = capsys.readouterr().err
+        assert "INCOMPLETE" in err
+        assert "floor" in err
+        assert "HISTORY_REDIS_CUTOVER" in err
+
+    async def test_a_failing_close_does_not_hide_the_run(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # Both closes are guarded individually so a failing archive close
+        # cannot skip the Redis pool close and chain over the real outcome —
+        # the shape of the documented MusicBotApp.close() incident. The run's
+        # own result must survive teardown noise.
+        wired.closed = AsyncMock(side_effect=RuntimeError("pg close blew up"))
+        monkeypatch.setattr(
+            backfill_history,
+            "close_redis_pool",
+            AsyncMock(side_effect=RuntimeError("redis close blew up")),
+        )
+        await _seed(fake_redis, 5, _entry(1, guild_id=5))
+
+        assert await backfill_history._run(dry_run=False) == 0
+        assert "1 guild(s) backfilled" in capsys.readouterr().out
+        cast(Any, backfill_history.close_redis_pool).assert_awaited_once()
+
+    async def test_the_summary_reports_what_a_dry_run_actually_did(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The message, not just the behaviour. Mutations that make the summary
+        lie — swapping a counter, or hardcoding the verb so a dry run claims
+        "submitted" — survived every behavioural test, and this line is what the
+        operator reads before deciding the migration is done.
+
+        EVERY COUNT IS DISTINCT here on purpose: 3 scanned, 2 submitted, 1
+        corrupt, 1 guild. An earlier version of this test seeded two clean
+        entries, so `attempted == scanned` and swapping those two fields in the
+        f-string was undetectable — the test asserted a lying summary was fine.
+        """
+        await _seed(fake_redis, 5, _entry(1, guild_id=5), _entry(2, guild_id=5))
+        await fake_redis.lpush(GUILD_HISTORY_KEY.format(guild_id=5), b"not json")
+
+        assert await backfill_history._run(dry_run=True) == 0
+
+        out = capsys.readouterr().out
+        assert "1 guild(s) backfilled" in out
+        assert "3 entries scanned" in out
+        assert "would submit 2" in out
+        assert "1 corrupt" in out
+        # The verb is the dry-run one, and the writing verb appears nowhere.
+        assert "submitted 2" not in out.replace("would submit 2", "")
+        assert wired.rows == []
 
     def test_dry_run_flag_reaches_the_backfill(
         self,

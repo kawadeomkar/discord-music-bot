@@ -130,8 +130,7 @@ class GuildHistory:
         2. The Redis list, ALWAYS merged in — never skipped on the grounds that
            the archive looked full. Covers the two cases the archive cannot:
            plays still sitting in the outbox (every song's newest few seconds)
-           and every pre-existing play until `just db-backfill` has run — the
-           recipe arrives with this branch, so the reference resolves. The dedup key
+           and every pre-existing play until `just db-backfill` has run. The dedup key
            is (played_at, webpage_url), the same identity the archive's unique
            index uses.
         3. The in-memory cache, merged in on the same terms. It was a

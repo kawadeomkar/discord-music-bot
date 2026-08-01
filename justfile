@@ -518,7 +518,16 @@ db-migrate:
     {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
 
 # Copy pre-archive history off the Redis lists into Postgres. Idempotent and
-# resumable (ON CONFLICT DO NOTHING). MUST run before HISTORY_REDIS_CUTOVER=1.
+# resumable (ON CONFLICT DO NOTHING). MUST run before HISTORY_REDIS_CUTOVER=1,
+# which trims the only other copy of exactly what this moves.
+#
+# This leg needs a local venv. On a Docker-only host use the compose one-shot,
+# which is the same image and the same module:
+#
+#   docker compose run --rm db-backfill --dry-run
+#
+# (It sits behind the `ops` profile so it never runs on `docker compose up` —
+# unlike db-migrate, this is an operator decision, not a startup task.)
 [doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
 [group('database')]
 db-backfill *ARGS:
