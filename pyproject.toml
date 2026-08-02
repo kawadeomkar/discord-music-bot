@@ -186,8 +186,16 @@ timeout = 120
 markers = [
     # Integration tier against a real Postgres, excluded from the default run:
     # postgres:18-alpine via testcontainers locally, a service container in CI.
-    # Nothing carries it yet — the tier arrives with the archive code.
+    # Several archive invariants live ONLY there (ON CONFLICT dedup, the schema
+    # lock in both directions, and a rejected payload holding a NUL byte that
+    # jsonb and text both refuse) — see tests/test_pg_integration.py.
     "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
+    # Integration tier against a real Redis, excluded from the default run:
+    # redis:7-alpine via testcontainers locally, a service container in CI.
+    # fakeredis executes every stream command the outbox uses but gets five of
+    # them wrong, all in the safe-looking direction — see the module docstring
+    # of tests/test_redis_integration.py.
+    "redis: real-Redis integration test (needs Docker, or REDIS_TEST_URL)",
 ]
 filterwarnings = [
     "error",

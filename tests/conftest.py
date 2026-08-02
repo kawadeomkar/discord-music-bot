@@ -1,5 +1,7 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import re
+import sys
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -14,7 +16,75 @@ from src.config import SpotifyStatus
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, tier_enabled
+
+
+def pytest_collection_modifyitems(
+    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Refuse a `-m pg` run that would skip the entire tier.
+
+    An all-skipped tier is otherwise a GREEN job:
+
+        $ env -u RUN_PG_TESTS -u POSTGRES_TEST_URL pytest -m pg -q
+        25 skipped, 1465 deselected      EXIT=0
+
+    `just test-pg` hardcodes RUN_PG_TESTS=1 so this cannot happen through
+    workflow env alone, and CI's `build` needs: pg-integration — but nothing
+    ASSERTED that any pg test actually ran, and several invariants are covered
+    ONLY here: ON CONFLICT dedup, the -history tie-break, the schema lock in
+    both directions (every constructible HistoryEntry inserts; a CHECK still
+    refuses one that bypassed the validator), NOT VALID's treatment of legacy
+    rows, and play_history_rejected.payload holding a NUL byte that jsonb and
+    text both refuse. A tier that silently stops running is worse than one that
+    was never wired up.
+
+    The redis tier is here for the same reason and gets the same treatment:
+    its own invariants — that an exact trim actually trims, that WRONGTYPE is a
+    ResponseError, that XAUTOCLAIM's completion cursor is "0-0", that XINFO
+    GROUPS' lag goes nil — are ones fakeredis answers WRONGLY rather than not at
+    all, so a silently-skipped job leaves the suite asserting the fake's
+    behaviour and nothing else.
+
+    Shares tier_enabled() with test_pg_integration._PG_ENABLED and
+    test_redis_integration._REDIS_ENABLED rather than re-deriving the check:
+    the two used to be hand-kept in step, and a gate that disagrees with the
+    skipif it gates is worse than no gate at all.
+
+    Matches the marker as a WORD in the expression, not as the whole string.
+    `-m pg` was the only spelling that reached this check, so the moment anyone
+    narrowed a run — `-m "pg and not slow"`, `-m "pg or redis"` — the gate went
+    silent and the all-skipped-green hole reopened under the exact command a
+    developer reaches for when triaging.
+    """
+    enablers = {
+        "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
+        "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
+    }
+    markexpr = config.option.markexpr
+    selected = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", markexpr)) - {
+        "and",
+        "or",
+        "not",
+    }
+    tiers = [t for t in enablers if t in selected]
+    if len(tiers) != 1:
+        # Zero tiers: an ordinary run, nothing to gate. More than one: the
+        # expression selects a mix, so "every test would skip" is not what a
+        # disabled tier means any more and the per-module skipif is the honest
+        # reporter.
+        return
+    tier = tiers[0]
+    flag, url = enablers[tier]
+    if tier_enabled(flag, url):
+        return
+    print(
+        f"\nERROR: `-m {markexpr}` selects the {tier} tier but it is disabled, "
+        f"so every test would skip.\n       Set {flag}=1 (needs Docker) or "
+        f"{url}.",
+        file=sys.stderr,
+    )
+    raise pytest.UsageError(f"{tier} tier selected but not enabled")
 
 
 @pytest.fixture(autouse=True)
