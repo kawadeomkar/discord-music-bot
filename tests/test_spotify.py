@@ -328,73 +328,6 @@ class TestSpotifyTrack:
         assert "v1/tracks/abc123" in called_endpoint
 
 
-class TestSpotifyPlaylist:
-    async def test_playlist_returns_list_of_titles(self, spotify: Spotify) -> None:
-        mock_response = {
-            "items": [
-                {
-                    "track": {
-                        "name": "Track One",
-                        "artists": [{"name": "Artist X"}],
-                    }
-                },
-                {
-                    "track": {
-                        "name": "Track Two",
-                        "artists": [{"name": "Artist Y"}],
-                    }
-                },
-            ]
-        }
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value=mock_response)
-        ):
-            result = await spotify.playlist("playlist_id_123")
-
-        assert len(result) == 2
-        assert result[0] == "Track One Artist X"
-        assert result[1] == "Track Two Artist Y"
-
-    async def test_playlist_empty_items_returns_empty_list(
-        self, spotify: Spotify
-    ) -> None:
-        mock_response = {"items": []}
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value=mock_response)
-        ):
-            result = await spotify.playlist("empty_playlist_id")
-
-        assert result == []
-
-    async def test_playlist_calls_correct_endpoint(self, spotify: Spotify) -> None:
-        mock_response = {"items": []}
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value=mock_response)
-        ) as mock_call:
-            await spotify.playlist("pl_abc")
-
-        called_endpoint = mock_call.call_args[0][0]
-        assert "v1/playlists/pl_abc/tracks" in called_endpoint
-
-    async def test_playlist_multi_artist_track(self, spotify: Spotify) -> None:
-        mock_response = {
-            "items": [
-                {
-                    "track": {
-                        "name": "Collab",
-                        "artists": [{"name": "A"}, {"name": "B"}, {"name": "C"}],
-                    }
-                }
-            ]
-        }
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value=mock_response)
-        ):
-            result = await spotify.playlist("pid")
-
-        assert result[0] == "Collab A B C"
-
-
 class TestSpotifyHttpCall:
     async def test_http_call_raises_on_non_200(self, spotify: Spotify) -> None:
         spotify.auth_token = "prefetched_token"
@@ -452,15 +385,6 @@ class TestSpotifyRedisCache:
             await spotify.track("tid_cache1")  # second call — cache hit
         mock_call.assert_called_once()
 
-    async def test_playlist_cache_hit_skips_http(self, spotify: Spotify) -> None:
-        mock_resp = {"items": [{"track": {"name": "T", "artists": [{"name": "A"}]}}]}
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value=mock_resp)
-        ) as m:
-            await spotify.playlist("pid_cache1")
-            await spotify.playlist("pid_cache1")
-        m.assert_called_once()
-
     async def test_track_ttl_is_24h(self, spotify: Spotify, fake_redis: Redis) -> None:
         with patch.object(
             spotify,
@@ -470,16 +394,6 @@ class TestSpotifyRedisCache:
             await spotify.track("ttl_test_track")
         ttl = await fake_redis.ttl("spotify:track:ttl_test_track")
         assert 86390 <= ttl <= 86400
-
-    async def test_playlist_ttl_is_1h(
-        self, spotify: Spotify, fake_redis: Redis
-    ) -> None:
-        with patch.object(
-            spotify, "http_call", new=AsyncMock(return_value={"items": []})
-        ):
-            await spotify.playlist("ttl_test_playlist")
-        ttl = await fake_redis.ttl("spotify:playlist:ttl_test_playlist")
-        assert 3590 <= ttl <= 3600
 
     async def test_cache_graceful_when_no_redis(self, fake_redis: Redis) -> None:
         """Spotify without Redis still works via network."""
@@ -880,6 +794,23 @@ class TestPlaylistStream:
             pages = await _drain(spotify.playlist_stream("plweird"))
         titles = [t for p in pages for t in p.titles]
         assert titles == ["T0 A", "T1 A", "T2 A"]
+
+    async def test_multi_artist_track_renders_all_artists(
+        self, spotify: Spotify
+    ) -> None:
+        """Ported from the deleted playlist() tests: the guarded unwrap must
+        still hand multi-artist tracks to _track_search_title intact."""
+        collab = {
+            "track": {
+                "type": "track",
+                "name": "Collab",
+                "artists": [{"name": "A"}, {"name": "B"}, {"name": "C"}],
+            }
+        }
+        api, _ = _playlist_api("plcollab", total=1, extra_items=[collab])
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            pages = await _drain(spotify.playlist_stream("plcollab"))
+        assert [t for p in pages for t in p.titles] == ["T0 A", "Collab A B C"]
 
     async def test_first_yield_costs_exactly_one_call(self, spotify: Spotify) -> None:
         api, calls = _playlist_api("plfirst", total=716)

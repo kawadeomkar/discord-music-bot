@@ -323,34 +323,6 @@ class Spotify:
 
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
-    @_tracer.start_as_current_span("spotify.playlist")
-    async def playlist(self, pid: str) -> list[str]:
-        """Return "<title> <artist1> <artist2> ..." for every track in a playlist, cached for 1h."""
-        trace.get_current_span().set_attribute("spotify.playlist_id", pid)
-
-        async def fetch() -> list[str]:
-            # FIXME: Spotify playlists over 100 tracks are silently truncated.
-            # /v1/playlists/{id}/tracks is a paged endpoint returning 100 items per
-            # page. This call reads the first page only and never follows the `next`
-            # cursor, so a 300-track playlist queues its first 100 tracks and the user
-            # is told the playlist was queued — no error, no warning, no indication that
-            # two thirds of it is missing.
-            # Fix: add `next` to the fields mask (it is excluded by the mask today) and
-            # follow the cursor until it comes back null.
-            endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
-            resp = await self.http_call(
-                endpoint, params={"fields": "items(track(name,artists(name)))"}
-            )
-            track_titles = [
-                _track_search_title(item["track"]) for item in resp.get("items", [])
-            ]
-            trace.get_current_span().set_attribute(
-                "spotify.track_count", len(track_titles)
-            )
-            return track_titles
-
-        return await self._cached_call(f"spotify:playlist:{pid}", _PLAYLIST_TTL, fetch)
-
     # ── Streaming collection pagers ───────────────────────────────────────────
     # Async generators, deliberately NOT span-decorated: start_as_current_span
     # would open and close the span around generator *construction*, not its
