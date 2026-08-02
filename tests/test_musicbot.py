@@ -1915,6 +1915,50 @@ class TestHistoryCommand:
         """
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
+    @pytest.mark.parametrize("name", ["history", "ping"])
+    def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
+        """`-history` is the heaviest send in the bot — up to 8 song embeds plus
+        the NP block MusicContext.send may prepend — so unbounded concurrent
+        renders are how a guild rate-limits itself out of its own channel. The
+        decorator that prevents that carried nine lines of comment and no test:
+        deleting it left the whole suite green.
+
+        `wait=False` is half the point. Queueing the extra invocations behind
+        the first would still issue every send; declining them immediately is
+        what bounds the traffic, and cog_command_error renders the resulting
+        MaxConcurrencyReached as a notice rather than an error embed.
+        """
+        guard = getattr(MusicBot, name)._max_concurrency
+        assert guard is not None
+        assert guard.number == 1
+        assert guard.per is commands.BucketType.guild
+        assert guard.wait is False
+
+    def test_help_copy_states_the_real_retention_window(self) -> None:
+        """The user-facing copy must name the window the command actually keeps.
+
+        This string told users history "is kept permanently — the limit here is
+        a display cap … not how much is retained" for the entire life of the
+        branch that capped the list, i.e. it promised permanent retention in the
+        configuration that now ships by DEFAULT. Both halves were inverted at
+        once: 50 is the retention cap, and it is the same number as the display
+        cap (HISTORY_MAX_LIMIT is HISTORY_CACHE_LIMIT).
+
+        Interpolating the constant is the structural fix; this pins that it
+        stays interpolated, so raising the window can never leave the copy
+        quoting the old one. The negative assertion names the exact false claim
+        — if a rewrite ever uses "permanently" truthfully in the help body,
+        update this test deliberately rather than deleting it.
+        """
+        help_text = MusicBot.history.help
+        assert help_text is not None
+        assert str(HISTORY_MAX_LIMIT) in help_text
+        assert "permanently" not in help_text
+        # The archive caveat belongs in NOTES, and it is the one place the word
+        # is honest: Postgres retention really is permanent when enabled.
+        note = (MusicBot.history.extras or {}).get("note", "")
+        assert "permanently" in note
+
 
 class TestHistoryReadsRedis:
     """That `-history` renders the Redis leg at all, asserted at the command

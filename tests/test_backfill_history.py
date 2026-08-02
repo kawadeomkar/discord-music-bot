@@ -283,6 +283,13 @@ class TestBackfill:
         today; the bot's own LTRIM does, and the entries it eats are the
         OLDEST — exactly the ones this tool exists to save. Simulated here with
         RPOP between pages.
+
+        The VERDICT is the assertion that matters. This test used to check the
+        log line alone, and that is precisely how the defect shipped: the
+        shrink was detected, warned about, and then folded into `guilds` as a
+        guild that had moved in full, so `ok` stayed True and the tool exited 0
+        over plays it had just watched disappear — while the README tells the
+        operator to gate an irreversible deploy on that exit code.
         """
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
@@ -295,9 +302,57 @@ class TestBackfill:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(fake_redis, "lrange", shrinking_lrange)
-            await backfill(fake_redis, CollectingArchive(), page=2)
+            report = await backfill(fake_redis, CollectingArchive(), page=2)
 
-        assert "the list shrank from the tail" in caplog.text
+        assert "trimmed from the tail" in caplog.text
+        assert report.short_guilds == 1
+        # NOT counted as backfilled: that number is what the summary reports.
+        assert report.guilds == 0
+        assert not report.ok
+
+    async def test_a_trim_that_keeps_the_length_is_still_caught(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The steady-state trim, which no count can see.
+
+        push_history LPUSHes and LTRIMs in ONE transaction, so a list already at
+        HISTORY_CACHE_LIMIT keeps its length exactly while every song end
+        destroys one unread tail entry. `attempted + corrupt < total` is
+        therefore always false here — the old reconciliation was structurally
+        blind to it — yet pre-archive plays are being lost the whole time.
+
+        This is not an exotic race: it is the shape of every active guild on a
+        deployment already running this build with the archive off, i.e. exactly
+        the population the README's "enable the archive later" flow sends to
+        this tool. Caught by comparing the OLDEST entry's bytes across the walk
+        rather than counting.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
+        real_lrange = fake_redis.lrange
+        pushed = 100
+
+        async def churning_lrange(name: str, start: int, end: int) -> Any:
+            out = await real_lrange(name, start, end)
+            # One song end: LPUSH a new play, LTRIM the oldest away. Net length
+            # unchanged — which is the entire point.
+            nonlocal pushed
+            await fake_redis.lpush(
+                key, serialize_history_entry(_entry(pushed, guild_id=1))
+            )
+            await fake_redis.rpop(key)
+            pushed += 1
+            return out
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(fake_redis, "lrange", churning_lrange)
+            report = await backfill(fake_redis, CollectingArchive(), page=2)
+
+        # The count check alone would have said everything was fine.
+        assert report.scanned == report.attempted
+        assert report.short_guilds == 1
+        assert not report.ok
+        assert "trimmed from the tail" in caplog.text
 
     async def test_ignores_keys_with_an_unparseable_guild_id(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
@@ -310,6 +365,95 @@ class TestBackfill:
         assert report.guilds == 0
         assert archive.rows == []
         assert "unparseable guild id" in caplog.text
+        # The key still holds real plays that did not move, so the run is not
+        # clean — skipping it silently let the verdict claim otherwise.
+        assert report.skipped_keys == 1
+        assert not report.ok
+
+    async def test_the_corrupt_entry_offset_points_at_the_corrupt_entry(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The offset is the forensic half of the only record these plays get.
+
+        A page runs newest→oldest internally while `start` advances
+        oldest→newest, so the distance from the oldest end is
+        `start + (len-1-i)`. The old expression walked the page the wrong way
+        and mixed a guild-cumulative `corrupt` with a page-local
+        `len(entries)`: on this list — 5 entries, the OLDEST corrupt — it
+        reported tail offset 4, pointing the operator at a healthy entry.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        # LPUSH order: the FIRST pushed ends up oldest (tail offset 0).
+        await fake_redis.lpush(key, b"not json")
+        for n in range(1, 5):
+            await fake_redis.lpush(key, serialize_history_entry(_entry(n, guild_id=1)))
+
+        await backfill(fake_redis, CollectingArchive(), page=5)
+
+        assert "at tail offset 0," in caplog.text
+
+    async def test_the_corrupt_entry_dump_is_not_truncated_below_a_real_entry(
+        self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # config.py sizes an entry at ~420 bytes and a realistic one measures
+        # 545, so the old 400-byte cap stopped mid-thumbnail and never reached
+        # uploader / played_at / message_id — the fields needed to attribute
+        # the play. Build something comfortably past the old cap and assert the
+        # tail of it survives.
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        marker = "END-OF-PAYLOAD-MARKER"
+        wire = b'{"title": "' + b"x" * 600 + marker.encode() + b'"'  # unparseable
+        await fake_redis.lpush(key, wire)
+
+        await backfill(fake_redis, CollectingArchive())
+
+        assert marker in caplog.text
+
+    async def test_a_key_returned_twice_by_scan_is_counted_once(
+        self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SCAN is at-LEAST-once: a rehash can hand back the same key again.
+
+        The rows are idempotent so nothing durable breaks, but `guilds`,
+        `scanned` and `attempted` double — and README tells the operator to
+        verify those counts against `SELECT count(*) FROM play_history` before
+        an irreversible deploy, while the module docstring calls them "the only
+        signal".
+        """
+        await _seed(fake_redis, 1, _entry(1, guild_id=1), _entry(2, guild_id=1))
+        key = GUILD_HISTORY_KEY.format(guild_id=1).encode()
+
+        async def duplicating_scan(*args: Any, **kwargs: Any) -> Any:
+            for k in (key, key):  # the same key, twice
+                yield k
+
+        monkeypatch.setattr(fake_redis, "scan_iter", duplicating_scan)
+        archive = CollectingArchive()
+
+        report = await backfill(fake_redis, archive)
+
+        assert report.guilds == 1
+        assert report.scanned == 2
+        assert report.attempted == 2
+        assert len(archive.rows) == 2
+
+    async def test_each_page_is_inserted_oldest_first(self, fake_redis: Redis) -> None:
+        # insert_batch documents "Insert oldest-first". A page arrives
+        # newest→oldest while pages advance oldest→newest, so unreversed the
+        # global order was neither — and this tool and the drainer could touch
+        # overlapping keys in opposite orders, which is how a deadlock costs a
+        # whole guild here rather than one row.
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
+        archive = CollectingArchive()
+
+        await backfill(fake_redis, archive, page=2)
+
+        assert [e.title for e in archive.rows] == [
+            "Song 0",
+            "Song 1",
+            "Song 2",
+            "Song 3",
+        ]
 
     async def test_empty_redis_is_a_noop(self, fake_redis: Redis) -> None:
         report = await backfill(fake_redis, CollectingArchive())
@@ -368,6 +512,10 @@ class TestBackfill:
         assert report.guilds == 1  # only the good key
         assert [e.guild_id for e in archive.rows] == [7]
         assert "outside the play_history domain" in caplog.text
+        # …and the run says so. A skipped key is data that still exists and did
+        # not move, so it has to reach the verdict the deploy is gated on.
+        assert report.skipped_keys == 1
+        assert not report.ok
 
     async def test_every_guild_is_enumerated_past_one_scan_page(
         self, fake_redis: Redis
@@ -674,6 +822,88 @@ class TestCli:
         assert "INCOMPLETE" in err
         assert "floor" in err
         assert "Do NOT deploy" in err
+
+    async def test_a_mid_run_trim_exits_nonzero_and_says_to_stop_the_bot(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The exit code is the contract the README gates the deploy on.
+
+        This is the case that used to print a clean summary and exit 0 having
+        just watched plays be destroyed, so anything scripting
+        `just db-backfill && ./build_docker.sh` proceeded straight into the
+        irreversible step. It is also the only verdict that must NOT promise a
+        re-run fixes it — what has been trimmed is gone.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
+        real_lrange = fake_redis.lrange
+
+        async def shrinking_lrange(name: str, start: int, end: int) -> Any:
+            out = await real_lrange(name, start, end)
+            await fake_redis.rpop(key)
+            return out
+
+        monkeypatch.setattr(fake_redis, "lrange", shrinking_lrange)
+
+        assert await backfill_history._run(dry_run=False) == 1
+
+        err = capsys.readouterr().err
+        assert "INCOMPLETE" in err
+        assert "STOP THE BOT" in err
+        assert "nothing recovers" in err
+
+    async def test_an_unattributable_key_exits_nonzero(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # A key holding real plays that this tool will never move. Reporting
+        # success over it is the same class of lie as the trim above.
+        await fake_redis.lpush("guild:0:history", serialize_history_entry(_entry(1)))
+        assert await backfill_history._run(dry_run=False) == 1
+        err = capsys.readouterr().err
+        assert "INCOMPLETE" in err
+        assert "could not be attributed" in err
+
+    async def test_every_applicable_verdict_prints_not_just_the_first(
+        self,
+        fake_redis: Redis,
+        wired: CollectingArchive,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A run can fail in more than one way at once.
+
+        These were an if/elif chain, so the first reason won and the rest were
+        invisible — and an operator who fixes only the reported one re-runs
+        straight into the next, on a tool whose next step is irreversible.
+        """
+        key = GUILD_HISTORY_KEY.format(guild_id=1)
+        await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
+        await fake_redis.lpush("guild:0:history", serialize_history_entry(_entry(9)))
+        real_lrange = fake_redis.lrange
+
+        async def shrinking_lrange(name: Any, start: int, end: int) -> Any:
+            out = await real_lrange(name, start, end)
+            # scan_iter yields BYTES keys, so this has to normalise before
+            # comparing — matching str against bytes silently never fires.
+            if (name.decode() if isinstance(name, bytes) else name) == key:
+                await fake_redis.rpop(key)
+            return out
+
+        monkeypatch.setattr(fake_redis, "lrange", shrinking_lrange)
+
+        assert await backfill_history._run(dry_run=False) == 1
+
+        err = capsys.readouterr().err
+        assert "STOP THE BOT" in err  # the trim
+        assert "could not be attributed" in err  # …and the skipped key
+        assert err.count("INCOMPLETE") == 2
 
     async def test_a_failing_close_does_not_hide_the_run(
         self,

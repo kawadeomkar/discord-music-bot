@@ -168,6 +168,27 @@ def _add_environment(
     return event_dict
 
 
+def setup_cli_logging() -> None:
+    """Structured logging for the one-shot operator CLIs, without the OTel SDK.
+
+    `src.util.get_logger` hands back a structlog proxy that is inert until
+    something configures structlog — and only this module does. Unconfigured, it
+    falls back to PrintLoggerFactory: readable text on STDOUT that never enters
+    the logging module, so `2> errors.log` captures nothing and no handler ever
+    sees it. For `src/backfill_history.py` that is not cosmetic; its
+    corrupt-entry ERROR is documented as the only durable record of a play about
+    to become unrecoverable.
+
+    Deliberately NOT setup_telemetry(). A migration that runs once, by hand,
+    should not stand up a TracerProvider, open an OTLP gRPC channel, or wait on
+    a BatchSpanProcessor flush it has no spans for — and the SDK's LoggingHandler
+    is deprecated upstream, which under this project's `filterwarnings = error`
+    turns importing it into a test failure. What these tools actually need is the
+    JSON renderer and the stdout handler, which is exactly what this installs.
+    """
+    _configure_structlog()
+
+
 def _configure_structlog() -> None:
     structlog.configure(
         processors=[

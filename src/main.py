@@ -13,6 +13,7 @@ from src.config import ENVIRONMENT, spotify_enabled
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
     close_redis_pool,
     create_redis_pool,
     ensure_outbox_group,
@@ -258,10 +259,21 @@ class MusicBotApp(commands.AutoShardedBot):
         renders OFF, close() skips the tier). push_history's XADD leg reads
         the same flag, so nothing accumulates for Postgres either.
         """
+        # SAYS WHAT THE RETENTION IS, not merely what it is not. "Nothing is
+        # written to long-term storage" was true about Postgres and misleading
+        # about the whole: push_history PERSISTs guild:{id}:history — no TTL,
+        # ever, by design — so an opted-out deployment does retain requester
+        # ids, titles and timestamps for 50 plays per guild, indefinitely. An
+        # operator who read the short version and was later asked to erase a
+        # user's data would follow README's erasure step, remove the
+        # postgres-data volume, and delete nothing at all, because the only
+        # copy is in Redis. The number and the "no expiry" are the load-bearing
+        # parts; README's "Disabling — and erasing" carries the command.
         log.info(
             "History archive disabled (the default; HISTORY_ARCHIVE_ENABLED=true "
-            "opts in). Plays are kept only in the capped per-guild Redis list "
-            "behind -history; nothing is written to long-term storage."
+            f"opts in). Plays are kept only in the per-guild Redis list behind "
+            f"-history — the newest {HISTORY_CACHE_LIMIT} per guild, retained "
+            "until deleted (no expiry); nothing is written to Postgres."
         )
         if config.postgres_url():
             # The flag wins over URL presence, explicitly. Compose interpolates

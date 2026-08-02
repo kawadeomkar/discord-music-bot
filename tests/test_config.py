@@ -502,6 +502,24 @@ class TestComposeMatchesTheDefault:
         ).read_text()
         assert f'= "{DEFAULT_POSTGRES_PASSWORD}"' in preflight
 
+    def test_the_justfile_dsn_uses_the_same_default(self) -> None:
+        """The SIXTH copy, and the only one nothing held.
+
+        `_dotenv` grew `${POSTGRES_PASSWORD:-password}` with the comment "Keep
+        this default in step with docker-compose.yml's" — a stated coupling with
+        nothing enforcing it, while the three tests around this one cover
+        config.py, build_common.sh and the compose interpolations. Rotate the
+        default in those three and every test stays green while `just run`,
+        `just db-migrate` and `just db-backfill` build a DSN the database
+        rejects. The archive connects lazily, so `just run` starts fine and
+        surfaces it much later as a drainer backoff loop — the exact two-step
+        trap the justfile comment above it was written to prevent.
+        """
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        fallbacks = set(re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", justfile))
+        assert len(fallbacks) >= 1  # non-empty guard, as above
+        assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
+
     def test_the_bot_and_the_migration_tiers_all_carry_a_default(self) -> None:
         # Count rather than merely "none mandatory": a service whose
         # POSTGRES_URL was deleted outright would also pass the first test.

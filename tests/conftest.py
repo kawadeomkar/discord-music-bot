@@ -262,6 +262,20 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.latency = 0.05
     bot.is_closed.return_value = False
     bot.wait_until_ready = AsyncMock()
+    # Declared, never auto-vivified. MusicPlayer.__init__ reads
+    # bot.history_drainer to decide whether GuildHistory gets a real outbox
+    # notify or None, and an auto-vivified MagicMock attribute answers
+    # `is not None` with True — so every player built from this fixture takes
+    # the archive-ENABLED arm, and the disabled arm (which is the SHIP DEFAULT)
+    # would be exercised by nothing in the suite at all. That is not
+    # hypothetical: dropping the None guard from musicplayer.py once passed the
+    # entire suite while bricking every -play in the default configuration.
+    #
+    # Spelling the enabled shape out keeps it a deliberate choice rather than an
+    # accident of MagicMock; TestOutboxNotifyWiring in test_musicplayer.py
+    # covers BOTH arms against the real constructor.
+    bot.history_archive = MagicMock()
+    bot.history_drainer = MagicMock()
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
 

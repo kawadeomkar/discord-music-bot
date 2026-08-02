@@ -385,7 +385,14 @@ def _ping_value(r: ProbeResult) -> str:
     # ConnectionError) is the actionable half and costs one short parenthetical.
     # An n/a row gets the same treatment when it has a reason to give — "not
     # configured" is why an optional dependency is dark, and it costs nothing.
-    if r.state in (ProbeState.DOWN, ProbeState.NA) and r.detail:
+    # OFF carries its detail for the same reason NA does, and it was omitted by
+    # oversight rather than by design: probe_postgres sets
+    # detail="archive disabled" and its docstring says the row "must say so
+    # rather than shrug", but the renderer dropped it, so the field was dead
+    # data and the row was indistinguishable from any other OFF. A test
+    # asserted the detail on the ProbeResult, which looked like coverage of
+    # exactly that claim while pinning something no user could see.
+    if r.state in (ProbeState.DOWN, ProbeState.NA, ProbeState.OFF) and r.detail:
         return f"{word} ({r.detail})"
     return word
 
@@ -619,9 +626,22 @@ async def run_health_dashboard(
         # for the person who can act on it, and for a self-hosted bot the
         # application owner IS that person. The startup ERROR still fires on
         # every boot for anyone reading logs.
-        warning = (
-            default_password_embed() if await ctx.bot.is_owner(ctx.author) else None
-        )
+        #
+        # ORDER IS LOAD-BEARING, not style. is_owner() is not a local predicate:
+        # MusicBotApp passes neither owner_id nor owner_ids, so discord.py falls
+        # through to application_info() — a REST GET, retried up to 5 times over
+        # ~25s on a 5xx, and it raises rather than returning False. Written as
+        # `embed() if await is_owner() else None` the await runs FIRST and
+        # UNCONDITIONALLY, which put a network round trip (and a new failure
+        # mode) ahead of the skeleton send this function promises is immediate —
+        # so the health dashboard broke exactly when Discord was degraded, which
+        # is when it gets run. PING_DEADLINE_SECS does not bound it; that clock
+        # starts after the send. Ask the cheap, local, always-correct question
+        # first: with the archive off — the ship default — the embed is None on
+        # its first line and the owner check is never reached at all.
+        warning = default_password_embed()
+        if warning is not None and not await ctx.bot.is_owner(ctx.author):
+            warning = None
         message = await ctx.channel.send(  # bypass NP host (§5.3)
             embeds=[e for e in (warning, last) if e is not None]
         )

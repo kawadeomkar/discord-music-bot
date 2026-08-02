@@ -111,6 +111,79 @@ def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
 
+# ── Archive wiring ────────────────────────────────────────────────────────────
+
+
+class TestOutboxNotifyWiring:
+    """MusicPlayer decides GuildHistory's outbox notify from the bot's drainer,
+    and BOTH answers have to be constructible.
+
+    This is the seam where the opt-in archive reaches the playback path:
+    enabled, the drainer exists and its notify wakes the drain immediately;
+    disabled — the SHIP DEFAULT — there is no drainer, and GuildHistory demands
+    the None explicitly (its keyword has no default, precisely so that a caller
+    cannot forget to decide).
+
+    Asserted here rather than left to the fixtures because nothing else can see
+    it. Every other player test builds from `mock_bot`, and an auto-vivified
+    MagicMock attribute is truthy, so the None arm was reachable only in
+    production. Coverage cannot flag that — the wiring is a one-line
+    conditional expression, which reports as covered the moment either arm
+    runs. Dropping the guard entirely once passed all 1711 tests while raising
+    AttributeError on the first -play of any default deployment.
+    """
+
+    def test_a_running_drainer_is_wired_to_the_history(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        drainer = MagicMock()
+        mock_bot.history_drainer = drainer
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        assert mp.history._on_outbox_push is drainer.notify
+
+    def test_no_drainer_wires_none_rather_than_crashing(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        # The archive-disabled shape MusicBotApp.__init__ really produces —
+        # pinned by TestAppInitDefaults in test_main.py.
+        mock_bot.history_drainer = None
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        assert mp.history._on_outbox_push is None
+
+    async def test_a_play_is_still_recorded_with_no_drainer(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """Construction is not the whole contract — the display legs must still
+        work, or the default deployment would have a silent -history."""
+        mock_bot.history_drainer = None
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        await mp.history.add(
+            HistoryEntry(title="Song", webpage_url="https://yt.com/v=1", played_at=1.0)
+        )
+        assert [e.title for e in await mp.history.recent(10)] == ["Song"]
+
+
 # ── Formatter helpers ─────────────────────────────────────────────────────────
 
 

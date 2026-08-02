@@ -20,12 +20,20 @@ Safe to re-run and safe to interrupt: ON CONFLICT DO NOTHING makes every insert
 idempotent, so a run that dies half-way is resumed simply by running it again.
 Order within a guild does not matter — reads sort on played_at.
 
-This must run BEFORE the archive build is deployed. push_history LTRIMs each
-guild's list to HISTORY_CACHE_LIMIT on every write, so the first song a guild
-plays under that build destroys the only copy of exactly the entries this exists
-to move. The window is per guild and it opens at that guild's next song end —
-there is no flag to check and nothing to undo, which is why the ordering lives
-in the upgrade procedure (README) rather than in a runtime switch.
+This must run BEFORE this build is deployed. push_history LTRIMs each guild's
+list to HISTORY_CACHE_LIMIT on every write, so the first song a guild plays
+under it destroys the only copy of exactly the entries this exists to move. The
+window is per guild and it opens at that guild's next song end — there is no
+flag to check and nothing to undo, which is why the ordering lives in the
+upgrade procedure (README) rather than in a runtime switch.
+
+"This build", deliberately, not "the archive build". The cap is NOT part of the
+archive tier — push_history trims in both modes — so an operator who never opts
+in is on the same clock and simply has no backfill to run, this tool requiring a
+reachable Postgres. Describing the deadline as an archive concern is how the
+runbook came to be filed under "applies to a deployment that has opted in",
+leaving the one population that has no second copy reading past it. README's
+"Upgrading to 2.5.0" is unconditional and tells them to snapshot Redis instead.
 
 Nothing here can detect that it already happened: a guild's list sitting at
 exactly HISTORY_CACHE_LIMIT is also what a healthy migrated guild looks like.
@@ -52,6 +60,7 @@ from src.redis_client import (
     create_redis_pool,
     get_redis,
 )
+from src.telemetry import setup_cli_logging
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -83,6 +92,11 @@ _INT8_MAX = 2**63 - 1
 # it is only used to REPORT what the run connected to; the pool remains the
 # single place that decides it.
 _DEFAULT_REDIS = "redis://localhost:6379"
+# How much of a corrupt entry's wire bytes to log. Matches history_archive's
+# _REJECT_DETAIL_MAX rather than being tuned here: both are "keep enough of a
+# rejected payload to act on it", and a realistic history entry measures 545
+# bytes, so anything under ~600 truncates the fields an operator would use.
+_WIRE_DUMP_MAX = 2000
 
 
 # kw_only: four adjacent int fields is exactly the shape where a positional
@@ -108,6 +122,22 @@ class BackfillReport:
     # INCOMPLETE — and completeness is what gates the deploy that destroys the
     # source. `ok` below is the single question the operator is actually asking.
     failed_guilds: int = 0
+    # Guilds whose list was trimmed from the tail WHILE this run walked it, so
+    # some of their oldest entries were destroyed before they could be read.
+    # Detected, reported, and — the point of this counter — fatal to `ok`.
+    #
+    # It used to be none of the last: the shrink was logged as a warning and the
+    # guild was then folded into `guilds` as if it had moved in full, so a run
+    # that had just watched plays disappear printed a clean summary and exited
+    # 0. The README gates an irreversible deploy on that exit code, so anything
+    # scripting `just db-backfill && ./build_docker.sh` got its green light
+    # immediately after the loss.
+    short_guilds: int = 0
+    # History keys that could not be attributed to a guild (see
+    # _guild_id_from_key). Their entries were not migrated and never will be by
+    # this tool, so — like short_guilds — they have to reach `ok`. Skipping them
+    # silently made the run's headline count exclude data that still exists.
+    skipped_keys: int = 0
     # True when enumeration itself died, i.e. an unknown number of guilds were
     # never even looked at. Distinct from failed_guilds, where the population is
     # known and the failures are counted within it.
@@ -120,8 +150,18 @@ class BackfillReport:
         The one thing that may gate the deploy. Deliberately a
         property rather than a caller-side expression: the check has to change
         in one place when a future failure mode is added to this report.
+
+        EVERY not-moved outcome belongs here, not just the loud ones. Three of
+        them once did not — a detected tail shrink, an unattributable key, and
+        the steady-state trim below — and each independently let this return
+        True over data that had just been destroyed.
         """
-        return not self.failed_guilds and not self.scan_aborted
+        return not (
+            self.failed_guilds
+            or self.short_guilds
+            or self.skipped_keys
+            or self.scan_aborted
+        )
 
 
 def _guild_id_from_key(key: bytes) -> Optional[int]:
@@ -192,9 +232,22 @@ async def backfill(
     which `except Exception` does not catch.
     """
     report = BackfillReport()
+    # SCAN guarantees at-LEAST-once, not exactly-once: a key present for the
+    # whole scan is returned at least once, and a rehash can return it again.
+    # The rows themselves are idempotent, so a repeat costs nothing durable —
+    # but it double-counts `guilds`, `scanned` and `attempted`, and those counts
+    # are what README tells the operator to verify against a
+    # `SELECT count(*) FROM play_history` before an irreversible deploy. The
+    # module docstring calls them "the only signal", so they have to mean what
+    # they say. Bounded by guild count, which this tool already holds per-guild
+    # state for.
+    seen_keys: set[bytes] = set()
     try:
         keys = redis.scan_iter(match=_HISTORY_KEY_MATCH, count=100)
         async for key in keys:
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             report = await _backfill_one(
                 redis, archive, key, report, page=page, dry_run=dry_run
             )
@@ -220,9 +273,16 @@ async def _backfill_one(
     """One guild's list, folded into `report`. Never raises — see backfill()."""
     guild_id = _guild_id_from_key(key)
     if guild_id is None:
-        return report
+        # Counted, not silently dropped. _guild_id_from_key has already logged
+        # WHY; this is what carries it into the verdict so the run cannot report
+        # a clean migration while a key holding real plays sits unread.
+        return dataclasses.replace(report, skipped_keys=report.skipped_keys + 1)
     try:
         total = await redis.llen(key)
+        # The OLDEST entry's bytes, as an identity anchor for the reconciliation
+        # below. Index -1 because push_history LPUSHes: the head is newest, so
+        # the tail is the oldest entry and the first thing a trim destroys.
+        tail_before = await redis.lindex(key, -1)
         attempted = corrupt = 0
         for start in range(0, total, page):
             # Paged from the TAIL (oldest), NOT by head-relative index.
@@ -231,7 +291,7 @@ async def _backfill_one(
             # index right by one and entries slide out of the window unread —
             # measured: 3 songs during a 10-entry backfill silently skipped the
             # 3 OLDEST, while the report still said 10. That is unrecoverable,
-            # because the archive build then LTRIMs the list this was the
+            # because this build then LTRIMs the list this was the
             # only copy of.
             # Tail-relative indices are stable under head pushes; the worst a
             # concurrent play can now do is make us re-read a page, which the
@@ -239,14 +299,25 @@ async def _backfill_one(
             # purpose — they reach Postgres through the outbox.
             raw = await redis.lrange(key, -(start + page), -(start + 1))
             entries = []
-            for wire in raw:
+            for i, wire in enumerate(raw):
                 entry = parse_history_entry(wire)
                 if entry is None:
                     corrupt += 1
+                    # The page runs NEWEST→OLDEST internally (the list is
+                    # LPUSHed, and a tail-relative LRANGE still returns it in
+                    # list order), while `start` advances oldest→newest. So the
+                    # distance from the oldest end is start + (len-1-i), NOT
+                    # anything derived from how many entries have been parsed:
+                    # the previous expression walked the page the wrong way AND
+                    # mixed a guild-cumulative `corrupt` with a page-local
+                    # `len(entries)`, so on a 5-entry list whose OLDEST entry
+                    # was corrupt it reported offset 4 for offset 0 — pointing
+                    # the operator at a healthy entry.
+                    offset = start + len(raw) - 1 - i
                     # The BYTES, not just a count. parse_history_entry logs
                     # only its exception, so `corrupt: 3` in the summary was
                     # otherwise the entire forensic record of three plays the
-                    # archive build is about to trim away.
+                    # build is about to trim away.
                     #
                     # This is where the backfill diverges from the drainer,
                     # which drops corrupt entries just as quietly. That
@@ -262,10 +333,20 @@ async def _backfill_one(
                     # this row" and whose emptiness `just db-rejects` reports
                     # as a code-defect signal. A row this tool could not even
                     # parse was never offered to Postgres.
+                    # _WIRE_DUMP_MAX, not 400. A realistic entry — ordinary
+                    # title, a maxresdefault thumbnail URL with sqp/rs params,
+                    # snowflake requester and message ids — measures 545 bytes,
+                    # and config.py's own sizing note says ~420, so the old cap
+                    # truncated the record mid-thumbnail and never reached
+                    # uploader, played_at or message_id: exactly the fields
+                    # needed to reconstruct or attribute the lost play. A
+                    # forensic record that stops before the forensics is not
+                    # one. This path is rare by construction, so the bytes are
+                    # affordable.
                     log.error(
                         f"corrupt history entry in {key!r} at tail offset "
-                        f"{start + len(entries) + corrupt - 1}, NOT migrated "
-                        f"and about to be unrecoverable: {wire[:400]!r}"
+                        f"{offset}, NOT migrated and about to be "
+                        f"unrecoverable: {wire[:_WIRE_DUMP_MAX]!r}"
                     )
                     continue
                 if entry.guild_id == 0:
@@ -300,6 +381,16 @@ async def _backfill_one(
                 # reports INCOMPLETE rather than pretending otherwise.
                 entries.append(entry)
             if entries and not dry_run:
+                # OLDEST-FIRST, which is what insert_batch documents ("Insert
+                # oldest-first"). The page arrives newest→oldest while pages
+                # advance oldest→newest, so handing `entries` over unreversed
+                # made the global order neither — harmless for an ON CONFLICT
+                # DO NOTHING index, but it meant this tool and the drainer could
+                # touch overlapping keys in OPPOSITE orders if they ever ran
+                # together (the mis-ordered deploy this module warns about).
+                # That is the classic deadlock recipe, and here a deadlock costs
+                # a whole guild via failed_guilds rather than one row.
+                entries.reverse()
                 await archive.insert_batch(entries)
             attempted += len(entries)
     except Exception as e:
@@ -313,29 +404,55 @@ async def _backfill_one(
             exc_info=e,
         )
         return dataclasses.replace(report, failed_guilds=report.failed_guilds + 1)
-    # RECONCILIATION, in the one direction that can mean loss. attempted may
-    # legitimately EXCEED total: the last page's tail window clamps at index 0
-    # and picks up entries pushed during the run, which the dedup index absorbs.
-    # Coming up SHORT is the opposite — it means entries the initial LLEN
-    # counted were not read back, which only a tail-side shrink can cause.
-    # This is LIVE, not latent: push_history LTRIMs on every song end — from
-    # the tail, eating the oldest entries, i.e. exactly the ones this tool
-    # exists to save. A backfill racing a live bot running the archive build is
-    # precisely the ordering mistake the module docstring describes, and this
-    # warning is how a single guild's share of it becomes visible.
-    if attempted + corrupt < total:
+    # RECONCILIATION — did the list lose entries from the tail while we walked
+    # it? push_history LTRIMs on every song end, from the tail, eating the
+    # OLDEST entries: exactly the ones this tool exists to save. A backfill
+    # racing a live bot on this build is the ordering mistake the module
+    # docstring describes, and this is where a single guild's share of it
+    # becomes visible.
+    #
+    # BY IDENTITY, not by count, and the difference is the whole finding. The
+    # count test (`attempted + corrupt < total`) can only see a list that got
+    # SHORTER — but push_history LPUSHes and LTRIMs in ONE transaction, so a
+    # list already at HISTORY_CACHE_LIMIT keeps its length exactly while each
+    # song end destroys one unread tail entry. That is not an exotic case: it
+    # is the shape of every guild on a deployment that has been running this
+    # build with the archive off, i.e. precisely the population the README's
+    # "enable the archive later" flow sends here. Measured on a 50-entry list
+    # with one push per page: 4 pre-archive plays gone, scanned == attempted,
+    # no warning, exit 0.
+    #
+    # Re-reading the tail bytes answers the question the count cannot: if the
+    # oldest entry is not the one we started from, the tail moved under us.
+    # Costs two LINDEX round trips per guild on a one-shot offline tool.
+    #
+    # attempted may legitimately EXCEED total — the last page's window clamps
+    # at index 0 and picks up entries pushed during the run, which the dedup
+    # index absorbs. That direction is not loss and is not flagged.
+    tail_after = await redis.lindex(key, -1)
+    shrank = attempted + corrupt < total or (
+        tail_before is not None and tail_after != tail_before
+    )
+    if shrank:
         log.warning(
-            f"guild {guild_id}: read {attempted + corrupt} of {total} entries "
-            f"the initial LLEN counted — the list shrank from the tail during "
-            f"the run. Re-run to pick up anything missed."
+            f"guild {guild_id}: the list was trimmed from the tail DURING the "
+            f"run (read {attempted + corrupt} of the {total} entries the "
+            f"initial LLEN counted; oldest entry changed: "
+            f"{tail_before != tail_after}). Its oldest plays were destroyed "
+            f"before they could be read. Stop the bot and re-run — re-running "
+            f"is safe, but it cannot recover what has already been trimmed."
         )
     log.info(
         f"{'would backfill' if dry_run else 'backfilled'} guild {guild_id}: "
         f"{attempted} entries ({total} scanned, {corrupt} corrupt)"
+        f"{' — INCOMPLETE, list trimmed mid-run' if shrank else ''}"
     )
+    # A guild that lost entries mid-run did NOT move in full, so it must not
+    # inflate `guilds` — that counter is what the summary reports as backfilled.
     return dataclasses.replace(
         report,
-        guilds=report.guilds + 1,
+        guilds=report.guilds + (0 if shrank else 1),
+        short_guilds=report.short_guilds + (1 if shrank else 0),
         scanned=report.scanned + total,
         attempted=report.attempted + attempted,
         corrupt=report.corrupt + corrupt,
@@ -379,7 +496,7 @@ async def _run(dry_run: bool) -> int:
     # and exit 0 — a clean-looking run over whatever the trim left. Saying so
     # every time is the only warning that can be given.
     print(
-        f"note:               the archive build caps these lists at "
+        f"note:               this build caps these lists at "
         f"{HISTORY_CACHE_LIMIT} entries per guild, from each\n"
         f"                    guild's next song end. Run this BEFORE deploying "
         f"it; anything older\n"
@@ -428,20 +545,46 @@ async def _run(dry_run: bool) -> int:
     # infer from a count. This is the line that gates the deploy, so it says
     # what to do rather than only what happened — and the exit code carries the
     # same answer for anything driving this from a script.
+    #
+    # EVERY applicable reason prints, rather than the first one winning an
+    # if/elif chain. A run can fail in more than one way at once, and an
+    # operator who fixes only the reason that happened to be reported would
+    # re-run straight into the next one — on a tool whose next step is
+    # irreversible. `ok` above is the single source of the exit code, so these
+    # branches can never disagree with it.
     if report.scan_aborted:
         print(
             "INCOMPLETE: the scan for history keys aborted, so an unknown "
             "number of guilds were never read. The counts above are a floor, "
             "not a total. Fix the cause and re-run — re-running is safe. Do "
-            "NOT deploy the archive build until this reports a clean run.",
+            "NOT deploy until this reports a clean run.",
             file=sys.stderr,
         )
-    elif report.failed_guilds:
+    if report.failed_guilds:
         print(
             f"INCOMPLETE: {report.failed_guilds} guild(s) FAILED and their "
             "history did not move (see the errors above). Re-running is safe "
-            "and retries them. Do NOT deploy the archive build until this "
-            "reports 0 failures.",
+            "and retries them. Do NOT deploy until this reports 0 failures.",
+            file=sys.stderr,
+        )
+    if report.short_guilds:
+        # The only verdict that reports damage already done rather than work
+        # still outstanding, so it is the only one that does not promise a
+        # re-run fixes it.
+        print(
+            f"INCOMPLETE: {report.short_guilds} guild(s) had their history "
+            "list trimmed WHILE this ran, destroying their oldest plays before "
+            "they could be read. This bot is already running a build that caps "
+            f"the lists at {HISTORY_CACHE_LIMIT} entries. STOP THE BOT, then "
+            "re-run: re-running picks up what is left, but nothing recovers "
+            "what has already been trimmed.",
+            file=sys.stderr,
+        )
+    if report.skipped_keys:
+        print(
+            f"INCOMPLETE: {report.skipped_keys} history key(s) could not be "
+            "attributed to a guild and were NOT migrated (see the errors "
+            "above). Fix or remove those keys and re-run.",
             file=sys.stderr,
         )
     return 0 if report.ok else 1
@@ -467,13 +610,25 @@ Safe to re-run and safe to interrupt: every insert is idempotent, so a run that
 dies part-way is resumed by running it again. Exits non-zero if any guild
 failed — re-run until it reports 0 failures.
 
-MUST complete before the archive build is deployed: it caps the Redis lists this
+MUST complete before this build is deployed: it caps the Redis lists this
 reads from, at each guild's next song end. Anything missed by then is
 unrecoverable.
 """
 
 
 def main() -> int:
+    # CONFIGURE LOGGING FIRST, before anything can emit. src.util.get_logger
+    # returns a structlog proxy that is inert until this runs; unconfigured,
+    # structlog falls back to PrintLoggerFactory — readable text on STDOUT that
+    # never touches the logging module, so `just db-backfill 2> errors.log`
+    # captures none of it and `docker compose run --rm` deletes the container
+    # that held it.
+    #
+    # That matters more here than in a normal CLI: this module's corrupt-entry
+    # ERROR is documented as the ONLY durable record of a play about to become
+    # unrecoverable. Leaving it in terminal scrollback is not a record.
+    # (src/db_migrate.py has the same shape; it does not make the same claim.)
+    setup_cli_logging()
     parser = argparse.ArgumentParser(
         description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter
     )

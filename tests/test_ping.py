@@ -391,6 +391,24 @@ class TestPingReportsPostgres:
         row = await self._run(music_bot, mock_ctx)
         assert "n/a" in row
 
+    async def test_the_disabled_archive_row_explains_itself(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ship default, asserted on the RENDERED row.
+
+        probe_postgres' docstring says a disabled archive "must say so rather
+        than shrug", and it sets detail="archive disabled" to do it — but
+        _ping_value only appended a detail for DOWN and NA, so the string was
+        dead data and the row read as a bare "off", identical to any other.
+        The test that existed asserted the detail on the ProbeResult, which
+        looks like coverage of that claim while pinning something no user could
+        see. This is the same claim, checked where it is observable.
+        """
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        music_bot.history_archive = None
+        row = await self._run(music_bot, mock_ctx)
+        assert "off (archive disabled)" in row
+
 
 class TestDownReasonRendering:
     """A bare "down" sends the operator to the logs; the server's reason code is
@@ -977,3 +995,34 @@ class TestTheAdvisoryIsForTheOperator:
 
         message.edit.assert_awaited()
         assert len(message.edit.await_args.kwargs["embeds"]) == 1
+
+    async def test_the_owner_check_is_never_paid_for_when_there_is_no_advisory(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_owner() must be reached only when the advisory actually exists.
+
+        It is not a local predicate: MusicBotApp passes neither owner_id nor
+        owner_ids, so discord.py falls through to application_info() — a REST
+        GET that retries ~25s on a 5xx and then RAISES. Written as the obvious
+        `embed() if await is_owner() else None`, that await ran first and
+        unconditionally, putting a network call ahead of the skeleton send this
+        command documents as immediate, and taking the whole dashboard down
+        whenever Discord was degraded — which is when -ping gets run.
+
+        The two assertions are the two halves of the fix: not awaited at all,
+        and therefore immune to it failing. is_owner returns True here on
+        purpose, so a regression cannot pass by answering False.
+        """
+        # The ship default. default_password_embed() returns None on its first
+        # line, so there is nothing to gate and nothing to ask about.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        mock_ctx.bot.is_owner = AsyncMock(
+            return_value=True, side_effect=RuntimeError("application_info() 500")
+        )
+        _ping_message(mock_ctx)
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        mock_ctx.bot.is_owner.assert_not_awaited()
+        assert len(mock_ctx.channel.send.await_args.kwargs["embeds"]) == 1

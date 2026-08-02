@@ -1388,6 +1388,57 @@ class TestHistoryRetention:
         # …and the play landed rather than being lost to the refusal.
         assert await fake_redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
         assert "at maxmemory" in caplog.text
+        # The message names what the trim will actually achieve — this branch
+        # is the one where it achieves something.
+        assert "retrying" in caplog.text
+
+    async def test_an_oom_refusal_at_the_cap_says_the_trim_frees_nothing(
+        self,
+        fake_redis: Redis,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The steady state, where the self-heal cannot heal.
+
+        push_history LPUSHes and LTRIMs in one transaction, so every list this
+        build has already written sits at exactly the cap — and a recovery
+        LTRIM there frees nothing. Measured against redis:7-alpine at
+        maxmemory 3mb: the bare LTRIM was allowed, llen stayed 50, the retry
+        aborted again, the play was dropped. The comment nevertheless promised
+        "the push now has room and the play is not lost".
+
+        So: no pointless LTRIM round trip on the per-song-end path of every
+        guild while Redis is full, and a warning that says the play is likely
+        lost rather than reporting a recovery that did not happen.
+        """
+        store = GuildRedisStore(fake_redis, guild_id=42)
+        for n in range(HISTORY_CACHE_LIMIT):  # exactly at the cap, not over
+            await fake_redis.lpush(store.history_key(), _hentry(n).to_redis())
+
+        seq: list[str] = []
+        real_execute = Pipeline.execute
+        real_ltrim = fake_redis.ltrim
+
+        async def failing_once(self: Any, *a: Any, **k: Any) -> Any:
+            seq.append("execute")
+            if seq.count("execute") == 1:
+                raise OutOfMemoryError(
+                    "OOM command not allowed when used memory > 'maxmemory'."
+                )
+            return await real_execute(self, *a, **k)
+
+        async def recording_ltrim(*a: Any, **k: Any) -> Any:
+            seq.append("bare-ltrim")
+            return await real_ltrim(*a, **k)
+
+        monkeypatch.setattr(Pipeline, "execute", failing_once)
+        monkeypatch.setattr(fake_redis, "ltrim", recording_ltrim)
+        await store.push_history(_hentry(999))
+
+        # No standalone trim: it provably frees nothing at the cap.
+        assert seq == ["execute", "execute"]
+        assert "would free nothing" in caplog.text
+        assert "likely LOST" in caplog.text
 
     async def test_trimming_the_list_never_affects_the_outbox(
         self, fake_redis: Redis

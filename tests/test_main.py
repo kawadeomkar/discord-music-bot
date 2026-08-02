@@ -47,6 +47,38 @@ def app() -> MusicBotApp:
     return instance
 
 
+class TestAppInitDefaults:
+    """The real __init__, against the real constructor — no fixture in the way.
+
+    Everywhere else in this file the `app` fixture bypasses __init__ via
+    __new__, which is right for setup_hook and close() (an unset attribute is
+    the true pre-setup_hook state) but means nothing in the suite proves what
+    __init__ actually assigns. That matters more than it looks: the disabled arm
+    of setup_hook deliberately never assigns these two, MusicPlayer.__init__
+    reads `bot.history_drainer` BARE rather than through getattr, and the
+    disabled-mode tests below seed both attributes by hand — so without this
+    test, `assert app.history_archive is None` would be asserting against a
+    value the fixture itself wrote.
+
+    Reverting the two assignments to bare annotations passes every other test
+    in the repo and makes the default deployment raise AttributeError on its
+    first -play. This is the test that fails instead.
+    """
+
+    def test_the_archive_pair_defaults_to_none(self) -> None:
+        # Cheap (~1ms): AutoShardedBot.__init__ neither connects nor needs a
+        # running loop. Constructed inside the test, never at module scope —
+        # see the yt-dlp pool's spawn/forkserver re-import rule.
+        app = MusicBotApp()
+        assert app.history_archive is None
+        assert app.history_drainer is None
+
+    def test_teardown_flag_starts_clear(self) -> None:
+        # Same constructor, same reason: close() is one-shot off this flag, and
+        # a stale True would skip teardown entirely.
+        assert MusicBotApp()._teardown_started is False
+
+
 class TestSetupHook:
     @pytest.fixture(autouse=True)
     def postgres_configured(self, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
@@ -163,9 +195,14 @@ class TestSetupHookDisabledArchive:
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Flip the flag to the ship default, and model the post-__init__
-        attrs: the app fixture bypasses __init__ (which now assigns None), and
-        the disabled arm deliberately never assigns them — so seed None here
-        to make 'still None after setup_hook' a real assertion."""
+        attrs: the app fixture bypasses __init__ (which assigns None), and the
+        disabled arm deliberately never assigns them — so seed None here to
+        make 'still None after setup_hook' a real assertion.
+
+        That the seeded value is the value __init__ genuinely produces is NOT
+        assumed here — it is pinned by TestAppInitDefaults above, against the
+        real constructor. Without that, this fixture would be writing the
+        answer its own tests then assert."""
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         app.history_archive = None
         app.history_drainer = None
@@ -281,6 +318,8 @@ class TestLeftoverOutboxWarning:
     def archive_disabled(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Same shape as TestSetupHookDisabledArchive's fixture, for the same
+        # reason; TestAppInitDefaults pins that None is what __init__ assigns.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         app.history_archive = None
         app.history_drainer = None
@@ -351,27 +390,40 @@ class TestLeftoverOutboxWarning:
     async def test_a_wrongtype_key_downgrades_to_a_warning(
         self,
         app: MusicBotApp,
+        fake_redis: aioredis.Redis,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The enabled path ABORTS on a mis-shaped outbox because its producer
         would silently lose plays through it. Disabled, the XADD leg is off,
         the key is inert, and an abort would be disproportionate — warn and
-        serve. (Patched rather than staged in fakeredis: fakeredis' stream-
-        on-list behavior diverges from real Redis, and the real WRONGTYPE
-        shape belongs to the redis tier.)"""
-        wrongtype = ResponseError(
-            "WRONGTYPE Operation against a key holding the wrong kind of value"
-        )
+        serve.
+
+        STAGED, not patched. This test used to install
+        `outbox_depth = AsyncMock(side_effect=ResponseError(...))`, which proved
+        only that `except ResponseError` catches an object handed directly to
+        it — not that a mis-shaped key produces one, nor that `outbox_depth` is
+        the call that reaches it. Any change to WHICH helper the probe calls, or
+        to how outbox_depth surfaces a mis-shaped key (wrap it to
+        swallow-and-return-0 and the disabled bot stops reporting a leftover
+        list entirely), left it green.
+
+        Its stated reason for patching was also wrong: fakeredis' documented
+        stream-on-list divergence is XADD-specific (it raises AttributeError
+        there). XLEN — which is what outbox_depth actually calls — models the
+        real ResponseError faithfully, so the whole path runs here honestly.
+        """
+        # A LIST at the stream's key: the real leftover shape, from a build
+        # predating the switch to a stream outbox.
+        await fake_redis.rpush(HISTORY_OUTBOX_KEY, b"legacy-entry")
         mock_load = AsyncMock()
         with (
             patch("src.main.create_redis_pool", return_value=MagicMock()),
-            patch("src.main.get_redis", return_value=MagicMock()),
-            patch("src.main.outbox_depth", new=AsyncMock(side_effect=wrongtype)),
+            patch("src.main.get_redis", return_value=fake_redis),
             patch.object(app, "load_extension", new=mock_load),
         ):
             await app.setup_hook()
         assert "not a stream" in caplog.text
-        mock_load.assert_awaited()
+        mock_load.assert_awaited()  # startup still completed
 
 
 class TestOutboxGroupBootstrap:

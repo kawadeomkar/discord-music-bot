@@ -11,6 +11,7 @@ makes reading one leg complete.
 """
 
 import asyncio
+import dataclasses
 from unittest.mock import AsyncMock, patch
 
 import redis.asyncio as aioredis
@@ -286,6 +287,54 @@ class TestRecentIsRedisOnly:
         got = await h.recent(10)
         assert len(got) == 1
         assert got[0].played_at == raw
+
+    async def test_a_song_played_twice_survives_the_merge(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The other direction of the dedup property, and the one no test had.
+
+        Every builder in this file mints a distinct URL per entry, so no test
+        ever presented two entries sharing one — which left the `played_at`
+        half of the key load-bearing but unasserted in a file at 100%
+        coverage. The mutation `key = (0.0, entry.webpage_url)` survived the
+        whole suite while collapsing every repeat play of a song into its
+        newest occurrence. Playing something twice in a session is ordinary.
+        """
+        h = _history(store)
+        await h.add(_entry(1, played_at=1000.0))
+        await h.add(_entry(2, played_at=1001.0))
+        # Same URL as the first, played again later.
+        await h.add(_entry(1, played_at=1002.0))
+
+        got = await h.recent(10)
+
+        assert [e.played_at for e in got] == [1002.0, 1001.0, 1000.0]
+        assert sum(e.webpage_url == _entry(1).webpage_url for e in got) == 2
+
+    async def test_unknown_timestamps_are_not_treated_as_one_identity(
+        self, store: GuildRedisStore
+    ) -> None:
+        """played_at == 0.0 means "never recorded", not "played at the epoch".
+
+        parse_history_entry defaults it and __post_init__ forces it for
+        NaN/out-of-range, so EVERY entry that predates the timestamped wire
+        format carries the same value. Keying on it collapsed distinct plays of
+        one URL into a single row — a real play vanishing from -history, and a
+        page one short of --limit — where the pre-cap code returned both.
+        """
+        h = _history(store)
+        first = _entry(1, played_at=0.0)
+        # The same song, played again by someone else — still no timestamp.
+        # Keyed on (played_at, webpage_url) these two were indistinguishable
+        # and one of them silently vanished.
+        again = dataclasses.replace(first, requester_id=99, requester_name="user99")
+        await h.add(first)
+        await h.add(again)
+
+        got = await h.recent(10)
+
+        assert len(got) == 2
+        assert {e.requester_id for e in got} == {1, 99}
 
     async def test_redis_failure_falls_through_to_the_cache_and_warns(
         self, store: GuildRedisStore, caplog: pytest.LogCaptureFixture
