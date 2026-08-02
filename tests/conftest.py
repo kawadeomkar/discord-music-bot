@@ -265,4 +265,5 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()
+    cog._enqueue_locks = {}
     return cog
