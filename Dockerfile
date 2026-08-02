@@ -57,6 +57,12 @@ COPY tests/ ./tests/
 # directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
 # them present, not just the module.
 COPY migrations/ ./migrations/
+# Same reason, different file: `just outbox` hardcodes the outbox key and consumer
+# group because a shell recipe cannot import them, and a test reads this file back
+# to prove the two have not drifted. Without it that guard fails in the container
+# tier with FileNotFoundError while passing everywhere else — which is how a check
+# ends up skipped instead of fixed.
+COPY justfile ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
