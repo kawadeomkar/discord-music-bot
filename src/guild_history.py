@@ -2,21 +2,33 @@
 GuildHistory — a guild's played-song history for one guild.
 
 The domain twin of GuildQueue, one layer smaller — but with an inverted
-ownership story: the Redis guild:{id}:history list is the SOURCE OF TRUTH for
-every song ever played (unbounded, PERSISTed — Postgres eventually, see
-docs/HISTORY_OVERHAUL_PLAN.md §8), while the in-memory leg is a bounded
-display cache of the newest HISTORY_CACHE_LIMIT entries, sized to the most
-`-history --limit` can show. Owning both privately means the legs can only
-move together: every add() lands on the cache and the Redis list in one step,
-and restore() refills the cache from the newest slice of the list.
+ownership story. Postgres (play_history, via the outbox) is the durable record
+of every song ever played; the Redis guild:{id}:history list is the write-side
+staging copy — still unbounded and PERSISTed, so it remains a complete second
+copy — while the in-memory leg is a bounded display cache of the newest
+HISTORY_CACHE_LIMIT entries, sized to the most `-history --limit` can show.
+Owning both privately means the legs can only move together: every add() lands
+on the cache and the Redis list in one step, and restore() refills the cache
+from the newest slice of the list.
 
 The at-rest wire format is owned by guild_state.py (HistoryEntry +
 serialize_history_entry/parse_history_entry); the store surface is
 push_history/get_history. This class never sees wire bytes.
+
+add() also XADDs every entry onto the global Postgres outbox stream — in the same
+pipeline as the display-list push — and nudges the drainer
+(docs/POSTGRES_HISTORY_PLAN.md). The archive is a required tier, so that leg is
+unconditional. Postgres is never awaited on the WRITE path: the outbox/drainer
+split keeps the playback loop on Redis-only latency.
+
+Reads do not go to Postgres, and never will: recent() serves -history from the
+Redis list, falling back to the in-memory cache. That is why no archive handle
+is passed in — writes fan out to three places, reads to two, and the asymmetry
+is the design rather than a stage of it.
 """
 
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Optional
 
 from src.guild_state import HistoryEntry
@@ -32,18 +44,41 @@ class GuildHistory:
     restore() only, so the Redis mirror can't be skipped.
     """
 
-    __slots__ = ("_store", "_entries")
+    __slots__ = ("_store", "_entries", "_on_outbox_push")
 
-    def __init__(self, store: Optional[GuildRedisStore]) -> None:
+    def __init__(
+        self,
+        store: Optional[GuildRedisStore],
+        *,
+        on_outbox_push: Callable[[], None],
+    ) -> None:
+        # on_outbox_push is REQUIRED: the Postgres tier is not optional, so
+        # there is no shape of this object that writes history without an outbox
+        # consumer behind it. It is the drainer's notify — a sync callable so
+        # add() stays Redis-only and never awaits the archive.
+        #
+        # No archive handle and no guild_id, deliberately. Both would be the READ
+        # side, and this class does not have one that reaches Postgres: -history
+        # is served from the Redis list and the cache below. The entry's own
+        # guild_id is stamped a layer up by HistoryEntry.from_song, which is
+        # where the outbox needs it.
+        #
+        # store IS Optional, and that is a different axis: Redis may be
+        # unconfigured, in which case there is no wire to push to at all.
         self._store = store
         self._entries: deque[HistoryEntry] = deque(maxlen=HISTORY_CACHE_LIMIT)
+        self._on_outbox_push = on_outbox_push
 
     async def add(self, entry: HistoryEntry) -> None:
-        """Record one played song on both legs. Degrades gracefully when the
-        store is None or the push fails (GuildRedisStore logs, never raises)."""
+        """Record one played song on all three legs — in-memory cache, the
+        Redis display list, and the Postgres outbox (the latter two in one
+        pipeline). Degrades gracefully when the store is None or the push
+        fails (GuildRedisStore logs, never raises; a notify after a failed
+        push just drains an empty outbox)."""
         self._entries.append(entry)
         if self._store is not None:
             await self._store.push_history(entry)
+            self._on_outbox_push()
 
     def restore(self, newest_first: Sequence[HistoryEntry]) -> None:
         """Populate from persisted history after a restart. In-memory leg
