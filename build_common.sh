@@ -233,9 +233,16 @@ warn_default_postgres_password() {
         echo "         will fail regardless of any default. Run ./setup_env.sh." >&2
         return 0
     fi
+    # The ENVIRONMENT WINS over .env, mirroring Compose's own precedence. Both
+    # of these are read by Compose from the process environment first, so
+    # `COMPOSE_PROFILES=archive ./build_docker.sh` with a token-only .env really
+    # does deploy Postgres — and reading the file alone made this preflight
+    # return 0 and say nothing, which is a silent miss in the one function whose
+    # entire job is not to miss one.
     local flag profiles
-    flag="$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file" | tr '[:upper:]' '[:lower:]')"
-    profiles="$(_env_value COMPOSE_PROFILES "$env_file")"
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]')"
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
     case "$flag" in
         true | 1 | yes) : ;; # archive enabled — warn below
         *)

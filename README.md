@@ -317,7 +317,7 @@ run `just check`.
 | Recipe | Does |
 |---|---|
 | `just db-migrate` | Apply pending play-history schema migrations |
-| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before deploying the archive build** |
+| `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before deploying this build** (the 50-entry cap applies in both archive modes — see [Upgrading to 2.5.0](#upgrading-to-250)) |
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
@@ -372,6 +372,7 @@ The Compose stack runs the bot plus its supporting services:
 | `redis` | Redis 7 with AOF persistence — queue/state/cache storage |
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: deployed only with the `archive` profile active (`COMPOSE_PROFILES=archive`) |
 | `db-migrate` | One-shot schema migration for the archive — same `archive` profile |
+| `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `docker compose run --rm db-backfill` |
 | `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works ([details](docs/PO_TOKEN_SIDECAR_PLAN.md)); optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
@@ -454,10 +455,56 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.5.0
+
+**Read this before deploying 2.5.0 over an existing install, whether or not you use the
+archive.** One change here destroys data on upgrade, and it is not opt-in.
+
+This build caps every guild's Redis history list at **50 entries** — the same number
+`-history` can display. Earlier builds never trimmed that list, so an established
+deployment may be holding thousands of plays per guild. The cap is applied by
+`push_history`, which runs on **every song end in both archive modes**, so each guild
+loses everything beyond its newest 50 at its next song end. There is no flag, no warning
+and nothing to undo.
+
+Whether that matters depends on what else holds a copy:
+
+| Upgrading from | Where your history lives | Before deploying |
+|---|---|---|
+| 2.4.x with the archive (Postgres was mandatory) | Postgres has every play | Nothing. The Redis list is a display cache; the durable copy is untouched. `-history` will show 50 rather than more |
+| Any build with **no Postgres** | The Redis list is the **only** copy | **Back it up, or opt in and backfill** — see below |
+
+### If you are not enabling the archive
+
+`just db-backfill` cannot help you: it moves history *into* Postgres, and refuses to run
+without a reachable, migrated database. Snapshot Redis instead, with the bot stopped so
+nothing is mid-write:
+
+```bash
+docker compose stop discord-music-bot
+docker compose exec redis redis-cli SAVE
+docker run --rm -v discord-music-bot_redis-data:/data -v "$PWD:/backup" alpine \
+    tar czf /backup/redis-history-backup.tar.gz -C /data .
+docker compose up -d
+```
+
+That captures the whole keyspace (AOF and RDB); the part that matters is the
+`guild:*:history` lists. Keep the tarball somewhere off the host — restoring it is a
+manual job, but it is the difference between "recoverable" and "gone".
+
+### If you are enabling the archive
+
+Run the backfill **before** deploying this build, and verify it reports a clean run:
+[Backfilling history that predates the archive](#backfilling-history-that-predates-the-archive).
+The ordering is load-bearing and the tool cannot detect that you got it wrong — a list
+already trimmed to 50 looks exactly like a small one.
+
 ## Operating the play-history archive
 
-The archive is **off by default**. Everything in this section applies to a
-deployment that has opted in.
+The archive is **off by default**. Everything in this section applies to a deployment that
+has opted in — with one exception: the 50-entry cap described in
+[Upgrading to 2.5.0](#upgrading-to-250) applies in **both** modes, and the backfill runbook
+below is the only tool that preserves data against it.
 
 ### Enabling the archive
 
@@ -500,6 +547,25 @@ the `postgres-data` volume until you remove it:
 docker volume rm discord-music-bot_postgres-data   # the erasure step
 ```
 
+**There is a second copy, and it is not in Postgres.** Every deployment — including
+one that never enabled the archive — keeps the newest 50 plays per guild in
+`guild:{id}:history`, holding requester id, title and timestamp. That list is
+deliberately `PERSIST`ed: it has no TTL, ever, because it is the only thing serving
+`-history` and length is what bounds it. So it survives the volume removal above, and
+a request to erase a user's data is not satisfied by that command alone:
+
+```bash
+# with the bot stopped, so nothing rewrites the keys mid-delete
+docker compose stop discord-music-bot
+docker compose exec redis sh -c \
+    "redis-cli --scan --pattern 'guild:*:history' | xargs -r redis-cli del"
+docker compose up -d
+```
+
+Erasing one user rather than everything means editing the lists rather than deleting
+them — there is no tooling for that, and the 50-entry cap means an active guild ages a
+given play out on its own within 50 further plays.
+
 ### The write path
 
 While enabled, play history is written twice on every song end, in one Redis
@@ -539,10 +605,25 @@ The archive only records songs played *after* it was deployed. Everything alread
 just db-backfill --dry-run   # count what would move, write nothing
 just db-backfill             # do it
 
-# Docker-only host (no local venv):
+# Docker-only host (no local venv). Build FIRST — see below:
+just image
 docker compose run --rm db-backfill --dry-run
 docker compose run --rm db-backfill
 ```
+
+**The Docker path needs `just image` first, and the order is build → backfill → deploy.**
+`docker compose run` uses a locally-present tag and will not rebuild a stale one, but
+`db-backfill` is pinned to `discord-music-bot:${GIT_SHA:-latest}` — the tag your *running*
+deployment already has. On a host that has not built this commit yet, that image predates
+the backfill and the run ends at:
+
+```
+/app/.venv/bin/python: No module named src.backfill_history
+```
+
+It fails loudly rather than silently, but the obvious reaction ("deploy the new image
+first, then backfill") is the unrecoverable direction. `just image` builds and tags
+without deploying anything, which is why it is a separate step from `./build_docker.sh`.
 
 Rehearse with `--dry-run` first: it checks the database is reachable and migrated, then
 walks the same keys and reports the same counts without writing.
@@ -552,8 +633,8 @@ part-way is resumed by running it again — there is no "figure out where it sto
 It exits non-zero and prints `INCOMPLETE` if any guild failed, so **re-run until it
 reports zero failures**.
 
-**Order matters, and one direction is unrecoverable.** This must complete *before* the
-archive build is deployed. That build caps each guild's Redis history list at 50 entries,
+**Order matters, and one direction is unrecoverable.** This must complete *before* this
+build is deployed. It caps each guild's Redis history list at 50 entries,
 trimming it at that guild's next song end — exactly the entries this command exists to
 move, with Postgres as the only other copy.
 
@@ -711,11 +792,15 @@ that scratch database. WAL archiving / PITR is
 out of scope for the bundled Compose stack; on a managed Postgres, use the platform's
 own PITR.
 
-### Backfill before the archive build
+### Backfill before deploying this build
 
 Order is load-bearing: **backfill → verify zero failures → deploy**. Deploying first caps
 the Redis lists at 50 entries per guild, trimming away exactly the entries the backfill
 exists to preserve, and Postgres is the only other copy.
+
+"This build", not "the archive build": the cap ships in **both** modes, so an operator who
+stays opted out is on the same clock — they just have no backfill to run. See
+[Upgrading to 2.5.0](#upgrading-to-250) for what to do instead.
 
 The full procedure — dry-run rehearsal, the Docker-only path, and what to check before
 deploying — is under
