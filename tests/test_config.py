@@ -389,6 +389,69 @@ def _compose_directives() -> str:
     )
 
 
+def _service_block(name: str) -> str:
+    """The directive lines of one top-level compose service (comments already
+    stripped). Regex, not a YAML parser, on the same terms as everything else
+    in this file: nothing in the repo's dependency set reads YAML, and adding
+    a parser for a contract test would be the tail wagging the dog."""
+    match = re.search(
+        rf"^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)",
+        _compose_directives(),
+        re.S | re.M,
+    )
+    assert match is not None, f"service {name} not found in docker-compose.yml"
+    return match.group(1)
+
+
+class TestComposeArchiveProfile:
+    """The deployment half of the opt-in archive: postgres and db-migrate
+    exist in the model only while the `archive` profile is active, and a
+    token-only `docker compose up` deploys no long-term storage at all.
+    Invisible to every other check — nothing in CI parses compose — so the
+    contract is asserted against the real file, like the password tests
+    above (empirical findings: docs/HISTORY_ARCHIVE_OPT_IN_PLAN.md §2)."""
+
+    def test_postgres_and_db_migrate_are_archive_profiled(self) -> None:
+        # The profile IS the deployment gate: without it, a default `up`
+        # deploys a database nobody opted in to and the consent story is
+        # app-side only.
+        for service in ("postgres", "db-migrate"):
+            assert 'profiles: ["archive"]' in _service_block(service), service
+
+    def test_the_bot_does_not_depend_on_the_profiled_services(self) -> None:
+        """REGRESSION GUARD (F1): an un-profiled service with depends_on on a
+        profiled one makes the WHOLE project invalid while the profile is
+        inactive — even `docker compose config` fails ("depends on undefined
+        service") — so re-adding either dependency breaks token-only `up`
+        outright, invisibly to every other check. Reproduced on Compose
+        v5.3.1."""
+        bot = _service_block("discord-music-bot")
+        depends = re.search(r"depends_on:\n((?:      .*\n)*)", bot)
+        assert depends is not None
+        assert "postgres" not in depends.group(1)
+        assert "db-migrate" not in depends.group(1)
+        # redis stays: it is un-profiled, so F1 does not apply to it.
+        assert "redis:" in depends.group(1)
+
+    def test_db_backfill_stays_on_ops_not_archive(self) -> None:
+        """`up` starts EVERY service of an active profile, so db-backfill
+        joining `archive` would run the backfill — a full Redis keyspace
+        walk — on every enabled `up`. It keeps its own profile and runs only
+        when explicitly targeted (`docker compose run` auto-activates a
+        target's own profiles)."""
+        backfill = _service_block("db-backfill")
+        assert 'profiles: ["ops"]' in backfill
+        assert "archive" not in backfill
+
+    def test_just_down_activates_the_archive_profile(self) -> None:
+        """`docker compose down` with the profile inactive removes only
+        un-profiled containers and leaves a running postgres behind (F4), so
+        the justfile recipe must pass --profile archive. Greps the justfile —
+        the same cannot-import-shell reasoning as the preflight test above."""
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        assert "docker compose --profile archive down" in justfile
+
+
 class TestComposeMatchesTheDefault:
     """The two halves of the first-run promise, asserted against the real file.
 

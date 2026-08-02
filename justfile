@@ -437,6 +437,11 @@ ci: check container-test test-pg test-redis
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #
+# All of these assume the ARCHIVE IS ENABLED and its services are up
+# (HISTORY_ARCHIVE_ENABLED=true + COMPOSE_PROFILES=archive in .env). Against a
+# disabled stack they fail at connect — curt, but honest: there is no database
+# deployed to operate on.
+#
 # All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
 # the environment, which for a compose deployment means `.env`. They run the
 # LOCAL venv's python against whatever that URL points at — operator tools, not
@@ -744,7 +749,13 @@ up TAG='':
 # Stop the compose stack (volumes are kept)
 [group('deploy')]
 down:
-    docker compose down
+    # --profile archive is load-bearing, not decoration. `docker compose down`
+    # with the profile INACTIVE removes only un-profiled containers and leaves
+    # a running postgres behind (plus a "network in use" error) — exactly the
+    # just-disabled-the-archive case where the operator most expects the
+    # database to stop. Activating a profile whose services have no containers
+    # is a no-op, so the always-disabled case is unaffected.
+    docker compose --profile archive down
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text
