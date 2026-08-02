@@ -2,9 +2,15 @@
 
 The property under test mirrors test_guild_queue's: after every operation the
 in-memory display cache and the Redis leg agree on their shared window. The
-cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded (source of
-truth for all played songs — docs/HISTORY_OVERHAUL_PLAN.md §4).
+cache is capped at HISTORY_CACHE_LIMIT; the Redis leg is unbounded and PERSISTed.
+
+Writes fan out to Postgres (TestAddOutboxRouting); reads do not
+(TestRecentIsRedisOnly). TestRecentWindowIsComplete asserts the arithmetic that
+makes reading one leg enough.
 """
+
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 import redis.asyncio as aioredis
 from typing import Any, cast
@@ -21,7 +27,7 @@ from src.redis_client import (
 )
 
 
-def _entry(n: int) -> HistoryEntry:
+def _entry(n: int, played_at: float | None = None) -> HistoryEntry:
     return HistoryEntry(
         title=f"Song {n}",
         webpage_url=f"https://yt.com/v={n}",
@@ -29,7 +35,7 @@ def _entry(n: int) -> HistoryEntry:
         played_secs=200,
         requester_id=n,
         requester_name=f"user{n}",
-        played_at=1000.0 + n,
+        played_at=1000.0 + n if played_at is None else played_at,
     )
 
 
@@ -46,9 +52,8 @@ def _history(
     """GuildHistory with the required notify wiring defaulted.
 
     on_outbox_push is mandatory on the real constructor (the Postgres tier is
-    not optional on the write path) and is not what most tests here are about,
-    so it defaults to an inert stand-in. There is no archive parameter: this
-    class never reads Postgres.
+    not optional on the WRITE path). There is no archive parameter any more:
+    recent() reads Redis and the in-memory deque, never Postgres.
     """
     return GuildHistory(
         store,
@@ -81,6 +86,8 @@ class TestAdd:
         # …while every entry landed in Redis.
         raw = await fake_redis.lrange(store.history_key(), 0, -1)
         assert len(raw) == HISTORY_CACHE_LIMIT + 5
+        # Non-evictable: no TTL, because -history has no other source.
+        assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_cache_matches_newest_slice_of_redis(
         self, store: GuildRedisStore
@@ -95,7 +102,9 @@ class TestAdd:
 class TestAddOutboxRouting:
     """Postgres archive wiring (docs/POSTGRES_HISTORY_PLAN.md §5.4): every
     add() pushes to the outbox and nudges the drainer. Unconditional — the
-    archive is a required tier, so there is no no-archive shape to gate on."""
+    archive is a required tier, so there is no no-archive shape to gate on.
+    Write path only — and it is the ONLY direction Postgres appears in now; the
+    read path is TestRecentIsRedisOnly."""
 
     async def test_add_routes_entry_to_outbox_too(
         self, store: GuildRedisStore, fake_redis: Redis
@@ -185,6 +194,172 @@ class TestRecent:
         h = _history(None)
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
+
+
+class TestRecentIsRedisOnly:
+    """-history is served from the Redis list and the in-memory deque, and from
+    nothing else.
+
+    The class this replaced (TestRecentReadsPostgresFirst) pinned a three-tier
+    merge: archive first, Redis merged in for undrained plays, cache last. Every
+    defect it documented — a full archive result short-circuiting the newest
+    songs, µs-quantized timestamps duplicating a play across legs, one archived
+    row suppressing the whole cache — was a reconciliation bug between tiers that
+    hold the same plays at different times. Reading one leg deletes the class of
+    bug rather than fixing instances of it.
+
+    What makes that sound is arithmetic, not preference, and it is asserted in
+    TestRecentWindowIsTheCap below: push_history caps the list at
+    HISTORY_CACHE_LIMIT and musicbot.HISTORY_MAX_LIMIT is pinned to the same
+    constant, so the list always holds every play the command can ask for.
+    """
+
+    async def test_redis_is_the_source_when_the_cache_is_cold(
+        self, store: GuildRedisStore
+    ) -> None:
+        # The restart shape: entries on the list, nothing in memory yet.
+        await store.push_history(_entry(1))
+        await store.push_history(_entry(2))
+        h = _history(store)
+        assert [e.title for e in await h.recent(10)] == ["Song 2", "Song 1"]
+
+    async def test_the_cache_adds_depth_redis_did_not_return(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The deque is MERGED, not a fallback reached only on an empty read.
+
+        REGRESSION: it used to be consulted only when every leg above it came
+        back empty, so a single row from a healthier leg hid it entirely —
+        reproduced at Redis-erroring / cache-holding-9, where recent(10)
+        returned 1 where the pre-archive code returned 9. As a second leg it can
+        only add depth.
+        """
+        h = _history(store)
+        await h.add(_entry(1))
+        # A play that reached the deque but not the list (the write half of a
+        # Redis blip): get_history() cannot see it, recent() still must.
+        h.restore([_entry(2)])
+        assert [e.title for e in await h.recent(10)] == ["Song 2", "Song 1"]
+
+    async def test_the_two_legs_dedup_exactly(self, store: GuildRedisStore) -> None:
+        """Both legs carry the same time.time() float — the deque holds the
+        object add() appended, the list holds it through orjson, which
+        round-trips a double without loss — so identity is equality.
+
+        This is what the deleted quantized_played_at guarded on the archive leg,
+        where timestamptz truncated to µs and ~37% of real timestamps compared
+        unequal against their own Redis copy. No such boundary is left.
+        """
+        h = _history(store)
+        raw = 1000.0000014  # finer than µs; nothing truncates it now
+        await h.add(_entry(1, played_at=raw))  # lands on BOTH legs
+        got = await h.recent(10)
+        assert len(got) == 1
+        assert got[0].played_at == raw
+
+    async def test_redis_failure_falls_through_to_the_cache_and_warns(
+        self, store: GuildRedisStore, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        h = _history(store)
+        await h.add(_entry(1))
+        with patch.object(
+            store, "get_history", AsyncMock(side_effect=OSError("redis unreachable"))
+        ):
+            assert await h.recent(10) == [_entry(1)]
+        assert "redis read failed" in caplog.text
+
+    async def test_a_slow_redis_is_bounded_and_falls_through(
+        self, store: GuildRedisStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bound exists even though GuildRedisStore swallows its own errors:
+        swallowing turns a FAILURE into [], but a connected-and-unresponsive
+        server produces no error to swallow, and the pool sets no socket read
+        timeout. Without the timeout this test HANGS rather than failing.
+        """
+        import src.guild_history as guild_history
+
+        monkeypatch.setattr(guild_history, "_READ_TIMEOUT_SECS", 0.02)
+        h = _history(store)
+        await h.add(_entry(1))
+
+        async def never() -> list[HistoryEntry]:
+            await asyncio.Event().wait()
+            return []
+
+        with patch.object(store, "get_history", never):
+            assert await h.recent(10) == [_entry(1)]
+
+    async def test_no_store_at_all_still_reaches_the_cache(self) -> None:
+        # Redis unconfigured is a different axis from Redis failing: there is no
+        # leg to read, and the deque is the whole answer.
+        h = _history(None)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(10) == [_entry(2), _entry(1)]
+
+    async def test_merge_still_honours_the_limit(self, store: GuildRedisStore) -> None:
+        h = _history(store)
+        for n in (1, 2, 3):
+            await h.add(_entry(n))
+        assert [e.title for e in await h.recent(2)] == ["Song 3", "Song 2"]
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    async def test_a_nonpositive_limit_yields_nothing(self, limit: int) -> None:
+        """The CONTRACT, not the early-out that implements it.
+
+        recent()'s `limit <= 0` check is an equivalent mutation away from
+        `< 0` — merged[:limit] handles 0 identically — so a test asserting the
+        branch would be theatre. What is worth pinning is that a caller asking
+        for nothing gets nothing, from the arrangement that used to be able to
+        return the whole cache instead: nothing above the cache, cache full.
+        """
+        h = _history(None)
+        h.restore([_entry(2), _entry(1)])
+        assert await h.recent(limit) == []
+
+
+class TestRecentWindowIsComplete:
+    """The arithmetic the whole Redis-only read path rests on.
+
+    get_history reads the newest HISTORY_CACHE_LIMIT entries and
+    musicbot.HISTORY_MAX_LIMIT is pinned to the same constant — so the list
+    provably holds every play -history can be asked for. Break either and the
+    command silently starts losing depth, which is why the relationship is
+    asserted rather than left to the comments that state it.
+    """
+
+    async def test_the_command_ceiling_cannot_outrun_the_window(self) -> None:
+        # Imported here rather than at module scope: this is the one assertion
+        # in this file that reaches into the command layer, and it is asserting
+        # a relationship between two constants, not exercising a command.
+        from src.musicbot import HISTORY_MAX_LIMIT
+
+        assert HISTORY_MAX_LIMIT == HISTORY_CACHE_LIMIT
+
+    async def test_the_full_window_is_readable_at_the_ceiling(
+        self, store: GuildRedisStore
+    ) -> None:
+        """A guild that has played more than the window still renders a full
+        page — from Redis alone, with no archive behind it."""
+        h = _history(store)
+        total = HISTORY_CACHE_LIMIT + 10
+        for n in range(total):
+            await h.add(_entry(n))
+        got = await h.recent(HISTORY_CACHE_LIMIT)
+        assert len(got) == HISTORY_CACHE_LIMIT
+        assert [e.title for e in got] == [
+            f"Song {n}" for n in range(total - 1, total - 1 - HISTORY_CACHE_LIMIT, -1)
+        ]
+
+    async def test_an_undrained_play_renders_immediately(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The property that makes Postgres unnecessary here: the list is
+        written synchronously at song end, so it LEADS the archive. A play the
+        drainer has not touched is already the newest row -history shows."""
+        h = _history(store)
+        await h.add(_entry(1))
+        await h.add(_entry(2))  # drained nowhere yet
+        assert [e.title for e in await h.recent(10)] == ["Song 2", "Song 1"]
 
 
 class TestSequenceProtocol:

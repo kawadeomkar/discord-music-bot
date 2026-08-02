@@ -1219,8 +1219,9 @@ class TestPushHistoryAtomicity:
         """Failure mode if they split: the connection drops between the two
         round-trips, the display list gains the play and the outbox does not,
         and no drainer ever sees it — absent from Postgres forever. -history
-        still shows it from Redis, so nobody notices until the Phase C cutover
-        trims the list."""
+        still shows it, because that command reads the Redis list rather than
+        Postgres, so nothing surfaces the gap until the archive is queried
+        directly."""
         queued: list[str] = []
         direct: list[str] = []
         real_pipeline = fake_redis.pipeline

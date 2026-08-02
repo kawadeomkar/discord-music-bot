@@ -436,7 +436,7 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 ## Operating the play-history archive
 
 Play history is written twice on every song end, in one Redis pipeline: to the guild's
-history list, and to a global **outbox** the background drainer moves into Postgres.
+display list, and to a global **outbox** the background drainer moves into Postgres.
 The playback loop never waits on Postgres — an unreachable database just means the
 outbox grows and drains later.
 
@@ -619,7 +619,7 @@ src/
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
 ├── guild_queue.py     # GuildQueue — owns the three queue representations
-├── guild_history.py   # GuildHistory — played-song history (Redis + display cache)
+├── guild_history.py   # GuildHistory — play history: Redis list + display cache
 ├── guild_state.py     # Redis schema: frozen value objects + field constants
 ├── redis_client.py    # connection pool, GuildRedisStore, cache helpers
 ├── youtube.py         # yt-dlp integration, YTDL audio source, prefetch pipeline
