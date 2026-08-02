@@ -305,6 +305,77 @@ class TestPingReportsSpotifySource:
         assert "rejected" not in latency and "not configured" not in latency
 
 
+class TestPingReportsPostgres:
+    """End-to-end for the Postgres row, probe_postgres left UNPATCHED: what is
+    under test is the wiring from the cog's history_archive through the
+    dashboard to the archive's health_check.
+
+    This is a regression guard with history. The probe shipped ahead of the
+    Postgres tier reading `getattr(self, "pg_pool", None)` off the cog — an
+    attribute nothing ever set — so the row rendered a permanent "n/a" while the
+    command's help text and the README both advertised a Postgres latency. Only
+    an end-to-end test catches that class of bug: every unit test of
+    probe_postgres passed the whole time.
+    """
+
+    def _patch_everything_but_postgres(self) -> Any:
+        async def _make(res: ProbeResult) -> ProbeResult:
+            return res
+
+        async def _versions() -> dict[str, str]:
+            await asyncio.sleep(0)  # yield so the immediate probes settle
+            return dict.fromkeys(
+                ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
+            )
+
+        return patch.multiple(
+            "src.ping",
+            probe_redis=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_spotify=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_otel=lambda *a, **k: _make(_probe(ProbeState.OFF)),
+            collect_versions=_versions,
+        )
+
+    async def _run(self, music_bot: MusicBot, mock_ctx: MagicMock) -> str:
+        """The Postgres ROW, not the whole latency field: the other probes are
+        patched to n/a/off, so a field-wide `"n/a" not in ...` would match their
+        rows and never fail no matter what Postgres reported."""
+        _ping_message(mock_ctx)
+        with self._patch_everything_but_postgres():
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        field = _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        return next(line for line in field.splitlines() if "Postgres" in line)
+
+    async def test_healthy_archive_row_is_a_live_latency(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock()
+        music_bot.history_archive = archive
+        row = await self._run(music_bot, mock_ctx)
+        assert "ms" in row
+        assert "n/a" not in row and "down" not in row
+        archive.health_check.assert_awaited_once_with()
+
+    async def test_unreachable_archive_row_is_down(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock(side_effect=OSError("connection refused"))
+        music_bot.history_archive = archive
+        row = await self._run(music_bot, mock_ctx)
+        assert "down (OSError)" in row
+
+    async def test_no_archive_row_is_na(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Only reachable outside a real MusicBotApp — setup_hook refuses to start
+        # without POSTGRES_URL — but it is what keeps the probe renderable.
+        music_bot.history_archive = None
+        row = await self._run(music_bot, mock_ctx)
+        assert "n/a" in row
+
+
 class TestDownReasonRendering:
     """A bare "down" sends the operator to the logs; the server's reason code is
     the actionable half (regression for the live MISCONF outage)."""
@@ -433,17 +504,34 @@ class TestProbePostgres:
         r = await ping.probe_postgres(None)
         assert r.state is ProbeState.NA
 
-    async def test_live_pool_is_ok(self) -> None:
-        conn = MagicMock()
-        conn.execute = AsyncMock()
-        acquire_cm = MagicMock()
-        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
-        acquire_cm.__aexit__ = AsyncMock(return_value=None)
-        pool = MagicMock()
-        pool.acquire = MagicMock(return_value=acquire_cm)
-        r = await ping.probe_postgres(pool)
+    async def test_healthy_archive_is_ok(self) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock()
+        r = await ping.probe_postgres(archive)
         assert r.state is ProbeState.OK
-        conn.execute.assert_awaited_once_with("SELECT 1")
+        assert r.latency_ms is not None
+        archive.health_check.assert_awaited_once_with()
+
+    async def test_unreachable_archive_is_down_with_reason(self) -> None:
+        # The whole point of asking the archive rather than a pool: a bot whose
+        # Postgres is unreachable reports DOWN, not the "n/a (not configured)"
+        # that a lazily-absent pool would have produced.
+        archive = MagicMock()
+        archive.health_check = AsyncMock(
+            side_effect=ConnectionRefusedError("no server")
+        )
+        r = await ping.probe_postgres(archive)
+        assert r.state is ProbeState.DOWN
+        assert r.detail == "ConnectionRefusedError"
+
+    async def test_cancellation_propagates(self) -> None:
+        # _timed re-raises CancelledError so the dashboard's deadline can flip a
+        # straggling probe to FAILED itself. A first connect can outlast that
+        # deadline, so Postgres is the probe most likely to take this path.
+        archive = MagicMock()
+        archive.health_check = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await ping.probe_postgres(archive)
 
 
 # ── OTEL ───────────────────────────────────────────────────────────────────────

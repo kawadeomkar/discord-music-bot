@@ -332,6 +332,10 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
+    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
+    # AttributeError rather than returning None. Tests that care about the
+    # Postgres row set their own archive (see TestPingReportsPostgres).
+    cog.history_archive = None
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()
