@@ -141,8 +141,17 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv and wins. Same shape as the ytdlp seam and the structlog
     contextvar reset above: make the suite mean what it says regardless of the
     shell it runs in.
+
+    HISTORY_ARCHIVE_ENABLED is pinned TRUE — the suite default deliberately
+    inverts the ship default (False). The enabled configuration exercises
+    strictly more code (the outbox XADD leg, the notify, the drainer wiring)
+    and hundreds of existing assertions encode it; the shipped default is
+    covered by explicit disabled-mode tests that monkeypatch the variable per
+    case, which wins over this fixture (same MonkeyPatch instance, later call).
+    See docs/HISTORY_ARCHIVE_OPT_IN_PLAN.md D9.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
 @pytest.fixture(autouse=True, scope="session")

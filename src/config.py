@@ -137,6 +137,52 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
 
+def history_archive_enabled() -> bool:
+    """True when the operator has opted in to the Postgres history archive.
+
+    This is the consent gate for long-term storage. Enabled, the bot runs
+    today's full archive tier: POSTGRES_URL required at startup, every play
+    XADDed to history:outbox, the drainer moving it into play_history forever.
+    Disabled — the DEFAULT — none of that exists: no outbox writes, no
+    archive/drainer objects, no Postgres requirement. Redis behavior is
+    identical in both modes; only the durable tier is optional.
+
+    Read at call time (the spotify_enabled/postgres_url rationale): no hot
+    path — push_history calls it once per song — and tests monkeypatch the
+    environment per case instead of reloading the module.
+
+    Parsing is strict, and the failure direction is why. A lenient
+    anything-but-true-is-False rule turns a typo (`HISTORY_ARCHIVE_ENABLED=on`)
+    into an operator who believes they enabled archiving while every play goes
+    unrecorded — silent data loss discovered months later, the exact shape of
+    bug the archive exists to prevent. Garbage therefore raises, naming the
+    variable, because the message can surface with no logger attached.
+
+    Unset and empty read as False — the fail-CLOSED default is the feature:
+    collection must be a choice, so absence of a choice means no collection.
+    `HISTORY_ARCHIVE_ENABLED=` is the bare `KEY=` shape .env.example models
+    for POSTGRES_PASSWORD, same tolerance rule as _int_env.
+
+    Validation placement is load-bearing: setup_hook MUST call this before any
+    other consumer, because the next reader is push_history, which is
+    @_guild_op-wrapped — a garbage value first read there would be swallowed
+    into one warning per song instead of aborting startup. After setup_hook has
+    read it once, the environment cannot change for the life of the process.
+    """
+    raw = os.environ.get("HISTORY_ARCHIVE_ENABLED")
+    value = (raw or "").strip().lower()
+    if not value:
+        return False
+    if value in ("true", "1", "yes"):
+        return True
+    if value in ("false", "0", "no"):
+        return False
+    raise ValueError(
+        f"HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no "
+        f"(case-insensitive); got {raw!r}"
+    )
+
+
 def postgres_url() -> Optional[str]:
     """The play-history archive's DSN, or None when unset.
 

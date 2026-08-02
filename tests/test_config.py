@@ -18,6 +18,7 @@ from src.config import (
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     _int_env,
+    history_archive_enabled,
     postgres_url,
     spotify_enabled,
     using_default_postgres_password,
@@ -110,6 +111,65 @@ class TestPostgresUrl:
         assert postgres_url() is None
         monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
         assert postgres_url() == "postgresql://u@h/db"
+
+
+class TestHistoryArchiveEnabled:
+    """The consent gate for long-term storage.
+
+    Two rules under test, each bought by a failure direction. Fail-closed:
+    absence of a choice must mean no collection, so unset and empty are False.
+    Strict parse: a lenient anything-but-true-is-False rule turns a typo into
+    an operator who believes they enabled archiving while every play goes
+    unrecorded — so garbage raises, naming the variable.
+    """
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES"])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "False", "0", "no", "NO"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_unset_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`HISTORY_ARCHIVE_ENABLED=` is the bare KEY= shape .env.example
+        models for POSTGRES_PASSWORD — same tolerance rule as _int_env."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_surrounding_whitespace_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "  true  ")
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "ture", "2", "y", "t"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Includes near-misses an operator would plausibly type (`on`, `y`,
+        `enabled`): every one silently disables archiving under a lenient
+        parser, which is the failure the strict parse exists to prevent."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        with pytest.raises(ValueError, match="HISTORY_ARCHIVE_ENABLED"):
+            history_archive_enabled()
+
+    def test_read_at_call_time_not_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        assert history_archive_enabled() is True
 
 
 class TestIntEnv:
