@@ -9,9 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 import orjson
 import pytest
 import redis.asyncio as aioredis
+from redis.asyncio.connection import Connection as RedisConnection
 from redis.asyncio import Redis
 from redis.asyncio.client import Pipeline
-from redis.backoff import ExponentialBackoff
+from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -96,6 +97,44 @@ class TestCreateRedisPool:
         — one immediate reattempt, which a restarting Redis outlives."""
         conn = create_redis_pool().make_connection()
         assert isinstance(conn.retry._backoff, ExponentialBackoff)
+
+    async def test_a_failing_connect_is_actually_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTATION GUARD: `redis.retry.Retry` in place of the asyncio one.
+
+        The three tests above assert the retry OBJECT, and every one of them
+        passes under either class — same name, same constructor, same
+        get_retries()/_supported_errors/_backoff. The sync class simply never
+        awaits: its call_with_retry does `try: return do()`, which hands back an
+        un-awaited coroutine, so nothing raises inside the try and the error
+        escapes from the caller's await, outside the loop. The pool spent a year
+        configured for three retries and performing none, with a green suite.
+
+        Counting attempts is the only assertion that can tell them apart, which
+        is why this test drives a real connect instead of reading config.
+        `_connect` is patched rather than pointing at a closed port: no socket, no
+        chance a dev machine has something listening, and it isolates the retry
+        from connect-timeout behaviour.
+        """
+        attempts = 0
+
+        async def refuse(_self: object) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise RedisConnectionError("connection refused")
+
+        monkeypatch.setattr(RedisConnection, "_connect", refuse)
+        # NoBackoff so the assertion is about the retry count, not about waiting
+        # out ExponentialBackoff's 8+16+32ms. The backoff itself is asserted above.
+        monkeypatch.setattr(
+            create_redis_pool.__module__ + ".ExponentialBackoff", NoBackoff
+        )
+        conn = create_redis_pool().make_connection()
+        with pytest.raises(RedisConnectionError):
+            await conn.connect()
+        # 1 initial + 3 retries. The sync class yields exactly 1.
+        assert attempts == 4
 
 
 class TestGetRedis:

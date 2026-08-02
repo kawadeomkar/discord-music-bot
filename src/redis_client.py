@@ -13,7 +13,7 @@ from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from redis.retry import Retry
+from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
 from src.guild_state import (
@@ -140,6 +140,20 @@ def create_redis_pool() -> aioredis.ConnectionPool:
         # Redis is usually gone for longer than that, and a hammering reconnect is what
         # backoff exists to avoid. 3 attempts over ExponentialBackoff's default 8ms→512ms
         # ceiling covers an ordinary restart without stalling a command for long.
+        # `redis.asyncio.retry.Retry`, NOT `redis.retry.Retry` — they are different
+        # classes with the same name, the same constructor and the same attributes,
+        # and only the async one awaits. The sync version's call_with_retry does
+        # `try: return do()`, which under an async connection returns a COROUTINE
+        # without awaiting it: no exception is ever raised inside that try, the
+        # `except` arm is dead, the failure handler never runs, and the error
+        # surfaces from the caller's await — outside the retry loop entirely.
+        # Measured against a closed port: sync = 1 connection attempt, async = 4.
+        # For a year this pool was configured for 3 retries and performed none.
+        #
+        # Nothing about the object looks wrong, which is why it survived:
+        # get_retries() is 3, _supported_errors and _backoff are exactly as set,
+        # so every assertion on the CONFIGURATION passes under both classes. The
+        # test below counts attempts instead, because that is the only difference.
         retry=Retry(ExponentialBackoff(), 3),
         socket_connect_timeout=5,
     )

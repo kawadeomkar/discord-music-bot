@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "1.5.0"
+version = "2.0.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -52,7 +52,14 @@ optional = true
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
-fakeredis = ">=2.26.0"
+# Floor is 2.36, not 2.26: that is where fakeredis models the Redis-7 deleted-ID
+# list, so XAUTOCLAIM over a trimmed-but-pending entry hands back the (id, {})
+# tombstone shape a real server does. The drainer MUST ack tombstones — one
+# unacked tombstone stalls the drain permanently — and that is the P1-critical
+# path the unit tier exists to cover. Below this floor the shape is wrong and the
+# guard tests pass against a fiction. The lock has resolved above it for a while;
+# the declared floor had not moved, so a fresh resolve could have gone under it.
+fakeredis = ">=2.36"
 pytest-cov = "^7.1.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
 # several guards here are asyncio.timeout() calls, and a regression that removes
