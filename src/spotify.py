@@ -122,20 +122,34 @@ def _collection_from_cache(
 ) -> Optional[tuple[SpotifyCollection, list[str]]]:
     """Parse a cached collection. None ⇒ treat as a cache miss (unparseable
     entries are re-fetched, not crashed on). Every field reads with a default
-    so entries written by an older build stay readable."""
+    so entries written by an older build stay readable — but a field of the
+    WRONG TYPE is garbage, not an older build, and the whole entry is a miss:
+    a corrupt `total` would otherwise flow uncoerced into embed copy
+    (guild_state.py's wire discipline; review M10)."""
     if not isinstance(raw, dict):
         return None
     titles = raw.get("titles")
     if not isinstance(titles, list):
         return None
+    total = raw.get("total", len(titles))
+    if not isinstance(total, int):
+        return None
+    name = raw.get("name")
+    thumbnail = raw.get("thumbnail")
+    release_date = raw.get("release_date")
+    if any(
+        v is not None and not isinstance(v, str)
+        for v in (name, thumbnail, release_date)
+    ):
+        return None
     collection = SpotifyCollection(
         kind=kind,
         id=cid,
-        total=raw.get("total", len(titles)),
-        name=raw.get("name"),
+        total=total,
+        name=name,
         artists=[str(a) for a in raw.get("artists") or []],
-        thumbnail=raw.get("thumbnail"),
-        release_date=raw.get("release_date"),
+        thumbnail=thumbnail,
+        release_date=release_date,
     )
     return collection, [str(t) for t in titles]
 
@@ -240,8 +254,8 @@ class Spotify:
         off one known info-dict shape on the playback hot path, so a wrong
         assumption there breaks playback. This returns whatever the requested
         endpoint returns — the shape is chosen by the caller's URL, so there is no
-        single schema to write. The two callers that do read named fields
-        (`track()`, `playlist()`) narrow to `str` / `list[str]` at their own
+        single schema to write. The callers that do read named fields (`track()`
+        and the `album_stream`/`playlist_stream` pagers) narrow at their own
         boundary, which is where the shape is actually known.
         """
         if time.time() > self.token_expiry:
@@ -333,8 +347,9 @@ class Spotify:
     # its last yield. A partially-consumed generator (-playnow's page-1-only
     # path, a preemption, a mid-stream error, aclose()) takes GeneratorExit at
     # a yield and never reaches the write, so a truncated collection can never
-    # poison the entry. Nothing awaits on the GeneratorExit path (golden rule
-    # 11: an unraisable warning from asyncgen finalization is a test failure).
+    # poison the entry. Nothing awaits on the GeneratorExit path — an await
+    # there is illegal during finalization, and the resulting unraisable
+    # warning is a hard test failure under filterwarnings=["error"].
 
     async def album_stream(self, aid: str) -> AsyncGenerator[TrackPage]:
         """Yield an album's tracks as TrackPages of YouTube search titles.

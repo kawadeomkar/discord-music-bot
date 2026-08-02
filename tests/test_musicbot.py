@@ -1348,6 +1348,31 @@ class TestCleanup:
         await music_bot.cleanup(mock_guild)
         mp.queue.bump_generation.assert_awaited_once()
 
+    async def test_cleanup_bumps_generation_before_cancelling_tasks(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The bump-FIRST ordering is load-bearing, not incidental: bumped
+        after the cancellations, a drain page parked on the queue mutex can
+        commit to the mirror of a guild mid-teardown (review M8)."""
+        events: list[str] = []
+
+        async def parked() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+
+        task = asyncio.create_task(parked())
+        await asyncio.sleep(0)  # park it
+        mp = self._make_minimal_mp(music_bot, mock_guild, _prefetch_task=task)
+        mp.queue.bump_generation = AsyncMock(side_effect=lambda: events.append("bump"))
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert events == ["bump", "cancelled"]
+
     async def test_cancels_player_task_before_disconnect(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -3809,9 +3834,18 @@ class TestPlaynow:
         mock_ctx.message.content = f"-playnow {url}"
         assert music_bot.spotify is not None
         col = _scollection(SpotifyType.ALBUM, total=11)
+        consumed: list[int] = []
         music_bot.spotify.album_stream = MagicMock(
             return_value=_sgen(
-                [_spage(col, ["Iridescence ESPRIT 空想", "Second Track"], is_last=True)]
+                [
+                    _spage(
+                        col,
+                        ["Iridescence ESPRIT 空想", "Second Track"],
+                        is_last=False,
+                    ),
+                    _spage(col, ["Third Track", "Fourth Track"], is_last=True),
+                ],
+                yielded=consumed,
             )
         )
         qobj = QueueObject("https://yt.com/v=first", "Iridescence", mock_ctx.author)
@@ -3822,6 +3856,9 @@ class TestPlaynow:
             await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url)
 
         music_bot.spotify.album_stream.assert_called_once_with("6WgSCcRfaXuBVfM2TpV0Kl")
+        # Page-1-only, pinned against a MULTI-page stream: a mutation that
+        # drains everything before taking track 1 fetches page 2 (review L10).
+        assert consumed == [0]
         ys.assert_awaited_once()
         assert ys.call_args.args[1] == "ytsearch:Iridescence ESPRIT 空想"
         live_mp.interject.assert_awaited_once()
@@ -4006,6 +4043,35 @@ class TestAcquireEnqueueSlot:
             first.waiters = 0
             first.lock.release()
 
+    async def test_fast_path_is_bounded_during_release_handoff(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """During asyncio.Lock's release→wakeup handoff, locked() reads False
+        while the woken waiter is still queued, so the fast path's acquire()
+        parks behind it. It must park BOUNDED — without the timeout this call
+        blocks unboundedly with no notice, no cap, no waiter count
+        (review M3)."""
+        monkeypatch.setattr("src.musicbot._ENQUEUE_WAIT_SECS", 0.05)
+        entry = music_bot._enqueue_locks.setdefault(
+            mock_ctx.guild.id, _GuildEnqueueLock()
+        )
+        await entry.lock.acquire()  # the drain holding the slot
+        waiter = asyncio.create_task(entry.lock.acquire())  # a parked waiter
+        await asyncio.sleep(0)
+        entry.lock.release()  # the handoff window
+        assert not entry.lock.locked()  # ...in which locked() reads False
+
+        slot = await music_bot._acquire_enqueue_slot(mock_ctx)
+
+        assert slot is None  # timed out instead of parking forever
+        notices = [c.kwargs["embed"].description for c in mock_ctx.send.call_args_list]
+        assert any("Still queueing" in n for n in notices)
+        await waiter  # the woken waiter did get the lock
+        entry.lock.release()
+
 
 class TestPlayAdmission:
     """The tier rule at the top of play(): collections take the per-guild
@@ -4030,13 +4096,23 @@ class TestPlayAdmission:
         mock_ctx.voice_client = None
         url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
         mock_ctx.message.content = f"-play {url}"
-        music_bot._play_resolved = AsyncMock()
+        held_during_body: list[bool] = []
+
+        async def probe(*args: Any, **kwargs: Any) -> None:
+            held_during_body.append(
+                music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+            )
+
+        music_bot._play_resolved = AsyncMock(side_effect=probe)
 
         await command_callback(MusicBot.play)(music_bot, mock_ctx, url)
 
         music_bot._play_resolved.assert_awaited_once()
+        # Held ACROSS the body — an acquire-release-immediately would pass a
+        # released-after check alone (review L9) — then released.
+        assert held_during_body == [True]
         entry = music_bot._enqueue_locks[mock_ctx.guild.id]
-        assert not entry.lock.locked()  # held across the body, released after
+        assert not entry.lock.locked()
 
     async def test_declined_admission_skips_resolution(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4264,6 +4340,66 @@ class TestPlayStreamIntegration:
         ]
         assert any("Queueing stopped" in (n or "") for n in notices)
 
+    async def test_single_play_mid_drain_lands_at_current_tail(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """M5→b's other half: a single -play issued mid-drain neither waits on
+        the collection lock nor lands after the still-arriving collection — it
+        appends at the CURRENT tail, between pages (review L9)."""
+        col = _scollection(SpotifyType.ALBUM, total=6)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=False),
+            _spage(col, ["T4 A", "T5 A"], is_last=True),
+        ]
+        release = asyncio.Event()
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            yield pages[0]
+            await release.wait()  # the drain parks here, slot held
+            yield pages[1]
+            yield pages[2]
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        collection_task = asyncio.create_task(
+            command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
+        )
+        async with asyncio.timeout(5):
+            while music_player.queue.qsize() < 2:  # page 1 has landed
+                await asyncio.sleep(0)
+
+        single = QueueObject("https://yt.com/v=s", "Single", mock_author)
+        mock_ctx.message.content = "-play single song"
+        with (
+            patch("src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=single)),
+            patch("src.musicplayer.YTDL.prefetch_stream", new=AsyncMock()),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "single song")
+            assert music_player.queue.qsize() == 3  # landed immediately, no wait
+
+            release.set()
+            await collection_task
+
+        assert music_player.store is not None
+        stored = [
+            orjson.loads(raw)
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert [d.get("ytsearch") or d.get("title") for d in stored] == [
+            "ytsearch:T0 A",
+            "ytsearch:T1 A",
+            "Single",
+            "ytsearch:T2 A",
+            "ytsearch:T3 A",
+            "ytsearch:T4 A",
+            "ytsearch:T5 A",
+        ]
+
 
 class TestBeginStreamEnqueue:
     async def test_streaming_puts_page1_and_returns_drain_state(
@@ -4361,11 +4497,12 @@ class TestBeginStreamEnqueue:
         mock_ctx.send.assert_not_awaited()
         await resolved.aclose()
 
-    async def test_refused_page1_returns_none_and_sends_nothing(
+    async def test_refused_page1_returns_none_with_notice_and_no_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """A clear/teardown landed between the generation snapshot and the
-        put: nothing was queued, so no embed either."""
+        put: nothing was queued, so no enqueue embed and no 👍 — but the user
+        is told, not silently swallowed (review M6)."""
         col = _scollection(SpotifyType.ALBUM, total=11)
         resolved = ResolvedSpotifyStream(
             SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
@@ -4378,7 +4515,10 @@ class TestBeginStreamEnqueue:
         )
 
         assert drain is None
-        mock_ctx.send.assert_not_awaited()
+        assert mock_ctx.send.await_count == 1
+        notice = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "Queueing stopped" in notice
+        mock_ctx.message.add_reaction.assert_not_awaited()
         await resolved.aclose()
 
     async def test_front_with_backlog_buffers_into_one_put_front(
@@ -4407,6 +4547,78 @@ class TestBeginStreamEnqueue:
         assert [y.ytsearch for y in args[0]] == [f"ytsearch:T{i} A" for i in range(150)]
         assert kwargs["prefetch"] is False
         assert kwargs["expected_generation"] == 3
+        # The success side is user-visible too: embed + 👍 (review M7 —
+        # inverting the refusal guard would silence exactly this).
+        assert mock_ctx.send.await_count == 1
+        assert "150 songs" in mock_ctx.send.call_args.kwargs["embed"].title
+        mock_ctx.message.add_reaction.assert_awaited_once()
+
+    async def test_refused_buffered_put_front_notifies_and_returns_none(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The buffered arm of the M6 fix: the user waited through the whole
+        fetch — a refusal here must say so, and send no enqueue embed."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=True),
+        ]
+        resolved = ResolvedSpotifyStream(SpotifyType.ALBUM, _sgen(pages))
+        mp = _stream_mp(backlog=True)
+        mp.queue_put_front = AsyncMock(return_value=False)
+
+        drain = await music_bot._begin_stream_enqueue(
+            mock_ctx, resolved, mp, front=True
+        )
+
+        assert drain is None
+        assert mock_ctx.send.await_count == 1
+        notice = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "Queueing stopped" in notice
+        mock_ctx.message.add_reaction.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_empty_non_last_page1_streams_on(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A playlist whose first 100 items are all skipped (episodes/nulls)
+        yields an EMPTY non-last page 1: that streams on — only an empty LAST
+        page means the collection has nothing (review M12). Tightening the
+        guard to `not page1.titles` kills such playlists."""
+        col = _scollection(SpotifyType.PLAYLIST, total=101)
+        pages = [
+            _spage(col, [], is_last=False),
+            _spage(col, ["T A"], is_last=True),
+        ]
+        resolved = ResolvedSpotifyStream(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _stream_mp()
+
+        drain = await music_bot._begin_stream_enqueue(
+            mock_ctx, resolved, mp, front=False
+        )
+
+        assert drain is not None  # did not raise "no queueable tracks"
+        await music_bot._drain_stream_tail(mock_ctx, mp, drain)
+        assert drain.enqueued == 1
+
+    async def test_album_embed_title_is_truncated(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord rejects >256-char embed titles; truncate_embed_title on the
+        album name is load-bearing, not decorative (review L11)."""
+        col = _scollection(SpotifyType.ALBUM, total=1, name="X" * 300)
+        resolved = ResolvedSpotifyStream(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
+        )
+        mp = _stream_mp()
+
+        drain = await music_bot._begin_stream_enqueue(
+            mock_ctx, resolved, mp, front=False
+        )
+
+        assert drain is not None
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert len(embed.title) <= 256
 
     async def test_front_without_backlog_streams(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4434,6 +4646,29 @@ class TestBeginStreamEnqueue:
 
 
 class TestDrainStreamTail:
+    async def test_failed_completion_notice_does_not_raise(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A Discord error sending the SUCCESS notice must not escape to
+        play's error handler, which would report a fully successful enqueue
+        as 'Failed to queue song' (review M4)."""
+        col = _scollection(SpotifyType.PLAYLIST, total=200)
+        pages = [
+            _spage(col, ["T0 A"], is_last=False),
+            _spage(col, ["T1 A"], is_last=True),
+        ]
+        mp = _stream_mp()
+        resolved = ResolvedSpotifyStream(SpotifyType.PLAYLIST, _sgen(pages))
+        drain = await music_bot._begin_stream_enqueue(
+            mock_ctx, resolved, mp, front=False
+        )
+        assert drain is not None and drain.completion_notice
+
+        mock_ctx.send = AsyncMock(side_effect=RuntimeError("discord hiccup"))
+        await music_bot._drain_stream_tail(mock_ctx, mp, drain)  # must not raise
+
+        assert drain.enqueued == 2  # the enqueue itself completed
+
     async def test_tail_drains_all_pages_in_order_with_batch_flags(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -4563,6 +4798,8 @@ class TestShuffleSerialized:
         mp = MagicMock()
         mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
         music_bot.get_mp = MagicMock(return_value=mp)
+        # The M1 guard shuffles only the guild's REGISTERED player.
+        music_bot.mps[mock_ctx.guild.id] = mp
         mock_ctx.message.add_reaction = AsyncMock()
 
         await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
@@ -4570,6 +4807,49 @@ class TestShuffleSerialized:
         music_bot._acquire_enqueue_slot.assert_awaited_once()
         mp.queue_shuffle.assert_awaited_once()
         assert not entry.lock.locked()  # released even on the happy path
+
+    async def test_slot_released_when_shuffle_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A leaked slot is forever: every later collection/-shuffle in the
+        guild eats the full wait timeout then declines (review M9)."""
+        entry = _GuildEnqueueLock()
+        await entry.lock.acquire()
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
+        mp = MagicMock()
+        mp.queue_shuffle = AsyncMock(side_effect=RuntimeError("boom"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        assert not entry.lock.locked()
+
+    async def test_shuffle_bails_when_player_torn_down_during_wait(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The wait can end BECAUSE of a teardown (cleanup() aborts the drain
+        holding the slot). Shuffling the popped player would rebuild the Redis
+        mirror from a dead snapshot — resurrecting a queue -stop deliberately
+        left persisted (review M1)."""
+        entry = _GuildEnqueueLock()
+        await entry.lock.acquire()
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
+        mp = MagicMock()
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps.pop(mock_ctx.guild.id, None)  # cleanup() popped it mid-wait
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
+        assert not entry.lock.locked()
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs
+        ]
+        assert any("while shuffle waited" in (n or "") for n in notices)
 
     async def test_declined_shuffle_does_not_run(
         self, music_bot: MusicBot, mock_ctx: MagicMock

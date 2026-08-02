@@ -15,6 +15,7 @@ from src.spotify import (
     _ALBUM_PAGE_CONCURRENCY,
     _HTTP_TIMEOUT,
     _PLAYLIST_FIELDS,
+    _collection_from_cache,
     Spotify,
     SpotifyAuthError,
     TrackPage,
@@ -576,6 +577,37 @@ async def _drain(gen: Any) -> list[TrackPage]:
         return [page async for page in pages]
 
 
+class TestCollectionFromCache:
+    """The cache-read wire discipline: a wrong-TYPED field means garbage and
+    the whole entry is a miss (re-fetched, never rendered), while MISSING
+    optional fields — an older build's entry — stay readable (review M10)."""
+
+    def test_non_dict_is_a_miss(self) -> None:
+        assert _collection_from_cache(SpotifyType.ALBUM, "cid", ["list"]) is None
+
+    def test_non_list_titles_is_a_miss(self) -> None:
+        raw = {"titles": "garbage"}
+        assert _collection_from_cache(SpotifyType.ALBUM, "cid", raw) is None
+
+    def test_non_int_total_is_a_miss(self) -> None:
+        raw: dict[str, Any] = {"titles": ["T A"], "total": "11"}
+        assert _collection_from_cache(SpotifyType.ALBUM, "cid", raw) is None
+
+    @pytest.mark.parametrize("field", ["name", "thumbnail", "release_date"])
+    def test_non_str_identity_field_is_a_miss(self, field: str) -> None:
+        raw: dict[str, Any] = {"titles": ["T A"], "total": 1, field: 42}
+        assert _collection_from_cache(SpotifyType.ALBUM, "cid", raw) is None
+
+    def test_missing_optional_fields_stay_readable(self) -> None:
+        got = _collection_from_cache(SpotifyType.PLAYLIST, "cid", {"titles": ["T A"]})
+        assert got is not None
+        collection, titles = got
+        assert titles == ["T A"]
+        assert collection.total == 1  # defaults to len(titles)
+        assert collection.name is None
+        assert collection.thumbnail is None
+
+
 class TestAlbumStream:
     async def test_single_page_album_is_one_call(self, spotify: Spotify) -> None:
         api, calls = _album_api("alb1", total=11, page1_limit=50)
@@ -620,6 +652,47 @@ class TestAlbumStream:
         assert offsets == [20, 70]
         titles = [t for p in pages for t in p.titles]
         assert titles == [f"Track {i} Artist" for i in range(120)]
+
+    async def test_stride_falls_back_to_page1_length_when_limit_absent(
+        self, spotify: Spotify
+    ) -> None:
+        """The `or len(page1)` arm of the stride derivation: a response with
+        no `limit` field derives the stride from the page itself — a fallback
+        of 50 would skip every track between the real page-1 end and offset
+        50 (review L6)."""
+        calls: list[dict[str, Any]] = []
+
+        async def api(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            calls.append({"endpoint": endpoint, "params": params})
+            if endpoint.endswith("v1/albums/albnolimit"):
+                return {
+                    "name": "N",
+                    "artists": [{"name": "A"}],
+                    "images": [{"url": "u"}],
+                    "release_date": "2020-01-01",
+                    "tracks": {
+                        # No "limit" key at all — 30 items speak for themselves.
+                        "items": [_album_track(i) for i in range(30)],
+                        "total": 90,
+                        "next": (
+                            "https://api.spotify.com/v1/albums/albnolimit"
+                            "/tracks?offset=30&limit=50"
+                        ),
+                    },
+                }
+            assert params is not None
+            end = min(params["offset"] + params["limit"], 90)
+            return {"items": [_album_track(i) for i in range(params["offset"], end)]}
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            pages = await _drain(spotify.album_stream("albnolimit"))
+
+        assert [c["params"]["offset"] for c in calls[1:]] == [30, 80]
+        assert [t for p in pages for t in p.titles] == [
+            f"Track {i} Artist" for i in range(90)
+        ]
 
     async def test_boundary_exact_page_no_second_call(self, spotify: Spotify) -> None:
         api, calls = _album_api("alb50", total=50, page1_limit=50)
@@ -760,6 +833,62 @@ class TestPlaylistStream:
         assert titles == [f"T{i} A" for i in range(250)]
         assert pages[-1].is_last and not pages[0].is_last
         assert pages[0].collection.total == 250
+
+    async def test_first_request_targets_playlist_tracks_endpoint(
+        self, spotify: Spotify
+    ) -> None:
+        """Nothing else pins the URL itself — a typo'd endpoint would pass
+        every mask/cursor assertion (review L7; ports the deleted
+        test_playlist_calls_correct_endpoint)."""
+        api, calls = _playlist_api("plendpoint", total=5)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            await _drain(spotify.playlist_stream("plendpoint"))
+
+        assert "v1/playlists/plendpoint/tracks" in calls[0]["endpoint"]
+
+    async def test_exactly_one_full_page_makes_no_second_call(
+        self, spotify: Spotify
+    ) -> None:
+        """The page-limit boundary: exactly 100 tracks with next=null is one
+        call — the album 50/51 boundaries had this pin, the playlist path did
+        not (review L12)."""
+        api, calls = _playlist_api("pl100", total=100)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            pages = await _drain(spotify.playlist_stream("pl100"))
+
+        assert len(calls) == 1
+        assert pages[-1].is_last
+        assert sum(len(p.titles) for p in pages) == 100
+
+    async def test_mid_drain_failure_writes_no_cache(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """A cursor-page failure after page 1 must abandon without caching a
+        truncated collection — the album fanout had this guard, the playlist
+        path did not (review L8)."""
+        calls: list[str] = []
+
+        async def api(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            calls.append(endpoint)
+            if len(calls) == 1:
+                return {
+                    "items": [_playlist_track(i) for i in range(100)],
+                    "total": 250,
+                    "next": (
+                        "https://api.spotify.com/v1/playlists/plfail"
+                        "/tracks?offset=100&limit=100&fields=next,total"
+                    ),
+                }
+            raise SpotifyAuthError(401, "revoked mid-cursor")
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            with pytest.raises(SpotifyAuthError):
+                await _drain(spotify.playlist_stream("plfail"))
+
+        assert len(calls) == 2
+        assert await fake_redis.get("spotify:playlist_tracks:plfail") is None
 
     async def test_first_request_mask_and_params(self, spotify: Spotify) -> None:
         api, calls = _playlist_api("plmask", total=10)

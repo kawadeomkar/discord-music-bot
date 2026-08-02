@@ -1049,6 +1049,31 @@ class TestGenerationCounter:
         assert gq.display_items() == []
         assert await fake_redis.llen(store.queue_key()) == 0
 
+    async def test_empty_items_put_reports_success(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+    ) -> None:
+        """An all-filtered collection page enqueues []: that is success, not
+        an abandon — a False here would stop a live drain with a spurious
+        'queue was cleared' notice (review M12). No leg is touched either
+        way."""
+        assert await gq.put([], batch=True, expected_generation=gq.generation) is True
+        assert await gq.put([], batch=True) is True  # generation-blind callers too
+        assert gq.qsize() == 0
+        assert gq.display_items() == []
+        assert await fake_redis.llen(store.queue_key()) == 0
+
+    async def test_empty_items_put_still_respects_generation(
+        self, gq: GuildQueue
+    ) -> None:
+        """The generation check comes FIRST: even a no-op page must tell a
+        preempted drain to stop consuming pages."""
+        gen = gq.generation
+        await gq.bump_generation()
+        assert await gq.put([], batch=True, expected_generation=gen) is False
+
     async def test_stale_put_front_refused_no_leg_touched(
         self,
         gq: GuildQueue,

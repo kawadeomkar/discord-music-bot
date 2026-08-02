@@ -103,7 +103,9 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
-# Bounds on the per-guild collection-enqueue lock (§3.5.3 of the design doc).
+# Bounds on the per-guild collection-enqueue lock
+# (docs/SPOTIFY_ALBUM_SUPPORT_PLAN.md §3.5.3 — the design doc every bare
+# "design §" reference in this file means).
 # A FIFO that can be entered but not exited is worse than no FIFO; each bound
 # closes a failure mode the naive version has.
 #
@@ -168,6 +170,14 @@ class ResolvedSpotifyStream:
             self.first_page.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.first_page
+        elif not self.first_page.cancelled() and self.first_page.exception():
+            # Retrieved but not re-raised: the abandon paths run because
+            # something else already failed. Left unretrieved, the task's
+            # exception surfaces only as an opaque "exception was never
+            # retrieved" at GC (review L1).
+            log.info(
+                f"abandoned page-1 fetch had failed: {self.first_page.exception()!r}"
+            )
         await self.pages.aclose()
 
 
@@ -686,9 +696,24 @@ class MusicBot(commands.Cog):
         assert ctx.guild is not None
         entry = self._enqueue_locks.setdefault(ctx.guild.id, _GuildEnqueueLock())
         if not entry.lock.locked():
-            # No await between the locked() check and acquire(): nothing can
-            # interleave, so this cannot barge past a live waiter.
-            await entry.lock.acquire()
+            # No await between the locked() check and acquire(), so this
+            # cannot barge past a live waiter. It CAN still park: during a
+            # release→wakeup handoff locked() reads False while waiters are
+            # queued, and Lock.acquire() then joins that queue. The timeout
+            # keeps the bounded-wait guarantee in that window (review M3);
+            # skipping the waiting notice is deliberate — this path is the
+            # uncontended 99% case.
+            try:
+                async with asyncio.timeout(_ENQUEUE_WAIT_SECS):
+                    await entry.lock.acquire()
+            except TimeoutError:
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still queueing a large collection — try again in a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return None
             return entry
         if entry.waiters >= _ENQUEUE_MAX_WAITERS:
             await ctx.send(
@@ -779,6 +804,17 @@ class MusicBot(commands.Cog):
             )
             if not ok:
                 log.info("buffered collection enqueue abandoned: queue invalidated")
+                # Tell the user — they waited through the full fetch, and a
+                # silently swallowed -play reads as a dead bot (review M6).
+                with contextlib.suppress(Exception):
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"Queueing stopped — the queue was cleared or "
+                            f"playback was stopped before the {noun} could "
+                            f"be added.",
+                            discord.Color.orange(),
+                        )
+                    )
                 return None
             await asyncio.gather(
                 self._send_stream_embed(
@@ -798,6 +834,15 @@ class MusicBot(commands.Cog):
         )
         if not ok:
             log.info("stream enqueue abandoned before page 1: queue invalidated")
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queueing stopped — the queue was cleared or "
+                        f"playback was stopped before the {noun} could "
+                        f"be added.",
+                        discord.Color.orange(),
+                    )
+                )
             return None
         exact = len(page1.titles) if page1.is_last else None
         await asyncio.gather(
@@ -899,12 +944,17 @@ class MusicBot(commands.Cog):
                         # belongs to was deleted. Abandon without refilling —
                         # the H2 regression this design exists to prevent.
                         log.info("collection drain abandoned: queue invalidated")
+                        # Teardown-neutral copy: of the five doors that bump
+                        # the generation, only -clear empties the queue — the
+                        # others (-stop, kick, alone-timer, gate timeout)
+                        # deliberately leave pages 1..k persisted (review M5).
                         with contextlib.suppress(Exception):
                             await ctx.send(
                                 embed=notice_embed(
-                                    f"Queueing stopped — {drain.enqueued} "
-                                    f"{pluralize(drain.enqueued, 'song')} were "
-                                    "added before the queue was cleared.",
+                                    f"Queueing stopped after {drain.enqueued} "
+                                    f"{pluralize(drain.enqueued, 'song')} — "
+                                    "the queue was cleared or playback was "
+                                    "stopped.",
                                     discord.Color.orange(),
                                 )
                             )
@@ -929,13 +979,17 @@ class MusicBot(commands.Cog):
             raise
         span.set_attribute("spotify.enqueued", drain.enqueued)
         if drain.completion_notice:
-            await ctx.send(
-                embed=notice_embed(
-                    f"Playlist finished queueing — {drain.enqueued} "
-                    f"{pluralize(drain.enqueued, 'song')} in total.",
-                    discord.Color.blue(),
+            # Suppressed: a failed SEND of the success notice must not reach
+            # play's error handler, which would report a fully successful
+            # enqueue as "Failed to queue song" (review M4).
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Playlist finished queueing — {drain.enqueued} "
+                        f"{pluralize(drain.enqueued, 'song')} in total.",
+                        discord.Color.blue(),
+                    )
                 )
-            )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
@@ -1014,6 +1068,7 @@ class MusicBot(commands.Cog):
                 # (37i9…) playlist, which Spotify 404s for third-party apps —
                 # a documented example that could never work (§2.3).
                 "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
+                "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
@@ -1109,6 +1164,12 @@ class MusicBot(commands.Cog):
                     join_task = asyncio.create_task(ctx.invoke(self.join))
                     try:
                         qobj = await self.queue_source(ctx, source)
+                        # Captured BEFORE awaiting the join: if the join (or a
+                        # cancellation delivered there) raises, the finally
+                        # below must still aclose() the stream — its page-1
+                        # task is already in flight (review M2).
+                        if isinstance(qobj, ResolvedSpotifyStream):
+                            resolved_stream = qobj
                         await join_task
                     except BaseException:
                         if not join_task.done():
@@ -1176,9 +1237,10 @@ class MusicBot(commands.Cog):
         indefinitely; -play queues the full thing.
 
         The Spotify path consumes page 1 of the stream and abandons the
-        generator under aclosing: exactly one HTTP call, and deliberately no
-        cache write (the pagers cache only on a full drain, so a page-1-only
-        read can never poison the cache with a truncated collection)."""
+        generator under aclosing: at most one HTTP call (zero on a warm
+        cache), and deliberately no cache write (the pagers cache only on a
+        full drain, so a page-1-only read can never poison the cache with a
+        truncated collection)."""
         if isinstance(source, SpotifySource) and source.type in (
             SpotifyType.PLAYLIST,
             SpotifyType.ALBUM,
@@ -1567,6 +1629,23 @@ class MusicBot(commands.Cog):
                 if slot is None:
                     return
                 try:
+                    # The wait can end BECAUSE of a teardown: cleanup() bumps
+                    # the generation, the drain holding this slot abandons,
+                    # and the release wakes us on a guild whose player was
+                    # popped. Shuffling the dead player would rebuild the
+                    # Redis mirror from its snapshot — resurrecting (and
+                    # scrambling) a queue that -stop deliberately left
+                    # persisted (review M1).
+                    assert ctx.guild is not None
+                    if self.mps.get(ctx.guild.id) is not mp:
+                        await ctx.send(
+                            embed=notice_embed(
+                                "Playback was shut down while shuffle waited "
+                                "— nothing to shuffle.",
+                                discord.Color.orange(),
+                            )
+                        )
+                        return
                     await ctx.send(
                         embed=notice_embed(
                             "Please wait... shuffling", discord.Color.blue()
