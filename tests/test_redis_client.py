@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+from pathlib import Path
 from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -484,6 +485,40 @@ async def _stream_entries(fake_redis: Redis) -> list[tuple[bytes, dict[bytes, by
 
 async def _stream_ids(fake_redis: Redis) -> list[bytes]:
     return [i for i, _ in await _stream_entries(fake_redis)]
+
+
+class TestOperatorRecipeMatchesTheSchema:
+    """`just outbox` hardcodes the key and group names — a shell recipe cannot
+    import them.
+
+    Same coupling as build_common.sh's copy of DEFAULT_POSTGRES_PASSWORD, and it
+    drifts the same way: rename either constant and the recipe keeps working
+    against a key nothing writes, reporting "nothing buffered, nothing to do"
+    during the incident it exists for. Fails OPEN, silently, which is why it is
+    asserted here rather than left to review.
+    """
+
+    @staticmethod
+    def _recipe() -> str:
+        text = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        start = text.index("\noutbox IDLE_MS=")
+        # Recipes end at the first line that is neither blank nor indented.
+        body: list[str] = []
+        for line in text[start + 1 :].splitlines()[1:]:
+            if line and not line.startswith((" ", "\t")):
+                break
+            body.append(line)
+        return "\n".join(body)
+
+    def test_the_recipe_targets_the_key_the_producer_writes(self) -> None:
+        # Whole assignment lines, not `in`: the substring form passes for
+        # `key=history:outbox_old`, which is precisely the drift being guarded.
+        assigned = {ln.strip() for ln in self._recipe().splitlines()}
+        assert f"key={HISTORY_OUTBOX_KEY}" in assigned
+
+    def test_the_recipe_targets_the_group_the_drainer_reads(self) -> None:
+        assigned = {ln.strip() for ln in self._recipe().splitlines()}
+        assert f"group={HISTORY_OUTBOX_GROUP}" in assigned
 
 
 class TestEnsureOutboxGroup:

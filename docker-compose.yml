@@ -15,6 +15,27 @@ services:
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      #
+      # Built from the same POSTGRES_* vars as the postgres service below, so
+      # the password lives in exactly one place (.env). This overrides any
+      # POSTGRES_URL coming from env_file — to point at an EXTERNAL Postgres
+      # instead, comment this line out and set POSTGRES_URL in .env directly.
+      #
+      # `${VAR:?}` is Compose's mandatory-variable form (POSIX parameter
+      # expansion): unset OR empty fails the command outright instead of
+      # silently defaulting. Deliberately terse — Compose emits "required
+      # variable POSTGRES_PASSWORD is missing a value" on its own, and the
+      # friendly, actionable message lives in build_common.sh's
+      # require_postgres_password preflight, which fires before the image build
+      # rather than at `up`. Do NOT give it a `:-` fallback: a defaulted
+      # password would bring the stack up with a credential nobody chose.
+      #
+      # The host port is a variable because the bot runs on the HOST network
+      # namespace, so it reaches Postgres through the published port rather
+      # than the compose network — and 5432 is exactly the port a
+      # already-installed local Postgres occupies. POSTGRES_HOST_PORT lets that
+      # developer move ours without editing tracked files.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
@@ -22,6 +43,35 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        # The archive is a required tier, so this is a real dependency. It is
+        # not load-bearing for correctness — the asyncpg pool is lazy and the
+        # drainer backs off, so the bot survives a Postgres that is slow or
+        # briefly down — but waiting for healthy keeps a cold `up` from opening
+        # with a burst of connection-refused backoff logging.
+        condition: service_healthy
+      db-migrate:
+        # started, NOT service_completed_successfully.
+        #
+        # The bot no longer creates its own schema; it verifies the version and
+        # refuses to ARCHIVE against an unmigrated database
+        # (PostgresHistoryArchive._assert_schema_version). Waiting for the
+        # one-shot to exit 0 makes `up` on a fresh volume work end to end — but
+        # it also means a corrupt volume, a wrong password or one bad migration
+        # stops the music bot from starting AT ALL, and postgres carries
+        # restart: always, so a crash-looping database holds that gate open
+        # indefinitely.
+        #
+        # That inverts this project's posture. Redis backs queue persistence,
+        # crash recovery and every cache, and it is optional and degrades
+        # gracefully; Postgres stores *history*. The failure mode of a history
+        # archive must not be "no music". Ordering is all that is actually
+        # needed: the migration starts first, the lazy pool means the bot does
+        # no Postgres IO at startup, and the drainer's backoff plus the
+        # actionable SchemaVersionError cover the window where it has not
+        # finished. `just db-migrate` remains the way to see migration failures
+        # directly.
+        condition: service_started
       # otel-lgtm is intentionally NOT in depends_on.
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
@@ -33,11 +83,27 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru: guild:{id}:history keys are persistent
-    # (no TTL — unbounded full-history retention, docs/HISTORY_OVERHAUL_PLAN.md
-    # §4) and must never be eviction candidates. Every cache key (ytdl:*,
-    # spotify:*) and the other guild:* keys carry TTLs, so volatile-lru
-    # preserves the existing cache-eviction behavior for them.
+    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and
+    # must never become eviction candidates:
+    #
+    #   history:outbox      plays written but not yet durable in Postgres.
+    #                       Evicting one loses that play silently — no error,
+    #                       nothing in play_history_rejected, nothing in the
+    #                       logs; the drainer just finds fewer entries than were
+    #                       pushed. It is normally near-empty and grows precisely
+    #                       during a Postgres outage, i.e. exactly when eviction
+    #                       pressure is highest.
+    #   guild:{id}:history  the full per-guild list, PERSISTed. Nothing trims
+    #                       it and nothing gives it a TTL, so every play it
+    #                       holds is a primary copy — one lost to eviction is
+    #                       lost outright.
+    #
+    # There used to be a third, history:outbox:dlq. The schema lock retired it:
+    # rows Postgres refuses now land in the play_history_rejected TABLE, which
+    # cannot pressure Redis at all.
+    #
+    # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
+    # so volatile-lru preserves the existing cache-eviction behavior for them.
     command: >
       redis-server
       --appendonly yes
@@ -55,22 +121,24 @@ services:
       retries: 5
 
   postgres:
-    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). Inert for
-    # now — nothing in the bot reads or writes Postgres yet.
+    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). Required —
+    # MusicBotApp.setup_hook refuses to start without POSTGRES_URL.
     image: postgres:18-alpine
     container_name: discord-postgres
     restart: always
     environment:
       # Interpolated from the project .env at compose parse time (NOT env_file —
       # that would spray the bot's other secrets into this container). The
-      # db-migrate one-shot below builds its URL from these same three values.
+      # bot's POSTGRES_URL above is built from these same three values.
       - POSTGRES_USER=${POSTGRES_USER:-musicbot}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?}
       - POSTGRES_DB=${POSTGRES_DB:-musicbot}
     ports:
-      # Loopback-bound. The host side is overridable because 5432 is the port a
-      # developer's own local Postgres already holds; the `just db-*` recipes
-      # build their host DSN from the same variable, so the two cannot drift.
+      # Loopback-bound, and the host side is overridable: the bot uses host
+      # networking, so it connects through this published port, and 5432 is the
+      # port a developer's own local Postgres already holds. Set
+      # POSTGRES_HOST_PORT in .env to move it — the bot's POSTGRES_URL above
+      # reads the same variable, so the two cannot drift.
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       # 18+ image layout: the declared volume moved to /var/lib/postgresql
@@ -86,14 +154,17 @@ services:
       retries: 5
 
   db-migrate:
-    # One-shot schema migration, so a fresh volume comes up already migrated
-    # rather than waiting for someone to remember.
+    # One-shot schema migration, run to completion before the bot starts.
     #
     # The bot image, not a postgres client image: the runner is src/db_migrate.py
     # and the migrations ship in that image, so there is exactly one definition
     # of "what schema this build expects" and no way for a sidecar image to
-    # drift from it. `restart: "no"` is spelled out because `always` on a
-    # one-shot is a crash loop of successful exits.
+    # drift from it.
+    #
+    # `restart: "no"` is explicit and load-bearing — the default here would
+    # inherit nothing, but a copy-paste of `restart: always` from the services
+    # above would turn a successful one-shot into a crash loop of successful
+    # exits, and depends_on: service_completed_successfully would never settle.
     image: discord-music-bot:${GIT_SHA:-latest}
     build:
       context: .
@@ -102,9 +173,9 @@ services:
     restart: "no"
     command: ["python", "-m", "src.db_migrate"]
     environment:
-      # Container networking here (not 127.0.0.1): this service is on the
-      # compose network, so it addresses postgres by service name and is
-      # unaffected by POSTGRES_HOST_PORT.
+      # Container networking here (not 127.0.0.1): unlike the bot, this service
+      # is on the compose network, so it addresses postgres by service name and
+      # is unaffected by POSTGRES_HOST_PORT.
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-musicbot}
     depends_on:
       postgres:
