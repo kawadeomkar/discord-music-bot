@@ -17,6 +17,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
+from src import config
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -930,16 +931,23 @@ class GuildRedisStore:
     # row and no log line (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry, cap and PERSIST the list, and mirror the entry onto
-        the Postgres outbox — one transaction, one round trip, no branches.
+        """LPUSH one entry, cap and PERSIST the list, and — while the archive
+        is enabled — mirror the entry onto the Postgres outbox: one
+        transaction, one round trip, one branch.
 
         The list is a bounded, permanent window of the newest HISTORY_CACHE_LIMIT
         plays: LTRIM on every write, PERSIST so nothing expires it. Those two
-        commands are the whole retention policy, and they are unconditional.
+        commands are the whole retention policy, and they are unconditional —
+        identical whether the archive is enabled or not, because the display
+        list is runtime state and HISTORY_ARCHIVE_ENABLED gates only the
+        durable tier.
 
-        BOUNDED because Postgres is the durable record — the archive holds every
-        play, so Redis has no reason to keep a second unbounded copy, and an
-        unbounded non-evictable key is the OOM shape the note above describes.
+        BOUNDED because an unbounded non-evictable key is the OOM shape the
+        note above describes — and, while the archive is enabled, because
+        Postgres is the durable record that holds every play, so Redis has no
+        reason to keep a second unbounded copy. With the archive disabled the
+        window IS the whole retained record, which is the deal the operator
+        chose: the opt-in exists so that nothing outlives it.
 
         PERMANENT because -history reads this list and nothing else
         (guild_history.recent). An idle TTL here would mean a guild that goes a
@@ -965,13 +973,15 @@ class GuildRedisStore:
         never gains a TTL — see the eviction note above and docker-compose.yml's
         volatile-lru comment.
 
-        The same wire bytes are also XADDed onto the HISTORY_OUTBOX_KEY stream
-        in the same (transactional) pipeline, for the Postgres drainer.
-        Unconditional: the archive is a required tier, so there is always a
-        drainer behind the outbox. The two legs share one
+        While the archive is enabled (HISTORY_ARCHIVE_ENABLED — the opt-in
+        consent gate for long-term storage), the same wire bytes are also
+        XADDed onto the HISTORY_OUTBOX_KEY stream in the same (transactional)
+        pipeline, for the Postgres drainer. Disabled — the default — the leg
+        is absent: nothing accumulates for a drainer that does not exist, and
+        the outbox key is never created. The two legs share one
         serialize_history_entry call so they cannot drift and song-end pays only
         one orjson.dumps. Song-end still costs exactly ONE Redis round trip for
-        both legs and never awaits Postgres — the property
+        every leg and never awaits Postgres — the property
         docs/POSTGRES_HISTORY_PLAN.md calls the single most important one in the
         design.
 
@@ -982,7 +992,8 @@ class GuildRedisStore:
         pre-R1 list at this key fails the XADD leg with WRONGTYPE and would be
         swallowed into one warning per song — which is why
         ensure_outbox_group() aborts at STARTUP instead. That is the only place
-        the signal can be loud.
+        the signal can be loud. (Enabled mode; disabled, there is no XADD leg
+        to fail and a mis-shaped key is inert.)
 
         The outbox leg is idempotent under a re-sent transaction (a duplicate
         stream entry collapses on the archive's unique index); the
@@ -1044,7 +1055,20 @@ class GuildRedisStore:
         # time never does. PERSIST because -history has no other source, and
         # because it clears an inherited TTL from an older build in one write.
         pipe.persist(self.history_key())
-        pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
+        # The outbox leg is the pipeline's ONE conditional command: the flag is
+        # the consent gate for long-term storage, and with the archive disabled
+        # nothing may accumulate for a drainer that does not exist — the XADD
+        # would even MKSTREAM-like create the non-evictable key on first write.
+        # Read per call (config's call-time convention, no hot path: once per
+        # song end), through the module so tests can patch either the function
+        # or the environment. A garbage value must never FIRST surface here:
+        # @_guild_op would swallow the parser's ValueError into one warning per
+        # song, so setup_hook is required to read the flag before anything else
+        # consumes it — by the time a song ends, the process has already proven
+        # the value parses (history_archive_enabled's validation-placement
+        # rule).
+        if config.history_archive_enabled():
+            pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 
     @_guild_op(default_factory=list)

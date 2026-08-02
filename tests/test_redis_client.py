@@ -455,13 +455,45 @@ class TestPushHistory:
 
 
 class TestPushHistoryOutbox:
+    """The outbox leg of the push pipeline, in both archive modes.
+
+    The suite default is archive-ENABLED (conftest pins the flag true), so
+    the tests below that don't touch the flag assert today's full wiring.
+    The disabled tests monkeypatch it false per case — the ship default —
+    and pin the consent property: the outbox key is never even created.
+    """
+
     async def test_every_push_reaches_the_outbox(
         self, store: GuildRedisStore, fake_redis: Redis
     ) -> None:
-        # Unconditional: the archive is a required tier, so there is always a
-        # drainer behind the outbox and no shape of push_history that skips it.
+        # The enabled shape: a drainer exists behind the outbox, so no push
+        # may skip it — an entry that misses the stream is a play the archive
+        # never hears about.
         await store.push_history(_hentry(1))
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 1
+
+    async def test_disabled_archive_never_creates_the_outbox(
+        self, store: GuildRedisStore, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ship default. EXISTS, not XLEN: the consent property is that
+        # nothing accumulates for Postgres AT ALL — the non-evictable key is
+        # never created, not merely left empty.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        await store.push_history(_hentry(1))
+        assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
+
+    async def test_disabled_archive_keeps_the_display_invariants(
+        self, store: GuildRedisStore, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The retention policy is identical in both modes: LTRIM to the window,
+        # PERSIST so nothing expires it. Only the outbox leg is gated.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        for i in range(HISTORY_CACHE_LIMIT + 5):
+            await store.push_history(_hentry(i))
+        items = await fake_redis.lrange(store.history_key(), 0, -1)
+        assert len(items) == HISTORY_CACHE_LIMIT
+        assert items[0] == _hentry(HISTORY_CACHE_LIMIT + 4).to_redis()
+        assert await fake_redis.ttl(store.history_key()) == -1
 
     async def test_outbox_gets_same_wire_bytes_under_the_agreed_field(
         self, store: GuildRedisStore, fake_redis: Redis
