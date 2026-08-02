@@ -516,9 +516,23 @@ class TestProbeSpotify:
 
 
 class TestProbePostgres:
-    async def test_none_is_na(self) -> None:
+    async def test_none_with_the_flag_on_is_na(self) -> None:
+        # The suite default pins HISTORY_ARCHIVE_ENABLED=true, so a None
+        # archive here means "constructed without an archive" (tests, a cog
+        # built outside MusicBotApp) — NA, not OFF.
         r = await ping.probe_postgres(None)
         assert r.state is ProbeState.NA
+
+    async def test_none_with_the_archive_disabled_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ship default. OFF is "deliberately disabled" (the OTEL row's
+        # state): the operator's choice must read as a choice on the
+        # dashboard, not as a fault or a shrug.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        r = await ping.probe_postgres(None)
+        assert r.state is ProbeState.OFF
+        assert r.detail == "archive disabled"
 
     async def test_healthy_archive_is_ok(self) -> None:
         archive = MagicMock()
@@ -704,6 +718,21 @@ class TestDefaultPasswordEmbed:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert default_password_embed() is None
+
+    def test_none_when_the_archive_is_disabled_even_with_the_default_dsn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Compose interpolates POSTGRES_URL (default password and all) into
+        # the bot's environment whether or not the archive profile is active,
+        # so the disabled bot can hold exactly this DSN with no Postgres
+        # deployed behind it. A credential warning about a database that
+        # isn't there is noise that trains operators to ignore warnings —
+        # same gate as setup_hook's startup ERROR.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
         assert default_password_embed() is None
 
     def test_warns_and_says_how_to_fix_it(

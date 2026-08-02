@@ -45,6 +45,7 @@ from src.config import (
     PING_DEADLINE_SECS,
     PING_TICK_SECS,
     SpotifyStatus,
+    history_archive_enabled,
     using_default_postgres_password,
 )
 from src.spotify import Spotify
@@ -209,11 +210,20 @@ async def probe_spotify(
 async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
     """The play-history archive's Postgres row.
 
-    None means the bot was built without an archive — only reachable in tests
-    and in a cog constructed outside MusicBotApp, since the tier is required
-    (MusicBotApp.setup_hook refuses to start without POSTGRES_URL).
+    A None archive splits on the flag. With the archive disabled
+    (HISTORY_ARCHIVE_ENABLED off — the ship default) setup_hook deliberately
+    built no archive, and the row must say so rather than shrug: OFF,
+    "deliberately disabled", the same state the OTEL row uses. The operator's
+    choice is visible on the dashboard instead of reading like a fault.
+
+    None with the flag ON means the bot was built without an archive some
+    other way — reachable only in tests and in a cog constructed outside
+    MusicBotApp, since setup_hook builds the tier whenever the flag is on —
+    and that stays NA: "constructed without an archive", not "off".
     """
     if archive is None:
+        if not history_archive_enabled():
+            return ProbeResult("Postgres", ProbeState.OFF, detail="archive disabled")
         return ProbeResult("Postgres", ProbeState.NA)
 
     return await _timed("Postgres", archive.health_check)
@@ -453,7 +463,14 @@ def default_password_embed() -> Optional[discord.Embed]:
     needed. Changing the server first means the warning survives until the fix
     is genuinely complete. A detector that could not be fooled would attempt a
     connection with DEFAULT_POSTGRES_PASSWORD instead of parsing a string.
+
+    Gated on the archive flag, like setup_hook's startup ERROR: with the
+    archive disabled there is no deployed Postgres for the bot to warn about,
+    and a credential advisory for a database that isn't there is noise that
+    trains operators to ignore warnings.
     """
+    if not history_archive_enabled():
+        return None
     if not using_default_postgres_password():
         return None
     embed = discord.Embed(
