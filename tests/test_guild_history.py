@@ -45,20 +45,26 @@ def store(fake_redis: aioredis.Redis) -> GuildRedisStore:
     return GuildRedisStore(fake_redis, guild_id=42)
 
 
+_UNSET: Any = object()
+
+
 def _history(
     store: Any,
     *,
-    on_outbox_push: Any = None,
+    on_outbox_push: Any = _UNSET,
 ) -> GuildHistory:
-    """GuildHistory with the required notify wiring defaulted.
+    """GuildHistory with the notify wiring defaulted to a no-op callable.
 
-    on_outbox_push is mandatory on the real constructor (the Postgres tier is
-    not optional on the WRITE path). There is no archive parameter any more:
-    recent() reads Redis and the in-memory deque, never Postgres.
+    A sentinel default, not None: on_outbox_push carries no default on the
+    real constructor and None is a MEANINGFUL value there (the archive tier is
+    disabled), so the helper must be able to pass it through. Tests that don't
+    care get the enabled shape, matching the suite's archive-enabled default.
+    There is no archive parameter any more: recent() reads Redis and the
+    in-memory deque, never Postgres.
     """
     return GuildHistory(
         store,
-        on_outbox_push=on_outbox_push if on_outbox_push is not None else (lambda: None),
+        on_outbox_push=(lambda: None) if on_outbox_push is _UNSET else on_outbox_push,
     )
 
 
@@ -104,11 +110,13 @@ class TestAdd:
 
 
 class TestAddOutboxRouting:
-    """Postgres archive wiring (docs/POSTGRES_HISTORY_PLAN.md §5.4): every
-    add() pushes to the outbox and nudges the drainer. Unconditional — the
-    archive is a required tier, so there is no no-archive shape to gate on.
-    Write path only — and it is the ONLY direction Postgres appears in now; the
-    read path is TestRecentIsRedisOnly."""
+    """Postgres archive wiring (docs/POSTGRES_HISTORY_PLAN.md §5.4): with the
+    archive tier wired — a notify present, the enabled shape and the suite
+    default — every add() pushes to the outbox and nudges the drainer. A None
+    notify is the disabled shape (HISTORY_ARCHIVE_ENABLED off, no drainer
+    exists): add() keeps the display legs and nudges nothing. Write path
+    only — and it is the ONLY direction Postgres appears in now; the read
+    path is TestRecentIsRedisOnly."""
 
     async def test_add_routes_entry_to_outbox_too(
         self, store: GuildRedisStore, fake_redis: Redis
@@ -147,6 +155,24 @@ class TestAddOutboxRouting:
         await h.add(_entry(1))
         assert list(h) == [_entry(1)]
         assert calls == []
+
+    async def test_none_notify_keeps_the_display_legs(
+        self, store: GuildRedisStore
+    ) -> None:
+        # The disabled-archive shape: no drainer exists, so the constructor
+        # receives None explicitly. The display legs are untouched by that
+        # choice — Redis behavior is identical in both modes.
+        h = _history(store, on_outbox_push=None)
+        await h.add(_entry(1))
+        assert list(h) == [_entry(1)]
+        assert await store.get_history() == [_entry(1)]
+
+    async def test_none_notify_without_store_degrades_to_memory(self) -> None:
+        # The two Optional axes compose: archive disabled AND Redis absent
+        # still records the in-memory leg — the bot keeps working.
+        h = _history(None, on_outbox_push=None)
+        await h.add(_entry(1))
+        assert list(h) == [_entry(1)]
 
 
 class TestRestore:

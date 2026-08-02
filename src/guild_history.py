@@ -9,10 +9,13 @@ together: every add() lands on the deque and the Redis list in one step, and
 restore() refills the deque from the newest slice of the list.
 
 WRITES fan out to a third place, READS do not, and that asymmetry is the whole
-design. add() also XADDs every entry onto the global Postgres outbox stream — in
-the same pipeline as the list push — and nudges the drainer, which archives it
-into play_history. Postgres is never awaited on the write path: the
-outbox/drainer split keeps the playback loop on Redis-only latency.
+design. While the archive is enabled (HISTORY_ARCHIVE_ENABLED — the opt-in
+consent gate for long-term storage), add() also XADDs every entry onto the
+global Postgres outbox stream — in the same pipeline as the list push — and
+nudges the drainer, which archives it into play_history. Postgres is never
+awaited on the write path: the outbox/drainer split keeps the playback loop on
+Redis-only latency. With the archive disabled (the default) there is no
+drainer, on_outbox_push is None, and the two legs above are the whole story.
 
 But recent() never asks Postgres. -history is a display command with a fixed
 window (musicbot.HISTORY_MAX_LIMIT, pinned to HISTORY_CACHE_LIMIT), and the
@@ -65,34 +68,43 @@ class GuildHistory:
         self,
         store: Optional[GuildRedisStore],
         *,
-        on_outbox_push: Callable[[], None],
+        on_outbox_push: Optional[Callable[[], None]],
     ) -> None:
-        # on_outbox_push is REQUIRED: the Postgres tier is not optional, so
-        # there is no shape of this object that writes history without an outbox
-        # consumer behind it. It is the drainer's notify — a sync callable so
-        # add() stays Redis-only and never awaits the archive.
+        # on_outbox_push is the drainer's notify — a sync callable so add()
+        # stays Redis-only and never awaits the archive. Optional but carrying
+        # NO default: None means the archive tier is disabled
+        # (HISTORY_ARCHIVE_ENABLED is off, so no drainer exists to nudge), and
+        # every constructor site must say so explicitly rather than fall into
+        # it — silently not archiving is the failure mode the opt-in flag's
+        # strict parsing exists to prevent.
         #
         # No archive and no guild_id here any more. Both existed only for the
         # Postgres leg of recent(); the entry's own guild_id is stamped one layer
         # up by HistoryEntry.from_song, which is where the outbox needs it.
         #
-        # store IS Optional, and that is a different axis: Redis may be
+        # store IS Optional on a different, independent axis: Redis may be
         # unconfigured, in which case there is no wire to push to at all — and
-        # -history then falls through to the in-memory deque alone.
+        # -history then falls through to the in-memory deque alone. The two
+        # axes compose: store None / notify set degrades to memory-only (the
+        # outbox never sees entries Redis never saw); store set / notify None
+        # keeps the display list while writing nothing durable.
         self._store = store
         self._entries: deque[HistoryEntry] = deque(maxlen=HISTORY_CACHE_LIMIT)
         self._on_outbox_push = on_outbox_push
 
     async def add(self, entry: HistoryEntry) -> None:
-        """Record one played song on all three legs — in-memory cache, the
-        Redis display list, and the Postgres outbox (the latter two in one
-        pipeline). Degrades gracefully when the store is None or the push
-        fails (GuildRedisStore logs, never raises; a notify after a failed
-        push just drains an empty outbox)."""
+        """Record one played song on every configured leg — the in-memory
+        cache, the Redis display list, and (while the archive is enabled) the
+        Postgres outbox, the latter two in one pipeline. Degrades gracefully
+        when the store is None or the push fails (GuildRedisStore logs, never
+        raises; a notify after a failed push just drains an empty outbox).
+        With no notify there is no drainer to nudge — the archive tier is
+        disabled (HISTORY_ARCHIVE_ENABLED)."""
         self._entries.append(entry)
         if self._store is not None:
             await self._store.push_history(entry)
-            self._on_outbox_push()
+            if self._on_outbox_push is not None:
+                self._on_outbox_push()
 
     def restore(self, newest_first: Sequence[HistoryEntry]) -> None:
         """Populate from persisted history after a restart. In-memory leg
