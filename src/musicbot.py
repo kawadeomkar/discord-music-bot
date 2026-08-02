@@ -203,10 +203,11 @@ class MusicBot(commands.Cog):
         # attributes: history_archive below is the same HACK for the same reason, and
         # is spelled the same way deliberately — one idiom and one FIXME beats two.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        # The play-history archive, read only by -ping's Postgres row. Always present
-        # in a real bot: setup_hook builds it (refusing to start without POSTGRES_URL)
-        # BEFORE load_extension constructs this cog, so the None branch is reachable
-        # only from tests and a cog built outside MusicBotApp. Typed as the narrow
+        # The play-history archive, read only by -ping's Postgres row. Present
+        # exactly when the archive is enabled: setup_hook builds it (requiring
+        # POSTGRES_URL) BEFORE load_extension constructs this cog when
+        # HISTORY_ARCHIVE_ENABLED is true, and leaves it None — the disabled
+        # default — otherwise. Typed as the narrow
         # ArchiveHealth protocol, not PostgresHistoryArchive — the Postgres row is all
         # this class does with it, so that is all it should be able to do with it.
         self.history_archive: Optional[ArchiveHealth] = getattr(

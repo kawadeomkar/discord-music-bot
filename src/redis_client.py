@@ -357,9 +357,13 @@ async def ensure_outbox_group(redis: aioredis.Redis) -> None:
     @_guild_op method, so its XADD failure is one warning per song and takes
     guild:{id}:history down with it (both legs share one MULTI/EXEC). XLEN
     would raise too, so depth reads -1 and the backlog alarm can never fire
-    either. Hence the startup abort — it matches setup_hook's existing refusal
-    to run without POSTGRES_URL: a bot that cannot durably record what it plays
-    must not serve.
+    either. Hence the startup abort — it matches setup_hook's refusal to run
+    an ENABLED archive without POSTGRES_URL: a bot the operator opted into
+    archiving with must not serve while it cannot durably record what it
+    plays. (Enabled mode only. With the archive disabled setup_hook never
+    calls this — creating the group would MKSTREAM the non-evictable key into
+    existence — and a mis-shaped key is inert, downgraded to a startup
+    warning by the leftover-outbox probe.)
 
     id="0" is NOT redis-py's default (it defaults to "$", which silently skips
     every entry already in the stream). MKSTREAM removes any separate
