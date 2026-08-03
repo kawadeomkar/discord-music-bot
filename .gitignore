@@ -8,10 +8,10 @@ pyproject.bak.toml
 docs/*
 !docs/ARCHITECTURE.md
 
-# Claude Code
+# Claude Code. CLAUDE.md is deliberately NOT ignored — it is the working guide to
+# this codebase and has to reach anyone who clones, same as docs/ARCHITECTURE.md.
+# .claude/ stays local: it holds per-developer settings and session state.
 .claude/
-CLAUDE.md
-/CLAUDE.md
 
 # PyCharm and misc
 .idea
