@@ -222,6 +222,22 @@ def _is_collection(
     return isinstance(source, YTSource) and source.type is YTType.PLAYLIST
 
 
+async def _send_queueing_stopped(ctx: commands.Context, noun: str) -> None:
+    """The refusal notice for a collection that never reached the queue — a
+    clear/teardown landed first. Suppressed: a failed send must not mask the
+    outcome play's error path is about to report.
+    """
+    with contextlib.suppress(Exception):
+        await ctx.send(
+            embed=notice_embed(
+                f"Queueing stopped — the queue was cleared or "
+                f"playback was stopped before the {noun} could "
+                f"be added.",
+                discord.Color.orange(),
+            )
+        )
+
+
 def _check_voice_permissions(
     author: Union[discord.Member, discord.User],
     voice_client: Optional[discord.VoiceClient],
@@ -756,6 +772,18 @@ class MusicBot(commands.Cog):
             # tracks later.
             raise ValueError(f"The {noun} has no queueable tracks")
         collection = page1.collection
+        # The page-1 await above is a full Spotify round-trip, and a teardown
+        # (-stop, kick, alone-timer, gate timeout) can land inside it.
+        # cleanup() pops the player BEFORE bumping the generation, so a
+        # snapshot taken after the pop reads the POST-teardown value and every
+        # page then matches and commits onto a dead guild's persisted mirror.
+        # Checking identity first closes it — no await separates the check from
+        # the snapshot, so nothing can interleave between them.
+        assert ctx.guild is not None
+        if self.mps.get(ctx.guild.id) is not mp:
+            log.info("stream enqueue abandoned: guild torn down during page 1")
+            await _send_queueing_stopped(ctx, noun)
+            return None
         gen = mp.queue.generation
 
         if front and await mp.queue.has_restored_backlog():
@@ -781,21 +809,10 @@ class MusicBot(commands.Cog):
                 log.info("buffered collection enqueue abandoned: queue invalidated")
                 # Tell the user — they waited through the full fetch, and a
                 # silently swallowed -play reads as a dead bot (review M6).
-                with contextlib.suppress(Exception):
-                    await ctx.send(
-                        embed=notice_embed(
-                            f"Queueing stopped — the queue was cleared or "
-                            f"playback was stopped before the {noun} could "
-                            f"be added.",
-                            discord.Color.orange(),
-                        )
-                    )
+                await _send_queueing_stopped(ctx, noun)
                 return None
-            await asyncio.gather(
-                self._send_stream_embed(
-                    ctx, resolved.kind, collection, titles, enqueued=len(titles)
-                ),
-                ctx.message.add_reaction("👍"),
+            await self._notify_stream_enqueued(
+                ctx, resolved.kind, collection, titles, enqueued=len(titles)
             )
             return None
 
@@ -809,24 +826,10 @@ class MusicBot(commands.Cog):
         )
         if not ok:
             log.info("stream enqueue abandoned before page 1: queue invalidated")
-            with contextlib.suppress(Exception):
-                await ctx.send(
-                    embed=notice_embed(
-                        f"Queueing stopped — the queue was cleared or "
-                        f"playback was stopped before the {noun} could "
-                        f"be added.",
-                        discord.Color.orange(),
-                    )
-                )
+            await _send_queueing_stopped(ctx, noun)
             return None
         exact = len(page1.titles) if page1.is_last else None
-        await asyncio.gather(
-            self._send_stream_embed(
-                ctx, resolved.kind, collection, page1.titles, enqueued=exact
-            ),
-            ctx.message.add_reaction("👍"),
-        )
-        return _StreamDrain(
+        drain = _StreamDrain(
             resolved=resolved,
             generation=gen,
             enqueued=len(page1.titles),
@@ -836,6 +839,61 @@ class MusicBot(commands.Cog):
             # drained, so it gets a completion notice (L6/G5).
             completion_notice=not is_album and not page1.is_last,
         )
+        # Built BEFORE the notification, and the notification cannot abort it:
+        # page 1 is already committed, so a raise here would return None, the
+        # caller would aclose() the generator, and the collection would truncate
+        # to page 1 while play reported "Failed to queue song" for songs that
+        # are playing. A channel without Add Reactions makes that deterministic.
+        await self._notify_stream_enqueued(
+            ctx, resolved.kind, collection, page1.titles, enqueued=exact
+        )
+        return drain
+
+    async def _resume_after_collection(self, ctx: commands.Context) -> None:
+        """Resume a player that was paused when -play queued a collection.
+
+        Mirrors the -resume command's guard rather than calling it, so a
+        -resume that landed while the collection was queueing is a no-op here
+        instead of a second resume.
+        """
+        vc = ctx.voice_client
+        if (
+            isinstance(vc, discord.VoiceClient)
+            and not vc.is_playing()
+            and vc.is_paused()
+        ):
+            mp = self.get_mp(ctx)
+            await mp.resume(vc)
+            await mp.rehost_np_after_resume()
+
+    async def _notify_stream_enqueued(
+        self,
+        ctx: commands.Context,
+        kind: SpotifyType,
+        collection: SpotifyCollection,
+        titles: list[str],
+        *,
+        enqueued: Optional[int],
+    ) -> None:
+        """Enqueue embed + 👍 for a committed collection page.
+
+        Never raises: by the time this runs the songs are queued, so a failed
+        send or a missing Add Reactions permission is a notification problem,
+        not an enqueue failure — propagating it would report success as
+        "Failed to queue song" and, on the streaming path, discard the tail.
+        """
+        try:
+            await asyncio.gather(
+                self._send_stream_embed(
+                    ctx, kind, collection, titles, enqueued=enqueued
+                ),
+                ctx.message.add_reaction("👍"),
+            )
+        except Exception as e:
+            log.warning(
+                f"stream enqueue notification failed: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
 
     async def _send_stream_embed(
         self,
@@ -1055,12 +1113,28 @@ class MusicBot(commands.Cog):
     async def play(self, ctx: commands.Context, url: str) -> None:
         async with background_typing(ctx):
             try:
+                source = parse_input(url, ctx.message.content)
+                is_collection = _is_collection(source)
+                # Non-None exactly when the bot is connected AND paused, so both
+                # branches below share one already-narrowed value.
+                vc_now = ctx.voice_client
+                paused_vc = (
+                    vc_now
+                    if isinstance(vc_now, discord.VoiceClient) and vc_now.is_paused()
+                    else None
+                )
+
                 # Paused → interject, not append: appending leaves the bot silent
                 # with the request buried behind a paused song. The interrupted song
-                # returns PLAYING, unlike -playnow. Checked before parse_input so the
-                # paused path parses once, inside _interject_flow.
-                paused_vc = ctx.voice_client
-                if isinstance(paused_vc, discord.VoiceClient) and paused_vc.is_paused():
+                # returns PLAYING, unlike -playnow.
+                #
+                # Collections are exempt. Interjection resolves to exactly ONE song
+                # (_resolve_playnow_source collapses a collection to its first
+                # track), so routing a paused -play <album> here would discard the
+                # rest of it and answer with "use -play for the full album" — the
+                # command the user just ran. They queue in full below and playback
+                # resumes afterwards instead, so -play still means play.
+                if paused_vc is not None and not is_collection:
                     paused_mp = self.get_mp(ctx)
                     if paused_mp.current_song is not None:
                         return await self._interject_flow(
@@ -1072,8 +1146,6 @@ class MusicBot(commands.Cog):
                             require_paused=True,
                         )
 
-                source = parse_input(url, ctx.message.content)
-
                 # Tier-1 admission: only collections take the per-guild lock — a
                 # second collection queueing while one streams would interleave its
                 # pages into the first. A single track skips straight through and
@@ -1081,7 +1153,7 @@ class MusicBot(commands.Cog):
                 # interleaving; it can also land ahead of a collection still
                 # waiting on this lock).
                 slot: Optional[_GuildEnqueueLock] = None
-                if _is_collection(source):
+                if is_collection:
                     slot = await self._acquire_enqueue_slot(ctx)
                     if slot is None:
                         return  # declined — the user has been told why
@@ -1091,6 +1163,13 @@ class MusicBot(commands.Cog):
                 finally:
                     if slot is not None:
                         slot.lock.release()
+
+                if paused_vc is not None and is_collection:
+                    # After the enqueue, never before: resuming first would restart
+                    # the paused song only for a failed resolve to leave the user
+                    # with playback they did not ask to change. The state is
+                    # re-read because a -resume may have landed during the drain.
+                    await self._resume_after_collection(ctx)
 
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")

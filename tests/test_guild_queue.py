@@ -1036,6 +1036,54 @@ class TestGenerationCounter:
         assert gq.display_items() == []
         assert await fake_redis.llen(store.queue_key()) == 0
 
+    async def test_put_parked_on_mutex_sees_the_clear_that_landed_first(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """The generation check must run INSIDE the mutex hold.
+
+        test_stale_put_refused_no_leg_touched cannot pin the placement: clear()
+        bumps synchronously, so its snapshot is already stale before the put is
+        scheduled and a check hoisted above the mutex refuses it too. Here the
+        snapshot is still current when the put starts and only goes stale while
+        it is parked on the mutex — the one ordering that tells the two
+        placements apart. Hoisting the check makes this page land after the
+        clear that deleted its collection.
+        """
+        gen = gq.generation
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_push(entries: list[str]) -> None:
+            entered.set()
+            await release.wait()
+
+        with patch.object(store, "push_queue_batch", side_effect=blocking_push):
+            # Holds the mutex across its Redis write, so the two tasks below
+            # queue up behind it in creation order.
+            blocker = asyncio.create_task(gq.put([_qobj(1, mock_author)], batch=True))
+            await entered.wait()
+
+            clearer = asyncio.create_task(gq.clear())
+            await asyncio.sleep(0)  # parks on the mutex, ahead of the put
+            parked = asyncio.create_task(
+                gq.put([_qobj(2, mock_author)], batch=True, expected_generation=gen)
+            )
+            await asyncio.sleep(0)  # runs up to the mutex; gen is still current
+
+            release.set()
+            await blocker
+            await clearer
+            ok = await parked
+
+        assert ok is False
+        assert gq.qsize() == 0
+        assert gq.display_items() == []
+        assert await fake_redis.llen(store.queue_key()) == 0
+
     async def test_empty_items_put_reports_success(
         self,
         gq: GuildQueue,
