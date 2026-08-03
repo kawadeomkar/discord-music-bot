@@ -7,7 +7,7 @@ import contextlib
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +21,7 @@ from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
+    HISTORY_MAX_LIMIT,
     HistoryFlags,
     MusicBot,
     ResolvedSpotifyStream,
@@ -34,6 +35,7 @@ from src.musicbot import (
     _typing_keepalive,
     background_typing,
 )
+from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
 from src.sources import SoundcloudSource, SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome, _PLAYBACK_GATE_TIMEOUT
@@ -107,7 +109,7 @@ def _stream_mp(*, generation: int = 0, backlog: bool = False) -> MagicMock:
 
 
 class TestCommandErrorRendering:
-    """_command_error must not leak yt-dlp's raw error text to the user (§12.5)."""
+    """_command_error must not leak yt-dlp's raw error text to the user."""
 
     async def test_extraction_error_renders_its_user_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -208,7 +210,7 @@ class TestCheckVoicePermissions:
 
 
 class TestBackgroundTyping:
-    """docs/PERFORMANCE_PLAN.md §2.2 — typing indicator must never delay the command body."""
+    """Typing indicator must never delay the command body."""
 
     async def test_body_runs_while_first_typing_post_is_in_flight(
         self, mock_ctx: MagicMock
@@ -297,21 +299,17 @@ class TestBackgroundTyping:
 class TestTypingKeepaliveCancellation:
     """_typing_keepalive must catch Exception only and let CancelledError propagate.
 
-    The distinction is invisible to statement coverage — one `except` line serves
-    both arms, so a handler that also swallows CancelledError reports as covered
-    while silently completing the task *normally*. These assert on
-    task.cancelled(), the only observable that separates the two.
-    """
+    Statement coverage cannot see the distinction — one `except` line serves both
+    arms, so a handler that also swallows CancelledError reports as covered while
+    completing the task *normally*. These assert `task.cancelled()`, the only
+    observable that separates the two; `done()` is true either way."""
 
     async def test_cancelled_keepalive_ends_cancelled_not_completed(
         self, mock_ctx: MagicMock
     ) -> None:
-        """cancel() must leave the task CANCELLED, not merely done().
-
-        Swallowing CancelledError here makes cooperative cancellation a lie:
-        task.cancelled() is False, and a cancellation aimed at an enclosing
-        scope (shutdown, an outer timeout) stops propagating at this frame.
-        """
+        """cancel() must leave the task cancelled, not just done(). Swallowing
+        CancelledError makes cooperative cancellation a lie: task.cancelled() is
+        False, and a cancellation aimed at an enclosing scope stops here."""
         task = asyncio.create_task(_typing_keepalive(mock_ctx))
         await asyncio.sleep(0)  # let it reach the sleep(3600)
         task.cancel()
@@ -328,22 +326,18 @@ class TestTypingKeepaliveCancellation:
     async def test_cancellation_still_exits_the_typing_cm(
         self, mock_ctx: MagicMock
     ) -> None:
-        """Letting CancelledError propagate must not skip Typing.__aexit__.
-
-        The indicator is dropped by the `async with` unwind. If __aexit__ were
-        skipped the bot would appear to type forever after every command.
-        """
+        """Letting CancelledError propagate must not skip Typing.__aexit__ — the
+        `async with` unwind is what drops the indicator, and skipping it leaves the
+        bot apparently typing forever after every command."""
         exited = asyncio.Event()
         entered = asyncio.Event()
         mock_ctx.typing.return_value.__aenter__ = AsyncMock(
             return_value=None, side_effect=lambda: entered.set()
         )
-        # return_value=None is load-bearing for any test that asserts on
-        # cancellation through this CM: __aexit__ returning a *truthy* value
-        # SUPPRESSES the exception being unwound, so a bare AsyncMock() would
-        # eat the CancelledError inside the `async with` and make the assert
-        # below fail for a reason that has nothing to do with the handler.
-        # Real discord.py Typing.__aexit__ returns None — keep it that way.
+        # return_value=None is required for any cancellation assert through this
+        # CM: an __aexit__ returning a truthy value suppresses the exception being
+        # unwound, so a bare AsyncMock() eats the CancelledError and fails the assert
+        # below for an unrelated reason. Real Typing.__aexit__ returns None.
         mock_ctx.typing.return_value.__aexit__ = AsyncMock(
             return_value=None, side_effect=lambda *a: exited.set()
         )
@@ -371,14 +365,10 @@ class TestTypingKeepaliveCancellation:
         assert task.exception() is None
 
     async def test_base_exception_is_not_swallowed(self, mock_ctx: MagicMock) -> None:
-        """Only Exception is cosmetic; a BaseException must propagate.
-
-        CancelledError is itself a BaseException, so this pins the general rule
-        the handler now follows. Uses a custom subclass rather than SystemExit:
-        asyncio special-cases SystemExit/KeyboardInterrupt by re-raising them
-        into the event loop, which would escape pytest.raises for reasons that
-        have nothing to do with this handler.
-        """
+        """Only Exception is cosmetic; a BaseException must propagate — CancelledError
+        is one, so this pins the general rule. A custom subclass rather than
+        SystemExit: asyncio re-raises SystemExit/KeyboardInterrupt into the loop,
+        escaping pytest.raises for reasons unrelated to this handler."""
 
         class Shutdown(BaseException):
             pass
@@ -393,7 +383,7 @@ class TestTypingKeepaliveCancellation:
         self, mock_ctx: MagicMock
     ) -> None:
         """End-to-end: the task background_typing() spawns and cancels on exit
-        must settle as CANCELLED. background_typing does not await it, so this
+        must settle as cancelled. background_typing does not await it, so this
         is the only place the contract is observable from outside."""
         spawned: list[asyncio.Task[Any]] = []
         real_create_task = asyncio.create_task
@@ -527,7 +517,7 @@ class TestQueueSource:
 
 class TestSpotifyDisabled:
     """When Spotify isn't usable — no credentials (self.spotify is None, status
-    DISABLED) or credentials rejected at startup (status INVALID) — any Spotify
+    disabled) or credentials rejected at startup (status invalid) — any Spotify
     source must raise SpotifyDisabledError, while every other source keeps
     working."""
 
@@ -549,7 +539,7 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot
     ) -> None:
         """Credentials were present (client built) but rejected at startup: the
-        gate still refuses, and the error reports INVALID rather than DISABLED."""
+        gate still refuses, and the error reports invalid rather than disabled."""
         music_bot._spotify_status = SpotifyStatus.INVALID
         with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
@@ -576,7 +566,7 @@ class TestSpotifyDisabled:
     async def test_spotify_track_raises_when_credentials_invalid(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Even with a live client object, an INVALID status short-circuits the
+        """Even with a live client object, an invalid status short-circuits the
         source before any Spotify API call is attempted."""
         music_bot._spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
@@ -1130,6 +1120,22 @@ class TestMusicBotInit:
         mock_bot.redis = mock_redis
         assert MusicBot(mock_bot).redis is mock_redis
 
+    def test_reads_history_archive_from_bot(self, mock_bot: MagicMock) -> None:
+        # -ping's Postgres row reads this. MusicBotApp.setup_hook builds the
+        # archive before load_extension constructs the cog, so it is always set
+        # on a real bot.
+        archive = MagicMock()
+        mock_bot.history_archive = archive
+        assert MusicBot(mock_bot).history_archive is archive
+
+    def test_missing_history_archive_is_none_not_an_error(
+        self, mock_bot: MagicMock
+    ) -> None:
+        # A bot without the attribute (tests, or a cog built outside MusicBotApp)
+        # must still construct — the Postgres row degrades to n/a instead.
+        del mock_bot.history_archive
+        assert MusicBot(mock_bot).history_archive is None
+
 
 class TestGetMp:
     def test_returns_existing_player_and_sets_context(
@@ -1178,7 +1184,7 @@ class TestCleanup:
     async def test_does_not_cancel_current_task(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """cleanup() skips cancellation when the alone-timer IS the running task (self-cancel guard)."""
+        """cleanup() skips cancellation when the alone-timer is the running task (self-cancel guard)."""
         current = asyncio.current_task()
         assert current is not None, "test must run inside an asyncio.Task"
         music_bot._alone_timers[mock_guild.id] = (
@@ -1276,11 +1282,9 @@ class TestCleanup:
     async def test_resets_activity_after_disconnecting(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """A stopped bot must not keep advertising the song it stopped. The
-        reset runs after the disconnect: until the voice client is gone it can
-        still register as playing, which is what made update_activity() bail out
-        and leave a stale "Listening to <song>" presence behind.
-        """
+        """A stopped bot must not keep advertising the song it stopped. The reset
+        runs after the disconnect: until the voice client is gone it still registers
+        as playing, so update_activity() bails and the stale presence survives."""
         call_order: list[str] = []
         mp = self._make_minimal_mp(music_bot, mock_guild)
         mp.update_activity = AsyncMock(
@@ -1493,7 +1497,7 @@ class TestCogBeforeInvoke:
     async def test_no_persist_when_channel_unchanged(
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
-        """set_connection is NOT called when the text channel hasn't changed."""
+        """set_connection is not called when the text channel hasn't changed."""
         channel = MagicMock(spec=discord.TextChannel)
         mock_ctx.channel = channel
 
@@ -1513,7 +1517,7 @@ class TestCogBeforeInvoke:
     async def test_no_persist_when_no_voice_client(
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
-        """set_connection is NOT called when the bot isn't in a voice channel yet."""
+        """set_connection is not called when the bot isn't in a voice channel yet."""
         old_channel = MagicMock(spec=discord.TextChannel)
         new_channel = MagicMock(spec=discord.TextChannel)
         mock_ctx.channel = new_channel
@@ -1817,7 +1821,7 @@ class TestResumeCommand:
     ) -> None:
         """If the -pause confirmation hosts the block, resume re-hosts it so
         "⏸️ Paused at…" becomes plain history instead of sitting beneath a
-        live, advancing bar (branch review M3)."""
+        live, advancing bar."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
@@ -1904,8 +1908,14 @@ def _flags(limit: int = 10) -> SimpleNamespace:
 class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
-        history = GuildHistory(None)
-        history.restore(list(reversed(entries)))  # restore takes newest-first
+        history = GuildHistory(None, on_outbox_push=lambda: None)
+        # No store, so the in-memory deque is the whole read path — these tests are
+        # about rendering (ordering, chunking, limits, fields), not which leg served
+        # them; that is TestHistoryReadsRedis, where the legs DISAGREE. Beware the
+        # trap the old Postgres double hit: recent() swallows every error, so a
+        # broken fixture reads exactly like graceful degradation and all 14 tests
+        # passed against the cache while covering none of the read path.
+        history.restore(list(reversed(entries)))
         mp.history = history
         music_bot.get_mp = MagicMock(return_value=mp)
         return mp
@@ -1995,6 +2005,96 @@ class TestHistoryCommand:
         # -h with no flags must parse to limit=10.
         assert HistoryFlags.get_flags()["limit"].default == 10
 
+    def test_max_limit_never_exceeds_the_redis_window(self) -> None:
+        """The merge's completeness argument, pinned rather than commented: the
+        union holds the true newest `limit` only while the Redis window is at least
+        as deep as anything this command accepts. Raising HISTORY_MAX_LIMIT alone
+        raises nothing — it silently starts returning short pages."""
+        assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
+
+    @pytest.mark.parametrize("name", ["history", "ping"])
+    def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
+        """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
+        NP block), so unbounded concurrent renders rate-limit a guild out of its own
+        channel — and deleting the decorator that prevents it left the suite green.
+        `wait=False` is half the point: queueing the extra invocations still issues
+        every send, so they must be declined outright."""
+        guard = getattr(MusicBot, name)._max_concurrency
+        assert guard is not None
+        assert guard.number == 1
+        assert guard.per is commands.BucketType.guild
+        assert guard.wait is False
+
+    def test_help_copy_states_the_real_retention_window(self) -> None:
+        """The user-facing copy must name the window the command actually keeps: 50
+        is the retention cap AND the display cap, and the copy once promised
+        permanent retention in the configuration that now ships by default. Pins
+        that the constant stays interpolated, so raising the window cannot leave the
+        copy quoting the old one; the negative assertion names the false claim."""
+        help_text = MusicBot.history.help
+        assert help_text is not None
+        assert str(HISTORY_MAX_LIMIT) in help_text
+        assert "permanently" not in help_text
+        # The archive caveat belongs in NOTES, and it is the one place the word
+        # is honest: Postgres retention really is permanent when enabled.
+        note = (MusicBot.history.extras or {}).get("note", "")
+        assert "permanently" in note
+
+
+class TestHistoryReadsRedis:
+    """That `-history` renders the Redis leg at all, asserted at the command level.
+
+    Every failure inside recent() degrades to the leg below by design, so a command
+    test can render a perfectly correct embed off the in-memory deque while the Redis
+    read raises on every invocation. Making the legs DISAGREE is the only way to tell
+    which one reached the user. Postgres is not on this read path at all."""
+
+    async def test_the_rendered_songs_come_from_redis_not_just_the_cache(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis, guild_id=1)
+        stored = _history_entries(2)  # Song 0 (t=1000), Song 1 (t=1001)
+        for entry in stored:
+            await store.push_history(entry)
+        # Older than both, and present only in the deque — so its position in
+        # the output says which legs ran: absent means the Redis leg never got
+        # read, first means the cache won, last means both legs merged and
+        # sorted, which is the contract.
+        cache_only = HistoryEntry(
+            title="CACHE ONLY",
+            webpage_url="https://yt.com/v=cache",
+            duration_secs=1,
+            played_secs=1,
+            requester_id=1,
+            requester_name="u",
+            played_at=1.0,
+        )
+        mp = MagicMock()
+        history = GuildHistory(store, on_outbox_push=lambda: None)
+        history.restore([cache_only])
+        mp.history = history
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        titles = [e.title for e in mock_ctx.send.call_args[1]["embeds"]]
+        assert titles == ["1. Song 1", "2. Song 0", "3. CACHE ONLY"]
+
+    async def test_a_broken_store_double_is_now_visible(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The guard on the guard: a stand-in without get_history stays green
+        # forever, so this pins that the same mistake now leaves a visible warning
+        # instead of a false claim that the read path is covered.
+        mp = MagicMock()
+        mp.history = GuildHistory(cast(Any, object()), on_outbox_push=lambda: None)
+        mp.history.restore(_history_entries(1))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        assert "redis read failed" in caplog.text
+        assert "AttributeError" in caplog.text
+
 
 class TestMaxConcurrencyNotice:
     async def test_reports_already_running(
@@ -2025,7 +2125,7 @@ class TestCogLoadSpotifyValidation:
     async def test_cog_load_spawns_probe_without_blocking(
         self, music_bot: MusicBot
     ) -> None:
-        """cog_load returns immediately (leaving status ENABLED) and the probe
+        """cog_load returns immediately (leaving status enabled) and the probe
         runs as a tracked background task, not inline."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
@@ -2056,7 +2156,7 @@ class TestCogLoadSpotifyValidation:
         assert music_bot._spotify_status is SpotifyStatus.INVALID
 
     async def test_network_error_leaves_enabled(self, music_bot: MusicBot) -> None:
-        """A non-auth failure is inconclusive: Spotify stays ENABLED."""
+        """A non-auth failure is inconclusive: Spotify stays enabled."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(
             side_effect=OSError("connection refused")
@@ -2066,7 +2166,7 @@ class TestCogLoadSpotifyValidation:
         assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
     async def test_timeout_leaves_enabled(self, music_bot: MusicBot) -> None:
-        """A probe timeout is inconclusive (not an auth rejection): stays ENABLED."""
+        """A probe timeout is inconclusive (not an auth rejection): stays enabled."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
         music_bot._spotify_status = SpotifyStatus.ENABLED
@@ -2106,12 +2206,10 @@ class TestClearCommand:
 
 
 def _no_typing() -> AbstractContextManager[MagicMock]:
-    """Stub play()'s background_typing wrapper with an inert async CM.
-
-    TestPlayCommand patches asyncio.create_task as a join-task spy; without this
-    stub the typing keepalive would also hit the patched create_task, polluting
-    call counts and receiving the fake join future. The wrapper itself is
-    covered by TestBackgroundTyping."""
+    """Stub play()'s background_typing wrapper with an inert async CM: TestPlayCommand
+    patches asyncio.create_task as a join-task spy, and without this the typing
+    keepalive hits the same patch, polluting call counts and taking the fake join
+    future. The wrapper itself is covered by TestBackgroundTyping."""
     return patch(
         "src.musicbot.background_typing",
         MagicMock(return_value=contextlib.nullcontext()),
@@ -2119,13 +2217,9 @@ def _no_typing() -> AbstractContextManager[MagicMock]:
 
 
 def _playing_vc() -> MagicMock:
-    """Connected voice client, actively playing.
-
-    Both flags must be set explicitly: an unstubbed is_paused() on a spec'd
-    MagicMock returns a truthy Mock, which sends -play down the interjection
-    branch instead of the append path — silently, since the test's own
-    assertions may still hold there.
-    """
+    """Connected voice client, actively playing. Both flags must be set explicitly:
+    an unstubbed is_paused() returns a truthy Mock, silently sending -play down the
+    interjection branch instead of the append path."""
     vc = MagicMock(spec=discord.VoiceClient)
     vc.is_playing.return_value = True
     vc.is_paused.return_value = False
@@ -2159,12 +2253,9 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
 
 
 class TestPlayCommand:
-    """Tests for the play() cold-join parallelism (Change A).
-
-    asyncio.Future is used as the join_task stand-in: unlike AsyncMock,
-    a Future is directly awaitable via __await__, matching how the real
-    asyncio.Task behaves when the code does `await join_task`.
-    """
+    """Tests for play()'s cold-join parallelism. asyncio.Future stands in for the
+    join_task: unlike AsyncMock it is directly awaitable, matching what the real
+    Task does when the code says `await join_task`."""
 
     async def test_cold_join_creates_task_and_awaits_after_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2302,8 +2393,8 @@ class TestPlayCommand:
 
 class TestPlayWhilePaused:
     """-play on a paused song interjects instead of appending
-    (docs/PLAY_WHILE_PAUSED_PLAN.md §3). Appending would leave the bot silent
-    with the request buried behind a paused song."""
+    . Appending would leave the bot silent
+        with the request buried behind a paused song."""
 
     def _paused_mp(self) -> MagicMock:
         mp = _mock_mp()
@@ -2404,7 +2495,7 @@ class TestPlayWhilePaused:
     ) -> None:
         """A -resume landing during the 1-4s extraction removes the reason to
         interject, so the resolved track is appended rather than interrupting a
-        song the user just chose to keep playing (§3.3)."""
+        song the user just chose to keep playing."""
         vc = _paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
@@ -2497,7 +2588,7 @@ class TestPlayWhilePaused:
 class TestPlayFrontInsertion:
     """-play on a disconnected bot means "play this", not "play whatever was
     left over": the requested song jumps ahead of the queue persisted by a
-    previous -stop, which resumes behind it. docs/PLAYBACK_GATE_PLAN.md."""
+    previous -stop, which resumes behind it."""
 
     async def test_cold_path_enqueues_at_front(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2548,7 +2639,7 @@ class TestPlayFrontInsertion:
     async def test_cold_path_waits_for_restore_before_enqueueing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Load-bearing ordering: put_front LPUSHes the Redis mirror while
+        """Ordering: put_front LPUSHes the Redis mirror while
         restore_entries replays already-listed entries in memory only, so
         inserting before restore reads its snapshot double-queues the song."""
         mock_ctx.voice_client = None
@@ -2708,15 +2799,10 @@ class TestPlayFrontInsertion:
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """End to end against a real GuildQueue and fake Redis: the requested
-        song leads, the persisted entries follow in their original order, and
-        the in-memory and Redis legs agree.
-
-        Also the double-queue regression (docs/PLAYBACK_GATE_PLAN.md §5.8): the
-        new song must appear exactly ONCE. put_front LPUSHes it onto the same
-        Redis list restore_entries replays from, so an insert sequenced before
-        the snapshot read lands in both legs and gets queued twice.
-        """
+        """End to end against a real GuildQueue and fake Redis: the requested song
+        leads, the persisted entries follow in order, both legs agree. Also the
+        double-queue regression — put_front LPUSHes onto the same Redis list
+        restore_entries replays, so inserting before the snapshot read queues twice."""
         assert music_player.store is not None
         for title in ("Persisted One", "Persisted Two"):
             await fake_redis.rpush(
@@ -2878,9 +2964,9 @@ class TestNowCommand:
     async def test_repins_live_block_when_paused(
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
-        """Design review (2026-07-01): -now while paused used to reply "No songs
-        are currently playing." — this is an intentional behavior change, not an
-        incidental side effect of making the embed live."""
+        """-now while paused repins the live block rather than replying "No songs
+        are currently playing" — an intentional behaviour change, not a side effect
+        of making the embed live."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=False)
         vc.is_paused = MagicMock(return_value=True)
@@ -2901,8 +2987,7 @@ class TestNowCommand:
     ) -> None:
         """-now from a channel other than the player's home channel must
         answer THERE with a static snapshot — the host never leaves home, so
-        repinning would leave the invoking channel with no response at all
-        (branch review M2)."""
+        repinning would leave the invoking channel with no response at all."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
         vc.is_paused = MagicMock(return_value=False)
@@ -2927,7 +3012,7 @@ class TestNowCommand:
     ) -> None:
         """The song can end between the liveness check and the repin —
         repin_now_playing() returns False and -now must still respond
-        instead of silently doing nothing (branch review L3)."""
+        instead of silently doing nothing."""
         vc = object.__new__(discord.VoiceClient)
         vc.is_playing = MagicMock(return_value=True)
         vc.is_paused = MagicMock(return_value=False)
@@ -3127,7 +3212,7 @@ class TestAloneCountdown:
     async def test_skips_cleanup_when_user_rejoined(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """After the sleep, if a human is present, cleanup is NOT called."""
+        """After the sleep, if a human is present, cleanup is not called."""
         self._setup_mp(music_bot, mock_guild)
 
         human = MagicMock(spec=discord.Member)
@@ -3228,11 +3313,9 @@ class TestRestoreGuildStateReadFailed:
         fake_redis_bot: aioredis.Redis,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """get_recovery_gate() returning None (Redis unavailable) must NOT
-        be treated as "nothing to restore": recovery is skipped with a warning
-        and no channel resolution or player creation is attempted.
-        Distinguishable from the empty-gate case, which also skips but
-        silently."""
+        """get_recovery_gate() returning None (Redis unavailable) must not read as
+        "nothing to restore": recovery skips with a WARNING and no channel or player
+        work — distinguishable from the empty-gate case, which skips silently."""
         from src.redis_client import GuildRedisStore
 
         with patch.object(
@@ -3693,7 +3776,7 @@ class TestPlaynow:
         live_vc: MagicMock,
     ) -> None:
         """The one outcome-wording branch with no coverage. Worth pinning now:
-        docs/PLAY_WHILE_PAUSED_PLAN.md §4.2 re-keys these branches off
+        re-keys these branches off
         returns_paused, and an unpinned branch could silently change text."""
         from src.musicplayer import InterjectOutcome
 
@@ -3754,11 +3837,10 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """Song ended mid-resolve: the already-resolved qobj is front-inserted
-        directly (the user asked for "now" and the window can be seconds long)
-        — NOT by re-invoking -play, which would re-parse, re-resolve, and
-        (for playlists) enqueue every track right after the first-track-only
-        notice — and the user always gets a confirmation embed."""
+        """Song ended mid-resolve: the resolved qobj is front-inserted directly, not
+        by re-invoking -play, which would re-parse, re-resolve and (for playlists)
+        enqueue every track right after the first-track-only notice. The user still
+        gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
         live_mp.queue.put_front = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=live_mp)
@@ -3915,7 +3997,7 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """The stream-URL cache is warmed BEFORE interject stops the current
+        """The stream-URL cache is warmed before interject stops the current
         song — a cache miss at dequeue would otherwise put yt-dlp dead air
         between the interrupt and the playnow song starting."""
         from src.musicplayer import InterjectOutcome

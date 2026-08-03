@@ -1,11 +1,17 @@
 -- The play-history schema: the durable long-term home for every played song,
 -- plus the reject table that catches anything the server refuses.
 --
--- Deliberately ONE migration. Nothing has shipped yet, so there is no database
--- whose schema this has to evolve, and a pre-release sequence of ALTER steps
--- would describe upgrades that never happened to anyone. Until the first
--- production release this file is edited IN PLACE. After it, every change
--- becomes a new numbered migration, because from then on the ALTERs are real.
+-- Deliberately ONE migration. No bot has ever opened a Postgres connection, so
+-- there is no database whose schema this has to evolve, and a pre-release
+-- sequence of ALTER steps would describe upgrades that never happened to
+-- anyone. While that holds, this file is edited IN PLACE.
+--
+-- The window closes when the first release whose bot actually reads the archive
+-- ships (the stack/4 durable-tier work — setup_hook requiring POSTGRES_URL and
+-- constructing PostgresHistoryArchive). From then on every change becomes a new
+-- numbered migration, because from then on the ALTERs are real. Note this is
+-- NOT "the first tagged release": v1.3.0 and v1.4.0 already ship this file, and
+-- editing it stayed safe only because their bots never connected to Postgres.
 --
 -- Consequence: IF NOT EXISTS makes this whole file a no-op against a database
 -- that already holds these tables, so a dev box on an earlier shape does NOT
@@ -50,10 +56,28 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- it, and HistoryEntry stays exactly the wire schema.
     inserted_at    timestamptz NOT NULL DEFAULT now(),
 
-    -- The Discord message id of the Now Playing embed that hosted this song, so
-    -- a history row can be joined back to the message a listener saw. 0 =
-    -- unknown, and for now that is the only value it holds: nothing writes this
-    -- table yet, and HistoryEntry carries no message_id.
+    -- The Discord message id of the Now Playing embed that hosted this song.
+    --
+    -- A CORRELATION TOKEN, not a resolvable pointer. discord.py has no
+    -- guild.fetch_message(id) — resolving a message needs channel.fetch_message,
+    -- and no channel id is stored here. The persisted text-channel id cannot
+    -- stand in either: MusicPlayer.set_context reassigns the home channel on
+    -- every command, so the NP host migrates across text channels within one
+    -- guild and that id only records wherever the last command ran. Match this
+    -- against a log line or a span (song.np_host_id), not against the API. If a
+    -- resolvable pointer is ever wanted, it needs a companion channel_id column
+    -- stamped from the same host — and that should land WITH the archive wiring
+    -- below, not before it, so the wire format does not grow a second field
+    -- nothing reads.
+    --
+    -- Populated by the archive: _INSERT_SQL / _RECENT_SQL / _entry_to_row /
+    -- _row_to_entry in history_archive.py all carry this column. HistoryEntry
+    -- carries the value on the Redis wire — HistoryEntry.from_song stamps it
+    -- from the host the playback loop captured at song end — and the drainer
+    -- writes it through unchanged. 0 is a real recorded value, but an
+    -- ambiguous one: it covers a song whose NP send failed, a host a listener
+    -- deleted mid-song (released on discord.NotFound), and any entry written
+    -- by a build older than the field.
     --
     -- Kept out of play_history_dedup, and not a foreign key, for the same
     -- reason: the NP host is not stable or permanent. It migrates across
@@ -117,8 +141,29 @@ CREATE INDEX IF NOT EXISTS play_history_recent
 -- also what makes replay exact. Inspect with encode(payload, 'escape'), never
 -- convert_from(payload, 'UTF8') — that raises on invalid UTF-8.
 --
--- No index: the table is expected to hold zero rows and the only query is
--- ORDER BY rejected_at DESC LIMIT n.
+-- One index, and it is not for querying: the table is expected to hold zero
+-- rows and the only read is ORDER BY rejected_at DESC LIMIT n. It exists to
+-- make the INSERT idempotent.
+--
+-- Why that is needed: the outbox is a stream consumer group under a stable
+-- consumer name, so two drainers can replay the same pending entry, both fail
+-- it, and both land here. Under the drainer lease this path was exactly-once
+-- for free and nothing noticed the dependency. Duplicates matter here more than
+-- ordinary duplicated work do, because the entire diagnostic value of this
+-- table is that it is normally empty — `just db-rejects` printing three rows
+-- must mean three distinct failures, never one failure seen three times.
+--
+-- The key is "the same entry, failing the same way, in the same guild".
+-- payload IS the entry verbatim, so its digest identifies it exactly; a
+-- STORED generated column rather than a bare expression index so the constraint
+-- has a NAME for _REJECT_SQL's ON CONFLICT ON CONSTRAINT to reference, instead
+-- of the app restating the index expression and drifting from it. md5 is
+-- immutable over bytea, which is what a generated column requires — and it is
+-- being used as a content digest, not as a security primitive.
+--
+-- rejected_at is deliberately NOT in the key: the same entry failing again an
+-- hour later is the same defect, and a timestamp in the key would defeat the
+-- whole clause.
 CREATE TABLE IF NOT EXISTS play_history_rejected (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     rejected_at  timestamptz NOT NULL DEFAULT now(),
@@ -126,5 +171,9 @@ CREATE TABLE IF NOT EXISTS play_history_rejected (
     error_type   text        NOT NULL DEFAULT '',
     error_detail text        NOT NULL DEFAULT '',
     trace_id     text        NOT NULL DEFAULT '',
-    payload      bytea       NOT NULL
+    payload      bytea       NOT NULL,
+    payload_md5  text        GENERATED ALWAYS AS (md5(payload)) STORED,
+
+    CONSTRAINT play_history_rejected_dedup
+        UNIQUE (guild_id, error_type, payload_md5)
 );

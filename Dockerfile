@@ -57,6 +57,24 @@ COPY tests/ ./tests/
 # directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
 # them present, not just the module.
 COPY migrations/ ./migrations/
+# Same reason, different file: `just outbox` hardcodes the outbox key and consumer
+# group because a shell recipe cannot import them, and a test reads this file back
+# to prove the two have not drifted. Without it that guard fails in the container
+# tier with FileNotFoundError while passing everywhere else — which is how a check
+# ends up skipped instead of fixed.
+COPY justfile ./
+# And the same again for the default-password coupling. The literal lives in four
+# places no Python import can reach — compose, the build preflight, the env
+# template and the generator — so the tests read those files to prove they have
+# not drifted, and setup_env.sh is executed against a temp copy to prove it
+# tightens .env's mode. All four have to be in the image or those guards are
+# container-tier failures rather than assertions.
+COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
+# The two deploy entry points, for the same reason once more: the archive's
+# opt-in is a shell parser (resolve_archive_profile) and an ordering — migrate,
+# then `up` — that only these files record, so the tests read them back. Absent,
+# those seven guards fail with FileNotFoundError in the container tier alone.
+COPY deploy_docker.sh build_docker.sh ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as

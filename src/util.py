@@ -18,10 +18,18 @@ def queue_message(songs: list[str]) -> str:
     return msg
 
 
+def trace_id_of(span: Span) -> str:
+    """The span's trace id as 32 hex chars, or "" when the span is not recording. Empty
+    string rather than None: every consumer stores this in a column or log field that is
+    text, so an absent trace and an unset one should not be two cases downstream."""
+    span_ctx = span.get_span_context()
+    return format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
+
+
 def trace_footer(span: Span) -> Optional[str]:
     """Return an embed-footer string identifying the current trace, or None if untraced."""
-    span_ctx = span.get_span_context()
-    return f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
+    trace_id = trace_id_of(span)
+    return f"trace: {trace_id}" if trace_id else None
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:
@@ -63,16 +71,10 @@ def notice_embed(
     *,
     title: Optional[str] = None,
 ) -> discord.Embed:
-    """Build a lightweight single-message embed for short status/notice replies.
-
-    The one place that turns a plain status string ("Shuffled!", "Volume set…",
-    validation errors) into an embed. Every command response must be an embed
-    now that MusicContext.send funnels responses and prepends the Now Playing
-    block: a bare `content` string would render as loose text above the block,
-    breaking the uniform embed stack. Pairs with the richer send_embed (which
-    forces a title/description split) for the one-liner case where a body-only
-    embed reads best.
-    """
+    """Turn a plain status string ("Shuffled!", validation errors) into an embed. Every
+    command response must be an embed: MusicContext.send prepends the Now Playing block,
+    and a bare `content` string would render as loose text above it. send_embed is the
+    pair for anything needing a title/description split."""
     return discord.Embed(title=title, description=message, color=color)
 
 
@@ -103,19 +105,15 @@ def fmt_duration(secs: int) -> str:
 
 
 def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
-    """The noun form matching `count`: `pluralize(1, "song")` → "song",
-    `pluralize(3, "song")` → "songs". `plural` overrides the default `+ "s"`
-    for irregulars. Collapses the `"song" if n == 1 else "songs"` /
-    `f"song{'s' if n != 1 else ''}"` idioms scattered across the command and
-    embed builders into one spelling."""
+    """The noun form matching `count`: pluralize(1, "song") → "song",
+    pluralize(3, "song") → "songs". `plural` overrides the default `+ "s"`."""
     if count == 1:
         return singular
     return plural if plural is not None else singular + "s"
 
 
-# Discord's hard limit on an embed title is 256 characters; an over-length
-# title makes the whole send() 400 — silently no-opping -history, or failing
-# the now-playing send/edit outright.
+# Discord's hard embed-title limit. An over-length title 400s the whole send(),
+# silently no-opping -history or failing the now-playing send/edit.
 EMBED_TITLE_LIMIT = 256
 
 
@@ -127,13 +125,9 @@ def truncate_embed_title(title: str) -> str:
 
 
 def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
-    """One embed per played song, in the given (newest-first) order.
-
-    Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
-    webpage_url on its own line (Discord auto-links it), then one line with
-    played/duration, requester, and — when known — the absolute played-at
-    timestamp (<t:…:f> — viewer-local absolute date/time).
-    """
+    """One embed per played song, in the given (newest-first) order. Layout: numbered
+    title, raw webpage_url on its own line (Discord auto-links it), then played/duration,
+    requester, and — when known — the played-at timestamp as viewer-local <t:…:f>."""
     embeds = []
     for i, entry in enumerate(entries, start=1):
         lines = []
@@ -148,8 +142,8 @@ def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
             f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
             f" · requested by {requested_by}"
         )
-        # played_at == 0 means "unknown" (absent on the wire); rendering
-        # <t:0:f> would show "1 January 1970", so omit the timestamp instead.
+        # played_at == 0 means unknown (absent on the wire); <t:0:f> would render
+        # "1 January 1970", so omit the timestamp instead.
         if entry.played_at:
             meta += f" · <t:{int(entry.played_at)}:f>"
         lines.append(meta)

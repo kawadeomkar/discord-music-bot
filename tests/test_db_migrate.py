@@ -1,10 +1,8 @@
 """Tests for src/db_migrate.py — migration discovery and the version contract.
 
-The runner's SQL execution needs a real server and belongs to the pg tier, which
-arrives with the archive code. What lives here is everything that can be wrong
-without one: the file-naming contract, ordering, duplicate detection, and the
-agreement between migrations/ on disk and EXPECTED_SCHEMA_VERSION in the code —
-which is the whole reason that constant is a literal rather than derived.
+SQL execution needs a real server and lives in the pg tier. Here: everything
+that can be wrong without one — the file-naming contract, ordering, duplicate
+detection, and migrations/ agreeing with EXPECTED_SCHEMA_VERSION.
 """
 
 from pathlib import Path
@@ -106,3 +104,28 @@ class TestMain:
         monkeypatch.setattr("src.db_migrate.migrate", fake_migrate)
         assert main() == 1
         assert "expects" in capsys.readouterr().err
+
+    def test_a_newer_database_succeeds_with_a_note(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A database AHEAD of this build is the rollback case, and it must exit 0.
+
+        Two things depend on that. PostgresHistoryArchive._assert_schema_version
+        already tolerates it — migrations are additive, so an older bot reads a
+        newer schema fine — and a runner stricter than the bot it serves would
+        contradict it. And deploy_docker.sh now gates the deploy on this exit
+        status, so returning non-zero would make every rollback fail to deploy:
+        a routine rollback turned into an outage, which is precisely what the
+        archive's tolerance was written to prevent.
+        """
+
+        async def fake_migrate(url: str) -> int:
+            return EXPECTED_SCHEMA_VERSION + 1
+
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://app@h/db")
+        monkeypatch.delenv("POSTGRES_MIGRATE_URL", raising=False)
+        monkeypatch.setattr("src.db_migrate.migrate", fake_migrate)
+        assert main() == 0
+        captured = capsys.readouterr()
+        assert "ahead of this build" in captured.out
+        assert captured.err == ""

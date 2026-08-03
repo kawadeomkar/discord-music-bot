@@ -1,5 +1,8 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import re
+import sys
+import time
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -8,35 +11,67 @@ import discord
 import fakeredis
 import pytest
 import structlog
+from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, tier_enabled
+
+
+def pytest_collection_modifyitems(
+    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Refuse a `-m pg` / `-m redis` run that would skip the entire tier.
+
+    An all-skipped tier exits 0 and looks green while invariants that live only
+    there stop being checked — ON CONFLICT dedup, the -history tie-break, the
+    schema lock, and everything fakeredis answers WRONGLY rather than not at all.
+    Matches the marker as a WORD so `-m "pg and not slow"` cannot slip past, and
+    shares tier_enabled() with the modules' skipif so the two cannot disagree.
+    """
+    enablers = {
+        "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
+        "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
+    }
+    markexpr = config.option.markexpr
+    selected = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", markexpr)) - {
+        "and",
+        "or",
+        "not",
+    }
+    tiers = [t for t in enablers if t in selected]
+    if len(tiers) != 1:
+        # Zero tiers: an ordinary run, nothing to gate. More than one: the
+        # expression selects a mix, so "every test would skip" is not what a
+        # disabled tier means any more and the per-module skipif is the honest
+        # reporter.
+        return
+    tier = tiers[0]
+    flag, url = enablers[tier]
+    if tier_enabled(flag, url):
+        return
+    print(
+        f"\nERROR: `-m {markexpr}` selects the {tier} tier but it is disabled, "
+        f"so every test would skip.\n       Set {flag}=1 (needs Docker) or "
+        f"{url}.",
+        file=sys.stderr,
+    )
+    raise pytest.UsageError(f"{tier} tier selected but not enabled")
 
 
 @pytest.fixture(autouse=True)
 def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
 
-    Production uses a ProcessPoolExecutor, which pickles the submitted callable to a
-    worker. Tests patch src.youtube._ytdlp_extract with a MagicMock, which is unpicklable
-    — and even a real patch would never reach a worker process. A thread pool runs
-    in-process so the patch is honored and no children are ever spawned.
-
-    A fresh YtdlpPool per test, not a shared one: a test that exercises the shutdown path
-    (src.main.MusicBotApp.close) closes the pool permanently, and the next test must not
-    inherit a closed one. ThreadPoolExecutor spawns threads lazily on first submit, so
-    tests that never extract pay nothing.
-
-    Consequence worth stating plainly: **no test that goes through src.youtube ever
-    spawns a worker process.** The pickling that production performs on every submit is
-    asserted directly and cheaply by TestProcessBoundaryContract (tests/test_youtube.py),
-    and one dedicated test in tests/test_ytdlp_pool.py spawns a real worker end-to-end.
-    Everything else about the process path — orphan reaping, live playback — is the
-    manual gate in docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
+    Production pickles the submitted callable to a ProcessPoolExecutor worker; tests
+    patch src.youtube._ytdlp_extract with MagicMocks that could never be pickled, so a
+    thread pool is the only seam that honors the patch (fresh per test — the
+    shutdown-path tests close it permanently). Consequence: no test through
+    src.youtube spawns a worker process, so the pickle contract is asserted by
+    TestProcessBoundaryContract and one test in tests/test_ytdlp_pool.py.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -54,12 +89,30 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     pool.shutdown(wait=False)
 
 
+@pytest.fixture(autouse=True)
+def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the env the suite asserts against, whatever shell it runs in.
+
+    `just test` does not load .env, so the exposure is an EXPORTED variable: a
+    shell carrying a real POSTGRES_URL silently disables every default-credential
+    test, one exporting the default flips them the other way (setenv still wins).
+
+    HISTORY_ARCHIVE_ENABLED is pinned TRUE, deliberately INVERTING the ship
+    default: the enabled path exercises strictly more code (outbox XADD, notify,
+    drainer wiring) and hundreds of assertions encode it. Don't change this to
+    the ship default — disabled-mode tests monkeypatch the flag per case and win
+    over this fixture (same MonkeyPatch instance, later call).
+    """
+    monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+
+
 @pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.
 
-    Replaces the JSON renderer with a plain renderer so test output is readable,
-    and drops the OTel context processor (no TracerProvider in tests).
+    Plain renderer instead of JSON so output is readable; no OTel context
+    processor (there is no TracerProvider in tests).
     """
     structlog.configure(
         processors=[
@@ -78,8 +131,7 @@ def configure_structlog_for_tests() -> None:
 def reset_structlog_contextvars() -> Iterator[None]:
     """Clear structlog context variables between every test.
 
-    Without this, a test that calls bind_contextvars(guild_id=...) would
-    leak that context into subsequent tests via the ContextVar storage.
+    Otherwise bind_contextvars(guild_id=...) leaks into later tests.
     """
     structlog.contextvars.clear_contextvars()
     yield
@@ -146,6 +198,11 @@ def mock_ctx(
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
     ctx.typing.return_value.__aexit__ = AsyncMock(return_value=None)
+    # Owner by default: on a self-hosted bot the application owner is the
+    # operator, so it is the ordinary case for owner-gated commands (today,
+    # -ping's default-password advisory). AsyncMock is required — a bare
+    # MagicMock attribute is unawaitable and every such command dies with TypeError.
+    ctx.bot.is_owner = AsyncMock(return_value=True)
     return ctx
 
 
@@ -156,8 +213,45 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.latency = 0.05
     bot.is_closed.return_value = False
     bot.wait_until_ready = AsyncMock()
+    # Declared, never auto-vivified: MusicPlayer.__init__ reads
+    # bot.history_drainer, and an auto-vivified MagicMock answers `is not None`
+    # with True — so every player would take the archive-enabled arm and the
+    # disabled arm (the SHIP default) would be exercised by nothing. Dropping
+    # musicplayer.py's None guard once passed the entire suite while bricking
+    # every -play in the default configuration.
+    bot.history_archive = MagicMock()
+    bot.history_drainer = MagicMock()
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
+
+
+def _patch_xadd_monotonic_ids() -> None:
+    """Make a generated stream ID outrank every ID the stream ever issued.
+
+    fakeredis derives the next `*` ID from the LIVE entries alone, so a stream
+    drained to empty forgets its last ID and reissues one that is not greater —
+    same millisecond, or any wall-clock step backwards. XREADGROUP `>` then
+    skips that entry forever, because it does not outrank the group's
+    last-delivered-id, and the drainer reports an empty cycle over a non-empty
+    outbox. Real Redis keeps last_id independently of the entries.
+
+    Divergence 6 in tests/test_redis_integration.py; still present in fakeredis
+    2.37.0. Pinned by TestGeneratedStreamIds in tests/test_history_archive.py.
+    """
+    original = XStream.add
+
+    def add(self: XStream, fields: Any, entry_key: Any = "*", **kwargs: Any) -> Any:
+        key = entry_key.decode() if isinstance(entry_key, bytes) else entry_key
+        if key in (None, "*") and self._last_generated_id is not None:
+            last = StreamEntryKey.parse_str(self._last_generated_id)
+            if last.ts >= int(1000 * time.time()):
+                entry_key = f"{last.ts}-{last.seq + 1}"
+        return original(self, fields, cast(str, entry_key), **kwargs)
+
+    XStream.add = add  # type: ignore[method-assign]
+
+
+_patch_xadd_monotonic_ids()
 
 
 @pytest.fixture
@@ -177,16 +271,11 @@ def music_player(
     mock_ctx: MagicMock,
     fake_redis: Redis,
 ) -> MusicPlayer:
-    """Construct MusicPlayer with fake Redis. start() is NOT called — tests operate on state directly.
+    """MusicPlayer on fake Redis; start() is not called — tests drive state directly.
 
-    loop() blocks on _restore_complete until _restore_state() finishes (see its docstring
-    for why); since start() never runs here, nothing would set it. Tests that
-    exercise that race explicitly should clear it again before calling loop().
-
-    loop() then blocks on the playback gate until a voice connection is
-    established (docs/PLAYBACK_GATE_PLAN.md). start() and the -join/-play call
-    sites that open it never run here either, so it is opened for the same
-    reason — tests that exercise the gate itself should clear it again.
+    loop() blocks on both _restore_complete and the playback gate, and nothing
+    here would ever set them (start() and the -join/-play call sites never run),
+    so both are set. Tests exercising either race must clear them again first.
     """
     mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis)
     mp._restore_complete.set()
@@ -240,8 +329,8 @@ def ytdl_instance(
             return YTDL(
                 mock_channel,
                 default_data["url"],
-                # Arbitrary per-test overrides merge in above, so this is a plain
-                # dict by construction; the cast is the info-dict shape assertion.
+                # Per-test overrides merge in above, so this is a plain dict by
+                # construction; the cast is the info-dict shape assertion.
                 data=cast(YTDLVideoInfo, default_data),
                 requester=mock_author,
             )
@@ -253,8 +342,7 @@ def ytdl_instance(
 def music_bot(mock_bot: MagicMock) -> MusicBot:
     """Minimal MusicBot instance bypassing __init__ Discord registration.
 
-    Shared: tests/test_musicbot.py drives the cog's commands, tests/test_ping.py
-    drives the -ping dashboard through the same cog.
+    Shared by tests/test_musicbot.py (commands) and tests/test_ping.py (dashboard).
     """
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
@@ -262,6 +350,10 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
+    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
+    # AttributeError rather than returning None. Tests that care about the
+    # Postgres row set their own archive (see TestPingReportsPostgres).
+    cog.history_archive = None
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()

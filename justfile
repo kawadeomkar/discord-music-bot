@@ -248,6 +248,40 @@ test *ARGS: (_tools 'pytest')
     set -euo pipefail
     {{ PYTEST }} --tb=short -q "$@"
 
+# The real-Postgres tier, excluded from `test` by its `pg` marker.
+#
+# Server comes from one of two places, decided by the tests themselves: with
+# POSTGRES_TEST_URL set it uses that server (how CI's pg-integration job points
+# at its service container), otherwise testcontainers starts postgres:18-alpine
+# and Docker must be running. RUN_PG_TESTS=1 is set here so the local invocation
+# is just `just test-pg`; the tests also accept POSTGRES_TEST_URL alone.
+#
+# --no-cov, and not as a shortcut: this tier drives SQL against a real server
+# rather than exercising src/ branches, so measuring it under the 80% gate would
+# fail the run on a coverage number that means nothing for what it tests.
+[doc('Run the real-Postgres integration tier (needs Docker, or POSTGRES_TEST_URL)')]
+[group('check')]
+test-pg *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_PG_TESTS=1 {{ PYTEST }} -m pg --no-cov --tb=short -q "$@"
+
+# Opt-in real-Redis tier (testcontainers; needs Docker)
+#
+# fakeredis executes every stream command the outbox uses and gets FIVE of them
+# wrong — all in the safe-looking direction, so the default suite stays green
+# while production breaks. See tests/test_redis_integration.py's docstring.
+#
+# [doc] is not decoration here: without it `just --list` shows the LAST line of
+# the comment block above as this recipe's description, which is a docs pointer
+# rather than a description. Its sibling test-pg carries both attributes.
+[doc('Run the real-Redis integration tier (needs Docker, or REDIS_TEST_URL)')]
+[group('check')]
+test-redis *ARGS: (_tools 'pytest')
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RUN_REDIS_TESTS=1 {{ PYTEST }} -m redis --no-cov --tb=short -q "$@"
+
 # Check this file's own formatting (~0.01s)
 [group('check')]
 fmt-justfile:
@@ -281,6 +315,55 @@ pins:
     sh_image="$(sed -n 's/^IMAGE_NAME="\(.*\)"$/\1/p' build_common.sh)"
     if [ -z "$just_image" ] || [ "$just_image" != "$sh_image" ]; then
         echo "image name drift: justfile IMAGE=[$just_image] build_common.sh IMAGE_NAME=[$sh_image]" >&2
+        fail=1
+    fi
+
+    # The pg tier runs against testcontainers locally and a CI service container
+    # on GitHub, and the two must be the same server: a schema or type behaviour
+    # that differs between majors would pass in one place and fail in the other,
+    # with nothing pointing at the version as the cause.
+    py_pg="$(sed -n 's/^_PG_IMAGE = "\(.*\)"$/\1/p' tests/test_pg_integration.py)"
+    # Anchored to the pg-integration job, not `head -1`: the first
+    # `image: postgres:*` in the file happens to be that job's today, and a
+    # second postgres service added anywhere above it would silently start
+    # comparing the wrong one.
+    ci_pg="$(awk '/^  pg-integration:/{f=1} f && /image: postgres:/{print $2; exit}' .github/workflows/ci.yml)"
+    if [ -z "$py_pg" ] || [ "$py_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: test_pg_integration.py=[$py_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    # ...and compose, which is the copy that holds real data. Checking only the
+    # two test-side copies left the deployed server free to drift to another
+    # major while `just pins` and CI stayed green — exactly the scenario above,
+    # but validated against a server nobody runs in production.
+    compose_pg="$(awk '/^  postgres:/{f=1} f && /image: postgres:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$compose_pg" ] || [ "$compose_pg" != "$ci_pg" ]; then
+        echo "postgres image drift: docker-compose.yml=[$compose_pg] ci.yml=[$ci_pg]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    # Same rule for the redis tier, and this one carries live risk rather than
+    # theoretical: `redis:7-alpine` FLOATS (7.4.9 today), Dependabot runs the
+    # docker ecosystem at the repo root so it will bump the compose tag on its
+    # own, and a hardcoded test image left behind would have the suite asserting
+    # one server's behaviour while the bot runs another. That is not
+    # hypothetical here — a memory measurement of this very design was taken
+    # against the wrong major for exactly that reason.
+    py_redis="$(sed -n 's/^_REDIS_IMAGE = "\(.*\)"$/\1/p' tests/test_redis_integration.py)"
+    ci_redis="$(awk '/^  redis-integration:/{f=1} f && /image: redis:/{print $2; exit}' .github/workflows/ci.yml)"
+    if [ -z "$py_redis" ] || [ "$py_redis" != "$ci_redis" ]; then
+        echo "redis image drift: test_redis_integration.py=[$py_redis] ci.yml=[$ci_redis]" >&2
+        echo "  Bump both in the same commit." >&2
+        fail=1
+    fi
+
+    compose_redis="$(awk '/^  redis:/{f=1} f && /image: redis:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$compose_redis" ] || [ "$compose_redis" != "$ci_redis" ]; then
+        echo "redis image drift: docker-compose.yml=[$compose_redis] ci.yml=[$ci_redis]" >&2
+        echo "  Bump both in the same commit." >&2
         fail=1
     fi
 
@@ -339,10 +422,24 @@ container-test: test-image-rebuild
     docker run --rm "{{ IMAGE }}:test"
 
 # Full local mirror of the CI workflow
+#
+# test-pg and test-redis are here because CI's pg-integration and
+# redis-integration jobs are merge gates (`build` needs both), so a green `ci`
+# that skipped them would not mean what it says. They need Docker, which
+# `container-test` already required of this recipe.
+#
+# [doc(...)] because `just --list` shows only the LAST comment line, so the
+# multi-line reasoning above would otherwise replace this recipe's description
+# with "needs Docker, which `container-test` already required of this recipe."
+[doc('Full local mirror of CI (check + container-test + test-pg + test-redis)')]
 [group('check')]
-ci: check container-test
+ci: check container-test test-pg test-redis
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
+#
+# All of these assume the ARCHIVE IS ENABLED (HISTORY_ARCHIVE_ENABLED=true in
+# .env) and its services are up. Against a disabled stack they fail at connect —
+# curt, but honest: there is no database deployed to operate on.
 #
 # All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
 # the environment, which for a compose deployment means `.env`. They run the
@@ -377,12 +474,24 @@ _dotenv := '''
         done < .env
     fi
     # Build a HOST dsn from the compose parts when POSTGRES_URL is unset. The
-    # bundled stack synthesises its URL inside compose (docker-compose.yml's
-    # db-migrate service builds it from POSTGRES_USER/PASSWORD/DB), so it never
-    # lands in .env — and without this every recipe below died with
-    # "POSTGRES_URL is not set" on the exact stack the README tells you to run.
-    if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
-        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
+    # bundled stack synthesises the bot's URL inside compose (docker-compose.yml
+    # builds it from POSTGRES_USER/PASSWORD/DB), so it never lands in .env — and
+    # without this every recipe below died with "POSTGRES_URL is not set" on the
+    # exact stack the README tells you to run, including db-backfill, which is
+    # the mandatory step before the history lists are capped.
+    #
+    # The password FALLS BACK, exactly as compose does. It did not, and that was
+    # a lockout generator rather than a missing convenience: on the stack the
+    # default now enables (only DISCORD_TOKEN in .env) every recipe here died
+    # with "POSTGRES_URL is unset" and advised ./setup_env.sh — which mints a
+    # NEW password, while the postgres volume was already initialised on the
+    # default. The next `just run` then built a DSN the database rejects, and
+    # because the archive connects lazily the bot started fine and surfaced it
+    # much later as a drainer backoff loop. That is precisely the two-step trap
+    # .env.example and the -ping advisory warn about, reached by following this
+    # file's own advice. Keep this default in step with docker-compose.yml's.
+    if [ -z "${POSTGRES_URL:-}" ]; then
+        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
     fi
 '''
 
@@ -393,14 +502,215 @@ _dotenv := '''
 setup *ARGS:
     ./setup_env.sh {{ ARGS }}
 
-# Apply pending schema migrations. Nothing in the bot reads Postgres yet — this
-# lands the schema and its runner ahead of the code that will.
+# Start what `just run` connects to: Redis always, Postgres and the migration
+# one-shot only when HISTORY_ARCHIVE_ENABLED says so. Replaces having to
+# remember which of two `docker compose up` lines matches your .env.
+[doc('Start the backing services for `just run` (Postgres only when the archive is enabled)')]
+[group('dev')]
+services:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+        docker compose up -d redis postgres db-migrate
+    else
+        docker compose up -d redis
+    fi
+
+# Escape hatch for compose commands this file does not wrap, with the archive
+# profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
+# A raw `docker compose` still works — it just never deploys the archive tier.
+[doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
+[group('deploy')]
+compose *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    docker compose "$@"
+
+# Run the bot against the compose-backed services.
+#
+# `poetry run bot` alone does NOT work from a fresh clone: the bot reads its
+# configuration from the ENVIRONMENT and has no .env support, so the documented
+# local-run flow died on missing configuration and pointed at a setup_env.sh
+# that could not fix it. This recipe supplies the same environment the db-*
+# recipes use (.env, then a host DSN built from the compose parts).
+#
+# POSTGRES_URL is required only while HISTORY_ARCHIVE_ENABLED=true — the archive
+# is opt-in and OFF by default, and a disabled bot ignores the DSN entirely
+# (setup_hook logs one INFO saying so). The recipe derives one either way
+# because it costs nothing and makes flipping the flag a one-line change.
+# Bring the services up first with `just services` — it reads the same flag and
+# starts Postgres only when the archive is enabled.
+[doc('Run the bot locally with .env loaded (services must already be up)')]
+[group('dev')]
+run:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    # _dotenv always derives a DSN now (the password falls back like compose's),
+    # so this only fires if someone exported an empty POSTGRES_URL by hand — and
+    # only then does it matter, because the bot needs the DSN just while the
+    # archive is opted in. Refusing unconditionally would block the DEFAULT
+    # configuration, which archives nothing and ignores the variable entirely.
+    if [ -z "${POSTGRES_URL:-}" ]; then
+        case "$(printf '%s' "${HISTORY_ARCHIVE_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" in
+            true | 1 | yes)
+                echo "POSTGRES_URL is empty but HISTORY_ARCHIVE_ENABLED is true — setup_hook will refuse to start." >&2
+                echo "Unset POSTGRES_URL to let .env supply one, or set it." >&2
+                exit 1
+                ;;
+        esac
+    fi
+    exec {{ quote(VENV_BIN / 'python') }} -m src.main
+
+# Apply pending schema migrations — the bot refuses to start against an
+# unmigrated database (PostgresHistoryArchive._assert_schema_version).
+#
+# Every deploy already runs this (deploy_docker.sh, before the bot is
+# recreated), so this recipe is for external databases and out-of-band runs.
+# Re-running applies nothing: versions are recorded in schema_migrations.
 [doc('Apply pending play-history schema migrations')]
 [group('database')]
 db-migrate:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
+
+# Copy pre-archive history off the Redis lists into Postgres. Idempotent and
+# resumable (ON CONFLICT DO NOTHING). MUST run before the change that caps the
+# history lists, which trims the only other copy of exactly what this moves.
+#
+# This leg needs a local venv. On a Docker-only host use `just db-backfill-docker`
+# below — the same image and the same module.
+[doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
+[group('database')]
+db-backfill *ARGS:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
+
+# The container leg of db-backfill, for hosts with Docker and no Python toolchain.
+#
+# The profile resolution is what makes it work: `docker compose run` activates
+# only the target's own `ops` profile, so db-backfill's `depends_on: postgres`
+# is unresolvable ("no such service: postgres") unless `archive` is active too.
+# Disabled, this refuses up front rather than surfacing that as a compose error.
+[doc('Backfill via the compose one-shot — no local venv needed')]
+[group('database')]
+db-backfill-docker *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    if [ "$ARCHIVE_ENABLED" -ne 1 ]; then
+        echo "The history archive is disabled — there is no database to backfill into." >&2
+        echo "Set HISTORY_ARCHIVE_ENABLED=true in .env and deploy first (just up)." >&2
+        exit 1
+    fi
+    # Same reason as the deploy's migration step: the service's DSN is the
+    # compose-network one, and .env's POSTGRES_URL is the host form.
+    resolve_external_postgres_env
+    docker compose run --rm ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-backfill "$@"
+
+# The one Redis-side operator recipe. It exists because XLEN alone cannot tell
+# apart four states that call for four different responses, and working that out
+# by hand during an incident is the wrong time to learn the commands:
+#
+#   undelivered        backlog the drainer has not read yet
+#   in flight          delivered, insert not committed — normal, unless it is old
+#   acked, undeleted   a crash between XACK and XDEL — harmless, self-clearing
+#   TOMBSTONED         body trimmed while still pending — these are LOST PLAYS
+#
+# The last one is the reason this is a recipe rather than a README snippet:
+# spotting it means cross-referencing every pending ID against XRANGE, and it is
+# the only state that is silent everywhere else — no Postgres row, no
+# play_history_rejected row, no log line naming the entry.
+[doc('Outbox health: depth, in-flight, stranded entries, lost plays')]
+[group('database')]
+outbox IDLE_MS='60000':
+    #!/usr/bin/env bash
+    set -uo pipefail
+    r() { docker compose exec -T redis redis-cli "$@" | tr -d '\r'; }
+    key=history:outbox
+    group=drainers
+
+    kind="$(r TYPE "$key")"
+    if [ "$kind" = "none" ]; then
+        echo "outbox: key absent — nothing buffered, nothing to do."
+        exit 0
+    fi
+    if [ "$kind" != "stream" ]; then
+        # Startup aborts on this, but only the bot sees that; an operator running
+        # this recipe should be told the same thing in the same words.
+        echo "outbox: WRONGTYPE — '$key' is a $kind, not a stream." >&2
+        echo "  A pre-R1 build left a list here. Stop the bot, DEL the key, start it." >&2
+        exit 1
+    fi
+
+    depth="$(r XLEN "$key")"
+    echo "depth (XLEN):        $depth   # entries whose plays are not in Postgres yet"
+
+    summary="$(r XPENDING "$key" "$group" 2>&1)"
+    case "$summary" in
+        NOGROUP*|*"No such key"*)
+            echo "group '$group': MISSING — every read fails NOGROUP." >&2
+            echo "  The drainer recreates it on its next tick; if depth is not falling," >&2
+            echo "  the bot is down or wedged." >&2
+            exit 1 ;;
+    esac
+    in_flight="$(printf '%s\n' "$summary" | sed -n 1p)"
+    echo "in flight (XPENDING): ${in_flight:-0}   # delivered, insert not yet committed"
+
+    # Idle time is the tell for "stranded" — compare against DRAIN_DEADLINE_SECS.
+    stranded="$(r XPENDING "$key" "$group" IDLE {{ IDLE_MS }} - + 10)"
+    if [ -n "$stranded" ]; then
+        echo
+        echo "STRANDED — pending longer than {{ IDLE_MS }}ms (id / consumer / idle / deliveries):"
+        printf '%s\n' "$stranded" | paste - - - - | sed 's/^/  /'
+    fi
+
+    # Tombstones: pending IDs whose bodies are gone. XPENDING's range form prints
+    # four lines per entry (id, consumer, idle, delivery-count), so every fourth
+    # line from the first is an ID.
+    lost=0
+    for id in $(r XPENDING "$key" "$group" - + 1000 | awk 'NR % 4 == 1'); do
+        if [ -z "$(r XRANGE "$key" "$id" "$id")" ]; then
+            [ "$lost" -eq 0 ] && echo && echo "LOST PLAYS — pending, but the body is gone (tombstones):"
+            echo "  $id"
+            lost=$((lost + 1))
+        fi
+    done
+    if [ "$lost" -gt 0 ]; then
+        echo "  $lost entr$([ "$lost" -eq 1 ] && echo y || echo ies) trimmed while in flight." >&2
+        echo "  Each is a play that reached no table. Check HISTORY_OUTBOX_MAX." >&2
+        exit 1
+    fi
+    echo
+    echo "head (oldest 3):"
+    r XRANGE "$key" - + COUNT 3 | sed 's/^/  /'
+
+# Rows Postgres refused, parked by record_rejection. Expected to print NOTHING:
+# every entry reaching the drainer is insertable by construction, so a row here
+# means the HistoryEntry validator regressed or this build is talking to a schema
+# it was not written for. Treat any output as a code defect, not a data problem.
+#
+# encode(payload, 'escape') rather than convert_from(payload, 'UTF8'): payload is
+# bytea precisely because it may hold a NUL or invalid UTF-8, and convert_from
+# raises on exactly those (the play_history_rejected block in
+# migrations/0001_play_history.sql has the reasoning).
+[doc('List play_history rows Postgres refused (expected: nothing)')]
+[group('database')]
+db-rejects COUNT='10':
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    docker compose exec -T postgres psql -U "${POSTGRES_USER:-musicbot}" \
+        -d "${POSTGRES_DB:-musicbot}" -x -c \
+        "SELECT id, rejected_at, guild_id, error_type, error_detail, trace_id,
+                encode(payload, 'escape') AS payload
+         FROM play_history_rejected
+         ORDER BY rejected_at DESC LIMIT {{ COUNT }}"
 
 # Custom-format dump (-Fc): compressed and restorable selectively, unlike plain
 # SQL. Writes into backups/, which is gitignored.
@@ -409,6 +719,14 @@ db-migrate:
 db-backup:
     #!/usr/bin/env bash
     {{ _dotenv }}
+    # A dump is the whole play_history table — every guild id, user id and song
+    # title the bot has ever recorded — and the shell's redirect below creates it
+    # under the ambient umask, which is 022 on a stock macOS or Ubuntu account.
+    # That published the entire history to every local account, in a directory
+    # (`backups/`) that then accumulates them. Set here rather than chmod'ing
+    # after the fact so the file is never briefly world-readable, and so the
+    # `backups/` mkdir is covered by the same rule.
+    umask 077
     mkdir -p backups
     out="backups/play_history_$(date +%F_%H%M%S).dump"
     # Dump to a temp file and rename only on success. Redirecting straight into
@@ -493,7 +811,13 @@ up TAG='':
 # Stop the compose stack (volumes are kept)
 [group('deploy')]
 down:
-    docker compose down
+    # --profile archive is load-bearing, not decoration. `docker compose down`
+    # with the profile INACTIVE removes only un-profiled containers and leaves
+    # a running postgres behind (plus a "network in use" error) — exactly the
+    # just-disabled-the-archive case where the operator most expects the
+    # database to stop. Activating a profile whose services have no containers
+    # is a no-op, so the always-disabled case is unaffected.
+    docker compose --profile archive down
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text

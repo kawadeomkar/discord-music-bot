@@ -9,7 +9,6 @@
 # those three names, with build_runtime_image variadic — it passes one SHA tag
 # where the compose path passes two. Renaming or re-signaturing one of them turns
 # that branch's merge into a rewrite under conflict markers, months from now.
-# Rationale: docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §4.1.
 #
 # git_sha_tag is ADDITIVE — new callers may use it, the three names above keep
 # working untouched, so the k8s merge is unaffected by its existence.
@@ -195,24 +194,149 @@ _env_value() {
         || true
 }
 
-# require_postgres_password — compose-path preflight, called only from
+# resolve_archive_profile — HISTORY_ARCHIVE_ENABLED into the compose `archive`
+# profile, so that flag is the only switch. Exports COMPOSE_PROFILES and
+# ARCHIVE_ENABLED (0/1). Compose cannot derive it: profiles activate only from
+# COMPOSE_PROFILES or --profile, and `${FLAG:+archive}` yields `archive` for
+# `false` too. See docs/ARCHITECTURE.md#history-archive-tier.
+#
+# The export is unconditional, EMPTY INCLUDED — the process environment beats
+# .env, which is how a flag flipped to false overrides an older .env still
+# carrying COMPOSE_PROFILES=archive. Only that element is owned; other profiles
+# survive. Garbage exits 1 in config.history_archive_enabled's own terms: a
+# deploy that disagreed with the bot it deploys is the worst outcome.
+resolve_archive_profile() {
+    local env_file=".env" flag profiles rest item
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$flag" in
+        "" | false | 0 | no) ARCHIVE_ENABLED=0 ;;
+        true | 1 | yes) ARCHIVE_ENABLED=1 ;;
+        *)
+            echo "HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no" >&2
+            echo "(case-insensitive); got '$flag'. The bot refuses to start on this" >&2
+            echo "value, so the deploy refuses too." >&2
+            exit 1
+            ;;
+    esac
+
+    # Rebuild the list without `archive` rather than appending to it: this runs
+    # on every deploy, so a plain append would accumulate duplicates, and a
+    # disabled flag has to be able to REMOVE the element it did not add.
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
+    rest=""
+    while IFS= read -r item; do
+        case "$item" in "" | archive) continue ;; esac
+        rest="${rest:+$rest,}$item"
+    done <<< "$(printf '%s' "$profiles" | tr ',' '\n' | tr -d '[:blank:]')"
+
+    if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+        COMPOSE_PROFILES="${rest:+$rest,}archive"
+        echo "History archive: ENABLED — deploying postgres + db-migrate" >&2
+    else
+        COMPOSE_PROFILES="$rest"
+        echo "History archive: disabled — no postgres deployed (the default)" >&2
+    fi
+    export COMPOSE_PROFILES ARCHIVE_ENABLED
+}
+
+# resolve_external_postgres_env — fill EXTERNAL_PG_ENV with `-e POSTGRES_URL=…`
+# when the DSN names a database a CONTAINER can reach, empty otherwise. For
+# `docker compose run` of db-migrate / db-backfill, which address postgres by
+# service name: right for the bundled stack, wrong for an external database.
+#
+# Passing POSTGRES_URL through unconditionally is worse than either. .env holds
+# the HOST-form DSN the host-networked bot and `just run` need, and 127.0.0.1
+# inside a compose-network container is that container — the migration then
+# fails with connection refused against a healthy database. Loopback is the
+# discriminator, and an unparsed DSN errs toward the service name.
+resolve_external_postgres_env() {
+    EXTERNAL_PG_ENV=()
+    local url host
+    url="${POSTGRES_URL:-$(_env_value POSTGRES_URL .env)}"
+    [ -n "$url" ] || return 0
+    # Order matters: scheme, then path/query, THEN credentials, then the port.
+    # Credentials are stripped to the LAST `@` so a password containing one does
+    # not leave `ss@127.0.0.1` looking like an external host — but only after the
+    # path is gone, or a `@` in a database name would eat the host instead.
+    # Brackets last, for the IPv6 `[::1]:5432` form.
+    host="$(printf '%s' "$url" \
+        | sed -E 's#^[a-zA-Z0-9+.-]+://##; s#[/?].*$##; s#^.*@##; s#:[^:]*$##; s#^\[|\]$##g')"
+    case "$host" in
+        "" | localhost | ::1 | 127.*) return 0 ;;
+    esac
+    EXTERNAL_PG_ENV=(-e "POSTGRES_URL=$url")
+}
+
+# warn_default_postgres_password — compose-path preflight, called only from
 # build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #
-# docker-compose.yml interpolates `${POSTGRES_PASSWORD:?}` for both the postgres
-# service and the bot's POSTGRES_URL, so compose would catch an unset password on
-# its own — but only at `up`, after the whole image build. Fail here instead,
-# with a message that says what to do.
-require_postgres_password() {
+# Renamed from require_postgres_password, which stopped requiring anything when
+# the default landed: it returns 0 on every path now. Safe to rename — the
+# file's declared "Fixed API" above names only resolve_environment,
+# run_test_gate and build_runtime_image.
+#
+# The password is not required even when archiving: compose falls back to a
+# known default so `docker compose up` works with nothing configured but
+# DISCORD_TOKEN. So this warns rather than exits — a build that refused to
+# proceed would put back the first-run cliff the default removed.
+#
+# The bot repeats the warning at startup and on every -ping, which are the
+# surfaces an operator actually watches; this one just catches it earlier, at
+# build time, with the same remedy.
+#
+# Skipped when nothing suggests a Postgres is deployed. The archive is opt-in
+# (HISTORY_ARCHIVE_ENABLED + the `archive` compose profile), and a credential
+# warning about a database that isn't there is noise. The gate is an OR of
+# BOTH .env lines, deliberately wider than the bot's own flag-only gate: in
+# the drift case — profile active, flag off — postgres runs idle with the
+# default password and the bot's warnings are all silenced, so this preflight
+# is the one surface left that can still say so. The string comparisons are
+# dumb on purpose (truthy spellings / substring on the profile list); they
+# mirror config.py's parser without importing it.
+warn_default_postgres_password() {
     local env_file=".env"
     if [ ! -f "$env_file" ]; then
-        echo "Error: $env_file not found — run ./setup_env.sh to create it." >&2
-        exit 1
+        # NOT "compose will use its built-in defaults" — that was wrong and the
+        # README (§Requirements) says so: docker-compose.yml declares
+        # `env_file: .env`, and Compose treats a MISSING one as an error, not a
+        # warning. The password has a fallback; the file itself does not.
+        echo "WARNING: $env_file not found. Compose declares env_file: .env and" >&2
+        echo "         treats a missing one as an error, so \`docker compose up\`" >&2
+        echo "         will fail regardless of any default. Run ./setup_env.sh." >&2
+        return 0
     fi
-    if [ -z "$(_env_value POSTGRES_PASSWORD "$env_file")" ]; then
-        echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
-        echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
-        echo "       built from it, and it has no fallback by design." >&2
-        echo "       Run ./setup_env.sh to generate one." >&2
-        exit 1
+    # The ENVIRONMENT WINS over .env, mirroring Compose's own precedence. Both
+    # of these are read by Compose from the process environment first, so
+    # `COMPOSE_PROFILES=archive ./build_docker.sh` with a token-only .env really
+    # does deploy Postgres — and reading the file alone made this preflight
+    # return 0 and say nothing, which is a silent miss in the one function whose
+    # entire job is not to miss one.
+    local flag profiles
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]')"
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
+    case "$flag" in
+        true | 1 | yes) : ;; # archive enabled — warn below
+        *)
+            case "$profiles" in
+                *archive*) : ;; # drift case: postgres deployed anyway — warn below
+                *) return 0 ;;  # no archive, no deployed postgres — nothing to warn about
+            esac
+            ;;
+    esac
+    local value
+    value="$(_env_value POSTGRES_PASSWORD "$env_file")"
+    if [ -z "$value" ] || [ "$value" = "password" ]; then
+        echo "WARNING: POSTGRES_PASSWORD is unset or still the default in $env_file." >&2
+        echo "         The play-history database will accept 'password' from" >&2
+        echo "         anything that can reach the host's published port." >&2
+        echo "         Fix it IN THIS ORDER — the bot's warning reads its DSN, so" >&2
+        echo "         doing (2) first silences it while the server still accepts" >&2
+        echo "         the old password:" >&2
+        echo "           1. docker compose exec postgres psql -U <user> \\" >&2
+        echo "                -c \"ALTER USER <user> PASSWORD '<new>'\"" >&2
+        echo "           2. ./setup_env.sh --force, with the same value" >&2
+        echo "           3. docker compose up -d   (the DSN is baked at create time)" >&2
     fi
 }

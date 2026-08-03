@@ -66,13 +66,36 @@ _set_env_var() {
         cp "$file" "$tmp"
         printf '%s=%s\n' "$name" "$value" >> "$tmp"
     fi
-    # Preserve the original mode (a .env is often 600) across the rewrite. Read
-    # it with stat, BSD spelling first then GNU: `chmod --reference` is GNU-only
-    # and fails silently on macOS, this project's primary dev platform.
+    # Preserve the original OWNER mode across the rewrite, then strip group and
+    # other unconditionally. `chmod --reference` is GNU-only and fails on macOS,
+    # this project's primary dev platform, so the mode is read with stat.
+    #
+    # Both spellings are tried AND THE RESULT IS VALIDATED, because a plain
+    # `bsd || gnu` fallback does not work here: on GNU coreutils `stat -f` is a
+    # valid option meaning "display FILESYSTEM status", so the BSD attempt
+    # SUCCEEDS on Linux and prints a multi-line filesystem dump. The `||` never
+    # fires and chmod is handed that dump, which fails with `invalid mode` and
+    # exits 1 — after .env has already been created, so the run leaves a file
+    # with no generated password behind it. That is every Linux run of this
+    # script, including on the production host the README points at. Checking
+    # that the answer is octal is what makes the fallback real rather than
+    # decorative.
+    #
+    # The `go-rwx` is the point, and it is a narrowing of what this used to do.
+    # Preserving the mode verbatim is right for a .env this script created (600)
+    # and wrong for one the operator made by hand — `cp .env.example .env` lands
+    # at 644 under the usual umask, and this function is how the generated
+    # POSTGRES_PASSWORD gets written into it. Faithfully preserving 644 meant
+    # minting a fresh credential and immediately publishing it to every account
+    # on the box. Tightening never loses anything: a stricter original (400, or
+    # 600) survives untouched, because go-rwx only ever clears bits.
     if [ -f "$file" ]; then
-        mode="$(stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null || echo '')"
+        mode="$(stat -f '%Lp' "$file" 2>/dev/null || true)"
+        case "$mode" in '' | *[!0-7]*) mode="$(stat -c '%a' "$file" 2>/dev/null || true)" ;; esac
+        case "$mode" in '' | *[!0-7]*) mode='' ;; esac
         if [ -n "$mode" ]; then chmod "$mode" "$tmp"; else chmod 600 "$tmp"; fi
     fi
+    chmod go-rwx "$tmp"
     mv "$tmp" "$file"
 }
 
