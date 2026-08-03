@@ -1135,6 +1135,35 @@ class TestPendingBeforeNew:
         assert [e.title for e in archive.inserted] == ["Song 1", "Song 2"]
 
 
+class TestGeneratedStreamIds:
+    """A generated ID outranks every ID the stream has issued, drained or not.
+
+    The drain settles by XACK + XDEL, so a caught-up outbox is an EMPTY stream
+    holding a group whose last-delivered-id is the ID it just retired. Every
+    push after that depends on the next generated ID still outranking it.
+    """
+
+    async def test_an_emptied_stream_does_not_reissue_a_delivered_id(
+        self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
+    ) -> None:
+        # Seeded far-future so the collision is deterministic rather than a
+        # sub-millisecond race: a generator that forgets the emptied stream's
+        # last ID falls back to the wall clock, lands below the group's
+        # last-delivered-id, and `>` skips the entry — the drain then reports an
+        # empty cycle over a non-empty outbox. That is the CI flake this pins.
+        await fake_redis.xadd(
+            HISTORY_OUTBOX_KEY,
+            {OUTBOX_FIELD: serialize_history_entry(_entry(1))},
+            id=b"99999999999999-0",
+        )
+        assert await drainer._drain_once() == 1
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
+        await _push(fake_redis, 2)
+        assert await drainer._drain_once() == 1
+        assert [e.title for e in archive.inserted] == ["Song 1", "Song 2"]
+
+
 class TestTombstones:
     """An entry delivered, then deleted while still pending — XTRIM and any
     operator XDEL produce this, since neither consults the PEL. The ID replays

@@ -2,6 +2,7 @@
 
 import re
 import sys
+import time
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ import discord
 import fakeredis
 import pytest
 import structlog
+from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
@@ -221,6 +223,35 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.history_drainer = MagicMock()
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
+
+
+def _patch_xadd_monotonic_ids() -> None:
+    """Make a generated stream ID outrank every ID the stream ever issued.
+
+    fakeredis derives the next `*` ID from the LIVE entries alone, so a stream
+    drained to empty forgets its last ID and reissues one that is not greater —
+    same millisecond, or any wall-clock step backwards. XREADGROUP `>` then
+    skips that entry forever, because it does not outrank the group's
+    last-delivered-id, and the drainer reports an empty cycle over a non-empty
+    outbox. Real Redis keeps last_id independently of the entries.
+
+    Divergence 6 in tests/test_redis_integration.py; still present in fakeredis
+    2.37.0. Pinned by TestGeneratedStreamIds in tests/test_history_archive.py.
+    """
+    original = XStream.add
+
+    def add(self: XStream, fields: Any, entry_key: Any = "*", **kwargs: Any) -> Any:
+        key = entry_key.decode() if isinstance(entry_key, bytes) else entry_key
+        if key in (None, "*") and self._last_generated_id is not None:
+            last = StreamEntryKey.parse_str(self._last_generated_id)
+            if last.ts >= int(1000 * time.time()):
+                entry_key = f"{last.ts}-{last.seq + 1}"
+        return original(self, fields, cast(str, entry_key), **kwargs)
+
+    XStream.add = add  # type: ignore[method-assign]
+
+
+_patch_xadd_monotonic_ids()
 
 
 @pytest.fixture

@@ -5,8 +5,8 @@ Opt-in; two ways to supply the server (see `redis_url`):
     just test-redis                      # local: testcontainers, needs Docker
     REDIS_TEST_URL=... just test-redis   # CI: an already-running server
 
-fakeredis runs every stream command the design uses, but five behaviours
-diverge from `redis:7-alpine` (measured on 7.4.9) and every one fails in the
+fakeredis runs every stream command the design uses, but six behaviours diverge
+from `redis:7-alpine` (measured on 7.4.9) and every one fails in the
 SAFE-LOOKING direction — green unit tests, broken production:
 
     1  xtrim(approximate=True), redis-py's default: fakeredis trims exactly;
@@ -18,9 +18,14 @@ SAFE-LOOKING direction — green unit tests, broken production:
     4  XADD against a list key: fakeredis raises AttributeError, real Redis
        raises ResponseError (WRONGTYPE)
     5  ref_policy=KEEPREF/DELREF/ACKED: syntax error below Redis 8.2 on both
+    6  generated IDs after the stream empties: fakeredis derives `*` from the
+       live entries alone, so a drained stream forgets its last ID and reissues
+       one the group already delivered; real Redis keeps last_id independently
 
-Rows 1, 3 and 4 are undetectable without a real server; row 2 is asserted here
-so the unit tier's workaround stays honest about what it works around.
+Rows 1, 3 and 4 are undetectable without a real server; rows 2 and 6 are
+asserted here so the unit tier's workarounds stay honest about what they work
+around. Row 6 is patched into the fake — see _patch_xadd_monotonic_ids in
+tests/conftest.py — because it surfaces as a rare, silent drain of nothing.
 
 Floor is Redis 7.0, not 6.2: XAUTOCLAIM's 3-element reply carrying the
 deleted-ID list — the tombstone behaviour the drainer depends on — arrived in
@@ -148,6 +153,12 @@ async def _push(redis: aioredis.Redis, *ns: int) -> None:
     store = GuildRedisStore(redis, guild_id=42)
     for n in ns:
         await store.push_history(_entry(n))
+
+
+def _id_parts(raw: bytes) -> tuple[int, int]:
+    """`ms-seq` as integers — bytes compare lexicographically, not numerically."""
+    ts, seq = raw.split(b"-")
+    return int(ts), int(seq)
 
 
 async def _ids(redis: aioredis.Redis) -> list[bytes]:
@@ -564,6 +575,45 @@ class TestRetireSemantics:
         await _push(redis, 6, 7)
         # Same command, same argument, a second destructive effect.
         assert await redis.xtrim(HISTORY_OUTBOX_KEY, maxlen=1, approximate=False) == 2
+
+
+class TestGeneratedIdsOutrankRetiredOnes:
+    """Divergence 6, asserted against a real server.
+
+    retire_outbox empties the stream while the group keeps its
+    last-delivered-id, so every later push depends on the server issuing an ID
+    above it. Real Redis carries last_id on the stream itself; fakeredis derives
+    it from the live entries and reissues a retired ID, which `>` then skips.
+    """
+
+    async def test_an_emptied_stream_still_issues_a_rising_id(
+        self, redis: aioredis.Redis
+    ) -> None:
+        await ensure_outbox_group(redis)
+        await _push(redis, 1)
+        first = await read_outbox_new(redis, 10)
+        await retire_outbox(redis, [e.id for e in first])
+        assert await outbox_depth(redis) == 0
+
+        # Same millisecond as the retired entry, most likely — the case the fake
+        # gets wrong. The entry must still be delivered.
+        await _push(redis, 2)
+        second = await read_outbox_new(redis, 10)
+        assert len(second) == 1
+        assert _id_parts(second[0].id) > _id_parts(first[0].id)
+
+    async def test_last_id_survives_deleting_every_entry(
+        self, redis: aioredis.Redis
+    ) -> None:
+        await ensure_outbox_group(redis)
+        await _push(redis, 1)
+        ids = await _ids(redis)
+        await redis.xdel(HISTORY_OUTBOX_KEY, ids[0])
+        # XINFO field names come back decoded even at decode_responses=False;
+        # only the values stay bytes.
+        info = cast(dict[str, Any], await redis.xinfo_stream(HISTORY_OUTBOX_KEY))
+        assert info["length"] == 0
+        assert info["last-generated-id"] == ids[0]
 
 
 class TestOutboxKeyIsNonEvictable:
