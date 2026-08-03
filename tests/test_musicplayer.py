@@ -71,6 +71,10 @@ def mock_song() -> MagicMock:
     song.interjected = False
     song.is_resume = False
     song.start_paused = False
+    # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them into
+    # the play_history column domain.
+    song.queued_at = 0.0
+    song.queue_position = 0
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -2331,6 +2335,118 @@ class TestQueuePutFront:
             await asyncio.sleep(0)
 
         mock_prefetch.assert_not_awaited()
+
+
+# ── Enqueue stamps ────────────────────────────────────────────────────────────
+
+
+class TestEnqueueStamps:
+    """queued_at / queue_position: written once at enqueue, carried everywhere
+    after. queue_position counts songs ahead INCLUDING the one playing, so 0
+    means the song played immediately."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from src import youtube
+
+        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
+    async def test_first_song_into_an_idle_player_is_position_zero(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        await music_player.queue_put(queue_obj)
+        assert queue_obj.queue_position == 0
+        assert queue_obj.queued_at > 0
+
+    async def test_enqueue_behind_a_live_song_is_position_one(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        await music_player.queue_put(queue_obj)
+        assert queue_obj.queue_position == 1
+
+    async def test_batch_increments_per_track(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        playlist = [
+            QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
+            for i in range(3)
+        ]
+        await music_player.queue_put(playlist, prefetch=False)
+        assert [q.queue_position for q in playlist] == [1, 2, 3]
+
+    async def test_second_enqueue_counts_the_queued_song(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        first = QueueObject("https://yt.com/v=1", "One", mock_author)
+        second = QueueObject("https://yt.com/v=2", "Two", mock_author)
+        await music_player.queue_put(first)
+        await music_player.queue_put(second)
+        assert (first.queue_position, second.queue_position) == (0, 1)
+
+    async def test_put_front_while_disconnected_is_position_zero(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        # -play on a disconnected bot: the persisted queue it jumps ahead of is
+        # behind it, and nothing is playing.
+        await music_player.queue_put(
+            [QueueObject("https://yt.com/v=old", "Old", mock_author)]
+        )
+        jumper = QueueObject("https://yt.com/v=new", "New", mock_author)
+        await music_player.queue_put_front(jumper)
+        assert jumper.queue_position == 0
+
+    async def test_put_front_behind_a_live_song_is_position_one(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        jumper = QueueObject("https://yt.com/v=new", "New", mock_author)
+        await music_player.queue_put_front(jumper)
+        assert jumper.queue_position == 1
+
+    async def test_already_stamped_item_is_not_restamped(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        # requeue_front and the restore paths hand back items that already
+        # carry a stamp; re-entering an enqueue site must leave them alone.
+        music_player.current_song = mock_song
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "One",
+            mock_author,
+            queued_at=1752530000.5,
+            queue_position=7,
+        )
+        await music_player.queue_put(item)
+        assert (item.queued_at, item.queue_position) == (1752530000.5, 7)
+
+    async def test_yt_source_is_stamped_by_replacement(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        # YTSource is frozen, so the queue holds a stamped copy — the caller's
+        # instance stays untouched.
+        music_player.current_song = mock_song
+        source = YTSource(ytsearch="ytsearch:a song", process=True)
+        await music_player.queue_put(source)
+        queued = music_player.queue.display_items()[0]
+        assert isinstance(queued, YTSource)
+        assert queued.queue_position == 1
+        assert queued.queued_at > 0
+        assert source.queued_at == 0.0
+
+    async def test_resolved_search_carries_its_stamps(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        # yt_source builds the QueueObject, so _resolve_source copies the
+        # search's stamps onto it rather than losing them at resolve time.
+        source = YTSource(
+            ytsearch="ytsearch:a song", queued_at=1752530000.5, queue_position=4
+        )
+        resolved = QueueObject("https://yt.com/v=1", "One", mock_author)
+        with patch.object(YTDL, "yt_source", new=AsyncMock(return_value=resolved)):
+            out = await music_player._resolve_source(source)
+        assert (out.queued_at, out.queue_position) == (1752530000.5, 4)
 
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
@@ -4739,6 +4855,10 @@ class TestLoop:
         song.interjected = False
         song.is_resume = False
         song.start_paused = False
+        # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
+        # into the play_history column domain.
+        song.queued_at = 0.0
+        song.queue_position = 0
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -5744,6 +5864,10 @@ class TestLoopAdditional:
         song.interjected = False
         song.is_resume = False
         song.start_paused = False
+        # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
+        # into the play_history column domain.
+        song.queued_at = 0.0
+        song.queue_position = 0
         return song
 
     async def test_update_activity_called_at_song_start_and_end(
@@ -5958,6 +6082,28 @@ class TestInterject:
         assert outcome.resume_position == 42
         assert outcome.was_paused is False
         assert outcome.replaced is False
+
+    async def test_interjection_is_position_zero_and_tail_keeps_the_original(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        # The interruption plays immediately; the tail is the same play, so it
+        # keeps the stamps the interrupted song was queued with.
+        live_song.elapsed_secs = 42.0
+        live_song.queued_at = 1752530000.5
+        live_song.queue_position = 5
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        assert playnow_obj.queue_position == 0
+        assert playnow_obj.queued_at > 0
+        resume = music_player.queue.display_items()[1]
+        assert isinstance(resume, QueueObject)
+        assert (resume.queued_at, resume.queue_position) == (1752530000.5, 5)
 
     async def test_paused_song_returns_start_paused(
         self,
@@ -6238,6 +6384,38 @@ class TestNeutralizePrefetch:
         assert rebuilt.is_resume is True
         assert rebuilt.start_paused is True
         assert rebuilt.interjected is False
+
+    async def test_completed_task_rebuild_keeps_enqueue_stamps(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        # Losing the stamps here would let the rebuilt entry be restamped as
+        # freshly queued at whatever depth the queue happens to be.
+        original = QueueObject(
+            "https://yt.com/v=orig",
+            "Interrupted Song",
+            mock_author,
+            queued_at=1752530000.5,
+            queue_position=6,
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.queued_at = 1752530000.5
+        live_song.queue_position = 6
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert (rebuilt.queued_at, rebuilt.queue_position) == (1752530000.5, 6)
 
     async def test_completed_task_rebuild_keeps_interjected_flag(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass
 from itertools import islice
 from typing import (
@@ -849,6 +850,9 @@ class MusicBot(commands.Cog):
             # "now", and this window can be seconds long with songs queued behind.
             # Reset the marker or a normally queued song triggers replace semantics.
             qobj.interjected = False
+            # This path goes straight to the queue, so it stamps its own enqueue:
+            # nothing is playing, so the song is next up at position 0.
+            qobj.queued_at = time.time()
             await mp.queue.put_front([qobj])
             await asyncio.gather(
                 send_embed(

@@ -69,14 +69,16 @@ _tracer = get_tracer(__name__)
 _INSERT_SQL = """
 INSERT INTO play_history (guild_id, title, webpage_url, duration_secs,
                           played_secs, requester_id, requester_name,
-                          thumbnail, uploader, played_at, message_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                          thumbnail, uploader, played_at, message_id,
+                          queued_at, queue_position)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ON CONFLICT (guild_id, played_at, webpage_url) DO NOTHING
 """
 
 _RECENT_SQL = """
 SELECT guild_id, title, webpage_url, duration_secs, played_secs,
-       requester_id, requester_name, thumbnail, uploader, played_at, message_id
+       requester_id, requester_name, thumbnail, uploader, played_at, message_id,
+       queued_at, queue_position
 FROM play_history
 WHERE guild_id = $1
 ORDER BY played_at DESC, id DESC
@@ -124,6 +126,8 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
         entry.uploader,
         datetime.fromtimestamp(entry.played_at, tz=timezone.utc),
         entry.message_id,
+        datetime.fromtimestamp(entry.queued_at, tz=timezone.utc),
+        entry.queue_position,
     )
 
 
@@ -140,6 +144,8 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
         uploader=row["uploader"],
         played_at=row["played_at"].timestamp(),
         message_id=row["message_id"],
+        queued_at=row["queued_at"].timestamp(),
+        queue_position=row["queue_position"],
     )
 
 

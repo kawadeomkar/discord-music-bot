@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS play_history (
     uploader       text        NOT NULL DEFAULT '',
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
 
+    -- When the song was first added to the queue (epoch 0 = unknown, the same
+    -- sentinel as played_at) and how many songs were ahead of it then, counting
+    -- the one playing. 0 = played immediately, which is also what an entry
+    -- written before these fields existed parses as.
+    queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
+    queue_position integer     NOT NULL DEFAULT 0,
+
     -- When the row reached Postgres, as opposed to when the song was played.
     -- played_at is a client clock captured at song end and can be arbitrarily
     -- far in the past for backfilled or long-buffered entries, so this is what
@@ -92,7 +99,8 @@ CREATE TABLE IF NOT EXISTS play_history (
     CONSTRAINT play_history_requester_valid   CHECK (requester_id >= 0),
     CONSTRAINT play_history_played_secs_valid CHECK (played_secs >= 0),
     CONSTRAINT play_history_duration_valid    CHECK (duration_secs >= 0),
-    CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0)
+    CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0),
+    CONSTRAINT play_history_queue_position_valid CHECK (queue_position >= 0)
 );
 
 -- Dedup for at-least-once delivery (drainer redelivery) and backfill overlap.

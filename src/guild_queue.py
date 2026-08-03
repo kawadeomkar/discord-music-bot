@@ -448,6 +448,8 @@ class GuildQueue:
                 url=entry.url,
                 process=entry.process,
                 ts=entry.ts,
+                queued_at=entry.queued_at,
+                queue_position=entry.queue_position,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
@@ -473,4 +475,6 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
+            queued_at=entry.queued_at,
+            queue_position=entry.queue_position,
         )

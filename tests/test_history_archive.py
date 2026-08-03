@@ -341,6 +341,8 @@ _COLUMNS = (
     "uploader",
     "played_at",
     "message_id",
+    "queued_at",
+    "queue_position",
 )
 
 
@@ -377,6 +379,18 @@ class TestRowMapping:
         assert row[_COLUMNS.index("played_at")] == datetime.fromtimestamp(
             1001.0, tz=timezone.utc
         )
+
+    def test_queued_at_maps_to_utc_datetime(self) -> None:
+        # The enqueue stamp rides the same epoch -> aware-UTC conversion as
+        # played_at, so both columns hold the same kind of instant.
+        entry = HistoryEntry(guild_id=1, title="x", queued_at=1001.0, queue_position=4)
+        row = _entry_to_row(entry)
+        assert row[_COLUMNS.index("queued_at")] == datetime.fromtimestamp(
+            1001.0, tz=timezone.utc
+        )
+        assert row[_COLUMNS.index("queue_position")] == 4
+        restored = _row_to_entry(_as_record(dict(zip(_COLUMNS, row))))
+        assert (restored.queued_at, restored.queue_position) == (1001.0, 4)
 
     def test_epoch_zero_unknown_sentinel_survives(self) -> None:
         # played_at 0.0 = "unknown" — carried into Postgres as to_timestamp(0),
