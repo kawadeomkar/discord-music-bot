@@ -468,20 +468,6 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
-## Upgrading to 2.7.0
-
-**If you run the archive, apply the migration before starting this build.** 2.7.0 adds
-two columns to `play_history` (`queued_at`, `queue_position` — where a song sat in the
-queue when it was requested) in `migrations/0002_enqueue_stamps.sql`:
-
-```bash
-just db-migrate     # or: docker compose run --rm db-migrate
-```
-
-The bot refuses to start against an unmigrated database and names this command, so the
-failure is loud rather than silent. If you do not run the archive
-(`HISTORY_ARCHIVE_ENABLED` unset or `false`, the default), there is nothing to do.
-
 ## Upgrading to 2.5.0
 
 **Read this before deploying 2.5.0 or any later build over an install that predates it,
