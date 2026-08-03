@@ -493,6 +493,295 @@ class TestComposeMatchesTheDefault:
         assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4
 
 
+class TestArchiveProfileDerivation:
+    """`HISTORY_ARCHIVE_ENABLED` is the ONLY switch: build_common.sh's
+    resolve_archive_profile turns it into compose's `archive` profile on every
+    deploy path, so opting in never means editing a tracked file.
+
+    Run rather than grepped. The parser duplicates
+    config.parse_history_archive_enabled in shell — a language that cannot import
+    it — and the failure mode of a wrong answer is silent in both directions: a
+    truthy spelling that resolves to no profile gives an archive-enabled bot no
+    database, and a falsy one that resolves to `archive` deploys long-term
+    storage nobody opted in to.
+    """
+
+    @staticmethod
+    def _resolve(
+        tmp_path: Path, dotenv: str = "", **env: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run resolve_archive_profile against a throwaway .env and report what it
+        exported. Deliberately NOT inheriting os.environ: this machine's own
+        shell exports POSTGRES_* and could export the flag too, which would make
+        the cases below assert against the developer's environment."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source ./build_common.sh; resolve_archive_profile; printf "%s" "$COMPOSE_PROFILES"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("value", ["true", "TRUE", "True", "1", "yes", " true "])
+    def test_truthy_spellings_activate_the_profile(
+        self, value: str, tmp_path: Path
+    ) -> None:
+        # Every spelling config.py accepts, or the deploy silently disagrees with
+        # the bot it is deploying.
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", ""])
+    def test_falsy_spellings_deactivate_it(self, value: str, tmp_path: Path) -> None:
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_unset_is_the_off_default(self, tmp_path: Path) -> None:
+        # Fail-closed, matching the bot: absence of a choice means no collection
+        # and therefore no database.
+        assert self._resolve(tmp_path).stdout == ""
+
+    def test_the_flag_is_read_from_dotenv(self, tmp_path: Path) -> None:
+        # The operator sets it in .env and runs a deploy script; nothing exports
+        # it into that script's environment.
+        assert (
+            self._resolve(tmp_path, dotenv="HISTORY_ARCHIVE_ENABLED=true\n").stdout
+            == "archive"
+        )
+
+    def test_the_environment_wins_over_dotenv(self, tmp_path: Path) -> None:
+        # Compose's own precedence, and the same order warn_default_postgres_password
+        # uses. The bot agrees: the compose file passes HISTORY_ARCHIVE_ENABLED
+        # through valuelessly, so a set one overrides env_file for the container too.
+        result = self._resolve(
+            tmp_path,
+            dotenv="HISTORY_ARCHIVE_ENABLED=true\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == ""
+
+    def test_garbage_refuses_the_deploy(self, tmp_path: Path) -> None:
+        """setup_hook raises on `on`/`maybe` rather than picking a side, so the
+        deploy must too — deploying a database for a bot that will refuse to
+        start is worse than failing here, where the message is on screen."""
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED="on")
+        assert result.returncode == 1
+        assert "HISTORY_ARCHIVE_ENABLED" in result.stderr
+
+    def test_other_profiles_survive(self, tmp_path: Path) -> None:
+        # Only the `archive` element is owned here. Clobbering the list would
+        # silently drop an operator's own profile on every deploy.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="true", COMPOSE_PROFILES="ops"
+        )
+        assert result.stdout == "ops,archive"
+
+    def test_a_stale_archive_entry_is_removed_when_the_flag_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """The migration path: installs that predate the derivation carry
+        COMPOSE_PROFILES=archive in .env. Flipping the flag to false has to
+        override it, which works only because the export happens even when the
+        resulting list is EMPTY — the process environment beats .env in compose,
+        an unset variable does not."""
+        result = self._resolve(
+            tmp_path,
+            dotenv="COMPOSE_PROFILES=ops,archive\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == "ops"
+
+    def test_the_profile_is_not_duplicated(self, tmp_path: Path) -> None:
+        # Runs on every deploy, and build_docker.sh resolves before exec'ing
+        # deploy_docker.sh, which resolves again over the exported result.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="1", COMPOSE_PROFILES="archive"
+        )
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("script", ["deploy_docker.sh", "build_docker.sh"])
+    def test_both_pipelines_resolve_the_profile(self, script: str) -> None:
+        """deploy_docker.sh is the only script that starts containers, so a
+        missing call there is the whole feature missing; build_docker.sh calls it
+        early so a garbage flag fails before the gate and the image build."""
+        text = (Path(__file__).resolve().parent.parent / script).read_text()
+        assert "resolve_archive_profile" in text
+
+    def test_the_deploy_resolves_before_it_starts_containers(self) -> None:
+        # Order, not presence: an export after `docker compose up` is a no-op.
+        # Anchored for the reason the migration-ordering test spells out — the
+        # file quotes this command inside comments too, and matching one of
+        # those checks an ordering nobody cares about.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        up = re.search(r"^docker compose up -d", text, re.M)
+        assert up is not None
+        assert text.index("resolve_archive_profile") < up.start()
+
+    def test_the_bot_receives_the_same_flag_it_deploys_on(self) -> None:
+        """The compose file must pass HISTORY_ARCHIVE_ENABLED through VALUELESSLY.
+        Written with a value it would ignore .env; omitted entirely, an exported
+        flag would steer the profile while the container still read .env — the
+        two-switch drift this whole mechanism exists to remove, reintroduced
+        between the deploy shell and the bot."""
+        assert re.search(r"^\s*- HISTORY_ARCHIVE_ENABLED$", _compose_directives(), re.M)
+
+    def test_an_external_postgres_needs_no_tracked_file_edit(self) -> None:
+        """The BOT's DSN is ${POSTGRES_URL:-<parts>}, so a URL in .env wins. The
+        old instruction was to comment out that line, which conflicted on every
+        `git pull`.
+
+        Exactly one service, and that is the invariant. The bot has host
+        networking, so .env's loopback DSN is right for it. The two compose-network
+        one-shots must NOT take it: 127.0.0.1 inside them is themselves, and
+        giving them .env's URL broke the migration with connection refused
+        against a healthy database. They address postgres by service name, and
+        the deploy passes a genuinely external DSN in explicitly.
+        """
+        overridable = re.findall(
+            r"- POSTGRES_URL=\$\{POSTGRES_URL:-", _compose_directives()
+        )
+        assert len(overridable) == 1
+        for service in ("db-migrate", "db-backfill"):
+            block = _service_block(service)
+            assert "POSTGRES_URL=${POSTGRES_URL" not in block, service
+            assert "@postgres:5432" in block, service
+
+    def test_every_deploy_migrates_before_it_starts_the_new_bot(self) -> None:
+        """A `git pull` can bring new migrations with new code, so the deploy
+        applies them — and BEFORE `up`, because the bot refuses to archive
+        against a schema older than its build. Recreating the bot first would
+        leave it archiving nothing until someone read the logs."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        # The `up` anchored to the start of a line is the COMMAND; the file also
+        # quotes `docker compose up -d` inside comments, and matching one of
+        # those instead made this pass on ordering it never checked.
+        up = re.search(r"^docker compose up -d", text, re.M)
+        migrate = re.search(r"docker compose run --rm -T .*db-migrate", text)
+        assert up is not None and migrate is not None
+        assert migrate.start() < up.start()
+
+    def test_the_migration_step_is_gated_on_the_archive_being_enabled(self) -> None:
+        # No archive, no database, nothing to migrate — the step must sit inside
+        # the ARCHIVE_ENABLED branch, not run unconditionally.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        branch = re.search(
+            r'if \[ "\$ARCHIVE_ENABLED" -eq 1 \]; then\n(.*?)\nfi\n', text, re.S
+        )
+        assert branch is not None
+        assert "db-migrate" in branch.group(1)
+
+    def test_a_failed_migration_stops_the_deploy(self) -> None:
+        """The gate is the point: `run --rm` reports the runner's exit status,
+        and a non-zero one must leave the running bot untouched rather than
+        deploy code against a schema that was not applied."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        assert re.search(
+            r"if ! docker compose run --rm -T .*db-migrate; then(?:.|\n)*?exit 1", text
+        )
+
+    @staticmethod
+    def _external_env(tmp_path: Path, dotenv: str = "", **env: str) -> str:
+        """What resolve_external_postgres_env would add to a `docker compose run`."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "source ./build_common.sh; resolve_external_postgres_env; "
+                'printf "%s" "${EXTERNAL_PG_ENV[*]-}"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://u:p@127.0.0.1:5432/db",
+            "postgresql://u:p@localhost:5432/db",
+            "postgres://u:p@127.0.0.1/db",
+            "postgresql://u:p@[::1]:5432/db",
+            "postgresql://127.0.0.1:5432/db",
+            # A literal `@` in the password: credentials are stripped to the LAST
+            # one, or the host reads as `ss@127.0.0.1` and this misfires in the
+            # only direction that breaks a working deployment.
+            "postgresql://u:p@ss@127.0.0.1:5432/db",
+        ],
+    )
+    def test_a_loopback_dsn_is_never_handed_to_a_container(
+        self, url: str, tmp_path: Path
+    ) -> None:
+        """This is the regression. .env holds the HOST-form DSN — the
+        host-networked bot needs one, and `just run` derives one — and passing it
+        into a compose-network container points that container at itself. The
+        symptom was the migration failing with connection refused while postgres
+        was healthy, which reads as a database problem and is not one."""
+        assert self._external_env(tmp_path, POSTGRES_URL=url) == ""
+
+    @pytest.mark.parametrize(
+        "url",
+        ["postgresql://u:p@db.example.com:5432/hist", "postgresql://u:p@10.0.0.5/hist"],
+    )
+    def test_an_external_dsn_is_passed_through(self, url: str, tmp_path: Path) -> None:
+        # Otherwise the deploy's migration gate silently migrates the BUNDLED
+        # database while the bot runs against the external one — the schema
+        # error surfaces later, at runtime, as a refusal to archive.
+        assert (
+            self._external_env(tmp_path, POSTGRES_URL=url) == f"-e POSTGRES_URL={url}"
+        )
+
+    def test_no_url_means_the_service_default_stands(self, tmp_path: Path) -> None:
+        # The bundled stack, which is the common case: the compose file's own
+        # service-name DSN is correct and nothing should override it.
+        assert self._external_env(tmp_path) == ""
+
+    def test_the_url_is_read_from_dotenv_too(self, tmp_path: Path) -> None:
+        assert (
+            self._external_env(
+                tmp_path, dotenv="POSTGRES_URL=postgresql://u:p@db.example.com/hist\n"
+            )
+            == "-e POSTGRES_URL=postgresql://u:p@db.example.com/hist"
+        )
+
+    @pytest.mark.parametrize(
+        ("path", "command"),
+        [
+            ("deploy_docker.sh", "docker compose run --rm -T"),
+            ("justfile", "docker compose run --rm"),
+        ],
+    )
+    def test_both_container_one_shots_resolve_the_external_dsn(
+        self, path: str, command: str
+    ) -> None:
+        """db-migrate (deploy) and db-backfill (recipe) are the two commands that
+        run this image against the archive from inside the compose network."""
+        text = (Path(__file__).resolve().parent.parent / path).read_text()
+        assert "resolve_external_postgres_env" in text
+        assert f'{command} ${{EXTERNAL_PG_ENV[@]+"${{EXTERNAL_PG_ENV[@]}}"}}' in text
+
+    def test_the_docs_no_longer_ship_a_second_switch(self) -> None:
+        """`.env.example` is copied verbatim into .env by setup_env.sh, so a
+        commented-out COMPOSE_PROFILES line there is an invitation to uncomment
+        one — recreating the pair the derivation replaced."""
+        example = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+        assert not re.search(r"^#?\s*COMPOSE_PROFILES=", example, re.M)
+
+
 class TestSetupEnvTightensTheEnvFile:
     """setup_env.sh is the escape hatch from the shared default, so the file it
     writes the replacement into must not be world-readable.

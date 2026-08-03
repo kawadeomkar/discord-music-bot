@@ -31,6 +31,11 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
 - **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
   persistent play history
+- **Opt-in play-history archive** — off by default, and a default deployment keeps
+  nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
+  deployed at all. One flag (`HISTORY_ARCHIVE_ENABLED=true`) makes a deploy bring up
+  Postgres, apply the schema, and record every play permanently
+  ([details](#operating-the-play-history-archive))
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
 - **Rich `-help`** — a custom man-page-style help command with aliases, examples,
   and per-command notes
@@ -118,11 +123,13 @@ bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 
 **Long-term storage is opt-in.** By default the bot archives nothing: plays live
 only in a capped per-guild Redis list (the newest 50, serving `-history`), and no
-Postgres is deployed at all. Opting in — the `archive` compose profile plus
-`HISTORY_ARCHIVE_ENABLED=true` in `.env` — permanently records every play
-(guild id, user id, title, timestamp) in Postgres until you erase the volume.
-That is a decision the deployer makes explicitly, never a side effect of
-`docker compose up`. The enable/disable/erase procedures are under
+Postgres is deployed at all. Opting in — `HISTORY_ARCHIVE_ENABLED=true` in
+`.env`, then `just up` — permanently records every play (guild id, user id,
+title, timestamp) in Postgres until you erase the volume. That is a decision the
+deployer makes explicitly, never a side effect of `docker compose up`: the deploy
+tooling derives Compose's `archive` profile from that one flag, and a raw
+`docker compose up` deploys the default stack whatever the flag says. The
+enable/disable/erase procedures are under
 [Operating the play-history archive](#operating-the-play-history-archive).
 
 While the archive is enabled, Postgres is required — the bot refuses to start
@@ -132,13 +139,15 @@ archive-enabled `docker compose up` still works with nothing else configured; th
 bot logs an ERROR at startup and shows a warning on every `-ping` until you
 replace it with [`./setup_env.sh`](#install-and-configure). To use a
 Postgres you already run instead of the bundled service, set `POSTGRES_URL` in `.env`
-and comment out the `POSTGRES_URL` line in `docker-compose.yml`. If port 5432 is
+and that is all — Compose builds its DSN as `${POSTGRES_URL:-<parts>}`, so yours wins
+without editing any tracked file. If port 5432 is
 already taken on your machine, set `POSTGRES_HOST_PORT` — the bot uses host
 networking, so it reaches the database through the published port.
 
-The schema is applied by a migration runner, not by the bot. An archive-enabled
-`docker compose up` runs it for you as a one-shot `db-migrate` service; against an
-external Postgres, run it yourself:
+The schema is applied by a migration runner, not by the bot, and **every deploy
+applies pending migrations before the new bot starts** — so a `git pull` that brings
+schema changes needs no extra step, and re-running applies nothing. Against an
+external Postgres, or to migrate without deploying:
 
 ```bash
 just db-migrate            # apply pending migrations
@@ -219,15 +228,11 @@ to when something is missing; `just --evaluate` prints it directly.
 ### 3. Run
 
 ```bash
-# Backing services. Redis alone for the default (no-archive) setup:
-docker compose up -d redis
-
-# Or, with the archive: Redis, Postgres, and the one-shot that applies the
-# schema. Naming the services explicitly auto-activates their `archive`
-# profile, so this works regardless of COMPOSE_PROFILES. db-migrate exits 0
-# when the database is up to date — the bot refuses to archive against an
-# unmigrated one.
-docker compose up -d redis postgres db-migrate
+# Backing services: Redis, plus Postgres and the schema one-shot when
+# HISTORY_ARCHIVE_ENABLED=true in .env. The recipe reads the flag, so there is
+# nothing to remember. (db-migrate exits 0 when the database is up to date —
+# the bot refuses to archive against an unmigrated one.)
+just services
 
 just run
 ```
@@ -276,6 +281,7 @@ The native path is the default because it is faster (~24s vs ~31s, and ~0.05s vs
 | Recipe | Does |
 |---|---|
 | `just install` | Create the venv with main + test + lint + dev dependencies |
+| `just services` | Start the backing services `just run` needs — Postgres included only when the archive is enabled |
 | `just hooks` | Install the git hooks (see [Git hooks](#git-hooks)) |
 | `just hooks-run` | Run every hook against every file, not just staged ones |
 | `just hooks-update` | Bump the pinned hook revisions in `.pre-commit-config.yaml` |
@@ -316,8 +322,9 @@ run `just check`.
 
 | Recipe | Does |
 |---|---|
-| `just db-migrate` | Apply pending play-history schema migrations |
+| `just db-migrate` | Apply pending play-history schema migrations — every deploy does this too, so this is for external databases and out-of-band runs |
 | `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before deploying this build** (the 50-entry cap applies in both archive modes — see [Upgrading to 2.5.0](#upgrading-to-250)) |
+| `just db-backfill-docker [--dry-run]` | The same, through the Compose one-shot — for hosts with Docker and no Python toolchain |
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
 | `just db-backup` | Dump the play-history database to `backups/` |
 | `just db-restore <file> [db]` | Restore a dump into a scratch DB (or a named one) |
@@ -333,11 +340,12 @@ external one. A value already exported in your shell wins over `.env`, so
 
 | Recipe | Does |
 |---|---|
-| `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA |
+| `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. With `HISTORY_ARCHIVE_ENABLED=true` it also deploys Postgres and applies pending migrations first, aborting the deploy if they fail |
 | `just down` | Stop the compose stack (volumes are kept) |
 | `just restart` | Restart the running bot in place — does **not** pick up a new image |
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
 | `just ps` | Show compose service status |
+| `just compose <args>` | Any `docker compose` command, with the `archive` profile derived from the flag |
 
 `just up` never builds. If no image exists for the current commit it fails rather
 than letting Compose build one and label it with that SHA — see
@@ -370,9 +378,9 @@ The Compose stack runs the bot plus its supporting services:
 |---|---|
 | `discord-music-bot` | The bot itself (host networking) |
 | `redis` | Redis 7 with AOF persistence — queue/state/cache storage |
-| `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: deployed only with the `archive` profile active (`COMPOSE_PROFILES=archive`) |
-| `db-migrate` | One-shot schema migration for the archive — same `archive` profile |
-| `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `docker compose run --rm db-backfill` |
+| `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: on the `archive` profile, which the deploy tooling activates when `HISTORY_ARCHIVE_ENABLED=true` |
+| `db-migrate` | One-shot schema migration for the archive — same `archive` profile. Every deploy runs it before recreating the bot, and `docker compose up` runs it too; re-running applies nothing |
+| `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `just db-backfill-docker` |
 | `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works; optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
@@ -411,6 +419,11 @@ docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
 The script refuses to deploy a tag it cannot find locally rather than letting
 Compose build one from your working tree and label it with that SHA.
 
+A rollback re-runs the *older* image's migrations, which is a no-op: every version it
+knows about is already applied, and a database ahead of that image is accepted with a
+note rather than refused. Rolling back the code does not roll back the schema — nothing
+here drops columns, which is what makes an older build safe against a newer database.
+
 A tag identifies exactly what was built. Building from anything other than a clean
 checkout produces `<git-sha>-dirty.<digest>`, so a tag never identifies a commit it
 was not built from. A clean tree produces the bare SHA, which is what you roll back
@@ -435,9 +448,9 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `SPOTIFY_CLIENT_ID` | | — | Spotify app client ID (Client Credentials flow). Enables Spotify links; omit both Spotify vars to run without Spotify support |
 | `SPOTIFY_CLIENT_SECRET` | | — | Spotify app client secret. Required alongside `SPOTIFY_CLIENT_ID` to enable Spotify links |
 | `REDIS_URL` | | `redis://localhost:6379` | Redis connection URL |
-| `HISTORY_ARCHIVE_ENABLED` | | `false` | **The consent switch for long-term storage.** `true` turns on the Postgres archive: every play (guild id, user id, title, timestamp) is recorded permanently. Unset or `false` — the default — nothing is written to long-term storage and no Postgres is required. Strictly parsed (`true/1/yes` or `false/0/no`, case-insensitive); anything else refuses startup rather than silently picking a side. Set it together with `COMPOSE_PROFILES=archive` — see [Operating the play-history archive](#operating-the-play-history-archive) |
-| `COMPOSE_PROFILES` | | — | Compose-side half of the archive opt-in: `archive` deploys the `postgres` and `db-migrate` services. Read by Docker Compose itself from `.env`, not by the bot. The flag above decides whether the bot archives; this decides whether the database it archives into exists |
-| `POSTGRES_URL` | when the archive is enabled | built by Compose from the three vars below | Play-history archive connection URL. With `HISTORY_ARCHIVE_ENABLED=true` the bot refuses to start without it, rather than quietly buffering history into an outbox nothing drains; with the archive disabled it is ignored (an INFO line says so — the flag, never URL presence, is what enables archiving). To point at a Postgres you already run, set this in `.env` and comment out the `POSTGRES_URL` line in `docker-compose.yml` |
+| `HISTORY_ARCHIVE_ENABLED` | | `false` | **The consent switch for long-term storage.** `true` turns on the Postgres archive: every play (guild id, user id, title, timestamp) is recorded permanently. Unset or `false` — the default — nothing is written to long-term storage and no Postgres is required. Strictly parsed (`true/1/yes` or `false/0/no`, case-insensitive); anything else refuses startup rather than silently picking a side — and refuses the deploy too, for the same value. It is also the **only** switch: the deploy tooling derives Compose's `archive` profile from it, so nothing else needs setting. See [Operating the play-history archive](#operating-the-play-history-archive) |
+| `COMPOSE_PROFILES` | | derived | Read by Docker Compose itself, never by the bot. `build_common.sh`'s `resolve_archive_profile` sets it from the flag above on every deploy path, adding or removing `archive` and preserving any other profile you set. Set it by hand only to drive `docker compose` directly |
+| `POSTGRES_URL` | when the archive is enabled | built by Compose from the three vars below | Play-history archive connection URL. With `HISTORY_ARCHIVE_ENABLED=true` the bot refuses to start without it, rather than quietly buffering history into an outbox nothing drains; with the archive disabled it is ignored (an INFO line says so — the flag, never URL presence, is what enables archiving). To point at a Postgres you already run, set this in `.env`; Compose falls back to the parts-built DSN only when it is unset, so no tracked file needs editing |
 | `POSTGRES_PASSWORD` | — | `password` | Password for the bundled Postgres service. The default exists so a first `docker compose up` needs no setup; while it is in use the bot logs an ERROR at startup and renders a warning embed on every `-ping`. Replace it with `./setup_env.sh` (a fresh 128-bit value, independent of every other secret). **Changing it later needs three, in order** — Postgres reads this only when initializing an empty data directory, so an existing volume keeps its old password: (1) `ALTER USER <user> PASSWORD '<new>'`, (2) edit `.env`, (3) `docker compose up -d`. Doing (2) first silences the warning while the server still accepts the old password. To start clean instead, drop only the database volume (`docker compose down && docker volume rm discord-music-bot_postgres-data`) — not `down -v`, which also removes the Redis volume holding un-drained plays |
 | `POSTGRES_USER` | | `musicbot` | Role owning the bundled Postgres service's database |
 | `POSTGRES_DB` | | `musicbot` | Database name on the bundled Postgres service |
@@ -457,8 +470,10 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 
 ## Upgrading to 2.5.0
 
-**Read this before deploying 2.5.0 over an existing install, whether or not you use the
-archive.** One change here destroys data on upgrade, and it is not opt-in.
+**Read this before deploying 2.5.0 or any later build over an install that predates it,
+whether or not you use the archive.** One change here destroys data on upgrade, and it is
+not opt-in. (The heading names the release that introduced the cap; every build since
+carries it.)
 
 This build caps every guild's Redis history list at **50 entries** — the same number
 `-history` can display. Earlier builds never trimmed that list, so an established
@@ -508,20 +523,29 @@ below is the only tool that preserves data against it.
 
 ### Enabling the archive
 
-Add both lines to `.env` — they are a pair (the flag makes the bot archive, the
-profile deploys the database it archives into):
+One line in `.env`:
 
 ```env
 HISTORY_ARCHIVE_ENABLED=true
-COMPOSE_PROFILES=archive
 ```
 
-then `docker compose up -d`. Postgres and the `db-migrate` one-shot come up, the
-bot creates its outbox consumer group at the next start, and every play from then
-on is archived. Plays from before enabling were never collected — that was the
-point of the default — but the newest ≤50 per guild still sit in the Redis
-display lists, and the [backfill](#backfilling-history-that-predates-the-archive)
-can move exactly that window into the new archive.
+then `just up` (or `./build_docker.sh`, or `./deploy_docker.sh`). Postgres and the
+`db-migrate` one-shot come up, the bot creates its outbox consumer group at the
+next start, and every play from then on is archived. Plays from before enabling
+were never collected — that was the point of the default — but the newest ≤50 per
+guild still sit in the Redis display lists, and the
+[backfill](#backfilling-history-that-predates-the-archive) can move exactly that
+window into the new archive.
+
+**It has to be one of those commands, not a bare `docker compose up`.** Compose
+activates a profile only from `COMPOSE_PROFILES` or `--profile` and never reads
+this flag, so the deploy scripts translate one into the other
+(`resolve_archive_profile` in `build_common.sh`). A raw `docker compose up`
+deploys the default stack with no Postgres behind an archive-enabled bot. If you
+want to drive Compose directly, name the services
+(`docker compose up -d postgres db-migrate`) or export `COMPOSE_PROFILES=archive`
+yourself — both still work, and `just compose <args>` does the derivation for
+arbitrary compose commands.
 
 ### Disabling — and erasing
 
@@ -529,12 +553,14 @@ Order matters, because `docker compose down` only removes services in the active
 model:
 
 ```bash
-docker compose down        # FIRST, while the profile is still active
-# then flip both .env lines back (false / remove the profile)
-docker compose up -d
+just down                                   # FIRST — always passes --profile archive
+# then set HISTORY_ARCHIVE_ENABLED=false in .env
+just up
 ```
 
-(`just down` always passes `--profile archive`, so it is safe in either state.)
+Doing it in the other order leaves Postgres running: deactivating a profile never
+stops what it already started, and a `down` without the profile cannot see it.
+`just up` warns when it finds that container with the archive disabled.
 On the next start the bot logs a warning if the outbox still holds plays that
 were buffered but never archived — they will not drain while the archive is off.
 Re-enable to drain them, or discard them with `DEL history:outbox` (inspect
@@ -587,14 +613,23 @@ play that was never inserted.
 
 ### Schema
 
+**Every deploy applies pending migrations before the new bot starts**, so a `git pull`
+that brings schema changes needs no extra step — `just up`, `./deploy_docker.sh` and
+`./build_docker.sh` all run them and abort the deploy if they fail, leaving the running
+bot untouched. Out-of-band runs (an external database, or applying a migration without
+deploying) go through the recipe:
+
 ```bash
 just db-migrate            # apply pending migrations (idempotent, concurrency-safe)
 ```
 
-Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. On its first
-connection it reads `schema_migrations` and refuses to serve a database older than the
-version it was built for, naming this command. A *newer* database is accepted with a
-warning — migrations are additive, so rolling the bot back must not become an outage.
+Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. Each version is
+recorded in `schema_migrations` inside the same transaction as its own DDL, under an
+advisory lock, so re-running applies nothing and two runners racing is fine — that is
+what makes it safe on every deploy. On its first connection the bot reads that table and
+refuses to serve a database older than the version it was built for, naming this command.
+A *newer* database is accepted with a warning by both the bot and the migration runner —
+migrations are additive, so rolling the bot back must not become an outage.
 
 ### Backfilling history that predates the archive
 
@@ -607,8 +642,12 @@ just db-backfill             # do it
 
 # Docker-only host (no local venv). Build FIRST — see below:
 just image
-docker compose run --rm db-backfill --dry-run
-docker compose run --rm db-backfill
+just db-backfill-docker --dry-run
+just db-backfill-docker
+
+# Without `just`, activate the archive profile explicitly — db-backfill depends
+# on postgres, which is undefined without it:
+COMPOSE_PROFILES=archive docker compose run --rm db-backfill --dry-run
 ```
 
 **The Docker path needs `just image` first, and the order is build → backfill → deploy.**

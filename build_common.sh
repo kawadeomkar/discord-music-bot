@@ -194,6 +194,80 @@ _env_value() {
         || true
 }
 
+# resolve_archive_profile — HISTORY_ARCHIVE_ENABLED into the compose `archive`
+# profile, so that flag is the only switch. Exports COMPOSE_PROFILES and
+# ARCHIVE_ENABLED (0/1). Compose cannot derive it: profiles activate only from
+# COMPOSE_PROFILES or --profile, and `${FLAG:+archive}` yields `archive` for
+# `false` too. See docs/ARCHITECTURE.md#history-archive-tier.
+#
+# The export is unconditional, EMPTY INCLUDED — the process environment beats
+# .env, which is how a flag flipped to false overrides an older .env still
+# carrying COMPOSE_PROFILES=archive. Only that element is owned; other profiles
+# survive. Garbage exits 1 in config.history_archive_enabled's own terms: a
+# deploy that disagreed with the bot it deploys is the worst outcome.
+resolve_archive_profile() {
+    local env_file=".env" flag profiles rest item
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$flag" in
+        "" | false | 0 | no) ARCHIVE_ENABLED=0 ;;
+        true | 1 | yes) ARCHIVE_ENABLED=1 ;;
+        *)
+            echo "HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no" >&2
+            echo "(case-insensitive); got '$flag'. The bot refuses to start on this" >&2
+            echo "value, so the deploy refuses too." >&2
+            exit 1
+            ;;
+    esac
+
+    # Rebuild the list without `archive` rather than appending to it: this runs
+    # on every deploy, so a plain append would accumulate duplicates, and a
+    # disabled flag has to be able to REMOVE the element it did not add.
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
+    rest=""
+    while IFS= read -r item; do
+        case "$item" in "" | archive) continue ;; esac
+        rest="${rest:+$rest,}$item"
+    done <<< "$(printf '%s' "$profiles" | tr ',' '\n' | tr -d '[:blank:]')"
+
+    if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+        COMPOSE_PROFILES="${rest:+$rest,}archive"
+        echo "History archive: ENABLED — deploying postgres + db-migrate" >&2
+    else
+        COMPOSE_PROFILES="$rest"
+        echo "History archive: disabled — no postgres deployed (the default)" >&2
+    fi
+    export COMPOSE_PROFILES ARCHIVE_ENABLED
+}
+
+# resolve_external_postgres_env — fill EXTERNAL_PG_ENV with `-e POSTGRES_URL=…`
+# when the DSN names a database a CONTAINER can reach, empty otherwise. For
+# `docker compose run` of db-migrate / db-backfill, which address postgres by
+# service name: right for the bundled stack, wrong for an external database.
+#
+# Passing POSTGRES_URL through unconditionally is worse than either. .env holds
+# the HOST-form DSN the host-networked bot and `just run` need, and 127.0.0.1
+# inside a compose-network container is that container — the migration then
+# fails with connection refused against a healthy database. Loopback is the
+# discriminator, and an unparsed DSN errs toward the service name.
+resolve_external_postgres_env() {
+    EXTERNAL_PG_ENV=()
+    local url host
+    url="${POSTGRES_URL:-$(_env_value POSTGRES_URL .env)}"
+    [ -n "$url" ] || return 0
+    # Order matters: scheme, then path/query, THEN credentials, then the port.
+    # Credentials are stripped to the LAST `@` so a password containing one does
+    # not leave `ss@127.0.0.1` looking like an external host — but only after the
+    # path is gone, or a `@` in a database name would eat the host instead.
+    # Brackets last, for the IPv6 `[::1]:5432` form.
+    host="$(printf '%s' "$url" \
+        | sed -E 's#^[a-zA-Z0-9+.-]+://##; s#[/?].*$##; s#^.*@##; s#:[^:]*$##; s#^\[|\]$##g')"
+    case "$host" in
+        "" | localhost | ::1 | 127.*) return 0 ;;
+    esac
+    EXTERNAL_PG_ENV=(-e "POSTGRES_URL=$url")
+}
+
 # warn_default_postgres_password — compose-path preflight, called only from
 # build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #

@@ -437,10 +437,9 @@ ci: check container-test test-pg test-redis
 
 # ── Play-history database (Postgres) ─────────────────────────────────────────
 #
-# All of these assume the ARCHIVE IS ENABLED and its services are up
-# (HISTORY_ARCHIVE_ENABLED=true + COMPOSE_PROFILES=archive in .env). Against a
-# disabled stack they fail at connect — curt, but honest: there is no database
-# deployed to operate on.
+# All of these assume the ARCHIVE IS ENABLED (HISTORY_ARCHIVE_ENABLED=true in
+# .env) and its services are up. Against a disabled stack they fail at connect —
+# curt, but honest: there is no database deployed to operate on.
 #
 # All of these read POSTGRES_URL (or POSTGRES_MIGRATE_URL for db-migrate) from
 # the environment, which for a compose deployment means `.env`. They run the
@@ -503,6 +502,34 @@ _dotenv := '''
 setup *ARGS:
     ./setup_env.sh {{ ARGS }}
 
+# Start what `just run` connects to: Redis always, Postgres and the migration
+# one-shot only when HISTORY_ARCHIVE_ENABLED says so. Replaces having to
+# remember which of two `docker compose up` lines matches your .env.
+[doc('Start the backing services for `just run` (Postgres only when the archive is enabled)')]
+[group('dev')]
+services:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+        docker compose up -d redis postgres db-migrate
+    else
+        docker compose up -d redis
+    fi
+
+# Escape hatch for compose commands this file does not wrap, with the archive
+# profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
+# A raw `docker compose` still works — it just never deploys the archive tier.
+[doc('Run `docker compose` with the archive profile derived from HISTORY_ARCHIVE_ENABLED')]
+[group('deploy')]
+compose *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    docker compose "$@"
+
 # Run the bot against the compose-backed services.
 #
 # `poetry run bot` alone does NOT work from a fresh clone: the bot reads its
@@ -515,8 +542,8 @@ setup *ARGS:
 # is opt-in and OFF by default, and a disabled bot ignores the DSN entirely
 # (setup_hook logs one INFO saying so). The recipe derives one either way
 # because it costs nothing and makes flipping the flag a one-line change.
-# Bring the services up first: docker compose up -d redis
-# (or, with the archive: docker compose up -d redis postgres db-migrate)
+# Bring the services up first with `just services` — it reads the same flag and
+# starts Postgres only when the archive is enabled.
 [doc('Run the bot locally with .env loaded (services must already be up)')]
 [group('dev')]
 run:
@@ -540,6 +567,10 @@ run:
 
 # Apply pending schema migrations — the bot refuses to start against an
 # unmigrated database (PostgresHistoryArchive._assert_schema_version).
+#
+# Every deploy already runs this (deploy_docker.sh, before the bot is
+# recreated), so this recipe is for external databases and out-of-band runs.
+# Re-running applies nothing: versions are recorded in schema_migrations.
 [doc('Apply pending play-history schema migrations')]
 [group('database')]
 db-migrate:
@@ -551,19 +582,37 @@ db-migrate:
 # resumable (ON CONFLICT DO NOTHING). MUST run before the change that caps the
 # history lists, which trims the only other copy of exactly what this moves.
 #
-# This leg needs a local venv. On a Docker-only host use the compose one-shot,
-# which is the same image and the same module:
-#
-#   docker compose run --rm db-backfill --dry-run
-#
-# (It sits behind the `ops` profile so it never runs on `docker compose up` —
-# unlike db-migrate, this is an operator decision, not a startup task.)
+# This leg needs a local venv. On a Docker-only host use `just db-backfill-docker`
+# below — the same image and the same module.
 [doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
 [group('database')]
 db-backfill *ARGS:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
+
+# The container leg of db-backfill, for hosts with Docker and no Python toolchain.
+#
+# The profile resolution is what makes it work: `docker compose run` activates
+# only the target's own `ops` profile, so db-backfill's `depends_on: postgres`
+# is unresolvable ("no such service: postgres") unless `archive` is active too.
+# Disabled, this refuses up front rather than surfacing that as a compose error.
+[doc('Backfill via the compose one-shot — no local venv needed')]
+[group('database')]
+db-backfill-docker *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source ./build_common.sh
+    resolve_archive_profile
+    if [ "$ARCHIVE_ENABLED" -ne 1 ]; then
+        echo "The history archive is disabled — there is no database to backfill into." >&2
+        echo "Set HISTORY_ARCHIVE_ENABLED=true in .env and deploy first (just up)." >&2
+        exit 1
+    fi
+    # Same reason as the deploy's migration step: the service's DSN is the
+    # compose-network one, and .env's POSTGRES_URL is the host form.
+    resolve_external_postgres_env
+    docker compose run --rm ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-backfill "$@"
 
 # The one Redis-side operator recipe. It exists because XLEN alone cannot tell
 # apart four states that call for four different responses, and working that out
