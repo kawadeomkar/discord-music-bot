@@ -861,11 +861,14 @@ default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable �
 parse) → `QueueObject` + `GuildQueue._rehydrate` → carry it through
 `_neutralize_prefetch`'s rebuild if playback-relevant.
 
-**Add a schema migration**: **before the first production release, don't** — edit
-`migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
-so a pre-release ALTER sequence would describe upgrades that never happened), then drop
-and re-create the scratch database, since `IF NOT EXISTS` makes the file a no-op against
-one that already holds the tables. After that release: new
+**Add a schema migration**: **never edit an existing migration** — that window closed at
+v2.4.0, the first release whose bot connects to Postgres, and `0001`'s header records it.
+Editing one fails silently and in the worst direction: `migrate()` skips a version already
+in `schema_migrations` without reading the file, so the change reaches fresh databases
+only, every deployed one keeps the old shape and still passes the version check, and each
+insert then raises `UndefinedColumnError` — which is not in `_POISON`, so the drainer
+treats it as transient and redelivers onto the non-evictable outbox forever. Dropping the
+tables does not recover; the ledger row survives. Instead: new
 `migrations/NNNN_short_name.sql` (numeric prefix, next
 free number — `discover()` rejects duplicates and orders numerically, so `0010` follows
 `0009`) → bump `EXPECTED_SCHEMA_VERSION` in `src/db_migrate.py` (a test asserts the two

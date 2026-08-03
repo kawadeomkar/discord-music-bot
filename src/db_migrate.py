@@ -33,7 +33,7 @@ log = get_logger(__name__)
 # The schema version this code is written against. A literal rather than "the
 # highest file in migrations/" so the runtime never depends on that directory
 # being present in the image; a test asserts the two agree.
-EXPECTED_SCHEMA_VERSION = 1
+EXPECTED_SCHEMA_VERSION = 2
 
 # src/db_migrate.py → src/ → project root.
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"

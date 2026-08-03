@@ -25,7 +25,12 @@ import asyncpg
 import pytest
 from redis.asyncio import Redis
 
-from src.db_migrate import EXPECTED_SCHEMA_VERSION, migrate
+from src.db_migrate import (
+    _MIGRATIONS_TABLE_DDL,
+    EXPECTED_SCHEMA_VERSION,
+    MIGRATIONS_DIR,
+    migrate,
+)
 from src.backfill_history import backfill
 from src.guild_state import (
     HistoryEntry,
@@ -211,8 +216,8 @@ class TestMigrations:
     async def test_inserted_at_column_exists_and_defaults(
         self, archive: PostgresHistoryArchive, pg_dsn: str
     ) -> None:
-        # 0002. Not part of HistoryEntry — the default is what fills it, which
-        # is exactly what makes it useful for outage forensics.
+        # Not part of HistoryEntry — the default is what fills it, which is
+        # exactly what makes it useful for outage forensics.
         import asyncpg
 
         await archive.insert_batch([_entry(1)])
@@ -242,12 +247,44 @@ class TestMigrations:
         results = await asyncio.gather(*(migrate(raw_pg_dsn) for _ in range(6)))
         assert results == [EXPECTED_SCHEMA_VERSION] * 6
 
+    async def test_an_already_migrated_database_gains_later_columns(
+        self, raw_pg_dsn: str
+    ) -> None:
+        """The upgrade every deployed archive takes, and the one a version-only
+        assertion cannot see. 0001 is frozen because migrate() skips a version
+        already in schema_migrations WITHOUT reading the file: a column added to
+        it in place reaches fresh databases only, while every deployed one keeps
+        the old shape, passes the version check, and fails every insert with an
+        UndefinedColumnError the drainer treats as transient and retries forever.
+        Only executing an insert afterwards catches that."""
+        conn = await asyncpg.connect(raw_pg_dsn)
+        try:
+            await conn.execute(_MIGRATIONS_TABLE_DDL)
+            await conn.execute((MIGRATIONS_DIR / "0001_play_history.sql").read_text())
+            await conn.execute("INSERT INTO schema_migrations (version) VALUES (1)")
+        finally:
+            await conn.close()
+
+        assert await migrate(raw_pg_dsn) == EXPECTED_SCHEMA_VERSION
+
+        archive = PostgresHistoryArchive(raw_pg_dsn)
+        try:
+            await archive.insert_batch([_entry(7)])
+            rows = await archive.recent(42, 1)
+        finally:
+            await archive.close()
+        assert rows[0].queue_position == 7
+        assert rows[0].queued_at == 1752529007.0
+
     async def test_migrator_upgrades_a_legacy_first_use_ddl_database(
         self, raw_pg_dsn: str
     ) -> None:
         # The upgrade path for deployments created by the OLD first-use DDL:
         # the table already exists, so 0001 must record itself as applied
-        # without failing.
+        # without failing. Shape tolerance only — that DDL never shipped in a
+        # release, so no such database is reachable and the table it leaves is
+        # missing the columns 0001 added later. The test above is the one that
+        # covers a real deployment's upgrade end to end.
         import asyncpg
 
         conn = await asyncpg.connect(raw_pg_dsn)
