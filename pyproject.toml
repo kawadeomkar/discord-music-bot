@@ -211,6 +211,11 @@ filterwarnings = [
     # discord.py's Command.__init__ still calls asyncio.iscoroutinefunction, deprecated
     # in Python 3.14. Suppress until discord.py switches to inspect.iscoroutinefunction.
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+    # discord.utils.escape_markdown passes re.sub's count positionally, deprecated in
+    # Python 3.13. Scoped to that module so our own calls still fail. Suppress until
+    # discord.py passes it by keyword — Python 3.15 makes it a TypeError, which would
+    # break the function outright.
+    "ignore:'count' is passed as positional argument:DeprecationWarning:discord.utils",
 ]
 
 [tool.coverage.run]
