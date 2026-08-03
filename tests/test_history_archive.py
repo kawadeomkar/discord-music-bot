@@ -87,7 +87,7 @@ class RecordsRejections:
         trace_id: str = "",
         wire: Optional[bytes] = None,
     ) -> None:
-        # wire is captured, not dropped: it is the DELIVERED bytes, and the
+        # wire is captured, not dropped: it is the delivered bytes, and the
         # whole reason the parameter exists is that they can differ from a
         # re-serialization of `entry`.
         self.rejections.append((entry, error))
@@ -473,7 +473,7 @@ class TestPostgresArchiveClosedGuard:
         await archive.close()
 
     async def test_close_winning_the_race_to_the_lock_still_refuses(self) -> None:
-        """The re-check INSIDE _init_lock, which the pre-lock one cannot cover:
+        """The re-check inside _init_lock, which the pre-lock one cannot cover:
         _ensure reads _closed, then awaits the lock, and a close() landing in
         that window passes the first check and would go on to build a pool with
         nothing left to close it."""
@@ -552,7 +552,7 @@ class TestDrainerSupervision:
         try:
             await _push(fake_redis, 1)
             await _eventually(lambda: archive.inserted == [_entry(1)])
-            assert calls >= 2  # it came back, it did not merely log
+            assert calls >= 2  # it came back, it did not just log
         finally:
             await drainer.stop()
 
@@ -623,7 +623,7 @@ class PoisonArchive(RecordsRejections):
         # branches of asyncpg's hierarchy, which is why _POISON names both.
         self._exc = exc or asyncpg.exceptions.DataError("invalid byte sequence")
         # Fires ONCE per title, then forgets it: a blip on one entry, not an
-        # outage. Checked AFTER the poison set so a batch containing both still
+        # outage. Checked after the poison set so a batch containing both still
         # fails the way executemany does (poison first), leaving the transient
         # to land during per-entry isolation.
         self._transient = set(transient_titles or ())
@@ -696,14 +696,14 @@ class TestRejectionIsolation:
 
         assert [e.title for e in archive.inserted] == ["Song 1", "Song 3", "Song 5"]
         assert [e.title for e, _ in archive.rejections] == ["Song 2", "Song 4"]
-        # The head is retired either way — that is the whole point.
+        # The head is retired either way.
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_a_check_violation_routes_to_record_rejection(
         self, fake_redis: Redis
     ) -> None:
         # The arm the play_history CHECK constraints make reachable:
-        # CheckViolationError is SQLSTATE 23514 and NOT a DataError, so before
+        # CheckViolationError is SQLSTATE 23514 and not a DataError, so before
         # _POISON was widened this propagated instead of being isolated — a
         # permanent drain wedge.
         archive = PoisonArchive(
@@ -772,8 +772,8 @@ class TestRejectionIsolation:
     async def test_a_transient_failure_mid_isolation_redelivers_the_rest(
         self, fake_redis: Redis
     ) -> None:
-        # A network blip while isolating must NOT record a rejection and must
-        # NOT retire past its progress: the remainder comes back and the dedup
+        # A network blip while isolating must not record a rejection and must
+        # not retire past its progress: the remainder comes back and the dedup
         # index absorbs the rows that already landed.
         archive = PoisonArchive({"Song 2"})
         drainer = HistoryOutboxDrainer(fake_redis, archive)
@@ -802,7 +802,7 @@ class TestRejectionIsolation:
     ) -> None:
         """An unforeseen error type must keep redelivering rather than drop the
         batch: with the schema lock a data-caused refusal is a CHECK or a
-        DataError, both named in _POISON, so anything else genuinely IS transient
+        DataError, both named in _POISON, so anything else genuinely is transient
         and dropping would be data loss. The growing outbox is the symptom, and
         HISTORY_OUTBOX_MAX plus the depth gauge are what page on it."""
 
@@ -852,7 +852,7 @@ class TestRetireAccounting:
         self, fake_redis: Redis
     ) -> None:
         # _isolate settles entry by entry, so _drain_batch's else-branch settle
-        # must NOT also run. Isolating 100 entries takes ~343ms, which is plenty
+        # must not also run. Isolating 100 entries takes ~343ms, which is plenty
         # of time for arrivals to stack up behind them.
         poison = PoisonArchive({"Song 2"})
         drainer = HistoryOutboxDrainer(
@@ -874,7 +874,7 @@ class TestRetireAccounting:
     async def test_isolation_retires_corrupt_elements_too(
         self, fake_redis: Redis
     ) -> None:
-        """_isolate iterates RAW BYTES, never the parsed entries. A corrupt
+        """_isolate iterates RAW bytes, never the parsed entries. A corrupt
         element parses to None and is absent from `entries`, so an isolation pass
         walking `entries` would never settle it — its ID stays pending on a
         non-evictable key and the drain re-reads the same batch forever, the
@@ -947,7 +947,7 @@ class TestDrainDeadline:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        # The observable the original repro showed was ABSENT: a hang must
+        # The observable the original repro showed was absent: a hang must
         # produce the same warning + backlog depth an error does.
         class WedgedArchive(RecordsRejections):
             async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None:
@@ -989,14 +989,14 @@ class TestConcurrentDrainers:
         The shared consumer name hands the peer the same in-flight set, so it
         inserts them again and settles by ID — duplicated work, free in
         production via ON CONFLICT DO NOTHING but visible against FakeArchive,
-        hence assertions on the SET of titles. The property: nothing is LOST, and
+        hence assertions on the SET of titles. The property: nothing is lost, and
         the parked drainer's late settle of destroyed IDs is a harmless no-op.
         """
         entered = asyncio.Event()
         release = asyncio.Event()
 
         class GatedArchive(FakeArchive):
-            """Blocks the FIRST insert only. Later calls run straight through,
+            """Blocks the first insert only. Later calls run straight through,
             so a drainer that wrongly proceeds actually completes its settle and
             the damage becomes observable — a gate that blocked everyone would
             hide the very bug this test is for."""
@@ -1031,7 +1031,7 @@ class TestConcurrentDrainers:
             release.set()
             await second.stop()
             await first.stop()
-        # Every entry reached the archive exactly once as a DISTINCT play, and
+        # Every entry reached the archive exactly once as a distinct play, and
         # the parked drainer's late settle of already-destroyed IDs neither
         # raised nor resurrected anything.
         assert {e.title for e in archive.inserted} == {"Song 1", "Song 2", "Song 3"}
@@ -1111,7 +1111,7 @@ class TestPendingBeforeNew:
         with pytest.raises(RuntimeError):
             await drainer._drain_once()  # 2 entries now pending
 
-        await _push(fake_redis, 3)  # new arrival, must NOT be read this cycle
+        await _push(fake_redis, 3)  # new arrival, must not be read this cycle
         seen: list[str] = []
         real_xreadgroup = fake_redis.xreadgroup
 
@@ -1198,7 +1198,7 @@ class TestTombstones:
     async def test_a_tombstone_does_not_reach_the_parser(
         self, fake_redis: Redis, drainer: HistoryOutboxDrainer
     ) -> None:
-        """MUTATION GUARD: routing a tombstone through parse_history_entry. A
+        """mutation guard: routing a tombstone through parse_history_entry. A
         tombstone is not corrupt data — there is no data — so treating it as a
         parse failure logs recoverable corruption instead of a lost play, and
         leans on an empty payload surviving orjson, which it does by accident."""
@@ -1246,7 +1246,7 @@ class TestNogroupHealing:
         self, fake_redis: Redis, drainer: HistoryOutboxDrainer
     ) -> None:
         # Only NOGROUP is recoverable. Healing the class would paper over a
-        # WRONGTYPE — a legacy LIST at the key — by pointlessly recreating a
+        # WRONGTYPE — a legacy list at the key — by pointlessly recreating a
         # group that cannot exist.
         with patch(
             "src.history_archive.ensure_outbox_group", new=AsyncMock()
@@ -1288,8 +1288,8 @@ class TestPelSweep:
     async def test_a_sweep_failure_does_not_stop_the_drain(
         self, fake_redis: Redis, archive: Any, drainer: HistoryOutboxDrainer
     ) -> None:
-        # Housekeeping must never cost the drain. The entries it moves are the
-        # exception; the entries the drain moves are the whole point.
+        # Housekeeping must never cost the drain: the entries it moves are the
+        # exception, the ones the drain moves are the norm.
         await _push(fake_redis, 1)
         with patch(
             "src.history_archive.reclaim_outbox_stale",
@@ -1318,7 +1318,7 @@ class TestPelSweep:
 
     async def test_min_idle_exceeds_the_drain_deadline(self) -> None:
         """INVARIANT: under a shared consumer name "idle" is measured from last
-        DELIVERY, so a sweep whose min_idle_time is below the drain deadline
+        delivery, so a sweep whose min_idle_time is below the drain deadline
         reclaims a live sibling's batch while it is still inserting. Removing the
         drainer lease removed the old coupling's name, not the constraint."""
         assert (
@@ -1389,7 +1389,7 @@ class TestSuccessPathDepthSampling:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """REGRESSION: the sample sat below `if drained: continue`. Every test
+        """regression: the sample sat below `if drained: continue`. Every test
         above calls _sample_depth directly, so all passed while the loop could
         not reach it — and a succeeding-but-behind drain takes the productive
         branch every cycle, so the alarm's own condition never logged."""
@@ -1470,7 +1470,7 @@ class TestStopIdempotence:
         archive = GatedArchive()
         drainer = HistoryOutboxDrainer(fake_redis, archive)
         await _push(fake_redis, *range(6))
-        # Deliberately NOT started: this isolates the two stop() paths from the
+        # Deliberately not started: this isolates the two stop() paths from the
         # run loop's own drain, so `calls` counts only what shutdown did.
 
         stops = [asyncio.create_task(drainer.stop()) for _ in range(2)]
@@ -1525,7 +1525,7 @@ class TestOutboxCap:
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
         assert "over cap" in caplog.text
         assert any(r.levelname == "ERROR" for r in caplog.records)
-        # The dropped ones are the OLDEST: entries 2,3,4 go, 5,6,7 stay.
+        # The dropped ones are the oldest: entries 2,3,4 go, 5,6,7 stay.
         assert await _outbox_wires(fake_redis) == [
             serialize_history_entry(_entry(n)) for n in (5, 6, 7)
         ]
@@ -1536,7 +1536,7 @@ class TestOutboxCap:
         archive: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """MUTATION GUARD: XACK must precede XTRIM inside _enforce_cap. Deleting
+        """mutation guard: XACK must precede XTRIM inside _enforce_cap. Deleting
         the ack passes every state-based assertion here — the end state
         self-heals via the sweep and _settle_tombstones — so the order is
         asserted by command sequence. Trim-first leaves the doomed delivered
@@ -1576,7 +1576,7 @@ class TestOutboxCap:
         archive: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """REGRESSION: minid discovery used to be one XRANGE COUNT=over+1. XRANGE
+        """regression: minid discovery used to be one XRANGE COUNT=over+1. XRANGE
         replies carry bodies, so that single fetch scaled with the backlog —
         against a 500k-entry outbox it would haul ~240 MB over the socket in one
         reply. The fetch stays bounded by CAP_PAGE per pass and the cap converges
@@ -1602,7 +1602,7 @@ class TestOutboxCap:
         assert counts, "no XRANGE ran"
         assert max(counts) <= drainer.CAP_PAGE + 1
         assert len(counts) >= 2  # it actually paged, not one overage-sized fetch
-        # And still converged fully in one invocation, dropping the OLDEST.
+        # And still converged fully in one invocation, dropping the oldest.
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 3
         assert await _outbox_wires(fake_redis) == [
             serialize_history_entry(_entry(n)) for n in (7, 8, 9)
@@ -1665,7 +1665,7 @@ class TestOutboxCap:
         archive: Any,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """REGRESSION: _enforce_cap used to run only on the success tail of
+        """regression: _enforce_cap used to run only on the success tail of
         _drain_batch, so it was unreachable for the whole duration of an outage —
         the one scenario HISTORY_OUTBOX_MAX exists for."""
         monkeypatch.setattr(HistoryOutboxDrainer, "OUTBOX_MAX", 3)
@@ -1778,8 +1778,8 @@ class TestDrainerLoopInvariants:
         spins issuing an XREADGROUP per pass on an empty outbox — a pegged core
         and a permanent load floor on the Redis that also serves playback.
 
-        Two properties of the measurement are load-bearing. It counts XREADGROUP:
-        the LIST-era LRANGE instrument survived the switch to a stream, where the
+        Two properties of the measurement matter. It counts XREADGROUP:
+        the list-era LRANGE instrument survived the switch to a stream, where the
         drain path never issues one, so the assertion had become 0 == 0. And it
         samples event-loop TURNS against an absolute ceiling rather than two
         timed windows — wall-clock windows are starved by the very spin they
@@ -1872,7 +1872,7 @@ class TestDrainerLoopInvariants:
     async def test_retry_backoff_doubles_then_holds_at_the_ceiling(
         self, fake_redis: Redis, archive: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The ladder itself. Every other failure-path test asserts only THAT a
+        """The ladder itself. Every other failure-path test asserts only that a
         retry happened, so both halves of `min(backoff * 2, _BACKOFF_MAX)` could
         regress silently: a constant backoff turns a Postgres outage into a hot
         retry loop against the Redis that also serves playback, and a missing
@@ -1900,7 +1900,7 @@ class TestDrainerLoopInvariants:
                     await asyncio.sleep(0.01)
         finally:
             await drainer.stop(timeout=0.5)
-        # Doubling from the base, then pinned at the ceiling — not merely
+        # Doubling from the base, then pinned at the ceiling — not just
         # non-decreasing, which a constant ladder also satisfies.
         assert delays[:5] == [0.01, 0.02, 0.04, 0.04, 0.04]
 
@@ -2109,7 +2109,7 @@ class TestRecordRejection:
         pool = MagicMock()
         acquired = MagicMock()
         acquired.__aenter__ = AsyncMock(return_value=conn)
-        # return_value=None, not a bare AsyncMock: a truthy __aexit__ SUPPRESSES
+        # return_value=None, not a bare AsyncMock: a truthy __aexit__ suppresses
         # the exception under test and silently turns a failing assertion green.
         acquired.__aexit__ = AsyncMock(return_value=None)
         pool.acquire = MagicMock(return_value=acquired)
@@ -2197,7 +2197,7 @@ class TestPoisonClassification:
     rather than inferred from drainer behaviour."""
 
     def test_check_violation_is_poison(self) -> None:
-        # SQLSTATE 23514, and NOT a DataError: it inherits from
+        # SQLSTATE 23514, and not a DataError: it inherits from
         # IntegrityConstraintViolationError. The play_history CHECKs make this
         # reachable, and without the arm a violation propagates past the
         # quarantine path and wedges the drain head on a non-evictable stream.

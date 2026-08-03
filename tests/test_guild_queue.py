@@ -130,7 +130,7 @@ class TestPut:
     async def test_in_memory_before_redis(
         self, mock_guild: MagicMock, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """The in-memory legs are populated for ALL items before the first
+        """The in-memory legs are populated for all items before the first
         Redis push (matching the original queue_put ordering)."""
         gq = GuildQueue(mock_guild, store)
         sizes_at_push: list[int] = []

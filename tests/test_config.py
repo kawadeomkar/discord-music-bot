@@ -393,15 +393,15 @@ class TestComposeArchiveProfile:
     compose, so the contract is asserted against the real file."""
 
     def test_postgres_and_db_migrate_are_archive_profiled(self) -> None:
-        # The profile IS the deployment gate: without it, a default `up`
+        # The profile is the deployment gate: without it, a default `up`
         # deploys a database nobody opted in to and the consent story is
         # app-side only.
         for service in ("postgres", "db-migrate"):
             assert 'profiles: ["archive"]' in _service_block(service), service
 
     def test_the_bot_does_not_depend_on_the_profiled_services(self) -> None:
-        """REGRESSION GUARD: an un-profiled service with depends_on on a profiled
-        one makes the WHOLE project invalid while the profile is inactive — even
+        """regression guard: an un-profiled service with depends_on on a profiled
+        one makes the whole project invalid while the profile is inactive — even
         `docker compose config` fails ("depends on undefined service") — so
         re-adding either dependency breaks token-only `up` outright."""
         bot = _service_block("discord-music-bot")
@@ -413,7 +413,7 @@ class TestComposeArchiveProfile:
         assert "redis:" in depends.group(1)
 
     def test_db_backfill_stays_on_ops_not_archive(self) -> None:
-        """`up` starts EVERY service of an active profile, so db-backfill joining
+        """`up` starts every service of an active profile, so db-backfill joining
         `archive` would run a full Redis keyspace walk on every enabled `up`. Its
         own profile means it runs only when explicitly targeted (`docker compose
         run` auto-activates a target's own profiles)."""
@@ -438,8 +438,8 @@ class TestComposeMatchesTheDefault:
     """
 
     def test_no_postgres_password_interpolation_is_mandatory(self) -> None:
-        """REGRESSION: db-backfill kept `:?` when the other three services moved.
-        Compose interpolates the WHOLE document before profile filtering, so an
+        """regression: db-backfill kept `:?` when the other three services moved.
+        Compose interpolates the whole document before profile filtering, so an
         `ops`-profiled service with a mandatory variable fails `up`, `ps`, `logs`
         and `config` alike.
         """
@@ -451,7 +451,7 @@ class TestComposeMatchesTheDefault:
     def test_every_fallback_is_the_password_the_bot_warns_about(self) -> None:
         """The drift check. DEFAULT_POSTGRES_PASSWORD is duplicated across
         config.py, build_common.sh and three compose services with nothing holding
-        them together, and drift fails OPEN: change compose's fallback alone and
+        them together, and drift fails open: change compose's fallback alone and
         the detector goes permanently silent on a known credential.
         """
         fallbacks = set(

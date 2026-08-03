@@ -24,7 +24,7 @@ def pytest_collection_modifyitems(
 ) -> None:
     """Refuse a `-m pg` / `-m redis` run that would skip the entire tier.
 
-    An all-skipped tier exits 0 and looks green while invariants that live ONLY
+    An all-skipped tier exits 0 and looks green while invariants that live only
     there stop being checked — ON CONFLICT dedup, the -history tie-break, the
     schema lock, and everything fakeredis answers WRONGLY rather than not at all.
     Matches the marker as a WORD so `-m "pg and not slow"` cannot slip past, and
@@ -97,7 +97,7 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
 
     HISTORY_ARCHIVE_ENABLED is pinned TRUE, deliberately INVERTING the ship
     default: the enabled path exercises strictly more code (outbox XADD, notify,
-    drainer wiring) and hundreds of assertions encode it. Do NOT "fix" this to
+    drainer wiring) and hundreds of assertions encode it. Don't change this to
     the ship default — disabled-mode tests monkeypatch the flag per case and win
     over this fixture (same MonkeyPatch instance, later call).
     """
@@ -196,7 +196,7 @@ def mock_ctx(
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
     ctx.typing.return_value.__aexit__ = AsyncMock(return_value=None)
-    # Owner by default: on a self-hosted bot the application owner IS the
+    # Owner by default: on a self-hosted bot the application owner is the
     # operator, so it is the ordinary case for owner-gated commands (today,
     # -ping's default-password advisory). AsyncMock is required — a bare
     # MagicMock attribute is unawaitable and every such command dies with TypeError.
@@ -213,8 +213,8 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.wait_until_ready = AsyncMock()
     # Declared, never auto-vivified: MusicPlayer.__init__ reads
     # bot.history_drainer, and an auto-vivified MagicMock answers `is not None`
-    # with True — so every player would take the archive-ENABLED arm and the
-    # disabled arm (the SHIP DEFAULT) would be exercised by nothing. Dropping
+    # with True — so every player would take the archive-enabled arm and the
+    # disabled arm (the SHIP default) would be exercised by nothing. Dropping
     # musicplayer.py's None guard once passed the entire suite while bricking
     # every -play in the default configuration.
     bot.history_archive = MagicMock()
@@ -240,7 +240,7 @@ def music_player(
     mock_ctx: MagicMock,
     fake_redis: Redis,
 ) -> MusicPlayer:
-    """MusicPlayer on fake Redis; start() is NOT called — tests drive state directly.
+    """MusicPlayer on fake Redis; start() is not called — tests drive state directly.
 
     loop() blocks on both _restore_complete and the playback gate, and nothing
     here would ever set them (start() and the -join/-play call sites never run),

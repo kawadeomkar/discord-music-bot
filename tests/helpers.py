@@ -95,7 +95,7 @@ def tier_enabled(*env_vars: str) -> bool:
 
     One definition for all three readers (conftest's gate hook, both tiers' own
     skipif) — a gate disagreeing with what it gates is worse than no gate. "0",
-    "false" and "" are DISABLED; `bool(os.getenv(...))` reads all three as on."""
+    "false" and "" are disabled; `bool(os.getenv(...))` reads all three as on."""
     import os
 
     return any(
@@ -110,5 +110,5 @@ def bind_loopback_only(container: Any, port: int) -> None:
     Docker binds 0.0.0.0, so a plain testcontainer exposes an unauthenticated
     Redis / weak-password Postgres to the LAN for a whole run. testcontainers
     hands `.ports` to docker-py, which accepts `(host_ip, host_port)`; `None`
-    keeps the random high port. Call BEFORE start — that dict is read once."""
+    keeps the random high port. Call before start — that dict is read once."""
     container.ports[port] = ("127.0.0.1", None)

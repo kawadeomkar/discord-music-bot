@@ -288,7 +288,7 @@ class TestYTSourcePlaylistUrl:
         assert src.playlist_url == "https://www.youtube.com/playlist?list=PLtest"
 
     def test_property_is_not_gated_on_playlist_type(self) -> None:
-        """Documents that the property does NOT assert type == PLAYLIST: a TRACK
+        """Documents that the property does not assert type == PLAYLIST: a TRACK
         source with a url returns it unchanged. Callers are responsible for only
         reading this on playlist sources."""
         src = YTSource(url="https://yt.com/watch?v=one", type=YTType.TRACK)

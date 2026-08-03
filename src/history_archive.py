@@ -8,7 +8,7 @@ Postgres play-history archive — the durable long-term home for every played so
   pending IDs → read new → INSERT ... ON CONFLICT DO NOTHING → XACK+XDEL by ID.
   At-least-once: a crash between insert and ack redelivers and play_history_dedup
   collapses the replay. The playback loop never awaits Postgres. One task per
-  process but NOT one per deployment — the consumer group makes concurrent
+  process but not one per deployment — the consumer group makes concurrent
   drainers safe with no lease to win (`>` gives them disjoint entries; the
   pending replay a shared set ON CONFLICT collapses).
 
@@ -302,7 +302,7 @@ class PostgresHistoryArchive:
         error_detail is text and asyncpg messages echo the offending value, so it
         is NUL-scrubbed and capped: the same poison this table exists to record
         would otherwise fail the insert recording it. payload is bytea and takes
-        the DELIVERED `wire` bytes verbatim, never a re-serialized entry — in a
+        the delivered `wire` bytes verbatim, never a re-serialized entry — in a
         mixed-version rollout an entry written by a NEWER build carries fields
         this parser drops, so the record would be a lossy re-encoding, and since
         the dedup identity is an md5 of payload, one entry seen by two builds
@@ -337,7 +337,7 @@ class PostgresHistoryArchive:
         Connects if nothing has yet: the pool is lazy, so before the first song
         end it is simply absent and reporting "not configured" for an enabled
         tier would be a lie an operator acts on. _ensure's timeout=10 outlasts
-        PING_DEADLINE_SECS (3s), so the first -ping of a cold bot can render ONE
+        PING_DEADLINE_SECS (3s), so the first -ping of a cold bot can render one
         red row for a healthy-but-slow connect; it self-corrects next tick, and
         widening the deadline would delay every OTHER row's first render.
 
@@ -351,7 +351,7 @@ class PostgresHistoryArchive:
     async def close(self) -> None:
         """Close the pool. Terminal: _ensure() refuses afterwards.
 
-        _closed is set FIRST so new callers are turned away immediately, then the
+        _closed is set first so new callers are turned away immediately, then the
         init lock is taken so an _ensure() already inside its connect cannot hand
         a fresh pool to a field nobody will read again. That wait can cost up to
         the 10s connect timeout, which is the price of not leaking a live pool.
@@ -391,11 +391,11 @@ class PostgresHistoryArchive:
 #   DataError             SQLSTATE 22xxx server-side data rejections
 #                         (CharacterNotInRepertoireError for NUL bytes,
 #                         NumericValueOutOfRangeError, …)
-#   CheckViolationError   23514, and NOT a DataError — both inherit from
+#   CheckViolationError   23514, and not a DataError — both inherit from
 #   NotNullViolationError IntegrityConstraintViolationError; without both arms a
 #                         CHECK violation wedges the drain head permanently
 #
-# Deliberately NOT here — each would break the drain:
+# Deliberately not here — each would break the drain:
 #   - UniqueViolationError: play_history_dedup is the ON CONFLICT target, so it
 #     cannot surface; catching it hides a genuine index bug.
 #   - bare ValueError / TypeError: asyncpg raises them for whole-statement
@@ -419,7 +419,7 @@ class HistoryOutboxDrainer:
     backs off exponentially while entries accumulate safely in the outbox
     (persistent, non-evictable — see HISTORY_OUTBOX_KEY).
 
-    NOT single-consumer, and does not need to be: the outbox is a stream consumer
+    Not single-consumer, and does not need to be: the outbox is a stream consumer
     group under a stable name, so a second instance (an overlapping k8s rollout,
     a developer's bot on a shared REDIS_URL) reads disjoint new entries and
     shares the pending set, which the archive's unique index collapses.
@@ -431,7 +431,7 @@ class HistoryOutboxDrainer:
     DEPTH_ALARM: int = 10_000  # backlog that escalates the retry warning to ERROR
     # Whole-cycle bound, belt to command_timeout's braces: covers connection
     # acquisition, DNS re-resolution and anything else asyncpg does not bound, so
-    # ANY hang becomes a TimeoutError on _run's normal error path — which is what
+    # any hang becomes a TimeoutError on _run's normal error path — which is what
     # makes DEPTH_ALARM fire for hangs and not only for errors.
     DRAIN_DEADLINE_SECS: float = 60.0
     # Rate limit for the depth watchdog on the productive path. Matched to
@@ -441,7 +441,7 @@ class HistoryOutboxDrainer:
     # catches is rare by construction, and it costs an XAUTOCLAIM scan.
     SWEEP_INTERVAL_SECS: float = 300.0
     # INVARIANT: must exceed DRAIN_DEADLINE_SECS * 1000. Under a shared consumer
-    # name "idle" is measured from last DELIVERY, so a smaller value lets the
+    # name "idle" is measured from last delivery, so a smaller value lets the
     # sweep reclaim a live sibling's batch while it is still inserting.
     SWEEP_MIN_IDLE_MS: int = 300_000
     # Bounds one sweep's work, and terminates the cursor loop under fakeredis,
@@ -582,7 +582,7 @@ class HistoryOutboxDrainer:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # The cap MUST also be enforced here, not only on _drain_batch's
+                # The cap must also be enforced here, not only on _drain_batch's
                 # success tail: that one is unreachable for the whole duration of
                 # a Postgres outage — every failure raises before it — so a cap
                 # evaluated only on cycles that delivered never fires while the
@@ -606,19 +606,19 @@ class HistoryOutboxDrainer:
                 # respawn damping starts over from the base delay.
                 self._restart_delay = self.RESTART_BASE
                 # Sample here too, or the alarm cannot fire in the case its own
-                # message describes: "keeping up but not catching up" IS a
+                # message describes: "keeping up but not catching up" is a
                 # succeeding drain, which takes this branch every time — so with
                 # the sample only below, a backlog growing faster than BATCH_SIZE
                 # per cycle logged nothing at all, forever.
                 await self._sample_depth_if_due()
                 continue  # backlog: keep draining without waiting
-            # Idle — the drain settled everything it can. Sample on the SUCCESS
+            # Idle — the drain settled everything it can. Sample on the success
             # path: _log_retry only fires in the except arm, so without this a
             # healthy drainer sitting on a growing outbox (or a stranded PEL)
             # says nothing at all.
             await self._sample_depth()
             # clear() only ever runs after wait() returns, so a notify() landing
-            # in that window IS dropped — but the next iteration drains
+            # in that window is dropped — but the next iteration drains
             # unconditionally, so the entry costs at most a TICK_SECS delay,
             # never a loss.
             try:
@@ -671,11 +671,10 @@ class HistoryOutboxDrainer:
     async def _read_batch(self) -> list[OutboxEntry]:
         """Pending first, then new — and never both in one cycle.
 
-        FIFO within this drainer is the weaker reason and does not generalise:
-        delivery across two live drainers is disjoint, so entry N+1 can commit
-        before entry N. The load-bearing reason is a MEMORY invariant — the PEL
-        is bounded by BATCH_SIZE x concurrent readers only while a cycle never
-        reads `>` with a non-empty PEL. Any future head-of-line-blocking fix,
+        FIFO within this drainer does not generalise: delivery across two live
+        drainers is disjoint, so entry N+1 can commit before entry N. The real reason
+        is a memory bound — the PEL stays within BATCH_SIZE x concurrent readers only
+        while a cycle never reads `>` with a non-empty PEL. Any future head-of-line-blocking fix,
         whose natural shape is "keep draining new entries while the stuck batch
         retries", breaks that bound and must re-derive the sizing.
 
@@ -728,7 +727,7 @@ class HistoryOutboxDrainer:
                     await self._archive.insert_batch(entries)
             except _POISON:
                 # _isolate settles each entry as it goes, so the batch settle in
-                # the else-branch must NOT also run — try/except/else keeps the
+                # the else-branch must not also run — try/except/else keeps the
                 # two settle paths structurally exclusive.
                 await self._isolate(live, span)
             else:
@@ -742,7 +741,7 @@ class HistoryOutboxDrainer:
 
         A tombstone is delivered-but-deleted: XTRIM and any operator XDEL remove
         bodies without consulting the PEL, so the ID replays with an empty field
-        map. Unrecoverable — a LOST PLAY, logged at ERROR and counted apart from
+        map. Unrecoverable — a lost PLAY, logged at ERROR and counted apart from
         a parse failure, which is recoverable in principle.
 
         Unconditional ack is the point. Left pending, a tombstone is re-read
@@ -770,8 +769,8 @@ class HistoryOutboxDrainer:
         whole batch on a validator regression turns a one-row bug into a
         hundred-play loss.
 
-        Takes the DELIVERED ENTRIES, not parsed rows, and settles EVERY element.
-        Both properties are load-bearing:
+        Takes the delivered entries, not parsed rows, and settles every element.
+        Both matter:
 
         - Settle per entry, never once at the end. A transient error partway
           through raises before an end-of-batch settle would run, redelivering
@@ -814,20 +813,20 @@ class HistoryOutboxDrainer:
         the trade-off is documented). Dropping un-archived plays is data loss, so
         every drop logs at ERROR.
 
-        NEVER RUNS WHILE SHUTTING DOWN: a departing process knows least about
+        Never RUNS while SHUTTING DOWN: a departing process knows least about
         what a live peer is doing. Re-checked each pass, so stop() also halts a
         convergence loop already in progress.
 
-        ACK BEFORE TRIM. XTRIM does not consult the PEL: on real Redis 7.4.9,
+        ACK before TRIM. XTRIM does not consult the PEL: on real Redis 7.4.9,
         five delivered-and-unacked entries survived `XTRIM MAXLEN 2` as pending
         records while three bodies were destroyed, and trimming first leaves an
         ID pending with no body — a tombstone, which replays forever. A crash
         between the two leaves entries acked but not trimmed: invisible to
         readers, reclaimed next pass.
 
-        The cap DELIBERATELY crosses the PEL. Refusing to is the one thing that
+        The cap deliberately crosses the PEL. Refusing to is the one thing that
         would make it useless: during an outage the cycle re-reads the same
-        pending batch every tick, so the OLDEST entries are permanently in flight
+        pending batch every tick, so the oldest entries are permanently in flight
         and a clamp below the oldest pending ID trims nothing while the backlog
         grows. Their drainer still holds the parsed rows, so a later successful
         insert archives them anyway.
@@ -901,7 +900,7 @@ class HistoryOutboxDrainer:
         await self._sample_depth()
 
     async def _sample_depth(self) -> None:
-        """Report a backlog on the SUCCESS path too. _log_retry is the only other
+        """Report a backlog on the success path too. _log_retry is the only other
         reader of depth and runs exclusively in the failure arm, so a
         healthy-but-behind drainer — or one on a stranded PEL — reported nothing
         at all. Best-effort and silent when shallow: a watchdog, not a metric.

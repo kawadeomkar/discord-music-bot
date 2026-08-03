@@ -16,8 +16,8 @@ writes, carrying a dequeued-but-uncommitted head through untouched
 (_in_flight_head). One residual window remains — see the ISSUE below. The
 cleared-flag the playback loop consumes lives here too.
 
-NOT known here:
-- stream prefetch — MusicPlayer cancels its prefetch task BEFORE
+Not known here:
+- stream prefetch — MusicPlayer cancels its prefetch task before
   clear()/shuffle()/remove(); the task consumes via get_nowait()/task_done()
 - embeds and ETA math — MusicPlayer builds them over display_items()/peek_next()
 - the state hash — crash recovery hands this class ready-made entries
@@ -106,7 +106,7 @@ class GuildQueue:
         """Undo a get()/get_nowait() whose consumer abandoned the item without
         playing it (prefetch cancellation). The display and Redis legs never moved,
         so undoing the pending leg realigns all three and leaves no in-flight head.
-        The abandoned get()'s task slot transfers to the re-put: callers must NOT
+        The abandoned get()'s task slot transfers to the re-put: callers must not
         also call task_done(). `item` may be the RESOLVED form of what was dequeued
         (YTSource → QueueObject); the other legs still hold the original — counts
         stay aligned and they converge at the next dequeue."""
@@ -136,7 +136,7 @@ class GuildQueue:
     def _drain_pending(self) -> list[QueueItem]:
         """Remove and return every item in _pending, in queue order, each balanced
         with task_done(). Shared first step of put_front()/clear()/shuffle()/
-        remove(). MUST hold _mutex — the drain must not race a consumer."""
+        remove(). Must hold _mutex — the drain must not race a consumer."""
         drained: list[QueueItem] = []
         for _ in range(self._pending.qsize()):
             try:
@@ -179,7 +179,7 @@ class GuildQueue:
                     await self._store.push_queue(entry)
 
     async def put_front(self, items: Sequence[QueueItem]) -> None:
-        """Insert items at the FRONT of all three legs — the -playnow interjection
+        """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
@@ -188,12 +188,12 @@ class GuildQueue:
         commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the
         new head.
 
-        That branch is LOAD-BEARING, not defensive — do not delete it as dead code.
-        MusicPlayer.interject() neutralizes the prefetch first, but one
-        interleaving still reaches it: the song ends naturally, the loop claims a
-        STILL-RUNNING prefetch and awaits it (up to yt-dlp's socket timeout), and
-        interject() runs inside that await — its neutralize finds no task to take
-        while the prefetch's dequeued item sits uncommitted at the display head.
+        That branch is reachable, despite looking unused.
+        MusicPlayer.interject() neutralizes the prefetch first, but one interleaving
+        still reaches it: the song ends naturally, the loop claims a still-running
+        prefetch and awaits it (up to yt-dlp's socket timeout), and interject() runs
+        inside that await — its neutralize finds no task to take while the prefetch's
+        dequeued item sits uncommitted at the display head.
         """
         if not items:
             return
@@ -223,7 +223,7 @@ class GuildQueue:
                     await self._store.push_queue_front(entries)
 
     # ── Bulk operations ───────────────────────────────────────────────────────
-    # Callers with a prefetch task (MusicPlayer) must cancel it BEFORE any of
+    # Callers with a prefetch task (MusicPlayer) must cancel it before any of
     # these: a running prefetch holds a get_nowait() item, and its CancelledError
     # handler's requeue_front() must land before the drain, or the item is
     # stranded. A COMPLETED prefetch is fine — its item is an in-flight head.
@@ -327,7 +327,7 @@ class GuildQueue:
         requester_fallback: Union[discord.Member, discord.User, None],
     ) -> bool:
         """Re-queue the crash-recovered "current song" at the front of the line.
-        In-memory legs ONLY: the entry is persisted=False — its LPOP already
+        In-memory legs only: the entry is persisted=False — its LPOP already
         committed, so it is not on the Redis list and the loop must not LPOP for it
         (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
         persisted requester ID that no longer resolves; False when nobody does, and
@@ -426,7 +426,7 @@ class GuildQueue:
         head since dequeues come off the front. Called under the mutex after
         draining _pending, so anything beyond drained_count is in-flight.
 
-        Bulk mutations MUST carry these through untouched on BOTH legs, or the
+        Bulk mutations must carry these through untouched on both legs, or the
         consumer's eventual display-pop and LPOP retire someone else's entry —
         permanent triad desync, and a queued song's persisted entry lost."""
         extra = len(self._display) - drained_count

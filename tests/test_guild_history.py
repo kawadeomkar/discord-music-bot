@@ -135,7 +135,7 @@ class TestAddOutboxRouting:
         assert len(calls) == 2
 
     async def test_no_store_skips_outbox_and_notify(self) -> None:
-        # Redis optionality is a SEPARATE axis from the archive: without a
+        # Redis optionality is a separate axis from the archive: without a
         # store there is nowhere to buffer, so add() degrades to memory-only
         # and must not nudge a drainer that has nothing to drain.
         calls = []
@@ -238,7 +238,7 @@ class TestRecentIsRedisOnly:
     ) -> None:
         """The deque is MERGED, not a fallback reached only on an empty read.
 
-        REGRESSION: consulted only when every leg above it came back empty, a
+        Regression: consulted only when every leg above it came back empty, a
         single row from a healthier leg hid it entirely. As a second leg it can
         only add depth.
         """
@@ -257,7 +257,7 @@ class TestRecentIsRedisOnly:
         """
         h = _history(store)
         raw = 1000.0000014  # finer than µs; nothing truncates it now
-        await h.add(_entry(1, played_at=raw))  # lands on BOTH legs
+        await h.add(_entry(1, played_at=raw))  # lands on both legs
         got = await h.recent(10)
         assert len(got) == 1
         assert got[0].played_at == raw

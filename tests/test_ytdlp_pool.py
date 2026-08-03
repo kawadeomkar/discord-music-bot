@@ -56,7 +56,7 @@ class _UnpicklableError(Exception):
 class _UnpicklableBroken(BrokenExecutor):
     """A BrokenExecutor that itself cannot cross the boundary. The real BrokenProcessPool
     is picklable, so only a synthetic one like this can prove the exclusion in
-    _picklable_call is load-bearing rather than incidental."""
+    _picklable_call is needed."""
 
     def __init__(self, message: str, extra: object) -> None:
         super().__init__(message)
@@ -464,7 +464,7 @@ class TestAclose:
         self,
     ) -> None:
         """A ProcessPoolExecutor must be actively terminated on timeout: shutdown(
-        wait=False) does NOT bound interpreter exit — _python_exit re-joins the
+        wait=False) does not bound interpreter exit — _python_exit re-joins the
         abandoned pool (measured 61s → 3.4s once workers are SIGTERMed). The
         isinstance guard picks terminate_workers() over the thread-pool fallback."""
         started = threading.Event()
@@ -488,7 +488,7 @@ class TestAclose:
 
             assert pool.is_closed
             executor.terminate_workers.assert_called_once_with()
-            # only the wait=True join ran; the wait=False fallback must NOT be taken
+            # Only the wait=True join ran; the wait=False fallback must not be taken
             executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
         finally:
             release.set()
@@ -576,7 +576,7 @@ class TestPicklableCall:
         assert pickle.loads(pickle.dumps(caught.value)).message == "cannot ship me"
 
     def test_a_picklable_broken_executor_is_re_raised_untouched(self) -> None:
-        """BrokenExecutor is run()'s healing signal — it must NOT be converted, or the
+        """BrokenExecutor is run()'s healing signal — it must not be converted, or the
         heal-once retry never fires."""
 
         def boom() -> None:
@@ -588,7 +588,7 @@ class TestPicklableCall:
     def test_even_an_unpicklable_broken_executor_is_re_raised_not_converted(
         self,
     ) -> None:
-        """Pins the exclusion as load-bearing: a picklable BrokenProcessPool round-trips
+        """Pins the exclusion: a picklable BrokenProcessPool round-trips
         and is re-raised either way, so removing `except BrokenExecutor: raise` is
         invisible unless the broken signal is itself unshippable. It must still reach the
         caller as a BrokenExecutor (so run() heals), never as a RemoteCallError."""
@@ -743,7 +743,7 @@ class TestRealWorkerProcess:
         span_id = 0x00F067AA0BA902B7
         marker = "yt-dlp: SABR-only experiment detected [marker-6]"
 
-        # Present on root BEFORE the spawn: the listener captures root.handlers at start.
+        # Present on root before the spawn: the listener captures root.handlers at start.
         logging.root.addHandler(cap)
         pool = YtdlpPool(max_workers=1)
         try:

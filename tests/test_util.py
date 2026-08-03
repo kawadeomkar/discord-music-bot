@@ -190,7 +190,7 @@ def _rich_entry(**overrides: Any) -> HistoryEntry:
 class TestHistoryEmbeds:
     def test_layout_title_url_then_info_line(self) -> None:
         # numbered title; webpage_url on its own line beneath it;
-        # played/duration · requester · absolute timestamp on ONE line below.
+        # played/duration · requester · absolute timestamp on one line below.
         [embed] = history_embeds([_rich_entry()])
         assert embed.title == "1. Rich Song"
         assert embed.description is not None

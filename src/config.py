@@ -66,7 +66,7 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     Negatives are refused. `-1` is the near-universal "no limit" idiom and means
     the OPPOSITE downstream: `if not OUTBOX_MAX` is truthy for -1 and `depth <=
     OUTBOX_MAX` never true, so the drainer's trim takes the entire outbox — on
-    the SUCCESS path too, wiping every un-archived play roughly every 30s. The
+    the success path too, wiping every un-archived play roughly every 30s. The
     message names the variable because it surfaces with no logger attached.
     """
     raw = (os.environ.get(name) or "").strip()
@@ -82,12 +82,12 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 
 
 # Opt-in ceiling on the Postgres history outbox, in entries. 0 (the default) is
-# unbounded, which IS the durability contract — an entry only leaves the outbox
+# unbounded, which is the durability contract — an entry only leaves the outbox
 # once Postgres has it. A cap trades that for bounding a non-evictable key during
 # a long outage; every drop logs at ERROR and is UNRECOVERABLE, since the cap
-# destroys the OLDEST entries while guild:{id}:history is capped at
+# destroys the oldest entries while guild:{id}:history is capped at
 # HISTORY_CACHE_LIMIT, so anything older existed only here. Enforced on the drain
-# SUCCESS path too, after each 100-entry batch, and it deliberately destroys
+# success path too, after each 100-entry batch, and it deliberately destroys
 # entries a drainer is holding, ACKing them first (see _enforce_cap) — so size it
 # well above BATCH_SIZE x peak burst, not just above steady-state depth.
 #
@@ -108,7 +108,7 @@ def history_archive_enabled() -> bool:
 
     The consent gate for long-term storage. Enabled: POSTGRES_URL required at
     startup, every play XADDed to history:outbox, the drainer moving it into
-    play_history forever. Disabled — the DEFAULT — none of that exists; Redis
+    play_history forever. Disabled — the default — none of that exists; Redis
     behavior is identical either way. Read at call time (once per song at most).
 
     Parsing is STRICT because of the failure direction: a lenient
@@ -116,9 +116,9 @@ def history_archive_enabled() -> bool:
     into an operator who believes they enabled archiving while every play goes
     unrecorded. Unset and empty read as False — collection must be a choice.
 
-    Validation placement is load-bearing: setup_hook MUST call this before any
-    other consumer, because the next reader is @_guild_op-wrapped push_history,
-    where a garbage value becomes one warning per song, not a startup abort.
+    setup_hook must call this before any other consumer: the next reader is
+    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
+    song instead of a startup abort.
     """
     raw = os.environ.get("HISTORY_ARCHIVE_ENABLED")
     value = (raw or "").strip().lower()
@@ -146,7 +146,7 @@ def postgres_url() -> Optional[str]:
 # `docker compose up` works with nothing configured but DISCORD_TOKEN. A
 # first-run convenience and a liability everywhere else, hence the loud
 # detection; only defensible because compose publishes postgres on 127.0.0.1.
-# `.env` is the ONE supported place the real password is set (setup_env.sh writes
+# `.env` is the one supported place the real password is set (setup_env.sh writes
 # it; compose and `just run` read it); a per-install POSTGRES_PASSWORD_FILE was
 # declined — see docs/ARCHITECTURE.md#postgres-credential-handling.
 DEFAULT_POSTGRES_PASSWORD: Final[str] = "password"
@@ -158,13 +158,13 @@ def using_default_postgres_password() -> bool:
     Parsed out of POSTGRES_URL, not POSTGRES_PASSWORD: the bot only ever sees the
     assembled DSN, so the password variable is frequently absent from its own
     environment. SCOPED to the shape this project's tooling produces — userinfo
-    in a DSN assembled from `.env` — so it fails OPEN for three hand-written
+    in a DSN assembled from `.env` — so it fails open for three hand-written
     shapes asyncpg accepts and this misses:
 
       * `?password=` in the query string. asyncpg honours it; to urlsplit the
         query is opaque, so this reads as "no password at all".
       * a password containing an unescaped `@`. asyncpg partitions the netloc on
-        the FIRST `@` and urlsplit on the LAST, so `u:p@ss@host/db` authenticates
+        the first `@` and urlsplit on the last, so `u:p@ss@host/db` authenticates
         as `p` but reads here as `p@ss`.
       * `PGPASSWORD` exported in the environment. Nothing in this repo sets it.
 
@@ -179,7 +179,7 @@ def using_default_postgres_password() -> bool:
         password = urlsplit(url).password
     except ValueError:
         return False
-    # unquote because SplitResult.password does NOT percent-decode: a DSN
+    # unquote because SplitResult.password does not percent-decode: a DSN
     # carrying %70assword would otherwise read as a different credential than
     # the identical one written literally. asyncpg decodes it, so we must too.
     return password is not None and unquote(password) == DEFAULT_POSTGRES_PASSWORD

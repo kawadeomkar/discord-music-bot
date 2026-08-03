@@ -71,7 +71,7 @@ def _ping_message(mock_ctx: MagicMock) -> MagicMock:
 
 
 def _health_embed(call: Any) -> discord.Embed:
-    """The health card out of a send/edit call. The dashboard sends a LIST (a
+    """The health card out of a send/edit call. The dashboard sends a list (a
     default-password advisory can ride in front of the card), and the health card
     is always last — which is also what _safe_edit returns to the diffing loop."""
     return call.kwargs["embeds"][-1]
@@ -163,7 +163,7 @@ class TestPingCommand:
         mock_ctx: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The headline behavior: a probe that returns AFTER the skeleton send is
+        """The headline behavior: a probe that returns after the skeleton send is
         folded in on a tick and the message is edited from pending → its latency."""
         message = _ping_message(mock_ctx)
         monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
@@ -236,7 +236,7 @@ class TestPingCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Regression: -join must post the cheap latency line and
-        must NOT run the dependency probes."""
+        must not run the dependency probes."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
         mock_ctx.guild.change_voice_state = AsyncMock()
@@ -484,7 +484,7 @@ class TestProbeSpotify:
         assert r.state is ProbeState.NA
 
     async def test_disabled_status_is_na_without_calling_the_api(self) -> None:
-        """DISABLED wins even if a client object is somehow present: no API call."""
+        """disabled wins even if a client object is somehow present: no API call."""
         http_call = AsyncMock()
         r = await ping.probe_spotify(self._spotify(http_call), SpotifyStatus.DISABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.NA
@@ -541,7 +541,7 @@ class TestProbePostgres:
         archive.health_check.assert_awaited_once_with()
 
     async def test_unreachable_archive_is_down_with_reason(self) -> None:
-        # The whole point of asking the archive rather than a pool: a bot whose
+        # Why the probe asks the archive rather than a pool: a bot whose
         # Postgres is unreachable reports DOWN, not the "n/a (not configured)"
         # that a lazily-absent pool would have produced.
         archive = MagicMock()
@@ -660,7 +660,7 @@ class TestVersions:
         completed = MagicMock(stdout="ffmpeg version 7.1 Copyright (c) 2000-2024\n")
         with patch("src.ping.subprocess.run", return_value=completed) as run:
             assert ping.ffmpeg_version() == "7.1"
-            # second call is cached — no second subprocess
+            # Second call is cached — no second subprocess
             assert ping.ffmpeg_version() == "7.1"
             run.assert_called_once()
 
@@ -670,7 +670,7 @@ class TestVersions:
             assert ping.ffmpeg_version() == "unknown"
 
     def test_bot_version_reads_pyproject(self) -> None:
-        # Must match [tool.poetry].version in pyproject.toml — NOT installed dist
+        # Must match [tool.poetry].version in pyproject.toml — not installed dist
         # metadata (the container installs --no-root, so none exists).
         ping._bot_version_cache = None
         with ping._PYPROJECT.open("rb") as f:
@@ -700,7 +700,7 @@ class TestVersions:
 
 
 class TestDefaultPasswordEmbed:
-    """The standing advisory. Rendered on EVERY -ping rather than once at
+    """The standing advisory. Rendered on every -ping rather than once at
     startup: the startup log is seen once, usually by whoever already knows,
     while -ping is the surface an operator returns to."""
 
@@ -745,7 +745,7 @@ class TestDefaultPasswordEmbed:
         assert "ALTER USER" in body
         assert "up -d" in body  # the container recreate the old remedy omitted
 
-        # ORDER, not just presence. The detector reads the bot's DSN, so running
+        # Order, not just presence. The detector reads the bot's DSN, so running
         # `setup_env.sh --force` first clears the warning while Postgres still
         # accepts the old password — an unwarned exposure. The server change has
         # to come first and the embed has to say so.
@@ -793,7 +793,7 @@ class TestDefaultPasswordWarningReachesTheWire:
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
         assert len(embeds) == 2
-        # FIRST, above the health card — an advisory below the fold is one the
+        # First, above the health card — an advisory below the fold is one the
         # operator scrolls past.
         assert "Default database password" in (embeds[0].title or "")
 
@@ -898,7 +898,7 @@ class TestDefaultPasswordWarningReachesTheWire:
 class TestTheAdvisoryIsForTheOperator:
     """Who sees the default-password warning. -ping has no permission check and
     answers to `-status`, `-health`, `-l`, so an ungated advisory confirms to every
-    member of every guild — permanently, in Discord's history — that THIS host runs
+    member of every guild — permanently, in Discord's history — that this host runs
     the public default. The leak is the confirmation, not the string."""
 
     @pytest.fixture(autouse=True)
@@ -961,7 +961,7 @@ class TestTheAdvisoryIsForTheOperator:
         application_info(), a REST GET that retries ~25s on a 5xx and then RAISES,
         ahead of the skeleton send. is_owner answers True on purpose here, so a
         regression cannot pass by answering False."""
-        # The ship default. default_password_embed() returns None on its first
+        # The ship default. Default_password_embed() returns None on its first
         # line, so there is nothing to gate and nothing to ask about.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         mock_ctx.bot.is_owner = AsyncMock(

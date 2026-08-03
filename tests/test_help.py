@@ -234,7 +234,7 @@ class TestCommandHelp:
         await help_command.command_callback(ctx, command="play")
         embed = sent_embed(ctx)
         assert embed.title == "-play(1)"
-        # NAME, as man writes it: name — one-line summary.
+        # Name, as man writes it: name — one-line summary.
         assert (embed.description or "").startswith("**play** — ")
         fields = {f.name: f.value or "" for f in embed.fields}
         assert "SoundCloud" in fields["DESCRIPTION"]

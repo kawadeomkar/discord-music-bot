@@ -159,7 +159,7 @@ class InterjectOutcome:
     replaced: bool  # the interrupted song was itself a -playnow interjection
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
     # -playnow restores what it interrupted while -play brings it back playing.
-    # Wording must key off THIS, or a -play interjection announces "will return
+    # Wording must key off this, or a -play interjection announces "will return
     # paused" for a song that returns playing.
     returns_paused: bool = False
 
@@ -181,7 +181,7 @@ def _reached_end(song: YTDL) -> bool:
     """Did this song play through to its end — the only case where the bar finalizes
     to 100%? Answered by position, not cause, so it covers -skip, interjection and a
     mid-song stream death that produced audio (which `stream_failed` deliberately
-    does NOT call a failure). No known duration → False."""
+    does not call a failure). No known duration → False."""
     if song.duration_secs <= 0:
         return False
     return song.position_secs >= song.duration_secs - _SONG_COMPLETE_MARGIN_SECS
@@ -267,7 +267,7 @@ def _build_now_playing_base_embed(
 ) -> discord.Embed:
     """Shared field layout for both now-playing builders — live (YTDL-backed) and
     Redis-recovery (NowPlayingData-backed). Channel/Views/Likes are exactly Discord's
-    per-row cap of three inline fields. Duration is NOT a field (the live bar carries
+    per-row cap of three inline fields. Duration is not a field (the live bar carries
     it, the recovered embed puts it in the description), nor is the webpage URL — the
     title links to it. Views/likes are routinely absent and a partial Redis hash can
     blank any value, hence _field_value on every one."""
@@ -418,9 +418,9 @@ class MusicPlayer:
         self._np_host_dedicated: bool = False
         self._np_edit_lock = asyncio.Lock()
         self._pause_debounce_task: Optional[asyncio.Task] = None
-        # Set by interject() to the song it stopped WITH a resume entry pending, so
+        # Set by interject() to the song it stopped with a resume entry pending, so
         # the stop transition skips its history add and it is recorded once, when its
-        # tail finishes. Holds the song's IDENTITY, not a flag: the song can end
+        # tail finishes. Holds the song's identity, not a flag: the song can end
         # during interject()'s awaits and a stale boolean would eat the next entry.
         self._skip_history_for: Optional[YTDL] = None
 
@@ -509,7 +509,7 @@ class MusicPlayer:
 
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
-        cumulative_secs starts at the current song's TOTAL duration as a proxy for
+        cumulative_secs starts at the current song's total duration as a proxy for
         its remaining time — an overestimate that avoids showing "now" for
         everything; uncertain flags an unknown duration anywhere behind."""
         uncertain = False
@@ -603,12 +603,12 @@ class MusicPlayer:
 
     def _resume_left_off_field(self) -> Optional[tuple[str, str]]:
         """(name, value) for the resume notice's "where the last session got to"
-        field, or None when nothing recorded it. Call BEFORE the front insertion,
+        field, or None when nothing recorded it. Call before the front insertion,
         while the display head is still the restored one.
 
         The two restores landing here know different things:
         * A crash re-queues the mid-play song as the display head (persisted=False,
-          recovery offset in `ts`). That song IS where the session stopped.
+          recovery offset in `ts`). That song is where the session stopped.
         * A `-stop` cancels the loop mid-song before its history bookkeeping, so the
           interrupted song is recorded nowhere and clear_connection() dropped its
           state fields. The newest history entry is the last song that ran to its
@@ -643,7 +643,7 @@ class MusicPlayer:
         self, started: QueueObject
     ) -> Optional[discord.Embed]:
         """Heads-up that `-play` on a disconnected bot woke a persisted queue. Build
-        BEFORE front-inserting, while the queue holds only restored entries; None
+        before front-inserting, while the queue holds only restored entries; None
         when nothing was restored (the common first-`-play` case).
 
         `started` must be named here because this response hosts no NP block: the
@@ -856,7 +856,7 @@ class MusicPlayer:
         *,
         prefetch: bool = True,
     ) -> None:
-        """Insert at the FRONT of the queue, then optionally prefetch. Same contract
+        """Insert at the front of the queue, then optionally prefetch. Same contract
         as queue_put(), used when -play runs on a disconnected bot with a persisted
         queue: the requested song plays now, the persisted entries resume behind it.
         Playlists insert in full and in order, with prefetch=False for the same
@@ -878,10 +878,10 @@ class MusicPlayer:
         return await self.queue.get()
 
     async def _cancel_prefetch(self) -> None:
-        """Cancel any in-flight prefetch task and wait for it to finish. MUST run
+        """Cancel any in-flight prefetch task and wait for it to finish. Must run
         before any bulk queue mutation, so the item the prefetch dequeued via
         get_nowait() is returned to the front (requeue_front, in its CancelledError
-        handler) BEFORE the drain — the mutation then handles it with everything else
+        handler) before the drain — the mutation then handles it with everything else
         instead of stranding it. A prefetch blocked inside run_in_executor cannot be
         interrupted, so this await can sit until the worker exits (socket_timeout)."""
         await cancel_task(self._prefetch_task)
@@ -899,7 +899,7 @@ class MusicPlayer:
         ]
 
     async def queue_shuffle(self) -> str:
-        # Cancel BEFORE shuffle()'s too-few guard: a prefetch holding a dequeued
+        # Cancel before shuffle()'s too-few guard: a prefetch holding a dequeued
         # item must be accounted for even when the shuffle is a no-op.
         await self._cancel_prefetch()
         outcome = await self.queue.shuffle()
@@ -963,7 +963,7 @@ class MusicPlayer:
     def build_pause_confirmation_embed(self) -> Optional[discord.Embed]:
         """Slim -pause confirmation: just the pause position. The response hosts the
         live NP block right below, so repeating the bar/requester/thumbnail would
-        render them twice — the paused state is the one thing the block does NOT
+        render them twice — the paused state is the one thing the block does not
         show. position_secs is frozen while paused, so it is the exact point (-ss
         offset included). None when no song is live."""
         song = self.current_song
@@ -1084,7 +1084,7 @@ class MusicPlayer:
         dedicated: bool = False,
     ) -> bool:
         """Adopt gate for every attach site. The block in `message` was built for
-        `song` BEFORE the send's await, and the song may have ended or been replaced
+        `song` before the send's await, and the song may have ended or been replaced
         in flight; adopting then installs a stale block as host and delete-retires
         the next song's NP message (or leaves a frozen block nothing cleans up), so
         the just-sent message sheds it instead. True when adopted."""
@@ -1117,7 +1117,7 @@ class MusicPlayer:
                 log.warning(f"NP host retire failed for guild {self._guild.id}: {e}")
 
     def _release_np_host(self) -> None:
-        """Clear host state WITHOUT retiring the message. Used at song end: the
+        """Clear host state without retiring the message. Used at song end: the
         completed bar stays in the channel as a record, and the next song's adopt
         sees no old host to retire."""
         self._np_host_message = None
@@ -1279,7 +1279,7 @@ class MusicPlayer:
         an interjection builds NO resume entry — the ORIGINAL song's entry, still at
         the queue front, is untouched (replace semantics).
 
-        resume_paused decides whether a song interrupted WHILE PAUSED comes back
+        resume_paused decides whether a song interrupted while PAUSED comes back
         paused: True (-playnow) restores what it interrupted, False (-play) brings it
         back playing. No effect on a song that wasn't paused.
 
@@ -1287,8 +1287,8 @@ class MusicPlayer:
         neutralization — the caller falls back to a plain front-enqueue. Residual
         race: a song ending naturally while put_front awaits still gets its resume
         entry, replaying its final seconds. The widest variant is the loop awaiting a
-        STILL-RUNNING prefetch claimed before this ran, so put_front executes against
-        a real in-flight head — its rebuild branch is load-bearing here.
+        still-running prefetch claimed before this ran, so put_front executes against
+        a real in-flight head and takes its rebuild branch.
         """
         current = self.current_song
         if current is None:
@@ -1415,7 +1415,7 @@ class MusicPlayer:
     async def _announce_resume(self, song: YTDL) -> None:
         """One-line notice when an interrupted song returns, sent from the loop's
         start path because yt_stream suppresses its "Starting song at Xs" notice for
-        resume entries. Plain channel send, NOT send_with_np: this song's NP host is
+        resume entries. Plain channel send, not send_with_np: this song's NP host is
         not sent yet, so send_with_np would adopt the notice only for
         _send_now_playing to immediately retire it."""
         position = fmt_duration(int(song.position_secs))
@@ -1505,7 +1505,7 @@ class MusicPlayer:
 
     async def repin_now_playing(self) -> bool:
         """-now: re-host the NP block at the bottom as a fresh dedicated message.
-        Does NOT touch _progress_task — the updater follows the host pointer and
+        Does not touch _progress_task — the updater follows the host pointer and
         picks up the new message next tick. False when no song is live (including one
         that ended mid-send) so the command can respond another way."""
         return await self._send_np_host_message() is not None
@@ -1520,7 +1520,7 @@ class MusicPlayer:
         await self._send_np_host_message()
 
     async def _send_now_playing(self, song: YTDL) -> None:
-        # Release BEFORE the send, not after a failure, so a partial send never
+        # Release before the send, not after a failure, so a partial send never
         # leaves the host pointing at the *previous* song's message — a stale host
         # would let a later mark_paused()/mark_resumed() on the new song overwrite
         # the old song's already-sent embed.
@@ -1645,7 +1645,7 @@ class MusicPlayer:
                 if vc.is_paused():
                     continue  # frozen — mark_resumed() fires a debounced edit
                 async with self._np_edit_lock:
-                    host = self._np_host_message  # re-read INSIDE the lock: a host
+                    host = self._np_host_message  # re-read inside the lock: a host
                     # swap during this tick's sleep must not leave the edit
                     # targeting the old, about-to-be-stripped message
                     if host is None:
@@ -1715,7 +1715,7 @@ class MusicPlayer:
         # crash-recovered song that was never on the Redis list).
         await self._restore_complete.wait()
         # Queue populated; wait for a voice connection before playing any of it. The
-        # timeout is NOT optional: a player blocked here is not blocked in
+        # timeout is not optional: a player blocked here is not blocked in
         # queue_get(), so the 300s idle-disconnect below can never fire, and a player
         # that never connects would leak its mps entry and task forever.
         try:
@@ -1816,7 +1816,7 @@ class MusicPlayer:
                     span.set_attribute("song.title", self.current_song.title or "")
 
                     if not await self.queue.try_commit_dequeue():
-                        # Cleared while this song resolved (e.g. inside yt_stream).
+                        # Cleared while this song resolved (e.g. Inside yt_stream).
                         # Discard without playing: task_done() balances the get()
                         # above, and cleanup() terminates the FFmpeg subprocess
                         # yt_stream already spawned, which would otherwise leak.
@@ -1859,7 +1859,7 @@ class MusicPlayer:
                         # Park the player thread SYNCHRONOUSLY, before any await, so
                         # a song returning paused leaks a frame or two rather than a
                         # Redis round-trip of audio. Idempotent with the full pause()
-                        # below, which runs AFTER the start transaction so its
+                        # below, which runs after the start transaction so its
                         # pause_start_epoch survives that transaction's HDEL.
                         vc.pause()
                     play_start = time.time()  # capture immediately before any awaits
@@ -1905,7 +1905,7 @@ class MusicPlayer:
                     await self.play_next.wait()
 
                     # Zero frames AND an ffmpeg error means the stream never opened
-                    # (typically a 403 on a revoked URL). BOTH conditions matter:
+                    # (typically a 403 on a revoked URL). Both conditions matter:
                     # zero frames alone also describes a song parked paused by
                     # -playnow or stopped the instant it started (vc.stop() reports
                     # no error), and an error alone also describes a mid-song death
@@ -1952,7 +1952,7 @@ class MusicPlayer:
                             # completed=_reached_end(): a skipped, interjected or
                             # dead song finalizes at its true position, never 100%.
                             # The edit fires either way — the 3s tick would leave
-                            # the bar frozen a tick BEFORE the interruption.
+                            # the bar frozen a tick before the interruption.
                             self._fire_finalize_now_playing(
                                 self.current_song,
                                 finished_host,
@@ -1960,7 +1960,7 @@ class MusicPlayer:
                                 completed=_reached_end(self.current_song),
                             )
 
-                    # ORDERING: stop advertising this song as current BEFORE the
+                    # Ordering: stop advertising this song as current before the
                     # prefetch await below, which can sit for seconds on a yt-dlp
                     # extraction. Everything above is synchronous, so this is the
                     # first point another coroutine can interleave, and
@@ -1975,7 +1975,7 @@ class MusicPlayer:
 
                     # Claim-then-await: interject() may have neutralized (and nulled)
                     # the task while this iteration sat in play_next.wait(). Both
-                    # sides read-and-null synchronously, so exactly ONE consumer sees
+                    # sides read-and-null synchronously, so exactly one consumer sees
                     # any given result; a task interject() cancelled resolves to None.
                     prefetch_task = self._prefetch_task
                     self._prefetch_task = None
@@ -1987,7 +1987,7 @@ class MusicPlayer:
                             prefetched_song = None
 
                     # interject() stopped this song with a resume entry pending —
-                    # history records it when the tail ends. IDENTITY match, and the
+                    # history records it when the tail ends. Identity match, and the
                     # marker clears either way: a marker left for a song that ended
                     # during interject()'s awaits must not eat this song's entry.
                     # stream_failed → never heard, so never recorded.
@@ -1999,7 +1999,7 @@ class MusicPlayer:
                                 song,
                                 guild_id=self._guild.id,
                                 played_at=time.time(),
-                                # The host captured at song end, NOT
+                                # The host captured at song end, not
                                 # _np_host_message, which _release_np_host() nulled
                                 # above. Clearing current_song before the prefetch
                                 # await makes this complete: nothing can adopt a

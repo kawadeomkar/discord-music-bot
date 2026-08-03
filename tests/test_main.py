@@ -126,7 +126,7 @@ class TestSetupHook:
         monkeypatch: pytest.MonkeyPatch,
         value: Optional[str],
     ) -> None:
-        """An ENABLED archive requires its database (the suite default pins
+        """An enabled archive requires its database (the suite default pins
         HISTORY_ARCHIVE_ENABLED=true), so an unset (or empty) POSTGRES_URL is
         a startup error, not a degraded mode. Failing here is what stops the
         bot from silently XADDing onto an outbox no drainer will ever read."""
@@ -142,7 +142,7 @@ class TestSetupHook:
             pytest.raises(RuntimeError, match="POSTGRES_URL is not set"),
         ):
             await app.setup_hook()
-        # It refuses BEFORE loading the cogs, so no partially-wired bot is left.
+        # It refuses before loading the cogs, so no partially-wired bot is left.
         mock_load.assert_not_awaited()
 
     async def test_postgres_url_starts_archive_and_drainer(
@@ -270,7 +270,7 @@ class TestSetupHookDisabledArchive:
     async def test_garbage_flag_aborts_startup_before_anything(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Validation placement is the feature: the flag is read FIRST, so a typo
+        """Validation placement is the feature: the flag is read first, so a typo
         aborts startup with a named error instead of surfacing inside
         @_guild_op-wrapped push_history, where the ValueError would be swallowed
         into one warning per song while archiving silently stayed off."""
@@ -381,7 +381,7 @@ class TestLeftoverOutboxWarning:
         stayed green through any change to which helper the probe calls. XLEN
         models the real ResponseError faithfully, so the path runs here honestly.
         """
-        # A LIST at the stream's key: the real leftover shape, from a build
+        # A list at the stream's key: the real leftover shape, from a build
         # predating the switch to a stream outbox.
         await fake_redis.rpush(HISTORY_OUTBOX_KEY, b"legacy-entry")
         mock_load = AsyncMock()
@@ -400,9 +400,9 @@ class TestOutboxGroupBootstrap:
 
     The helper's own discrimination (BUSYGROUP tolerated, WRONGTYPE raised) is
     asserted in test_redis_client and against real Redis; these pin that it runs,
-    that it runs BEFORE the drainer, and that a WRONGTYPE aborts startup. That
-    abort is load-bearing (golden rule 5): push_history is @_guild_op, so a
-    leftover LIST would otherwise be swallowed into one warning per song."""
+    that it runs before the drainer, and that a WRONGTYPE aborts startup. The abort
+    has to happen there: push_history is @_guild_op, so a leftover list would
+    otherwise be swallowed into one warning per song."""
 
     async def test_wrongtype_aborts_startup_before_anything_starts(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
@@ -422,7 +422,7 @@ class TestOutboxGroupBootstrap:
             pytest.raises(ResponseError, match="WRONGTYPE"),
         ):
             await app.setup_hook()
-        # Aborted BEFORE the archive tier or the cogs: a drainer started
+        # Aborted before the archive tier or the cogs: a drainer started
         # against a mis-typed key would raise on every read, and a loaded cog
         # would accept plays whose history has nowhere to go.
         mock_pg.assert_not_called()
@@ -520,7 +520,7 @@ class TestDefaultPostgresPassword:
         assert "ALTER USER" in caplog.text
         assert "up -d" in caplog.text  # the container recreate, or the DSN is stale
 
-        # And in the ORDER that works. This check reads the bot's DSN, so
+        # And in the order that works. This check reads the bot's DSN, so
         # `setup_env.sh --force` silences it while the server still accepts the
         # old password — running that first walks the operator through the one
         # window where they are exposed and nothing says so.
@@ -608,7 +608,7 @@ class TestClose:
         """Two independent constraints, asserted together because they compose:
         the drainer's final drain reads the outbox and writes Postgres, so it
         needs both alive; super().close() can still dispatch events whose
-        cleanup() writes Redis, so it must run BEFORE the pool closes or a clean
+        cleanup() writes Redis, so it must run before the pool closes or a clean
         shutdown leaves state looking like a crash.
         """
         order: list[str] = []
@@ -639,10 +639,10 @@ class TestClose:
     async def test_teardown_completes_when_a_step_raises(
         self, app: MusicBotApp, sick: str
     ) -> None:
-        """REGRESSION: drainer.stop() and archive.close() were both unguarded and
+        """regression: drainer.stop() and archive.close() were both unguarded and
         both can raise (a hung Postgres, a drainer task that died). Because
         _teardown_started is already set the retry path short-circuits, so every
-        step AFTER the raiser was skipped permanently: Redis pool left open,
+        step after the raiser was skipped permanently: Redis pool left open,
         discord.py never closed, the yt-dlp pool left to its 61s atexit join, and
         no spans flushed — which hid the very failure that caused it.
         """

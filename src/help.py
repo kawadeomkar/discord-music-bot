@@ -230,7 +230,7 @@ class MusicHelpCommand(commands.HelpCommand):
 
         embed = discord.Embed(
             title=f"{prefix}{command.qualified_name}(1)",
-            # The NAME section, as man(1) writes it: name — one-line summary.
+            # The name section, as man(1) writes it: name — one-line summary.
             description=(
                 f"**{command.qualified_name}** — "
                 f"{command.brief or command.short_doc or 'no description'}"

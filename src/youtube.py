@@ -32,7 +32,7 @@ ytdlp_pool = YtdlpPool()
 class ExtractionError(Exception):
     """A yt-dlp failure, flattened so it survives the process boundary: yt-dlp's own
     errors store sys.exc_info(), so __dict__ carries a live traceback and will not
-    pickle. Every field here MUST have a default — BaseException.__reduce__ rebuilds
+    pickle. Every field here must have a default — BaseException.__reduce__ rebuilds
     as `cls(*args)`, so a required positional raises TypeError while UNPICKLING in the
     parent, killing the executor's result thread and bricking the pool permanently.
     """
@@ -145,7 +145,7 @@ class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
 class YTDLEntry(YTDLVideoMetadata, total=False):
     """One leaf of yt-dlp's info-dict tree: a search result's full video, or a flat
     playlist's sparser `id`/`title`/`url` shape (_YTDL_PLAYLIST_OPTS, extract_flat).
-    Both fit because every key is optional. Deliberately NOT recursive — yt_source
+    Both fit because every key is optional. Deliberately not recursive — yt_source
     skips nested playlists (`_type == "playlist"`) rather than descending.
     """
 
@@ -214,10 +214,10 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ExtractRequest:
-    """Everything one yt-dlp extraction needs, as a single picklable payload. kw_only is
-    load-bearing: `download` and `process` are both bool, so a positional pair could
-    transpose silently — same value, wrong meaning, invisible to pyright. Frozen + slots
-    because it crosses a process boundary; use dataclasses.replace() for variants.
+    """Everything one yt-dlp extraction needs, as a single picklable payload. kw_only
+    because `download` and `process` are both bool, so a positional pair could transpose
+    silently — same value, wrong meaning, invisible to pyright. Frozen + slots because it
+    crosses a process boundary; use dataclasses.replace() for variants.
     """
 
     url: str
@@ -282,7 +282,7 @@ class _YtdlpLogger:
 
 _YTDLP_LOGGER = _YtdlpLogger()
 
-# Client strategy — read this before bumping yt-dlp.
+# Client strategy. Relevant when bumping yt-dlp.
 #
 # android_vr is primary: it needs no PO token and serves audio-only formats. yt-dlp
 # resolves `default` by JS-runtime availability, so shipping Deno (yt-dlp's `deno`
@@ -290,7 +290,7 @@ _YTDLP_LOGGER = _YtdlpLogger()
 # ('android_vr', 'web_safari') and makes the fallback's signature/n challenges solvable.
 # web_safari serves *muxed* formats only (HLS 91-96, https 18) — the `/best` leg picks
 # one and ffmpeg's -vn drops the video. The bgutil-pot-provider sidecar mints PO tokens
-# via the bgutil-ytdlp-pot-provider plugin, whose pyproject pin MUST move in lockstep
+# via the bgutil-ytdlp-pot-provider plugin, whose pyproject pin must move in lockstep
 # with that compose image tag.
 #
 # Degradation ladder — every rung lands on a previously-working configuration:
@@ -343,7 +343,7 @@ _YTDL_STREAM_OPTS = {
 
 # Used by yt_source: the unified single-extraction play path. One stream-opts extraction
 # returns identity AND a playable stream URL, so a single call populates both the
-# ytdl:source and ytdl:stream caches. default_search is what the stream opts lack for
+# ytdl:source and ytdl:stream caches. Default_search is what the stream opts lack for
 # bare search queries; retries stays at 10 because this call serves playback.
 _YTDL_STREAM_SEARCH_OPTS = {
     **_YTDL_STREAM_OPTS,

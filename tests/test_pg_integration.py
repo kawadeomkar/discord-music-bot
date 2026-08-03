@@ -207,7 +207,7 @@ class TestMigrations:
     ) -> None:
         """Two pods (or a manual run racing the compose one-shot) starting at
         once is normal, and the advisory lock makes the loser wait rather than
-        double-apply. raw_pg_dsn, NOT pg_dsn: on an already-migrated database
+        double-apply. raw_pg_dsn, not pg_dsn: on an already-migrated database
         every racer hits the `IF NOT EXISTS` short-circuit and no concurrent
         bootstrap happens; on a VIRGIN one this hits the pg_type catalog race
         `CREATE TABLE IF NOT EXISTS` does not protect against, ~50% of runs."""
@@ -427,7 +427,7 @@ class TestPoisonAgainstARealServer:
 
 def _boundary_entries() -> list[HistoryEntry]:
     """Every clamp __post_init__ performs, one entry each. Enumerated rather than
-    sampled: this list IS the claim that the residual poison set is empty, so
+    sampled: this list is the claim that the residual poison set is empty, so
     extend it whenever a column type or a domain tuple changes. Distinct
     webpage_urls keep play_history_dedup from collapsing rows that clamp alike."""
     return [
@@ -493,7 +493,7 @@ class TestSchemaLock:
         # Backward: bypass the validator and the database still refuses. Every
         # CHECK gets its own case; object.__setattr__ is how a regression would
         # present (a dropped clamp, or a field added to the dataclass but not to
-        # a domain tuple). The constraint NAME is asserted, not just the class —
+        # a domain tuple). The constraint name is asserted, not just the class —
         # a row can violate several CHECKs at once and the server reports
         # whichever it evaluates first, so a bare raises() would pass even with
         # the constraint under test dropped from the schema entirely.
@@ -511,7 +511,7 @@ class TestSchemaLock:
     ) -> None:
         """The one deliberate hole in "constructible implies insertable":
         __post_init__ floors every integer at 0 while the CHECK is strictly
-        `> 0`, so this entry is built WITHOUT bypassing the validator and still
+        `> 0`, so this entry is built without bypassing the validator and still
         refused. Both halves are choices — clamping up to 1 would file an
         unattributable play into a real guild's history, relaxing the CHECK would
         make guild 0 a bucket of orphans no read path excludes. Refusing routes
@@ -525,7 +525,7 @@ class TestSchemaLock:
 
     async def test_a_check_violation_is_classified_as_poison(self) -> None:
         # CheckViolationError is SQLSTATE 23514 under
-        # IntegrityConstraintViolationError, NOT a DataError. Without that arm in
+        # IntegrityConstraintViolationError, not a DataError. Without that arm in
         # _POISON a violation propagates past the quarantine path and wedges the
         # drain head permanently on a non-evictable stream.
         assert issubclass(
@@ -565,7 +565,7 @@ class TestSchemaLock:
                 )
                 == 1
             )
-            # And the constraint is live for NEW rows even while unvalidated.
+            # And the constraint is live for new rows even while unvalidated.
             with pytest.raises(asyncpg.exceptions.CheckViolationError):
                 await conn.execute(
                     "INSERT INTO play_history (guild_id, title, webpage_url, "
@@ -584,7 +584,7 @@ class TestRejectsTable:
     async def test_a_nul_bearing_payload_round_trips_through_bytea(
         self, pg_dsn: str
     ) -> None:
-        # THE reason payload is bytea. A NUL byte is the first poison vector, and
+        # the reason payload is bytea. A NUL byte is the first poison vector, and
         # both jsonb and text refuse it — so either would fail to store exactly
         # the class of row this table exists to capture.
         entry = _entry(1)
@@ -674,7 +674,7 @@ class TestRejectsTable:
 
 
 class TestMessageIdColumn:
-    """message_id reaches Postgres. The column is `DEFAULT 0` with a
+    """message_id reaches Postgres. The column is `default 0` with a
     `message_id >= 0` CHECK, so a value dropped between the wire and the INSERT
     lands cleanly and is indistinguishable from a song that genuinely had no Now
     Playing host. Only a real round trip catches that; the drainer tests never
@@ -799,7 +799,7 @@ class TestDrainerEndToEnd:
         archive: PostgresHistoryArchive,
         fake_redis: Redis,
     ) -> None:
-        """The former poison classes against a real server: ALL FIVE land and
+        """The former poison classes against a real server: all FIVE land and
         nothing is dead-lettered, because `title="bad\\x00title"` and
         `played_at=1e18` are clamped by __post_init__ at construction. Kept in
         the pg tier because the claim is about what a real Postgres accepts (NUL
@@ -851,7 +851,7 @@ class TestBackfillAgainstARealArchive:
 
         assert first.ok and second.ok
         assert first.attempted == second.attempted == 5
-        # THE assertion the unit tier cannot make: the second run inserted
+        # the assertion the unit tier cannot make: the second run inserted
         # nothing new, because ON CONFLICT collapsed every row.
         rows = await archive.recent(42, 100)
         assert len(rows) == 5

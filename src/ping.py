@@ -80,7 +80,7 @@ class ProbeState(Enum):
 class ArchiveHealth(Protocol):
     """The only thing the Postgres row needs from the play-history archive: a way to
     prove its database answers. Declared structurally rather than imported from
-    history_archive.py so ping.py stays out of asyncpg's import graph. Deliberately NOT
+    history_archive.py so ping.py stays out of asyncpg's import graph. Deliberately not
     the raw asyncpg.Pool: the pool is created lazily on first archive use, so a
     just-started bot has none and a pool-shaped probe would report the tier as
     "not configured".
@@ -149,7 +149,7 @@ async def probe_spotify(
 ) -> ProbeResult:
     """Spotify's row: the *source's* usability, not just reachability. `status` (from
     MusicBot._spotify_status' startup probe) separates "configured but rejected" from
-    "reachable but slow" without spending a doomed API call; it defaults to ENABLED so a
+    "reachable but slow" without spending a doomed API call; it defaults to enabled so a
     caller with no status still gets the plain reachability probe.
     """
     # None client (started without credentials) and a client with empty creds are
@@ -286,7 +286,7 @@ async def collect_versions() -> dict[str, str]:
 # Pure presentation: takes the values SECTION 1 produces and decides dots, colours
 # and layout. No I/O.
 
-# One band table drives BOTH the status dot and the embed accent, so a green dot can't
+# One band table drives both the status dot and the embed accent, so a green dot can't
 # appear under a yellow accent. These bands (≤100/≤200) differ on purpose from
 # util.latency_color's (≤50/≤100/≤200), which backs send_latency_line — don't swap them.
 _LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
@@ -399,9 +399,9 @@ def default_password_embed() -> Optional[discord.Embed]:
     """A standing warning that the Postgres password is still the compose default, or
     None when it is not.
 
-    Rendered on EVERY -ping rather than once at startup: this is the surface an operator
-    returns to, so it keeps the problem visible until it is fixed. IT READS THE DSN, NOT
-    THE SERVER, which is why the remedy below is ordered — `setup_env.sh --force` first
+    Rendered on every -ping rather than once at startup: this is the surface an operator
+    returns to, so it keeps the problem visible until it is fixed. IT reads the DSN, not
+    the SERVER, which is why the remedy below is ordered — `setup_env.sh --force` first
     would clear the warning while Postgres still accepts the old password. Gated on the
     archive flag, like setup_hook's startup ERROR: with the archive disabled there is no
     deployed Postgres to warn about, and an advisory for an absent database is noise.
@@ -515,7 +515,7 @@ async def run_health_dashboard(
         return changed
 
     try:
-        # 1. launch INSIDE try so `finally` cancels them wherever a later await raises.
+        # 1. launch inside try so `finally` cancels them wherever a later await raises.
         #    create_task copies the otel context, so probe spans nest under bot.ping.
         tasks = {
             "Redis": asyncio.create_task(probe_redis(redis)),
@@ -535,18 +535,18 @@ async def run_health_dashboard(
         # Computed once: it is static, so it cannot make _ping_embed_changed see a
         # difference that is not there.
         #
-        # OWNER ONLY. -ping has no permission gate, so this advisory — which names the
-        # credential and confirms THIS host runs on it — would otherwise reach every
+        # OWNER only. -ping has no permission gate, so this advisory — which names the
+        # credential and confirms this host runs on it — would otherwise reach every
         # member of every guild and stay in Discord's retained history. The value is a
         # public constant in a GPL repo, so the leak was never the string but the free
         # confirmation of which hosts are worth trying. The startup ERROR still fires on
         # every boot for anyone reading logs.
         #
-        # ORDER IS LOAD-BEARING, not style. is_owner() is not a local predicate:
+        # Order matters here. is_owner() is not a local predicate:
         # MusicBotApp passes neither owner_id nor owner_ids, so discord.py falls through
         # to application_info() — a REST GET, retried up to 5 times over ~25s on a 5xx,
         # and it raises rather than returning False. Written as `embed() if await
-        # is_owner() else None` the await runs FIRST and UNCONDITIONALLY, putting a
+        # is_owner() else None` the await runs first and unconditionally, putting a
         # network round trip ahead of the skeleton send this function promises is
         # immediate, and PING_DEADLINE_SECS does not bound it (that clock starts after
         # the send). Ask the cheap, local question first.
@@ -557,7 +557,7 @@ async def run_health_dashboard(
             embeds=[e for e in (warning, last) if e is not None]
         )
 
-        # 3. live-edit loop: tick, drain, edit-on-change; exit early when done.
+        # 3. Live-edit loop: tick, drain, edit-on-change; exit early when done.
         deadline = loop.time() + PING_DEADLINE_SECS
         while pending and (remaining := deadline - loop.time()) > 0:
             await asyncio.sleep(min(PING_TICK_SECS, remaining))

@@ -68,7 +68,7 @@ class NowPlayingField:
 # ── Parsing helpers (module-level; shared by both from_redis constructors) ───
 #
 # The bare `except A, B:` clauses below are PEP 758 (Python 3.14+) multi-exception
-# syntax, NOT the old Python-2 catch-one/bind-name form: they catch the tuple
+# syntax, not the old Python-2 catch-one/bind-name form: they catch the tuple
 # (A, B) and let unlisted types propagate. ruff's formatter normalizes to this at
 # `target-version = "py314"`; do not re-parenthesize, ruff strips it back.
 
@@ -128,7 +128,7 @@ class GuildStateData:
     """Typed snapshot of guild:{id}:state deserialized from Redis.
 
     Zero-value defaults throughout, so GuildStateData() is the canonical "empty
-    hash" snapshot. volume is None when nothing is stored, NOT 1.0: the caller must
+    hash" snapshot. volume is None when nothing is stored, not 1.0: the caller must
     tell "nothing persisted" from "user set 1.0" so a restore can skip the
     assignment instead of clobbering a concurrent -volume with a fabricated default.
     """
@@ -567,9 +567,9 @@ class HistoryEntry:
     layer degrades. The field set matches the Postgres play_history row.
 
     guild_id is redundant on the per-guild display list (the key carries it) but
-    load-bearing on the global history:outbox stream, where all guilds interleave
-    and the drainer maps each entry to a Postgres row; entries written before the
-    field existed parse as guild_id=0.
+    required on the global history:outbox stream, where all guilds interleave and
+    the drainer maps each entry to a Postgres row. Entries written before the field
+    existed parse as guild_id=0.
 
     message_id is a WEAK reference — the NP host migrates across messages during
     one song and a dedicated host is deleted when retired, so it records which
@@ -597,21 +597,21 @@ class HistoryEntry:
         _row_to_entry, dataclasses.replace, the backfill — so no consumer re-proves
         it and the archive holds no opinion about data.
 
-        ONE FIELD IS EXEMPT: the clamp floors every integer at 0, but play_history's
+        One field is exempt: the clamp floors every integer at 0, but play_history's
         CHECK on guild_id is strictly `> 0`, so a guild_id-0 entry is constructible
-        and NOT insertable. Clamping up to 1 would file an unattributable play into
+        and not insertable. Clamping up to 1 would file an unattributable play into
         a real guild's history; relaxing the CHECK would make guild 0 a permanent
         bucket of orphans no read path excludes. Refusing at the database routes
         those entries to play_history_rejected, where a row means "a producer
         stopped stamping guild_id" — the actual defect.
 
-        These are the ONLY ways a wire-parseable entry could fail an INSERT:
+        These are the only ways a wire-parseable entry could fail an INSERT:
         everything else the columns could refuse — lone surrogates, non-finite
         floats, integers past 64 bits — orjson already refuses to encode. Range
         tests rather than pairs of bound checks because a chained comparison is
         False for NaN, which lands NaN on the sentinel.
 
-        TOTAL BY DESIGN — never raises, and it runs on the READ path over stored
+        Total BY DESIGN — never raises, and it runs on the read path over stored
         rows that predate it, so a validator that rejected them would break -history
         for precisely the guilds with the most history; strictness lives in the DB
         CHECK constraints instead. No type coercion: HistoryEntry(title=None)

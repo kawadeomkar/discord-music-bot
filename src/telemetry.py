@@ -158,7 +158,7 @@ def setup_cli_logging() -> None:
     `src.util.get_logger` hands back a structlog proxy that is inert until something
     configures structlog, and only this module does; unconfigured it falls back to
     PrintLoggerFactory — readable text on stdout that never enters the logging module,
-    so `2> errors.log` captures nothing. Deliberately NOT setup_telemetry(): a hand-run
+    so `2> errors.log` captures nothing. Deliberately not setup_telemetry(): a hand-run
     one-shot needs no TracerProvider or OTLP flush, and the SDK's LoggingHandler is
     deprecated upstream, so importing it under `filterwarnings = error` fails the suite.
     """

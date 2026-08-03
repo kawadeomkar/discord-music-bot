@@ -86,7 +86,7 @@ def _call_with_context(carrier: dict[str, str], fn: Callable[..., T], *args: Any
 
 class RemoteCallError(Exception):
     """Generic picklable stand-in for a worker exception that can't cross the boundary.
-    Every field MUST have a default: BaseException.__reduce__ rebuilds as `cls(*args)`,
+    Every field must have a default: BaseException.__reduce__ rebuilds as `cls(*args)`,
     so a required positional *serialises* fine in the worker and then fails to *unpickle*
     in the parent's executor-manager thread, bricking the pool. Same rule as
     ExtractionError in src/youtube.py.
@@ -174,7 +174,7 @@ class YtdlpPool:
         )
 
     def _stop_log_listener(self) -> None:
-        """Drain and stop the listener. MUST run only after the workers are gone
+        """Drain and stop the listener. Must run only after the workers are gone
         (join or terminate): stop() enqueues a sentinel and drains what is already
         queued, so stopping while workers still emit discards their final records."""
         listener = self._log_listener
@@ -276,7 +276,7 @@ class YtdlpPool:
                     f"yt-dlp pool #{self._generation} did not finish joining within "
                     f"{timeout}s — terminating its workers"
                 )
-                # shutdown(wait=False) does NOT bound exit: the abandoned join keeps
+                # shutdown(wait=False) does not bound exit: the abandoned join keeps
                 # the manager thread alive and _python_exit joins it at interpreter
                 # exit. Measured: 61s with an in-flight extraction, 3.4s once SIGTERMed.
                 if isinstance(executor, ProcessPoolExecutor):
@@ -291,7 +291,7 @@ class YtdlpPool:
 
     def shutdown(self, wait: bool = True) -> None:
         """Synchronous close, for a caller with no event loop to await. Used by tests;
-        production flows through aclose(). Deliberately NOT an atexit or signal handler
+        production flows through aclose(). Deliberately not an atexit or signal handler
         despite the shape inviting it: discord.py already routes SIGTERM and
         KeyboardInterrupt through the bot's close(). Blocking by default, idempotent,
         safe when no executor was created; after this, submits raise PoolClosedError.

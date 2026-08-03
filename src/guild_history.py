@@ -84,7 +84,7 @@ class GuildHistory:
         play this command can ask for. See docs/ARCHITECTURE.md#history-read-path.
 
         The deque is MERGED, not a fallback — a second leg can only ADD depth.
-        Reaching it only when the leg above came back EMPTY let a single Redis row
+        Reaching it only when the leg above came back empty let a single Redis row
         suppress the whole cache. Dedup is exact rather than quantized: both legs
         carry the same `time.time()` float (orjson round-trips a double without
         loss), so equality is identity.
@@ -98,9 +98,9 @@ class GuildHistory:
         seen: set[HistoryEntry] = set()
 
         def take(entries: Sequence[HistoryEntry]) -> None:
-            """Append what this leg adds. FIRST leg to carry an entry wins."""
+            """Append what this leg adds. First leg to carry an entry wins."""
             for entry in entries:
-                # THE WHOLE ENTRY IS THE IDENTITY, not (played_at, url): both legs
+                # the whole entry is the identity, not (played_at, url): both legs
                 # carry the same object's values, so a full-value comparison is
                 # exact. played_at defaults to 0.0 on entries predating the
                 # timestamped wire format, so the narrower key collapsed two

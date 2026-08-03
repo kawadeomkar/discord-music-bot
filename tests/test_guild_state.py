@@ -626,13 +626,13 @@ def _entry_with(**kwargs: Any) -> HistoryEntry:
     """Constructor shim for the parametrized domain tests below.
 
     Splatting a parametrized field name into HistoryEntry makes pyright check the
-    value against EVERY field's type; widening here confines the Any to one line.
+    value against every field's type; widening here confines the Any to one line.
     """
     return HistoryEntry(**kwargs)
 
 
 class TestHistoryEntryDomain:
-    """The schema lock: constructing a HistoryEntry IS the proof that Postgres
+    """The schema lock: constructing a HistoryEntry is the proof that Postgres
     accepts it, so every clamp is asserted on the TYPE rather than on any archive
     helper — the property is about the value object, not the repository.
     """
@@ -741,7 +741,7 @@ class TestHistoryEntryDomain:
         )
 
     def test_replace_re_runs_the_validator(self) -> None:
-        # Load-bearing: backfill_history stamps guild_id onto legacy entries
+        # backfill_history stamps guild_id onto legacy entries
         # with dataclasses.replace, on the least trustworthy data in the system.
         # If that bypassed __post_init__ the whole lock would be decorative.
         entry = HistoryEntry(guild_id=1, title="x")
@@ -814,7 +814,7 @@ class TestHistoryEntryFromSong:
 
     def test_guild_id_and_message_id_are_required_keywords(self) -> None:
         # Requiredness is the whole protection for message_id: play_history's
-        # CHECK is `message_id >= 0` with DEFAULT 0, so a forgotten stamp inserts
+        # CHECK is `message_id >= 0` with default 0, so a forgotten stamp inserts
         # cleanly and reads as a song that genuinely had no host. pyright catches
         # a missing argument only while no default exists — adding one silently
         # retires the guarantee, and this is what notices.

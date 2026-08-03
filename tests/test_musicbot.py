@@ -245,7 +245,7 @@ class TestTypingKeepaliveCancellation:
     async def test_cancelled_keepalive_ends_cancelled_not_completed(
         self, mock_ctx: MagicMock
     ) -> None:
-        """cancel() must leave the task CANCELLED, not merely done(). Swallowing
+        """cancel() must leave the task cancelled, not just done(). Swallowing
         CancelledError makes cooperative cancellation a lie: task.cancelled() is
         False, and a cancellation aimed at an enclosing scope stops here."""
         task = asyncio.create_task(_typing_keepalive(mock_ctx))
@@ -272,8 +272,8 @@ class TestTypingKeepaliveCancellation:
         mock_ctx.typing.return_value.__aenter__ = AsyncMock(
             return_value=None, side_effect=lambda: entered.set()
         )
-        # return_value=None is load-bearing for any cancellation assert through this
-        # CM: a __aexit__ returning a TRUTHY value SUPPRESSES the exception being
+        # return_value=None is required for any cancellation assert through this
+        # CM: an __aexit__ returning a truthy value suppresses the exception being
         # unwound, so a bare AsyncMock() eats the CancelledError and fails the assert
         # below for an unrelated reason. Real Typing.__aexit__ returns None.
         mock_ctx.typing.return_value.__aexit__ = AsyncMock(
@@ -321,7 +321,7 @@ class TestTypingKeepaliveCancellation:
         self, mock_ctx: MagicMock
     ) -> None:
         """End-to-end: the task background_typing() spawns and cancels on exit
-        must settle as CANCELLED. background_typing does not await it, so this
+        must settle as cancelled. background_typing does not await it, so this
         is the only place the contract is observable from outside."""
         spawned: list[asyncio.Task[Any]] = []
         real_create_task = asyncio.create_task
@@ -404,7 +404,7 @@ class TestQueueSource:
 
 class TestSpotifyDisabled:
     """When Spotify isn't usable — no credentials (self.spotify is None, status
-    DISABLED) or credentials rejected at startup (status INVALID) — any Spotify
+    disabled) or credentials rejected at startup (status invalid) — any Spotify
     source must raise SpotifyDisabledError, while every other source keeps
     working."""
 
@@ -426,7 +426,7 @@ class TestSpotifyDisabled:
         self, music_bot: MusicBot
     ) -> None:
         """Credentials were present (client built) but rejected at startup: the
-        gate still refuses, and the error reports INVALID rather than DISABLED."""
+        gate still refuses, and the error reports invalid rather than disabled."""
         music_bot._spotify_status = SpotifyStatus.INVALID
         with pytest.raises(SpotifyDisabledError) as exc:
             music_bot._require_spotify()
@@ -453,7 +453,7 @@ class TestSpotifyDisabled:
     async def test_spotify_track_raises_when_credentials_invalid(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Even with a live client object, an INVALID status short-circuits the
+        """Even with a live client object, an invalid status short-circuits the
         source before any Spotify API call is attempted."""
         music_bot._spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
@@ -1102,7 +1102,7 @@ class TestCleanup:
     async def test_does_not_cancel_current_task(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """cleanup() skips cancellation when the alone-timer IS the running task (self-cancel guard)."""
+        """cleanup() skips cancellation when the alone-timer is the running task (self-cancel guard)."""
         current = asyncio.current_task()
         assert current is not None, "test must run inside an asyncio.Task"
         music_bot._alone_timers[mock_guild.id] = (
@@ -1201,7 +1201,7 @@ class TestCleanup:
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
         """A stopped bot must not keep advertising the song it stopped. The reset
-        runs AFTER the disconnect: until the voice client is gone it still registers
+        runs after the disconnect: until the voice client is gone it still registers
         as playing, so update_activity() bails and the stale presence survives."""
         call_order: list[str] = []
         mp = self._make_minimal_mp(music_bot, mock_guild)
@@ -1375,7 +1375,7 @@ class TestCogBeforeInvoke:
     async def test_no_persist_when_channel_unchanged(
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
-        """set_connection is NOT called when the text channel hasn't changed."""
+        """set_connection is not called when the text channel hasn't changed."""
         channel = MagicMock(spec=discord.TextChannel)
         mock_ctx.channel = channel
 
@@ -1395,7 +1395,7 @@ class TestCogBeforeInvoke:
     async def test_no_persist_when_no_voice_client(
         self, music_bot: MusicBot, mock_ctx: MagicMock, mock_guild: MagicMock
     ) -> None:
-        """set_connection is NOT called when the bot isn't in a voice channel yet."""
+        """set_connection is not called when the bot isn't in a voice channel yet."""
         old_channel = MagicMock(spec=discord.TextChannel)
         new_channel = MagicMock(spec=discord.TextChannel)
         mock_ctx.channel = new_channel
@@ -1787,7 +1787,7 @@ class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
         history = GuildHistory(None, on_outbox_push=lambda: None)
-        # No store, so the in-memory deque IS the whole read path — these tests are
+        # No store, so the in-memory deque is the whole read path — these tests are
         # about rendering (ordering, chunking, limits, fields), not which leg served
         # them; that is TestHistoryReadsRedis, where the legs DISAGREE. Beware the
         # trap the old Postgres double hit: recent() swallows every error, so a
@@ -1936,7 +1936,7 @@ class TestHistoryReadsRedis:
         stored = _history_entries(2)  # Song 0 (t=1000), Song 1 (t=1001)
         for entry in stored:
             await store.push_history(entry)
-        # Older than both, and present ONLY in the deque — so its position in
+        # Older than both, and present only in the deque — so its position in
         # the output says which legs ran: absent means the Redis leg never got
         # read, first means the cache won, last means both legs merged and
         # sorted, which is the contract.
@@ -2003,7 +2003,7 @@ class TestCogLoadSpotifyValidation:
     async def test_cog_load_spawns_probe_without_blocking(
         self, music_bot: MusicBot
     ) -> None:
-        """cog_load returns immediately (leaving status ENABLED) and the probe
+        """cog_load returns immediately (leaving status enabled) and the probe
         runs as a tracked background task, not inline."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(return_value=None)
@@ -2034,7 +2034,7 @@ class TestCogLoadSpotifyValidation:
         assert music_bot._spotify_status is SpotifyStatus.INVALID
 
     async def test_network_error_leaves_enabled(self, music_bot: MusicBot) -> None:
-        """A non-auth failure is inconclusive: Spotify stays ENABLED."""
+        """A non-auth failure is inconclusive: Spotify stays enabled."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(
             side_effect=OSError("connection refused")
@@ -2044,7 +2044,7 @@ class TestCogLoadSpotifyValidation:
         assert music_bot._spotify_status is SpotifyStatus.ENABLED
 
     async def test_timeout_leaves_enabled(self, music_bot: MusicBot) -> None:
-        """A probe timeout is inconclusive (not an auth rejection): stays ENABLED."""
+        """A probe timeout is inconclusive (not an auth rejection): stays enabled."""
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.validate = AsyncMock(side_effect=asyncio.TimeoutError)
         music_bot._spotify_status = SpotifyStatus.ENABLED
@@ -2517,7 +2517,7 @@ class TestPlayFrontInsertion:
     async def test_cold_path_waits_for_restore_before_enqueueing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Load-bearing ordering: put_front LPUSHes the Redis mirror while
+        """Ordering: put_front LPUSHes the Redis mirror while
         restore_entries replays already-listed entries in memory only, so
         inserting before restore reads its snapshot double-queues the song."""
         mock_ctx.voice_client = None
@@ -3080,7 +3080,7 @@ class TestAloneCountdown:
     async def test_skips_cleanup_when_user_rejoined(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """After the sleep, if a human is present, cleanup is NOT called."""
+        """After the sleep, if a human is present, cleanup is not called."""
         self._setup_mp(music_bot, mock_guild)
 
         human = MagicMock(spec=discord.Member)
@@ -3181,7 +3181,7 @@ class TestRestoreGuildStateReadFailed:
         fake_redis_bot: aioredis.Redis,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """get_recovery_gate() returning None (Redis unavailable) must NOT read as
+        """get_recovery_gate() returning None (Redis unavailable) must not read as
         "nothing to restore": recovery skips with a WARNING and no channel or player
         work — distinguishable from the empty-gate case, which skips silently."""
         from src.redis_client import GuildRedisStore
@@ -3705,7 +3705,7 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """Song ended mid-resolve: the resolved qobj is front-inserted directly, NOT
+        """Song ended mid-resolve: the resolved qobj is front-inserted directly, not
         by re-invoking -play, which would re-parse, re-resolve and (for playlists)
         enqueue every track right after the first-track-only notice. The user still
         gets a confirmation embed."""
@@ -3807,7 +3807,7 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """The stream-URL cache is warmed BEFORE interject stops the current
+        """The stream-URL cache is warmed before interject stops the current
         song — a cache miss at dequeue would otherwise put yt-dlp dead air
         between the interrupt and the playnow song starting."""
         from src.musicplayer import InterjectOutcome

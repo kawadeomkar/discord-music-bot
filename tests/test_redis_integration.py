@@ -9,13 +9,13 @@ fakeredis runs every stream command the design uses, but five behaviours
 diverge from `redis:7-alpine` (measured on 7.4.9) and every one fails in the
 SAFE-LOOKING direction — green unit tests, broken production:
 
-    1  xtrim(approximate=True), redis-py's DEFAULT: fakeredis trims EXACTLY;
+    1  xtrim(approximate=True), redis-py's default: fakeredis trims exactly;
        real Redis trims NOTHING on a small stream and reports success anyway
     2  XAUTOCLAIM completion cursor: fakeredis returns the last-scanned id,
        real Redis returns "0-0"
     3  XINFO GROUPS `lag`: fakeredis is off by one on a fresh group and goes
        NEGATIVE after deletion; real Redis returns nil when unreconcilable
-    4  XADD against a LIST key: fakeredis raises AttributeError, real Redis
+    4  XADD against a list key: fakeredis raises AttributeError, real Redis
        raises ResponseError (WRONGTYPE)
     5  ref_policy=KEEPREF/DELREF/ACKED: syntax error below Redis 8.2 on both
 
@@ -273,7 +273,7 @@ class TestTrimIsBlindToThePel:
 
 
 class TestWrongTypeIsAResponseError:
-    """DIVERGENCE 4. A pre-stream LIST at history:outbox must abort startup, and the
+    """DIVERGENCE 4. A pre-stream list at history:outbox must abort startup, and the
     abort turns on the exception CLASS: ensure_outbox_group tolerates only
     BUSYGROUP and re-raises everything else. fakeredis raises AttributeError
     from XADD against a list, so only a real server can prove the class."""
@@ -298,7 +298,7 @@ class TestWrongTypeIsAResponseError:
     async def test_outbox_depth_against_a_list_raises_wrongtype(
         self, redis: aioredis.Redis
     ) -> None:
-        # The DISABLED arm of the same condition: setup_hook's leftover-outbox
+        # The disabled arm of the same condition: setup_hook's leftover-outbox
         # probe calls outbox_depth (XLEN) and downgrades a ResponseError to a
         # warning instead of aborting, so the class matters there too. fakeredis
         # models XLEN-against-a-list correctly; this pins that the server agrees.
@@ -328,7 +328,7 @@ class TestNogroupAfterDelete:
         await ensure_outbox_group(redis)
         await _push(redis, 1)
         await redis.delete(HISTORY_OUTBOX_KEY)
-        await _push(redis, 2)  # recreates the key, WITHOUT a group
+        await _push(redis, 2)  # recreates the key, without a group
         with pytest.raises(aioredis.ResponseError, match="NOGROUP"):
             await read_outbox_new(redis, 10)
         # And the heal restores service without losing the entry.
@@ -365,7 +365,7 @@ class TestAutoclaimCursorContract:
     """DIVERGENCE 2. Real Redis signals a completed scan with "0-0"; fakeredis
     returns the last-scanned ID, which fed back as an inclusive start re-delivers
     entries already counted. So the sweep terminates on "this pass found nothing
-    new" and counts DISTINCT ids — correct under both conventions."""
+    new" and counts distinct ids — correct under both conventions."""
 
     async def test_a_completed_scan_returns_the_zero_cursor(
         self, redis: aioredis.Redis
@@ -513,7 +513,7 @@ class TestDisjointDelivery:
     async def test_a_shared_name_replays_the_same_pending_set(
         self, redis: aioredis.Redis
     ) -> None:
-        # The other half: recovery works because the PEL belongs to the NAME.
+        # The other half: recovery works because the PEL belongs to the name.
         # A successor process reading "0" inherits its predecessor's in-flight
         # batch with no lease and no TTL to wait out.
         await ensure_outbox_group(redis)
@@ -536,7 +536,7 @@ class TestRetireSemantics:
 
     async def test_re_settling_is_a_no_op(self, redis: aioredis.Redis) -> None:
         # Why the drain path needs no special no-retry pool: it runs on the
-        # application pool with retries ENABLED, and a re-sent settle is inert.
+        # application pool with retries enabled, and a re-sent settle is inert.
         await ensure_outbox_group(redis)
         await _push(redis, 1)
         batch = await read_outbox_new(redis, 10)
@@ -550,7 +550,7 @@ class TestRetireSemantics:
         self, redis: aioredis.Redis
     ) -> None:
         """MINID names an absolute ID, so a re-send is inert; MAXLEN names a
-        LENGTH, so a re-send after concurrent arrivals destroys a SECOND tranche
+        length, so a re-send after concurrent arrivals destroys a second tranche
         of unarchived plays. Both halves are asserted — "MINID is safe" only
         means something next to "MAXLEN is not"."""
         await ensure_outbox_group(redis)
@@ -587,7 +587,7 @@ class TestHistoryWritePathAgainstARealServer:
     ) -> None:
         # An oversized list left by a build that did not cap — the shape every
         # upgrading deployment has — must come down on the first write and stay
-        # PERSISTed. Golden rule 12: bounded by LENGTH, never by time.
+        # PERSISTed. Golden rule 12: bounded by length, never by time.
         store = GuildRedisStore(redis, guild_id=42)
         key = store.history_key()
         for n in range(HISTORY_CACHE_LIMIT + 25):
@@ -604,7 +604,7 @@ class TestHistoryWritePathAgainstARealServer:
     async def test_the_disabled_archive_never_creates_the_outbox(
         self, redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The consent gate, against a real server: absent, not merely empty.
+        # The consent gate, against a real server: absent, not just empty.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         store = GuildRedisStore(redis, guild_id=42)
         for n in range(5):

@@ -330,7 +330,7 @@ class TestYTDLOpts:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
     def test_default_search_is_auto(self) -> None:
-        # default_search belongs to yt_source's unified search opts, not the stream opts
+        # Default_search belongs to yt_source's unified search opts, not the stream opts
         assert _YTDL_STREAM_SEARCH_OPTS["default_search"] == "auto"
         assert "default_search" not in _YTDL_STREAM_OPTS
 
@@ -457,7 +457,7 @@ class TestYTSource:
     async def test_yt_source_reraises_non_unsupported_extraction_error(
         self, mock_ctx: MagicMock
     ) -> None:
-        """A yt-dlp failure that is NOT an unsupported-site error (e.g. a network
+        """A yt-dlp failure that is not an unsupported-site error (e.g. a network
         failure) is re-raised untouched as the classified ExtractionError — only a
         genuine UnsupportedError is remapped to the friendly message. _command_error
         renders the ExtractionError via its user_message."""
@@ -622,7 +622,7 @@ class TestYTSource:
 
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
-    populates BOTH the ytdl:source and ytdl:stream
+    populates both the ytdl:source and ytdl:stream
     caches, making queue_put's prefetch_stream a cache-hit no-op instead of a
     second YouTube extraction."""
 
@@ -661,9 +661,8 @@ class TestYTSourceUnifiedExtraction:
     async def test_stream_cache_hit_for_prefetch_after_yt_source(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
     ) -> None:
-        """prefetch_stream must not re-extract a song yt_source just resolved —
-        the whole point of the unified extraction is that the enqueue-time prefetch becomes one
-        Redis GET."""
+        """prefetch_stream must not re-extract a song yt_source just resolved: the
+        unified extraction makes the enqueue-time prefetch one Redis GET."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni2")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
             qobj = await YTDL.yt_source(
@@ -996,7 +995,7 @@ class TestRevokedStreamUrl:
         assert await fake_redis.get(f"ytdl:stream:{webpage_url}") is None
 
     async def test_probe_opens_the_request_the_way_ffmpeg_does(self) -> None:
-        """Load-bearing: a revoked URL still answers 206 to a *ranged* GET while refusing
+        """A revoked URL still answers 206 to a *ranged* GET while refusing
         the open-ended one ffmpeg actually sends. Probing with a Range header (or HEAD)
         reports a dead URL as healthy — which is the bug this whole path exists to catch.
         """
@@ -1331,7 +1330,7 @@ class TestProcessBoundaryContract:
         self, name: str, opts: dict[str, Any]
     ) -> None:
         """Every profile is an argument to _ytdlp_extract, so it is pickled per call.
-        Round-tripped, not merely dumped: a value that serialises but cannot
+        Round-tripped, not just dumped: a value that serialises but cannot
         reconstruct fails only in the worker, as an opaque BrokenProcessPool."""
         restored = pickle.loads(pickle.dumps(opts))
         assert restored.keys() == opts.keys(), f"{name} profile lost keys"
@@ -1400,13 +1399,13 @@ class TestSlimInfoReturnContract:
 
     def test_a_realistic_raw_info_dict_is_genuinely_unpicklable(self) -> None:
         """Guards the premise: if this ever starts pickling on its own, the fix below is
-        no longer load-bearing and this test should be revisited — not deleted silently.
+        no longer needed and this test should be revisited, not deleted silently.
         """
         with pytest.raises((TypeError, pickle.PicklingError)):
             pickle.dumps(_realistic_raw_info())
 
     def test_slimmed_info_round_trips_through_pickle(self) -> None:
-        """The whole point: _ytdlp_extract's return value survives the boundary. The
+        """_ytdlp_extract's return value survives the boundary. The
         pool pickles results synchronously, so a value that fails here fails *every*
         extraction with an opaque pickling error."""
         # cast to a plain dict: these assertions poke raw content, not the narrowed

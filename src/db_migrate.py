@@ -7,7 +7,7 @@ against a version it was not built for, so its database role needs no DDL rights
 and this module is the only thing that changes the schema.
 
 `migrations/NNNN_name.sql` applied in numeric order, each recorded in
-`schema_migrations` in the SAME transaction as its own DDL — Postgres has
+`schema_migrations` in the same transaction as its own DDL — Postgres has
 transactional DDL, so a half-way failure leaves nothing behind and no version row
 claiming it succeeded. `pg_advisory_xact_lock` serializes concurrent runners (two
 pods, or `just db-migrate` racing the compose one-shot, is the normal case) and
@@ -83,8 +83,8 @@ async def migrate(url: str, directory: Path = MIGRATIONS_DIR) -> int:
 
     conn = await asyncpg.connect(url, timeout=10)
     try:
-        # The bootstrap DDL runs INSIDE the advisory lock, not before it.
-        # `CREATE TABLE IF NOT EXISTS` is NOT safe to race: concurrent creators
+        # The bootstrap DDL runs inside the advisory lock, not before it.
+        # `CREATE TABLE IF NOT EXISTS` is not safe to race: concurrent creators
         # hit a catalog race and all but one die with
         #   UniqueViolationError: duplicate key value violates unique
         #   constraint "pg_type_typname_nsp_index"

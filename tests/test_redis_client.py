@@ -67,7 +67,7 @@ class TestCreateRedisPool:
 
     def test_redis_errors_are_not_builtin_subclasses(self) -> None:
         """The invariant that made the old config a silent no-op: redis-py's
-        ConnectionError and TimeoutError derive from RedisError, NOT from the
+        ConnectionError and TimeoutError derive from RedisError, not from the
         builtins of the same name — so `retry_on_error=[ConnectionError,
         TimeoutError]` (the builtins) matched nothing redis-py ever raises."""
         assert not issubclass(RedisConnectionError, ConnectionError)
@@ -101,7 +101,7 @@ class TestCreateRedisPool:
     async def test_a_failing_connect_is_actually_retried(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """MUTATION GUARD: `redis.retry.Retry` in place of the asyncio one.
+        """mutation guard: `redis.retry.Retry` in place of the asyncio one.
 
         Every test above passes under either class, but the sync one never awaits:
         its call_with_retry hands back an un-awaited coroutine, so the error
@@ -445,7 +445,7 @@ class TestPushHistory:
 
 class TestPushHistoryOutbox:
     """The outbox leg of the push pipeline, in both archive modes. The suite
-    default is archive-ENABLED (conftest pins the flag), so tests that don't touch
+    default is archive-enabled (conftest pins the flag), so tests that don't touch
     it assert the full wiring; the disabled tests monkeypatch it false per case
     and pin the consent property — the outbox key is never even created.
     """
@@ -463,8 +463,8 @@ class TestPushHistoryOutbox:
         self, store: GuildRedisStore, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The ship default. EXISTS, not XLEN: the consent property is that
-        # nothing accumulates for Postgres AT ALL — the non-evictable key is
-        # never created, not merely left empty.
+        # nothing accumulates for Postgres AT all — the non-evictable key is
+        # never created, not just left empty.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         await store.push_history(_hentry(1))
         assert await fake_redis.exists(HISTORY_OUTBOX_KEY) == 0
@@ -552,7 +552,7 @@ async def _stream_ids(fake_redis: Redis) -> list[bytes]:
 
 class TestOperatorRecipeMatchesTheSchema:
     """`just outbox` hardcodes the key and group names — a shell recipe cannot
-    import them. Drift fails OPEN: rename either constant and the recipe keeps
+    import them. Drift fails open: rename either constant and the recipe keeps
     working against a key nothing writes, reporting "nothing buffered, nothing to
     do" during the incident it exists for.
     """
@@ -591,7 +591,7 @@ class TestEnsureOutboxGroup:
         await ensure_outbox_group(fake_redis)  # BUSYGROUP, swallowed
 
     async def test_group_sees_entries_that_predate_it(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: xgroup_create(id="0") → redis-py's default id="$".
+        """mutation guard: xgroup_create(id="0") → redis-py's default id="$".
 
         "$" delivers only what arrives after the call, so a group created after any
         window where push_history ran first would silently skip every entry already
@@ -619,11 +619,11 @@ class TestEnsureOutboxGroup:
         assert await read_outbox_pending(fake_redis, 10) == []
 
     async def test_wrongtype_propagates(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: `except ResponseError: pass` for a BUSYGROUP check.
+        """mutation guard: `except ResponseError: pass` for a BUSYGROUP check.
 
         BUSYGROUP, WRONGTYPE and NOGROUP are all bare ResponseError, so a
         class-level catch swallows the two meaning "this bot cannot record
-        history" along with the one meaning "already fine". A leftover LIST here
+        history" along with the one meaning "already fine". A leftover list here
         must abort startup: @_guild_op would otherwise silence the producer's
         failed XADD, taking guild:{id}:history down in the same transaction.
         """
@@ -642,9 +642,9 @@ class TestOutboxDrainHelpers:
         fake_redis: Redis,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """MUTATION GUARD: inheriting redis-py's `noack` default, which happens to
+        """mutation guard: inheriting redis-py's `noack` default, which happens to
         be correct — so it can flip with nothing going red. noack=True delivers
-        WITHOUT entering the PEL, turning at-least-once into at-most-once, and
+        without entering the PEL, turning at-least-once into at-most-once, and
         every behavioural assertion in this class still passes under it. Only the
         emitted kwargs can catch it.
         """
@@ -672,7 +672,7 @@ class TestOutboxDrainHelpers:
         ]
 
     async def test_new_read_caps_at_count(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: dropping `count` from XREADGROUP. Without it the whole
+        """mutation guard: dropping `count` from XREADGROUP. Without it the whole
         backlog lands in the PEL in one read, and the PEL's bound (BATCH_SIZE x
         readers) is what keeps a Postgres outage from being paid for twice in
         Redis.
@@ -695,7 +695,7 @@ class TestOutboxDrainHelpers:
         assert await read_outbox_new(fake_redis, 10) == []
 
     async def test_two_consumers_get_disjoint_entries(self, fake_redis: Redis) -> None:
-        # The server-side property the whole design rests on. Named consumers
+        # The server-side property the design rests on. Named consumers
         # here rather than the module constant, because this asserts what Redis
         # guarantees about a group, not what our code chose to call itself.
         await ensure_outbox_group(fake_redis)
@@ -730,9 +730,9 @@ class TestOutboxDrainHelpers:
     async def test_pending_read_inherits_a_dead_predecessors_batch(
         self, fake_redis: Redis
     ) -> None:
-        """MUTATION GUARD: a per-process consumer name (uuid4().hex). The PEL
-        belongs to the NAME, not the process: a successor recovers a dead
-        predecessor's batch by reading `0` under the SAME name — no lease, no TTL,
+        """mutation guard: a per-process consumer name (uuid4().hex). The PEL
+        belongs to the name, not the process: a successor recovers a dead
+        predecessor's batch by reading `0` under the same name — no lease, no TTL,
         no XAUTOCLAIM. A random name per process orphans that PEL instead.
         """
         await ensure_outbox_group(fake_redis)
@@ -751,14 +751,14 @@ class TestOutboxDrainHelpers:
         assert await read_outbox_pending(fake_redis, 10) == []
 
     async def test_reads_on_an_empty_outbox(self, fake_redis: Redis) -> None:
-        # The two empty replies have DIFFERENT shapes — `>` gives [] and `0`
+        # The two empty replies have different shapes — `>` gives [] and `0`
         # gives [[key, []]] — so both arms of the parser are exercised.
         await ensure_outbox_group(fake_redis)
         assert await read_outbox_new(fake_redis, 10) == []
         assert await read_outbox_pending(fake_redis, 10) == []
 
     async def test_retire_acks_and_deletes(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: dropping either half of retire_outbox. Without XACK the
+        """mutation guard: dropping either half of retire_outbox. Without XACK the
         entry is redelivered forever, which the archive's dedup index HIDES (every
         replay a silent no-op insert while the PEL grows); without XDEL the body
         stays in a key golden rule 12 makes non-evictable. Either assertion alone
@@ -772,7 +772,7 @@ class TestOutboxDrainHelpers:
         assert await outbox_depth(fake_redis) == 1  # XDEL ran
 
     async def test_retire_settles_only_the_named_ids(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: acking only the first ID of the batch. Unlike the
+        """mutation guard: acking only the first ID of the batch. Unlike the
         positional retire this replaced ("drop the oldest N"), this one means
         "drop exactly these" — a push landing between the read and the retire
         must be untouched.
@@ -800,7 +800,7 @@ class TestOutboxDrainHelpers:
 
     async def test_retire_of_nothing_is_a_noop(self, fake_redis: Redis) -> None:
         # XACK/XDEL with zero IDs is a syntax error on real Redis, so the guard
-        # is load-bearing, not defensive.
+        # is required.
         await ensure_outbox_group(fake_redis)
         await _push(fake_redis, 1)
         await retire_outbox(fake_redis, [])
@@ -809,7 +809,7 @@ class TestOutboxDrainHelpers:
     async def test_retire_acks_before_it_deletes(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """CONTROL + MUTATION GUARD: the XACK→XDEL order inside the MULTI. A crash
+        """CONTROL + mutation guard: the XACK→XDEL order inside the MULTI. A crash
         between the two is only safe this way round: XACK-then-crash leaves an
         acked-but-undeleted entry the MINID trim reclaims; XDEL-then-crash leaves
         an unrecoverable TOMBSTONE (an ID pending with no body). Asserted by
@@ -1005,7 +1005,7 @@ class TestPrevStreamId:
 
     def test_borrows_from_the_millisecond_half_at_sequence_zero(self) -> None:
         # 2^64-1, not 0: the sequence half is 64-bit, so the predecessor of
-        # <ms>-0 is the LAST id of the previous millisecond. Borrowing to
+        # <ms>-0 is the last id of the previous millisecond. Borrowing to
         # <ms-1>-0 would leave that millisecond's other entries outside the range.
         assert _prev_stream_id(b"7-0") == b"6-%d" % ((1 << 64) - 1)
 
@@ -1019,7 +1019,7 @@ class TestAckOutbox:
     async def test_clears_the_pel_without_deleting_the_body(
         self, fake_redis: Redis
     ) -> None:
-        """Deliberately NOT retire_outbox: the cap removes bodies with a single
+        """Deliberately not retire_outbox: the cap removes bodies with a single
         MINID trim, so naming every doomed ID in an XDEL would reintroduce the
         unbounded-command problem the list transport had. This only clears PEL
         records, a set bounded by BATCH_SIZE x live drainers.
@@ -1048,7 +1048,7 @@ class TestTrimOutboxBelow:
     async def test_returns_the_number_actually_destroyed(
         self, fake_redis: Redis
     ) -> None:
-        # The caller logs THIS, not a derived depth-minus-cap: XLEN over-counts
+        # The caller logs this, not a derived depth-minus-cap: XLEN over-counts
         # acked-but-undeleted entries and the clamp may trim fewer than asked.
         await ensure_outbox_group(fake_redis)
         await _push(fake_redis, 1, 2, 3)
@@ -1056,10 +1056,10 @@ class TestTrimOutboxBelow:
         assert await trim_outbox_below(fake_redis, ids[0]) == 0  # nothing older
 
     async def test_is_idempotent(self, fake_redis: Redis) -> None:
-        """MUTATION GUARD: XTRIM MINID → XTRIM MAXLEN. MINID names an absolute ID,
-        so a re-send removes nothing; MAXLEN names a LENGTH, so a re-send after
+        """mutation guard: XTRIM MINID → XTRIM MAXLEN. MINID names an absolute ID,
+        so a re-send removes nothing; MAXLEN names a length, so a re-send after
         concurrent XADDs destroys a second tranche of un-archived plays. The drain
-        path runs on the pool with retries ENABLED, so re-sends really happen.
+        path runs on the pool with retries enabled, so re-sends really happen.
         """
         await ensure_outbox_group(fake_redis)
         await _push(fake_redis, 1, 2, 3)
@@ -1072,7 +1072,7 @@ class TestTrimOutboxBelow:
     async def test_passes_approximate_false(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """MUTATION GUARD: relying on redis-py's `approximate` default, which is
+        """mutation guard: relying on redis-py's `approximate` default, which is
         True — trimming to radix-node boundaries, so on a small real stream it
         removes NOTHING while returning success. fakeredis models it as EXACT, so
         end-state assertions pass either way; only the emitted call can catch it.
@@ -1092,8 +1092,8 @@ class TestTrimOutboxBelow:
         assert "maxlen" not in seen[0]
 
     async def test_trim_does_not_clear_the_pel(self, fake_redis: Redis) -> None:
-        """The reason the cap must XACK what it destroys BEFORE it trims: XTRIM IS
-        BLIND TO THE PEL. Deleting a delivered-but-unacked entry destroys a play a
+        """The reason the cap must XACK what it destroys before it trims: XTRIM is
+        blind TO the PEL. Deleting a delivered-but-unacked entry destroys a play a
         drainer is holding — no Postgres row, no play_history_rejected row, no
         error naming it — and leaves a tombstone behind.
         """
@@ -1140,7 +1140,7 @@ class TestReclaimOutboxStale:
     async def test_min_idle_time_protects_a_live_siblings_batch(
         self, fake_redis: Redis
     ) -> None:
-        # Idle is measured from last DELIVERY under a shared name, so a sweep
+        # Idle is measured from last delivery under a shared name, so a sweep
         # with too small a min_idle_time reclaims a peer mid-insert. The
         # drainer's SWEEP_MIN_IDLE_MS is what keeps this from firing.
         await ensure_outbox_group(fake_redis)
@@ -1155,7 +1155,7 @@ class TestReclaimOutboxStale:
 
     async def test_terminates_on_an_empty_sweep(self, fake_redis: Redis) -> None:
         """The cursor loop must not depend on cursor == b"0-0" alone: fakeredis
-        returns the LAST-SCANNED id where real Redis returns "0-0", so a
+        returns the last-SCANNED id where real Redis returns "0-0", so a
         cursor-only termination runs correctly in production and spins forever
         here. Empty-pass termination works on both.
         """
@@ -1185,7 +1185,7 @@ class TestReclaimOutboxStale:
 
 
 class TestPushHistoryAtomicity:
-    """The display push and the outbox push must ride ONE transactional
+    """The display push and the outbox push must ride one transactional
     pipeline. Every existing test checks only end state, which is identical
     whether they share a pipeline or not."""
 
@@ -1268,19 +1268,19 @@ class TestHistoryRetention:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """REGRESSION: a full Redis could not self-heal.
+        """regression: a full Redis could not self-heal.
 
-        LPUSH carries Redis' `denyoom` flag and is queued FIRST, so the server
+        LPUSH carries Redis' `denyoom` flag and is queued first, so the server
         refuses it at queue time and EXEC aborts with the LTRIM never running;
         reordering inside the MULTI does not help, and @_guild_op swallows the
-        OutOfMemoryError into one warning per song. A bare LTRIM is NOT denyoom,
+        OutOfMemoryError into one warning per song. A bare LTRIM is not denyoom,
         so the one command that can make room is what can still run.
         """
         store = GuildRedisStore(fake_redis, guild_id=42)
         for n in range(HISTORY_CACHE_LIMIT + 10):
             await fake_redis.lpush(store.history_key(), _hentry(n).to_redis())
 
-        # The ORDER is the assertion, not the end state: the retried pipeline
+        # The order is the assertion, not the end state: the retried pipeline
         # carries an LTRIM of its own, so the list ends at the cap either way.
         # Only a real server tells them apart, so what is pinned is that a
         # standalone LTRIM happened BETWEEN the refusal and the retry.
@@ -1688,8 +1688,8 @@ class TestGetRecoveryGate:
     async def test_does_not_transfer_queue_contents(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        """The whole point of the gate: it reads LLEN, never LRANGE, so the
-        queue payload never rides the wire on the recovery path."""
+        """The gate reads LLEN, never LRANGE, so the queue payload never rides
+        the wire on the recovery path."""
         real_lrange = fake_redis.lrange
         lrange_keys = []
 

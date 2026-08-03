@@ -38,7 +38,7 @@ def _track_search_title(track: dict[str, Any]) -> str:
 class SpotifyAuthError(Exception):
     """Spotify rejected the configured client credentials. Raised only for the two
     responses that actually indicate that: a non-2xx token grant, and a 401/403 from an
-    API call. NOT for network errors, timeouts or other codes (404, 5xx) — those say
+    API call. Not for network errors, timeouts or other codes (404, 5xx) — those say
     nothing about validity, and startup validation disables the source only on this.
     """
 

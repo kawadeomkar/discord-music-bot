@@ -113,11 +113,11 @@ def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class TestOutboxNotifyWiring:
     """MusicPlayer decides GuildHistory's outbox notify from the bot's drainer, and
-    BOTH answers must be constructible: enabled, the notify wakes the drain; disabled
-    — the SHIP DEFAULT — there is no drainer and the None is passed explicitly.
+    both answers must be constructible: enabled, the notify wakes the drain; disabled
+    — the SHIP default — there is no drainer and the None is passed explicitly.
 
     Nothing else can see this. Every other player test builds from `mock_bot`, whose
-    auto-vivified attributes are TRUTHY, so the None arm is reachable only in
+    auto-vivified attributes are truthy, so the None arm is reachable only in
     production, and coverage reports the one-line conditional covered the moment
     either arm runs. Dropping the guard passed the entire suite while raising
     AttributeError on the first -play of any default deployment."""
@@ -1717,7 +1717,7 @@ class TestUpdateActivity:
         activity = music_player.bot.change_presence.call_args.kwargs["activity"]
         assert isinstance(activity, discord.Activity)
         assert activity.type == discord.ActivityType.listening
-        # name encodes uploader as suffix since bot activities only render name
+        # Name encodes uploader as suffix since bot activities only render name
         assert activity.name == f"{mock_song.title} · {mock_song.uploader}"
         assert activity.state == mock_song.duration
         assert activity.state_url == mock_song.webpage_url
@@ -1789,7 +1789,7 @@ class TestUpdateActivity:
     async def test_resets_while_own_client_is_still_playing(
         self, music_player: MusicPlayer
     ) -> None:
-        """cleanup() cancels the playback loop BEFORE disconnecting, so the loop's
+        """cleanup() cancels the playback loop before disconnecting, so the loop's
         CancelledError handler calls update_activity(None) while this guild's own
         client is still connected and playing. The "another guild is playing" gate
         must not count our own client, or the presence stays stuck on the stopped
@@ -2030,7 +2030,7 @@ class TestReachedEnd:
 class TestFinalizeCompletion:
     """The finalize edit fires either way; only the rendered position differs.
     Skipping the edit entirely would leave the bar frozen up to one 3s progress
-    tick BEFORE the interruption, rather than at the true stop point."""
+    tick before the interruption, rather than at the true stop point."""
 
     async def test_completed_renders_full_bar(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -2101,7 +2101,7 @@ class TestPlaybackGate:
         mock_channel: MagicMock,
         mock_ctx: MagicMock,
     ) -> None:
-        """Crash recovery connects to voice BEFORE start() — that path must keep
+        """Crash recovery connects to voice before start() — that path must keep
         resuming from the head with no extra call site."""
         mock_guild.voice_client = MagicMock(spec=discord.VoiceClient)
         mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
@@ -2191,8 +2191,8 @@ class TestPlaybackGate:
     async def test_wait_for_restore_blocks_until_restore_completes(
         self, music_player: MusicPlayer
     ) -> None:
-        """The load-bearing ordering guarantee of the front-insert path: -play
-        must not touch the queue before _restore_state() has read its snapshot,
+        """The ordering guarantee of the front-insert path: -play must not touch
+        the queue before _restore_state() has read its snapshot,
         or put_front's LPUSH lands in that snapshot and gets queued twice."""
         music_player._restore_complete.clear()
         waiter = asyncio.create_task(music_player.wait_for_restore())
@@ -2206,7 +2206,7 @@ class TestPlaybackGate:
     async def test_gate_timeout_tears_down_player(
         self, music_player: MusicPlayer
     ) -> None:
-        """A player blocked on the gate is NOT blocked in queue_get(), so the
+        """A player blocked on the gate is not blocked in queue_get(), so the
         idle-disconnect never fires for it — the gate needs its own timeout or
         the mps entry and task leak forever."""
         music_player._playback_gate.clear()
@@ -3291,7 +3291,7 @@ class TestSendNowPlaying:
     async def test_sent_block_reuses_play_message_embed(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The NP embed stored as play_message IS the one sent in the block —
+        """The NP embed stored as play_message is the one sent in the block —
         not an identical rebuild."""
         await music_player._send_now_playing(mock_song)
         embeds = mocked(music_player._channel.send).call_args.kwargs["embeds"]
@@ -3815,7 +3815,7 @@ class TestEditNowPlayingOnce:
     ) -> None:
         """Adopt is lock-free, so a command response can swap in a new host
         while this edit's PATCH is in flight. A NotFound then must not release
-        the NEW host — that would permanently orphan its block."""
+        the new host — that would permanently orphan its block."""
         music_player.current_song = mock_song
         old_host = AsyncMock(spec=discord.Message)
         new_host = AsyncMock(spec=discord.Message)
@@ -3933,7 +3933,7 @@ class TestFinalizeNowPlaying:
     async def test_waits_for_lock_holder(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The finalize's completed-bar write must land AFTER any in-flight
+        """The finalize's completed-bar write must land after any in-flight
         debounce-spawned edit (which holds _np_edit_lock across its PATCH) —
         otherwise a resume just before song end can freeze the historical bar
         short of 100%."""
@@ -4103,7 +4103,7 @@ class TestProgressUpdater:
     ) -> None:
         """Adopt is lock-free, so a command response can swap in a new host
         while this tick's PATCH is in flight. A NotFound then must not release
-        the NEW host — that would permanently orphan its block."""
+        the new host — that would permanently orphan its block."""
         vc = MagicMock(spec=discord.VoiceClient)
         vc.source = mock_song
         vc.is_paused.return_value = False
@@ -4955,7 +4955,7 @@ class TestLoop:
     async def test_history_entry_records_the_np_host_message_id(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """The history row carries the host of THIS song, as of song END: not the
+        """The history row carries the host of this song, as of song END: not the
         *released* _np_host_message (None by then), and not a host captured before
         this song adopted its own — a hoisted capture yields the PREVIOUS song's id,
         undetectable downstream since every id is a plausible snowflake. The side
@@ -5125,7 +5125,7 @@ class TestLoop:
     async def test_song_stopped_before_first_frame_is_not_a_dead_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """Zero frames WITHOUT an ffmpeg error is a deliberate stop — a -skip or
+        """Zero frames without an ffmpeg error is a deliberate stop — a -skip or
         interject inside ffmpeg's startup window, or a resume entry parked at
         vc.pause(). The stream was never refused, so the cached URL survives, no
         failure notice is posted, and the song keeps its history entry."""
@@ -5140,7 +5140,7 @@ class TestLoop:
         music_player.queue._display.append(queue_obj)
 
         vc = object.__new__(discord.VoiceClient)
-        # after fires with no error, exactly how discord.py reports a vc.stop().
+        # After fires with no error, exactly how discord.py reports a vc.stop().
         vc.play = MagicMock(side_effect=lambda song, after: after(None))
         mocked(music_player._guild).voice_client = vc
         music_player.play_next.wait = AsyncMock()
@@ -6054,7 +6054,7 @@ class TestInterject:
         playnow_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
-        live_song.interjected = True  # the playing song IS a -playnow song
+        live_song.interjected = True  # the playing song is a -playnow song
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
 

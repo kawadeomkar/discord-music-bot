@@ -106,7 +106,7 @@ class MusicBotApp(commands.AutoShardedBot):
         self.redis = None
         # Postgres play-history archive + its outbox drainer, built in setup_hook while
         # HISTORY_ARCHIVE_ENABLED (the opt-in consent gate for long-term storage). None
-        # is the disabled shape — the DEFAULT — and every consumer handles it:
+        # is the disabled shape — the default — and every consumer handles it:
         # musicplayer wires a None notify, -ping renders Postgres OFF, close() skips it.
         self.history_archive: Optional[PostgresHistoryArchive] = None
         self.history_drainer: Optional[HistoryOutboxDrainer] = None
@@ -115,7 +115,7 @@ class MusicBotApp(commands.AutoShardedBot):
         self._teardown_started = False
 
     async def setup_hook(self) -> None:
-        # The archive flag is read FIRST, before anything else can consume it: the
+        # The archive flag is read first, before anything else can consume it: the
         # parser raises on garbage and the next reader would be push_history, which is
         # @_guild_op-wrapped and would swallow that ValueError into one warning per
         # song. Startup is the only place the signal can be loud.
@@ -155,9 +155,9 @@ class MusicBotApp(commands.AutoShardedBot):
                 "(postgresql://user:password@host:5432/dbname). To run without "
                 "the archive instead, remove HISTORY_ARCHIVE_ENABLED."
             )
-        # Loud, but NOT fatal: compose defaults POSTGRES_PASSWORD so `docker compose up`
+        # Loud, but not fatal: compose defaults POSTGRES_PASSWORD so `docker compose up`
         # works with nothing configured but DISCORD_TOKEN, and refusing to start would
-        # put the first-run cliff straight back. The message spells out the ORDER because
+        # put the first-run cliff straight back. The message spells out the order because
         # Postgres reads the variable only when it INITIALIZES an empty data directory —
         # editing .env against an existing volume just locks the bot out of its own db.
         if config.using_default_postgres_password():
@@ -180,10 +180,10 @@ class MusicBotApp(commands.AutoShardedBot):
                 "EMPTY data directory, so editing .env alone never changes the "
                 "server — it just locks the bot out of its own database."
             )
-        # Create the outbox consumer group before anything can write to it. The SECOND
+        # Create the outbox consumer group before anything can write to it. The second
         # fail-fast, and it has to be at startup: push_history is @_guild_op-wrapped, so
-        # a WRONGTYPE from a pre-stream LIST at history:outbox would be swallowed into one
-        # warning per song while BOTH legs of its transaction failed — total history
+        # a WRONGTYPE from a pre-stream list at history:outbox would be swallowed into one
+        # warning per song while both legs of its transaction failed — total history
         # loss, reported as a warning. ensure_outbox_group tolerates only BUSYGROUP;
         # WRONGTYPE propagates, remedied by `DEL history:outbox` with the bot stopped.
         #
@@ -210,7 +210,7 @@ class MusicBotApp(commands.AutoShardedBot):
         the non-evictable outbox key into existence); history_archive/history_drainer
         stay None, and push_history's XADD leg reads the same flag, so nothing accrues.
         """
-        # Says what the retention IS, not merely what it is not: push_history PERSISTs
+        # States what is retained, not just what is not: push_history PERSISTs
         # guild:{id}:history — no TTL, ever, by design — so an opted-out deployment
         # still retains requester ids, titles and timestamps for 50 plays per guild,
         # indefinitely. An operator asked to erase a user's data has to know that the
@@ -307,11 +307,10 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
-        # Order is load-bearing in BOTH directions, and the two constraints order
-        # different pairs, so they compose:
-        #   drainer BEFORE archive and Redis — its final drain reads the outbox and
+        # Two ordering constraints, on different pairs, so they compose:
+        #   drainer before archive and Redis — its final drain reads the outbox and
         #     writes Postgres, so both have to still be alive for it.
-        #   super().close() BEFORE the Redis pool — it disconnects voice clients and can
+        #   super().close() before the Redis pool — it disconnects voice clients and can
         #     still dispatch events; an on_voice_state_update landing in that window runs
         #     cleanup(), whose clear_connection()/refresh_ttl() would hit a dead pool and
         #     be swallowed, so an ORDERLY shutdown persists state as if the bot had
@@ -380,7 +379,7 @@ def main() -> None:
         raise ValueError("DISCORD_TOKEN environment variable is not set")
     # Spotify is optional: without credentials only Spotify links are rejected. This
     # reports only whether credentials were PROVIDED; MusicBot.cog_load probes them
-    # against the live API and logs ENABLED/INVALID.
+    # against the live API and logs enabled/invalid.
     if spotify_enabled():
         log.info(
             "Spotify credentials found — validating against Spotify API on startup"

@@ -15,11 +15,11 @@ place that information still exists.
 Safe to re-run and safe to interrupt: ON CONFLICT DO NOTHING makes every insert
 idempotent. Order within a guild does not matter — reads sort on played_at.
 
-MUST RUN BEFORE THIS BUILD IS DEPLOYED. push_history LTRIMs each guild's list to
+Must RUN before this BUILD is DEPLOYED. push_history LTRIMs each guild's list to
 HISTORY_CACHE_LIMIT on every write, so a guild's first song under it destroys the
 only copy of exactly what this exists to move. The window opens per guild at that
 guild's next song end, with no flag to check and nothing to undo. "This build",
-not "the archive build": the cap is NOT part of the archive tier (push_history
+not "the archive build": the cap is not part of the archive tier (push_history
 trims in both modes), so an operator who never opts in is on the same clock.
 
 Nothing here can detect that it already happened: a list sitting at exactly
@@ -69,7 +69,7 @@ _GUILD_ID_INDEX = GUILD_HISTORY_KEY.split(":").index("{guild_id}")
 _HISTORY_KEY_MATCH = GUILD_HISTORY_KEY.format(guild_id="*")
 # Upper bound of play_history.guild_id (bigint). Local, not imported from
 # guild_state's clamp constants: this is a validation bound, and the point of
-# _guild_id_from_key's check is that the clamp is NOT the validation.
+# _guild_id_from_key's check is that the clamp is not the validation.
 _INT8_MAX = 2**63 - 1
 # Mirrors create_redis_pool's default, duplicated because it only REPORTS what
 # the run connected to; the pool stays the single place that decides it.
@@ -86,7 +86,7 @@ _WIRE_DUMP_MAX = 2000
 class BackfillReport:
     guilds: int = 0
     scanned: int = 0
-    # Rows handed to insert_batch, NOT rows that landed: ON CONFLICT DO NOTHING
+    # Rows handed to insert_batch, not rows that landed: ON CONFLICT DO NOTHING
     # collapses entries colliding on (guild_id, played_at, webpage_url) — two
     # plays of one URL in the same clock second, several epoch-0 legacy entries
     # for one URL — and they are counted here anyway. Named for what it can
@@ -94,12 +94,12 @@ class BackfillReport:
     # attest to a durability claim this number cannot support.
     attempted: int = 0
     corrupt: int = 0
-    # Guilds whose backfill raised. NOT `corrupt`: a corrupt entry is data this
+    # Guilds whose backfill raised. Not `corrupt`: a corrupt entry is data this
     # tool understood and rejected, while a failure here means an unknown amount
     # of that guild's history did not move. Only this one makes the run
-    # INCOMPLETE, and completeness gates the deploy that destroys the source.
+    # incomplete, and completeness gates the deploy that destroys the source.
     failed_guilds: int = 0
-    # Guilds whose list was trimmed from the tail WHILE this run walked it, so
+    # Guilds whose list was trimmed from the tail while this run walked it, so
     # some of their oldest entries were destroyed before they could be read.
     # Detected, reported, and — the point of this counter — fatal to `ok`:
     # anything scripting `just db-backfill && ./build_docker.sh` gates on the
@@ -121,7 +121,7 @@ class BackfillReport:
 
         The one thing that may gate the deploy. A property rather than a
         caller-side expression so the check changes in one place when a future
-        failure mode is added. EVERY not-moved outcome belongs here, not just the
+        failure mode is added. Every not-moved outcome belongs here, not just the
         loud ones — each omission lets this return True over destroyed data.
         """
         return not (
@@ -137,7 +137,7 @@ def _guild_id_from_key(key: bytes) -> Optional[int]:
 
     Parseability is not enough, and this is the one place in the system that can
     manufacture an out-of-domain guild_id: play_history's CHECK is `guild_id > 0`
-    (strict) while HistoryEntry.__post_init__ CLAMPS to `0 <= v <= int8max`, so
+    (strict) while HistoryEntry.__post_init__ clamps to `0 <= v <= int8max`, so
     `guild:0:history` yields an entry that constructs fine and Postgres refuses,
     and a 20-digit key id clamps to 2**63-1 and files that whole history under a
     fabricated guild with no error at all. Neither shape comes from the bot —
@@ -169,7 +169,7 @@ async def backfill(
 ) -> BackfillReport:
     """Copy every guild's Redis history list into the archive.
 
-    NEVER RAISES, and that is a contract: this runs once, by hand, immediately
+    Never RAISES, and that is a contract: this runs once, by hand, immediately
     before the step that trims the lists it reads, so the operator's only
     question is "did all of it move?" — an exception cannot answer it honestly.
     One WRONGTYPE from a stray key would kill the run, skip every guild after it
@@ -227,18 +227,18 @@ async def _backfill_one(
         return dataclasses.replace(report, skipped_keys=report.skipped_keys + 1)
     try:
         total = await redis.llen(key)
-        # The OLDEST entry's bytes, an identity anchor for the reconciliation
+        # The oldest entry's bytes, an identity anchor for the reconciliation
         # below. Index -1 because push_history LPUSHes: the tail is the oldest
         # entry and the first thing a trim destroys.
         tail_before = await redis.lindex(key, -1)
         attempted = corrupt = 0
         for start in range(0, total, page):
-            # Paged from the TAIL (oldest), NOT by head-relative index.
+            # Paged from the TAIL (oldest), not by head-relative index.
             # push_history LPUSHes at the head, so with `lrange(key, start,
             # start + page - 1)` every play that finishes mid-run shifts every
             # index right by one and entries slide out of the window unread —
             # measured: 3 songs during a 10-entry backfill silently skipped the
-            # 3 OLDEST while the report still said 10, unrecoverable once this
+            # 3 oldest while the report still said 10, unrecoverable once this
             # build LTRIMs the only copy. Tail-relative indices are stable under
             # head pushes; the worst a concurrent play can do is make us re-read
             # a page, which the dedup index absorbs. Entries pushed during the
@@ -249,7 +249,7 @@ async def _backfill_one(
                 entry = parse_history_entry(wire)
                 if entry is None:
                     corrupt += 1
-                    # The page runs NEWEST→OLDEST internally (LPUSHed list, and a
+                    # The page runs newest→oldest internally (LPUSHed list, and a
                     # tail-relative LRANGE still returns list order) while
                     # `start` advances oldest→newest, so the distance from the
                     # oldest end is start + (len-1-i) — never anything derived
@@ -257,9 +257,9 @@ async def _backfill_one(
                     # guild-cumulative count with a page-local one and points the
                     # operator at a healthy entry.
                     offset = start + len(raw) - 1 - i
-                    # The BYTES, not just a count: parse_history_entry logs only
+                    # The bytes, not just a count: parse_history_entry logs only
                     # its exception, so `corrupt: 3` would be the whole forensic
-                    # record of three plays the build is about to trim away. NOT
+                    # record of three plays the build is about to trim away. Not
                     # play_history_rejected, which means "Postgres refused this
                     # row" — a row this tool could not parse was never offered to
                     # Postgres. _WIRE_DUMP_MAX because a realistic entry measures
@@ -277,20 +277,20 @@ async def _backfill_one(
                     # (not object.__setattr__) is the correct way to modify a
                     # frozen dataclass; it re-runs __post_init__, which is
                     # belt-and-braces — the validation is _guild_id_from_key
-                    # upstream, because __post_init__ CLAMPS an out-of-domain
+                    # upstream, because __post_init__ clamps an out-of-domain
                     # key id into a plausible wrong one rather than refusing it.
                     entry = dataclasses.replace(entry, guild_id=guild_id)
                 # No sanitize call: parse_history_entry constructs a HistoryEntry,
                 # whose __post_init__ clamps into the play_history column domain.
-                # ONE FIELD IS EXEMPT, and it is the one this tool writes:
+                # One field is exempt, and it is the one this tool writes:
                 # __post_init__ clamps to 0 <= v <= int8max while play_history's
-                # CHECK on guild_id is strictly > 0, so the type does NOT prove a
+                # CHECK on guild_id is strictly > 0, so the type does not prove a
                 # stamped entry insertable. The hole is closed upstream by
                 # _guild_id_from_key; if a refusal still happens, executemany is
-                # atomic — the batch is lost and the guild reports INCOMPLETE.
+                # atomic — the batch is lost and the guild reports incomplete.
                 entries.append(entry)
             if entries and not dry_run:
-                # OLDEST-FIRST, which is what insert_batch documents. The page
+                # Oldest-first, which is what insert_batch documents. The page
                 # arrives newest→oldest while pages advance oldest→newest, so
                 # unreversed the global order is neither — harmless for an
                 # ON CONFLICT DO NOTHING index, but it lets this tool and the
@@ -300,7 +300,7 @@ async def _backfill_one(
                 await archive.insert_batch(entries)
             attempted += len(entries)
     except Exception as e:
-        # Counted, not raised, and NOT folded into `guilds` — that counter means
+        # Counted, not raised, and not folded into `guilds` — that counter means
         # "guilds moved in full". Already-inserted rows stay in Postgres and
         # collapse on the dedup index when the operator re-runs.
         log.error(
@@ -310,11 +310,11 @@ async def _backfill_one(
         )
         return dataclasses.replace(report, failed_guilds=report.failed_guilds + 1)
     # RECONCILIATION — did the list lose entries from the tail while we walked it?
-    # push_history LTRIMs on every song end, from the tail, eating the OLDEST
+    # push_history LTRIMs on every song end, from the tail, eating the oldest
     # entries: exactly the ones this tool exists to save.
     #
-    # BY IDENTITY, not by count. `attempted + corrupt < total` only sees a list
-    # that got SHORTER, but push_history LPUSHes and LTRIMs in ONE transaction, so
+    # BY identity, not by count. `attempted + corrupt < total` only sees a list
+    # that got shorter, but push_history LPUSHes and LTRIMs in one transaction, so
     # a list already at HISTORY_CACHE_LIMIT keeps its length exactly while each
     # song end destroys one unread tail entry. Measured on a 50-entry list with
     # one push per page: 4 pre-archive plays gone, scanned == attempted, no
@@ -340,7 +340,7 @@ async def _backfill_one(
         f"{attempted} entries ({total} scanned, {corrupt} corrupt)"
         f"{' — INCOMPLETE, list trimmed mid-run' if shrank else ''}"
     )
-    # A guild that lost entries mid-run did NOT move in full, so it must not
+    # A guild that lost entries mid-run did not move in full, so it must not
     # inflate `guilds` — that counter is what the summary reports as backfilled.
     return dataclasses.replace(
         report,
@@ -379,7 +379,7 @@ async def _run(dry_run: bool) -> int:
     # the only line separating "I forgot to set it" from "nothing to migrate".
     print(f"source (Redis):     {_redacted(os.getenv('REDIS_URL', _DEFAULT_REDIS))}")
     print(f"destination (PG):   {_redacted(url)}")
-    # THE ORDERING NOTICE, unconditional because it is unverifiable: a trimmed
+    # the ordering notice, unconditional because it is unverifiable: a trimmed
     # list is indistinguishable from a short one, so an operator who runs this
     # after deploying sees a clean-looking run over whatever the trim left.
     # Saying so every time is the only warning that can be given.
@@ -395,7 +395,7 @@ async def _run(dry_run: bool) -> int:
         # pool is lazy — _ensure() (connect + schema-version check) is reached
         # only from insert_batch, which a dry run never calls, so a rehearsal
         # against an unreachable host, wrong credentials or an unmigrated schema
-        # would walk the whole keyspace and report success, exit 0. BEFORE the
+        # would walk the whole keyspace and report success, exit 0. Before the
         # walk: failing after a million entries teaches the same thing later.
         try:
             await archive.health_check()
@@ -426,7 +426,7 @@ async def _run(dry_run: bool) -> int:
     )
     # The completeness verdict, stated rather than inferred from a count: this
     # line gates the deploy, so it says what to do, and the exit code carries the
-    # same answer for anything driving this from a script. EVERY applicable
+    # same answer for anything driving this from a script. Every applicable
     # reason prints, not the first to win an if/elif chain — a run can fail
     # several ways at once, and fixing only the reported one means re-running
     # straight into the next, on a tool whose next step is irreversible. `ok` is
@@ -468,7 +468,7 @@ async def _run(dry_run: bool) -> int:
     return 0 if report.ok else 1
 
 
-# Operator-facing help. NOT the module docstring: argparse's default formatter
+# Operator-facing help. Not the module docstring: argparse's default formatter
 # collapses whitespace, so passing __doc__ fuses the two example commands into a
 # copy-pasteable trap. The rationale stays in the module docstring where
 # maintainers look; this is what someone running it needs.
@@ -492,11 +492,11 @@ unrecoverable.
 
 
 def main() -> int:
-    # CONFIGURE LOGGING FIRST, before anything can emit. Unconfigured, structlog
+    # CONFIGURE LOGGING first, before anything can emit. Unconfigured, structlog
     # falls back to PrintLoggerFactory — readable text on STDOUT that never
     # touches the logging module, so `just db-backfill 2> errors.log` captures
     # none of it and `docker compose run --rm` deletes the container that held
-    # it. This module's corrupt-entry ERROR is the ONLY durable record of a play
+    # it. This module's corrupt-entry ERROR is the only durable record of a play
     # about to become unrecoverable; terminal scrollback is not a record.
     setup_cli_logging()
     parser = argparse.ArgumentParser(
