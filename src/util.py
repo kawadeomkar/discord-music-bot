@@ -18,10 +18,21 @@ def queue_message(songs: list[str]) -> str:
     return msg
 
 
+def trace_id_of(span: Span) -> str:
+    """The span's trace id as 32 hex chars, or "" when the span is not recording.
+
+    Empty string rather than None: every consumer stores this in a column or a
+    log field that is text, so an absent trace and an unset one should not be
+    two different cases downstream.
+    """
+    span_ctx = span.get_span_context()
+    return format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
+
+
 def trace_footer(span: Span) -> Optional[str]:
     """Return an embed-footer string identifying the current trace, or None if untraced."""
-    span_ctx = span.get_span_context()
-    return f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
+    trace_id = trace_id_of(span)
+    return f"trace: {trace_id}" if trace_id else None
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:

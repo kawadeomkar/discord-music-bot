@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     # A runtime import would close the cycle (musicbot imports MusicPlayer); the
     # cog is only named in annotations here. Same guard main.py uses for MusicPlayer.
     from src.musicbot import MusicBot
+    from src.main import MusicBotApp
 
 log = get_logger(__name__)
 _tracer = get_tracer(__name__)
@@ -396,7 +397,20 @@ class MusicPlayer:
         # cleared-flag) lives behind this one object — see guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
         # Played-song history (in-memory ring + Redis mirror) — guild_history.py.
-        self.history = GuildHistory(self.store)
+        # Only the DRAINER is wired in: history writes nudge it so the outbox is
+        # archived promptly, but nothing here reads Postgres back. The drainer
+        # lives on the app, one per process, present exactly when the archive is
+        # enabled (HISTORY_ARCHIVE_ENABLED), so a None drainer wires a None
+        # notify — the disabled shape GuildHistory's constructor demands be
+        # explicit. The cast is only because `bot` is typed as the plain
+        # commands.Bot base; it is a no-op at runtime.
+        app = cast("MusicBotApp", bot)
+        self.history = GuildHistory(
+            self.store,
+            on_outbox_push=(
+                app.history_drainer.notify if app.history_drainer is not None else None
+            ),
+        )
         self._player: Optional[asyncio.Task] = None
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
@@ -2017,6 +2031,16 @@ class MusicPlayer:
                     finished_own = self._np_host_own_embeds
                     finished_dedicated = self._np_host_dedicated
                     self._release_np_host()
+                    # The id that lands in play_history.message_id. Recorded on
+                    # the span because 0 is ambiguous in the stored row — send
+                    # failed, host deleted mid-song, pre-message_id build, or
+                    # backfill all read as 0 — and nothing else surfaces it. With
+                    # this, a 0 row can be joined to its trace and the cause read
+                    # off song.stream_failed and the span's events.
+                    span.set_attribute(
+                        "song.np_host_id",
+                        str(finished_host.id) if finished_host is not None else "",
+                    )
                     if finished_host is not None:
                         if stream_failed:
                             # A completed bar is truthful only for a song that
@@ -2041,10 +2065,26 @@ class MusicPlayer:
                                 completed=_reached_end(self.current_song),
                             )
 
-                    # Claim-then-await: interject() may have neutralized and nulled
-                    # the task while this iteration sat in play_next.wait(). Both
-                    # sides read-and-null synchronously, so exactly one consumer
-                    # sees any given result; a cancelled task resolves to None.
+                    # The song is over: stop advertising it as current BEFORE the
+                    # prefetch await below, which resolves a whole yt-dlp
+                    # extraction and can sit for seconds. Everything above is
+                    # synchronous, so this is the first point another coroutine can
+                    # interleave — and MusicContext.send's attach gate is
+                    # `current_song is not None`. Left set across that await, a
+                    # command response in the home channel prepends a block for a
+                    # song that already ended and adopts ITSELF as host; the next
+                    # iteration's _send_now_playing() then RELEASES that host
+                    # without retiring it, orphaning a message with a frozen bar
+                    # that nothing can clean up. `song` is this iteration's copy and
+                    # is what the history entry below is built from.
+                    self.current_song = None
+                    self.play_message = None  # -now must not serve a finished song
+
+                    # Claim-then-await: interject() may have neutralized (and
+                    # nulled) the task while this iteration sat in play_next.wait().
+                    # Both sides read-and-null synchronously, so exactly one consumer
+                    # sees any given prefetch result; a task interject() cancelled
+                    # resolves here to None.
                     prefetch_task = self._prefetch_task
                     self._prefetch_task = None
                     prefetched_song = None
@@ -2054,29 +2094,42 @@ class MusicPlayer:
                         except asyncio.CancelledError:
                             prefetched_song = None
 
-                    if self.current_song is not None:
-                        # interject() stopped this song with a resume entry pending,
-                        # so history records it when the tail ends. Identity match,
-                        # and the marker clears either way: one left for a song that
-                        # ended naturally during interject()'s awaits must not eat a
-                        # different song's entry. A song that never produced audio
-                        # was never played, and -history records what was heard.
-                        skip_history = self._skip_history_for is self.current_song
-                        self._skip_history_for = None
-                        if not skip_history and not stream_failed:
-                            await self.history.add(
-                                HistoryEntry.from_song(
-                                    self.current_song, played_at=time.time()
-                                )
+                    # interject() stopped this song with a resume entry pending —
+                    # history records it when the tail ends. Identity match, and the
+                    # marker clears either way: one left for a song that ended
+                    # naturally during interject()'s awaits must not eat this
+                    # (different) song's entry. A song that never produced audio was
+                    # never played, and -history records what was heard.
+                    skip_history = self._skip_history_for is song
+                    self._skip_history_for = None
+                    if not skip_history and not stream_failed:
+                        await self.history.add(
+                            HistoryEntry.from_song(
+                                song,
+                                guild_id=self._guild.id,
+                                played_at=time.time(),
+                                # The host captured at song end, NOT
+                                # _np_host_message, which _release_np_host() nulled
+                                # above. Clearing current_song before the prefetch
+                                # await is what makes this the whole story: nothing
+                                # can adopt a later host for this song after that
+                                # point, and the next song's send happens in the
+                                # next iteration of this same task. 0 when nothing
+                                # hosted the block.
+                                message_id=(
+                                    finished_host.id if finished_host is not None else 0
+                                ),
                             )
+                        )
 
                     if self.store is not None:
                         await self.store.clear_song_end_state()
 
                     self.queue.task_done()
                     dequeue_owed = False
-                    self.current_song = None
-                    self.play_message = None  # -now must not serve the finished song
+                    # current_song / play_message were cleared above, before the
+                    # prefetch await, so nothing could adopt a host for a song
+                    # that had already ended.
                     await self.update_activity(None)
 
                     # Deliberately last: current_song is already cleared, so the

@@ -7,7 +7,7 @@ import contextlib
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +21,7 @@ from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
+    HISTORY_MAX_LIMIT,
     HistoryFlags,
     MusicBot,
     ResolvedSpotifyPlaylist,
@@ -30,6 +31,7 @@ from src.musicbot import (
     _typing_keepalive,
     background_typing,
 )
+from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome
@@ -1050,6 +1052,22 @@ class TestMusicBotInit:
         mock_bot.redis = mock_redis
         assert MusicBot(mock_bot).redis is mock_redis
 
+    def test_reads_history_archive_from_bot(self, mock_bot: MagicMock) -> None:
+        # -ping's Postgres row reads this. MusicBotApp.setup_hook builds the
+        # archive before load_extension constructs the cog, so it is always set
+        # on a real bot.
+        archive = MagicMock()
+        mock_bot.history_archive = archive
+        assert MusicBot(mock_bot).history_archive is archive
+
+    def test_missing_history_archive_is_none_not_an_error(
+        self, mock_bot: MagicMock
+    ) -> None:
+        # A bot without the attribute (tests, or a cog built outside MusicBotApp)
+        # must still construct — the Postgres row degrades to n/a instead.
+        del mock_bot.history_archive
+        assert MusicBot(mock_bot).history_archive is None
+
 
 class TestGetMp:
     def test_returns_existing_player_and_sets_context(
@@ -1782,8 +1800,19 @@ def _flags(limit: int = 10) -> SimpleNamespace:
 class TestHistoryCommand:
     def _mp_with_history(self, music_bot: MusicBot, entries: Any) -> MagicMock:
         mp = MagicMock()
-        history = GuildHistory(None)
-        history.restore(list(reversed(entries)))  # restore takes newest-first
+        history = GuildHistory(None, on_outbox_push=lambda: None)
+        # No store, so the in-memory deque IS the whole read path here — these
+        # tests are about rendering (ordering, chunking, limits, embed fields),
+        # not about which leg served them. Which leg served them is
+        # TestHistoryReadsRedis below, where the two legs are made to DISAGREE.
+        #
+        # This used to seed a Postgres double instead, because recent() read the
+        # archive first. Its docstring recorded the trap that cost: the double
+        # was `object()`, every recent() raised AttributeError inside the broad
+        # `except Exception`, and all 14 tests passed against the cache while
+        # covering none of the read path they claimed. Degrading gracefully and
+        # hiding a broken fixture are the same mechanism.
+        history.restore(list(reversed(entries)))
         mp.history = history
         music_bot.get_mp = MagicMock(return_value=mp)
         return mp
@@ -1872,6 +1901,127 @@ class TestHistoryCommand:
     def test_flag_defaults(self) -> None:
         # -h with no flags must parse to limit=10.
         assert HistoryFlags.get_flags()["limit"].default == 10
+
+    def test_max_limit_never_exceeds_the_redis_window(self) -> None:
+        """The merge's completeness argument, pinned rather than commented.
+
+        GuildHistory.recent() merges the newest `limit` archived rows with the
+        newest HISTORY_CACHE_LIMIT Redis holds, and that union contains the true
+        newest `limit` only while the Redis window is at least as deep as
+        anything this command accepts. Raising HISTORY_MAX_LIMIT alone would
+        fail nowhere and raise nothing — it would just start returning short
+        pages — which is precisely the kind of silent shortfall the branch this
+        test was added on already shipped once.
+        """
+        assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
+
+    @pytest.mark.parametrize("name", ["history", "ping"])
+    def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
+        """`-history` is the heaviest send in the bot — up to 8 song embeds plus
+        the NP block MusicContext.send may prepend — so unbounded concurrent
+        renders are how a guild rate-limits itself out of its own channel. The
+        decorator that prevents that carried nine lines of comment and no test:
+        deleting it left the whole suite green.
+
+        `wait=False` is half the point. Queueing the extra invocations behind
+        the first would still issue every send; declining them immediately is
+        what bounds the traffic, and cog_command_error renders the resulting
+        MaxConcurrencyReached as a notice rather than an error embed.
+        """
+        guard = getattr(MusicBot, name)._max_concurrency
+        assert guard is not None
+        assert guard.number == 1
+        assert guard.per is commands.BucketType.guild
+        assert guard.wait is False
+
+    def test_help_copy_states_the_real_retention_window(self) -> None:
+        """The user-facing copy must name the window the command actually keeps.
+
+        This string told users history "is kept permanently — the limit here is
+        a display cap … not how much is retained" for the entire life of the
+        branch that capped the list, i.e. it promised permanent retention in the
+        configuration that now ships by DEFAULT. Both halves were inverted at
+        once: 50 is the retention cap, and it is the same number as the display
+        cap (HISTORY_MAX_LIMIT is HISTORY_CACHE_LIMIT).
+
+        Interpolating the constant is the structural fix; this pins that it
+        stays interpolated, so raising the window can never leave the copy
+        quoting the old one. The negative assertion names the exact false claim
+        — if a rewrite ever uses "permanently" truthfully in the help body,
+        update this test deliberately rather than deleting it.
+        """
+        help_text = MusicBot.history.help
+        assert help_text is not None
+        assert str(HISTORY_MAX_LIMIT) in help_text
+        assert "permanently" not in help_text
+        # The archive caveat belongs in NOTES, and it is the one place the word
+        # is honest: Postgres retention really is permanent when enabled.
+        note = (MusicBot.history.extras or {}).get("note", "")
+        assert "permanently" in note
+
+
+class TestHistoryReadsRedis:
+    """That `-history` renders the Redis leg at all, asserted at the command
+    level rather than inferred from GuildHistory's own tests.
+
+    Needed because every failure inside recent() degrades to the leg below by
+    design, so a command test can render a perfectly correct embed off the
+    in-memory deque while the Redis read raises on every invocation. The only
+    way to tell the two apart is to make the legs DISAGREE and assert which one
+    reached the user.
+
+    This replaced TestHistoryReadsTheArchive, which asserted the same property
+    about Postgres. -history no longer reads Postgres: the Redis list is capped
+    at exactly the command's ceiling and is written ahead of the archive, so it
+    already holds every play the command can ask for.
+    """
+
+    async def test_the_rendered_songs_come_from_redis_not_just_the_cache(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
+    ) -> None:
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis, guild_id=1)
+        stored = _history_entries(2)  # Song 0 (t=1000), Song 1 (t=1001)
+        for entry in stored:
+            await store.push_history(entry)
+        # Older than both, and present ONLY in the deque — so its position in
+        # the output says which legs ran: absent means the Redis leg never got
+        # read, first means the cache won, last means both legs merged and
+        # sorted, which is the contract.
+        cache_only = HistoryEntry(
+            title="CACHE ONLY",
+            webpage_url="https://yt.com/v=cache",
+            duration_secs=1,
+            played_secs=1,
+            requester_id=1,
+            requester_name="u",
+            played_at=1.0,
+        )
+        mp = MagicMock()
+        history = GuildHistory(store, on_outbox_push=lambda: None)
+        history.restore([cache_only])
+        mp.history = history
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        titles = [e.title for e in mock_ctx.send.call_args[1]["embeds"]]
+        assert titles == ["1. Song 1", "2. Song 0", "3. CACHE ONLY"]
+
+    async def test_a_broken_store_double_is_now_visible(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The guard on the guard. A stand-in without get_history used to produce
+        # green tests forever; this pins that the same mistake now leaves a
+        # warning an author can see, so nobody restores one and concludes the
+        # read path is covered.
+        mp = MagicMock()
+        mp.history = GuildHistory(cast(Any, object()), on_outbox_push=lambda: None)
+        mp.history.restore(_history_entries(1))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.history)(music_bot, mock_ctx, flags=_flags())
+        assert "redis read failed" in caplog.text
+        assert "AttributeError" in caplog.text
 
 
 class TestMaxConcurrencyNotice:

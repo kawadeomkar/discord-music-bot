@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "1.2.2"
+version = "2.5.1"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -32,6 +32,7 @@ opentelemetry-exporter-otlp-proto-grpc = ">=1.27.0"
 opentelemetry-instrumentation-redis = ">=0.48b0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.48b0"
 structlog = ">=24.4.0"
+asyncpg = ">=0.30"
 
 # The three groups below are optional, which is what makes `--with` mean anything.
 # Poetry installs every NON-optional group by default and `--with` is documented as
@@ -50,8 +51,24 @@ optional = true
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.0.3,<10"
 pytest-asyncio = ">=0.25"
-fakeredis = ">=2.26.0"
+# Floor is 2.36, not 2.26: that is where fakeredis models the Redis-7 deleted-ID
+# list, so XAUTOCLAIM over a trimmed-but-pending entry hands back the (id, {})
+# tombstone shape a real server does. The drainer MUST ack tombstones — one
+# unacked tombstone stalls the drain permanently — and that is the P1-critical
+# path the unit tier exists to cover. Below this floor the shape is wrong and the
+# guard tests pass against a fiction. The lock has resolved above it for a while;
+# the declared floor had not moved, so a fresh resolve could have gone under it.
+fakeredis = ">=2.36"
 pytest-cov = "^7.1.0"
+# A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
+# several guards here are asyncio.timeout() calls, and a regression that removes
+# one makes the test HANG rather than fail — three such mutations were measured
+# hanging pytest indefinitely. On CI that burns the job's full timeout and
+# reports a cancellation, not a failure, so the signal is lost.
+pytest-timeout = "^2.3"
+# For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
+# code; needs Docker.
+testcontainers = ">=4.8"
 
 [tool.poetry.group.lint]
 optional = true
@@ -167,6 +184,25 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "--cov=src --cov-report=term-missing"
+# Per-test deadline. Generous relative to the whole suite (~50s for 1400+ tests)
+# because it exists to convert HANGS into failures, not to police slow tests —
+# and it has to leave room for the pg tier's container startup. See the
+# pytest-timeout entry in the test group for why a hang is otherwise invisible.
+timeout = 120
+markers = [
+    # Integration tier against a real Postgres, excluded from the default run:
+    # postgres:18-alpine via testcontainers locally, a service container in CI.
+    # Several archive invariants live ONLY there (ON CONFLICT dedup, the schema
+    # lock in both directions, and a rejected payload holding a NUL byte that
+    # jsonb and text both refuse) — see tests/test_pg_integration.py.
+    "pg: real-Postgres integration test (needs Docker, or POSTGRES_TEST_URL)",
+    # Integration tier against a real Redis, excluded from the default run:
+    # redis:7-alpine via testcontainers locally, a service container in CI.
+    # fakeredis executes every stream command the outbox uses but gets five of
+    # them wrong, all in the safe-looking direction — see the module docstring
+    # of tests/test_redis_integration.py.
+    "redis: real-Redis integration test (needs Docker, or REDIS_TEST_URL)",
+]
 filterwarnings = [
     "error",
     # audioop was removed in Python 3.13 but discord.py's Ogg/Opus parser still

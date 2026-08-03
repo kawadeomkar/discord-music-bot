@@ -53,6 +53,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# The migration runner discovers .sql files at run time, and a test asserts the
+# directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
+# them present, not just the module.
+COPY migrations/ ./migrations/
+# Same reason, different file: `just outbox` hardcodes the outbox key and consumer
+# group because a shell recipe cannot import them, and a test reads this file back
+# to prove the two have not drifted. Without it that guard fails in the container
+# tier with FileNotFoundError while passing everywhere else — which is how a check
+# ends up skipped instead of fixed.
+COPY justfile ./
+# And the same again for the default-password coupling. The literal lives in four
+# places no Python import can reach — compose, the build preflight, the env
+# template and the generator — so the tests read those files to prove they have
+# not drifted, and setup_env.sh is executed against a temp copy to prove it
+# tightens .env's mode. All four have to be in the image or those guards are
+# container-tier failures rather than assertions.
+COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
@@ -79,6 +96,10 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/
 COPY pyproject.toml ./
+# Required by the compose `db-migrate` one-shot, which runs `python -m
+# src.db_migrate` out of THIS image so the runner and the schema it applies can
+# never be different versions.
+COPY migrations/ ./migrations/
 
 ARG ENVIRONMENT=production
 ENV PATH="/app/.venv/bin:$PATH" \

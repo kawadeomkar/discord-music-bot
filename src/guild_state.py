@@ -6,9 +6,12 @@ The two Redis hashes and the queue list each have corresponding frozen dataclass
 field-name constants; GuildQueue in guild_queue.py converts between at-rest queue
 entries and live queue items. Callers never touch raw bytes from Redis directly.
 
-This module is pure schema: constructors, serializers, and derived read-only
-properties only — no domain logic, and no runtime imports from the rest of the
-project (orjson is the project-wide wire codec).
+This module is pure schema: constructors, serializers, derived read-only
+properties, and the domain NORMALIZATION that keeps a value object inside the
+column domain it is stored in (HistoryEntry.__post_init__) — but no behaviour,
+and no runtime imports from the rest of the project (orjson is the project-wide
+wire codec). Normalization belongs here precisely because it is schema: the type
+and the domain it promises cannot be allowed to drift apart.
 """
 
 import logging
@@ -542,6 +545,7 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
 
 
 class HistoryEntryField:
+    GUILD_ID: Final[str] = "guild_id"
     TITLE: Final[str] = "title"
     WEBPAGE_URL: Final[str] = "webpage_url"
     DURATION_SECS: Final[str] = "duration_secs"
@@ -551,17 +555,49 @@ class HistoryEntryField:
     THUMBNAIL: Final[str] = "thumbnail"
     UPLOADER: Final[str] = "uploader"
     PLAYED_AT: Final[str] = "played_at"
+    MESSAGE_ID: Final[str] = "message_id"
+
+
+# The play_history column domain (migrations/0001_play_history.sql), mirrored
+# here because HistoryEntry is now the thing that guarantees it. Kept next to the
+# dataclass rather than in history_archive.py so the type and its domain cannot
+# drift apart, and so this module stays free of runtime imports from the rest of
+# the project.
+_TEXT_FIELDS: Final[tuple[str, ...]] = (
+    "title",
+    "webpage_url",
+    "requester_name",
+    "thumbnail",
+    "uploader",
+)
+_INT4_FIELDS: Final[tuple[str, ...]] = ("duration_secs", "played_secs")
+_INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id", "message_id")
+_INT4_MAX: Final[int] = 2**31 - 1
+_INT8_MAX: Final[int] = 2**63 - 1
+_TS_MAX: Final[float] = 253402300799.0  # 9999-12-31T23:59:59Z, the timestamptz ceiling
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HistoryEntry:
     """One played song at rest — an element of guild:{id}:history.
 
-    Zero-values mean "unknown": fields absent on the wire default on parse and
+    Zero-values mean "unknown": fields absent on the wire default on parse, and
     the display layer degrades accordingly. The field set deliberately matches
-    the future Postgres play_history row.
+    the Postgres play_history row.
+
+    guild_id is redundant on the per-guild display list (the key carries it) but
+    load-bearing on the global history:outbox stream, where entries from all
+    guilds interleave and the drainer maps each to a Postgres row. Entries
+    written before the field existed parse as guild_id=0.
+
+    message_id is a WEAK reference by design — the NP host migrates across
+    messages during one song and a dedicated host is deleted when retired, so
+    this records which message hosted the block when the song ended, not a
+    message guaranteed to still exist. That is why it is neither a foreign key
+    nor part of play_history_dedup.
     """
 
+    guild_id: int = 0
     title: str = ""
     webpage_url: str = ""  # YouTube link used
     duration_secs: int = 0  # full song length; 0 = unknown
@@ -571,12 +607,77 @@ class HistoryEntry:
     thumbnail: str = ""
     uploader: str = ""
     played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
+    message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
+
+    def __post_init__(self) -> None:
+        """Normalize into the play_history column domain at construction.
+
+        This is the schema lock: an instance of this class is, by construction, a
+        row Postgres accepts. Every producer routes through here — from_song,
+        parse_history_entry, _row_to_entry, dataclasses.replace, the backfill — so
+        no consumer re-proves it and the archive holds no opinion about data.
+
+        ONE FIELD IS DELIBERATELY EXEMPT: the clamp floors every integer at 0, but
+        play_history's CHECK on guild_id is strictly `> 0`, so a HistoryEntry
+        holding guild_id 0 is constructible and NOT insertable. Clamping up to 1
+        would file an unattributable play into a real guild's history, where it is
+        indistinguishable from a genuine play; relaxing the CHECK to `>= 0` would
+        make guild 0 a permanent bucket of orphans no read path excludes. Refusing
+        at the database sends exactly those entries to play_history_rejected, where
+        a row means "a producer stopped stamping guild_id" — the actual defect. No
+        real producer can reach it today (from_song takes guild_id keyword-only and
+        Discord snowflakes are positive).
+
+        The four vectors closed here are the ONLY ways a wire-parseable entry could
+        fail an INSERT. Everything else the column types could refuse — lone
+        surrogates, non-finite floats, integers past 64 bits — orjson already
+        refuses to encode.
+
+        Written as range tests rather than pairs of bound checks because a chained
+        comparison is False for NaN, which lands NaN on the sentinel. That arm is
+        unreachable from the wire (orjson emits null, the parser reads 0.0) and
+        reachable from from_song, which is why it belongs on the type.
+
+        TOTAL BY DESIGN — this never raises. It also runs on the READ path
+        (_row_to_entry, and the backfill's dataclasses.replace), and stored rows
+        predate it, so a validator that rejected them would break -history for
+        precisely the guilds with the most history. Strictness lives in the DB
+        CHECK constraints instead, where a violation means "this validator
+        regressed" and cannot retroactively invalidate durable data.
+
+        No type coercion: HistoryEntry(title=None) raising TypeError out of the
+        `in` test below is the correct outcome — coercing would turn a caught bug
+        into a stored row reading "None".
+        """
+        for name in _TEXT_FIELDS:
+            value: str = getattr(self, name)
+            if "\x00" in value:
+                object.__setattr__(self, name, value.replace("\x00", ""))
+        for name, ceiling in (
+            *((f, _INT4_MAX) for f in _INT4_FIELDS),
+            *((f, _INT8_MAX) for f in _INT8_FIELDS),
+        ):
+            value_int: int = getattr(self, name)
+            if not 0 <= value_int <= ceiling:
+                object.__setattr__(self, name, min(max(value_int, 0), ceiling))
+        if not 0.0 <= self.played_at <= _TS_MAX:
+            object.__setattr__(self, "played_at", 0.0)
 
     @classmethod
-    def from_song(cls, song: YTDL, *, played_at: float) -> Self:
-        """Canonical extraction from a finished song. `played_at` is a
+    def from_song(
+        cls, song: YTDL, *, guild_id: int, played_at: float, message_id: int
+    ) -> Self:
+        """Canonical extraction from a finished song. played_at is a
         caller-supplied clock (as in crashed_position_at) so this stays a pure
-        field mapping.
+        field mapping. guild_id is required (keyword) because the song object
+        doesn't carry it and a forgotten stamp would silently write
+        unattributable outbox entries.
+
+        message_id is required for the same reason, and more strictly: nothing
+        downstream can catch a forgotten one. play_history's CHECK is
+        `message_id >= 0`, so a missed stamp inserts cleanly as 0 and is
+        permanently indistinguishable from a song that genuinely had no host.
+        Pass 0 explicitly for that case.
 
         played_secs is the position reached (start_offset + audio delivered),
         capped at duration when known. For a -playnow-interrupted song recorded
@@ -589,6 +690,7 @@ class HistoryEntry:
         if duration:
             played = min(played, duration)
         return cls(
+            guild_id=guild_id,
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             duration_secs=duration,
@@ -598,6 +700,7 @@ class HistoryEntry:
             thumbnail=song.thumbnail or "",
             uploader=song.uploader or "",
             played_at=played_at,
+            message_id=message_id,
         )
 
     def to_redis(self) -> bytes:
@@ -606,6 +709,7 @@ class HistoryEntry:
         HistoryEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
+                HistoryEntryField.GUILD_ID: self.guild_id,
                 HistoryEntryField.TITLE: self.title,
                 HistoryEntryField.WEBPAGE_URL: self.webpage_url,
                 HistoryEntryField.DURATION_SECS: self.duration_secs,
@@ -615,6 +719,7 @@ class HistoryEntry:
                 HistoryEntryField.THUMBNAIL: self.thumbnail,
                 HistoryEntryField.UPLOADER: self.uploader,
                 HistoryEntryField.PLAYED_AT: self.played_at,
+                HistoryEntryField.MESSAGE_ID: self.message_id,
             }
         )
 
@@ -640,6 +745,7 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
         return None
     try:
         return HistoryEntry(
+            guild_id=int(entry.get(HistoryEntryField.GUILD_ID) or 0),
             title=str(entry.get(HistoryEntryField.TITLE) or ""),
             webpage_url=str(entry.get(HistoryEntryField.WEBPAGE_URL) or ""),
             duration_secs=int(entry.get(HistoryEntryField.DURATION_SECS) or 0),
@@ -649,6 +755,7 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
             thumbnail=str(entry.get(HistoryEntryField.THUMBNAIL) or ""),
             uploader=str(entry.get(HistoryEntryField.UPLOADER) or ""),
             played_at=float(entry.get(HistoryEntryField.PLAYED_AT) or 0.0),
+            message_id=int(entry.get(HistoryEntryField.MESSAGE_ID) or 0),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt history entry dropped: {e}")

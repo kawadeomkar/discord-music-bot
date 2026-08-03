@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Concatenate, Optional, ParamSpec, TypeVar, cast
 
 import orjson
 import redis.asyncio as aioredis
 from redis.asyncio.client import Pipeline
+from redis.backoff import ExponentialBackoff
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError
+from redis.exceptions import ResponseError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
+from src import config
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -31,11 +39,51 @@ GUILD_QUEUE_KEY = "guild:{guild_id}:queue"
 GUILD_STATE_KEY = "guild:{guild_id}:state"
 GUILD_HISTORY_KEY = "guild:{guild_id}:history"
 GUILD_NOW_PLAYING_KEY = "guild:{guild_id}:now_playing"
-GUILD_TTL = 86400  # 24h idle expiry (never applied to the history key — see below)
-# Display cap only — NOT a retention cap. The Redis history list is unbounded
-# (source of truth for all played songs; Postgres eventually); this bounds the
-# GuildHistory deque and every read, so startup stays O(50) against an unbounded
-# list.
+# Global (not per-guild) write-ahead buffer for the Postgres history archive:
+# entries from all guilds interleave (each carries its guild_id on the wire),
+# XADDed alongside the display list and drained oldest-first by
+# HistoryOutboxDrainer. Deliberately NO TTL — it holds not-yet-durable entries,
+# so under volatile-lru it must never be an eviction candidate; normally
+# near-empty, it grows only while Postgres is unreachable.
+#
+# A STREAM with a consumer group, not a list: a list retire is `RPOP <count>` —
+# "remove the oldest N", not "remove the N I just archived" — and those are equal
+# only when nothing else touched the key and the command ran exactly once. XACK
+# names IDs, so it cannot mean anything else.
+HISTORY_OUTBOX_KEY = "history:outbox"
+HISTORY_OUTBOX_GROUP = "drainers"
+# STABLE, not per-process, and load-bearing: the PEL belongs to the NAME, so a
+# starting process's `XREADGROUP ... 0` inherits whatever its predecessor — or a
+# live sibling — left in flight, and recovery needs no lease, no TTL and no
+# housekeeping. Two live drainers are safe by construction: `>` hands them
+# disjoint entries and `0` replays a shared set that ON CONFLICT DO NOTHING
+# collapses on the Postgres side, so concurrency costs duplicated work, never
+# lost data.
+HISTORY_OUTBOX_CONSUMER = "drainer"
+# The single stream field holding one serialize_history_entry blob. Keeping the
+# orjson payload opaque means parse_history_entry, HistoryEntry's domain clamping
+# and every wire-compatibility rule in guild_state.py are untouched by transport.
+OUTBOX_FIELD = b"e"
+# 24h idle expiry. NEVER applied to the history key: that list is capped rather
+# than expired (see HISTORY_CACHE_LIMIT and push_history), and it is the only
+# thing -history reads, so a guild that goes quiet for a day must still answer
+# the command. Every TTL path here excludes it unconditionally.
+GUILD_TTL = 86400
+# The retention cap, the display cap and the -history ceiling at once — the same
+# number on purpose. push_history LTRIMs the list to this many entries on every
+# write and PERSISTs it, so the list is a bounded, permanent window of the newest
+# plays, and musicbot.HISTORY_MAX_LIMIT is pinned to this constant: the command
+# can never ask for more SLOTS than the window holds.
+#
+# "Slots", not "plays" — the equality leaves no headroom, so anything that costs
+# a slot without yielding a renderable play shortens the answer by one: a corrupt
+# entry (get_history drops it) or a duplicate (recent() dedups it). The second is
+# reachable — create_redis_pool sets retry_on_error, and the LPUSH is not
+# idempotent, so a timeout after the server applied EXEC re-sends the pipeline
+# and the entry lands twice. See docs/ARCHITECTURE.md#history-read-path.
+#
+# Raising it costs Redis memory in all three roles at once — roughly 487 B per
+# entry per guild, permanently, since nothing expires it.
 HISTORY_CACHE_LIMIT = 50
 
 # Transient per-song fields and the playback-position fields, cleared together on
@@ -78,7 +126,37 @@ def create_redis_pool() -> aioredis.ConnectionPool:
         socket_keepalive=True,
         health_check_interval=30,
         retry_on_timeout=True,
-        retry_on_error=[ConnectionError, TimeoutError],
+        # redis-py's OWN exception classes, not the builtins of the same name.
+        # `redis.exceptions.ConnectionError` does not subclass builtins.ConnectionError
+        # (it derives from RedisError), so listing the builtin here matched nothing
+        # redis-py ever raises and connection errors got no retry at all — while every
+        # store method logs-and-swallows, so the missing retry surfaced as persistence
+        # quietly degrading rather than as an error. See test_redis_client.py, which
+        # asserts the non-subclass relationship that makes this easy to get wrong.
+        #
+        # (The builtin TimeoutError was harmless but redundant: retry_on_timeout=True
+        # already appends socket.timeout, which IS builtins.TimeoutError on 3.10+.)
+        retry_on_error=[RedisConnectionError, RedisTimeoutError],
+        # Without an explicit Retry, redis-py synthesises `Retry(NoBackoff(), 1)` for a
+        # non-empty retry_on_error: one immediate reattempt, no backoff. A restarting
+        # Redis is usually gone for longer than that, and a hammering reconnect is what
+        # backoff exists to avoid. 3 attempts over ExponentialBackoff's default 8ms→512ms
+        # ceiling covers an ordinary restart without stalling a command for long.
+        # `redis.asyncio.retry.Retry`, NOT `redis.retry.Retry` — they are different
+        # classes with the same name, the same constructor and the same attributes,
+        # and only the async one awaits. The sync version's call_with_retry does
+        # `try: return do()`, which under an async connection returns a COROUTINE
+        # without awaiting it: no exception is ever raised inside that try, the
+        # `except` arm is dead, the failure handler never runs, and the error
+        # surfaces from the caller's await — outside the retry loop entirely.
+        # Measured against a closed port: sync = 1 connection attempt, async = 4.
+        # For a year this pool was configured for 3 retries and performed none.
+        #
+        # Nothing about the object looks wrong, which is why it survived:
+        # get_retries() is 3, _supported_errors and _backoff are exactly as set,
+        # so every assertion on the CONFIGURATION passes under both classes. The
+        # test below counts attempts instead, because that is the only difference.
+        retry=Retry(ExponentialBackoff(), 3),
         socket_connect_timeout=5,
     )
 
@@ -183,6 +261,390 @@ async def spotify_token_get_with_ttl(
         return None
 
 
+# ── History outbox (drain side) ───────────────────────────────────────────────
+# Consumed only by HistoryOutboxDrainer (history_archive.py). Unlike the cache
+# helpers above, these deliberately DO raise on Redis failure — the drainer's
+# backoff loop is the error handler, and a swallowed error here would look
+# like an empty outbox and silently stall the drain. Raw bytes in/out: wire
+# parsing stays in guild_state.py (parse_history_entry), per the schema rule.
+#
+# There is no lease and no single-consumer requirement. Both were consequences
+# of a positional retire; the consumer group replaces them (see
+# HISTORY_OUTBOX_CONSUMER). What the lease also silently provided and nothing
+# here replaces is exactly-once `play_history_rejected` recording — that moved
+# into the SQL as an ON CONFLICT clause rather than into a lock.
+#
+# Every command below is idempotent under re-send, which is why the drain path
+# is safe on the application pool with retries enabled: XACK and XDEL return 0
+# for an ID they have already settled, and XTRIM MINID names an absolute ID so
+# its effect is a function of its argument. `XTRIM MAXLEN` is NOT — it means
+# "keep the newest n", so a re-send after two concurrent XADDs destroys a
+# second tranche. It is not used here, and must not be introduced.
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OutboxEntry:
+    """One delivered stream entry: its ID, and its payload if it still has one.
+
+    kw_only because both fields are Optional[bytes]-shaped and transposing them
+    would type-check silently (the convention ExtractRequest documents).
+
+    `wire is None` is a TOMBSTONE — the entry was delivered to a consumer and
+    then had its body deleted while still pending, which XTRIM and any operator
+    XDEL can both produce because neither consults the PEL. The ID survives in
+    the PEL, so the read returns it with an EMPTY field map. This is not a
+    corrupt entry and must not be routed to parse_history_entry: the bytes are
+    gone from Redis and nothing can reproduce them. The drainer acks it
+    unconditionally and logs a lost play — leaving it pending replays it every
+    cycle forever, on a key the volatile-lru eviction policy can never reclaim
+    (it carries no TTL, by design — see push_history).
+    """
+
+    id: bytes
+    wire: Optional[bytes]
+
+
+def _parse_outbox_reply(reply: Any) -> list[OutboxEntry]:
+    """Flatten redis-py's XREADGROUP reply into IDs and payloads.
+
+    The reply is [[stream_name, [(id, {field: value}), ...]], ...] — one outer
+    element per stream, and we always ask for exactly one. The two empty cases
+    have DIFFERENT shapes, which is why this tolerates both rather than
+    indexing: `>` with nothing new returns `[]`, while `0` with an empty PEL
+    returns `[[key, []]]`.
+
+    `.get(OUTBOX_FIELD)` rather than `[OUTBOX_FIELD]` is the tombstone rule.
+    A literal subscript raises KeyError, which is not a ResponseError and not a
+    parse failure, so it escapes every handler the drain path has and reaches
+    the generic backoff — where the same entry replays on the next tick,
+    forever, while the outbox grows unbounded behind it.
+    """
+    out: list[OutboxEntry] = []
+    for _key, entries in cast(list[Any], reply) or []:
+        for entry_id, fields in cast(list[Any], entries):
+            out.append(
+                OutboxEntry(
+                    id=cast(bytes, entry_id),
+                    wire=cast(Optional[bytes], fields.get(OUTBOX_FIELD)),
+                )
+            )
+    return out
+
+
+async def ensure_outbox_group(redis: aioredis.Redis) -> None:
+    """Create the consumer group if it is missing. Tolerates only BUSYGROUP.
+
+    Deliberately NOT `except ResponseError: pass`. BUSYGROUP, WRONGTYPE and
+    NOGROUP are all plain ResponseError — redis-py has no subclass for any of
+    them — so a class-level catch swallows the two that mean "this bot cannot
+    record history" alongside the one that means "already fine":
+
+      BUSYGROUP   repeat create              → fine, ignore
+      WRONGTYPE   a pre-R1 LIST at the key   → fatal, must abort startup
+      NOGROUP     the key was deleted        → recoverable, healed by the
+                                               drain cycle
+
+    Swallowing WRONGTYPE is total, silent history loss: push_history is a
+    @_guild_op method, so its XADD failure is one warning per song and takes
+    guild:{id}:history down with it (both legs share one MULTI/EXEC). XLEN
+    would raise too, so depth reads -1 and the backlog alarm can never fire
+    either. Hence the startup abort — it matches setup_hook's refusal to run
+    an ENABLED archive without POSTGRES_URL: a bot the operator opted into
+    archiving with must not serve while it cannot durably record what it
+    plays. (Enabled mode only. With the archive disabled setup_hook never
+    calls this — creating the group would MKSTREAM the non-evictable key into
+    existence — and a mis-shaped key is inert, downgraded to a startup
+    warning by the leftover-outbox probe.)
+
+    id="0" is NOT redis-py's default (it defaults to "$", which silently skips
+    every entry already in the stream). MKSTREAM removes any separate
+    create-the-key step. Repeating this call does not rewind an existing group.
+    """
+    try:
+        await redis.xgroup_create(
+            HISTORY_OUTBOX_KEY, HISTORY_OUTBOX_GROUP, id="0", mkstream=True
+        )
+    except ResponseError as e:
+        if not str(e).startswith("BUSYGROUP"):
+            raise
+
+
+async def read_outbox_pending(redis: aioredis.Redis, count: int) -> list[OutboxEntry]:
+    """Re-deliver this consumer name's still-unacked entries, oldest first.
+
+    Runs EVERY cycle, not only at startup. Under a shared consumer name this is
+    what recovers a peer that was SIGKILLed mid-batch — including one killed
+    past K8s' terminationGracePeriodSeconds — without any lease TTL to wait out.
+
+    noack=False is redis-py's default and is spelled out anyway, alongside the
+    other kwarg this module pins (xgroup_create's id="0"). noack=True would
+    deliver without ever entering the PEL, turning the whole design's
+    at-least-once into at-most-once: this "0" read would find nothing to
+    re-deliver and a drainer that died mid-batch would lose its plays outright.
+    No behavioural test can catch it — every fakeredis assertion still passes —
+    so the defence is that the value is written down at both call sites.
+    """
+    return _parse_outbox_reply(
+        await redis.xreadgroup(
+            HISTORY_OUTBOX_GROUP,
+            HISTORY_OUTBOX_CONSUMER,
+            {HISTORY_OUTBOX_KEY: "0"},
+            count=count,
+            noack=False,
+        )
+    )
+
+
+async def read_outbox_new(redis: aioredis.Redis, count: int) -> list[OutboxEntry]:
+    """Claim never-before-delivered entries into this consumer's PEL.
+
+    Two live drainers get DISJOINT sets here — the server guarantees it — so
+    this is the half of the design that makes a lease unnecessary.
+    """
+    return _parse_outbox_reply(
+        await redis.xreadgroup(
+            HISTORY_OUTBOX_GROUP,
+            HISTORY_OUTBOX_CONSUMER,
+            {HISTORY_OUTBOX_KEY: ">"},
+            count=count,
+            noack=False,  # see read_outbox_pending — at-least-once depends on it
+        )
+    )
+
+
+async def retire_outbox(redis: aioredis.Redis, ids: Sequence[bytes]) -> None:
+    """Settle entries by ID — call only after their Postgres INSERT committed.
+
+    Both commands are required, and the ORDER IS LOAD-BEARING.
+
+    XACK clears the pending record but does NOT remove the entry: a stream is a
+    log, not a queue. Ack-without-delete would grow this key forever, which is
+    strictly worse than the list design because this key carries no TTL and so is
+    never an eviction candidate. XDEL frees the memory and is idempotent (missing ID → 0).
+
+    Written this way — transactionally, XACK strictly first — a crash between
+    them leaves an acked-but-undeleted entry: invisible to XREADGROUP, harmless,
+    and reclaimed by the cap's MINID trim. Written the other way, or
+    non-transactionally, the window inverts to XDEL landing without XACK, which
+    is an unrecoverable tombstone (OutboxEntry). That is the one new loss
+    window the stream transport introduces, and it is closed by construction
+    here rather than by remembering to be careful at the call site.
+
+    Crash BEFORE the ack and the batch simply stays pending → redelivered →
+    deduped by the archive's unique index. At-least-once is preserved, which is
+    the same property that makes the Phase C backfill idempotent.
+    """
+    if not ids:
+        return
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.xack(HISTORY_OUTBOX_KEY, HISTORY_OUTBOX_GROUP, *ids)
+        pipe.xdel(HISTORY_OUTBOX_KEY, *ids)
+        await pipe.execute()
+
+
+async def outbox_depth(redis: aioredis.Redis) -> int:
+    """Entries present in the stream — the drainer's backlog watchdog metric.
+
+    An approximation of the un-archived backlog, and it diverges in BOTH
+    directions. It over-reports after a crash between XACK and XDEL (harmless,
+    reconciled by the MINID trim). It UNDER-reports when entries were trimmed
+    or XDELed while still pending, because the bodies are gone while the PEL
+    records survive — i.e. it reads low at exactly the moment plays are being
+    lost. The cap's ack-before-trim rule (_enforce_cap in history_archive.py)
+    is what keeps that case rare — everything a trim destroys is XACKed first,
+    so no pending record outlives its body; without that rule, DEPTH_ALARM
+    would go quiet during the incident it exists to catch.
+
+    XINFO GROUPS' `lag` is NOT a usable exact alternative: it is nil whenever
+    entries have been deleted in a way Redis cannot reconcile, and retire_outbox
+    makes XDEL part of every successful cycle, so it is unavailable in precisely
+    the state an operator would consult it. The honest exact measure is
+    XPENDING's summary count plus XLEN.
+    """
+    return await redis.xlen(HISTORY_OUTBOX_KEY)
+
+
+async def outbox_pending_count(redis: aioredis.Redis) -> int:
+    """Entries delivered but not yet acked, across all consumers in the group."""
+    summary = cast(
+        dict[str, Any], await redis.xpending(HISTORY_OUTBOX_KEY, HISTORY_OUTBOX_GROUP)
+    )
+    return int(summary["pending"])
+
+
+async def outbox_pending_below(redis: aioredis.Redis, minid: bytes) -> list[bytes]:
+    """Delivered-but-unacked IDs strictly older than `minid`.
+
+    The set a trim is about to destroy while a drainer is still holding it.
+    XTRIM IS BLIND TO THE PEL — verified on redis:7-alpine (7.4.9): five entries
+    delivered and unacked, `XTRIM MAXLEN 2` deleted three, and XPENDING still
+    read 5 afterwards — so without this the cap leaves a pending record whose
+    body is gone. That is a tombstone, and a tombstone left unacked replays
+    every cycle forever on a non-evictable key.
+
+    Bounded by BATCH_SIZE x live drainers however large the trim is, because
+    the drain cycle never reads `>` with a non-empty PEL. That is what lets the
+    caller ack this set by ID while trimming the bodies with a single MINID
+    command: the expensive half stays O(1) in commands and the precise half
+    stays small.
+
+    Returns [] when the group has vanished (an operator DEL racing the cap).
+    With no group nothing is pending by definition, so there is nothing to ack.
+    """
+    try:
+        detail = cast(
+            list[dict[str, Any]],
+            await redis.xpending_range(
+                HISTORY_OUTBOX_KEY,
+                HISTORY_OUTBOX_GROUP,
+                min="-",
+                max=_prev_stream_id(minid),
+                count=_PENDING_SCAN_LIMIT,
+            ),
+        )
+    except ResponseError as e:
+        if not str(e).startswith("NOGROUP"):
+            raise
+        return []
+    return [cast(bytes, row["message_id"]) for row in detail]
+
+
+async def ack_outbox(redis: aioredis.Redis, ids: Sequence[bytes]) -> None:
+    """Clear PEL records WITHOUT archiving the entries — the cap only.
+
+    Deliberately separate from retire_outbox, which acks AND deletes and means
+    "these reached Postgres". This one means "these are being destroyed on
+    purpose", and it exists so `grep retire_outbox` keeps its meaning.
+
+    Only XACK: the bodies are removed by the caller's single MINID trim, which
+    is orders of magnitude cheaper than naming every doomed ID in an XDEL.
+    """
+    if not ids:
+        return
+    await redis.xack(HISTORY_OUTBOX_KEY, HISTORY_OUTBOX_GROUP, *ids)
+
+
+# Ceiling on one outbox_pending_below scan. The PEL is bounded by
+# BATCH_SIZE x live drainers, so this is far above any reachable size; it is a
+# runaway guard, not a page size.
+_PENDING_SCAN_LIMIT = 10_000
+
+
+def _prev_stream_id(entry_id: bytes) -> bytes:
+    """The ID immediately before `entry_id`, for an inclusive→exclusive bound.
+
+    XPENDING's range is inclusive at both ends while MINID's is exclusive
+    below, so scanning "everything the trim will destroy" needs the ID one step
+    down. Stream IDs are `<ms>-<seq>` with both halves 64-bit, so stepping the
+    sequence is exact rather than an epsilon; at seq 0 it borrows from the
+    millisecond half, and b"0-0" has nothing below it.
+    """
+    ms, _, seq = entry_id.partition(b"-")
+    ms_i, seq_i = int(ms), int(seq)
+    if seq_i:
+        return b"%d-%d" % (ms_i, seq_i - 1)
+    if ms_i:
+        return b"%d-%d" % (ms_i - 1, (1 << 64) - 1)
+    return b"0-0"
+
+
+async def trim_outbox_below(redis: aioredis.Redis, minid: bytes) -> int:
+    """Drop every entry older than `minid` WITHOUT archiving it, returning the
+    number actually destroyed — the opt-in HISTORY_OUTBOX_MAX cap only
+    (history_archive.py). A separate name from retire_outbox so that
+    `grep retire_outbox` still means "entries that reached Postgres" and this
+    one always reads as data loss.
+
+    MINID, never MAXLEN. MINID names an ID, so its effect is a function of its
+    argument and a re-send is a no-op; MAXLEN names a length, so its effect is a
+    function of stream state at execution time and a re-send after concurrent
+    XADDs destroys a second tranche of unarchived plays. That is the same
+    destructive-retry defect the positional RPOP had, reconstructed.
+
+    approximate=False is not optional. redis-py defaults it to True, which trims
+    to node boundaries — on a small stream that trims NOTHING while reporting
+    success, and fakeredis models it as an exact trim, so a unit test cannot see
+    the difference. The same default sits on xadd(maxlen=...).
+
+    The caller logs THIS value rather than a derived `depth - cap`: XLEN
+    over-counts acked-but-undeleted entries, and a retire racing the cap can
+    settle part of the doomed range first, so the trim may legitimately remove
+    fewer than the caller computed.
+
+    No slicing: XTRIM returns a count, not the entries — measured on a real
+    490,000-entry stream it removed 489,000 in 37ms, against the 206 MB / 5.3s a
+    single `RPOP key 490000` cost the list implementation. LIMIT cannot be
+    combined with approximate=False anyway.
+    """
+    return await redis.xtrim(HISTORY_OUTBOX_KEY, minid=minid, approximate=False)
+
+
+async def reclaim_outbox_stale(
+    redis: aioredis.Redis, *, min_idle_ms: int, count: int, max_passes: int
+) -> tuple[int, int]:
+    """Sweep the group's PEL: reclaim long-idle entries, purge tombstones.
+
+    Returns (reclaimed, purged). Not belt-and-braces — besides XACK this is the
+    only thing that clears a tombstone from the PEL on Redis 7, and it is the
+    only thing at all that reaches an ORPHANED PEL (one left under a consumer
+    name no live process reads, which a deploy that changed the name produces).
+    The ordinary case — a peer killed mid-batch — is already covered by the
+    every-cycle pending read, because the name is shared.
+
+    Claims into our OWN name as well as any other. Claiming an entry we already
+    hold is a no-op for live entries, but it is exactly what purges tombstones,
+    so scoping the sweep to foreign consumers would make it useless for its main
+    job.
+
+    min_idle_ms must exceed the drain deadline: under a shared name "idle" is
+    measured from last DELIVERY, so a shorter value reclaims a live sibling's
+    in-flight batch mid-insert. The caller asserts it.
+
+    justid=True is deliberately NOT used: redis-py's parser returns only the
+    claimed-ID list for that form, discarding both the cursor AND the deleted-ID
+    list — the two things this loop needs.
+
+    Requires Redis 7.0+. XAUTOCLAIM exists at 6.2, but the 3-element reply
+    carrying the deleted-ID list is 7.0; on 6.2 redis-py hands back a literal
+    (None, None) inside the claimed list and the tombstone is never purged.
+
+    The loop terminates on "this pass found nothing NEW", not on
+    `cursor == b"0-0"` alone, and the counts are of DISTINCT ids. Both are
+    forced by the same divergence: real Redis returns b"0-0" to signal a
+    completed scan, while fakeredis returns the last-scanned ID — which, fed
+    back as an inclusive start, re-delivers entries this sweep has already
+    counted. A cursor-only condition would run correctly in production and spin
+    here; a running total would report five reclaims for one entry. Tracking ids
+    is correct under both conventions and is what makes the unit tier meaningful
+    at all. max_passes bounds the work either way.
+    """
+    cursor: bytes = b"0-0"
+    seen_claimed: set[bytes] = set()
+    seen_purged: set[bytes] = set()
+    for _ in range(max_passes):
+        next_cursor, claimed, deleted = cast(
+            tuple[bytes, list[Any], list[bytes]],
+            await redis.xautoclaim(
+                HISTORY_OUTBOX_KEY,
+                HISTORY_OUTBOX_GROUP,
+                HISTORY_OUTBOX_CONSUMER,
+                min_idle_time=min_idle_ms,
+                start_id=cursor,
+                count=count,
+            ),
+        )
+        fresh = {cast(bytes, mid) for mid, _fields in claimed} - seen_claimed
+        fresh_deleted = {cast(bytes, mid) for mid in deleted} - seen_purged
+        if not fresh and not fresh_deleted:
+            break
+        seen_claimed |= fresh
+        seen_purged |= fresh_deleted
+        cursor = next_cursor
+        if cursor == b"0-0":
+            break
+    return len(seen_claimed), len(seen_purged)
+
+
 # ── Guild-scoped Redis store ──────────────────────────────────────────────────
 
 _P = ParamSpec("_P")
@@ -256,8 +718,11 @@ class GuildRedisStore:
 
     def _pipe_expire_all(self, pipe: Pipeline) -> None:
         """Queue expire commands for the TTL-managed guild keys onto an existing
-        pipeline. The history key is deliberately absent — it is PERSISTed by
-        push_history and must never be re-armed with an idle expiry."""
+        pipeline. The history key is deliberately absent: push_history PERSISTs
+        it and bounds it by LENGTH instead, so there is no TTL here to refresh.
+        Adding one would break -history quietly — the command reads that list and
+        nothing else, so an expired key is an empty answer for a guild that has
+        played hundreds of songs."""
         pipe.expire(self.queue_key(), GUILD_TTL)
         pipe.expire(self.state_key(), GUILD_TTL)
         pipe.expire(self.now_playing_key(), GUILD_TTL)
@@ -406,25 +871,150 @@ class GuildRedisStore:
 
     # History operations
 
-    # ISSUE: Unbounded, non-evictable history can exhaust Redis and stall all writes.
-    # History keys carry no TTL, so under `maxmemory-policy volatile-lru` (see the
-    # redis command in docker-compose.yml) they are never eviction candidates. Once
-    # history fills the 256mb maxmemory with no TTL-bearing key left to evict, Redis
-    # rejects EVERY write with OOM — state, queue and cache alike — and each store
-    # method logs and swallows it, so persistence degrades silently. A slow burn
-    # (~1M+ entries), but it does arrive. Planned fix: full history to Postgres, Redis
-    # list demoted to a bounded cache; until then this needs a memory/eviction alarm.
-    # Do NOT switch to allkeys-lru
-    # as a workaround — that makes history evictable and defeats the design.
+    # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
+    # Two kinds of key carry no TTL, so under `maxmemory-policy volatile-lru` they are
+    # never eviction candidates: guild:{id}:history and HISTORY_OUTBOX_KEY. Once they fill
+    # maxmemory with no TTL-bearing key left to evict, Redis rejects EVERY write with
+    # OOM — state, queue and cache alike — and each store method swallows it and logs, so
+    # persistence degrades silently rather than crashing.
+    #
+    # Only the OUTBOX can get there BY GROWING: the history lists are bounded at
+    # HISTORY_CACHE_LIMIT entries per guild, trimmed on every write, so their total scales
+    # with guild count (~24 KB each), not with runtime. The outbox is near-empty whenever
+    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~487
+    # bytes per play. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
+    # real data loss, since a capped list leaves no second copy. A Redis memory/eviction
+    # alarm is still owed.
+    #
+    # CAVEAT: the trim is LAZY — it runs inside push_history and nowhere else, so a guild
+    # that stops playing keeps whatever oversized list it already had, forever, and no TTL
+    # path touches it. Upgrading from a build that never trimmed, a dormant guild holding
+    # 100k entries is ~49 MB of the bundled 256mb, permanently, in a key volatile-lru can
+    # never evict; only a further play or a manual DEL reclaims it.
+    # See docs/ARCHITECTURE.md#redis-memory-bounds.
+    #
+    # Do NOT switch to allkeys-lru as a workaround: it makes the outbox evictable, and an
+    # evicted entry is a play that vanishes with no error, no rejected-table row and no
+    # log line (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry and PERSIST the key — no trim, no TTL: the list is the
-        unbounded source of truth for all played songs, with write-per-song-end as
-        the durability boundary. The PERSIST
-        also self-heals pre-migration keys still carrying the old 24h expiry."""
+        """LPUSH one entry, cap and PERSIST the list, and — while the archive is
+        enabled — mirror the entry onto the Postgres outbox: one transaction, one
+        round trip, one branch.
+
+        LTRIM + PERSIST are the whole retention policy and are unconditional,
+        identical whether the archive is enabled or not: the display list is
+        runtime state, and HISTORY_ARCHIVE_ENABLED gates only the durable tier.
+        BOUNDED because an unbounded non-evictable key is the OOM shape the note
+        above describes. PERMANENT because -history reads this list and nothing
+        else, so an idle TTL would answer a quiet guild with silence; the PERSIST
+        also self-heals keys written by an older build that applied a 24h expiry.
+
+        musicbot's HISTORY_MAX_LIMIT is pinned to HISTORY_CACHE_LIMIT, so the
+        window this trim leaves behind always contains every play -history can be
+        asked for — raising one without the other is what breaks it. Postgres is
+        deliberately NOT on the read path; see
+        docs/ARCHITECTURE.md#history-read-path.
+
+        While the archive is enabled the same wire bytes are also XADDed onto the
+        HISTORY_OUTBOX_KEY stream in the same transactional pipeline. Disabled —
+        the default — that leg is absent and the key is never created. Both legs
+        share one serialize_history_entry call so they cannot drift, and song end
+        costs exactly one Redis round trip and never awaits Postgres.
+
+        This method stays on the SWALLOWING side of the split (@_guild_op), unlike
+        the module-level drain helpers, which raise: the playback loop must never
+        die because Redis blinked. The consequence is that the producer can never
+        report a mis-shaped outbox — a pre-stream list at this key fails the XADD
+        leg with WRONGTYPE and would be swallowed into one warning per song —
+        which is why ensure_outbox_group() aborts at STARTUP instead, the only
+        place the signal can be loud.
+
+        The outbox leg is idempotent under a re-sent transaction (a duplicate
+        collapses on the archive's unique index); the guild:{id}:history LPUSH
+        above it is NOT, and nothing dedups it.
+        """
+        wire = serialize_history_entry(entry)
+        try:
+            await self._push_history_pipeline(wire)
+        except OutOfMemoryError:
+            # AN ALREADY-FULL REDIS CANNOT SELF-HEAL WITHOUT THIS. LPUSH carries
+            # Redis' `denyoom` flag and is queued FIRST, so once used_memory
+            # exceeds maxmemory with nothing evictable the server refuses it at
+            # queue time, the CAS is dirtied and EXEC aborts — measured on
+            # redis:7-alpine: llen unchanged at 386, TTL still -1, the LTRIM never
+            # ran. Reordering inside the MULTI does not help.
+            #
+            # A bare LTRIM is allowed at the cap (not denyoom) and frees memory
+            # immediately, so the one command that could make room is exactly the
+            # one that can still run. But at the steady state the trim frees
+            # NOTHING — measured at maxmemory 3mb: llen stayed 50, the retry
+            # aborted again, the play was dropped. The recovery is real exactly
+            # once per guild per upgrade (an oversized legacy list); after that
+            # the retry is a second attempt in case memory freed elsewhere, not a
+            # guarantee. Log which case happened.
+            #
+            # Reachable even though the lists are capped: the outbox grows without
+            # bound during a Postgres outage and fills the instance for every key.
+            #
+            # LLEN first, not LTRIM first: reads are not denyoom, and skipping a
+            # trim that provably frees nothing removes a round trip from a path
+            # that runs per song end for every guild while Redis is full.
+            length = await self.redis.llen(self.history_key())
+            if length > HISTORY_CACHE_LIMIT:
+                log.warning(
+                    f"guild {self.guild_id}: Redis is at maxmemory and refused "
+                    f"the history write; trimming {length} entries to "
+                    f"{HISTORY_CACHE_LIMIT} and retrying"
+                )
+                await self.redis.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            else:
+                log.warning(
+                    f"guild {self.guild_id}: Redis is at maxmemory and refused "
+                    f"the history write. This guild's list is already at the "
+                    f"{HISTORY_CACHE_LIMIT}-entry cap, so trimming would free "
+                    f"nothing — retrying once, but this play is likely LOST. "
+                    f"Free memory (usually: drain history:outbox by restoring "
+                    f"Postgres) or raise maxmemory."
+                )
+            await self._push_history_pipeline(wire)
+
+    async def _push_history_pipeline(self, wire: bytes) -> None:
+        """The one transactional write, factored out so the OOM path above can
+        re-issue it verbatim rather than restate it."""
         pipe = self.redis.pipeline()
-        pipe.lpush(self.history_key(), serialize_history_entry(entry))
+        pipe.lpush(self.history_key(), wire)
+        # UNPAGED on purpose, unlike HistoryOutboxDrainer._enforce_cap, which
+        # pages its trim at CAP_PAGE=10_000 against the same hazard class. The
+        # difference is that this one is O(1) in the steady state: LTRIM costs
+        # O(N) in elements REMOVED, and every push after the first trims 51→50.
+        # Only a list left over from a build that did not cap pays more, once.
+        # Measured on redis:7-alpine 7.4.9 — 0.24 ms at 10k entries, 6.3 ms at
+        # 100k, ~22 ms at 500k, with another guild's playback write seeing
+        # head-of-line blocking equal to that duration. Nothing in the codebase
+        # trips on a 30 ms stall (no socket_timeout on the pool, a 5s
+        # healthcheck, a 2s bound on the -history read, and audio is never
+        # Redis-gated). Paging it would mean carrying cursor state across song
+        # ends to save a quarter of a millisecond.
+        pipe.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+        # No EXPIRE anywhere near this key — see the docstring: length bounds it,
+        # time never does. PERSIST because -history has no other source, and
+        # because it clears an inherited TTL from an older build in one write.
         pipe.persist(self.history_key())
+        # The outbox leg is the pipeline's ONE conditional command: the flag is
+        # the consent gate for long-term storage, and with the archive disabled
+        # nothing may accumulate for a drainer that does not exist — the XADD
+        # would even MKSTREAM-like create the non-evictable key on first write.
+        # Read per call (config's call-time convention, no hot path: once per
+        # song end), through the module so tests can patch either the function
+        # or the environment. A garbage value must never FIRST surface here:
+        # @_guild_op would swallow the parser's ValueError into one warning per
+        # song, so setup_hook is required to read the flag before anything else
+        # consumes it — by the time a song ends, the process has already proven
+        # the value parses (history_archive_enabled's validation-placement
+        # rule).
+        if config.history_archive_enabled():
+            pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 
     @_guild_op(default_factory=list)
@@ -598,7 +1188,8 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def refresh_ttl(self) -> None:
         """Refresh GUILD_TTL on the TTL-managed guild keys. History is excluded
-        for the same reason as in _pipe_expire_all: the key is persistent."""
+        for the reason _pipe_expire_all gives: it is bounded by length, never by
+        time, because it is the only thing -history reads."""
         pipe = self.redis.pipeline()
         self._pipe_expire_all(pipe)
         await pipe.execute()

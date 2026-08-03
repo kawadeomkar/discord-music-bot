@@ -40,7 +40,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.ping import run_health_dashboard, send_latency_line
+from src.ping import ArchiveHealth, run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -88,8 +88,15 @@ class SpotifyDisabledError(Exception):
 
 
 HISTORY_MIN_LIMIT = 1
-# Ceiling is the display cache depth — -history reads the in-memory cache, or the
-# Redis list when it's cold.
+# NOT just a display ceiling — this equality is load-bearing.
+# GuildHistory.recent() serves this command from the Redis list alone, and
+# get_history() reads exactly the newest HISTORY_CACHE_LIMIT entries, so the read
+# is complete only because that window is at least as deep as anything this
+# command can ask for. Slots, not plays — the equality leaves no headroom, so a
+# corrupt or duplicated entry costs a slot and shortens the page by one (argued at
+# the HISTORY_CACHE_LIMIT comment in redis_client.py). Raising this above
+# HISTORY_CACHE_LIMIT would not fail anywhere; it would silently return a short
+# page. Raise both together or neither.
 HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = Discord's
 # per-message cap of 10, so the block always fits and is never shed.
@@ -170,6 +177,7 @@ class MusicBot(commands.Cog):
         "spotify",
         "_spotify_status",
         "redis",
+        "history_archive",
         "_active_spans",
         "_alone_timers",
         "_restore_tasks",
@@ -178,15 +186,29 @@ class MusicBot(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         # HACK: getattr() hides MusicBot's real dependency on MusicBotApp.redis.
-        # `bot` is typed commands.Bot, so the access is spelled as getattr() to quiet the
-        # checker — but getattr() returns Any, downgrading the annotation to an
-        # unchecked assertion. Renaming MusicBotApp.redis would silently degrade every
-        # guild to no-Redis (no persistence, no crash recovery) with nothing going red.
-        # Fix: type `bot` as "MusicBotApp" under TYPE_CHECKING (src/main.py already
-        # uses that idiom for this cycle), or a two-line Protocol carrying `redis`.
+        # `bot` is typed commands.Bot, but `redis` is a MusicBotApp attribute, so the
+        # access is spelled as getattr() to keep the type checker quiet. getattr()
+        # returns Any, which downgrades the Optional[aioredis.Redis] annotation from a
+        # checked type to an unchecked assertion: renaming MusicBotApp.redis silently
+        # degrades every guild to no-Redis — no persistence, no crash recovery — with
+        # nothing going red.
+        # Fix: type `bot` as "MusicBotApp" under `if TYPE_CHECKING` (src/main.py already
+        # uses that idiom to break this exact import cycle), or declare a two-line
+        # Protocol carrying `redis: Optional[aioredis.Redis]`. That fix covers two
+        # attributes: history_archive below is the same HACK, spelled the same way
+        # deliberately — one idiom and one FIXME beats two.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        # Optional: built only when credentials are present. When None, a Spotify
-        # link raises SpotifyDisabledError and every other source is unaffected.
+        # The play-history archive, read only by -ping's Postgres row. Present exactly
+        # when the archive is enabled: setup_hook builds it (requiring POSTGRES_URL)
+        # BEFORE load_extension constructs this cog, and leaves it None otherwise. Typed
+        # as the narrow ArchiveHealth protocol, not PostgresHistoryArchive — the Postgres
+        # row is all this class does with it.
+        self.history_archive: Optional[ArchiveHealth] = getattr(
+            bot, "history_archive", None
+        )
+        # Spotify is optional: only build the client when credentials are present. When
+        # None, playing a Spotify link raises SpotifyDisabledError; every other source
+        # (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
         self.spotify: Optional[Spotify] = (
             Spotify(redis=self.redis) if spotify_enabled() else None
         )
@@ -1275,17 +1297,39 @@ class MusicBot(commands.Cog):
         aliases=["h"],
         brief="show recently played songs",
         usage="[--limit N]",
+        # Interpolated, not spelled out: this copy asserts the retention window,
+        # and HISTORY_MAX_LIMIT is that window (it IS HISTORY_CACHE_LIMIT — see
+        # the constant above). A hand-typed number here is how the previous copy
+        # came to promise permanent retention months after the list was capped.
         help=(
             "Lists the songs already played in this server, most recent first.\n\n"
-            "`--limit N` controls how many are shown (1-50, default 10). History "
-            "is stored per server and survives a bot restart."
+            f"`--limit N` controls how many are shown ({HISTORY_MIN_LIMIT}-"
+            f"{HISTORY_MAX_LIMIT}, default 10). History is stored per server and "
+            f"survives a bot restart, but only the newest {HISTORY_MAX_LIMIT} plays "
+            f"are kept — so `--limit {HISTORY_MAX_LIMIT}` shows the whole record."
         ),
         extras={
             "category": "Queue",
             "examples": ["-history", "-h", "-history --limit 25"],
+            "note": (
+                f"The newest {HISTORY_MAX_LIMIT} plays are everything this command "
+                "can read. If this server's host has turned on the optional "
+                "long-term archive, plays are also recorded there permanently — "
+                f"but `-history` always serves the {HISTORY_MAX_LIMIT}-play window."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
+    # One in flight per guild, wait=False, so extra invocations are declined
+    # immediately rather than queueing behind the first (cog_command_error
+    # renders MaxConcurrencyReached as a notice).
+    #
+    # The reason is Discord-side, not database-side. -history is the heaviest
+    # send in the bot — up to 8 song embeds, plus the NP block MusicContext.send
+    # may prepend — so unbounded concurrent renders are how a guild rate-limits
+    # itself out of its own channel. It cannot contend with the drainer for the
+    # archive's connection pool, because this command never reaches Postgres.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.history")
     async def history(self, ctx: commands.Context, *, flags: HistoryFlags) -> None:
         try:
@@ -1442,7 +1486,7 @@ class MusicBot(commands.Cog):
                 # configured": lets the Spotify row say *why* the source is
                 # unusable without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
-                pg_pool=getattr(self, "pg_pool", None),
+                archive=self.history_archive,
             )
         except Exception as e:
             await self._command_error(ctx, e)

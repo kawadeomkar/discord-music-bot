@@ -1,6 +1,12 @@
 # Ignore
 pyproject.bak.toml
-docs/
+# docs/ is local-only working material (plans, reviews, proposals) EXCEPT
+# ARCHITECTURE.md, which source comments link to for the long-form context they
+# no longer carry inline. Those links must resolve for anyone who clones, so the
+# file is tracked. Negation needs `docs/*`, not `docs/` — git cannot re-include a
+# file whose parent directory is excluded.
+docs/*
+!docs/ARCHITECTURE.md
 
 # Claude Code
 .claude/
@@ -152,3 +158,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macOS Finder metadata and the JSON coverage report `just test-report` writes.
+# Both were tracked before this line existed.
+.DS_Store
+coverage.json
+backups/

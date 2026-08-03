@@ -520,6 +520,9 @@ class TestParseQueueEntryCorrupt:
 
 def _history_entry(**overrides: Any) -> HistoryEntry:
     fields: dict = dict(
+        # Real snowflake magnitude: must survive int() parsing without float
+        # precision loss (same hazard as requester_id snowflakes).
+        guild_id=111111111111111111,
         title="Song Title",
         webpage_url="https://yt.com/v=1",
         duration_secs=242,
@@ -529,6 +532,7 @@ def _history_entry(**overrides: Any) -> HistoryEntry:
         thumbnail="https://i.ytimg.com/t.jpg",
         uploader="Chan",
         played_at=1752530000.0,
+        message_id=999999999999999999,
     )
     fields.update(overrides)
     return HistoryEntry(**fields)
@@ -539,15 +543,59 @@ class TestHistoryEntryWire:
         # Wire format pinned: rolling restarts mix writers, so the field
         # names and value encodings must not drift.
         assert serialize_history_entry(_history_entry()) == (
-            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'{"guild_id":111111111111111111,"title":"Song Title",'
+            b'"webpage_url":"https://yt.com/v=1",'
             b'"duration_secs":242,"played_secs":225,"requester_id":42,'
             b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
-            b'"uploader":"Chan","played_at":1752530000.0}'
+            b'"uploader":"Chan","played_at":1752530000.0,'
+            b'"message_id":999999999999999999}'
         )
 
     def test_round_trip(self) -> None:
         entry = _history_entry()
         assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+    def test_pre_postgres_entry_parses_with_guild_id_zero(self) -> None:
+        # Golden bytes from the pre-guild_id writer (history overhaul era) —
+        # at-rest entries mix writers, so these must stay readable, with the
+        # absent fields defaulting to 0 (backfill stamps the real guild id from
+        # the key; message_id has no such recovery and stays unknown).
+        pre_postgres = (
+            b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0}'
+        )
+        assert parse_history_entry(pre_postgres) == _history_entry(
+            guild_id=0, message_id=0
+        )
+
+    def test_pre_message_id_entry_parses_with_message_id_zero(self) -> None:
+        # The narrower mixed-build case, and the one a rolling restart actually
+        # produces: a writer that already stamped guild_id but predates
+        # message_id. Its entries must keep parsing, not drop as corrupt.
+        pre_message_id = (
+            b'{"guild_id":111111111111111111,"title":"Song Title",'
+            b'"webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0}'
+        )
+        assert parse_history_entry(pre_message_id) == _history_entry(message_id=0)
+
+    def test_snowflake_guild_id_survives_round_trip(self) -> None:
+        entry = _history_entry(guild_id=222222222222222222)
+        parsed = parse_history_entry(serialize_history_entry(entry))
+        assert parsed is not None
+        assert parsed.guild_id == 222222222222222222
+
+    def test_snowflake_message_id_survives_round_trip(self) -> None:
+        # Same float-precision hazard as the other snowflake columns: a
+        # message id routed through a float would come back off by a digit.
+        entry = _history_entry(message_id=333333333333333333)
+        parsed = parse_history_entry(serialize_history_entry(entry))
+        assert parsed is not None
+        assert parsed.message_id == 333333333333333333
 
     def test_unknown_keys_ignored_and_missing_keys_default(self) -> None:
         # Forward/backward tolerance: a newer writer's extra field must not
@@ -577,6 +625,166 @@ class TestHistoryEntryWire:
         assert "corrupt history entry" in caplog.text
 
 
+def _entry_with(**kwargs: Any) -> HistoryEntry:
+    """Constructor shim for the parametrized domain tests below.
+
+    Splatting a parametrized field name straight into HistoryEntry makes pyright
+    check the value against EVERY field's type (int against title: str, and so
+    on). Widening here rather than casting at each call site keeps the tests
+    readable and confines the Any to one line.
+    """
+    return HistoryEntry(**kwargs)
+
+
+class TestHistoryEntryDomain:
+    """The schema lock: constructing a HistoryEntry IS the proof that Postgres
+    accepts it, so every clamp is asserted on the TYPE rather than on any
+    archive helper.
+
+    These moved here from tests/test_history_archive.py when _sanitize_entry
+    was deleted — the property was always about the value object, not the
+    repository that happened to enforce it.
+    """
+
+    def test_clean_entry_is_untouched(self) -> None:
+        entry = HistoryEntry(
+            guild_id=42,
+            title="Song",
+            webpage_url="https://yt.com/v=1",
+            duration_secs=200,
+            played_secs=200,
+            requester_id=222222222222222222,
+            requester_name="user",
+            thumbnail="https://img/x.jpg",
+            uploader="chan",
+            played_at=1000.0,
+            message_id=333333333333333333,
+        )
+        assert dataclasses.asdict(entry) == {
+            "guild_id": 42,
+            "title": "Song",
+            "webpage_url": "https://yt.com/v=1",
+            "duration_secs": 200,
+            "played_secs": 200,
+            "requester_id": 222222222222222222,
+            "requester_name": "user",
+            "thumbnail": "https://img/x.jpg",
+            "uploader": "chan",
+            "played_at": 1000.0,
+            "message_id": 333333333333333333,
+        }
+
+    def test_nul_stripped_from_every_text_field(self) -> None:
+        # Postgres text cannot hold NUL; the server raises
+        # CharacterNotInRepertoireError and takes the whole batch with it.
+        entry = HistoryEntry(
+            guild_id=42,
+            title="ab\x00cd",
+            webpage_url="https://yt\x00.com",
+            requester_name="u\x00ser",
+            thumbnail="\x00",
+            uploader="chan\x00",
+        )
+        assert entry.title == "abcd"
+        assert entry.webpage_url == "https://yt.com"
+        assert entry.requester_name == "user"
+        assert entry.thumbnail == ""
+        assert entry.uploader == "chan"
+
+    def test_nul_strip_leaves_other_fields_alone(self) -> None:
+        entry = HistoryEntry(guild_id=42, title="a\x00b", uploader="chan")
+        assert entry.title == "ab"
+        assert entry.uploader == "chan"
+        assert entry.guild_id == 42
+
+    @pytest.mark.parametrize(
+        "played_at",
+        [1e18, 1e300, -1e12, -1e18, float("nan"), float("inf"), float("-inf")],
+        ids=["huge", "absurd", "negative", "very-negative", "nan", "inf", "-inf"],
+    )
+    def test_out_of_range_epoch_collapses_to_unknown_sentinel(
+        self, played_at: float
+    ) -> None:
+        # datetime.fromtimestamp would raise in _entry_to_row, before any SQL
+        # is sent. The chained comparison is False for NaN, which is why it is
+        # written as a range test rather than two explicit bounds checks.
+        assert HistoryEntry(guild_id=1, played_at=played_at).played_at == 0.0
+
+    def test_timestamptz_ceiling_is_accepted_unchanged(self) -> None:
+        # The bound is inclusive: 9999-12-31T23:59:59Z is a legal timestamptz.
+        assert HistoryEntry(guild_id=1, played_at=253402300799.0).played_at == (
+            253402300799.0
+        )
+
+    @pytest.mark.parametrize("field", ["duration_secs", "played_secs"])
+    def test_int4_columns_clamp_at_the_int4_ceiling(self, field: str) -> None:
+        entry = _entry_with(guild_id=1, **{field: 2**31})
+        assert getattr(entry, field) == 2**31 - 1
+
+    @pytest.mark.parametrize("field", ["guild_id", "requester_id", "message_id"])
+    @pytest.mark.parametrize("value", [2**63, 2**64 - 1], ids=["int8-max+1", "uint64"])
+    def test_int8_columns_clamp_at_the_signed_bigint_ceiling(
+        self, field: str, value: int
+    ) -> None:
+        # The gap the earlier proposal missed: orjson happily encodes anything
+        # up to 2**64-1, but the column is a SIGNED bigint. Both of these are
+        # wire-legal and would be refused by Postgres.
+        entry = _entry_with(**{field: value})
+        assert getattr(entry, field) == 2**63 - 1
+
+    @pytest.mark.parametrize(
+        "field",
+        ["guild_id", "requester_id", "message_id", "duration_secs", "played_secs"],
+    )
+    def test_negative_ints_clamp_to_zero(self, field: str) -> None:
+        assert getattr(_entry_with(**{field: -5}), field) == 0
+
+    def test_snowflake_ids_survive(self) -> None:
+        # int8 columns: a real Discord snowflake must not be clamped into
+        # nonsense by an over-eager ceiling.
+        assert HistoryEntry(requester_id=222222222222222222).requester_id == (
+            222222222222222222
+        )
+        assert HistoryEntry(message_id=333333333333333333).message_id == (
+            333333333333333333
+        )
+
+    def test_replace_re_runs_the_validator(self) -> None:
+        # Load-bearing: backfill_history stamps guild_id onto legacy entries
+        # with dataclasses.replace, on the least trustworthy data in the system.
+        # If that bypassed __post_init__ the whole lock would be decorative.
+        entry = HistoryEntry(guild_id=1, title="x")
+        assert dataclasses.replace(entry, guild_id=2**64 - 1).guild_id == 2**63 - 1
+
+    def test_every_field_is_covered_by_a_domain(self) -> None:
+        """The lock is only closed if every field is in it. A field added to the
+        dataclass but not to a domain tuple is silently unvalidated — and would
+        be found by a production CHECK violation instead of by this test."""
+        from src.guild_state import _INT4_FIELDS, _INT8_FIELDS, _TEXT_FIELDS
+
+        covered = {*_TEXT_FIELDS, *_INT4_FIELDS, *_INT8_FIELDS, "played_at"}
+        assert {f.name for f in dataclasses.fields(HistoryEntry)} == covered
+
+    def test_every_clamped_entry_survives_the_wire(self) -> None:
+        # End-to-end: anything __post_init__ produces must also serialize and
+        # parse back unchanged, since the outbox is the path to Postgres.
+        for entry in (
+            HistoryEntry(guild_id=1, title="x\x00y"),
+            HistoryEntry(guild_id=2**64 - 1, played_at=1e18),
+            HistoryEntry(guild_id=1, duration_secs=-5, played_at=float("nan")),
+        ):
+            assert parse_history_entry(serialize_history_entry(entry)) == entry
+
+
+def test_orjson_refuses_what_post_init_cannot_clamp() -> None:
+    """The wire codec is the first half of the validator, and it is documented
+    nowhere a reader would find it. A lone surrogate cannot be encoded, so it
+    can never reach Redis — which is why __post_init__ has no surrogate arm and
+    why the residual poison set is only four vectors wide."""
+    with pytest.raises(TypeError):
+        serialize_history_entry(HistoryEntry(guild_id=1, title="a\ud800b"))
+
+
 def _history_song_stub(**overrides: Any) -> YTDL:
     fields: dict = dict(
         title="Test Song",
@@ -593,8 +801,14 @@ def _history_song_stub(**overrides: Any) -> YTDL:
 
 class TestHistoryEntryFromSong:
     def test_maps_song_fields(self) -> None:
-        entry = HistoryEntry.from_song(_history_song_stub(), played_at=1752530000.0)
+        entry = HistoryEntry.from_song(
+            _history_song_stub(),
+            guild_id=111,
+            played_at=1752530000.0,
+            message_id=444444444444444444,
+        )
         assert entry == HistoryEntry(
+            guild_id=111,
             title="Test Song",
             webpage_url="https://youtu.be/abc",
             duration_secs=242,
@@ -604,26 +818,65 @@ class TestHistoryEntryFromSong:
             thumbnail="https://img/x.jpg",
             uploader="Test Channel",
             played_at=1752530000.0,
+            message_id=444444444444444444,
         )
+
+    def test_guild_id_and_message_id_are_required_keywords(self) -> None:
+        # Requiredness is the whole protection for message_id: play_history's
+        # CHECK is `message_id >= 0` with DEFAULT 0, so a forgotten stamp inserts
+        # cleanly and is permanently indistinguishable from a song that genuinely
+        # had no host. pyright catches a missing argument today, but only while
+        # no default exists — adding one silently retires the guarantee, and this
+        # is what notices.
+        song = _history_song_stub()
+        with pytest.raises(TypeError):
+            HistoryEntry.from_song(song, guild_id=111, played_at=1.0)  # pyright: ignore[reportCallIssue]
+        with pytest.raises(TypeError):
+            HistoryEntry.from_song(song, played_at=1.0, message_id=0)  # pyright: ignore[reportCallIssue]
+
+    def test_message_id_is_caller_supplied(self) -> None:
+        # The song object carries no message id — it comes from the NP host the
+        # playback loop captured at song end, and 0 means "no message hosted
+        # this song's block" rather than "the caller forgot".
+        #
+        # Both arms are needed. 0 is also the dataclass default, so asserting it
+        # alone passes even if from_song hardcodes 0, drops the argument, or
+        # never sets the field — i.e. exactly when the property this test is
+        # named for is broken. The non-zero arm is what makes the zero arm mean
+        # "0 because the caller said 0".
+        song = _history_song_stub()
+        base = {"guild_id": 111, "played_at": 1.0}
+        assert HistoryEntry.from_song(song, **base, message_id=0).message_id == 0
+        assert HistoryEntry.from_song(song, **base, message_id=888).message_id == 888
 
     def test_played_secs_is_position_reached(self) -> None:
         song = _history_song_stub(position_secs=100.4)
-        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 100
+        assert (
+            HistoryEntry.from_song(
+                song, guild_id=111, played_at=1.0, message_id=0
+            ).played_secs
+            == 100
+        )
 
     def test_played_secs_capped_at_duration(self) -> None:
         # position can exceed duration by fractions of a frame at natural end.
         song = _history_song_stub(position_secs=243.02)
-        assert HistoryEntry.from_song(song, played_at=1.0).played_secs == 242
+        assert (
+            HistoryEntry.from_song(
+                song, guild_id=111, played_at=1.0, message_id=0
+            ).played_secs
+            == 242
+        )
 
     def test_unknown_duration_leaves_position_uncapped(self) -> None:
         song = _history_song_stub(duration_secs=0, position_secs=99.6)
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
         assert entry.duration_secs == 0
         assert entry.played_secs == 100
 
     def test_no_requester_degrades_to_zero_values(self) -> None:
         song = _history_song_stub(requester=None)
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
         assert entry.requester_id == 0
         assert entry.requester_name == ""
 
@@ -632,7 +885,7 @@ class TestHistoryEntryFromSong:
         song = _history_song_stub(
             title=None, webpage_url=None, uploader=None, thumbnail=None
         )
-        entry = HistoryEntry.from_song(song, played_at=1.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
         assert entry.title == ""
         assert entry.webpage_url == ""
         assert entry.uploader == ""

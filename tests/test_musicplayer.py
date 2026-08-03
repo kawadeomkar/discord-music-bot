@@ -25,6 +25,7 @@ from src.musicplayer import (
     _fmt_total_duration,
     _requester_mention,
 )
+from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
 from src.util import fmt_duration
 from src.youtube import QueueObject, YTDL
@@ -108,6 +109,79 @@ def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
     from src import youtube
 
     monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
+
+
+# ── Archive wiring ────────────────────────────────────────────────────────────
+
+
+class TestOutboxNotifyWiring:
+    """MusicPlayer decides GuildHistory's outbox notify from the bot's drainer,
+    and BOTH answers have to be constructible.
+
+    This is the seam where the opt-in archive reaches the playback path:
+    enabled, the drainer exists and its notify wakes the drain immediately;
+    disabled — the SHIP DEFAULT — there is no drainer, and GuildHistory demands
+    the None explicitly (its keyword has no default, precisely so that a caller
+    cannot forget to decide).
+
+    Asserted here rather than left to the fixtures because nothing else can see
+    it. Every other player test builds from `mock_bot`, and an auto-vivified
+    MagicMock attribute is truthy, so the None arm was reachable only in
+    production. Coverage cannot flag that — the wiring is a one-line
+    conditional expression, which reports as covered the moment either arm
+    runs. Dropping the guard entirely once passed all 1711 tests while raising
+    AttributeError on the first -play of any default deployment.
+    """
+
+    def test_a_running_drainer_is_wired_to_the_history(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        drainer = MagicMock()
+        mock_bot.history_drainer = drainer
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        assert mp.history._on_outbox_push is drainer.notify
+
+    def test_no_drainer_wires_none_rather_than_crashing(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        # The archive-disabled shape MusicBotApp.__init__ really produces —
+        # pinned by TestAppInitDefaults in test_main.py.
+        mock_bot.history_drainer = None
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        assert mp.history._on_outbox_push is None
+
+    async def test_a_play_is_still_recorded_with_no_drainer(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """Construction is not the whole contract — the display legs must still
+        work, or the default deployment would have a silent -history."""
+        mock_bot.history_drainer = None
+        mp = MusicPlayer(
+            mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=fake_redis
+        )
+        await mp.history.add(
+            HistoryEntry(title="Song", webpage_url="https://yt.com/v=1", played_at=1.0)
+        )
+        assert [e.title for e in await mp.history.recent(10)] == ["Song"]
 
 
 # ── Formatter helpers ─────────────────────────────────────────────────────────
@@ -1522,8 +1596,15 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(
             mock_song, position_override=210.0
         )
-        assert fmt_duration(210) in described(embed)
-        assert fmt_duration(30) not in described(embed)
+        # Scoped to the bar line, not the whole description, because the
+        # description also carries "Estimated finish: <wall clock>" — and
+        # fmt_duration(30) is "0:30", a substring of "10:30 PM PST". The
+        # unscoped assertion therefore failed for the two real minutes a day
+        # when the ETA lands at 10:30, on a suite that is otherwise
+        # deterministic. Caught at 10:27 PM PST; it had never fired in CI.
+        bar_line = next(line for line in described(embed).splitlines() if "🔘" in line)
+        assert fmt_duration(210) in bar_line
+        assert fmt_duration(30) not in bar_line
 
     def test_no_override_falls_back_to_live_position(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -1887,18 +1968,19 @@ class TestMusicPlayerInitialState:
 
 
 class TestRedisHelpers:
-    async def test_redis_push_history_unbounded(
+    async def test_redis_push_history_caps_the_list(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
-        # Full history retention: the Redis list must never be trimmed
-        # .
+        # Bounded retention: the list is a fixed window of the newest plays, not a
+        # full record. Postgres keeps everything; this is what -history reads, and
+        # it is capped at exactly that command's ceiling.
         assert music_player.store is not None
-        for i in range(55):
+        for i in range(HISTORY_CACHE_LIMIT + 5):
             await music_player.store.push_history(
                 HistoryEntry(title=f"Song {i}", webpage_url=f"url{i}")
             )
         items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
-        assert len(items) == 55
+        assert len(items) == HISTORY_CACHE_LIMIT
 
     async def test_store_set_volume_updates_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -4899,6 +4981,136 @@ class TestLoop:
         assert len(music_player.history) == 1
         assert music_player.history[0].title == mock_song.title
         assert music_player.history[0].webpage_url == mock_song.webpage_url
+        # _send_now_playing is patched out, so no message ever hosted the block:
+        # the play_history "unknown" sentinel, not a forgotten stamp.
+        assert music_player.history[0].message_id == 0
+
+    async def test_history_entry_records_the_np_host_message_id(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The history row carries the host of THIS song, as of song END.
+
+        Two properties, and the decoy below is what separates them. The entry
+        must not read the *released* _np_host_message (None by then), and it
+        must not read a host captured before this song adopted its own — a
+        capture hoisted anywhere earlier in the iteration yields the PREVIOUS
+        song's message and is wrong in a way nothing downstream can detect,
+        since every id is a plausible snowflake.
+
+        _send_now_playing is what adopts this song's host in production, so
+        patching it out with a bare AsyncMock would leave the pre-planted value
+        standing for the whole iteration and make "before release" and "this
+        song's host" indistinguishable. The side effect restores that half.
+        """
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        # Decoy: the host left over from the PREVIOUS song. Stamping this is the
+        # off-by-one-song failure, so it must not be what lands in history.
+        stale_host = AsyncMock(spec=discord.Message)
+        stale_host.id = 555555555555555555
+        music_player._np_host_message = stale_host
+
+        this_songs_host = AsyncMock(spec=discord.Message)
+        this_songs_host.id = 777777777777777777
+
+        async def adopt_this_songs_host(_song: object) -> None:
+            music_player._np_host_message = this_songs_host
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(
+                MusicPlayer,
+                "_send_now_playing",
+                new=AsyncMock(side_effect=adopt_this_songs_host),
+            ),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            # The completed-bar edit is a separate concern and would PATCH the
+            # mock host from a background task while this assertion runs.
+            patch.object(MusicPlayer, "_fire_finalize_now_playing", new=MagicMock()),
+        ):
+            await music_player.loop()
+
+        assert music_player._np_host_message is None  # released before the entry
+        assert len(music_player.history) == 1
+        assert music_player.history[0].message_id == 777777777777777777
+
+    async def test_current_song_is_cleared_before_the_prefetch_await(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The song must stop being 'current' before loop() blocks on prefetch.
+
+        MusicContext.send's attach gate is `current_song is not None`, and the
+        prefetch await resolves a whole yt-dlp extraction — seconds, not
+        microseconds. A song left current across it lets a command response in
+        the home channel prepend a block for a song that already ended and adopt
+        ITSELF as host. The next iteration's _send_now_playing() then releases
+        that host without retiring it, orphaning a message with a frozen bar
+        that retire_np_host_on_stop() can no longer reach.
+
+        The prefetch await is loop()'s first suspension point after song-end
+        teardown, so a patched prefetch coroutine observes exactly that instant.
+        """
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        observed: list[object] = []
+
+        async def observe_at_prefetch_await(_self: object) -> None:
+            observed.append(music_player.current_song)
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=observe_at_prefetch_await
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert observed == [None], (
+            "current_song was still set when loop() awaited the prefetch task — "
+            "a command response in that window can adopt an orphan NP host"
+        )
+        # The entry is still built from the iteration's own copy of the song.
+        assert len(music_player.history) == 1
+        assert music_player.history[0].title == mock_song.title
 
     async def test_song_that_produced_no_audio_is_not_treated_as_played(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock

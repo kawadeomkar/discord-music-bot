@@ -15,6 +15,38 @@ services:
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      #
+      # Built from the same POSTGRES_* vars as the postgres service below, so
+      # the password lives in exactly one place (.env). This overrides any
+      # POSTGRES_URL coming from env_file — to point at an EXTERNAL Postgres
+      # instead, comment this line out and set POSTGRES_URL in .env directly.
+      #
+      # Interpolated EVEN when the archive is disabled: Compose interpolates
+      # the whole document before profile filtering, so the bot receives this
+      # DSN whether or not the `archive` profile deploys postgres behind it.
+      # The bot ignores it unless HISTORY_ARCHIVE_ENABLED=true and logs one
+      # INFO saying so — enablement is the flag, never URL presence.
+      #
+      # `${POSTGRES_PASSWORD:-password}` deliberately DOES default. This used to
+      # be Compose's mandatory `${VAR:?}` form, which failed `up` outright — a
+      # correct instinct that made the very first command in the README unusable
+      # until you had run a setup script, for a bot whose database is bound to
+      # loopback. The default trades that cliff for a credential nobody chose,
+      # and pays for it with noise rather than silence: the bot logs an ERROR at
+      # startup and renders a warning embed on every -ping for as long as the
+      # default is in use (src/config.using_default_postgres_password).
+      #
+      # That trade holds ONLY while the published port stays bound to 127.0.0.1
+      # (see the postgres service below). If you ever widen that binding, remove
+      # this fallback in the same change — a default credential on a
+      # network-reachable database is not a warning-level problem.
+      #
+      # The host port is a variable because the bot runs on the HOST network
+      # namespace, so it reaches Postgres through the published port rather
+      # than the compose network — and 5432 is exactly the port a
+      # already-installed local Postgres occupies. POSTGRES_HOST_PORT lets that
+      # developer move ours without editing tracked files.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
@@ -22,6 +54,18 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      # postgres / db-migrate are deliberately NOT here, and cannot be: both
+      # live behind the `archive` profile, and Compose rejects the ENTIRE
+      # project — even `docker compose config` — when an un-profiled service
+      # depends_on a profiled one while the profile is inactive. Re-adding
+      # either breaks token-only `docker compose up` outright; a
+      # compose-contract test in tests/test_config.py pins this. The
+      # dependency was never load-bearing for correctness anyway — the asyncpg
+      # pool is lazy and the drainer backs off with an actionable
+      # SchemaVersionError — so an enabled cold `up` merely opens with a brief
+      # burst of connection-refused/backoff logging while postgres and the
+      # migration one-shot come up. `just db-migrate` remains the way to see
+      # migration failures directly.
       # otel-lgtm is intentionally NOT in depends_on.
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
@@ -33,11 +77,25 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru: guild:{id}:history keys are persistent
-    # (no TTL — unbounded full-history retention) and must never be eviction
-    # candidates. Every cache key (ytdl:*,
-    # spotify:*) and the other guild:* keys carry TTLs, so volatile-lru
-    # preserves the existing cache-eviction behavior for them.
+    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and must
+    # never become eviction candidates:
+    #
+    #   history:outbox      plays written but not yet durable in Postgres.
+    #                       Evicting one loses that play silently — no error, no
+    #                       play_history_rejected row, no log line. It is
+    #                       normally near-empty and grows during a Postgres
+    #                       outage, i.e. when eviction pressure is highest.
+    #                       Written only while HISTORY_ARCHIVE_ENABLED; disabled,
+    #                       the key is never created, but the policy must still
+    #                       protect a leftover from an earlier enabled run.
+    #   guild:{id}:history  the per-guild display window, capped at 50 entries
+    #                       and PERSISTed. The ONLY source -history reads, so
+    #                       evicting one answers a guild with silence despite a
+    #                       full archive behind it. Bounded by length, never by
+    #                       time: ~24 KB per guild, permanently.
+    #
+    # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
+    # so volatile-lru preserves cache-eviction behavior for them.
     command: >
       redis-server
       --appendonly yes
@@ -53,6 +111,142 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  postgres:
+    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). OPT-IN:
+    # long-term storage of user data is a choice the operator makes, so this
+    # service exists in the model only while the `archive` profile is active —
+    # COMPOSE_PROFILES=archive in .env, set alongside
+    # HISTORY_ARCHIVE_ENABLED=true (the pair is documented in .env.example; the
+    # profile deploys the database, the flag makes the bot use it). A default
+    # `docker compose up` starts no Postgres and archives nothing. While the
+    # archive IS enabled, MusicBotApp.setup_hook requires POSTGRES_URL and
+    # refuses to start without it.
+    profiles: ["archive"]
+    image: postgres:18-alpine
+    container_name: discord-postgres
+    restart: always
+    environment:
+      # Interpolated from the project .env at compose parse time (NOT env_file —
+      # that would spray the bot's other secrets into this container). The
+      # bot's POSTGRES_URL above is built from these same three values.
+      #
+      # The password FALLS BACK to a known default so `docker compose up` works
+      # with nothing configured but DISCORD_TOKEN. That is a first-run
+      # convenience and a liability afterwards, so the bot detects it and warns
+      # at startup and on every -ping (src/config.using_default_postgres_password).
+      # It is only defensible because the published port below is bound to
+      # 127.0.0.1; do not widen that binding without also removing this default.
+      - POSTGRES_USER=${POSTGRES_USER:-musicbot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=${POSTGRES_DB:-musicbot}
+    ports:
+      # Loopback-bound, and the host side is overridable: the bot uses host
+      # networking, so it connects through this published port, and 5432 is the
+      # port a developer's own local Postgres already holds. Set
+      # POSTGRES_HOST_PORT in .env to move it — the bot's POSTGRES_URL above
+      # reads the same variable, so the two cannot drift.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # 18+ image layout: the declared volume moved to /var/lib/postgresql
+      # (PGDATA is version-specific beneath it). Mounting the old .../data
+      # path would silently store the cluster OUTSIDE the volume.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # $$ escapes compose interpolation so the container's own env expands at
+      # runtime — keeps the check correct if the user/db are customized in .env.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  db-migrate:
+    # One-shot schema migration for the opt-in archive — `archive` profile,
+    # same as postgres above: no archive, no schema to migrate.
+    #
+    # The bot image, not a postgres client image: the runner is src/db_migrate.py
+    # and the migrations ship in that image, so there is exactly one definition
+    # of "what schema this build expects" and no way for a sidecar image to
+    # drift from it.
+    #
+    # `restart: "no"` is explicit and load-bearing — the default here would
+    # inherit nothing, but a copy-paste of `restart: always` from the services
+    # above would turn a successful one-shot into a crash loop of successful
+    # exits, and depends_on: service_completed_successfully would never settle.
+    profiles: ["archive"]
+    image: discord-music-bot:${GIT_SHA:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: discord-postgres-migrate
+    restart: "no"
+    command: ["python", "-m", "src.db_migrate"]
+    environment:
+      # Container networking here (not 127.0.0.1): unlike the bot, this service
+      # is on the compose network, so it addresses postgres by service name and
+      # is unaffected by POSTGRES_HOST_PORT.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  db-backfill:
+    # One-shot migration of pre-archive Redis history into Postgres, run BY HAND:
+    #
+    #   docker compose run --rm db-backfill --dry-run
+    #   docker compose run --rm db-backfill
+    #
+    # Exists because the justfile recipe needs a local venv, and the production
+    # host this README describes has only Docker — which left the one mandatory
+    # pre-deploy step impossible to run there. Every other db-* operation
+    # already has a container path (db-migrate is a service; db-rejects/backup/
+    # restore go through `docker compose exec postgres`).
+    #
+    # `profiles:` is what keeps it out of `docker compose up`. Unlike db-migrate
+    # this must NEVER run automatically: it is a once-per-deployment operator
+    # decision immediately before an irreversible step, not a startup task. A
+    # service without a profile would run on every `up` — harmless today because
+    # the insert is idempotent, but it would put a full keyspace walk on the
+    # startup path of every deploy.
+    #
+    # `ops`, deliberately NOT `archive`: `up` starts EVERY service of an active
+    # profile, so joining `archive` would run the backfill on every enabled
+    # `up` — the exact thing this comment forbids. `docker compose run`
+    # auto-activates a targeted service's own profiles, so the explicit
+    # invocations above keep working with the archive enabled
+    # (COMPOSE_PROFILES=archive from .env supplies postgres). With the archive
+    # DISABLED they fail at service resolution (`no such service: postgres`,
+    # exit 1) — curt, but honest: a backfill into a database that isn't
+    # deployed is meaningless.
+    profiles: ["ops"]
+    image: discord-music-bot:${GIT_SHA:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: "no"
+    # No `container_name`: `docker compose run` generates its own, and a fixed
+    # one makes a second invocation collide with the first's stopped container.
+    entrypoint: ["python", "-m", "src.backfill_history"]
+    environment:
+      # Both tiers by service name — same reasoning as db-migrate above. REDIS_URL
+      # matters more here than anywhere else: this is the only tool that treats
+      # Redis as the SOURCE, so pointing it at the wrong one reports "0 entries
+      # scanned" and exits 0, which reads as "nothing to migrate".
+      #
+      # `:-password` like every other service, and this one was MISSED when the
+      # default landed — it kept `:?`, and because Compose interpolates the whole
+      # document before profile filtering, an `ops`-profiled service broke every
+      # command in the file. `docker compose up` failed with only a
+      # DISCORD_TOKEN, which is the exact cliff the default exists to remove.
+      # A test now parses this file and asserts no POSTGRES_PASSWORD
+      # interpolation is mandatory, because nothing else in CI reads compose.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   bgutil-pot-provider:
     # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
@@ -98,6 +292,7 @@ services:
 
 volumes:
   redis-data:
+  postgres-data:
   ytdlp-cache:
   otel-grafana:
   otel-tempo:

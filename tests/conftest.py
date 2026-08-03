@@ -1,5 +1,7 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import re
+import sys
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -14,7 +16,75 @@ from src.config import SpotifyStatus
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
-from tests.helpers import noop_ffmpeg_init
+from tests.helpers import noop_ffmpeg_init, tier_enabled
+
+
+def pytest_collection_modifyitems(
+    session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Refuse a `-m pg` run that would skip the entire tier.
+
+    An all-skipped tier is otherwise a GREEN job:
+
+        $ env -u RUN_PG_TESTS -u POSTGRES_TEST_URL pytest -m pg -q
+        25 skipped, 1465 deselected      EXIT=0
+
+    `just test-pg` hardcodes RUN_PG_TESTS=1 so this cannot happen through
+    workflow env alone, and CI's `build` needs: pg-integration — but nothing
+    ASSERTED that any pg test actually ran, and several invariants are covered
+    ONLY here: ON CONFLICT dedup, the -history tie-break, the schema lock in
+    both directions (every constructible HistoryEntry inserts; a CHECK still
+    refuses one that bypassed the validator), NOT VALID's treatment of legacy
+    rows, and play_history_rejected.payload holding a NUL byte that jsonb and
+    text both refuse. A tier that silently stops running is worse than one that
+    was never wired up.
+
+    The redis tier is here for the same reason and gets the same treatment:
+    its own invariants — that an exact trim actually trims, that WRONGTYPE is a
+    ResponseError, that XAUTOCLAIM's completion cursor is "0-0", that XINFO
+    GROUPS' lag goes nil — are ones fakeredis answers WRONGLY rather than not at
+    all, so a silently-skipped job leaves the suite asserting the fake's
+    behaviour and nothing else.
+
+    Shares tier_enabled() with test_pg_integration._PG_ENABLED and
+    test_redis_integration._REDIS_ENABLED rather than re-deriving the check:
+    the two used to be hand-kept in step, and a gate that disagrees with the
+    skipif it gates is worse than no gate at all.
+
+    Matches the marker as a WORD in the expression, not as the whole string.
+    `-m pg` was the only spelling that reached this check, so the moment anyone
+    narrowed a run — `-m "pg and not slow"`, `-m "pg or redis"` — the gate went
+    silent and the all-skipped-green hole reopened under the exact command a
+    developer reaches for when triaging.
+    """
+    enablers = {
+        "pg": ("RUN_PG_TESTS", "POSTGRES_TEST_URL"),
+        "redis": ("RUN_REDIS_TESTS", "REDIS_TEST_URL"),
+    }
+    markexpr = config.option.markexpr
+    selected = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", markexpr)) - {
+        "and",
+        "or",
+        "not",
+    }
+    tiers = [t for t in enablers if t in selected]
+    if len(tiers) != 1:
+        # Zero tiers: an ordinary run, nothing to gate. More than one: the
+        # expression selects a mix, so "every test would skip" is not what a
+        # disabled tier means any more and the per-module skipif is the honest
+        # reporter.
+        return
+    tier = tiers[0]
+    flag, url = enablers[tier]
+    if tier_enabled(flag, url):
+        return
+    print(
+        f"\nERROR: `-m {markexpr}` selects the {tier} tier but it is disabled, "
+        f"so every test would skip.\n       Set {flag}=1 (needs Docker) or "
+        f"{url}.",
+        file=sys.stderr,
+    )
+    raise pytest.UsageError(f"{tier} tier selected but not enabled")
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +122,35 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(youtube, "ytdlp_pool", pool)
     yield
     pool.shutdown(wait=False)
+
+
+@pytest.fixture(autouse=True)
+def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset the environment variables the suite asserts defaults for.
+
+    `just test` does not load .env, so the exposure is an EXPORTED variable.
+    POSTGRES_URL is the one that matters: a developer
+    shell almost always has it, carrying a REAL password, so every test of the
+    default-credential warning silently ran with the warning off — including the
+    -ping dashboard tests, which is how "the advisory renders on every
+    invocation" stayed unasserted. The opposite shell (one exporting the default)
+    would have flipped those same tests to two embeds. Neither is a state the
+    suite should depend on.
+
+    Scrubbed at setup, so a test that wants a value still just calls
+    monkeypatch.setenv and wins. Same shape as the ytdlp seam and the structlog
+    contextvar reset above: make the suite mean what it says regardless of the
+    shell it runs in.
+
+    HISTORY_ARCHIVE_ENABLED is pinned TRUE — the suite default deliberately
+    inverts the ship default (False). The enabled configuration exercises
+    strictly more code (the outbox XADD leg, the notify, the drainer wiring)
+    and hundreds of existing assertions encode it; the shipped default is
+    covered by explicit disabled-mode tests that monkeypatch the variable per
+    case, which wins over this fixture (same MonkeyPatch instance, later call).
+    """
+    monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -146,6 +245,12 @@ def mock_ctx(
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
     ctx.typing.return_value.__aexit__ = AsyncMock(return_value=None)
+    # Owner by default: for a self-hosted bot the application owner IS the
+    # operator, so it is the ordinary case for any command that gates on it
+    # (today, -ping's default-password advisory). Must be an AsyncMock — a bare
+    # MagicMock attribute returns something unawaitable and every such command
+    # dies with TypeError, which is how the gate first showed up in this suite.
+    ctx.bot.is_owner = AsyncMock(return_value=True)
     return ctx
 
 
@@ -156,6 +261,20 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.latency = 0.05
     bot.is_closed.return_value = False
     bot.wait_until_ready = AsyncMock()
+    # Declared, never auto-vivified. MusicPlayer.__init__ reads
+    # bot.history_drainer to decide whether GuildHistory gets a real outbox
+    # notify or None, and an auto-vivified MagicMock attribute answers
+    # `is not None` with True — so every player built from this fixture takes
+    # the archive-ENABLED arm, and the disabled arm (which is the SHIP DEFAULT)
+    # would be exercised by nothing in the suite at all. That is not
+    # hypothetical: dropping the None guard from musicplayer.py once passed the
+    # entire suite while bricking every -play in the default configuration.
+    #
+    # Spelling the enabled shape out keeps it a deliberate choice rather than an
+    # accident of MagicMock; TestOutboxNotifyWiring in test_musicplayer.py
+    # covers BOTH arms against the real constructor.
+    bot.history_archive = MagicMock()
+    bot.history_drainer = MagicMock()
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
 
@@ -262,6 +381,10 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
+    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
+    # AttributeError rather than returning None. Tests that care about the
+    # Postgres row set their own archive (see TestPingReportsPostgres).
+    cog.history_archive = None
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()

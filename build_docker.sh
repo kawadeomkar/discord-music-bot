@@ -13,6 +13,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# Warn before the test gate + image build, so an operator on the default
+# credential sees it now rather than after ~24s of checks and a full image
+# build. It only WARNS: compose has a fallback for the password, so refusing to
+# build would put back the first-run cliff that default exists to remove.
+warn_default_postgres_password
 run_test_gate
 
 # Split from the export deliberately: `export FOO="$(cmd)"` returns export's own

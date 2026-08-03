@@ -113,3 +113,46 @@ def make_mock_task() -> MagicMock:
     task.done.return_value = False
     task.cancel = MagicMock()
     return task
+
+
+def tier_enabled(*env_vars: str) -> bool:
+    """Is an opt-in integration tier turned on by its environment?
+
+    One definition for all three readers — conftest's gate hook and the two
+    tier modules' own skipif — because a gate that disagrees with the thing it
+    gates is worse than no gate: it either refuses a run that would have worked
+    or waves through one that skips everything.
+
+    "0", "false" and "" are DISABLED. `bool(os.getenv(...))` reads all three as
+    enabled, so `RUN_PG_TESTS=0` started a testcontainer — the opposite of what
+    an operator writing 0 asked for.
+    """
+    import os
+
+    return any(
+        os.getenv(name, "").strip().lower() not in ("", "0", "false", "no")
+        for name in env_vars
+    )
+
+
+def bind_loopback_only(container: Any, port: int) -> None:
+    """Publish `port` on 127.0.0.1 instead of every interface.
+
+    Docker's default binding is 0.0.0.0, so a plain testcontainer puts its
+    throwaway database on the LAN for the length of a run — `just test-pg` is
+    ~45s of `test`/`test` reachable from any machine on the same coffee-shop
+    wifi, and the redis tier the same with no auth at all. The contents are
+    synthesized fixtures, so the exposure is the surface (an unauthenticated
+    Redis, a Postgres 18 with a two-letter password), not the data.
+
+    This matches what docker-compose.yml already does for every service it
+    publishes — the whole `network_mode: host` / loopback analysis the compose
+    file rests on — so the test tiers agreeing with it is the point.
+
+    Mechanism: testcontainers passes `.ports` straight through to docker-py's
+    `containers.run(ports=...)`, which accepts `(host_ip, host_port)` where a
+    bare port would go. `None` keeps the random-high-port assignment, so
+    `get_exposed_port()` resolves exactly as before. Must be called BEFORE the
+    container starts, since that dict is read once at `run`.
+    """
+    container.ports[port] = ("127.0.0.1", None)
