@@ -6,12 +6,11 @@ The two Redis hashes and the queue list each have corresponding frozen dataclass
 field-name constants; GuildQueue in guild_queue.py converts between at-rest queue
 entries and live queue items. Callers never touch raw bytes from Redis directly.
 
-This module is pure schema: constructors, serializers, derived read-only
-properties, and the domain NORMALIZATION that keeps a value object inside the
-column domain it is stored in (HistoryEntry.__post_init__) — but no behaviour,
-and no runtime imports from the rest of the project (orjson is the project-wide
-wire codec). Normalization belongs here precisely because it is schema: the type
-and the domain it promises cannot be allowed to drift apart.
+Pure schema: constructors, serializers, derived read-only properties, and the
+domain NORMALIZATION that keeps a value object inside the column domain it is
+stored in (HistoryEntry.__post_init__) — no behaviour, and no runtime imports from
+the rest of the project (orjson is the project-wide wire codec). Normalization
+lives here so the type and the domain it promises cannot drift apart.
 """
 
 import logging
@@ -68,24 +67,19 @@ class NowPlayingField:
 
 # ── Parsing helpers (module-level; shared by both from_redis constructors) ───
 #
-# The bare `except A, B:` clauses below are PEP 758 (Python 3.14+)
-# unparenthesized multi-exception syntax, NOT the old Python-2
-# catch-one/bind-name form: they catch the tuple (A, B) and let unlisted types
-# propagate. This is the concise style ruff's formatter normalizes to at
-# `target-version = "py314"` (documented, intended behavior since ruff v0.15.0)
-# — not a bug. requires-python is >=3.14, so it is valid on every interpreter
-# this project runs on; do not re-parenthesize (ruff would strip it back).
+# The bare `except A, B:` clauses below are PEP 758 (Python 3.14+) multi-exception
+# syntax, NOT the old Python-2 catch-one/bind-name form: they catch the tuple
+# (A, B) and let unlisted types propagate. ruff's formatter normalizes to this at
+# `target-version = "py314"`; do not re-parenthesize, ruff strips it back.
 
 
 def _b_str(raw: dict[bytes, bytes], key: str, default: str = "") -> str:
     v = raw.get(key.encode())
-    # `is None`, not truthiness: a missing key gets the default, but a stored
-    # empty string b"" stays "".
-    #
-    # errors="replace": one corrupt non-UTF8 byte must degrade to a mangled
-    # string, not raise. A strict decode would make from_redis() raise and
-    # get_guild_state() return None, misclassifying corruption as "Redis
-    # unavailable" and blocking recovery until TTL expiry.
+    # `is None`, not truthiness: a missing key gets the default, a stored b"" stays
+    # "". errors="replace" so one corrupt non-UTF8 byte degrades to a mangled
+    # string — a strict decode would raise out of from_redis(), get_guild_state()
+    # would return None, and corruption would be misclassified as "Redis
+    # unavailable", blocking recovery until TTL expiry.
     return v.decode(errors="replace") if v is not None else default
 
 
@@ -134,11 +128,9 @@ class GuildStateData:
     """Typed snapshot of guild:{id}:state deserialized from Redis.
 
     Zero-value defaults throughout, so GuildStateData() is the canonical "empty
-    hash" snapshot and callers never handle bytes or manual coercions.
-
-    volume is None when nothing is stored, NOT 1.0: the caller must tell
-    "nothing persisted" from "user set 1.0" so a restore can skip the assignment
-    instead of clobbering a concurrent -volume with a fabricated default.
+    hash" snapshot. volume is None when nothing is stored, NOT 1.0: the caller must
+    tell "nothing persisted" from "user set 1.0" so a restore can skip the
+    assignment instead of clobbering a concurrent -volume with a fabricated default.
     """
 
     volume: float | None = None
@@ -170,9 +162,8 @@ class GuildStateData:
     def was_paused_at_crash(self) -> bool:
         """True when a pause_start_epoch is recorded (bot was paused at crash).
 
-        Named for the crash, not is_paused, to keep it distinct from live state
-        (vc.is_paused()): this is persisted crash-time state only.
-        """
+        Named for the crash, not is_paused, to stay distinct from live state
+        (vc.is_paused()): this is persisted crash-time state only."""
         return self.pause_start_epoch is not None
 
     # FIXME: Crash recovery counts bot downtime as playback position.
@@ -185,13 +176,10 @@ class GuildStateData:
     # position instead of extrapolating.
     def crashed_position_at(self, now: float) -> int | None:
         """Approximate playback position (seconds) at crash time, or None when no
-        play_start_epoch was recorded.
-
-        Pure function of the snapshot plus a caller-supplied clock, so it needs no
-        mocks to test. play_start_epoch is already backdated by the FFmpeg -ss
-        offset at write time. Callers may still cap the result at the song duration
-        (current_song_duration, or the cached stream duration) to stop FFmpeg
-        seeking past EOF.
+        play_start_epoch was recorded. Pure function of the snapshot plus a
+        caller-supplied clock. play_start_epoch is already backdated by the FFmpeg
+        -ss offset at write time; callers still cap the result at the song duration
+        to stop FFmpeg seeking past EOF.
         """
         if self.play_start_epoch is None:
             return None
@@ -232,10 +220,9 @@ class GuildStateData:
 class NowPlayingData:
     """Typed snapshot of guild:{id}:now_playing.
 
-    Bidirectional: from_song() builds it from a live YTDL for the atomic
-    start-song write, from_redis() rebuilds it during crash recovery. One type,
-    so the live and recovered embeds can't drift.
-    """
+    Bidirectional: from_song() builds it from a live YTDL for the atomic start-song
+    write, from_redis() rebuilds it during crash recovery. One type, so the live
+    and recovered embeds can't drift."""
 
     title: str = ""
     webpage_url: str = ""
@@ -258,10 +245,10 @@ class NowPlayingData:
             title=song.title or "",
             webpage_url=song.webpage_url or "",
             uploader=song.uploader or "",
-            # Empty for unknown duration (livestream, missing metadata) rather
-            # than the "0:00" fmt_duration renders — mirrors the live embed, which
-            # draws no bar when duration_secs <= 0. The recovered embed keys its
-            # Duration line off this being truthy.
+            # Empty for unknown duration (livestream, missing metadata) rather than
+            # fmt_duration's "0:00" — mirrors the live embed, which draws no bar at
+            # duration_secs <= 0, and the recovered embed keys its Duration line
+            # off this being truthy.
             duration=song.duration if song.duration_secs > 0 else "",
             thumbnail=song.thumbnail or "",
             view_count=str(song.views) if song.views is not None else "",
@@ -300,8 +287,8 @@ class NowPlayingData:
         """Serialize to a flat string dict for Redis HSET mapping.
 
         Spelled out rather than dataclasses.asdict(), which would bind the wire
-        schema to Python attribute names — renaming an attribute would silently
-        rename the hash field. This table pins it to the NowPlayingField constants.
+        schema to Python attribute names — renaming one would silently rename the
+        hash field. This table pins it to the NowPlayingField constants.
         """
         return {
             NowPlayingField.TITLE: self.title,
@@ -360,9 +347,8 @@ class SongQueueEntry:
 
     requester is an ID because a live discord.Member cannot exist at rest;
     rehydration (which needs a guild to resolve members) happens in GuildQueue.
-    requester_id is None only for the crashed-head entry from
-    from_crashed_state() — wire entries always carry a real int, and snowflakes
-    stay exact end-to-end (orjson native ints, never a float path).
+    requester_id is None only for the crashed-head entry from from_crashed_state();
+    snowflakes stay exact end-to-end (orjson native ints, never a float path).
     """
 
     webpage_url: str
@@ -418,15 +404,14 @@ class SongQueueEntry:
     def from_crashed_state(
         cls, state: GuildStateData, *, position: int | None
     ) -> Self | None:
-        """The crashed "current song" reborn as a queue entry — the typed inverse
-        of pop_queue_and_start_song(), whose current_song_* fields ARE the entry
-        it LPOPed. None when no crashed song is recorded.
+        """The crashed "current song" reborn as a queue entry — the typed inverse of
+        pop_queue_and_start_song(), whose current_song_* fields ARE the entry it
+        LPOPed. None when no crashed song is recorded.
 
         persisted=False: that LPOP already committed, so this entry is not on the
-        Redis list and the loop must not LPOP again for it.
-
-        `position` is the caller-computed resume offset (crashed_position_at()
-        plus its duration cap), passed in so this stays a pure field mapping.
+        Redis list and the loop must not LPOP again for it. `position` is the
+        caller-computed resume offset (crashed_position_at() plus its duration cap),
+        passed in so this stays a pure field mapping.
         """
         if not state.has_crashed_song:
             return None
@@ -438,16 +423,15 @@ class SongQueueEntry:
             duration=state.current_song_duration,
             uploader=state.current_song_uploader,
             persisted=False,
-            # A crash mid-interjection must not demote the recovered song to a
-            # normal one: a -playnow after recovery still replaces it (no resume
-            # entry) instead of stacking one.
+            # A crash mid-interjection must not demote the recovered song: a
+            # -playnow after recovery still replaces it (no resume entry) rather
+            # than stacking one.
             interjected=state.current_song_interjected,
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out for the same
-        reason as NowPlayingData.to_redis_mapping: the wire schema is pinned to
-        QueueEntryField, not to Python attribute names."""
+        """Serialize to the wire format. Field table spelled out so the wire schema
+        is pinned to QueueEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
                 QueueEntryField.TYPE: _ENTRY_TYPE_SONG,
@@ -502,15 +486,14 @@ class SearchQueueEntry:
 QueueEntry = Union[SongQueueEntry, SearchQueueEntry]
 
 
-# `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return.
-# Narrowing to bytes forced every caller to cast for a call always fine at runtime
-# (parse_history_entry is the sibling).
+# `bytes | str` matches orjson.loads() and redis-py's declared LRANGE return;
+# narrowing to bytes forces a cast at every caller (parse_history_entry likewise).
 def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
     """Deserialize one queue-list entry into a value object.
 
-    The "type" field discriminates searches from songs. Corrupt entries (bad
-    JSON, missing required fields) return None with a warning, so one bad entry
-    is dropped and the rest of the queue survives.
+    The "type" field discriminates searches from songs. Corrupt entries (bad JSON,
+    missing required fields) return None with a warning, so one bad entry is
+    dropped and the rest of the queue survives.
     """
     try:
         d = orjson.loads(data)
@@ -558,11 +541,10 @@ class HistoryEntryField:
     MESSAGE_ID: Final[str] = "message_id"
 
 
-# The play_history column domain (migrations/0001_play_history.sql), mirrored
-# here because HistoryEntry is now the thing that guarantees it. Kept next to the
-# dataclass rather than in history_archive.py so the type and its domain cannot
-# drift apart, and so this module stays free of runtime imports from the rest of
-# the project.
+# The play_history column domain (migrations/0001_play_history.sql), mirrored here
+# because HistoryEntry is what guarantees it — next to the dataclass rather than in
+# history_archive.py so the type and its domain cannot drift apart, and so this
+# module stays free of runtime imports from the rest of the project.
 _TEXT_FIELDS: Final[tuple[str, ...]] = (
     "title",
     "webpage_url",
@@ -581,20 +563,18 @@ _TS_MAX: Final[float] = 253402300799.0  # 9999-12-31T23:59:59Z, the timestamptz 
 class HistoryEntry:
     """One played song at rest — an element of guild:{id}:history.
 
-    Zero-values mean "unknown": fields absent on the wire default on parse, and
-    the display layer degrades accordingly. The field set deliberately matches
-    the Postgres play_history row.
+    Zero-values mean "unknown": absent wire fields default on parse and the display
+    layer degrades. The field set matches the Postgres play_history row.
 
     guild_id is redundant on the per-guild display list (the key carries it) but
-    load-bearing on the global history:outbox stream, where entries from all
-    guilds interleave and the drainer maps each to a Postgres row. Entries
-    written before the field existed parse as guild_id=0.
+    load-bearing on the global history:outbox stream, where all guilds interleave
+    and the drainer maps each entry to a Postgres row; entries written before the
+    field existed parse as guild_id=0.
 
-    message_id is a WEAK reference by design — the NP host migrates across
-    messages during one song and a dedicated host is deleted when retired, so
-    this records which message hosted the block when the song ended, not a
-    message guaranteed to still exist. That is why it is neither a foreign key
-    nor part of play_history_dedup.
+    message_id is a WEAK reference — the NP host migrates across messages during
+    one song and a dedicated host is deleted when retired, so it records which
+    message hosted the block at song end, not one guaranteed to still exist. Hence
+    neither a foreign key nor part of play_history_dedup.
     """
 
     guild_id: int = 0
@@ -612,42 +592,31 @@ class HistoryEntry:
     def __post_init__(self) -> None:
         """Normalize into the play_history column domain at construction.
 
-        This is the schema lock: an instance of this class is, by construction, a
-        row Postgres accepts. Every producer routes through here — from_song,
-        parse_history_entry, _row_to_entry, dataclasses.replace, the backfill — so
-        no consumer re-proves it and the archive holds no opinion about data.
+        The schema lock: an instance is, by construction, a row Postgres accepts.
+        Every producer routes through here — from_song, parse_history_entry,
+        _row_to_entry, dataclasses.replace, the backfill — so no consumer re-proves
+        it and the archive holds no opinion about data.
 
-        ONE FIELD IS DELIBERATELY EXEMPT: the clamp floors every integer at 0, but
-        play_history's CHECK on guild_id is strictly `> 0`, so a HistoryEntry
-        holding guild_id 0 is constructible and NOT insertable. Clamping up to 1
-        would file an unattributable play into a real guild's history, where it is
-        indistinguishable from a genuine play; relaxing the CHECK to `>= 0` would
-        make guild 0 a permanent bucket of orphans no read path excludes. Refusing
-        at the database sends exactly those entries to play_history_rejected, where
-        a row means "a producer stopped stamping guild_id" — the actual defect. No
-        real producer can reach it today (from_song takes guild_id keyword-only and
-        Discord snowflakes are positive).
+        ONE FIELD IS EXEMPT: the clamp floors every integer at 0, but play_history's
+        CHECK on guild_id is strictly `> 0`, so a guild_id-0 entry is constructible
+        and NOT insertable. Clamping up to 1 would file an unattributable play into
+        a real guild's history; relaxing the CHECK would make guild 0 a permanent
+        bucket of orphans no read path excludes. Refusing at the database routes
+        those entries to play_history_rejected, where a row means "a producer
+        stopped stamping guild_id" — the actual defect.
 
-        The four vectors closed here are the ONLY ways a wire-parseable entry could
-        fail an INSERT. Everything else the column types could refuse — lone
-        surrogates, non-finite floats, integers past 64 bits — orjson already
-        refuses to encode.
+        These are the ONLY ways a wire-parseable entry could fail an INSERT:
+        everything else the columns could refuse — lone surrogates, non-finite
+        floats, integers past 64 bits — orjson already refuses to encode. Range
+        tests rather than pairs of bound checks because a chained comparison is
+        False for NaN, which lands NaN on the sentinel.
 
-        Written as range tests rather than pairs of bound checks because a chained
-        comparison is False for NaN, which lands NaN on the sentinel. That arm is
-        unreachable from the wire (orjson emits null, the parser reads 0.0) and
-        reachable from from_song, which is why it belongs on the type.
-
-        TOTAL BY DESIGN — this never raises. It also runs on the READ path
-        (_row_to_entry, and the backfill's dataclasses.replace), and stored rows
-        predate it, so a validator that rejected them would break -history for
-        precisely the guilds with the most history. Strictness lives in the DB
-        CHECK constraints instead, where a violation means "this validator
-        regressed" and cannot retroactively invalidate durable data.
-
-        No type coercion: HistoryEntry(title=None) raising TypeError out of the
-        `in` test below is the correct outcome — coercing would turn a caught bug
-        into a stored row reading "None".
+        TOTAL BY DESIGN — never raises, and it runs on the READ path over stored
+        rows that predate it, so a validator that rejected them would break -history
+        for precisely the guilds with the most history; strictness lives in the DB
+        CHECK constraints instead. No type coercion: HistoryEntry(title=None)
+        raising TypeError out of the `in` test below is correct — coercing would
+        store a row reading "None".
         """
         for name in _TEXT_FIELDS:
             value: str = getattr(self, name)
@@ -668,22 +637,17 @@ class HistoryEntry:
         cls, song: YTDL, *, guild_id: int, played_at: float, message_id: int
     ) -> Self:
         """Canonical extraction from a finished song. played_at is a
-        caller-supplied clock (as in crashed_position_at) so this stays a pure
-        field mapping. guild_id is required (keyword) because the song object
-        doesn't carry it and a forgotten stamp would silently write
-        unattributable outbox entries.
+        caller-supplied clock (as in crashed_position_at) so this stays a pure field
+        mapping. guild_id is keyword-required because the song object doesn't carry
+        it and a forgotten stamp would silently write unattributable outbox entries.
+        message_id more strictly still: play_history's CHECK is `>= 0`, so a missed
+        stamp inserts cleanly as 0 and is permanently indistinguishable from a song
+        that genuinely had no host — pass 0 explicitly for that case.
 
-        message_id is required for the same reason, and more strictly: nothing
-        downstream can catch a forgotten one. play_history's CHECK is
-        `message_id >= 0`, so a missed stamp inserts cleanly as 0 and is
-        permanently indistinguishable from a song that genuinely had no host.
-        Pass 0 explicitly for that case.
-
-        played_secs is the position reached (start_offset + audio delivered),
-        capped at duration when known. For a -playnow-interrupted song recorded
-        once at its resume tail's end, the tail's position spans the full
-        listened range — the desirable answer. A ?t= song includes the skip;
-        accepted.
+        played_secs is the position reached (start_offset + audio delivered), capped
+        at duration when known. A -playnow-interrupted song is recorded once at its
+        resume tail, whose position spans the full listened range; a ?t= song
+        includes the skip.
         """
         played = round(song.position_secs)
         duration = song.duration_secs or 0
@@ -704,9 +668,8 @@ class HistoryEntry:
         )
 
     def to_redis(self) -> bytes:
-        """Serialize to the wire format. Field table spelled out for the same
-        reason as NowPlayingData.to_redis_mapping: the wire schema is pinned to
-        HistoryEntryField, not to Python attribute names."""
+        """Serialize to the wire format. Field table spelled out so the wire schema
+        is pinned to HistoryEntryField, not to Python attribute names."""
         return orjson.dumps(
             {
                 HistoryEntryField.GUILD_ID: self.guild_id,
@@ -730,9 +693,9 @@ def serialize_history_entry(entry: HistoryEntry) -> bytes:
 
 def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
     """Deserialize one history-list entry. Corrupt entries (bad JSON, wrong type,
-    malformed fields) return None with a warning and are dropped, as in
-    parse_queue_entry. Unknown keys are ignored and missing keys default, so
-    mixed-build readers stay tolerant in both directions."""
+    malformed fields) are dropped with a warning, as in parse_queue_entry. Unknown
+    keys are ignored and missing keys default, so mixed-build readers stay tolerant
+    in both directions."""
     try:
         entry = orjson.loads(data)
     except Exception as e:
@@ -767,13 +730,12 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildPlaybackSnapshot:
-    """A guild's complete persisted playback aggregate — state hash, pending
-    queue, now-playing snapshot, played-song history — read together in one
-    pipelined round-trip (GuildRedisStore.get_playback_snapshot).
+    """A guild's complete persisted playback aggregate — state hash, pending queue,
+    now-playing snapshot, played-song history — read together in one pipelined
+    round-trip (GuildRedisStore.get_playback_snapshot).
 
-    The "a guild owns a queue (and a history)" relationship as a type: recovery
-    decisions spanning the halves live here as named properties rather than as
-    boolean expressions at call sites.
+    "A guild owns a queue (and a history)" as a type: recovery decisions spanning
+    the halves live here as named properties, not expressions at call sites.
     """
 
     state: GuildStateData
@@ -797,14 +759,12 @@ class GuildPlaybackSnapshot:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildRecoveryGate:
-    """The minimal read `_restore_guild` needs to decide whether to reconnect:
-    the state hash plus the pending queue's *length* — never its contents.
+    """The minimal read `_restore_guild` needs to decide whether to reconnect: the
+    state hash plus the pending queue's *length* — never its contents.
 
-    _restore_guild consults only the connection gate, the channel IDs, and
-    whether there is anything to resume; _restore_state re-reads the full
-    GuildPlaybackSnapshot after a successful voice connect. Reading only the
-    length keeps a -stopped guild's (possibly long) leftover queue off the wire
-    on every on_ready (see GuildRedisStore.get_recovery_gate).
+    _restore_state re-reads the full GuildPlaybackSnapshot after a successful voice
+    connect. Reading only the length keeps a -stopped guild's (possibly long)
+    leftover queue off the wire on every on_ready.
     """
 
     state: GuildStateData
@@ -813,6 +773,6 @@ class GuildRecoveryGate:
     @property
     def has_restorable_playback(self) -> bool:
         """True when a restart has anything to resume — pending entries or a song
-        mid-play at crash time. Mirrors
-        GuildPlaybackSnapshot.has_restorable_playback, over the queue length."""
+        mid-play at crash time. GuildPlaybackSnapshot.has_restorable_playback over
+        the queue length."""
         return self.pending_count > 0 or self.state.has_crashed_song

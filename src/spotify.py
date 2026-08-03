@@ -36,12 +36,10 @@ def _track_search_title(track: dict[str, Any]) -> str:
 
 
 class SpotifyAuthError(Exception):
-    """Spotify rejected the configured client credentials.
-
-    Raised only for the two responses that actually indicate bad credentials: a
-    non-2xx token grant, and a 401/403 from an API call. NOT for network errors,
-    timeouts, or other codes (404, 5xx) — those say nothing about validity.
-    Startup validation keys off this: only this error disables the source.
+    """Spotify rejected the configured client credentials. Raised only for the two
+    responses that actually indicate that: a non-2xx token grant, and a 401/403 from an
+    API call. NOT for network errors, timeouts or other codes (404, 5xx) — those say
+    nothing about validity, and startup validation disables the source only on this.
     """
 
     def __init__(self, status: int, detail: str = "") -> None:
@@ -82,11 +80,9 @@ class Spotify:
         self, use_cache: bool = True, strict: bool = False
     ) -> None:
         """Fetch a fresh access token via client-credentials and update expiry.
-
         `use_cache=False` bypasses the Redis-cached token so the configured
-        client_id/secret are genuinely exercised, not a token minted from earlier
-        credentials. `strict=True` raises SpotifyAuthError on a non-2xx grant
-        instead of surfacing a missing-`access_token` KeyError. Both are opted
+        client_id/secret are genuinely exercised; `strict=True` raises SpotifyAuthError
+        on a non-2xx grant instead of a missing-`access_token` KeyError. Both are opted
         into by validate(); the runtime path keeps the defaults."""
         if use_cache and self._redis is not None:
             cached = await spotify_token_get_with_ttl(self._redis)
@@ -120,13 +116,10 @@ class Spotify:
         data: Optional[dict[str, str]] = None,
         http_method: str = "GET",
     ) -> Any:
-        """Make an authenticated request to the Spotify API, refreshing the token
-        first if it has expired. Raises on any non-2xx response.
-
-        `Any` is deliberate, unlike yt-dlp's `YTDLVideoInfo`: the response shape is
-        chosen by the caller's URL, so there is no single schema to write. The two
-        callers that read named fields (`track()`, `playlist()`) narrow at their
-        own boundary, where the shape is actually known.
+        """Make an authenticated request to the Spotify API, refreshing the token first
+        if it has expired. Raises on any non-2xx response. `Any` is deliberate, unlike
+        yt-dlp's `YTDLVideoInfo`: the response shape is chosen by the caller's URL, so
+        the two callers that read named fields narrow at their own boundary instead.
         """
         if time.time() > self.token_expiry:
             async with self._auth_lock:
@@ -152,18 +145,12 @@ class Spotify:
             )
 
     async def validate(self, track_id: str) -> None:
-        """Exercise the configured credentials against the live Spotify API.
-
-        Forces a fresh token (bypassing the Redis cache, so the client_id/secret
-        themselves are tested), then fetches a known track.
-
-        Raises SpotifyAuthError *only* when Spotify rejects the credentials: a
-        non-2xx grant or a 401/403. Everything else — network error, timeout,
-        non-auth code, unexpected shape (ValueError) — propagates as its own type
-        and means "could not verify", not "invalid"; the caller keys its
-        enable/disable decision off that distinction.
-
-        A one-shot startup probe; it mutates no feature flag itself."""
+        """Exercise the configured credentials against the live Spotify API: force a
+        fresh token (bypassing the Redis cache, so client_id/secret themselves are
+        tested), then fetch a known track. Raises SpotifyAuthError *only* when Spotify
+        rejects the credentials; everything else — network error, timeout, non-auth
+        code, unexpected shape — propagates as its own type and means "could not
+        verify", not "invalid". A startup probe; it mutates no feature flag itself."""
         async with self._auth_lock:
             await self._refresh_token(use_cache=False, strict=True)
         endpoint = self.spotify_endpoint + f"v1/tracks/{track_id}"
@@ -231,10 +218,9 @@ class Spotify:
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[list[str], str]) -> Any:
         """Return raw Spotify artist objects for one or more artist IDs, cached 24h.
-
-        Untyped by intent: nothing in `src/` reads a field off it (this and
-        `albums()` have no production callers), so a TypedDict would be a guess at
-        Spotify's schema with no consumer to check it — see `http_call`.
+        Untyped by intent: nothing in `src/` reads a field off it (this and `albums()`
+        have no production callers), so a TypedDict would be a guess at Spotify's schema
+        with no consumer to check it — see `http_call`.
         """
         if isinstance(ids, str):
             ids = [ids]
@@ -254,9 +240,7 @@ class Spotify:
     @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[list[str], str]) -> Any:
         """Return raw Spotify album objects for one or more album IDs, cached for 24h.
-
-        Untyped for the same reason as `artists()` above.
-        """
+        Untyped for the same reason as `artists()` above."""
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.album_ids", ",".join(ids))

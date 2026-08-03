@@ -1,9 +1,8 @@
 """Tests for src/guild_queue.py — the queue domain class.
 
-The central property under test is the triad-sync invariant: after every
-operation, the asyncio queue, the display deque, and the Redis mirror agree
-(persisted=False items exist only on the in-memory legs by design).
-"""
+Central property: the triad-sync invariant — after every operation the asyncio
+queue, the display deque and the Redis mirror agree (persisted=False items live
+on the in-memory legs only, by design)."""
 
 import redis.asyncio as aioredis
 from typing import Any
@@ -154,15 +153,10 @@ class TestPut:
 
 
 class TestDrainPending:
-    """`_drain_pending` — the shared first step of put_front(), clear(),
-    shuffle() and remove(). All four drain the whole pending leg under the mutex
-    and rebuild it, so a bug here corrupts four commands at once.
-
-    Its non-obvious contract is the task_done() balance: each drained item must
-    be balanced, or the asyncio queue's unfinished counter drifts and join()
-    hangs forever. Tests assert via join() rather than only reading the counter,
-    because join() is what the bulk mutations actually depend on.
-    """
+    """`_drain_pending` — the shared first step of put_front(), clear(), shuffle()
+    and remove(), so a bug here corrupts four commands at once. Its non-obvious
+    contract is the task_done() balance: an unbalanced drain drifts the unfinished
+    counter and hangs join(), which is what the bulk mutations depend on."""
 
     async def test_returns_every_item_in_queue_order(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
@@ -190,12 +184,9 @@ class TestDrainPending:
     async def test_every_drained_item_is_balanced_with_task_done(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """The counter must return to zero so join() completes.
-
-        Omitting the task_done() would leave unfinished tasks pending and hang
-        the next join() — the failure would surface as a frozen bulk mutation,
-        not as an exception here.
-        """
+        """The counter must return to zero so join() completes. A missing
+        task_done() hangs the next join(), surfacing as a frozen bulk
+        mutation rather than an exception here."""
         await gq_no_redis.put([_qobj(n, mock_author) for n in range(1, 6)])
         assert gq_no_redis._pending._unfinished_tasks == 5  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -207,11 +198,9 @@ class TestDrainPending:
     async def test_drain_is_idempotent(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """A second drain must be a no-op, not an over-balanced task_done().
-
-        `_pending.task_done()` raises ValueError once called more times than
-        there were items, so an unguarded re-drain would crash the caller.
-        """
+        """A second drain must be a no-op, not an over-balanced task_done():
+        task_done() raises ValueError past the item count, so an unguarded
+        re-drain crashes the caller."""
         await gq_no_redis.put([_qobj(1, mock_author)])
         assert len(gq_no_redis._drain_pending()) == 1
         assert gq_no_redis._drain_pending() == []
@@ -859,11 +848,9 @@ class TestShuffleWithInFlightDequeue:
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """The loop dequeued an item and is resolving it (display/Redis heads
-        not yet committed); -shuffle must reorder only the pending items and
-        carry the in-flight head through on both legs — otherwise the
-        eventual commit retires someone else's entry and the triad desyncs
-        permanently."""
+        """The loop is resolving a dequeued item (display/Redis heads uncommitted);
+        -shuffle must reorder only the pending items and carry the in-flight head
+        through on both legs, or the commit retires someone else's entry."""
         items = [_qobj(n, mock_author) for n in range(1, 6)]
         await gq.put(items)
         in_flight = await gq.get()  # the loop's dequeue; commit comes later

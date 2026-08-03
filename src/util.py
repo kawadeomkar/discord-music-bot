@@ -19,12 +19,9 @@ def queue_message(songs: list[str]) -> str:
 
 
 def trace_id_of(span: Span) -> str:
-    """The span's trace id as 32 hex chars, or "" when the span is not recording.
-
-    Empty string rather than None: every consumer stores this in a column or a
-    log field that is text, so an absent trace and an unset one should not be
-    two different cases downstream.
-    """
+    """The span's trace id as 32 hex chars, or "" when the span is not recording. Empty
+    string rather than None: every consumer stores this in a column or log field that is
+    text, so an absent trace and an unset one should not be two cases downstream."""
     span_ctx = span.get_span_context()
     return format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
 
@@ -74,13 +71,10 @@ def notice_embed(
     *,
     title: Optional[str] = None,
 ) -> discord.Embed:
-    """Turn a plain status string ("Shuffled!", validation errors) into an embed.
-
-    Every command response must be an embed: MusicContext.send prepends the Now
-    Playing block, and a bare `content` string would render as loose text above
-    it. For the one-liner case where a body-only embed reads best; send_embed is
-    the pair for anything needing a title/description split.
-    """
+    """Turn a plain status string ("Shuffled!", validation errors) into an embed. Every
+    command response must be an embed: MusicContext.send prepends the Now Playing block,
+    and a bare `content` string would render as loose text above it. send_embed is the
+    pair for anything needing a title/description split."""
     return discord.Embed(title=title, description=message, color=color)
 
 
@@ -131,12 +125,9 @@ def truncate_embed_title(title: str) -> str:
 
 
 def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
-    """One embed per played song, in the given (newest-first) order.
-
-    Layout: numbered title, raw webpage_url on
-    its own line (Discord auto-links it), then played/duration, requester, and —
-    when known — the played-at timestamp as viewer-local <t:…:f>.
-    """
+    """One embed per played song, in the given (newest-first) order. Layout: numbered
+    title, raw webpage_url on its own line (Discord auto-links it), then played/duration,
+    requester, and — when known — the played-at timestamp as viewer-local <t:…:f>."""
     embeds = []
     for i, entry in enumerate(entries, start=1):
         lines = []

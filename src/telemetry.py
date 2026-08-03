@@ -27,8 +27,8 @@ from src.config import ENVIRONMENT
 
 if TYPE_CHECKING:
     # The SDK providers are imported lazily in _setup_traces/_setup_logs so the
-    # exporter stack loads only when telemetry is enabled; these type-only imports
-    # let the globals below keep their real types.
+    # exporter stack loads only when telemetry is enabled; these type-only imports let
+    # the globals below keep their real types.
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk.trace import TracerProvider
 
@@ -77,10 +77,9 @@ class _DiscordGatewayFilter(Sampler):
 
 
 def setup_telemetry() -> None:
-    """Initialize OTel SDK and structlog. No-op when OTEL_SDK_DISABLED=true.
-
-    A second call is a no-op: calling twice would add a second root LoggingHandler
-    (duplicate Loki records) and orphan the first TracerProvider's exporter.
+    """Initialize OTel SDK and structlog. No-op when OTEL_SDK_DISABLED=true. A second
+    call is a no-op too: it would add a second root LoggingHandler (duplicate Loki
+    records) and orphan the first TracerProvider's exporter.
     """
     global _tracer_provider
     if _tracer_provider is not None:
@@ -109,19 +108,12 @@ def get_tracer(name: str) -> trace.Tracer:
 
 def configure_worker_logging(log_queue: Optional["Queue"] = None) -> None:
     """Configure structured logging inside a yt-dlp pool worker (called via
-    ytdlp_pool._worker_init, which wraps this so a failure can't break the pool).
-
-    With a log_queue (production; the thread-pool test seam passes none), routes
-    worker records to the parent rather than standing up a redundant OTLP exporter
-    per worker:
-
-      * The stdout StreamHandler is REPLACED by a QueueHandler, not added — the
-        parent re-emits every record it drains, so keeping it would double-print.
-      * worker_id is bound as a contextvar so it lands on every worker line.
-
-    yt-dlp's warnings (the SABR/PO-token early-warning system via
-    youtube._YtdlpLogger) thus reach Loki through the parent's LoggingHandler with
-    worker_id and — via run()'s context propagation — the originating trace_id."""
+    ytdlp_pool._worker_init, which wraps this so a failure can't break the pool). With a
+    log_queue (production; the thread-pool test seam passes none), the stdout
+    StreamHandler is REPLACED by a QueueHandler — the parent re-emits every record it
+    drains, so keeping it would double-print — and worker_id is bound as a contextvar.
+    yt-dlp's warnings thus reach Loki through the parent's LoggingHandler with worker_id
+    and, via run()'s context propagation, the originating trace_id."""
     _configure_structlog()
     if log_queue is None:
         return
@@ -163,21 +155,12 @@ def _add_environment(
 
 def setup_cli_logging() -> None:
     """Structured logging for the one-shot operator CLIs, without the OTel SDK.
-
-    `src.util.get_logger` hands back a structlog proxy that is inert until
-    something configures structlog — and only this module does. Unconfigured, it
-    falls back to PrintLoggerFactory: readable text on STDOUT that never enters
-    the logging module, so `2> errors.log` captures nothing and no handler ever
-    sees it. For `src/backfill_history.py` that is not cosmetic; its
-    corrupt-entry ERROR is documented as the only durable record of a play about
-    to become unrecoverable.
-
-    Deliberately NOT setup_telemetry(). A migration that runs once, by hand,
-    should not stand up a TracerProvider, open an OTLP gRPC channel, or wait on
-    a BatchSpanProcessor flush it has no spans for — and the SDK's LoggingHandler
-    is deprecated upstream, which under this project's `filterwarnings = error`
-    turns importing it into a test failure. What these tools actually need is the
-    JSON renderer and the stdout handler, which is exactly what this installs.
+    `src.util.get_logger` hands back a structlog proxy that is inert until something
+    configures structlog, and only this module does; unconfigured it falls back to
+    PrintLoggerFactory — readable text on stdout that never enters the logging module,
+    so `2> errors.log` captures nothing. Deliberately NOT setup_telemetry(): a hand-run
+    one-shot needs no TracerProvider or OTLP flush, and the SDK's LoggingHandler is
+    deprecated upstream, so importing it under `filterwarnings = error` fails the suite.
     """
     _configure_structlog()
 
@@ -200,9 +183,9 @@ def _configure_structlog() -> None:
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
-    # Always add a stdout StreamHandler so logs reach `docker logs` and local dev
-    # even with the SDK off — under OTEL_SDK_DISABLED=true no LoggingHandler is
-    # added either, so without this all output is silently dropped.
+    # Always add a stdout StreamHandler so logs reach `docker logs` and local dev even
+    # with the SDK off — under OTEL_SDK_DISABLED=true nothing else adds a handler, so
+    # without this all output is silently dropped.
     if not any(isinstance(h, logging.StreamHandler) for h in logging.root.handlers):
         logging.root.addHandler(logging.StreamHandler(sys.stdout))
     logging.root.setLevel(logging.INFO)

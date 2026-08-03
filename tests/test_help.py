@@ -59,13 +59,9 @@ def sent_embed(ctx: MagicMock) -> discord.Embed:
 
 class TestSendDestination:
     """Help output must route through MusicContext.send so the Now Playing block
-    stays glued to the bottom of the channel — a bare context.channel.send()
-    would bury it.
-
-    Asserted on behaviour, not on the mechanism: the base HelpCommand's
-    inherited get_destination() returns context.channel, so any send path that
-    reached for it would trip these.
-    """
+    stays at the bottom of the channel; a bare context.channel.send() buries it.
+    The inherited get_destination() returns context.channel, so any send path
+    reaching for it trips these — which is why they assert on behaviour."""
 
     async def test_bot_help_sends_via_context(
         self, help_command: MusicHelpCommand, ctx: MagicMock
@@ -309,10 +305,9 @@ class TestHelpFlagEndToEnd:
         from src.main import MusicBotApp, MusicContext
 
         app = MusicBotApp()
-        # MusicBot types bot as commands.Bot, but production always hosts the
-        # cog on MusicBotApp — an AutoShardedBot, which shares BotBase with Bot
-        # but is not a subclass of it. The cog only touches BotBase/Client
-        # members, so this is the real runtime contract; pyright can't see it.
+        # MusicBot types bot as commands.Bot, but production hosts the cog on
+        # MusicBotApp — an AutoShardedBot, which shares BotBase without
+        # subclassing Bot. The cog only touches BotBase/Client members.
         await app.add_cog(MusicBot(app))  # type: ignore[arg-type]
         message = MagicMock()
         message.content = "-play lofi hip hop --help"

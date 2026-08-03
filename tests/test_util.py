@@ -113,11 +113,8 @@ class TestPluralize:
         ],
     )
     def test_only_exactly_one_is_singular(self, count: int, expected: str) -> None:
-        """The rule is `count == 1`, not `count <= 1`.
-
-        0 and -1 are the cases that separate the two: relaxing the condition to
-        `<= 1` would render "0 song" and "-1 song" and pass every other test.
-        """
+        """The rule is `count == 1`, not `count <= 1`: 0 and -1 separate the two,
+        since `<= 1` renders "0 song" / "-1 song" and passes every other test."""
         assert pluralize(count, "song") == expected
 
     def test_plural_override_used_for_irregulars(self) -> None:

@@ -295,12 +295,10 @@ class TestYTSourcePlaylistUrl:
         assert src.playlist_url == "https://yt.com/watch?v=one"
 
     def test_no_url_and_no_list_id_stringifies_none(self) -> None:
-        """Unguarded edge, pinned deliberately rather than endorsed: with both
-        fields unset the f-string interpolates the literal "None", producing
-        `...playlist?list=None`. Reachable only by constructing a PLAYLIST
-        source without a list_id, which parse_url never does. If a guard is
-        ever added, this test should change with it — it exists so that becomes
-        a deliberate decision instead of a silent one."""
+        """Unguarded edge, pinned rather than endorsed: with both fields unset the
+        f-string interpolates the literal "None". Reachable only by hand-building a
+        PLAYLIST source without a list_id, which parse_url never does; adding a
+        guard should change this test, so the change stays deliberate."""
         src = YTSource(type=YTType.PLAYLIST)
         assert src.playlist_url == "https://www.youtube.com/playlist?list=None"
 

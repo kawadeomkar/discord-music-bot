@@ -36,7 +36,14 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [History read path](#history-read-path)
     - [Redis memory bounds](#redis-memory-bounds)
     - [Postgres credential handling](#postgres-credential-handling)
-15. [Design Decisions](#design-decisions)
+    - [History backfill](#history-backfill)
+15. [Subsystem Invariants](#subsystem-invariants)
+    - [Redis connection retry](#redis-connection-retry)
+    - [yt-dlp client strategy](#yt-dlp-client-strategy)
+    - [yt-dlp process boundary](#yt-dlp-process-boundary)
+    - [Queue invariant](#queue-invariant)
+    - [Now Playing host model](#now-playing-host-model)
+16. [Design Decisions](#design-decisions)
 
 ---
 
@@ -971,6 +978,40 @@ Four rules on the outbox are load-bearing rather than stylistic:
 4. **`XTRIM` is blind to the PEL.** Anything that destroys entries must `XACK`
    them first or they replay forever.
 
+An enabled archive that cannot durably record refuses to serve: `ensure_outbox_group`
+aborts **startup** on a `WRONGTYPE` at `history:outbox`, the same policy as `setup_hook`
+refusing an enabled archive without `POSTGRES_URL`. That check has to live at startup
+because `push_history` is `@_guild_op`-wrapped, so the same error there would be
+swallowed into one warning per song while both legs of its transaction failed. With the
+archive disabled the key is inert — `setup_hook` never creates the group (that would
+MKSTREAM the non-evictable key into existence) and a leftover is downgraded to a
+warning.
+
+There is **no quarantine counter**. With the schema lock, a data-caused refusal is a
+CHECK violation or a `DataError`, both named in `_POISON`; anything else is genuinely
+transient and redelivers forever rather than being dropped. A growing outbox is the
+visible symptom, and `HISTORY_OUTBOX_MAX` plus the depth gauge are what page on it.
+
+Two operational hazards the stream transport introduces. `DEL history:outbox` — the
+remedy the upgrade note asks operators to perform — also destroys the consumer group,
+after which every read fails identically forever; `_read_batch` therefore heals
+`NOGROUP` itself rather than relying on startup. And `SWEEP_MIN_IDLE_MS` must exceed
+`DRAIN_DEADLINE_SECS * 1000`, because under a shared consumer name "idle" is measured
+from last delivery, so a shorter value reclaims a live sibling's in-flight batch
+mid-insert.
+
+Exactly-once `play_history_rejected` recording used to come free from the drainer
+lease, since only one process could hold a poisoned batch. Under a stable consumer name
+two drainers can replay the same pending entry and both fail it, so exactness moved into
+`_REJECT_SQL`'s `ON CONFLICT ON CONSTRAINT play_history_rejected_dedup` — it matters
+because that table is expected to stay empty forever and `just db-rejects` reports its
+contents, so two rows must mean two poisoned entries, never one seen twice.
+
+**Disabling the archive does not erase anything.** `push_history` still PERSISTs
+`guild:{id}:history` in both modes, so an operator who reads "nothing is written to
+long-term storage", is later asked to erase a user's data, and removes the
+`postgres-data` volume deletes nothing at all — the only copy is the Redis list.
+
 The consumer name is **stable, not per-process**. The PEL belongs to the name, so a
 starting process inherits whatever its predecessor left in flight and recovery
 needs no lease, TTL or housekeeping. Two live drainers are safe by construction:
@@ -1021,6 +1062,22 @@ comparison is exact. The narrower key collapsed genuinely distinct plays: `playe
 defaults to `0.0` for entries predating the timestamped wire format, so two
 different plays of one song keyed `(0.0, url)` became one.
 
+`-history` is additionally capped at one render per guild
+(`max_concurrency(1, guild, wait=False)`). It is the heaviest send in the bot — up to
+8 song embeds plus the prepended Now Playing block — so unbounded concurrent renders
+rate-limit a guild out of its own channel. `wait=False` is load-bearing: queueing the
+extra invocations behind the first still issues every send, so they must be declined
+outright, and `cog_command_error` renders the resulting `MaxConcurrencyReached` as a
+notice rather than an error embed.
+
+`PostgresHistoryArchive.recent()` has **no production caller**. It is the durable
+record's read side, exercised by the `pg` tier and available to tooling; the archive's
+own query is served by the `play_history_recent` index with no sort node. Planning it
+off `play_history_dedup` instead adds an Incremental Sort that must consume an entire
+equal-`played_at` group before emitting `LIMIT 50` — and with backfilled rows all
+landing on the epoch-0 sentinel those groups are large. Measured 37x slower: p50
+49.98 ms vs 1.34 ms, ~9,900 buffers per call.
+
 The Redis read is bounded at `_READ_TIMEOUT_SECS` even though `GuildRedisStore`
 swallows its own errors — swallowing turns a *failure* into `[]`, but a
 connected-and-unresponsive server produces no error to swallow and the pool sets no
@@ -1049,6 +1106,14 @@ whatever oversized list it already had, forever, and no TTL path touches it. On 
 deployment upgrading from a build that never trimmed, a dormant guild holding 100k
 entries is ~49 MB, permanently, in a key `volatile-lru` can never evict. Only a
 further play — or a manual `DEL` — reclaims it.
+
+`outbox_depth` under-reports whenever entries were destroyed while still pending —
+which is exactly when plays are being lost. The cap's ack-before-trim rule is what
+prevents that; without it the depth alarm goes quiet during the incident it exists to
+catch. The cap's MINID discovery also pages at `CAP_PAGE` and converges across passes:
+a single `XRANGE COUNT=<overage>` would scale with the backlog (~240 MB in one reply
+against a 500k-entry outbox), which is the stream re-creation of the 206 MB
+`RPOP key 490000` incident.
 
 A Redis memory/eviction alarm is still owed. Never switch to `allkeys-lru` as a
 workaround: it makes the outbox evictable, and an evicted entry is a play that
@@ -1082,6 +1147,149 @@ the narrow scope is fail-open (the advisory goes quiet) for three hand-written D
 shapes asyncpg accepts and this misses: `?password=` in the query string, a password
 containing an unescaped `@`, and `PGPASSWORD` in the environment. None is reachable
 from compose or `just run`.
+
+The advisory is **owner-gated on `-ping`**. That command carries no permission check
+and answers to `-status`, `-health` and `-l`, so an ungated advisory would confirm to
+every member of every guild — permanently, in Discord's retained history — that this
+host runs the public default. The value is a public constant in a GPL repo; the leak
+is the confirmation, not the string. The `is_owner()` await must also be reached only
+when the advisory exists: `MusicBotApp` sets neither `owner_id` nor `owner_ids`, so
+discord.py falls through to `application_info()`, a REST GET that retries ~25 s on a
+5xx and then raises — ahead of the skeleton send the command promises is immediate.
+
+The default lives in six places with nothing linking them: `src/config.py`,
+`build_common.sh`'s preflight, three `docker-compose.yml` service interpolations, and
+the justfile's DSN derivation. Every drift fails **open** — rotate one and the
+detector goes quiet while the deployment still runs on a known credential, or the
+`just` recipes build a DSN the database rejects, surfacing much later as a drainer
+backoff loop because the archive connects lazily. `tests/test_config.py` is the only
+thing holding the six together.
+
+The detector reads the bot's DSN; it cannot observe the server. A detector that could
+not be fooled would attempt a connection using `DEFAULT_POSTGRES_PASSWORD`, at the
+cost of a login attempt per render.
+
+### History backfill
+
+`src/backfill_history.py` copies pre-archive `guild:{id}:history` entries into
+`play_history`, stamping the real guild id from the key (legacy entries parse as
+`guild_id=0`, so every guild's rows would otherwise collide on the dedup index). It
+inserts directly rather than through the outbox, which would bury the live drain
+behind a historical backlog.
+
+It must run **before** this build is deployed, and that window is unforgiving:
+`push_history` LTRIMs each list on that guild's next song end, destroying the only
+copy of exactly what the tool exists to move. The window is per guild, has no flag to
+check and nothing to undo. "This build", not "the archive build" — the cap is not
+part of the archive tier, so an operator who never opts in is on the same clock and
+simply has no backfill to run.
+
+Three operator-safety properties were learned the expensive way and are easy to
+regress:
+
+- **Exceptions are counted, not propagated.** An early version let them escape: one
+  `WRONGTYPE` from a stray key killed the run, every guild later in SCAN order went
+  unattempted, and the summary never printed (it sits after the `try/finally`), so a
+  partially-applied migration surfaced as a bare traceback missing a different set of
+  guilds each run.
+- **`short_guilds` and `skipped_keys` are fatal to `ok`.** They were once warnings
+  that still folded the guild into the success count, so a run that had just watched
+  plays disappear printed a clean summary and exited 0 — and
+  `just db-backfill && ./build_docker.sh` gates on that exit code.
+- **Reconciliation is by identity, not by count.** `push_history` LPUSHes and LTRIMs
+  in one transaction, so a list already at the cap keeps its length exactly while each
+  song end destroys one unread tail entry. A count check sees nothing; re-reading the
+  tail bytes is what catches it.
+
+## Subsystem Invariants
+
+Long-form context for invariants outside the archive tier. Source comments state the
+rule and link here for the reasoning.
+
+### Redis connection retry
+
+The pool's `retry_on_error` must name **redis-py's** `ConnectionError`/`TimeoutError`,
+not the builtins of the same name — redis-py's derive from `RedisError`, so the
+builtins match nothing it ever raises. The retry object must also be the **asyncio**
+`Retry` (`redis.asyncio.retry`), not `redis.retry`: the two classes share a name, a
+constructor and their attributes, but only the async one awaits. The sync class's
+`call_with_retry` returns an un-awaited coroutine, so nothing raises inside its `try`
+and the error escapes outside the retry loop entirely.
+
+Every assertion on the *configuration* passes under both classes. This pool was
+configured for three retries and performed none for a year, with a green suite; only
+counting attempts against a real connect distinguishes them. Without an explicit
+`Retry`, redis-py also synthesises `Retry(NoBackoff(), 1)` for a non-empty
+`retry_on_error` — one immediate reattempt and no backoff.
+
+### yt-dlp client strategy
+
+`android_vr` is primary because it needs no PO token and offers audio-only formats;
+`web_safari` is a *working* fallback only because the image ships Deno plus yt-dlp-ejs
+(for JS challenges) and the bgutil PO-token sidecar. The plugin pin in `pyproject.toml`
+and the sidecar image tag in `docker-compose.yml` **move in lockstep** — `just pins`
+checks this and CI runs it.
+
+The degradation ladder is designed so every rung lands on a previously-working
+configuration: `android_vr` healthy → audio-only; `android_vr` out → `web_safari`
+muxed audio, warned once per format by `_record_serving_format`; sidecar down →
+`web_safari` still works until PO-token enforcement lands; Deno broken → yt-dlp
+reverts to the JS-less default, which is `android_vr` alone. Those warnings are the
+early-warning system for YouTube-side changes; watch them after any yt-dlp bump.
+
+Two facts that constrain deployment rather than extraction: YouTube signs `ip` inside
+the `sparams` HMAC of every stream URL, so a URL is bound to the host that extracted
+it and can never be replayed from another machine — relevant to any multi-host or
+sharded deployment. And `fetch_pot=auto` consults the sidecar only when a selected
+format requires a token, so it costs nothing while `android_vr` is healthy; YouTube's
+PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
+provisioned ahead of enforcement rather than after it.
+
+### yt-dlp process boundary
+
+Four things cross into the worker processes, each with its own contract:
+
+- **The request** — frozen, slotted and `kw_only`, so adjacent same-type parameters
+  (`download`/`process`) cannot transpose at a call site.
+- **The callable** — pickled by qualified name, so it must stay module-level and be
+  resolved per call. Capturing it would silently defeat every
+  `patch("src.youtube._ytdlp_extract")` in the suite.
+- **The result** — `_slim_info` is what makes it picklable at all; a raw
+  `process=True` info dict carries live objects and commonly 100 KB–1 MB nobody reads.
+- **The exception** — flattened in the worker by `_classify_ytdlp_error`, where the
+  structure still exists (yt-dlp's own exceptions carry live tracebacks and cannot
+  cross). **Every field of the flattened error needs a default**: a required
+  positional pickles fine and fails on *unpickling* in the parent's result thread,
+  which bricks the pool permanently.
+
+### Queue invariant
+
+**Why `put_front`'s in-flight branch is not dead code.** `MusicPlayer.interject()`
+neutralizes the prefetch before calling `GuildQueue.put_front()`, which normally means
+no dequeued-but-uncommitted head exists. One interleaving defeats that: the song ends
+naturally, the playback loop claims a *still-running* prefetch task and awaits it (up
+to yt-dlp's socket timeout), and `interject()` runs inside that await — its neutralize
+finds `_prefetch_task` already nulled, so it takes nothing, while the prefetch's
+dequeued item sits uncommitted at the display head. `put_front` must then rebuild the
+Redis mirror rather than LPUSH, because the in-flight item's entry is still at the list
+head awaiting a commit-time LPOP. Delete the branch as "unreachable" and that
+interleaving silently eats the new head.
+
+Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
+and `-help` both say 3 (tracked by an in-code FIXME).
+
+### Now Playing host model
+
+The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
+pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.
+Overlapping sends can complete out of order — channel position is send-*start* order
+while adopts run in send-*return* order — so an adopt for an older message id sheds its
+own block instead of becoming host.
+
+Song end *releases* the host, leaving a completed bar as truthful history. `-stop`
+*retires* it, because a bar frozen mid-song on a stopped player is misleading. A stream
+that never produced audio has its block disposed of rather than finalized, since a
+completed bar would be a false record.
 
 ## Design Decisions
 

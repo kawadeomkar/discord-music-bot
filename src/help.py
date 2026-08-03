@@ -1,16 +1,11 @@
 """Man-page-styled embed help command.
 
-Both built-ins (DefaultHelpCommand, MinimalHelpCommand) format through a
-Paginator into plain text, so an embed-only bot must subclass HelpCommand
-directly. Only the dispatch methods are overridden — command_callback still
-resolves, so `-help p` (alias) and `-help MusicBot` (cog) work for free.
-
-Layout borrows from man(1): caps section headers and hanging-indent entries —
-every form of a command on one line, summary indented beneath — rather than a
-column-aligned table, whose grid read poorly at Discord widths.
-
-Per-command copy lives on the commands themselves (brief/help/usage/extras in
-src/musicbot.py), so a new command appears in help as soon as it is declared.
+Both built-ins format through a Paginator into plain text, so an embed-only bot must
+subclass HelpCommand directly; only the dispatch methods are overridden, so
+command_callback still resolves `-help p` (alias) and `-help MusicBot` (cog) for free.
+Layout borrows from man(1) — caps section headers, hanging-indent entries — because a
+column-aligned table's grid read poorly at Discord widths. Per-command copy lives on
+the commands themselves (brief/help/usage/extras in src/musicbot.py).
 """
 
 import textwrap
@@ -24,9 +19,8 @@ from src.util import notice_embed
 
 HELP_COLOR = discord.Color.blurple()
 
-# Display order: categories as rendered, and within each the commands by
-# frequency of use (daily verbs first, housekeeping last) — not alphabetically,
-# which put `pause` above `play`.
+# Display order: categories as rendered, and within each by frequency of use (daily
+# verbs first, housekeeping last) — not alphabetically, which put `pause` above `play`.
 CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
     "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
     "Queue": ("queue", "now", "history", "shuffle", "remove", "clear", "jump"),
@@ -38,11 +32,10 @@ UNCATEGORISED = "Other"
 # Discord's hard cap on an embed field value.
 _FIELD_LIMIT = 1024
 
-# Entries live in code blocks — the only construct Discord renders monospace,
-# so the only place a hanging indent survives. But Discord soft-wraps code
-# blocks at the embed width (~54 chars on desktop, less on mobile) and restarts
-# at column 0, destroying the indent. Hard-wrapping narrower than any common
-# width keeps the wrapping ours, so continuations stay indented.
+# Entries live in code blocks — the only construct Discord renders monospace, so the
+# only place a hanging indent survives. But Discord soft-wraps code blocks at the embed
+# width (~54 chars on desktop, less on mobile) and restarts at column 0, so hard-wrapping
+# narrower than any common width keeps the wrapping ours.
 _WIDTH = 48
 _INDENT = "    "
 _FENCE = "```"
@@ -93,13 +86,10 @@ class MusicHelpCommand(commands.HelpCommand):
             **options,
         )
 
-    # Every send goes through self.context, never self.get_destination(): the
-    # inherited one returns context.channel, whose bare send() would bury the
-    # Now Playing host mid-song.
-    #
-    # Overriding get_destination() would be the natural hook, but its base promises
-    # a MessageableChannel and a Context is only Messageable; every send_* is
-    # overridden here, so the base never calls it.
+    # Every send goes through self.context, never self.get_destination(): the inherited
+    # one returns context.channel, whose bare send() would bury the Now Playing host
+    # mid-song. Overriding get_destination() would be the natural hook, but its base
+    # promises a MessageableChannel and a Context is only Messageable.
 
     # ── formatting helpers ────────────────────────────────────────────────────
 
@@ -108,12 +98,10 @@ class MusicHelpCommand(commands.HelpCommand):
         return self.context.clean_prefix
 
     def get_command_signature(self, command: commands.Command, /) -> str:
-        """`-play <url|search>` — the canonical form only.
-
-        The base inlines aliases as `-[play|p|sing] …`; here each alias gets its
-        own SYNOPSIS line, or joins the comma list heading a list entry, the way
-        man pages write `-h, --help`. Command.signature returns the `usage=`
-        kwarg verbatim when one is set.
+        """`-play <url|search>` — the canonical form only. The base inlines aliases as
+        `-[play|p|sing] …`; here each alias gets its own SYNOPSIS line, or joins the
+        comma list heading a list entry, the way man pages write `-h, --help`.
+        Command.signature returns the `usage=` kwarg verbatim when one is set.
         """
         return f"{self.prefix}{command.qualified_name} {command.signature}".strip()
 
@@ -146,9 +134,8 @@ class MusicHelpCommand(commands.HelpCommand):
             -play, -p, -sing <url|search>
                 queue a song and start playing
 
-        Overflow wraps rather than truncates — an entry may grow a line but never
-        silently loses text. A wrapped heading continues two spaces past the
-        summary indent so the two can't be confused.
+        Overflow wraps rather than truncates, and a wrapped heading continues two spaces
+        past the summary indent so the two can't be confused.
         """
         heading = f"{', '.join(self._forms(command))} {command.signature}".strip()
         summary = command.brief or command.short_doc or "no description"

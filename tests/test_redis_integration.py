@@ -1,46 +1,34 @@
 """Real-Redis integration tier for the outbox stream.
 
-Opt-in, with two ways to supply the server — see `redis_url` below:
+Opt-in; two ways to supply the server (see `redis_url`):
 
-    just test-redis                  # local: testcontainers, needs Docker
+    just test-redis                      # local: testcontainers, needs Docker
     REDIS_TEST_URL=... just test-redis   # CI: an already-running server
 
-Why this tier exists, when fakeredis executes every stream command the design
-uses: **fakeredis is sufficient for behaviour and insufficient for fidelity**,
-and the gap is not evenly distributed. Five divergences were reproduced against
-`redis:7-alpine` (7.4.9) while designing the transport, and every one of them
-fails in the SAFE-LOOKING direction — green unit tests, broken production:
+fakeredis runs every stream command the design uses, but five behaviours
+diverge from `redis:7-alpine` (measured on 7.4.9) and every one fails in the
+SAFE-LOOKING direction — green unit tests, broken production:
 
-    1  xtrim(approximate=True), redis-py's DEFAULT   fakeredis trims EXACTLY;
-                                                     real Redis trims NOTHING on
-                                                     a small stream, and reports
-                                                     success either way
-    2  XAUTOCLAIM completion cursor                  fakeredis returns the
-                                                     last-scanned id; real Redis
-                                                     returns "0-0"
-    3  XINFO GROUPS `lag`                            fakeredis is off by one on a
-                                                     fresh group and returns a
-                                                     NEGATIVE value after
-                                                     deletion; real Redis returns
-                                                     nil when unreconcilable
-    4  XADD against a LIST key                       fakeredis raises
-                                                     AttributeError; real Redis
-                                                     raises ResponseError
-                                                     (WRONGTYPE)
-    5  ref_policy=KEEPREF/DELREF/ACKED               syntax error below Redis 8.2
-                                                     on both
+    1  xtrim(approximate=True), redis-py's DEFAULT: fakeredis trims EXACTLY;
+       real Redis trims NOTHING on a small stream and reports success anyway
+    2  XAUTOCLAIM completion cursor: fakeredis returns the last-scanned id,
+       real Redis returns "0-0"
+    3  XINFO GROUPS `lag`: fakeredis is off by one on a fresh group and goes
+       NEGATIVE after deletion; real Redis returns nil when unreconcilable
+    4  XADD against a LIST key: fakeredis raises AttributeError, real Redis
+       raises ResponseError (WRONGTYPE)
+    5  ref_policy=KEEPREF/DELREF/ACKED: syntax error below Redis 8.2 on both
 
 Rows 1, 3 and 4 are undetectable without a real server; row 2 is asserted here
-so the unit-tier workaround stays honest about what it is working around.
+so the unit tier's workaround stays honest about what it works around.
 
-Floor is Redis 7.0, not 6.2. XAUTOCLAIM exists at 6.2, but the 3-element reply
-carrying the deleted-ID list — the tombstone behaviour the drainer depends on —
-arrived in 7.0; on 6.2 redis-py hands back a literal (None, None) inside the
-claimed list and the tombstone is never purged.
+Floor is Redis 7.0, not 6.2: XAUTOCLAIM's 3-element reply carrying the
+deleted-ID list — the tombstone behaviour the drainer depends on — arrived in
+7.0; on 6.2 redis-py hands back (None, None) and the tombstone is never purged.
 
-Isolation: Redis has no throwaway-database-per-test equivalent to the pg tier's
-`raw_pg_dsn`, so each test FLUSHDBs a dedicated numbered database instead. The
-tier therefore assumes it owns the server it is pointed at.
+Isolation: there is no throwaway-database-per-test equivalent to the pg tier's
+`raw_pg_dsn`, so each test FLUSHDBs a dedicated numbered database and the tier
+assumes it owns the server it is pointed at.
 """
 
 import os
@@ -89,12 +77,10 @@ pytestmark = [
     ),
 ]
 
-# Must match the redis service image in .github/workflows/ci.yml's
-# redis-integration job AND the one in docker-compose.yml — `just pins` asserts
-# all three agree. That is enforcement rather than a "keep these in step"
-# comment, and it is live risk: Dependabot bumps the compose tag, `redis:7-alpine`
-# FLOATS (7.4.9 today), and an earlier measurement of this very design was taken
-# against the wrong server for exactly that reason.
+# Must match the redis image in ci.yml's redis-integration job AND in
+# docker-compose.yml — `just pins` asserts all three agree. Live risk, not
+# housekeeping: `redis:7-alpine` FLOATS (7.4.9 today), so a compose bump can
+# move the server out from under the divergences measured above.
 _REDIS_IMAGE = "redis:7-alpine"
 
 
@@ -102,29 +88,20 @@ _REDIS_IMAGE = "redis:7-alpine"
 def redis_url() -> Iterator[str]:
     """A Redis this tier may FLUSHDB.
 
-    Two providers behind one fixture, mirroring the pg tier's admin_dsn.
-    REDIS_TEST_URL wins when set: CI runs a GitHub Actions *service container*,
-    already pulled and health-checked during job setup, so paying
-    testcontainers' pull and reaper cost again inside the job buys nothing.
-
-    Session-scoped and SYNCHRONOUS, yielding a URL rather than a client:
-    asyncio_default_fixture_loop_scope is "function", so a connection opened
-    here would be bound to a loop that is closed before the next test runs. The
-    pg tier documents the same trap.
+    REDIS_TEST_URL wins when set: CI's service container is already pulled and
+    health-checked, so testcontainers' pull and reaper cost buys nothing. Yields
+    a URL, not a client, and is SYNCHRONOUS — fixture loop scope is "function",
+    so a connection opened here would outlive its loop (as in the pg tier).
     """
     external = os.getenv("REDIS_TEST_URL")
     if external:
         yield external
         return
 
-    # Scoped suppression, not a pyproject filterwarnings entry. testcontainers
-    # 4.x applies its own deprecated @wait_container_is_ready decorator inside
-    # testcontainers.redis at IMPORT time, so under golden rule 11
-    # (filterwarnings = ["error"]) the import itself fails. Confining the filter
-    # to this one statement keeps every other DeprecationWarning in the suite
-    # fatal, which is the property the rule exists for. Removable once
-    # testcontainers migrates its own module to the structured wait strategies
-    # the warning recommends.
+    # Scoped suppression, not a pyproject filterwarnings entry: testcontainers
+    # 4.x applies its own deprecated @wait_container_is_ready at IMPORT time, so
+    # under golden rule 11 the import itself fails. Confining it here keeps every
+    # other DeprecationWarning fatal. Removable when testcontainers migrates.
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -195,14 +172,10 @@ class TestServerFloor:
 
 
 class TestTrimActuallyTrims:
-    """DIVERGENCE 1 — the one that made this whole tier necessary.
-
-    redis-py defaults `approximate` to True, which trims only to whole
-    radix-tree nodes. On a small stream that removes NOTHING, while still
-    returning success. fakeredis models approximate trimming as EXACT, so a unit
-    test asserting end state passes under both settings and the cap ships
-    silently disabled.
-    """
+    """DIVERGENCE 1, the one that made this tier necessary: redis-py defaults
+    `approximate` to True, which trims only whole radix-tree nodes — NOTHING on
+    a small stream, still reporting success. fakeredis models it as EXACT, so a
+    unit test passes either way and the cap ships silently disabled."""
 
     async def test_exact_trim_removes_entries(self, redis: aioredis.Redis) -> None:
         await ensure_outbox_group(redis)
@@ -238,13 +211,10 @@ class TestTrimActuallyTrims:
 
 
 class TestTrimIsBlindToThePel:
-    """The defect the cap's ack-before-trim rule exists for.
-
-    XTRIM does not consult the PEL, so a trim that crosses delivered-but-unacked
-    entries destroys their bodies and leaves the pending records behind. Those
-    are plays a drainer was holding: no Postgres row, no play_history_rejected
-    row, and no error naming them.
-    """
+    """The defect the cap's ack-before-trim rule exists for: XTRIM does not
+    consult the PEL, so a trim crossing delivered-but-unacked entries destroys
+    their bodies and leaves the pending records. Those are plays a drainer was
+    holding — no Postgres row, no play_history_rejected row, no error."""
 
     async def test_trimming_delivered_entries_leaves_the_pel_intact(
         self, redis: aioredis.Redis
@@ -303,7 +273,7 @@ class TestTrimIsBlindToThePel:
 
 
 class TestWrongTypeIsAResponseError:
-    """DIVERGENCE 4. A pre-R1 LIST at history:outbox must abort startup, and the
+    """DIVERGENCE 4. A pre-stream LIST at history:outbox must abort startup, and the
     abort turns on the exception CLASS: ensure_outbox_group tolerates only
     BUSYGROUP and re-raises everything else. fakeredis raises AttributeError
     from XADD against a list, so only a real server can prove the class."""
@@ -328,14 +298,10 @@ class TestWrongTypeIsAResponseError:
     async def test_outbox_depth_against_a_list_raises_wrongtype(
         self, redis: aioredis.Redis
     ) -> None:
-        # The DISABLED arm's leg of the same condition. setup_hook's
-        # leftover-outbox probe calls outbox_depth (XLEN) and downgrades a
-        # ResponseError to a warning instead of aborting, so the class matters
-        # there too — and this is the pairing for the other two above.
-        #
-        # Unlike XADD, fakeredis models XLEN-against-a-list correctly, so the
-        # unit test can and now does stage the real shape; this pins that the
-        # real server agrees rather than leaving that inferred.
+        # The DISABLED arm of the same condition: setup_hook's leftover-outbox
+        # probe calls outbox_depth (XLEN) and downgrades a ResponseError to a
+        # warning instead of aborting, so the class matters there too. fakeredis
+        # models XLEN-against-a-list correctly; this pins that the server agrees.
         await redis.lpush(HISTORY_OUTBOX_KEY, b"pre-R1 list entry")
         with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
             await outbox_depth(redis)
@@ -355,14 +321,10 @@ class TestNogroupAfterDelete:
     async def test_deleting_the_key_destroys_the_group(
         self, redis: aioredis.Redis
     ) -> None:
-        """The foot-gun the stream introduces in the one operation the upgrade
-        note asks operators to perform.
-
-        Under the list transport `DEL history:outbox` merely emptied it and the
-        drainer kept working. Here it takes the consumer group with it, XADD
-        recreates the key with no group, and every read then fails identically
-        forever unless the drain cycle heals it.
-        """
+        """The foot-gun in the one operation the upgrade note asks operators to
+        perform: under the list transport `DEL history:outbox` merely emptied
+        it, but here it takes the consumer group with it — XADD recreates the
+        key groupless and every read fails until the drain cycle heals it."""
         await ensure_outbox_group(redis)
         await _push(redis, 1)
         await redis.delete(HISTORY_OUTBOX_KEY)
@@ -401,14 +363,9 @@ class TestGroupBootstrap:
 
 class TestAutoclaimCursorContract:
     """DIVERGENCE 2. Real Redis signals a completed scan with "0-0"; fakeredis
-    returns the last-scanned ID, which fed back as an inclusive start
-    re-delivers entries the sweep already counted.
-
-    The sweep therefore terminates on "this pass found nothing new" and counts
-    DISTINCT ids, which is correct under both conventions. These tests pin the
-    real contract so that workaround stays explicable rather than looking like
-    superstition.
-    """
+    returns the last-scanned ID, which fed back as an inclusive start re-delivers
+    entries already counted. So the sweep terminates on "this pass found nothing
+    new" and counts DISTINCT ids — correct under both conventions."""
 
     async def test_a_completed_scan_returns_the_zero_cursor(
         self, redis: aioredis.Redis
@@ -472,22 +429,14 @@ class TestAutoclaimCursorContract:
 class TestLagIsUnusable:
     """DIVERGENCE 3, and the reason outbox_depth is XLEN rather than `lag`.
 
-    XINFO GROUPS' lag is Optional: Redis returns nil whenever a deletion leaves
-    a gap it cannot reconcile, so no caller can treat it as a number. fakeredis
-    returns a number unconditionally — and a NEGATIVE one after deletion — so a
-    unit test would assert against values production never produces.
-
-    The precise trigger is narrower than "any XDEL", and the tests below pin the
-    boundary rather than the slogan. An earlier draft of this design claimed lag
-    went nil after an ordinary drain cycle; measured on 7.4.9, it does not — a
-    contiguous prefix removal stays countable, whether it is the drain's own
-    XACK+XDEL or the cap's MINID trim. What breaks it is a HOLE: deleting an
-    entry ahead of last-delivered-id, which is exactly the shape an operator's
-    manual XDEL takes.
-
-    The conclusion is unchanged and does not depend on how often nil happens:
-    an Optional gauge cannot back DEPTH_ALARM's threshold comparison, and XLEN
-    is unconditional.
+    XINFO GROUPS' lag is Optional — nil whenever a deletion leaves a gap Redis
+    cannot reconcile — so no caller can treat it as a number; fakeredis returns
+    one unconditionally, and a NEGATIVE one after deletion. The trigger is
+    narrower than "any XDEL" and these tests pin the boundary: on 7.4.9 a
+    contiguous prefix removal (the drain's XACK+XDEL, the cap's MINID trim)
+    stays countable, while a HOLE ahead of last-delivered-id — the shape an
+    operator's manual XDEL takes — nils it. Either way an Optional gauge cannot
+    back DEPTH_ALARM's threshold comparison; XLEN is unconditional.
     """
 
     async def _lag(self, redis: aioredis.Redis) -> object:
@@ -600,12 +549,10 @@ class TestRetireSemantics:
     async def test_minid_trim_is_idempotent_where_maxlen_is_not(
         self, redis: aioredis.Redis
     ) -> None:
-        """MINID names an absolute ID, so a re-send is inert. MAXLEN names a
+        """MINID names an absolute ID, so a re-send is inert; MAXLEN names a
         LENGTH, so a re-send after concurrent arrivals destroys a SECOND tranche
-        of unarchived plays — structurally the same destructive-retry defect the
-        positional RPOP had. This asserts both halves, because the claim that
-        MINID is safe is only meaningful next to the one that MAXLEN is not.
-        """
+        of unarchived plays. Both halves are asserted — "MINID is safe" only
+        means something next to "MAXLEN is not"."""
         await ensure_outbox_group(redis)
         await _push(redis, 1, 2, 3)
         ids = await _ids(redis)
@@ -630,15 +577,10 @@ class TestOutboxKeyIsNonEvictable:
 
 
 class TestHistoryWritePathAgainstARealServer:
-    """The push path, which this branch rewrote and the tier did not follow.
-
-    push_history went from LPUSH+PERSIST+XADD to LPUSH+LTRIM+PERSIST+conditional
-    XADD, plus an OOM recovery — and gained no real-server coverage at all. That
-    matters here more than usual: the unit tier's LTRIM assertions run against
-    fakeredis, where `xtrim(approximate=True)` and several other stream
-    behaviours diverge (see this module's docstring), and the OOM path is
-    literally untestable there because fakeredis has no maxmemory concept.
-    """
+    """Real-server coverage for the push path: LPUSH+LTRIM+PERSIST+conditional
+    XADD, plus an OOM recovery. The unit tier's LTRIM assertions run against
+    fakeredis, where stream behaviour diverges (see the module docstring) and
+    the OOM path is untestable at all — there is no maxmemory concept."""
 
     async def test_the_list_is_capped_and_never_expires(
         self, redis: aioredis.Redis
@@ -674,20 +616,10 @@ class TestHistoryWritePathAgainstARealServer:
     async def test_lpush_is_denyoom_but_a_bare_ltrim_is_not(
         self, redis: aioredis.Redis
     ) -> None:
-        """The empirical claim the OOM recovery is built on.
-
-        push_history's `except OutOfMemoryError` exists because LPUSH carries
-        Redis' `denyoom` flag while LTRIM does not — so at maxmemory the
-        transaction is refused at queue time and EXEC aborts, yet the one
-        command that could free memory is still allowed. The unit test
-        simulates the refusal by monkeypatching Pipeline.execute against
-        fakeredis, which has no maxmemory at all, so it asserts call ORDER and
-        nothing about what the server permits. If LTRIM were ever denyoom too,
-        the recovery would be dead code and every play during an outage lost
-        silently — with that test still green.
-
-        This is the only place the claim can actually be checked.
-        """
+        """The empirical claim the OOM recovery rests on, checkable only here:
+        LPUSH carries Redis' `denyoom` flag and LTRIM does not, so at maxmemory
+        the transaction is refused while the one command that could free memory
+        is still allowed. The unit test can only pin call order, not this."""
         store = GuildRedisStore(redis, guild_id=42)
         key = store.history_key()
         for n in range(HISTORY_CACHE_LIMIT + 50):
@@ -712,18 +644,10 @@ class TestRefPolicyIsNotAvailableYet:
     async def test_acked_ref_policy_is_rejected_below_redis_8_2(
         self, redis: aioredis.Redis
     ) -> None:
-        """DIVERGENCE 5, recorded as a live check rather than a comment.
-
-        Redis 8.2's `XTRIM ... ACKED` refuses to drop unacked entries, which is
-        the cap's ack-before-trim rule in one keyword. It is a syntax error on
-        the pinned redis:7-alpine and on fakeredis, so it is neither usable nor
-        testable today.
-
-        This test is written to FAIL LOUDLY the day compose moves to 8.2+,
-        because that is exactly when the hand-rolled rule should collapse into
-        the native one — and a silently-still-hand-rolled implementation is how
-        that opportunity gets missed.
-        """
+        """DIVERGENCE 5, as a live check rather than a comment. Redis 8.2's
+        `XTRIM ... ACKED` is the cap's ack-before-trim rule in one keyword, but
+        a syntax error on the pinned redis:7-alpine and on fakeredis. This FAILS
+        LOUDLY the day compose moves to 8.2+, so the collapse is not missed."""
         info = cast(dict[str, Any], await redis.info("server"))
         version = tuple(int(p) for p in str(info["redis_version"]).split(".")[:2])
         await ensure_outbox_group(redis)

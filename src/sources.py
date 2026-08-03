@@ -13,8 +13,8 @@ class URLSource(Enum):
     YOUTUBE = "youtube"
     SOUNDCLOUD = "soundcloud"
     # Any host we don't special-case (tiktok, vimeo, bandcamp, …). yt-dlp's ~1800
-    # extractors are the source of truth, so the URL goes straight to it and is
-    # rejected only if yt-dlp reports the site unsupported (see YTDL.yt_source).
+    # extractors are the source of truth, so the URL goes straight to it and is rejected
+    # only if yt-dlp reports the site unsupported (see YTDL.yt_source).
     OTHER = "other"
 
 
@@ -39,12 +39,9 @@ class SpotifySource:
 
 @dataclass(frozen=True)
 class YTSource:
-    """
-    :param url: YT URL
-    :param ytsearch: youtube search
-    :param ts: timestamp
-    :param list_id: YouTube playlist ID (present when type == YTType.PLAYLIST)
-    """
+    """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
+    `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
+    when type == YTType.PLAYLIST."""
 
     url: Optional[str] = None
     ytsearch: Optional[str] = None
@@ -80,13 +77,8 @@ def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
-
-    domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path.
-
-    :param url: URL to be parsed
-    :param message: full message content (used for Spotify si param extraction)
-    :return: source
-    """
+    `message` is the full message content. domain regex groups: 1/2 = http/www prefix,
+    3 = domain, 4 = path."""
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
     args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
@@ -123,31 +115,23 @@ def parse_url(
         return SoundcloudSource(url, process=True)
     elif "." in domain:
         # Looks like a real domain but isn't special-cased: hand it to yt-dlp rather
-        # than maintain a whitelist. Unsupported sites surface yt-dlp's own
-        # "Unsupported URL" via YTDL.yt_source. Routed like a bare YouTube watch URL
-        # (resolved to a QueueObject in queue_source), so nothing downstream needs
-        # to know it's generic.
+        # than maintain a whitelist, so an unsupported site surfaces yt-dlp's own
+        # "Unsupported URL" via YTDL.yt_source. Routed like a bare YouTube watch URL, so
+        # nothing downstream needs to know it's generic.
         return YTSource(url=url, process=True, stype=URLSource.OTHER)
     else:
         # Regex matched but the "host" has no dot (e.g. "98" from the search term
-        # "98/99"). ValueError makes parse_input fall back to a YouTube search
-        # instead of shipping a bogus host to yt-dlp.
+        # "98/99"). ValueError makes parse_input fall back to a YouTube search.
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
 def parse_input(
     user_input: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """Top-level entry point for command input. Tries parse_url, falls back to ytsearch.
-
-    parse_url is attempted only for single-word input, since URLs never contain
-    spaces. A single-word term with a slash ("98/99") still reaches it but raises
-    ValueError on the dotless host and falls back to search.
-
-    :param user_input: the URL or search term from the command argument
-    :param message: full message content (used to extract the search query)
-    :return: source
-    """
+    """Top-level entry point for command input: tries parse_url, falls back to ytsearch.
+    parse_url is attempted only for single-word input, since URLs never contain spaces; a
+    single-word term with a slash ("98/99") still reaches it but raises ValueError on the
+    dotless host and falls back to search."""
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:

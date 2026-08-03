@@ -1,19 +1,17 @@
 """Real-Postgres integration tier.
 
-Opt-in, with two ways to supply the server — see `admin_dsn` below:
+Opt-in; two ways to supply the server (see `admin_dsn`):
 
     just test-pg                        # local: testcontainers, needs Docker
     POSTGRES_TEST_URL=... just test-pg  # CI: an already-running server
 
 A throwaway database per test gives isolation either way.
 
-Covers exactly what the in-memory fakes cannot: the migrations actually
-executing, PostgresHistoryArchive's _INSERT_SQL/_RECENT_SQL parameter binding
-against a real server, ON CONFLICT dedup, the timestamptz<->epoch round-trip,
-recent()'s newest-first ordering with the id tie-break, and the poison-entry
-classes (NUL bytes, out-of-range epochs) that only a real Postgres rejects the
-way production will. Until this tier runs, those SQL constants and the
-sanitizer's premises are validated only by inspection.
+Covers what the in-memory fakes cannot: the migrations actually executing,
+_INSERT_SQL/_RECENT_SQL binding against a real server, ON CONFLICT dedup, the
+timestamptz<->epoch round-trip, recent()'s newest-first ordering with the id
+tie-break, and the poison classes (NUL bytes, out-of-range epochs) only a real
+Postgres rejects the way production will.
 """
 
 import asyncio
@@ -50,11 +48,10 @@ from src.redis_client import (
 
 from tests.helpers import bind_loopback_only, tier_enabled
 
-# POSTGRES_TEST_URL enables the tier on its own, deliberately. If it only
-# *selected the provider* and RUN_PG_TESTS still had to be set as well, a CI job
-# that supplied the server but forgot the flag would skip every test in this
-# file and report green — a blind job that looks covered is worse than a
-# missing one. One variable is enough to say "there is a Postgres here".
+# POSTGRES_TEST_URL enables the tier on its own: if it only selected the
+# provider, a CI job that supplied the server but forgot RUN_PG_TESTS would skip
+# every test here and report green, and a blind job that looks covered is worse
+# than a missing one.
 _PG_ENABLED = tier_enabled("RUN_PG_TESTS", "POSTGRES_TEST_URL")
 
 pytestmark = [
@@ -65,38 +62,26 @@ pytestmark = [
     ),
 ]
 
-# Must match the postgres service image in .github/workflows/ci.yml's
-# pg-integration job — `just pins` asserts they agree, so this is enforcement
-# rather than a "keep these in step" comment.
+# Must match the postgres service image in ci.yml's pg-integration job —
+# `just pins` asserts they agree.
 _PG_IMAGE = "postgres:18-alpine"
 _dbname_counter = itertools.count(1)
 
 
 def _with_database(dsn: str, name: str) -> str:
-    """The same DSN pointed at a different database.
-
-    urlsplit rather than rsplit("/", 1): an externally supplied DSN may carry a
-    query string (?sslmode=require) or a password containing a slash, and a
-    naive split corrupts both.
-    """
+    """The same DSN pointed at a different database. urlsplit rather than
+    rsplit("/", 1): a supplied DSN may carry a query string (?sslmode=require)
+    or a password containing a slash, and a naive split corrupts both."""
     return urlunsplit(urlsplit(dsn)._replace(path=f"/{name}"))
 
 
 @pytest.fixture(scope="session")
 def admin_dsn() -> Iterator[str]:
-    """A Postgres this suite may CREATE and DROP databases on.
-
-    Two providers behind one fixture. POSTGRES_TEST_URL wins when set: CI runs a
-    GitHub Actions *service container*, which the runner pulls and health-checks
-    during job setup — before the first step executes — so paying testcontainers'
-    pull, container start and ryuk-reaper cost again inside the job would buy
-    nothing. Unset (the local default) falls back to testcontainers, which is
-    what keeps this tier zero-setup for a developer who just has Docker running.
-
-    Session-scoped and synchronous on purpose: the value is a plain string, so
-    it survives the per-function event loop that asyncio_default_fixture_loop_scope
-    pins us to. A pooled *connection* here would not.
-    """
+    """A Postgres this suite may CREATE and DROP databases on. POSTGRES_TEST_URL
+    wins when set (CI's service container is already pulled and health-checked);
+    unset, testcontainers keeps the tier zero-setup for anyone running Docker.
+    Session-scoped and synchronous: a plain string survives the per-function
+    fixture loop scope, a pooled connection would not."""
     external = os.getenv("POSTGRES_TEST_URL")
     if external:
         yield external
@@ -116,12 +101,9 @@ def admin_dsn() -> Iterator[str]:
 @pytest.fixture
 async def raw_pg_dsn(admin_dsn: str) -> AsyncIterator[str]:
     """A fresh, UNMIGRATED database per test — full isolation, ~ms to create.
-
-    Connects per operation instead of holding one admin connection open for the
-    session: fixture loop scope is "function", so a connection opened in one
-    test's loop is unusable in the next. Two extra connects are microseconds
-    against CREATE DATABASE — do not "optimize" this into a session fixture.
-    """
+    Connects per operation rather than holding an admin connection open: fixture
+    loop scope is "function", so a connection from one test's loop is unusable in
+    the next. Do not "optimize" this into a session fixture."""
     import asyncpg
 
     name = f"t{next(_dbname_counter)}"
@@ -140,13 +122,9 @@ async def raw_pg_dsn(admin_dsn: str) -> AsyncIterator[str]:
 
 @pytest.fixture
 async def pg_dsn(raw_pg_dsn: str) -> str:
-    """A fresh database with the schema applied, via the real runner.
-
-    The archive no longer creates its own schema, so the migration step is now
-    part of the setup rather than a side effect of first use — which also means
-    every run of this tier exercises src/db_migrate.py end to end against a
-    real server, not just the code that reads what it produced.
-    """
+    """A fresh database with the schema applied, via the real runner — so every
+    run of this tier exercises src/db_migrate.py end to end against a real
+    server, not just the code that reads what it produced."""
     await migrate(raw_pg_dsn)
     return raw_pg_dsn
 
@@ -228,15 +206,11 @@ class TestMigrations:
         self, raw_pg_dsn: str
     ) -> None:
         """Two pods (or a manual run racing the compose one-shot) starting at
-        once is the normal case; the advisory lock is what makes the loser wait
-        rather than double-apply.
-
-        raw_pg_dsn, NOT pg_dsn: this used to take the already-migrated fixture,
-        so all four racers hit the `IF NOT EXISTS` short-circuit and the test
-        passed without ever exercising a concurrent bootstrap. Against a VIRGIN
-        database it reproduced a ~50% failure rate — the pg_type catalog race
-        that `CREATE TABLE IF NOT EXISTS` does not protect against.
-        """
+        once is normal, and the advisory lock makes the loser wait rather than
+        double-apply. raw_pg_dsn, NOT pg_dsn: on an already-migrated database
+        every racer hits the `IF NOT EXISTS` short-circuit and no concurrent
+        bootstrap happens; on a VIRGIN one this hits the pg_type catalog race
+        `CREATE TABLE IF NOT EXISTS` does not protect against, ~50% of runs."""
         results = await asyncio.gather(*(migrate(raw_pg_dsn) for _ in range(6)))
         assert results == [EXPECTED_SCHEMA_VERSION] * 6
 
@@ -353,20 +327,13 @@ class TestDedupAndPrecision:
     async def test_recent_is_planned_as_a_plain_index_scan(
         self, archive: PostgresHistoryArchive, pg_dsn: str
     ) -> None:
-        """The -history query must be served by play_history_recent, with NO
-        sort node.
-
-        play_history_dedup (guild_id, played_at, webpage_url) only presorts
-        played_at, so the id DESC tie-break planned an Incremental Sort that had
-        to consume an ENTIRE equal-played_at group before emitting LIMIT 50.
-        Those groups are large in practice — every legacy row backfilled from
-        Redis lands on the epoch-0 sentinel — and it measured 37x slower (p50
-        49.98ms vs 1.34ms) with ~9,900 buffers touched per call.
-
-        Asserting the PLAN, not a duration: a timing threshold on a
-        few-hundred-row test table would be noise, and the defect was never
-        about absolute speed — it was about the plan degrading with group size.
-        """
+        """The -history query must be served by play_history_recent with NO sort
+        node: play_history_dedup only presorts played_at, so the id DESC
+        tie-break plans an Incremental Sort that consumes an ENTIRE
+        equal-played_at group (large in practice — every row backfilled from
+        Redis lands on the epoch-0 sentinel) before emitting LIMIT 50. The PLAN
+        is asserted because the defect is degradation with group size, not
+        absolute speed, and a timing threshold on a small table would be noise."""
         import asyncpg
 
         await archive.insert_batch([_entry(i, played_at=0.0) for i in range(200)])
@@ -385,16 +352,11 @@ class TestClose:
     async def test_close_is_final_and_data_outlives_the_instance(
         self, archive: PostgresHistoryArchive, pg_dsn: str
     ) -> None:
-        """close() is terminal for the instance, not for the data.
-
-        This used to assert the opposite — that a post-close op lazily rebuilt
-        the pool and still read its rows. That reuse was incidental (close() is
-        only ever called from MusicBotApp.close(), at shutdown) and became unsafe
-        once health_check() gave -ping a path into _ensure() that shutdown does
-        not sequence: a probe racing close() would have built a pool nothing was
-        left to close. What actually mattered in the old test — the rows survive
-        — is asserted here through a fresh archive on the same DSN.
-        """
+        """close() is terminal for the instance, not for the data: a post-close
+        op must raise rather than lazily rebuild the pool, because health_check()
+        gives -ping a path into _ensure() that shutdown does not sequence — a
+        probe racing close() would build a pool nothing is left to close. The
+        rows surviving is asserted through a fresh archive on the same DSN."""
         await archive.insert_batch([_entry(1)])
         await archive.close()
         with pytest.raises(RuntimeError, match="closed"):
@@ -422,9 +384,8 @@ class TestClose:
 
 
 class TestPoisonAgainstARealServer:
-    """The sanitizer's premises are claims about Postgres, so they are only
-    really tested here. Each case is a vector that reproducibly wedged the
-    outbox before C1."""
+    """The sanitizer's premises are claims about Postgres, so they can only be
+    tested here. Each case is a vector that reproducibly wedged the outbox."""
 
     async def test_nul_in_text_is_stripped_and_inserted(
         self, archive: PostgresHistoryArchive
@@ -453,8 +414,7 @@ class TestPoisonAgainstARealServer:
     async def test_one_poison_entry_does_not_block_a_healthy_batch(
         self, archive: PostgresHistoryArchive
     ) -> None:
-        # The actual C1 failure: good/poison/good in one executemany used to
-        # deliver nothing at all.
+        # good/poison/good in one executemany used to deliver nothing at all.
         await archive.insert_batch(
             [
                 _entry(1),
@@ -466,13 +426,10 @@ class TestPoisonAgainstARealServer:
 
 
 def _boundary_entries() -> list[HistoryEntry]:
-    """Every clamp __post_init__ performs, one entry each.
-
-    Enumerated rather than sampled: this list IS the claim that the residual
-    poison set is empty. Extend it
-    whenever a column type or a domain tuple changes. Distinct webpage_urls keep
-    play_history_dedup from collapsing rows that clamp to the same guild_id.
-    """
+    """Every clamp __post_init__ performs, one entry each. Enumerated rather than
+    sampled: this list IS the claim that the residual poison set is empty, so
+    extend it whenever a column type or a domain tuple changes. Distinct
+    webpage_urls keep play_history_dedup from collapsing rows that clamp alike."""
     return [
         HistoryEntry(guild_id=7, webpage_url="u/clean", played_at=1752530000.0),
         # int8 columns fed values orjson accepts but a SIGNED bigint refuses.
@@ -499,8 +456,8 @@ def _boundary_entries() -> list[HistoryEntry]:
 
 class TestSchemaLock:
     """The play_history CHECK constraints plus HistoryEntry.__post_init__ — both
-    directions of the
-    claim that possessing a HistoryEntry is the proof Postgres accepts it."""
+    directions of the claim that possessing a HistoryEntry is the proof Postgres
+    accepts it."""
 
     async def test_every_constructible_entry_is_insertable(
         self, archive: PostgresHistoryArchive
@@ -534,16 +491,12 @@ class TestSchemaLock:
         constraint: str,
     ) -> None:
         # Backward: bypass the validator and the database still refuses. Every
-        # CHECK gets its own case — only guild_id was exercised, so the other
-        # four were asserted to exist by reading the migration and nothing more.
-        # object.__setattr__ is how a regression would present: a future edit
-        # dropping a clamp, or a field added to the dataclass but not to a
-        # domain tuple.
-        #
-        # The constraint NAME is asserted, not just the class. A row can violate
-        # several CHECKs at once and the server reports whichever it evaluates
-        # first, so a bare `raises(CheckViolationError)` would pass even if the
-        # constraint under test had been dropped from the schema entirely.
+        # CHECK gets its own case; object.__setattr__ is how a regression would
+        # present (a dropped clamp, or a field added to the dataclass but not to
+        # a domain tuple). The constraint NAME is asserted, not just the class —
+        # a row can violate several CHECKs at once and the server reports
+        # whichever it evaluates first, so a bare raises() would pass even with
+        # the constraint under test dropped from the schema entirely.
         bad = HistoryEntry(guild_id=1, webpage_url="https://x", played_at=0.0)
         object.__setattr__(bad, field, value)
         with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
@@ -556,17 +509,14 @@ class TestSchemaLock:
     async def test_guild_id_zero_is_constructible_and_refused(
         self, archive: PostgresHistoryArchive
     ) -> None:
-        """The one deliberate hole in "constructible implies insertable".
-
-        __post_init__ floors every integer at 0 while play_history's CHECK is
-        strictly `> 0`, so this entry is built WITHOUT bypassing the validator —
-        no object.__setattr__ — and Postgres still refuses it. Both halves are
-        asserted here because both are choices: clamping up to 1 would file an
-        unattributable play into a real guild's history, and relaxing the CHECK
-        would make guild 0 a bucket of orphans no read path excludes. Refusing
-        sends it to play_history_rejected, where `just db-rejects` shows an
-        operator the actual defect — a producer that stopped stamping guild_id.
-        """
+        """The one deliberate hole in "constructible implies insertable":
+        __post_init__ floors every integer at 0 while the CHECK is strictly
+        `> 0`, so this entry is built WITHOUT bypassing the validator and still
+        refused. Both halves are choices — clamping up to 1 would file an
+        unattributable play into a real guild's history, relaxing the CHECK would
+        make guild 0 a bucket of orphans no read path excludes. Refusing routes
+        it to play_history_rejected, where `just db-rejects` shows an operator
+        the actual defect: a producer that stopped stamping guild_id."""
         orphan = HistoryEntry(guild_id=0, webpage_url="https://x", played_at=0.0)
         assert orphan.guild_id == 0  # constructed, not clamped away
         with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
@@ -574,10 +524,10 @@ class TestSchemaLock:
         assert exc.value.as_dict()["constraint_name"] == "play_history_guild_id_valid"
 
     async def test_a_check_violation_is_classified_as_poison(self) -> None:
-        # The ordering fix: CheckViolationError is SQLSTATE 23514 under
-        # IntegrityConstraintViolationError, NOT a DataError. Without the arm in
-        # _POISON a violation would propagate past the quarantine path and wedge
-        # the drain head permanently on a non-evictable list.
+        # CheckViolationError is SQLSTATE 23514 under
+        # IntegrityConstraintViolationError, NOT a DataError. Without that arm in
+        # _POISON a violation propagates past the quarantine path and wedges the
+        # drain head permanently on a non-evictable stream.
         assert issubclass(
             asyncpg.exceptions.CheckViolationError,
             asyncpg.exceptions.IntegrityConstraintViolationError,
@@ -590,10 +540,10 @@ class TestSchemaLock:
     async def test_not_valid_constraints_do_not_reject_legacy_rows(
         self, pg_dsn: str
     ) -> None:
-        # The NOT VALID promise, against a row that predates the constraint.
-        # This is the assertion that would have caught a migration failing on
-        # real data: drop the constraint, write a row that violates it, re-add
-        # it NOT VALID, and confirm both the ADD and a later read succeed.
+        # The NOT VALID promise against a row that predates the constraint: drop
+        # it, write a violating row, re-add it NOT VALID, and confirm both the
+        # ADD and a later read succeed. This is what catches a migration that
+        # would fail on real data.
         conn = await asyncpg.connect(pg_dsn)
         try:
             await conn.execute(
@@ -663,9 +613,8 @@ class TestRejectsTable:
     async def test_jsonb_and_text_would_both_refuse_that_payload(
         self, pg_dsn: str
     ) -> None:
-        # The counterfactual, asserted rather than argued in a comment: this is
-        # what makes the bytea column choice evidence instead of opinion.
-        # Built with chr(0) rather than written as a literal — a source file
+        # The counterfactual, asserted rather than argued: this is what makes the
+        # bytea column choice evidence. Built with chr(0) because a source file
         # containing a real NUL byte cannot be compiled at all.
         nul = chr(0)
         conn = await asyncpg.connect(pg_dsn)
@@ -725,14 +674,11 @@ class TestRejectsTable:
 
 
 class TestMessageIdColumn:
-    """message_id reaches Postgres.
-
-    It landed on the wire two branches before any INSERT carried it, and the
-    column's CHECK is `message_id >= 0` with `DEFAULT 0` — so a missed value
-    inserted cleanly and was permanently indistinguishable from a song that
-    genuinely had no Now Playing host. Nothing short of a real round trip
-    catches that: the fakeredis drainer tests never touch SQL.
-    """
+    """message_id reaches Postgres. The column is `DEFAULT 0` with a
+    `message_id >= 0` CHECK, so a value dropped between the wire and the INSERT
+    lands cleanly and is indistinguishable from a song that genuinely had no Now
+    Playing host. Only a real round trip catches that; the drainer tests never
+    touch SQL."""
 
     async def test_a_snowflake_survives_the_round_trip(
         self, archive: PostgresHistoryArchive
@@ -753,15 +699,11 @@ class TestMessageIdColumn:
 
 
 class TestRejectionDedup:
-    """play_history_rejected must be exactly-once.
-
-    Under the drainer lease it was, for free — only one process could hold a
-    poisoned batch. A stable stream consumer name lets two drainers replay the
-    same pending entry, fail it identically, and both write here. The whole
-    diagnostic value of this table is that it is normally empty and every row
-    is page-worthy, so `just db-rejects` printing three rows must mean three
-    distinct failures rather than one seen three times.
-    """
+    """play_history_rejected must be exactly-once. The stable stream consumer
+    name lets two drainers replay the same pending entry, fail it identically,
+    and both write here. The table's diagnostic value is that it is normally
+    empty and every row is page-worthy: three rows from `just db-rejects` must
+    mean three distinct failures, not one seen three times."""
 
     async def test_the_same_refusal_recorded_twice_stores_one_row(
         self, archive: PostgresHistoryArchive, pg_dsn: str
@@ -857,20 +799,11 @@ class TestDrainerEndToEnd:
         archive: PostgresHistoryArchive,
         fake_redis: Redis,
     ) -> None:
-        """The former poison classes, against a real server, after the schema
-        lock — ALL FIVE land and nothing is dead-lettered.
-
-        This test used to neutralize sanitization and assert that two of the
-        five reached the DLQ. That premise is gone: `title="bad\\x00title"` and
-        `played_at=1e18` are now clamped by HistoryEntry.__post_init__ at
-        construction, so the entries the outbox carries are insertable by
-        construction and the class of failure no longer exists. Asserting the
-        elimination is strictly stronger than asserting it was handled.
-
-        Kept in the pg tier rather than moved: the claim is about what a real
-        Postgres accepts (NUL in text, an out-of-range timestamptz), which is
-        precisely what fakes cannot answer.
-        """
+        """The former poison classes against a real server: ALL FIVE land and
+        nothing is dead-lettered, because `title="bad\\x00title"` and
+        `played_at=1e18` are clamped by __post_init__ at construction. Kept in
+        the pg tier because the claim is about what a real Postgres accepts (NUL
+        in text, an out-of-range timestamptz) — what fakes cannot answer."""
         await ensure_outbox_group(fake_redis)
         store = GuildRedisStore(fake_redis, guild_id=42)
         for entry in (
@@ -896,16 +829,12 @@ class TestDrainerEndToEnd:
 
 
 class TestBackfillAgainstARealArchive:
-    """`src/backfill_history.py` against a real Postgres.
-
-    No tier ran this module at all, and it is the one whose entire safety story
-    is "just run it again — the dedup index absorbs it". That claim composes
-    four things the in-memory double cannot model together: a key-derived
-    guild_id, real int8 columns, the `guild_id > 0` CHECK, and executemany's
-    atomicity. `CollectingArchive` has no unique index, so the unit-tier
-    idempotence test can only observe that the TOOL re-sends the same count —
-    after a rerun it holds two copies and nothing looks.
-    """
+    """`src/backfill_history.py` against a real Postgres. Its safety story is
+    "just run it again — the dedup index absorbs it", a claim composing four
+    things the in-memory double cannot model together: a key-derived guild_id,
+    real int8 columns, the `guild_id > 0` CHECK, and executemany's atomicity.
+    `CollectingArchive` has no unique index, so the unit tier can only observe
+    that the TOOL re-sent the same count."""
 
     async def test_rerunning_is_idempotent_against_the_dedup_index(
         self, archive: PostgresHistoryArchive, fake_redis: Redis
@@ -933,14 +862,10 @@ class TestBackfillAgainstARealArchive:
         self, archive: PostgresHistoryArchive, fake_redis: Redis, pg_dsn: str
     ) -> None:
         """One guild refused must not cost the others, and must not report ok.
-
-        Driven through a real CHECK violation rather than a fake exception:
-        `guild_id > 0` is the one constraint HistoryEntry.__post_init__ clamps
-        toward rather than away from, so it is the realistic refusal. The tool
-        skips such keys upstream now, so the violation is injected by dropping
-        the entry's guild through a patched key parser — which is exactly the
-        shape a future regression in that guard would take.
-        """
+        Driven through a real CHECK violation: `guild_id > 0` is the constraint
+        __post_init__ clamps toward rather than away from, so it is the realistic
+        refusal. The tool skips such keys upstream, so it is injected through a
+        patched key parser — the shape a regression in that guard would take."""
         import src.backfill_history as bh
 
         good = GUILD_HISTORY_KEY.format(guild_id=7)
