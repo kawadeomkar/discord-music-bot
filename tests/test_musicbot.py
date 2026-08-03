@@ -32,7 +32,12 @@ from src.musicbot import (
     _typing_keepalive,
     background_typing,
 )
-from src.history_archive import Leaderboard, RequesterLeader, SongLeader
+from src.history_archive import (
+    Leaderboard,
+    RequesterLeader,
+    SchemaVersionError,
+    SongLeader,
+)
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType
@@ -2136,7 +2141,9 @@ class TestLeaderboardCommand:
             music_bot, mock_ctx, flags=_lb_flags()
         )
         assert archive.leaderboard.await_args.kwargs["since_epoch"] == 0.0
-        assert mock_ctx.send.call_args[1]["embed"].title == "🏆 Leaderboard"
+        # Named, not blank: FlagConverter drops `--days=7`/`--days`/`7` to the
+        # default silently, so an unnamed title would read as the user's window.
+        assert mock_ctx.send.call_args[1]["embed"].title == "🏆 Leaderboard — all time"
 
     async def test_days_flag_passes_a_rolling_cutoff(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2163,6 +2170,51 @@ class TestLeaderboardCommand:
         )
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "last 7 days" in embed.description
+
+    @pytest.mark.parametrize(
+        "exc, secret",
+        [
+            (
+                ConnectionRefusedError(
+                    "[Errno 61] Connect call failed ('10.0.0.9', 5432)"
+                ),
+                "10.0.0.9",
+            ),
+            (
+                SchemaVersionError(
+                    "play_history schema is at version 1, this build needs 2. "
+                    "Run 'just db-migrate' against the archive database."
+                ),
+                "db-migrate",
+            ),
+            (
+                RuntimeError('password authentication failed for user "musicbot"'),
+                "musicbot",
+            ),
+        ],
+    )
+    async def test_archive_failures_never_reach_the_channel_verbatim(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        exc: Exception,
+        secret: str,
+    ) -> None:
+        """This is the only command whose exceptions come from infrastructure,
+        so _command_error's default detail would publish the archive's address
+        or an operator runbook to whoever ran it. -ping reduces the same class
+        for the same reason (ping._error_detail)."""
+        archive = MagicMock()
+        archive.leaderboard = AsyncMock(side_effect=exc)
+        music_bot.history_archive = archive
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert embed.title == "Leaderboard unavailable"
+        assert secret not in embed.description
+        assert type(exc).__name__ not in embed.description
+        assert "could not be reached" in embed.description
 
 
 class TestLeaderboardCache:

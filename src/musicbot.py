@@ -238,8 +238,13 @@ def _leaderboard_embed(board: Leaderboard, *, days: int = 0) -> Optional[discord
         sections.append("**Top songs**\n" + "\n".join(rows))
     if not sections:
         return None
+    # The period is always named, including all-time. FlagConverter silently
+    # defaults days=0 for every input it does not recognise — `--days=7`, a bare
+    # `--days`, a positional `7` — so an unnamed title would render a dropped
+    # window as an all-time board the requester reads as their window.
+    period = f"last {days} {pluralize(days, 'day')}" if days else "all time"
     embed = discord.Embed(
-        title="🏆 Leaderboard" if not days else f"🏆 Leaderboard — last {days} days",
+        title=f"🏆 Leaderboard — {period}",
         description="\n\n".join(sections),
         color=discord.Color.gold(),
     )
@@ -590,6 +595,7 @@ class MusicBot(commands.Cog):
         ctx: commands.Context,
         e: Exception,
         title: str = "Command failed",
+        detail: Optional[str] = None,
     ) -> None:
         # The failure log lives here so 15 command bodies don't each repeat it.
         # exc_info=True still captures the live traceback — this runs inside the
@@ -599,12 +605,17 @@ class MusicBot(commands.Cog):
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
-        if isinstance(e, ExtractionError):
-            # Show the user-safe line, not the raw message, which can carry
-            # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
-            detail = e.user_message
-        else:
-            detail = f"**{type(e).__name__}:** {e}"
+        # A caller-supplied detail wins: rendering the exception is safe for
+        # user-input failures, but a command whose exceptions come from
+        # infrastructure would publish what the operator sees — a DSN host and
+        # port, or a runbook naming a just recipe — to whoever ran it.
+        if detail is None:
+            if isinstance(e, ExtractionError):
+                # Show the user-safe line, not the raw message, which can carry
+                # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
+                detail = e.user_message
+            else:
+                detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
@@ -1572,7 +1583,18 @@ class MusicBot(commands.Cog):
                 return
             await ctx.send(embed=embed)
         except Exception as e:
-            await self._command_error(ctx, e, title="Leaderboard unavailable")
+            # Fixed copy rather than the exception text: this is the only command
+            # whose failures come from infrastructure, so the default detail would
+            # publish the archive's host and port, or SchemaVersionError's
+            # operator runbook, to the channel. -ping reduces the same class for
+            # the same reason (ping._error_detail). The trace footer still joins
+            # the report to the span, and the full exception is logged there.
+            await self._command_error(
+                ctx,
+                e,
+                title="Leaderboard unavailable",
+                detail="The long-term archive could not be reached. Try again in a moment.",
+            )
 
     @commands.command(
         name="jump",

@@ -750,7 +750,7 @@ sequenceDiagram
 | `current_song` | `Optional[YTDL]` | The `FFmpegOpusAudio` object currently playing |
 | `play_next` | `asyncio.Event` | Set by the `after=` callback (thread-safe via `call_soon_threadsafe`); cleared at the start of each loop iteration |
 | `queue` | `GuildQueue` | All queue state and operations (three legs private to the class) |
-| `history` | `GuildHistory` | Played songs: Postgres `play_history` is the source of truth (via the outbox drain); the in-memory ring (maxlen 50) + TTL'd Redis list are display caches; `recent()` is PG-primary with a freshness merge |
+| `history` | `GuildHistory` | Played songs: the in-memory ring (maxlen 50) and the Redis list are what `recent()` reads — it never touches Postgres. That list carries **no TTL, ever** (PERSISTed, capped by LENGTH); Postgres `play_history` is the durable record behind it, fed by the outbox drain and read only by `-leaderboard` |
 | `play_message` | `Optional[discord.Embed]` | Cached NP embed for `-now`; cleared on song end |
 | `volume` | `float` | 0.0–1.0; applied via FFmpeg `-filter:a volume=` on next song |
 | `store` | `Optional[GuildRedisStore]` | `None` if no Redis configured |
@@ -791,7 +791,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
 - **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz`, `inserted_at timestamptz` (server default; not on the wire), `message_id` (the NP host at song end — a correlation token, not a resolvable pointer), `queued_at timestamptz` and `queue_position` (when the song was first enqueued and how many songs were ahead of it then, counting the one playing; 0 = played immediately, and also what a row predating the fields carries). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
-- **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads, including both `-leaderboard` aggregates via its `guild_id` prefix.
+- **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
 ---
@@ -992,20 +992,39 @@ archive disabled the key is inert — `setup_hook` never creates the group (that
 MKSTREAM the non-evictable key into existence) and a leftover is downgraded to a
 warning.
 
-The read side is `-leaderboard`, and it is the archive's only production reader.
-Two `GROUP BY` aggregates — requesters and songs, both ranked by `sum(played_secs)`
-— run on **one** pooled connection out of the `max_size=4` pool the drainer and
-`-ping` also draw from, each bounded by `command_timeout`. Songs group by
-`webpage_url` rather than title (titles drift, the URL is stable identity) and the
-displayed title is simply the most recent one. The unknown sentinels — `requester_id`
-0 and `webpage_url` `''` — are excluded, since each would merge unrelated plays into
-one top-10 row. A single `$3` cutoff parameter serves both all-time and windowed
-boards: all-time passes `to_timestamp(0)`, the column floor, so the inclusive compare
-excludes nothing, while any real cutoff also excludes epoch-0 unknown-time rows by
-definition. A 60 s Redis cache (`leaderboard:{guild_id}:{days}`) is what bounds
-Postgres load — `max_concurrency` only serializes invocations, it does not limit rate.
-Entries still in the outbox are ignored: the boards lag song end by the drain, which
-the help copy says rather than promising real-time numbers.
+The read side is `-leaderboard`, the only production reader of `play_history` rows
+(`-ping`'s liveness probe is the other user of the pool). Two `GROUP BY` aggregates
+— requesters and songs, both ranked by `sum(played_secs)` — run on **one** pooled
+connection out of the `max_size=4` pool the drainer and `-ping` also draw from.
+Songs group by `webpage_url` rather than title (titles drift, the URL is stable
+identity) and the displayed title is simply the most recent one. The unknown
+sentinels — `requester_id` 0 and `webpage_url` `''` — are excluded, since each would
+merge unrelated plays into one top-10 row. A single `$3` cutoff parameter serves both
+all-time and windowed boards: all-time passes `to_timestamp(0)`, the wire format's
+floor, so the inclusive compare excludes nothing, while any real cutoff also excludes
+epoch-0 unknown-time rows by definition. Entries still in the outbox are ignored: the
+boards lag song end by the drain, which the help copy says rather than promising
+real-time numbers.
+
+**Each aggregate is two passes, and that is load-bearing.** Picking the display
+name/title inline with `(array_agg(x ORDER BY played_at DESC, id DESC))[1]` makes it
+an *ordered* aggregate, and an ordered aggregate removes hash aggregation from the
+planner's options entirely: both boards then plan as `GroupAggregate` over a full sort
+of every matching row, and `array_agg`'s state is not `work_mem`-bounded and cannot
+spill. Measured at 3M rows: 6.8 s, 140 MB of external merge, and 431 MB RSS in one
+backend for a single large group — enough to OOM a co-resident Postgres. Aggregating
+first and resolving the ten winners through `LATERAL` keeps it a `HashAggregate` with
+no temp files and no per-group state (300k rows: 880 ms → 53 ms, identical output).
+
+**Three bounds, because this is the pool's only user-triggered traffic.** `max_concurrency(1, guild)`
+serializes per guild; a 60 s Redis cache (`leaderboard:{guild_id}:{days}`) collapses
+repeats of the *same* window, though `--days` is a 0–3650 axis so it is not a rate
+limit; and `_READ_CONCURRENCY = 2` against `max_size=4` keeps reads off the last
+connections so a burst cannot starve the drainer — measured, 64 concurrent boards
+pushed `insert_batch` from 11.8 ms to a 10 s acquire timeout and into backoff. A
+`_READ_DEADLINE_SECS` bound covers the whole operation including the wait for a slot,
+since two statements on one connection are otherwise bounded only by
+2 × `command_timeout` — longer than the drainer's entire `DRAIN_DEADLINE_SECS`.
 
 There is **no quarantine counter**. With the schema lock, a data-caused refusal is a
 CHECK violation or a `DataError`, both named in `_POISON`; anything else is genuinely

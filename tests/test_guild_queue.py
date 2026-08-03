@@ -5,6 +5,7 @@ queue, the display deque and the Redis mirror agree (persisted=False items live
 on the in-memory legs only, by design)."""
 
 import redis.asyncio as aioredis
+from dataclasses import replace
 from typing import Any
 import asyncio
 from unittest.mock import MagicMock, patch
@@ -599,6 +600,39 @@ class TestRestoreEntries:
         assert item.interjected is False
         assert item.ts == 151
 
+    async def test_enqueue_stamps_rehydrate_on_both_entry_types(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """_rehydrate is the entry → item hop for the whole restored queue, and
+        the stamps must survive it: guild_state's CURRENT_SONG_QUEUED_AT records
+        that they are carried and never restamped, so a crash-recovered song
+        archives the position it was originally queued at. Zeroing either leg
+        left the whole suite green."""
+        mock_guild.get_member.return_value = mock_author
+        song = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester_id=mock_author.id,
+            queued_at=1752529000.5,
+            queue_position=3,
+        )
+        search = SearchQueueEntry(
+            ytsearch="ytsearch:abc",
+            process=True,
+            queued_at=1752529111.5,
+            queue_position=7,
+        )
+        assert await gq.restore_entries([song, search]) == 2
+        restored_song, restored_search = gq.display_items()
+        assert (restored_song.queued_at, restored_song.queue_position) == (
+            1752529000.5,
+            3,
+        )
+        assert (restored_search.queued_at, restored_search.queue_position) == (
+            1752529111.5,
+            7,
+        )
+
     async def test_search_entries_rehydrate_to_ytsource(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
@@ -631,6 +665,21 @@ class TestRestoreCrashed:
         assert item.ts == 95
         assert queue_object(item).persisted is False
         assert queue_object(item).requester is mock_author
+
+    async def test_carries_the_enqueue_stamps_of_the_original_enqueue(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        # The crashed song archives where it was queued, not where the restart
+        # put it — it goes to the front on recovery, which is not position 0.
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        entry = replace(
+            self._crashed_entry(mock_author.id),
+            queued_at=1752529000.5,
+            queue_position=6,
+        )
+        assert await gq.restore_crashed(entry, requester_fallback=mock_guild.me)
+        item = queue_object(gq.display_items()[0])
+        assert (item.queued_at, item.queue_position) == (1752529000.5, 6)
 
     async def test_fallback_used_when_member_gone(
         self, gq: GuildQueue, mock_guild: MagicMock

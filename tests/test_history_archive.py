@@ -24,6 +24,7 @@ from src.guild_state import HistoryEntry, serialize_history_entry
 from src.history_archive import (
     _INSERT_SQL,
     _POISON,
+    _READ_CONCURRENCY,
     _RECENT_SQL,
     _TOP_REQUESTERS_SQL,
     _TOP_SONGS_SQL,
@@ -490,6 +491,69 @@ class TestLeaderboardQuery:
             _TOP_REQUESTERS_SQL,
             _TOP_SONGS_SQL,
         ]
+
+    async def test_reads_leave_connections_for_the_writer(self) -> None:
+        """Reads are the pool's only user-triggered traffic and are unbounded
+        across guilds (max_concurrency serializes per guild, not globally). With
+        max_size=4 and no cap, a burst takes every connection and the drainer's
+        acquire starts timing out — measured at 64 concurrent boards pushing
+        insert_batch to a 10s TimeoutError and into backoff."""
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        live = 0
+        peak = 0
+
+        async def _slow_fetch(*_a: object, **_k: object) -> list[dict]:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            try:
+                await asyncio.sleep(0)
+                return []
+            finally:
+                live -= 1
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=_slow_fetch)
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await asyncio.gather(*(archive.leaderboard(g, 10) for g in range(12)))
+
+        assert peak <= _READ_CONCURRENCY
+        assert _READ_CONCURRENCY < 4  # the pool's max_size — one is always spare
+
+    async def test_a_slow_read_is_abandoned_rather_than_holding_a_connection(
+        self,
+    ) -> None:
+        # Two statements on one connection are otherwise bounded only by
+        # 2 x command_timeout = 60s, longer than the drainer's whole
+        # DRAIN_DEADLINE_SECS. The deadline covers the wait for a slot too.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+
+        async def _hang(*_a: object, **_k: object) -> list[dict]:
+            await asyncio.sleep(3600)
+            return []
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=_hang)
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with (
+            patch.object(archive, "_ensure", AsyncMock(return_value=pool)),
+            patch("src.history_archive._READ_DEADLINE_SECS", 0.01),
+            pytest.raises(TimeoutError),
+        ):
+            await archive.leaderboard(42, 10)
+        # Released, not leaked: the next caller can still get a slot.
+        assert archive._read_slots._value == _READ_CONCURRENCY
 
     async def test_all_time_passes_the_epoch_floor(self) -> None:
         # to_timestamp(0) IS the column floor and the compare is inclusive, so

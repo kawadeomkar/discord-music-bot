@@ -101,35 +101,73 @@ ON CONFLICT ON CONSTRAINT play_history_rejected_dedup DO NOTHING
 
 # The -leaderboard aggregates. Sentinel groups are excluded rather than shown:
 # requester_id 0 and webpage_url '' both mean "unknown" and would each merge
-# unrelated plays into one top-10 row. The name/title displayed is the most
-# recent one, since titles drift while the URL is stable identity. sum() over
-# integer returns bigint, so totals cannot overflow int4. $3 is the period
-# cutoff: to_timestamp(0) for all-time — the column floor, so an inclusive
-# compare excludes nothing — while any real cutoff also excludes the epoch-0
-# unknown-time rows by definition.
+# unrelated plays into one top-10 row. sum() over integer returns bigint, so
+# totals cannot overflow int4. $3 is the period cutoff: to_timestamp(0) for
+# all-time — the wire format's floor, so an inclusive compare excludes nothing
+# — while any real cutoff also excludes the epoch-0 unknown-time rows.
+#
+# Two passes, not one. The display name/title is the most recent one recorded
+# (titles drift; the id is stable identity), but taking it inline with
+# `(array_agg(x ORDER BY played_at DESC, id DESC))[1]` makes it an ORDERED
+# aggregate, and an ordered aggregate removes hash aggregation from the
+# planner's options entirely. Both boards then plan as GroupAggregate over a
+# full sort of every matching row, and array_agg's state is not work_mem-bounded
+# and cannot spill — measured at 3M rows: 6.8s, 140MB of external merge, and
+# 431MB RSS in one backend for a single large group. Aggregating first and
+# resolving the ten winners through LATERAL keeps it a HashAggregate: same rows,
+# same order, no temp files, and no per-group state.
+#
+# The LATERAL leg rides play_history_recent and filters, so it walks back to each
+# winner's newest play: cheap for a song still in rotation, proportional to the
+# guild's history for one that ranks on old plays alone. Measured at 300k rows,
+# 53ms typical against 111ms for that worst case — both against 880ms before. A
+# (guild_id, webpage_url, played_at DESC, id DESC) index would make it an exact
+# seek, at write amplification on an append-only table; not yet worth it.
+# See docs/ARCHITECTURE.md#history-archive-tier.
 _TOP_REQUESTERS_SQL = """
-SELECT requester_id,
-       (array_agg(requester_name ORDER BY played_at DESC, id DESC))[1] AS requester_name,
-       count(*)         AS plays,
-       sum(played_secs) AS played_secs
-FROM play_history
-WHERE guild_id = $1 AND requester_id > 0 AND played_at >= $3
-GROUP BY requester_id
-ORDER BY played_secs DESC, plays DESC, requester_id
-LIMIT $2
+WITH top AS (
+    SELECT requester_id,
+           count(*)         AS plays,
+           sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND requester_id > 0 AND played_at >= $3
+    GROUP BY requester_id
+    ORDER BY played_secs DESC, plays DESC, requester_id
+    LIMIT $2
+)
+SELECT t.requester_id, l.requester_name, t.plays, t.played_secs
+FROM top t
+CROSS JOIN LATERAL (
+    SELECT p.requester_name
+    FROM play_history p
+    WHERE p.guild_id = $1 AND p.requester_id = t.requester_id
+    ORDER BY p.played_at DESC, p.id DESC
+    LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.requester_id
 """
 
 _TOP_SONGS_SQL = """
-SELECT webpage_url,
-       (array_agg(title ORDER BY played_at DESC, id DESC))[1]         AS title,
-       (array_agg(duration_secs ORDER BY played_at DESC, id DESC))[1] AS duration_secs,
-       count(*)         AS plays,
-       sum(played_secs) AS played_secs
-FROM play_history
-WHERE guild_id = $1 AND webpage_url <> '' AND played_at >= $3
-GROUP BY webpage_url
-ORDER BY played_secs DESC, plays DESC, webpage_url
-LIMIT $2
+WITH top AS (
+    SELECT webpage_url,
+           count(*)         AS plays,
+           sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND webpage_url <> '' AND played_at >= $3
+    GROUP BY webpage_url
+    ORDER BY played_secs DESC, plays DESC, webpage_url
+    LIMIT $2
+)
+SELECT t.webpage_url, l.title, l.duration_secs, t.plays, t.played_secs
+FROM top t
+CROSS JOIN LATERAL (
+    SELECT p.title, p.duration_secs
+    FROM play_history p
+    WHERE p.guild_id = $1 AND p.webpage_url = t.webpage_url
+    ORDER BY p.played_at DESC, p.id DESC
+    LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
 """
 
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
@@ -145,6 +183,17 @@ _COMMAND_TIMEOUT_SECS = 30.0
 # Wait for a free connection. The drainer, -ping's health probe and archive reads
 # share max_size=4, so a stuck consumer must not block everyone else unboundedly.
 _ACQUIRE_TIMEOUT_SECS = 10.0
+# Concurrent -leaderboard reads, against that same max_size=4. Reads are the only
+# user-triggered traffic on this pool and are unbounded across guilds
+# (max_concurrency serializes per guild, not globally), so without a cap a burst
+# takes every connection and the drainer's acquire starts timing out — measured:
+# 64 concurrent boards pushed insert_batch from 11.8ms to a 10s TimeoutError and
+# into backoff. Two leaves two, one for the drainer and one for -ping.
+_READ_CONCURRENCY = 2
+# Whole-operation bound for a read, covering the wait for a slot. Deliberately
+# well under command_timeout: a leaderboard that cannot answer in this long is
+# better failed than left holding a connection the drain needs.
+_READ_DEADLINE_SECS = 15.0
 # Graceful pool shutdown before terminate(). Short: this runs on the shutdown
 # path, ahead of the Redis pool, discord.py's close and the span flush.
 _POOL_CLOSE_TIMEOUT_SECS = 5.0
@@ -263,6 +312,9 @@ class PostgresHistoryArchive:
         self._pool: Optional[asyncpg.Pool] = None
         self._init_lock = asyncio.Lock()
         self._closed = False
+        # Per instance, not module-level: one archive owns one pool, and a
+        # shared counter would leak across tests that build several.
+        self._read_slots = asyncio.Semaphore(_READ_CONCURRENCY)
 
     async def _create_pool(self) -> asyncpg.Pool:
         return await asyncpg.create_pool(
@@ -376,19 +428,26 @@ class PostgresHistoryArchive:
         """Top requesters and songs for one guild, ranked by total played_secs.
 
         since_epoch 0.0 = all-time; epoch-0 unknown-time rows appear only there,
-        since any real cutoff excludes them by definition. Both aggregates run
-        on ONE pooled connection, each bounded by command_timeout. Sentinel
-        groups (requester 0, url '') are excluded — see the SQL constants.
+        since any real cutoff excludes them by definition. Sentinel groups
+        (requester 0, url '') are excluded — see the SQL constants.
+
+        Bounded twice, because this is the pool's only user-triggered reader and
+        the drainer shares it. _read_slots keeps reads off the last connections
+        so a burst of commands cannot starve the writer, and the deadline covers
+        waiting for a slot as well as the queries — two statements on one
+        connection are otherwise bounded only by 2 x command_timeout, longer
+        than the drainer's whole DRAIN_DEADLINE_SECS.
         """
         if limit <= 0:
             return Leaderboard(requesters=[], songs=[])
         cutoff = datetime.fromtimestamp(max(0.0, since_epoch), tz=timezone.utc)
-        pool = await self._ensure()
-        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
-            requester_rows = await conn.fetch(
-                _TOP_REQUESTERS_SQL, guild_id, limit, cutoff
-            )
-            song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
+        async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
+            pool = await self._ensure()
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
+                requester_rows = await conn.fetch(
+                    _TOP_REQUESTERS_SQL, guild_id, limit, cutoff
+                )
+                song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
         return Leaderboard(
             requesters=[
                 RequesterLeader(
