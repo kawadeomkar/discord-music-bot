@@ -6,6 +6,7 @@ without a server (early-outs, row mapping, close-before-connect).
 """
 
 import asyncio
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,10 +25,15 @@ from src.history_archive import (
     _INSERT_SQL,
     _POISON,
     _RECENT_SQL,
+    _TOP_REQUESTERS_SQL,
+    _TOP_SONGS_SQL,
     HistoryArchive,
     HistoryOutboxDrainer,
+    Leaderboard,
     PostgresHistoryArchive,
+    RequesterLeader,
     SchemaVersionError,
+    SongLeader,
     _entry_to_row,
     _row_to_entry,
 )
@@ -416,6 +422,13 @@ class TestPostgresArchiveWithoutServer:
         assert await archive.recent(42, 0) == []
         assert await archive.recent(42, -1) == []
 
+    async def test_nonpositive_leaderboard_limit_never_connects(self) -> None:
+        # Same early-out as recent(): a bogus DSN proves no connect happened.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        empty = Leaderboard(requesters=[], songs=[])
+        assert await archive.leaderboard(42, 0) == empty
+        assert await archive.leaderboard(42, -1) == empty
+
     async def test_close_before_connect_is_safe(self) -> None:
         await PostgresHistoryArchive("postgresql://nope:1/nope").close()
 
@@ -445,6 +458,119 @@ class TestPostgresArchiveWithoutServer:
         ):
             with pytest.raises(OSError):
                 await archive.health_check()
+
+
+class TestLeaderboardQuery:
+    """The read path's plumbing: one connection for both aggregates, the epoch →
+    aware-UTC cutoff, and the row → dataclass mapping. The SQL's semantics are
+    the pg tier's job — mocking fetch() here would only assert the mock."""
+
+    @staticmethod
+    def _stubbed_pool(
+        requester_rows: list[dict], song_rows: list[dict]
+    ) -> tuple[MagicMock, MagicMock]:
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=[requester_rows, song_rows])
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        return pool, conn
+
+    async def test_both_aggregates_share_one_connection(self) -> None:
+        # One acquire, two fetches: the command holds a single connection out of
+        # the max_size=4 pool the drainer and -ping also draw from.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10)
+        pool.acquire.assert_called_once()
+        assert [c.args[0] for c in conn.fetch.await_args_list] == [
+            _TOP_REQUESTERS_SQL,
+            _TOP_SONGS_SQL,
+        ]
+
+    async def test_all_time_passes_the_epoch_floor(self) -> None:
+        # to_timestamp(0) IS the column floor and the compare is inclusive, so
+        # all-time excludes nothing — including epoch-0 unknown-time rows.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10)
+        assert conn.fetch.await_args_list[0].args[1:] == (
+            42,
+            10,
+            datetime.fromtimestamp(0, tz=timezone.utc),
+        )
+
+    async def test_window_cutoff_is_an_aware_utc_datetime(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=1752530000.0)
+        cutoff = conn.fetch.await_args_list[0].args[3]
+        assert cutoff == datetime.fromtimestamp(1752530000.0, tz=timezone.utc)
+        assert cutoff.tzinfo is timezone.utc
+
+    async def test_negative_since_epoch_floors_at_zero(self) -> None:
+        # datetime.fromtimestamp accepts negatives; the column cannot hold one.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=-1e9)
+        assert conn.fetch.await_args_list[0].args[3] == datetime.fromtimestamp(
+            0, tz=timezone.utc
+        )
+
+    async def test_rows_map_onto_the_dataclasses(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, _ = self._stubbed_pool(
+            [
+                {
+                    "requester_id": 7,
+                    "requester_name": "Omkar",
+                    "plays": 3,
+                    "played_secs": 900,
+                }
+            ],
+            [
+                {
+                    "webpage_url": "https://yt.com/v=1",
+                    "title": "Song",
+                    "duration_secs": 210,
+                    "plays": 2,
+                    "played_secs": 400,
+                }
+            ],
+        )
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            board = await archive.leaderboard(42, 10)
+        assert board == Leaderboard(
+            requesters=[
+                RequesterLeader(
+                    requester_id=7, requester_name="Omkar", plays=3, played_secs=900
+                )
+            ],
+            songs=[
+                SongLeader(
+                    title="Song",
+                    webpage_url="https://yt.com/v=1",
+                    duration_secs=210,
+                    plays=2,
+                    played_secs=400,
+                )
+            ],
+        )
+
+    def test_rows_are_frozen_and_keyword_only(self) -> None:
+        row = RequesterLeader(
+            requester_id=1, requester_name="x", plays=1, played_secs=1
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(row, "plays", 2)
+        with pytest.raises(TypeError):
+            SongLeader("t", "u", 1, 1, 1)  # pyright: ignore[reportCallIssue]
 
 
 class TestPostgresArchiveClosedGuard:
@@ -480,6 +606,8 @@ class TestPostgresArchiveClosedGuard:
             await archive.insert_batch([_entry(1)])
         with pytest.raises(RuntimeError, match="closed"):
             await archive.recent(42, 10)
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.leaderboard(42, 10)
 
     async def test_close_is_idempotent(self) -> None:
         archive = PostgresHistoryArchive("postgresql://nope:1/nope")

@@ -2,6 +2,9 @@
 Postgres play-history archive — the durable long-term home for every played song.
 
 - HistoryArchive — the protocol the drainer and the backfill tool program against.
+- ArchiveReader — the read side MusicBot holds: -ping's liveness probe and
+  -leaderboard's aggregate. Deliberately separate, so write-surface fakes do not
+  grow a read method they would never call.
 - PostgresHistoryArchive — asyncpg. Connects lazily so startup never blocks on
   Postgres; applies no DDL (migrations/ owns the schema, _ensure verifies it).
 - HistoryOutboxDrainer — Redis outbox STREAM → Postgres: replay this consumer's
@@ -34,6 +37,7 @@ See docs/ARCHITECTURE.md#history-archive-tier.
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, cast
 
@@ -95,6 +99,39 @@ VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT play_history_rejected_dedup DO NOTHING
 """
 
+# The -leaderboard aggregates. Sentinel groups are excluded rather than shown:
+# requester_id 0 and webpage_url '' both mean "unknown" and would each merge
+# unrelated plays into one top-10 row. The name/title displayed is the most
+# recent one, since titles drift while the URL is stable identity. sum() over
+# integer returns bigint, so totals cannot overflow int4. $3 is the period
+# cutoff: to_timestamp(0) for all-time — the column floor, so an inclusive
+# compare excludes nothing — while any real cutoff also excludes the epoch-0
+# unknown-time rows by definition.
+_TOP_REQUESTERS_SQL = """
+SELECT requester_id,
+       (array_agg(requester_name ORDER BY played_at DESC, id DESC))[1] AS requester_name,
+       count(*)         AS plays,
+       sum(played_secs) AS played_secs
+FROM play_history
+WHERE guild_id = $1 AND requester_id > 0 AND played_at >= $3
+GROUP BY requester_id
+ORDER BY played_secs DESC, plays DESC, requester_id
+LIMIT $2
+"""
+
+_TOP_SONGS_SQL = """
+SELECT webpage_url,
+       (array_agg(title ORDER BY played_at DESC, id DESC))[1]         AS title,
+       (array_agg(duration_secs ORDER BY played_at DESC, id DESC))[1] AS duration_secs,
+       count(*)         AS plays,
+       sum(played_secs) AS played_secs
+FROM play_history
+WHERE guild_id = $1 AND webpage_url <> '' AND played_at >= $3
+GROUP BY webpage_url
+ORDER BY played_secs DESC, plays DESC, webpage_url
+LIMIT $2
+"""
+
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
 
 # Cap on the asyncpg message in play_history_rejected.error_detail: enough for
@@ -147,6 +184,47 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
         queued_at=row["queued_at"].timestamp(),
         queue_position=row["queue_position"],
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RequesterLeader:
+    """One row of the -leaderboard listeners board. requester_name is the most
+    recent one recorded for that id, so a rename shows the current name."""
+
+    requester_id: int
+    requester_name: str
+    plays: int
+    played_secs: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SongLeader:
+    """One row of the -leaderboard songs board, grouped by webpage_url. title
+    and duration_secs are the most recent values seen for that URL."""
+
+    title: str
+    webpage_url: str
+    duration_secs: int
+    plays: int
+    played_secs: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Leaderboard:
+    requesters: list[RequesterLeader]
+    songs: list[SongLeader]
+
+
+class ArchiveReader(Protocol):
+    """What MusicBot needs from the archive: liveness for -ping's Postgres row
+    and the aggregate behind -leaderboard. Structural, like ping's ArchiveHealth
+    (which it satisfies), so the cog stays fake-able in tests."""
+
+    async def health_check(self) -> None: ...
+
+    async def leaderboard(
+        self, guild_id: int, limit: int, *, since_epoch: float = 0.0
+    ) -> Leaderboard: ...
 
 
 class HistoryArchive(Protocol):
@@ -291,6 +369,47 @@ class PostgresHistoryArchive:
         async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
+
+    async def leaderboard(
+        self, guild_id: int, limit: int, *, since_epoch: float = 0.0
+    ) -> Leaderboard:
+        """Top requesters and songs for one guild, ranked by total played_secs.
+
+        since_epoch 0.0 = all-time; epoch-0 unknown-time rows appear only there,
+        since any real cutoff excludes them by definition. Both aggregates run
+        on ONE pooled connection, each bounded by command_timeout. Sentinel
+        groups (requester 0, url '') are excluded — see the SQL constants.
+        """
+        if limit <= 0:
+            return Leaderboard(requesters=[], songs=[])
+        cutoff = datetime.fromtimestamp(max(0.0, since_epoch), tz=timezone.utc)
+        pool = await self._ensure()
+        async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
+            requester_rows = await conn.fetch(
+                _TOP_REQUESTERS_SQL, guild_id, limit, cutoff
+            )
+            song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
+        return Leaderboard(
+            requesters=[
+                RequesterLeader(
+                    requester_id=r["requester_id"],
+                    requester_name=r["requester_name"],
+                    plays=r["plays"],
+                    played_secs=r["played_secs"],
+                )
+                for r in requester_rows
+            ],
+            songs=[
+                SongLeader(
+                    title=r["title"],
+                    webpage_url=r["webpage_url"],
+                    duration_secs=r["duration_secs"],
+                    plays=r["plays"],
+                    played_secs=r["played_secs"],
+                )
+                for r in song_rows
+            ],
+        )
 
     async def record_rejection(
         self,
