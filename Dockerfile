@@ -70,6 +70,11 @@ COPY justfile ./
 # tightens .env's mode. All four have to be in the image or those guards are
 # container-tier failures rather than assertions.
 COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
+# The two deploy entry points, for the same reason once more: the archive's
+# opt-in is a shell parser (resolve_archive_profile) and an ordering — migrate,
+# then `up` — that only these files record, so the tests read them back. Absent,
+# those seven guards fail with FileNotFoundError in the container tier alone.
+COPY deploy_docker.sh build_docker.sh ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
