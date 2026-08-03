@@ -255,7 +255,7 @@ class TestSpotifyValidate:
     async def test_validate_non_auth_http_error_is_not_auth_error(
         self, spotify: Spotify
     ) -> None:
-        """Grant succeeds but the track endpoint 404s: a plain Exception, NOT a
+        """Grant succeeds but the track endpoint 404s: a plain Exception, not a
         SpotifyAuthError — the caller treats this as inconclusive, not invalid."""
         session = _make_split_session(
             _resp(200, {"access_token": "tok", "expires_in": 3600}),

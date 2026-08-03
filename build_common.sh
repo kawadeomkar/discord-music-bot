@@ -9,7 +9,6 @@
 # those three names, with build_runtime_image variadic — it passes one SHA tag
 # where the compose path passes two. Renaming or re-signaturing one of them turns
 # that branch's merge into a rewrite under conflict markers, months from now.
-# Rationale: docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §4.1.
 #
 # git_sha_tag is ADDITIVE — new callers may use it, the three names above keep
 # working untouched, so the k8s merge is unaffected by its existence.
@@ -195,24 +194,17 @@ _env_value() {
         || true
 }
 
-# resolve_archive_profile — turn HISTORY_ARCHIVE_ENABLED into the compose
-# `archive` profile, so the flag is the only switch an operator sets and no
-# tracked file is ever edited. Exports COMPOSE_PROFILES (the compose-side gate)
-# and ARCHIVE_ENABLED (0/1, for callers that branch on it).
+# resolve_archive_profile — HISTORY_ARCHIVE_ENABLED into the compose `archive`
+# profile, so that flag is the only switch. Exports COMPOSE_PROFILES and
+# ARCHIVE_ENABLED (0/1). Compose cannot derive it: profiles activate only from
+# COMPOSE_PROFILES or --profile, and `${FLAG:+archive}` yields `archive` for
+# `false` too. See docs/ARCHITECTURE.md#history-archive-tier.
 #
-# Compose cannot do this itself: profiles activate only from COMPOSE_PROFILES or
-# --profile, and interpolation has no value-conditional form (`${FLAG:+archive}`
-# yields `archive` for `false` too, measured). So the parse happens here.
-#
-# The export is unconditional, EMPTY VALUE INCLUDED. Compose reads the process
-# environment ahead of .env, so exporting an empty list is what makes a flag
-# flipped back to false stop deploying postgres even when an older .env still
-# carries COMPOSE_PROFILES=archive. Only that one element is owned here; any
-# other profile the operator set is preserved.
-#
-# Garbage exits 1 with config.parse_history_archive_enabled's own vocabulary:
-# setup_hook refuses to start on it, and a deploy that silently disagreed with
-# the bot it is deploying is the worst available outcome.
+# The export is unconditional, EMPTY INCLUDED — the process environment beats
+# .env, which is how a flag flipped to false overrides an older .env still
+# carrying COMPOSE_PROFILES=archive. Only that element is owned; other profiles
+# survive. Garbage exits 1 in config.history_archive_enabled's own terms: a
+# deploy that disagreed with the bot it deploys is the worst outcome.
 resolve_archive_profile() {
     local env_file=".env" flag profiles rest item
     flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
@@ -249,19 +241,15 @@ resolve_archive_profile() {
 }
 
 # resolve_external_postgres_env — fill EXTERNAL_PG_ENV with `-e POSTGRES_URL=…`
-# when the configured DSN names a database a CONTAINER can reach, and leave it
-# empty otherwise. For `docker compose run` of db-migrate / db-backfill.
+# when the DSN names a database a CONTAINER can reach, empty otherwise. For
+# `docker compose run` of db-migrate / db-backfill, which address postgres by
+# service name: right for the bundled stack, wrong for an external database.
 #
-# Those two address postgres by service name, which is correct for the bundled
-# stack and wrong for an external database. Passing POSTGRES_URL through
-# unconditionally is also wrong, and worse, because .env normally holds the
-# HOST-form DSN the host-networked bot and `just run` need: 127.0.0.1 inside a
-# compose-network container is that container, so the migration fails with
-# connection refused on a database that is running fine.
-#
-# Loopback is the discriminator, and it errs toward the service name: an
-# unparsed or unusual DSN yields no override, i.e. the bundled behaviour that
-# worked before any of this existed.
+# Passing POSTGRES_URL through unconditionally is worse than either. .env holds
+# the HOST-form DSN the host-networked bot and `just run` need, and 127.0.0.1
+# inside a compose-network container is that container — the migration then
+# fails with connection refused against a healthy database. Loopback is the
+# discriminator, and an unparsed DSN errs toward the service name.
 resolve_external_postgres_env() {
     EXTERNAL_PG_ENV=()
     local url host

@@ -71,13 +71,9 @@ def _ping_message(mock_ctx: MagicMock) -> MagicMock:
 
 
 def _health_embed(call: Any) -> discord.Embed:
-    """The health card out of a send/edit call.
-
-    The dashboard sends a LIST now — a standing default-password advisory can
-    ride in front of the health card (see default_password_embed) — and the
-    health card is always last, which is also what _safe_edit returns for the
-    change-diffing loop.
-    """
+    """The health card out of a send/edit call. The dashboard sends a list (a
+    default-password advisory can ride in front of the card), and the health card
+    is always last — which is also what _safe_edit returns to the diffing loop."""
     return call.kwargs["embeds"][-1]
 
 
@@ -128,8 +124,8 @@ class TestPingCommand:
     async def test_skeleton_prefills_na_and_off_not_pending(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """D2: unconfigured/disabled deps must never flash 'pending…' — the
-        pre-drain lands them in the skeleton send."""
+        """Unconfigured/disabled deps must never flash 'pending…' — the pre-drain
+        lands them in the skeleton send."""
         _ping_message(mock_ctx)
         with _patch_probes(otel=_probe(ProbeState.OFF)):  # redis None → NA on music_bot
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
@@ -167,7 +163,7 @@ class TestPingCommand:
         mock_ctx: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The headline behavior: a probe that returns AFTER the skeleton send is
+        """The headline behavior: a probe that returns after the skeleton send is
         folded in on a tick and the message is edited from pending → its latency."""
         message = _ping_message(mock_ctx)
         monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
@@ -239,8 +235,8 @@ class TestPingCommand:
     async def test_join_uses_latency_line_not_the_dashboard(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Regression for §2.3 / C1: -join must post the cheap latency line and
-        must NOT run the dependency probes."""
+        """Regression: -join must post the cheap latency line and
+        must not run the dependency probes."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
         mock_ctx.guild.change_voice_state = AsyncMock()
@@ -263,11 +259,8 @@ class TestPingCommand:
 class TestPingReportsSpotifySource:
     """End-to-end: the Spotify row reports the *source's* startup state — never
     configured, configured-but-rejected, or live — so a user can see why Spotify
-    links are being declined without anyone reading the bot's logs.
-
-    Unlike the tests above, these leave probe_spotify unpatched: the cog's
-    _spotify_status is exactly what is under test here.
-    """
+    links are declined without reading the logs. probe_spotify is left unpatched
+    here: the cog's _spotify_status is what is under test."""
 
     def _patch_everything_but_spotify(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
@@ -322,17 +315,10 @@ class TestPingReportsSpotifySource:
 
 
 class TestPingReportsPostgres:
-    """End-to-end for the Postgres row, probe_postgres left UNPATCHED: what is
-    under test is the wiring from the cog's history_archive through the
-    dashboard to the archive's health_check.
-
-    This is a regression guard with history. The probe shipped ahead of the
-    Postgres tier reading `getattr(self, "pg_pool", None)` off the cog — an
-    attribute nothing ever set — so the row rendered a permanent "n/a" while the
-    command's help text and the README both advertised a Postgres latency. Only
-    an end-to-end test catches that class of bug: every unit test of
-    probe_postgres passed the whole time.
-    """
+    """End-to-end for the Postgres row, probe_postgres left UNPATCHED: the wiring
+    from the cog's history_archive through the dashboard to health_check is what
+    is under test. The probe once read a `pg_pool` attribute nothing ever set, so
+    the row was a permanent "n/a" while every unit test of it passed."""
 
     def _patch_everything_but_postgres(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
@@ -394,16 +380,10 @@ class TestPingReportsPostgres:
     async def test_the_disabled_archive_row_explains_itself(
         self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The ship default, asserted on the RENDERED row.
-
-        probe_postgres' docstring says a disabled archive "must say so rather
-        than shrug", and it sets detail="archive disabled" to do it — but
-        _ping_value only appended a detail for DOWN and NA, so the string was
-        dead data and the row read as a bare "off", identical to any other.
-        The test that existed asserted the detail on the ProbeResult, which
-        looks like coverage of that claim while pinning something no user could
-        see. This is the same claim, checked where it is observable.
-        """
+        """The ship default, asserted on the RENDERED row. probe_postgres sets
+        detail="archive disabled", but _ping_value once appended a detail only for
+        DOWN and NA, so the row read as a bare "off". Asserting the detail on the
+        ProbeResult instead pins something no user can see."""
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         music_bot.history_archive = None
         row = await self._run(music_bot, mock_ctx)
@@ -504,7 +484,7 @@ class TestProbeSpotify:
         assert r.state is ProbeState.NA
 
     async def test_disabled_status_is_na_without_calling_the_api(self) -> None:
-        """DISABLED wins even if a client object is somehow present: no API call."""
+        """disabled wins even if a client object is somehow present: no API call."""
         http_call = AsyncMock()
         r = await ping.probe_spotify(self._spotify(http_call), SpotifyStatus.DISABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.NA
@@ -561,7 +541,7 @@ class TestProbePostgres:
         archive.health_check.assert_awaited_once_with()
 
     async def test_unreachable_archive_is_down_with_reason(self) -> None:
-        # The whole point of asking the archive rather than a pool: a bot whose
+        # Why the probe asks the archive rather than a pool: a bot whose
         # Postgres is unreachable reports DOWN, not the "n/a (not configured)"
         # that a lazily-absent pool would have produced.
         archive = MagicMock()
@@ -680,7 +660,7 @@ class TestVersions:
         completed = MagicMock(stdout="ffmpeg version 7.1 Copyright (c) 2000-2024\n")
         with patch("src.ping.subprocess.run", return_value=completed) as run:
             assert ping.ffmpeg_version() == "7.1"
-            # second call is cached — no second subprocess
+            # Second call is cached — no second subprocess
             assert ping.ffmpeg_version() == "7.1"
             run.assert_called_once()
 
@@ -690,7 +670,7 @@ class TestVersions:
             assert ping.ffmpeg_version() == "unknown"
 
     def test_bot_version_reads_pyproject(self) -> None:
-        # Must match [tool.poetry].version in pyproject.toml — NOT installed dist
+        # Must match [tool.poetry].version in pyproject.toml — not installed dist
         # metadata (the container installs --no-root, so none exists).
         ping._bot_version_cache = None
         with ping._PYPROJECT.open("rb") as f:
@@ -720,7 +700,7 @@ class TestVersions:
 
 
 class TestDefaultPasswordEmbed:
-    """The standing advisory. Rendered on EVERY -ping rather than once at
+    """The standing advisory. Rendered on every -ping rather than once at
     startup: the startup log is seen once, usually by whoever already knows,
     while -ping is the surface an operator returns to."""
 
@@ -741,12 +721,10 @@ class TestDefaultPasswordEmbed:
     def test_none_when_the_archive_is_disabled_even_with_the_default_dsn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Compose interpolates POSTGRES_URL (default password and all) into
-        # the bot's environment whether or not the archive profile is active,
-        # so the disabled bot can hold exactly this DSN with no Postgres
-        # deployed behind it. A credential warning about a database that
-        # isn't there is noise that trains operators to ignore warnings —
-        # same gate as setup_hook's startup ERROR.
+        # Compose interpolates POSTGRES_URL into the bot's environment whether or
+        # not the archive profile is active, so a disabled bot can hold this DSN
+        # with no Postgres behind it. Warning about a database that isn't there
+        # trains operators to ignore warnings — same gate as setup_hook's ERROR.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
@@ -767,12 +745,10 @@ class TestDefaultPasswordEmbed:
         assert "ALTER USER" in body
         assert "up -d" in body  # the container recreate the old remedy omitted
 
-        # ORDER, not just presence. The detector reads the bot's DSN, so
-        # `setup_env.sh --force` clears this warning while Postgres still
-        # accepts the old password — running it first is the one sequence that
-        # produces an unwarned exposure. The server change has to come first,
-        # and the embed has to say so, or the remedy walks the operator through
-        # exactly that window.
+        # Order, not just presence. The detector reads the bot's DSN, so running
+        # `setup_env.sh --force` first clears the warning while Postgres still
+        # accepts the old password — an unwarned exposure. The server change has
+        # to come first and the embed has to say so.
         assert body.index("ALTER USER") < body.index("setup_env.sh")
         assert "order is the point" in body
         # By STEP NUMBER too: relabelling the steps without moving them would
@@ -797,19 +773,11 @@ class TestDefaultPasswordEmbed:
 class TestDefaultPasswordWarningReachesTheWire:
     """The advisory on the actual dashboard, not in isolation.
 
-    TestDefaultPasswordEmbed above tests default_password_embed() alone, which
-    left the whole surface deletable: a mutation replacing the dashboard's
-    `warning = default_password_embed()` with `None` passed all 1,681 tests,
-    ruff and pyright. The design trades a shared credential for "noise rather
-    than silence", and the commit message calls -ping the half that matters —
-    "the startup log is seen once and usually by whoever already knows; -ping is
-    the surface an operator returns to". Nothing asserted the noise existed.
-
-    The reason it could not be tested before is the reason it needed testing:
-    no fixture pinned POSTGRES_URL, so the suite read the developer's shell,
-    which carries a real password. conftest scrubs it now, and these tests set
-    the default explicitly.
-    """
+    TestDefaultPasswordEmbed covers default_password_embed() alone, which left the
+    whole surface deletable: replacing the dashboard's `warning =
+    default_password_embed()` with `None` passed the entire suite. These need a
+    pinned POSTGRES_URL — conftest scrubs it, and they set the default explicitly,
+    because otherwise the suite reads a developer shell carrying a real password."""
 
     @pytest.fixture
     def on_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -825,7 +793,7 @@ class TestDefaultPasswordWarningReachesTheWire:
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
         assert len(embeds) == 2
-        # FIRST, above the health card — an advisory below the fold is one the
+        # First, above the health card — an advisory below the fold is one the
         # operator scrolls past.
         assert "Default database password" in (embeds[0].title or "")
 
@@ -906,16 +874,10 @@ class TestDefaultPasswordWarningReachesTheWire:
 
     async def test_safe_edit_returns_the_health_card_not_the_advisory(self) -> None:
         """_safe_edit's return feeds the change-diffing loop, so it must be the
-        HEALTH card — the only embed that moves.
-
-        Returning embeds[0] instead hands the loop the STATIC advisory, so
-        `_ping_embed_changed(new_health, static_warning)` is true on every tick:
-        a message.edit every PING_TICK_SECS for the whole deadline window,
-        firing only on deployments that already have the problem. Asserted
-        directly rather than through the dashboard, because the dashboard only
-        reaches this line when a probe resolves late — so a whole-command test
-        of it passes for the wrong reason whenever the probes are fast.
-        """
+        HEALTH card — the only embed that moves. Returning embeds[0] diffs against
+        the STATIC advisory and edits every tick. Asserted directly: the dashboard
+        reaches this line only when a probe resolves late, so a whole-command test
+        of it passes for the wrong reason whenever the probes are fast."""
         message = MagicMock(spec=discord.Message)
         message.edit = AsyncMock()
         warning = discord.Embed(title="⚠️ Default database password in use")
@@ -934,15 +896,10 @@ class TestDefaultPasswordWarningReachesTheWire:
 
 
 class TestTheAdvisoryIsForTheOperator:
-    """Who sees the default-password warning.
-
-    -ping carries no permission check and answers to `-status`, `-health`, `-l`,
-    so the advisory — which names the credential and confirms that THIS host
-    runs on it — was going to every member of every guild the bot is in, and
-    staying in Discord's retained history. The value is a public constant in a
-    GPL repo, so the leak was never the string: it was free confirmation of
-    which hosts are worth trying, handed to the population most likely to try.
-    """
+    """Who sees the default-password warning. -ping has no permission check and
+    answers to `-status`, `-health`, `-l`, so an ungated advisory confirms to every
+    member of every guild — permanently, in Discord's history — that this host runs
+    the public default. The leak is the confirmation, not the string."""
 
     @pytest.fixture(autouse=True)
     def on_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -999,21 +956,12 @@ class TestTheAdvisoryIsForTheOperator:
     async def test_the_owner_check_is_never_paid_for_when_there_is_no_advisory(
         self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """is_owner() must be reached only when the advisory actually exists.
-
-        It is not a local predicate: MusicBotApp passes neither owner_id nor
-        owner_ids, so discord.py falls through to application_info() — a REST
-        GET that retries ~25s on a 5xx and then RAISES. Written as the obvious
-        `embed() if await is_owner() else None`, that await ran first and
-        unconditionally, putting a network call ahead of the skeleton send this
-        command documents as immediate, and taking the whole dashboard down
-        whenever Discord was degraded — which is when -ping gets run.
-
-        The two assertions are the two halves of the fix: not awaited at all,
-        and therefore immune to it failing. is_owner returns True here on
-        purpose, so a regression cannot pass by answering False.
-        """
-        # The ship default. default_password_embed() returns None on its first
+        """is_owner() must be reached only when the advisory exists — it is not a
+        local predicate: with no owner_id set, discord.py falls through to
+        application_info(), a REST GET that retries ~25s on a 5xx and then RAISES,
+        ahead of the skeleton send. is_owner answers True on purpose here, so a
+        regression cannot pass by answering False."""
+        # The ship default. Default_password_embed() returns None on its first
         # line, so there is nothing to gate and nothing to ask about.
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
         mock_ctx.bot.is_owner = AsyncMock(

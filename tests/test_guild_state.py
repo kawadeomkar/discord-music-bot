@@ -220,10 +220,8 @@ class TestGuildStateDataImmutability:
 
 
 def _requester_stub(user_id: int, mention: str | None = None) -> discord.Member:
-    """A stand-in for the requester Member.
-
-    from_song/from_queue_object only ever read .id and .mention off it, and a
-    real Member needs a live connection state to construct.
+    """A stand-in for the requester Member: from_song/from_queue_object only read
+    .id and .mention, and a real Member needs a live connection state.
     """
     return cast(
         discord.Member,
@@ -234,9 +232,8 @@ def _requester_stub(user_id: int, mention: str | None = None) -> discord.Member:
 def _full_song_stub() -> YTDL:
     """A stand-in for a streamed song.
 
-    YTDL subclasses FFmpegOpusAudio, so building a real one spawns an FFmpeg
-    subprocess. NowPlayingData.from_song only reads plain metadata attributes,
-    so a namespace carrying them is a faithful substitute.
+    YTDL subclasses FFmpegOpusAudio, so a real one spawns an FFmpeg subprocess;
+    NowPlayingData.from_song only reads plain metadata attributes.
     """
     return cast(
         YTDL,
@@ -559,8 +556,7 @@ class TestHistoryEntryWire:
         # Golden bytes from the pre-guild_id writer (history overhaul era) —
         # at-rest entries mix writers, so these must stay readable, with the
         # absent fields defaulting to 0 (backfill stamps the real guild id from
-        # the key — docs/POSTGRES_HISTORY_PLAN.md §5.6; message_id has no such
-        # recovery and stays unknown).
+        # the key; message_id has no such recovery and stays unknown).
         pre_postgres = (
             b'{"title":"Song Title","webpage_url":"https://yt.com/v=1",'
             b'"duration_secs":242,"played_secs":225,"requester_id":42,'
@@ -629,22 +625,16 @@ class TestHistoryEntryWire:
 def _entry_with(**kwargs: Any) -> HistoryEntry:
     """Constructor shim for the parametrized domain tests below.
 
-    Splatting a parametrized field name straight into HistoryEntry makes pyright
-    check the value against EVERY field's type (int against title: str, and so
-    on). Widening here rather than casting at each call site keeps the tests
-    readable and confines the Any to one line.
+    Splatting a parametrized field name into HistoryEntry makes pyright check the
+    value against every field's type; widening here confines the Any to one line.
     """
     return HistoryEntry(**kwargs)
 
 
 class TestHistoryEntryDomain:
-    """The schema lock: constructing a HistoryEntry IS the proof that Postgres
-    accepts it, so every clamp is asserted on the TYPE rather than on any
-    archive helper (docs/HISTORY_SCHEMA_FIRST_FINDINGS.md §5).
-
-    These moved here from tests/test_history_archive.py when _sanitize_entry
-    was deleted — the property was always about the value object, not the
-    repository that happened to enforce it.
+    """The schema lock: constructing a HistoryEntry is the proof that Postgres
+    accepts it, so every clamp is asserted on the TYPE rather than on any archive
+    helper — the property is about the value object, not the repository.
     """
 
     def test_clean_entry_is_untouched(self) -> None:
@@ -751,7 +741,7 @@ class TestHistoryEntryDomain:
         )
 
     def test_replace_re_runs_the_validator(self) -> None:
-        # Load-bearing: backfill_history stamps guild_id onto legacy entries
+        # backfill_history stamps guild_id onto legacy entries
         # with dataclasses.replace, on the least trustworthy data in the system.
         # If that bypassed __post_init__ the whole lock would be decorative.
         entry = HistoryEntry(guild_id=1, title="x")
@@ -781,7 +771,7 @@ def test_orjson_refuses_what_post_init_cannot_clamp() -> None:
     """The wire codec is the first half of the validator, and it is documented
     nowhere a reader would find it. A lone surrogate cannot be encoded, so it
     can never reach Redis — which is why __post_init__ has no surrogate arm and
-    why the residual poison set is only four vectors wide (findings §3.1)."""
+    why the residual poison set is only four vectors wide."""
     with pytest.raises(TypeError):
         serialize_history_entry(HistoryEntry(guild_id=1, title="a\ud800b"))
 
@@ -824,11 +814,10 @@ class TestHistoryEntryFromSong:
 
     def test_guild_id_and_message_id_are_required_keywords(self) -> None:
         # Requiredness is the whole protection for message_id: play_history's
-        # CHECK is `message_id >= 0` with DEFAULT 0, so a forgotten stamp inserts
-        # cleanly and is permanently indistinguishable from a song that genuinely
-        # had no host. pyright catches a missing argument today, but only while
-        # no default exists — adding one silently retires the guarantee, and this
-        # is what notices.
+        # CHECK is `message_id >= 0` with default 0, so a forgotten stamp inserts
+        # cleanly and reads as a song that genuinely had no host. pyright catches
+        # a missing argument only while no default exists — adding one silently
+        # retires the guarantee, and this is what notices.
         song = _history_song_stub()
         with pytest.raises(TypeError):
             HistoryEntry.from_song(song, guild_id=111, played_at=1.0)  # pyright: ignore[reportCallIssue]
@@ -837,14 +826,11 @@ class TestHistoryEntryFromSong:
 
     def test_message_id_is_caller_supplied(self) -> None:
         # The song object carries no message id — it comes from the NP host the
-        # playback loop captured at song end, and 0 means "no message hosted
-        # this song's block" rather than "the caller forgot".
-        #
-        # Both arms are needed. 0 is also the dataclass default, so asserting it
-        # alone passes even if from_song hardcodes 0, drops the argument, or
-        # never sets the field — i.e. exactly when the property this test is
-        # named for is broken. The non-zero arm is what makes the zero arm mean
-        # "0 because the caller said 0".
+        # playback loop captured at song end, and 0 means "no message hosted this
+        # song's block" rather than "the caller forgot". Both arms are needed: 0
+        # is also the dataclass default, so asserting it alone passes even if
+        # from_song hardcodes 0, drops the argument, or never sets the field. The
+        # non-zero arm is what makes the zero arm mean "0 because the caller said".
         song = _history_song_stub()
         base = {"guild_id": 111, "played_at": 1.0}
         assert HistoryEntry.from_song(song, **base, message_id=0).message_id == 0

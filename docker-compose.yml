@@ -77,40 +77,31 @@ services:
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
       # bgutil-pot-provider is intentionally NOT in depends_on either: the bot is
       # fully functional without it (web_safari degrades to token-less, android_vr
-      # is untouched — see docs/PO_TOKEN_SIDECAR_PLAN.md §3.3).
+      # is untouched).
 
   redis:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and
-    # must never become eviction candidates:
+    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and must
+    # never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
-    #                       Evicting one loses that play silently — no error,
-    #                       nothing in play_history_rejected, nothing in the
-    #                       logs; the drainer just finds fewer entries than were
-    #                       pushed. It is normally near-empty and grows precisely
-    #                       during a Postgres outage, i.e. exactly when eviction
-    #                       pressure is highest. Written only while the archive
-    #                       is enabled (HISTORY_ARCHIVE_ENABLED); disabled — the
-    #                       default — the key is never created, but the policy
-    #                       must still protect a leftover from an earlier
-    #                       enabled run.
+    #                       Evicting one loses that play silently — no error, no
+    #                       play_history_rejected row, no log line. It is
+    #                       normally near-empty and grows during a Postgres
+    #                       outage, i.e. when eviction pressure is highest.
+    #                       Written only while HISTORY_ARCHIVE_ENABLED; disabled,
+    #                       the key is never created, but the policy must still
+    #                       protect a leftover from an earlier enabled run.
     #   guild:{id}:history  the per-guild display window, capped at 50 entries
-    #                       and PERSISTed. It is the ONLY source -history reads,
-    #                       so evicting one answers a guild with silence despite
-    #                       a full Postgres archive behind it. Bounded by length
-    #                       rather than by time on purpose: ~24 KB per guild,
-    #                       permanently, instead of a TTL that would expire a
-    #                       quiet guild's history out from under the command.
-    #
-    # There used to be a third, history:outbox:dlq. The schema lock retired it:
-    # rows Postgres refuses now land in the play_history_rejected TABLE, which
-    # cannot pressure Redis at all.
+    #                       and PERSISTed. The ONLY source -history reads, so
+    #                       evicting one answers a guild with silence despite a
+    #                       full archive behind it. Bounded by length, never by
+    #                       time: ~24 KB per guild, permanently.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
-    # so volatile-lru preserves the existing cache-eviction behavior for them.
+    # so volatile-lru preserves cache-eviction behavior for them.
     command: >
       redis-server
       --appendonly yes
@@ -128,22 +119,15 @@ services:
       retries: 5
 
   postgres:
-    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). OPT-IN:
-    # long-term storage of user data is a choice the operator makes, so this
-    # service exists in the model only while the `archive` profile is active.
+    # Durable home of play history. OPT-IN: this service is in the model only
+    # while the `archive` profile is active, and build_common.sh's
+    # resolve_archive_profile derives that from HISTORY_ARCHIVE_ENABLED on every
+    # deploy path — one flag in .env is the whole opt-in.
     #
-    # The profile is DERIVED from HISTORY_ARCHIVE_ENABLED, not set by hand:
-    # build_common.sh's resolve_archive_profile exports COMPOSE_PROFILES for
-    # every deploy path (./deploy_docker.sh, ./build_docker.sh, `just up`,
-    # `just services`, `just compose`). One flag in .env is the whole opt-in.
-    #
-    # Compose itself cannot read that flag — profiles activate only from
-    # COMPOSE_PROFILES or --profile — so a RAW `docker compose up` deploys the
-    # default stack and no Postgres whatever the flag says. Naming the services
-    # (`docker compose up -d postgres db-migrate`) auto-activates this profile,
-    # and a hand-set COMPOSE_PROFILES still works for anyone driving compose
-    # directly. While the archive is enabled, MusicBotApp.setup_hook requires
-    # POSTGRES_URL and refuses to start without it.
+    # Compose never reads that flag (profiles activate only from
+    # COMPOSE_PROFILES or --profile), so a raw `docker compose up` deploys no
+    # Postgres. Naming the services or setting COMPOSE_PROFILES by hand still
+    # works. See docs/ARCHITECTURE.md#history-archive-tier.
     profiles: ["archive"]
     image: postgres:18-alpine
     container_name: discord-postgres
@@ -186,11 +170,10 @@ services:
     # One-shot schema migration for the opt-in archive — `archive` profile,
     # same as postgres above: no archive, no schema to migrate.
     #
-    # Every deploy applies migrations before the bot is recreated, and gates on
-    # the result — deploy_docker.sh runs this service with `run --rm` for the
-    # exit status. This entry keeps `docker compose up` applying them too, for
-    # anyone driving compose directly. Running twice is a no-op: the runner
-    # records versions in schema_migrations and skips what is already applied.
+    # deploy_docker.sh runs this with `run --rm` before recreating the bot and
+    # gates on the exit status; this entry keeps `docker compose up` applying
+    # them too. Running twice is a no-op — versions are recorded in
+    # schema_migrations and skipped thereafter.
     #
     # The bot image, not a postgres client image: the runner is src/db_migrate.py
     # and the migrations ship in that image, so there is exactly one definition
@@ -214,12 +197,11 @@ services:
       # is on the compose network, so it addresses postgres by service name and
       # is unaffected by POSTGRES_HOST_PORT.
       #
-      # Deliberately NOT `${POSTGRES_URL:-…}` like the bot's. .env commonly holds
-      # the HOST-form DSN (`just run` needs one, and _dotenv derives one), and
-      # 127.0.0.1 inside this container is this container — measured: the
-      # migration died with connection refused on 127.0.0.1:5432. A genuinely
-      # external DSN is passed in by the deploy instead, which can tell the two
-      # apart; see resolve_external_postgres_env in build_common.sh.
+      # NOT `${POSTGRES_URL:-…}` like the bot's: .env holds the HOST-form DSN,
+      # and 127.0.0.1 inside this container is this container — the migration
+      # died with connection refused against a healthy database. The deploy
+      # passes a genuinely external DSN in instead
+      # (resolve_external_postgres_env, build_common.sh).
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
     depends_on:
       postgres:
@@ -294,7 +276,7 @@ services:
 
   bgutil-pot-provider:
     # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
-    # client (docs/PO_TOKEN_SIDECAR_PLAN.md). Version must match the
+    # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
     # released in lockstep; bump both together.
     image: brainicism/bgutil-ytdlp-pot-provider:1.3.1

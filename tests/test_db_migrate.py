@@ -1,10 +1,8 @@
 """Tests for src/db_migrate.py — migration discovery and the version contract.
 
-The runner's SQL execution needs a real server and belongs to the pg tier, which
-arrives with the archive code. What lives here is everything that can be wrong
-without one: the file-naming contract, ordering, duplicate detection, and the
-agreement between migrations/ on disk and EXPECTED_SCHEMA_VERSION in the code —
-which is the whole reason that constant is a literal rather than derived.
+SQL execution needs a real server and lives in the pg tier. Here: everything
+that can be wrong without one — the file-naming contract, ordering, duplicate
+detection, and migrations/ agreeing with EXPECTED_SCHEMA_VERSION.
 """
 
 from pathlib import Path

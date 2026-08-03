@@ -87,7 +87,7 @@ if ! docker image inspect "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# NOTE (merge-time, docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §8.3): when the k8s
+# NOTE (merge-time): when the k8s
 # stack lands, its "is a bot pod already live in a cluster?" guard belongs HERE,
 # immediately below — one Discord token means one live process, and this is the
 # line that starts one. It currently sits in that branch's build_docker.sh, which
@@ -107,19 +107,14 @@ if [ "$ARCHIVE_ENABLED" -eq 0 ] \
     echo "         Archived rows survive in the postgres-data volume either way." >&2
 fi
 
-# Migrate BEFORE the bot is recreated, and gate the deploy on it. A `git pull`
-# can bring new migrations with new code, and the bot refuses to archive against
-# a schema older than its build (SchemaVersionError) — so a deploy that started
-# the new bot first would archive nothing until someone noticed.
+# Migrate BEFORE the bot is recreated, and gate the deploy on it: a `git pull`
+# brings migrations with the code, and the bot refuses to archive against a
+# schema older than its build, so starting it first archives nothing until
+# someone reads the logs. Idempotent — versions are recorded with their DDL and
+# skipped thereafter, and a database newer than this image exits 0 (rollbacks).
 #
-# Idempotent by construction: src/db_migrate.py records each version in
-# schema_migrations inside the same transaction as its DDL and skips what is
-# already there, so every deploy after the first is a no-op that exits 0. A
-# database NEWER than this image is not an error either (rollbacks).
-#
-# `run --rm` rather than leaving it to `up`: `run` reports the runner's exit
-# status, which is what makes this a gate. Its depends_on starts postgres and
-# waits for healthy first. -T because deploys are not always interactive.
+# `run --rm`, not `up`: only `run` reports the runner's exit status, which is
+# what makes this a gate. depends_on waits for postgres to be healthy first.
 if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
     echo "Applying play-history migrations from $TAG"
     # Empty unless POSTGRES_URL names a database off this host — the compose

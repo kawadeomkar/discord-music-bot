@@ -113,11 +113,8 @@ class TestPluralize:
         ],
     )
     def test_only_exactly_one_is_singular(self, count: int, expected: str) -> None:
-        """The rule is `count == 1`, not `count <= 1`.
-
-        0 and -1 are the cases that separate the two: relaxing the condition to
-        `<= 1` would render "0 song" and "-1 song" and pass every other test.
-        """
+        """The rule is `count == 1`, not `count <= 1`: 0 and -1 separate the two,
+        since `<= 1` renders "0 song" / "-1 song" and passes every other test."""
         assert pluralize(count, "song") == expected
 
     def test_plural_override_used_for_irregulars(self) -> None:
@@ -192,8 +189,8 @@ def _rich_entry(**overrides: Any) -> HistoryEntry:
 
 class TestHistoryEmbeds:
     def test_layout_title_url_then_info_line(self) -> None:
-        # Plan §6: numbered title; webpage_url on its own line beneath it;
-        # played/duration · requester · absolute timestamp on ONE line below.
+        # numbered title; webpage_url on its own line beneath it;
+        # played/duration · requester · absolute timestamp on one line below.
         [embed] = history_embeds([_rich_entry()])
         assert embed.title == "1. Rich Song"
         assert embed.description is not None

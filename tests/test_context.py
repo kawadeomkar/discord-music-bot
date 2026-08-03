@@ -1,6 +1,6 @@
 """Tests for MusicContext (src/main.py) — the ctx.send override that keeps the
 Now Playing embed block attached to the newest bot message while a song is live
-(docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md §3)."""
+."""
 
 from contextlib import AbstractContextManager
 from typing import Any, Optional
@@ -104,7 +104,7 @@ class TestMusicContextAttach:
         self, mctx: MusicContext, live_mp: MagicMock
     ) -> None:
         """Plain-text responses need no embed conversion — content and embeds
-        coexist on one message (settled decision §4 of the plan)."""
+        coexist on one message."""
         sent = MagicMock(spec=discord.Message)
         with _parent_send(sent) as parent:
             await mctx.send("shuffling...")

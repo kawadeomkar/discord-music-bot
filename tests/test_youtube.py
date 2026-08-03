@@ -45,13 +45,9 @@ from tests.helpers import noop_ffmpeg_init
 def _suppress_ytdl_del(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch discord.AudioSource.__del__ to a no-op for every test in this module.
 
-    YTDL tests patch discord.FFmpegOpusAudio.__init__ to return_value=None so that
-    no real FFmpeg process is spawned. This leaves _process unset on the instance.
-    When Python GC collects the object, AudioSource.__del__ → FFmpegAudio.cleanup()
-    → _kill_process() → _check_process_returncode() accesses self._process and raises
-    AttributeError. Suppressing __del__ here avoids that crash without touching
-    production code.
-    """
+    YTDL tests stub FFmpegOpusAudio.__init__ so no FFmpeg spawns, leaving _process
+    unset; GC then runs __del__ → cleanup() → _kill_process(), which reads it and
+    raises AttributeError. Suppressing __del__ avoids that without touching src."""
     monkeypatch.setattr(discord.AudioSource, "__del__", lambda self: None)
 
 
@@ -59,10 +55,8 @@ def _suppress_ytdl_del(monkeypatch: pytest.MonkeyPatch) -> None:
 def playable_urls(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     """Treat every stream URL as playable unless a test says otherwise.
 
-    yt_stream() probes each URL before handing it to ffmpeg. Left unpatched that is a
-    real HTTP call to a fake googlevideo host in every test. Tests that exercise the
-    revocation path set the returned mock's return_value to False.
-    """
+    yt_stream() probes each URL before ffmpeg; unpatched that is a real HTTP call to
+    a fake googlevideo host. Revocation tests set the mock's return_value to False."""
     probe = AsyncMock(return_value=True)
     monkeypatch.setattr("src.youtube._stream_url_playable", probe)
     return probe
@@ -140,12 +134,10 @@ class TestYTDLDuration:
 
 
 class TestYTDLElapsedSecs:
-    """Elapsed-time tracking via YTDL.read() call counting — see Design §1 of
-    docs/NOW_PLAYING_PROGRESS_BAR_PLAN.md. Deterministic call counting, no
-    time-mocking needed: patches the parent FFmpegOpusAudio.read() (which
-    super().read() resolves to) directly rather than relying on the real
-    _packet_iter, since noop_ffmpeg_init doesn't set that up.
-    """
+    """Elapsed-time tracking by counting YTDL.read() calls — deterministic, no
+    time-mocking. Patches the parent FFmpegOpusAudio.read() (what super().read()
+    resolves to) rather than the real _packet_iter, which noop_ffmpeg_init
+    never sets up."""
 
     def test_zero_before_any_read(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
@@ -338,7 +330,7 @@ class TestYTDLOpts:
         assert YTDL_OPTS["source_address"] == "0.0.0.0"
 
     def test_default_search_is_auto(self) -> None:
-        # default_search belongs to yt_source's unified search opts, not the stream opts
+        # Default_search belongs to yt_source's unified search opts, not the stream opts
         assert _YTDL_STREAM_SEARCH_OPTS["default_search"] == "auto"
         assert "default_search" not in _YTDL_STREAM_OPTS
 
@@ -386,7 +378,7 @@ class TestYtdlpLogger:
 
     def test_unified_search_opts_carry_stream_format(self) -> None:
         """yt_source's single extraction must select a playable stream — the unified
-        play path (docs/PERFORMANCE_PLAN.md §2.1) populates the ytdl:stream cache from
+        play path populates the ytdl:stream cache from
         the same call, which only works with the stream format ladder and its retry
         budget. Dropping the format key would silently revert to double extraction."""
         assert _YTDL_STREAM_SEARCH_OPTS["format"] == _YTDL_STREAM_OPTS["format"]
@@ -444,18 +436,14 @@ class TestYTSource:
     async def test_yt_source_unsupported_url_gives_friendly_error(
         self, mock_ctx: MagicMock
     ) -> None:
-        """yt-dlp reports an unrecognised site by raising UnsupportedError, which
-        extract_info wraps in a DownloadError. Extraction runs in a worker process, so
-        _classify_ytdlp_error flattens that to an ExtractionError with .unsupported set;
-        yt_source keys off that flag to raise an actionable message instead of the
-        generic extractor error."""
+        """yt-dlp raises UnsupportedError for an unrecognised site, wrapped in a
+        DownloadError. _classify_ytdlp_error flattens that to an ExtractionError with
+        .unsupported set, and yt_source keys off the flag for an actionable message."""
         url = "https://example.com/not-media"
-        # Mirror how yt-dlp wraps an extractor error: extract_info catches the
-        # UnsupportedError and re-raises a DownloadError carrying it in exc_info.
-        # cast() because yt-dlp's ExcInfo type wants a non-None traceback we don't
-        # have (and don't need — _classify_ytdlp_error only reads exc_info[1], the
-        # instance). In tests _ytdlp_extract runs in-process (thread pool), so the
-        # worker-side classification runs for real against this mocked yt-dlp error.
+        # Mirrors yt-dlp's own wrapping: a DownloadError carrying the cause in
+        # exc_info. cast() because its ExcInfo type wants a non-None traceback we
+        # don't have and don't need (only exc_info[1] is read). _ytdlp_extract runs
+        # in-process here, so the worker-side classification runs for real.
         cause = UnsupportedError(url)
         wrapped = DownloadError(
             "ERROR: Unsupported URL", cast(Any, (type(cause), cause, None))
@@ -469,7 +457,7 @@ class TestYTSource:
     async def test_yt_source_reraises_non_unsupported_extraction_error(
         self, mock_ctx: MagicMock
     ) -> None:
-        """A yt-dlp failure that is NOT an unsupported-site error (e.g. a network
+        """A yt-dlp failure that is not an unsupported-site error (e.g. a network
         failure) is re-raised untouched as the classified ExtractionError — only a
         genuine UnsupportedError is remapped to the friendly message. _command_error
         renders the ExtractionError via its user_message."""
@@ -633,13 +621,13 @@ class TestYTSource:
 
 
 class TestYTSourceUnifiedExtraction:
-    """The unified single-extraction play path (docs/PERFORMANCE_PLAN.md §2.1):
-    one stream-opts yt-dlp call populates BOTH the ytdl:source and ytdl:stream
+    """The unified single-extraction play path: one stream-opts yt-dlp call
+    populates both the ytdl:source and ytdl:stream
     caches, making queue_put's prefetch_stream a cache-hit no-op instead of a
     second YouTube extraction."""
 
     async def test_always_extracts_with_process_true(self, mock_ctx: MagicMock) -> None:
-        """process=True is hardcoded — the §2.1 trap. Direct URLs used to flow with
+        """process=True is hardcoded — the process=True trap. Direct URLs used to flow with
         process=False, and an unprocessed extract_info performs no format selection,
         so data["url"] would be absent and the stream-cache write would silently
         never happen for direct-URL plays."""
@@ -673,9 +661,8 @@ class TestYTSourceUnifiedExtraction:
     async def test_stream_cache_hit_for_prefetch_after_yt_source(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
     ) -> None:
-        """prefetch_stream must not re-extract a song yt_source just resolved —
-        the whole point of §2.1 is that the enqueue-time prefetch becomes one
-        Redis GET."""
+        """prefetch_stream must not re-extract a song yt_source just resolved: the
+        unified extraction makes the enqueue-time prefetch one Redis GET."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni2")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
             qobj = await YTDL.yt_source(
@@ -690,7 +677,7 @@ class TestYTSourceUnifiedExtraction:
     ) -> None:
         """A failed probe never fails yt_source: the song enqueues on identity
         alone (source cache written), and dequeue-time re-extraction handles the
-        stream — exactly the pre-§2.1 behavior."""
+        stream — exactly the pre-unification behavior."""
         playable_urls.return_value = False
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni3")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
@@ -882,11 +869,9 @@ class TestYTStream:
 
 class TestStreamUrlTtl:
     def test_caps_ttl_regardless_of_expire(self) -> None:
-        """A URL claiming hours of life is still only cached for the cap.
-
-        YouTube revokes stream URLs long before their `expire`; trusting it meant a
-        revoked URL was replayed for hours and the song failed every time.
-        """
+        """A URL claiming hours of life is still only cached for the cap: YouTube
+        revokes long before `expire`, so trusting it replays a revoked URL for
+        hours and the song fails every time."""
         future = int(time.time()) + 7200  # 2h from now
         url = f"https://r2.googlevideo.com/stream?expire={future}&other=x"
         assert _stream_url_ttl(url) == 1800
@@ -1010,7 +995,7 @@ class TestRevokedStreamUrl:
         assert await fake_redis.get(f"ytdl:stream:{webpage_url}") is None
 
     async def test_probe_opens_the_request_the_way_ffmpeg_does(self) -> None:
-        """Load-bearing: a revoked URL still answers 206 to a *ranged* GET while refusing
+        """A revoked URL still answers 206 to a *ranged* GET while refusing
         the open-ended one ffmpeg actually sends. Probing with a Range header (or HEAD)
         reports a dead URL as healthy — which is the bug this whole path exists to catch.
         """
@@ -1206,13 +1191,10 @@ class TestPrefetchStream:
     async def test_swallows_extraction_errors(
         self, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        """prefetch_stream does not propagate yt-dlp exceptions.
-
-        The failure is an ExtractionError, the shape production now raises: since the
-        pool migration, _ytdlp_extract catches yt-dlp's own (unpicklable) errors in the
-        worker and re-raises this flat, picklable one (§12.1). A bare Exception here would
-        assert a shape the code can no longer produce.
-        """
+        """prefetch_stream does not propagate yt-dlp exceptions. The failure is an
+        ExtractionError because that is what production raises — the worker flattens
+        yt-dlp's own unpicklable errors — so a bare Exception here would assert a
+        shape the code can no longer produce."""
         from src.youtube import ExtractionError
 
         qobj = QueueObject("https://yt.com/v=pf4", "Error Song", mock_ctx.author)
@@ -1329,17 +1311,12 @@ class TestProcessBoundaryContract:
     """Everything that must survive being pickled to a worker process.
 
     The suite runs extraction on an in-process ThreadPoolExecutor (see conftest), so
-    nothing else here ever exercises the pickling that the production
-    ProcessPoolExecutor performs on every submit. These tests are the cheap half of
-    that coverage gap — they assert the contract directly, in microseconds, without
-    spawning anything. The expensive half (a real worker actually spawning) is
-    docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7.
-
-    What they catch: adding an unpicklable value to an opts profile — a logger
-    instance, a session, a lambda, a compiled callback — or turning a submitted
-    top-level function into a closure/lambda/bound method. Either breaks every
-    extraction in production the moment it ships, while a green suite says nothing.
-    """
+    nothing else exercises the pickling production performs on every submit. These
+    assert the contract directly, in microseconds; the expensive half is
+    TestRealWorkerProcess in tests/test_ytdlp_pool.py. What they catch: an
+    unpicklable value in an opts profile (a logger, a session, a lambda), or a
+    submitted top-level function becoming a closure or bound method — each breaks
+    every extraction in production while a green suite says nothing."""
 
     @pytest.mark.parametrize(
         "name,opts",
@@ -1353,11 +1330,8 @@ class TestProcessBoundaryContract:
         self, name: str, opts: dict[str, Any]
     ) -> None:
         """Every profile is an argument to _ytdlp_extract, so it is pickled per call.
-
-        Round-tripped rather than merely dumped: a value that serialises but does not
-        reconstruct (a class whose module moved, say) fails only in the worker, where
-        the failure surfaces as an opaque BrokenProcessPool.
-        """
+        Round-tripped, not just dumped: a value that serialises but cannot
+        reconstruct fails only in the worker, as an opaque BrokenProcessPool."""
         restored = pickle.loads(pickle.dumps(opts))
         assert restored.keys() == opts.keys(), f"{name} profile lost keys"
 
@@ -1368,13 +1342,10 @@ class TestProcessBoundaryContract:
         assert pickle.loads(pickle.dumps(_ytdlp_extract)) is _ytdlp_extract
 
     def test_worker_logging_initializer_is_picklable_by_reference(self) -> None:
-        """ProcessPoolExecutor pickles `initializer` to every worker. A closure or a
-        bound method here breaks pool construction rather than one extraction.
-
-        The initializer is `_worker_init` (which calls configure_worker_logging with the
-        log queue) — not configure_worker_logging itself; asserting the wrong one passes
-        while missing the real contract.
-        """
+        """ProcessPoolExecutor pickles `initializer` to every worker, so a closure or
+        bound method here breaks pool construction rather than one extraction. The
+        initializer is `_worker_init`, not configure_worker_logging itself; asserting
+        the wrong one passes while missing the real contract."""
         from src.ytdlp_pool import _worker_init
 
         assert pickle.loads(pickle.dumps(_worker_init)) is _worker_init
@@ -1386,11 +1357,9 @@ class TestProcessBoundaryContract:
 
 
 def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
-    """A process=True-shaped info dict carrying the exact things a real one does that a
-    flat _fake_ytdl_data() never has: a genuinely unpicklable live object, a LazyList
-    format ladder, and the large collections callers never read. This is what
-    extract_info() actually hands back — the thing _ytdlp_extract must not return as-is.
-    """
+    """A process=True-shaped info dict carrying what a flat _fake_ytdl_data() never
+    has: a genuinely unpicklable live object, a LazyList format ladder, and the large
+    collections no caller reads — what _ytdlp_extract must not return as-is."""
     from yt_dlp.utils import LazyList
 
     base: dict[str, Any] = {
@@ -1424,25 +1393,21 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
 class TestSlimInfoReturnContract:
     """The success-path return value crosses the process boundary on *every* extraction.
 
-    TestProcessBoundaryContract covers the arguments and the callable; the exception path
-    has its own round-trip tests. This covers the fourth thing that crosses — the info-dict
-    _ytdlp_extract returns — which the rest of the suite never exercises against a realistic
-    shape (_fake_ytdl_data is flat scalars with none of the live/oversized fields a real
-    process=True result carries). _slim_info is what makes that return value picklable at
-    all and keeps the oversized collections off the wire.
-    """
+    TestProcessBoundaryContract covers the arguments and the callable; this covers the
+    info-dict _ytdlp_extract returns, which the rest of the suite never exercises
+    against a realistic shape. _slim_info is what makes it picklable at all."""
 
     def test_a_realistic_raw_info_dict_is_genuinely_unpicklable(self) -> None:
         """Guards the premise: if this ever starts pickling on its own, the fix below is
-        no longer load-bearing and this test should be revisited — not deleted silently.
+        no longer needed and this test should be revisited, not deleted silently.
         """
         with pytest.raises((TypeError, pickle.PicklingError)):
             pickle.dumps(_realistic_raw_info())
 
     def test_slimmed_info_round_trips_through_pickle(self) -> None:
-        """The whole point: _ytdlp_extract's return value survives the boundary. The pool
-        pickles the result synchronously into its result queue, so a value that fails here
-        fails *every* extraction in production with an opaque pickling error."""
+        """_ytdlp_extract's return value survives the boundary. The
+        pool pickles results synchronously, so a value that fails here fails *every*
+        extraction with an opaque pickling error."""
         # cast to a plain dict: these assertions poke raw content, not the narrowed
         # YTDLExtractResult contract, and a realistic raw dict is never slimmed to None.
         slim = cast(dict[str, Any], _slim_info(_realistic_raw_info()))
@@ -1493,13 +1458,10 @@ class TestSlimInfoReturnContract:
 class TestExtractionErrorClassification:
     """_ytdlp_extract's worker-side rewrap of yt-dlp's own (unpicklable) errors.
 
-    yt-dlp's DownloadError carries exc_info → a live traceback, so it cannot cross the
-    process boundary; the parent would receive an opaque pickling error instead of the
-    reason (§12.1). _ytdlp_extract catches it in the worker — where the structure still
-    exists — and re-raises a flat ExtractionError. These assert the classification and
-    that the flat error round-trips; the far half (a real worker) is TestErrorAcrossBoundary
-    in tests/test_ytdlp_pool.py.
-    """
+    DownloadError's exc_info holds a live traceback, so it cannot cross the boundary
+    and the parent would get an opaque pickling error instead of the reason. The
+    worker re-raises a flat ExtractionError while the structure still exists; the far
+    half is TestErrorAcrossBoundary in tests/test_ytdlp_pool.py."""
 
     def _real_downloaderror(self) -> Any:
         """A DownloadError shaped exactly like yt-dlp's: exc_info holds the ExtractorError
@@ -1553,7 +1515,7 @@ class TestExtractionErrorClassification:
     def test_extractionerror_survives_pickle_round_trip(self) -> None:
         """loads(dumps(...)), not dumps alone: a multi-arg __init__ without __reduce__
         serialises fine and fails only on the *parent* side while unpickling, which is
-        exactly how the naive fix bricks the pool (§12.1). Values, not just keys."""
+        exactly how the naive fix bricks the pool. Values, not just keys."""
         from src.youtube import ExtractionError
 
         err = ExtractionError(
@@ -1644,21 +1606,16 @@ class TestExtractionErrorClassification:
 
 
 class TestExtractRequest:
-    """The request object that crosses the process boundary.
-
-    Its whole purpose is that `download` and `process` — two interchangeable
-    bools — cannot be transposed. kw_only is what provides that; frozen and
-    slots are for the boundary crossing. Each is asserted separately because a
-    future `@dataclass(frozen=True)` that drops kw_only would still look
-    correct in review while silently restoring the original defect.
-    """
+    """The request object that crosses the process boundary. Its whole purpose is
+    that `download` and `process` — two interchangeable bools — cannot be
+    transposed; kw_only provides that, frozen and slots are for the crossing. Each
+    is asserted separately: a `@dataclass(frozen=True)` dropping kw_only would look
+    correct in review while silently restoring the original defect."""
 
     def test_flags_cannot_be_passed_positionally(self) -> None:
-        """The defect this type exists to prevent.
-
-        Without kw_only, `ExtractRequest("u", opts, True, False)` is accepted
-        and means download=True, process=False — the exact silent swap.
-        """
+        """The defect this type exists to prevent: without kw_only,
+        `ExtractRequest("u", opts, True, False)` is accepted and means
+        download=True, process=False — the exact silent swap."""
         with pytest.raises(TypeError):
             ExtractRequest("http://x", {}, True, False)  # pyright: ignore[reportCallIssue]
 
@@ -1674,16 +1631,11 @@ class TestExtractRequest:
         assert req.process is True
 
     def test_survives_a_pickle_round_trip(self) -> None:
-        """It is submitted to a ProcessPoolExecutor, so it must pickle. A field
-        added later that is not picklable would break every extraction at once
-        — and, per §12.1, can break the pool permanently.
-
-        Asserted field-by-field rather than with `==`, because a real opts
-        profile carries a live `_YtdlpLogger` instance which has no __eq__ and
-        so compares by identity: the unpickled request holds the worker's own
-        logger, which is correct and expected. Equality would fail for a reason
-        that has nothing to do with picklability.
-        """
+        """It is submitted to a ProcessPoolExecutor, so it must pickle: an
+        unpicklable field added later breaks every extraction at once, and can brick
+        the pool permanently. Asserted field-by-field rather than with `==` because a
+        real opts profile carries a live `_YtdlpLogger`, which has no __eq__ and so
+        compares by identity — equality would fail for an unrelated reason."""
         req = ExtractRequest(
             url="http://x", opts=dict(_YTDL_STREAM_OPTS), download=True
         )
@@ -1714,14 +1666,10 @@ class TestExtractRequest:
 
 
 class TestRunExtract:
-    """`_run_extract` — the single call site for _ytdlp_extract. Every extraction
-    path (prefetch_stream, _resolve_playable_stream, yt_source, yt_playlist)
-    routes through it.
-
-    It now forwards one opaque request rather than four positional arguments, so
-    these assert the plumbing (request reaches the worker unchanged, both seams
-    stay patchable) rather than argument order, which the type system enforces.
-    """
+    """`_run_extract` — the single call site for _ytdlp_extract, through which every
+    extraction path routes. It forwards one opaque request, so these assert the
+    plumbing (request reaches the worker unchanged, both seams stay patchable)
+    rather than argument order, which the type system enforces."""
 
     async def test_forwards_the_request_unchanged(self) -> None:
         req = ExtractRequest(url="https://yt.com/v=x", opts={"quiet": True})
@@ -1733,12 +1681,10 @@ class TestRunExtract:
         assert forwarded is req  # not rebuilt, not copied, not spread
 
     async def test_submits_the_module_level_ytdlp_extract(self) -> None:
-        """The callable must be resolved per call, not captured at def time.
-
-        ~29 tests and tests/conftest.py patch `src.youtube._ytdlp_extract` and
-        `src.youtube.ytdlp_pool`; capturing either at import would make every
-        one of those patches silently ineffective.
-        """
+        """The callable must be resolved per call, not captured at def time: ~29
+        tests and tests/conftest.py patch `src.youtube._ytdlp_extract` and
+        `src.youtube.ytdlp_pool`, and capturing either at import would make every
+        one of those patches silently ineffective."""
         sentinel = MagicMock(name="patched_extract")
         with patch("src.youtube.ytdlp_pool") as mock_pool:
             mock_pool.run = AsyncMock(return_value=None)
