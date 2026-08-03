@@ -36,6 +36,7 @@ from src.spotify import (
     SpotifyAuthError,
     SpotifyCollection,
     SpotifyRateLimitError,
+    SpotifyRequestError,
     TrackPage,
 )
 from src.youtube import YTDL, ExtractionError, QueueObject
@@ -207,7 +208,7 @@ class ResolvedYoutubePlaylist:
     playlist_url: str
 
 
-@dataclass
+@dataclass(slots=True, kw_only=True)
 class _StreamDrain:
     """The state _begin_stream_enqueue hands to _drain_stream_tail: everything
     the tail needs to keep enqueueing pages after the playback gate opened."""
@@ -601,7 +602,7 @@ class MusicBot(commands.Cog):
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
-        if isinstance(e, (ExtractionError, SpotifyRateLimitError)):
+        if isinstance(e, (ExtractionError, SpotifyRateLimitError, SpotifyRequestError)):
             # Show the user-safe line, not the raw message: yt-dlp's carries
             # bug-report boilerplate, and a rate-limit needs to say "wait",
             # not name an endpoint. See each class's user_message.

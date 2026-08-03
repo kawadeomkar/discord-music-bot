@@ -23,6 +23,7 @@ from src.spotify import (
     Spotify,
     SpotifyAuthError,
     SpotifyRateLimitError,
+    SpotifyRequestError,
     TrackPage,
 )
 
@@ -458,8 +459,29 @@ class TestSpotifyHttpCall:
         mock_session = _make_mock_session(mock_response)
         spotify._session_factory = lambda **kw: mock_session
 
-        with pytest.raises(Exception, match="stat: 404"):
+        with pytest.raises(SpotifyRequestError, match="stat: 404") as excinfo:
             await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
+
+        # The args keep the detail for the log and span; only user_message is
+        # shown, so the endpoint must not appear there.
+        assert excinfo.value.status == 404
+        assert "check the link" in excinfo.value.user_message
+        assert "api.spotify.com" not in excinfo.value.user_message
+
+    async def test_server_error_user_message_says_try_again(
+        self, spotify: Spotify
+    ) -> None:
+        spotify.auth_token = "prefetched_token"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = AsyncMock()
+        mock_response.status = 503
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_response)
+
+        with pytest.raises(SpotifyRequestError) as excinfo:
+            await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        assert "having problems" in excinfo.value.user_message
+        assert "503" not in excinfo.value.user_message
 
     async def test_http_call_sets_authorization_header(self, spotify: Spotify) -> None:
         spotify.auth_token = "valid_token"

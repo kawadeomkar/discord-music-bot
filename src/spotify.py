@@ -79,12 +79,15 @@ def _track_search_title(track: dict[str, Any]) -> str:
 class SpotifyCollection:
     """Identity of a paged collection — what the enqueue embed renders.
 
-    name/artists/thumbnail/release_date are Optional/empty because the
-    PLAYLIST path cannot fill them: /v1/playlists/{id}/tracks returns the
-    paging object, and no `fields` mask yields the playlist's own name or
-    images (filling them would cost a second HTTP call the streaming design
-    does not budget for). Albums get all of it free from the single
-    GET /v1/albums/{id} call.
+    name/artists/thumbnail/release_date are Optional/empty because the PLAYLIST
+    path does not currently fill them: playlist_stream opens at
+    /v1/playlists/{id}/tracks, which returns the paging object and carries no
+    playlist identity under any `fields` mask. That is a choice of entry point,
+    NOT a cost: GET /v1/playlists/{id} returns name, images AND a `tracks`
+    paging object holding the first page — the same shape album_stream already
+    exploits — so filling them is one request either way. Deliberately deferred;
+    the consequence is that playlist embeds render without a title or cover art
+    while album embeds get both.
     """
 
     kind: SpotifyType
@@ -183,6 +186,26 @@ class SpotifyAuthError(Exception):
             f"Spotify rejected the credentials (HTTP {status})"
             + (f": {detail}" if detail else "")
         )
+
+
+class SpotifyRequestError(Exception):
+    """A non-2xx Spotify response that is neither a credential rejection nor a
+    429. The args carry the endpoint and params for the log and the span; only
+    user_message is safe to show, the same split ExtractionError uses. Before
+    this existed the raw text was the error embed, so a failed page told the
+    user the request URL and its offset."""
+
+    def __init__(self, status: int, endpoint: str, params: Any = None) -> None:
+        self.status = status
+        super().__init__(f"endpoint: {endpoint} stat: {status} params: {params}")
+
+    @property
+    def user_message(self) -> str:
+        if self.status == 404:
+            return "Spotify has no such track, album or playlist — check the link."
+        if self.status >= 500:
+            return "Spotify is having problems right now. Please try again shortly."
+        return "Spotify could not be reached right now. Please try again."
 
 
 class SpotifyRateLimitError(Exception):
@@ -335,10 +358,7 @@ class Spotify:
                             resp.status, f"endpoint: {endpoint_route}"
                         )
                     if resp.status != 429:
-                        raise Exception(
-                            f"endpoint: {endpoint_route} stat: {resp.status} "
-                            f"params: {params}"
-                        )
+                        raise SpotifyRequestError(resp.status, endpoint_route, params)
                     retry_after = _retry_after_secs(resp)
             # Slot released before sleeping: holding it would idle a slot every
             # other caller could be using.

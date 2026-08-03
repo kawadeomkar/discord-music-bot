@@ -45,6 +45,7 @@ from src.spotify import (
     SpotifyAuthError,
     SpotifyCollection,
     SpotifyRateLimitError,
+    SpotifyRequestError,
     TrackPage,
 )
 from src.youtube import YTDL, QueueObject
@@ -151,6 +152,26 @@ class TestCommandErrorRendering:
         detail = call.args[2]
         assert detail == "[youtube] v9: Video unavailable"
         assert "ExtractionError" not in detail  # not the raw type: message form
+
+    async def test_spotify_request_error_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Every page of every collection is a door to this error; the raw args
+        carry the endpoint and the offset, which are not the user's business."""
+        err = SpotifyRequestError(
+            503, "https://api.spotify.com/v1/albums/6WgS/tracks", {"offset": 50}
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert "api.spotify.com" not in detail
+        assert "offset" not in detail
 
     async def test_unexpected_extraction_error_is_generic(
         self, music_bot: MusicBot, mock_ctx: MagicMock
