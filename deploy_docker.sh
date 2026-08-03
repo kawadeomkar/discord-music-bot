@@ -16,6 +16,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# Turns HISTORY_ARCHIVE_ENABLED into the `archive` compose profile, so the flag
+# in .env is the only thing an operator sets and no tracked file is ever edited.
+# Before the preflight below, which reports on the resolved state.
+resolve_archive_profile
 # This script is the one that STARTS containers, so it is the one that has to
 # carry the credential preflight. build_docker.sh also calls it, but only
 # build_docker.sh — and `just up`, a rollback, and the README's own enable and
@@ -91,7 +95,21 @@ fi
 # Putting it here rather than in build_docker.sh also covers rollbacks, which the
 # branch's version does not.
 
+# Deactivating a profile does not stop what it already started: compose leaves a
+# running postgres alone and `down` without the profile cannot see it either. So
+# say so — the operator who just turned the archive off expects the database to
+# go away, and silence here looks like it did.
+if [ "$ARCHIVE_ENABLED" -eq 0 ] \
+    && [ -n "$(docker ps -q --filter 'name=^discord-postgres$' 2>/dev/null)" ]; then
+    echo "WARNING: the archive is disabled but discord-postgres is still running" >&2
+    echo "         from an earlier enabled deploy. This deploy leaves it up." >&2
+    echo "         Stop it with: just down   (then re-run this deploy)" >&2
+    echo "         Archived rows survive in the postgres-data volume either way." >&2
+fi
+
 echo "Deploying $TAG (ENVIRONMENT=$ENVIRONMENT)"
 # Only the bot's own container is recreated — Redis, the POT sidecar and
 # otel-lgtm are unchanged by a new bot tag, so compose leaves them running.
+# With the archive enabled, COMPOSE_PROFILES also brings up postgres and the
+# db-migrate one-shot (idempotent — it exits 0 when the schema is current).
 docker compose up -d

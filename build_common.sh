@@ -195,6 +195,59 @@ _env_value() {
         || true
 }
 
+# resolve_archive_profile — turn HISTORY_ARCHIVE_ENABLED into the compose
+# `archive` profile, so the flag is the only switch an operator sets and no
+# tracked file is ever edited. Exports COMPOSE_PROFILES (the compose-side gate)
+# and ARCHIVE_ENABLED (0/1, for callers that branch on it).
+#
+# Compose cannot do this itself: profiles activate only from COMPOSE_PROFILES or
+# --profile, and interpolation has no value-conditional form (`${FLAG:+archive}`
+# yields `archive` for `false` too, measured). So the parse happens here.
+#
+# The export is unconditional, EMPTY VALUE INCLUDED. Compose reads the process
+# environment ahead of .env, so exporting an empty list is what makes a flag
+# flipped back to false stop deploying postgres even when an older .env still
+# carries COMPOSE_PROFILES=archive. Only that one element is owned here; any
+# other profile the operator set is preserved.
+#
+# Garbage exits 1 with config.parse_history_archive_enabled's own vocabulary:
+# setup_hook refuses to start on it, and a deploy that silently disagreed with
+# the bot it is deploying is the worst available outcome.
+resolve_archive_profile() {
+    local env_file=".env" flag profiles rest item
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    case "$flag" in
+        "" | false | 0 | no) ARCHIVE_ENABLED=0 ;;
+        true | 1 | yes) ARCHIVE_ENABLED=1 ;;
+        *)
+            echo "HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no" >&2
+            echo "(case-insensitive); got '$flag'. The bot refuses to start on this" >&2
+            echo "value, so the deploy refuses too." >&2
+            exit 1
+            ;;
+    esac
+
+    # Rebuild the list without `archive` rather than appending to it: this runs
+    # on every deploy, so a plain append would accumulate duplicates, and a
+    # disabled flag has to be able to REMOVE the element it did not add.
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
+    rest=""
+    while IFS= read -r item; do
+        case "$item" in "" | archive) continue ;; esac
+        rest="${rest:+$rest,}$item"
+    done <<< "$(printf '%s' "$profiles" | tr ',' '\n' | tr -d '[:blank:]')"
+
+    if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+        COMPOSE_PROFILES="${rest:+$rest,}archive"
+        echo "History archive: ENABLED — deploying postgres + db-migrate" >&2
+    else
+        COMPOSE_PROFILES="$rest"
+        echo "History archive: disabled — no postgres deployed (the default)" >&2
+    fi
+    export COMPOSE_PROFILES ARCHIVE_ENABLED
+}
+
 # warn_default_postgres_password — compose-path preflight, called only from
 # build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #

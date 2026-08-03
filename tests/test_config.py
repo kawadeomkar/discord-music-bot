@@ -528,6 +528,159 @@ class TestComposeMatchesTheDefault:
         assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4
 
 
+class TestArchiveProfileDerivation:
+    """`HISTORY_ARCHIVE_ENABLED` is the ONLY switch: build_common.sh's
+    resolve_archive_profile turns it into compose's `archive` profile on every
+    deploy path, so opting in never means editing a tracked file.
+
+    Run rather than grepped. The parser duplicates
+    config.parse_history_archive_enabled in shell — a language that cannot import
+    it — and the failure mode of a wrong answer is silent in both directions: a
+    truthy spelling that resolves to no profile gives an archive-enabled bot no
+    database, and a falsy one that resolves to `archive` deploys long-term
+    storage nobody opted in to.
+    """
+
+    @staticmethod
+    def _resolve(
+        tmp_path: Path, dotenv: str = "", **env: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run resolve_archive_profile against a throwaway .env and report what it
+        exported. Deliberately NOT inheriting os.environ: this machine's own
+        shell exports POSTGRES_* and could export the flag too, which would make
+        the cases below assert against the developer's environment."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source ./build_common.sh; resolve_archive_profile; printf "%s" "$COMPOSE_PROFILES"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("value", ["true", "TRUE", "True", "1", "yes", " true "])
+    def test_truthy_spellings_activate_the_profile(
+        self, value: str, tmp_path: Path
+    ) -> None:
+        # Every spelling config.py accepts, or the deploy silently disagrees with
+        # the bot it is deploying.
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", ""])
+    def test_falsy_spellings_deactivate_it(self, value: str, tmp_path: Path) -> None:
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_unset_is_the_off_default(self, tmp_path: Path) -> None:
+        # Fail-closed, matching the bot: absence of a choice means no collection
+        # and therefore no database.
+        assert self._resolve(tmp_path).stdout == ""
+
+    def test_the_flag_is_read_from_dotenv(self, tmp_path: Path) -> None:
+        # The operator sets it in .env and runs a deploy script; nothing exports
+        # it into that script's environment.
+        assert (
+            self._resolve(tmp_path, dotenv="HISTORY_ARCHIVE_ENABLED=true\n").stdout
+            == "archive"
+        )
+
+    def test_the_environment_wins_over_dotenv(self, tmp_path: Path) -> None:
+        # Compose's own precedence, and the same order warn_default_postgres_password
+        # uses. The bot agrees: the compose file passes HISTORY_ARCHIVE_ENABLED
+        # through valuelessly, so a set one overrides env_file for the container too.
+        result = self._resolve(
+            tmp_path,
+            dotenv="HISTORY_ARCHIVE_ENABLED=true\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == ""
+
+    def test_garbage_refuses_the_deploy(self, tmp_path: Path) -> None:
+        """setup_hook raises on `on`/`maybe` rather than picking a side, so the
+        deploy must too — deploying a database for a bot that will refuse to
+        start is worse than failing here, where the message is on screen."""
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED="on")
+        assert result.returncode == 1
+        assert "HISTORY_ARCHIVE_ENABLED" in result.stderr
+
+    def test_other_profiles_survive(self, tmp_path: Path) -> None:
+        # Only the `archive` element is owned here. Clobbering the list would
+        # silently drop an operator's own profile on every deploy.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="true", COMPOSE_PROFILES="ops"
+        )
+        assert result.stdout == "ops,archive"
+
+    def test_a_stale_archive_entry_is_removed_when_the_flag_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """The migration path: installs that predate the derivation carry
+        COMPOSE_PROFILES=archive in .env. Flipping the flag to false has to
+        override it, which works only because the export happens even when the
+        resulting list is EMPTY — the process environment beats .env in compose,
+        an unset variable does not."""
+        result = self._resolve(
+            tmp_path,
+            dotenv="COMPOSE_PROFILES=ops,archive\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == "ops"
+
+    def test_the_profile_is_not_duplicated(self, tmp_path: Path) -> None:
+        # Runs on every deploy, and build_docker.sh resolves before exec'ing
+        # deploy_docker.sh, which resolves again over the exported result.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="1", COMPOSE_PROFILES="archive"
+        )
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("script", ["deploy_docker.sh", "build_docker.sh"])
+    def test_both_pipelines_resolve_the_profile(self, script: str) -> None:
+        """deploy_docker.sh is the only script that starts containers, so a
+        missing call there is the whole feature missing; build_docker.sh calls it
+        early so a garbage flag fails before the gate and the image build."""
+        text = (Path(__file__).resolve().parent.parent / script).read_text()
+        assert "resolve_archive_profile" in text
+
+    def test_the_deploy_resolves_before_it_starts_containers(self) -> None:
+        # Order, not presence: an export after `docker compose up` is a no-op.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        assert text.index("resolve_archive_profile") < text.index("docker compose up")
+
+    def test_the_bot_receives_the_same_flag_it_deploys_on(self) -> None:
+        """The compose file must pass HISTORY_ARCHIVE_ENABLED through VALUELESSLY.
+        Written with a value it would ignore .env; omitted entirely, an exported
+        flag would steer the profile while the container still read .env — the
+        two-switch drift this whole mechanism exists to remove, reintroduced
+        between the deploy shell and the bot."""
+        assert re.search(r"^\s*- HISTORY_ARCHIVE_ENABLED$", _compose_directives(), re.M)
+
+    def test_an_external_postgres_needs_no_tracked_file_edit(self) -> None:
+        """The bot and both one-shots build their DSN as ${POSTGRES_URL:-<parts>},
+        so a URL in .env wins. The old instruction was to comment out these
+        lines, which conflicted on every `git pull`."""
+        overridable = re.findall(
+            r"- POSTGRES_URL=\$\{POSTGRES_URL:-", _compose_directives()
+        )
+        assert len(overridable) == 3
+
+    def test_the_docs_no_longer_ship_a_second_switch(self) -> None:
+        """`.env.example` is copied verbatim into .env by setup_env.sh, so a
+        commented-out COMPOSE_PROFILES line there is an invitation to uncomment
+        one — recreating the pair the derivation replaced."""
+        example = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+        assert not re.search(r"^#?\s*COMPOSE_PROFILES=", example, re.M)
+
+
 class TestSetupEnvTightensTheEnvFile:
     """setup_env.sh is the escape hatch from the shared default, so the file it
     writes the replacement into must not be world-readable.

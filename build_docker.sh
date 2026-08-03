@@ -13,6 +13,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# Resolved here too, not only in deploy_docker.sh: a garbage
+# HISTORY_ARCHIVE_ENABLED must fail before ~24s of checks and a full image
+# build, not after. The exported list survives the exec below and the deploy leg
+# re-resolves it anyway — the rebuild is idempotent, `archive` is stripped and
+# re-added rather than appended.
+resolve_archive_profile
 # Warn before the test gate + image build, so an operator on the default
 # credential sees it now rather than after ~24s of checks and a full image
 # build. It only WARNS: compose has a fallback for the password, so refusing to
