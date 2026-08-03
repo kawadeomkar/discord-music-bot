@@ -173,7 +173,7 @@ class GuildQueue:
         passes it back via put(..., expected_generation=...); clear() and
         bump_generation() increment it, so every later page is refused instead
         of refilling a queue the user just emptied (or a guild being torn
-        down). The check happens INSIDE put()'s mutex hold — reading this
+        down). The check happens inside put()'s mutex hold — reading this
         property and then calling put() without expected_generation is a
         TOCTOU bug, not an alternative. See docs/ARCHITECTURE.md#queue-invariant."""
         return self._generation
@@ -271,7 +271,7 @@ class GuildQueue:
         """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
-        An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
+        An in-flight head (dequeued but uncommitted) keeps its position ahead of
         the inserted items on the display leg and forces the mirror down the
         rebuild path: its Redis entry still sits at the list head awaiting a
         commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the

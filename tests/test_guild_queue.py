@@ -276,7 +276,7 @@ class TestPutFront:
         mock_author: MagicMock,
     ) -> None:
         """A dequeued-but-uncommitted head (completed prefetch) must keep its
-        place AHEAD of the inserted items on display and Redis — its
+        place ahead of the inserted items on display and Redis — its
         commit-time LPOP retires ITS entry, not the new front item."""
         a, b = _qobj(1, mock_author), _qobj(2, mock_author)
         await gq.put([a, b])
@@ -1043,7 +1043,7 @@ class TestGenerationCounter:
         store: GuildRedisStore,
         mock_author: MagicMock,
     ) -> None:
-        """The generation check must run INSIDE the mutex hold.
+        """The generation check must run inside the mutex hold.
 
         test_stale_put_refused_no_leg_touched cannot pin the placement: clear()
         bumps synchronously, so its snapshot is already stale before the put is
@@ -1103,7 +1103,7 @@ class TestGenerationCounter:
     async def test_empty_items_put_still_respects_generation(
         self, gq: GuildQueue
     ) -> None:
-        """The generation check comes FIRST: even a no-op page must tell a
+        """The generation check comes first: even a no-op page must tell a
         preempted drain to stop consuming pages."""
         gen = gq.generation
         await gq.bump_generation()

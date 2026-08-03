@@ -283,7 +283,7 @@ class TestParseInput:
 
     def test_unsupported_spotify_link_propagates(self) -> None:
         """The fallback-eats-the-error regression guard: an /artist/ link must
-        surface UnsupportedSpotifyLinkError to the caller, NOT fall back to a
+        surface UnsupportedSpotifyLinkError to the caller, not fall back to a
         `ytsearch:https://…` search the way a ValueError would."""
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
         with pytest.raises(UnsupportedSpotifyLinkError):

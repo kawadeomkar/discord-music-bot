@@ -1318,6 +1318,34 @@ and reaching the gate's own timeout tears the player down and refuses the finish
 per-guild enqueue lock, stalling `-shuffle` and YouTube-playlist enqueues behind Spotify
 I/O). Timing out keeps what already arrived and reports a partial enqueue.
 
+### Spotify collection paging
+
+Albums and playlists resolve through async-generator pagers (`album_stream`,
+`playlist_stream`) yielding `TrackPage`s of YouTube search titles, so `-play` can enqueue
+page 1 and start playback while the rest arrives.
+
+**Album vs playlist paging differ for a reason.** An album's page 1 rides the single
+`GET /v1/albums/{id}` that also returns its identity (name, artists, cover art, total),
+and later pages fan out concurrently by offset — safe *only* because albums are immutable
+once released. A playlist can be edited between requests, which shifts every offset and
+would silently duplicate or drop tracks, so `playlist_stream` follows the `next` cursor
+sequentially. Do not copy the fanout onto the playlist path.
+
+**Cache discipline.** `spotify:{album,playlist}_tracks:{id}` is written only when the
+consumer iterates *past* the final page — i.e. the generator resumes after its last yield.
+A partially-consumed generator (`-playnow` taking page 1 only, a preemption, a mid-stream
+error, an `aclose()`) takes `GeneratorExit` at a yield and never reaches the write, so a
+truncated collection can never poison the entry. Nothing awaits on that path: an await
+during finalization is illegal, and the resulting unraisable warning is a hard test
+failure under `filterwarnings=["error"]`. An empty result is never cached either — the
+edit that follows "no queueable tracks" is usually the user adding the songs.
+
+**Rate limiting.** Un-truncating playlists turned one request per command into
+`ceil(total/100)`, and the enqueue lock is per guild, so a process-wide semaphore is the
+only bound on app-wide request rate against a single client-credentials app. A 429 is
+retried on its `Retry-After` (capped) and then raised as `SpotifyRateLimitError`, which
+the drain reports as "wait" rather than "re-run" — a re-run refetches every page.
+
 ### Now Playing host model
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the

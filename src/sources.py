@@ -77,7 +77,7 @@ def spotify_titles_to_ytsearch(titles: list[str]) -> list[YTSource]:
 class UnsupportedSpotifyLinkError(Exception):
     """A Spotify URL naming a type this bot does not queue (/artist/, /show/, …).
 
-    Deliberately NOT a ValueError: parse_input catches ValueError and falls back
+    Deliberately not a ValueError: parse_input catches ValueError and falls back
     to a YouTube search, which would turn an /artist/ link into a nonsense
     `ytsearch:https://open.spotify.com/...` query instead of an error the user
     can act on.

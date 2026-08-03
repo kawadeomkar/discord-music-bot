@@ -30,11 +30,10 @@ _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
 _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h — albums are immutable once released
 
-# Collection paging. The limits are Spotify's, not ours: 51 on an album-tracks
-# request and 101 on a playlist request are both HTTP 400. _ALBUM_PAGE_LIMIT applies only to the explicit
-# /albums/{id}/tracks?limit= requests WE issue — the first page arrives inside
-# GET /v1/albums/{id}, whose stride is Spotify's choice and must be read off
-# the response (album_stream), never assumed.
+# Paging limits are Spotify's, not ours: 51 on an album-tracks request and 101
+# on a playlist request are both HTTP 400. _ALBUM_PAGE_LIMIT applies only to the
+# /albums/{id}/tracks?limit= requests we issue — page 1 arrives inside
+# GET /v1/albums/{id}, whose stride is read off the response, never assumed.
 _ALBUM_PAGE_LIMIT = 50
 _PLAYLIST_PAGE_LIMIT = 100
 _ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst
@@ -43,24 +42,20 @@ _ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst
 # entire >100-track truncation bug.
 _PLAYLIST_FIELDS = "next,total,items(track(type,name,artists(name)))"
 # aiohttp's default is ClientTimeout(total=300) — one hung page would hold the
-# per-guild collection lock (musicbot.py) for five minutes. 30s is generous
-# for a single JSON page. Bounds ONE request, not a stream: the drain's own
-# wall-clock cap lives in musicbot._COLLECTION_DRAIN_TIMEOUT_SECS.
+# per-guild collection lock for five minutes. Bounds one request, not a stream;
+# the drain's own cap is musicbot._COLLECTION_DRAIN_TIMEOUT_SECS.
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
-# 429 handling. Pagination turned one request per command into ceil(total/100),
-# and the collection lock is per guild, so nothing bounds the app-wide rate
-# against a single client-credentials app. The semaphore caps concurrent calls
-# process-wide (the per-guild lock cannot); the retries absorb the transient
-# 429 that a burst earns. Loop-agnostic since 3.10, so module scope is safe.
+# Pagination made one request per command into ceil(total/100), and the
+# collection lock is per guild, so only this semaphore bounds the app-wide rate
+# against one client-credentials app. Loop-agnostic since 3.10, so module scope
+# is safe.
 _MAX_CONCURRENT_REQUESTS = 10
 _MAX_429_RETRIES = 3
-# Spotify's Retry-After on a sustained burst can be minutes. Anything past this
-# is not worth holding the enqueue lock for — surface it and let the user retry.
-# _MAX_429_RETRIES * this (30s) stays under musicbot._COLLECTION_DRAIN_TIMEOUT_SECS
-# (45s), so ONE rate-limited page can be absorbed inside a drain's budget while
-# sustained limiting trips the drain bound instead. Both report honestly; keep
-# the inequality if either moves.
+# Capped because Spotify's Retry-After can be minutes. _MAX_429_RETRIES * this
+# (30s) stays under musicbot._COLLECTION_DRAIN_TIMEOUT_SECS (45s), so one
+# rate-limited page fits inside a drain's budget while sustained limiting trips
+# the drain bound instead. Keep that inequality if either moves.
 _MAX_RETRY_AFTER_SECS = 10.0
 _request_slots = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
@@ -82,7 +77,7 @@ class SpotifyCollection:
     path does not currently fill them: playlist_stream opens at
     /v1/playlists/{id}/tracks, which returns the paging object and carries no
     playlist identity under any `fields` mask. That is a choice of entry point,
-    NOT a cost: GET /v1/playlists/{id} returns name, images AND a `tracks`
+    not a cost: GET /v1/playlists/{id} returns name, images and a `tracks`
     paging object holding the first page — the same shape album_stream already
     exploits — so filling them is one request either way. Deliberately deferred;
     the consequence is that playlist embeds render without a title or cover art
@@ -141,7 +136,7 @@ def _collection_from_cache(
     """Parse a cached collection. None ⇒ treat as a cache miss (unparseable
     entries are re-fetched, not crashed on). Every field reads with a default
     so entries written by an older build stay readable — but a field of the
-    WRONG TYPE is garbage, not an older build, and the whole entry is a miss:
+    wrong type is garbage, not an older build, and the whole entry is a miss:
     a corrupt `total` would otherwise flow uncoerced into embed copy
     (guild_state.py's wire discipline)."""
     if not isinstance(raw, dict):
@@ -211,7 +206,7 @@ class SpotifyRateLimitError(Exception):
     """Spotify returned 429 and the bounded retries did not clear it.
 
     Distinct from a generic request failure because the caller's advice differs:
-    a rate-limited drain must NOT tell the user to re-run the command — the
+    a rate-limited drain must not tell the user to re-run the command — the
     re-run refetches every page from 1 and doubles the load that earned the 429.
     """
 
@@ -421,18 +416,9 @@ class Spotify:
         return await self._cached_call(f"spotify:track:{tid}", _TRACK_TTL, fetch)
 
     # ── Streaming collection pagers ───────────────────────────────────────────
-    # Async generators, deliberately NOT span-decorated: start_as_current_span
-    # would open and close the span around generator *construction*, not its
-    # consumption — attributes go on the caller's current span instead.
-    #
-    # Cache discipline (shared by both): the cache is written ONLY when the
-    # consumer iterates past the final page — i.e. the generator resumes after
-    # its last yield. A partially-consumed generator (-playnow's page-1-only
-    # path, a preemption, a mid-stream error, aclose()) takes GeneratorExit at
-    # a yield and never reaches the write, so a truncated collection can never
-    # poison the entry. Nothing awaits on the GeneratorExit path — an await
-    # there is illegal during finalization, and the resulting unraisable
-    # warning is a hard test failure under filterwarnings=["error"].
+    # Async generators, not span-decorated: the span would wrap construction,
+    # not consumption. Both cache only on a full drain, and nothing awaits on
+    # the GeneratorExit path. See docs/ARCHITECTURE.md#spotify-collection-paging.
 
     async def album_stream(self, aid: str) -> AsyncGenerator[TrackPage]:
         """Yield an album's tracks as TrackPages of YouTube search titles.
@@ -440,7 +426,7 @@ class Spotify:
         Page 1 rides GET /v1/albums/{id}: one call returns the album's
         identity (name, artists, cover art, total) AND its first tracks page,
         so a ≤stride album costs a single HTTP round-trip. Later pages use a
-        concurrent offset fanout — safe ONLY because albums are immutable
+        concurrent offset fanout — safe only because albums are immutable
         once released; a mutable collection paged by offset can silently
         duplicate or drop tracks when an edit lands between requests, which
         is why playlist_stream pages sequentially. Do not copy the fanout
@@ -477,11 +463,9 @@ class Spotify:
         all_titles = list(page1)
         if tracks.get("next") is None:
             yield TrackPage(collection=collection, titles=page1, is_last=True)
-            # Reached only when the consumer drains past the last page — see
-            # the cache-discipline comment above. Empty is never cached: album
-            # immutability makes a real empty album safe to cache, but it does
-            # nothing for a malformed or partial response, which is the far
-            # likelier explanation — and that one would stick for 24h.
+            # Reached only on a full drain. Empty is never cached: immutability
+            # makes a real empty album safe, but not a malformed or partial
+            # response, which would stick for 24h.
             if all_titles:
                 await cache_set(
                     self._redis,
@@ -503,7 +487,7 @@ class Spotify:
             wave = offsets[wave_start : wave_start + _ALBUM_PAGE_CONCURRENCY]
             try:
                 async with asyncio.TaskGroup() as tg:
-                    # TaskGroup, not gather: a failed page CANCELS its
+                    # TaskGroup, not gather: a failed page cancels its
                     # siblings instead of leaving them hitting Spotify with
                     # their results discarded. No yield happens inside the
                     # group — every wave completes before its pages go out.
@@ -550,7 +534,7 @@ class Spotify:
     async def playlist_stream(self, pid: str) -> AsyncGenerator[TrackPage]:
         """Yield a playlist's tracks as TrackPages of YouTube search titles.
 
-        Pages sequentially via the `next` cursor — REQUIRED because playlists
+        Pages sequentially via the `next` cursor — required because playlists
         are mutable: an edit landing between two offset requests shifts every
         later offset and silently duplicates or drops tracks. `next`
         carries the fields mask forward, so following it needs no
@@ -560,7 +544,7 @@ class Spotify:
 
         Skipped items are real (removed/local tracks arrive as null,
         episodes without artists), so collection.total is an upper bound —
-        consumers report the ENQUEUED count, never total.
+        consumers report the enqueued count, never total.
         """
         span = trace.get_current_span()
         span.set_attribute("spotify.playlist_id", pid)
@@ -606,11 +590,9 @@ class Spotify:
                 break
             resp = await self._playlist_page(next_url)
         if not all_titles:
-            # Never cache "empty". _PLAYLIST_TTL is 1h *because* playlists are
-            # user-editable, and the edit that matters most is the one that
-            # follows this result: the user is told "no queueable tracks", adds
-            # songs, retries — and a cached empty answer repeats the error for
-            # an hour. The cost of not caching it is one request.
+            # Never cache "empty": _PLAYLIST_TTL is 1h because playlists are
+            # user-editable, and the edit that follows this result is the user
+            # adding the songs it just reported missing. Costs one request.
             return
         await cache_set(
             self._redis,

@@ -6089,7 +6089,7 @@ class TestInterject:
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
-                interrupted song comes back PLAYING at its pause position
+                interrupted song comes back playing at its pause position
         ."""
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song

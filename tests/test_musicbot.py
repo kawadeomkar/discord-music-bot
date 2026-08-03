@@ -2586,7 +2586,7 @@ class TestPlayWhilePaused:
     async def test_collection_queues_in_full_and_resumes(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """A paused -play <collection> must NOT interject.
+        """A paused -play <collection> must not interject.
 
         Interjection resolves to exactly one song, so collapsing here would
         discard the rest of the playlist and answer with "use -play for the
@@ -4405,7 +4405,7 @@ class TestPlayStreamIntegration:
         mock_ctx: MagicMock,
     ) -> None:
         """The latency property the streaming design exists for: page 1 is
-        consumed INSIDE the playback-gate hold, the tail strictly after it.
+        consumed inside the playback-gate hold, the tail strictly after it.
         _playback_holds is the real hold count defer_playback maintains, read
         at each yield — moving _drain_stream_tail back inside the
         AsyncExitStack turns the tail's 0s into 1s."""
@@ -4806,7 +4806,7 @@ class TestBeginStreamEnqueue:
     async def test_teardown_during_page1_fetch_queues_nothing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """A teardown landing INSIDE the page-1 round-trip must not enqueue.
+        """A teardown landing inside the page-1 round-trip must not enqueue.
 
         cleanup() pops the player before bumping the generation, so a snapshot
         taken after the pop reads the post-teardown value and every page then
@@ -4843,7 +4843,7 @@ class TestBeginStreamEnqueue:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Ordering matrix row 3: restored entries exist, so the whole
-        collection buffers into ONE put_front — successive streamed put_fronts
+        collection buffers into one put_front — successive streamed put_fronts
         would invert page order (put_front inserts at the head)."""
         col = _scollection(SpotifyType.PLAYLIST, total=150)
         pages = [
@@ -4941,7 +4941,7 @@ class TestBeginStreamEnqueue:
     async def test_front_without_backlog_streams(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Ordering matrix row 2: memory AND mirror empty — appending to an
+        """Ordering matrix row 2: memory and mirror empty — appending to an
         empty queue IS front insertion, so the fast streamed path applies."""
         col = _scollection(SpotifyType.ALBUM, total=60)
         pages = [
@@ -5113,7 +5113,7 @@ class TestDrainStreamTail:
             if c.kwargs.get("embed") is not None
         ]
         assert any("taking too long" in (d or "") for d in notices), notices
-        # The completion notice must NOT also fire — the drain did not complete.
+        # The completion notice must not also fire — the drain did not complete.
         assert not any("finished queueing" in (d or "") for d in notices), notices
         await resolved.aclose()
 

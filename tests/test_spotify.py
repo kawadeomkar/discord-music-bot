@@ -684,7 +684,7 @@ def _playlist_api(
 ) -> tuple[Any, list[dict[str, Any]]]:
     """An http_call side_effect emulating /v1/playlists/{id}/tracks with a
     `next` cursor. extra_items are appended to page 1 (for skip-guard tests)
-    and do NOT count toward `total`'s real-track numbering."""
+    and do not count toward `total`'s real-track numbering."""
     calls: list[dict[str, Any]] = []
     page = 100
 
@@ -1086,11 +1086,9 @@ class TestPlaylistStream:
         weird: list[dict[str, Any]] = [
             {"track": None},
             {"track": {"type": "episode", "name": "Podcast Ep 1"}},
-            # Disqualified by `type` ALONE — it carries a name and artists, so
-            # the name/artists guard below would pass it straight through. The
-            # only item in this list that isolates the `type` check; without it
-            # the guard can be deleted with the suite still green, and episodes
-            # queue as arbitrary YouTube search hits.
+            # Disqualified by `type` alone — it carries a name and artists, so
+            # the next guard would pass it through. The only item here that
+            # isolates the `type` check.
             {
                 "track": {
                     "type": "episode",
