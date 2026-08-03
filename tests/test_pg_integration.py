@@ -154,6 +154,34 @@ def _entry(
         thumbnail=f"https://img/{n}.jpg",
         uploader="Chan",
         played_at=1752530000.0 + n if played_at is None else played_at,
+        queued_at=1752529000.0 + n,
+        queue_position=n,
+    )
+
+
+def _play(
+    *,
+    guild_id: int = 42,
+    url: str,
+    title: str = "Song",
+    requester_id: int = 1,
+    requester_name: str = "user",
+    played_secs: int = 100,
+    duration_secs: int = 200,
+    played_at: float,
+) -> HistoryEntry:
+    """A leaderboard fixture row: everything the aggregates group or rank by is
+    a parameter, and played_at is required because play_history_dedup collapses
+    two plays of one URL that share it."""
+    return HistoryEntry(
+        guild_id=guild_id,
+        title=title,
+        webpage_url=url,
+        duration_secs=duration_secs,
+        played_secs=played_secs,
+        requester_id=requester_id,
+        requester_name=requester_name,
+        played_at=played_at,
     )
 
 
@@ -445,6 +473,12 @@ def _boundary_entries() -> list[HistoryEntry]:
         HistoryEntry(guild_id=7, webpage_url="u/negts", played_at=-1e12),
         HistoryEntry(guild_id=7, webpage_url="u/nan", played_at=float("nan")),
         HistoryEntry(guild_id=7, webpage_url="u/ceil", played_at=253402300799.0),
+        # queued_at rides the same _EPOCH_FIELDS clamp; queue_position is int4.
+        HistoryEntry(guild_id=7, webpage_url="u/qhuge", queued_at=1e300),
+        HistoryEntry(guild_id=7, webpage_url="u/qnan", queued_at=float("nan")),
+        HistoryEntry(guild_id=7, webpage_url="u/qceil", queued_at=253402300799.0),
+        HistoryEntry(guild_id=7, webpage_url="u/qpneg", queue_position=-1),
+        HistoryEntry(guild_id=7, webpage_url="u/qp31", queue_position=2**31),
         # NUL in each text field.
         HistoryEntry(guild_id=7, webpage_url="u/t", title="a\x00b"),
         HistoryEntry(guild_id=7, webpage_url="u/w\x00url"),
@@ -481,6 +515,7 @@ class TestSchemaLock:
             ("played_secs", -1, "play_history_played_secs_valid"),
             ("duration_secs", -1, "play_history_duration_valid"),
             ("message_id", -1, "play_history_message_id_valid"),
+            ("queue_position", -1, "play_history_queue_position_valid"),
         ],
     )
     async def test_constraints_catch_a_validator_regression(
@@ -696,6 +731,214 @@ class TestMessageIdColumn:
         await archive.insert_batch([_entry(2)])
         (got,) = await archive.recent(42, 10)
         assert got.message_id == 0
+
+
+class TestEnqueueStampColumns:
+    """queued_at / queue_position reach Postgres. Both default to the unknown
+    zero value, so a value dropped between the wire and the INSERT lands cleanly
+    and reads back indistinguishable from a legacy row — only a round trip
+    against a real server catches it."""
+
+    async def test_stamps_survive_the_round_trip(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        stamped = replace(_entry(1), queued_at=1752529000.25, queue_position=4)
+        await archive.insert_batch([stamped])
+        (got,) = await archive.recent(42, 10)
+        assert got.queued_at == 1752529000.25
+        assert got.queue_position == 4
+
+    async def test_unstamped_entry_reads_back_as_the_unknown_sentinel(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # queued_at 0.0 lands as to_timestamp(0), not NULL — the same sentinel
+        # played_at uses, so the zero-value convention holds across the tier.
+        await archive.insert_batch(
+            [replace(_entry(2), queued_at=0.0, queue_position=0)]
+        )
+        (got,) = await archive.recent(42, 10)
+        assert (got.queued_at, got.queue_position) == (0.0, 0)
+
+
+class TestLeaderboard:
+    """The aggregates against a real server. fakeredis has no Postgres and
+    mocking fetch() would only assert the mock, so every SQL semantic —
+    grouping, sentinel exclusion, latest-value pick, tie-breaks, the period
+    cutoff — is pinned here or nowhere."""
+
+    async def test_requesters_ranked_by_played_secs(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [
+                _play(url="u/1", requester_id=1, played_secs=100, played_at=1000.0),
+                _play(url="u/2", requester_id=1, played_secs=50, played_at=1001.0),
+                _play(url="u/3", requester_id=2, played_secs=400, played_at=1002.0),
+            ]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert [(r.requester_id, r.played_secs, r.plays) for r in board.requesters] == [
+            (2, 400, 1),
+            (1, 150, 2),
+        ]
+
+    async def test_songs_group_by_url_and_show_the_newest_title(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Titles drift (uploader edits, "[Official Video]" suffixes) while the
+        # URL is stable identity, so one URL is one row titled by its last play.
+        await archive.insert_batch(
+            [
+                _play(
+                    url="u/1",
+                    title="Old Title",
+                    duration_secs=200,
+                    played_secs=10,
+                    played_at=1000.0,
+                ),
+                _play(
+                    url="u/1",
+                    title="New Title",
+                    duration_secs=210,
+                    played_secs=20,
+                    played_at=2000.0,
+                ),
+            ]
+        )
+        (song,) = (await archive.leaderboard(42, 10)).songs
+        assert song.title == "New Title"
+        assert song.duration_secs == 210
+        assert (song.plays, song.played_secs) == (2, 30)
+
+    async def test_newest_requester_name_wins(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [
+                _play(
+                    url="u/1", requester_id=1, requester_name="old", played_at=1000.0
+                ),
+                _play(
+                    url="u/2", requester_id=1, requester_name="new", played_at=2000.0
+                ),
+            ]
+        )
+        (leader,) = (await archive.leaderboard(42, 10)).requesters
+        assert leader.requester_name == "new"
+
+    async def test_unknown_requester_is_excluded_but_still_counts_for_songs(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # requester_id 0 is the unknown sentinel: one merged pseudo-user would
+        # pollute a top-10, while the plays are still real listening time.
+        await archive.insert_batch(
+            [_play(url="u/1", requester_id=0, played_secs=90, played_at=1000.0)]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert board.requesters == []
+        assert [(s.webpage_url, s.played_secs) for s in board.songs] == [("u/1", 90)]
+
+    async def test_unknown_url_is_excluded_but_still_counts_for_requesters(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [_play(url="", requester_id=1, played_secs=90, played_at=1000.0)]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert board.songs == []
+        assert [(r.requester_id, r.played_secs) for r in board.requesters] == [(1, 90)]
+
+    async def test_boards_are_per_guild(self, archive: PostgresHistoryArchive) -> None:
+        await archive.insert_batch(
+            [
+                _play(guild_id=1, url="u/1", requester_id=1, played_at=1000.0),
+                _play(guild_id=2, url="u/2", requester_id=2, played_at=1000.0),
+            ]
+        )
+        board = await archive.leaderboard(1, 10)
+        assert [r.requester_id for r in board.requesters] == [1]
+        assert [s.webpage_url for s in board.songs] == ["u/1"]
+
+    async def test_limit_caps_both_boards(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [
+                _play(url=f"u/{i}", requester_id=i, played_secs=i, played_at=1000.0 + i)
+                for i in range(1, 6)
+            ]
+        )
+        board = await archive.leaderboard(42, 2)
+        assert len(board.requesters) == 2
+        assert len(board.songs) == 2
+
+    async def test_ties_break_deterministically(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Equal played_secs -> more plays first, then the group key ascending.
+        # Without this the ordering assertions above could flake on plan changes.
+        await archive.insert_batch(
+            [
+                _play(url="u/a", requester_id=9, played_secs=100, played_at=1000.0),
+                _play(url="u/b", requester_id=3, played_secs=50, played_at=1001.0),
+                _play(url="u/c", requester_id=3, played_secs=50, played_at=1002.0),
+                _play(url="u/d", requester_id=5, played_secs=100, played_at=1003.0),
+            ]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert [(r.requester_id, r.plays) for r in board.requesters] == [
+            (3, 2),  # same 100 seconds, but two plays
+            (5, 1),  # tie on both -> lower id first
+            (9, 1),
+        ]
+
+    async def test_totals_exceed_int4(self, archive: PostgresHistoryArchive) -> None:
+        # sum() over integer returns bigint; a client that narrowed it would
+        # overflow here rather than in a year's worth of real plays.
+        big = 2_000_000_000
+        await archive.insert_batch(
+            [
+                _play(url="u/1", requester_id=1, played_secs=big, played_at=1000.0),
+                _play(url="u/2", requester_id=1, played_secs=big, played_at=1001.0),
+            ]
+        )
+        (leader,) = (await archive.leaderboard(42, 10)).requesters
+        assert leader.played_secs == 2 * big
+
+    async def test_empty_guild_returns_empty_boards(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        board = await archive.leaderboard(42, 10)
+        assert board.requesters == [] and board.songs == []
+
+    async def test_cutoff_excludes_older_plays(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch(
+            [
+                _play(url="u/old", requester_id=1, played_secs=500, played_at=1000.0),
+                _play(url="u/new", requester_id=2, played_secs=10, played_at=3000.0),
+            ]
+        )
+        board = await archive.leaderboard(42, 10, since_epoch=2000.0)
+        assert [r.requester_id for r in board.requesters] == [2]
+        assert [s.webpage_url for s in board.songs] == ["u/new"]
+
+    async def test_cutoff_is_inclusive(self, archive: PostgresHistoryArchive) -> None:
+        await archive.insert_batch([_play(url="u/1", requester_id=1, played_at=2000.0)])
+        board = await archive.leaderboard(42, 10, since_epoch=2000.0)
+        assert [r.requester_id for r in board.requesters] == [1]
+
+    async def test_unknown_time_rows_appear_only_in_all_time_boards(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # played_at 0.0 is the unknown sentinel (backfilled legacy entries), so
+        # any real cutoff excludes it by definition — documented, not a bug.
+        await archive.insert_batch(
+            [_play(url="u/1", requester_id=1, played_secs=90, played_at=0.0)]
+        )
+        assert (await archive.leaderboard(42, 10)).requesters != []
+        assert (await archive.leaderboard(42, 10, since_epoch=1.0)).requesters == []
 
 
 class TestRejectionDedup:
