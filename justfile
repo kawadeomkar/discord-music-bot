@@ -475,8 +475,19 @@ _dotenv := '''
     # without this every recipe below died with "POSTGRES_URL is not set" on the
     # exact stack the README tells you to run, including db-backfill, which is
     # the mandatory step before the history lists are capped.
-    if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
-        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
+    #
+    # The password FALLS BACK, exactly as compose does. It did not, and that was
+    # a lockout generator rather than a missing convenience: on the stack the
+    # default now enables (only DISCORD_TOKEN in .env) every recipe here died
+    # with "POSTGRES_URL is unset" and advised ./setup_env.sh — which mints a
+    # NEW password, while the postgres volume was already initialised on the
+    # default. The next `just run` then built a DSN the database rejects, and
+    # because the archive connects lazily the bot started fine and surfaced it
+    # much later as a drainer backoff loop. That is precisely the two-step trap
+    # .env.example and the -ping advisory warn about, reached by following this
+    # file's own advice. Keep this default in step with docker-compose.yml's.
+    if [ -z "${POSTGRES_URL:-}" ]; then
+        export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
     fi
 '''
 
@@ -501,9 +512,10 @@ setup *ARGS:
 run:
     #!/usr/bin/env bash
     {{ _dotenv }}
+    # _dotenv always derives a DSN now (the password falls back like compose's),
+    # so this only fires if someone exported an empty POSTGRES_URL by hand.
     if [ -z "${POSTGRES_URL:-}" ]; then
-        echo "POSTGRES_URL is unset and could not be derived from .env." >&2
-        echo "Run ./setup_env.sh, or export POSTGRES_URL yourself." >&2
+        echo "POSTGRES_URL is empty. Unset it to let .env supply one, or set it." >&2
         exit 1
     fi
     exec {{ quote(VENV_BIN / 'python') }} -m src.main
@@ -534,6 +546,7 @@ db-backfill *ARGS:
     #!/usr/bin/env bash
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
+
 # The one Redis-side operator recipe. It exists because XLEN alone cannot tell
 # apart four states that call for four different responses, and working that out
 # by hand during an incident is the wrong time to learn the commands:
@@ -639,6 +652,14 @@ db-rejects COUNT='10':
 db-backup:
     #!/usr/bin/env bash
     {{ _dotenv }}
+    # A dump is the whole play_history table — every guild id, user id and song
+    # title the bot has ever recorded — and the shell's redirect below creates it
+    # under the ambient umask, which is 022 on a stock macOS or Ubuntu account.
+    # That published the entire history to every local account, in a directory
+    # (`backups/`) that then accumulates them. Set here rather than chmod'ing
+    # after the fact so the file is never briefly world-readable, and so the
+    # `backups/` mkdir is covered by the same rule.
+    umask 077
     mkdir -p backups
     out="backups/play_history_$(date +%F_%H%M%S).dump"
     # Dump to a temp file and rename only on success. Redirecting straight into

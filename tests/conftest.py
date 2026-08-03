@@ -124,6 +124,27 @@ def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     pool.shutdown(wait=False)
 
 
+@pytest.fixture(autouse=True)
+def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset the environment variables the suite asserts defaults for.
+
+    `just test` does not load .env, so the exposure is an EXPORTED variable.
+    POSTGRES_URL is the one that matters: a developer
+    shell almost always has it, carrying a REAL password, so every test of the
+    default-credential warning silently ran with the warning off — including the
+    -ping dashboard tests, which is how "the advisory renders on every
+    invocation" stayed unasserted. The opposite shell (one exporting the default)
+    would have flipped those same tests to two embeds. Neither is a state the
+    suite should depend on.
+
+    Scrubbed at setup, so a test that wants a value still just calls
+    monkeypatch.setenv and wins. Same shape as the ytdlp seam and the structlog
+    contextvar reset above: make the suite mean what it says regardless of the
+    shell it runs in.
+    """
+    monkeypatch.delenv("POSTGRES_URL", raising=False)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def configure_structlog_for_tests() -> None:
     """Configure structlog with minimal output for tests.
@@ -216,6 +237,12 @@ def mock_ctx(
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
     ctx.typing.return_value.__aexit__ = AsyncMock(return_value=None)
+    # Owner by default: for a self-hosted bot the application owner IS the
+    # operator, so it is the ordinary case for any command that gates on it
+    # (today, -ping's default-password advisory). Must be an AsyncMock — a bare
+    # MagicMock attribute returns something unawaitable and every such command
+    # dies with TypeError, which is how the gate first showed up in this suite.
+    ctx.bot.is_owner = AsyncMock(return_value=True)
     return ctx
 
 

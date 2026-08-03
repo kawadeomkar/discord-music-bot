@@ -70,7 +70,7 @@ from src.redis_client import (
     trim_outbox_below,
 )
 
-from tests.helpers import tier_enabled
+from tests.helpers import bind_loopback_only, tier_enabled
 
 # REDIS_TEST_URL enables the tier on its own, for the same reason
 # POSTGRES_TEST_URL does in the pg tier: a CI job that supplied the server but
@@ -130,7 +130,9 @@ def redis_url() -> Iterator[str]:
         )
         from testcontainers.redis import RedisContainer
 
-    with RedisContainer(_REDIS_IMAGE) as container:
+    container = RedisContainer(_REDIS_IMAGE)
+    bind_loopback_only(container, 6379)
+    with container:
         yield (
             f"redis://{container.get_container_host_ip()}"
             f":{container.get_exposed_port(6379)}/0"

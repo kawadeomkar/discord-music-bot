@@ -195,24 +195,46 @@ _env_value() {
         || true
 }
 
-# require_postgres_password — compose-path preflight, called only from
+# warn_default_postgres_password — compose-path preflight, called only from
 # build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #
-# docker-compose.yml interpolates `${POSTGRES_PASSWORD:?}` for both the postgres
-# service and the bot's POSTGRES_URL, so compose would catch an unset password on
-# its own — but only at `up`, after the whole image build. Fail here instead,
-# with a message that says what to do.
-require_postgres_password() {
+# Renamed from require_postgres_password, which stopped requiring anything when
+# the default landed: it returns 0 on every path now. Safe to rename — the
+# file's declared "Fixed API" above names only resolve_environment,
+# run_test_gate and build_runtime_image.
+#
+# The play-history archive is a required tier, but the password is NOT: compose
+# falls back to a known default so `docker compose up` works with nothing
+# configured but DISCORD_TOKEN. So this warns rather than exits — a build that
+# refused to proceed would put back the first-run cliff the default removed.
+#
+# The bot repeats the warning at startup and on every -ping, which are the
+# surfaces an operator actually watches; this one just catches it earlier, at
+# build time, with the same remedy.
+warn_default_postgres_password() {
     local env_file=".env"
     if [ ! -f "$env_file" ]; then
-        echo "Error: $env_file not found — run ./setup_env.sh to create it." >&2
-        exit 1
+        # NOT "compose will use its built-in defaults" — that was wrong and the
+        # README (§Requirements) says so: docker-compose.yml declares
+        # `env_file: .env`, and Compose treats a MISSING one as an error, not a
+        # warning. The password has a fallback; the file itself does not.
+        echo "WARNING: $env_file not found. Compose declares env_file: .env and" >&2
+        echo "         treats a missing one as an error, so \`docker compose up\`" >&2
+        echo "         will fail regardless of any default. Run ./setup_env.sh." >&2
+        return 0
     fi
-    if [ -z "$(_env_value POSTGRES_PASSWORD "$env_file")" ]; then
-        echo "Error: POSTGRES_PASSWORD is not set in $env_file." >&2
-        echo "       The postgres service and the bot's POSTGRES_URL are both" >&2
-        echo "       built from it, and it has no fallback by design." >&2
-        echo "       Run ./setup_env.sh to generate one." >&2
-        exit 1
+    local value
+    value="$(_env_value POSTGRES_PASSWORD "$env_file")"
+    if [ -z "$value" ] || [ "$value" = "password" ]; then
+        echo "WARNING: POSTGRES_PASSWORD is unset or still the default in $env_file." >&2
+        echo "         The play-history database will accept 'password' from" >&2
+        echo "         anything that can reach the host's published port." >&2
+        echo "         Fix it IN THIS ORDER — the bot's warning reads its DSN, so" >&2
+        echo "         doing (2) first silences it while the server still accepts" >&2
+        echo "         the old password:" >&2
+        echo "           1. docker compose exec postgres psql -U <user> \\" >&2
+        echo "                -c \"ALTER USER <user> PASSWORD '<new>'\"" >&2
+        echo "           2. ./setup_env.sh --force, with the same value" >&2
+        echo "           3. docker compose up -d   (the DSN is baked at create time)" >&2
     fi
 }

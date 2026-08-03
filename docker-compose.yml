@@ -21,21 +21,26 @@ services:
       # POSTGRES_URL coming from env_file — to point at an EXTERNAL Postgres
       # instead, comment this line out and set POSTGRES_URL in .env directly.
       #
-      # `${VAR:?}` is Compose's mandatory-variable form (POSIX parameter
-      # expansion): unset OR empty fails the command outright instead of
-      # silently defaulting. Deliberately terse — Compose emits "required
-      # variable POSTGRES_PASSWORD is missing a value" on its own, and the
-      # friendly, actionable message lives in build_common.sh's
-      # require_postgres_password preflight, which fires before the image build
-      # rather than at `up`. Do NOT give it a `:-` fallback: a defaulted
-      # password would bring the stack up with a credential nobody chose.
+      # `${POSTGRES_PASSWORD:-password}` deliberately DOES default. This used to
+      # be Compose's mandatory `${VAR:?}` form, which failed `up` outright — a
+      # correct instinct that made the very first command in the README unusable
+      # until you had run a setup script, for a bot whose database is bound to
+      # loopback. The default trades that cliff for a credential nobody chose,
+      # and pays for it with noise rather than silence: the bot logs an ERROR at
+      # startup and renders a warning embed on every -ping for as long as the
+      # default is in use (src/config.using_default_postgres_password).
+      #
+      # That trade holds ONLY while the published port stays bound to 127.0.0.1
+      # (see the postgres service below). If you ever widen that binding, remove
+      # this fallback in the same change — a default credential on a
+      # network-reachable database is not a warning-level problem.
       #
       # The host port is a variable because the bot runs on the HOST network
       # namespace, so it reaches Postgres through the published port rather
       # than the compose network — and 5432 is exactly the port a
       # already-installed local Postgres occupies. POSTGRES_HOST_PORT lets that
       # developer move ours without editing tracked files.
-      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
@@ -133,8 +138,15 @@ services:
       # Interpolated from the project .env at compose parse time (NOT env_file —
       # that would spray the bot's other secrets into this container). The
       # bot's POSTGRES_URL above is built from these same three values.
+      #
+      # The password FALLS BACK to a known default so `docker compose up` works
+      # with nothing configured but DISCORD_TOKEN. That is a first-run
+      # convenience and a liability afterwards, so the bot detects it and warns
+      # at startup and on every -ping (src/config.using_default_postgres_password).
+      # It is only defensible because the published port below is bound to
+      # 127.0.0.1; do not widen that binding without also removing this default.
       - POSTGRES_USER=${POSTGRES_USER:-musicbot}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       - POSTGRES_DB=${POSTGRES_DB:-musicbot}
     ports:
       # Loopback-bound, and the host side is overridable: the bot uses host
@@ -179,7 +191,7 @@ services:
       # Container networking here (not 127.0.0.1): unlike the bot, this service
       # is on the compose network, so it addresses postgres by service name and
       # is unaffected by POSTGRES_HOST_PORT.
-      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-musicbot}
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
     depends_on:
       postgres:
         condition: service_healthy
@@ -216,7 +228,15 @@ services:
       # matters more here than anywhere else: this is the only tool that treats
       # Redis as the SOURCE, so pointing it at the wrong one reports "0 entries
       # scanned" and exits 0, which reads as "nothing to migrate".
-      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-musicbot}
+      #
+      # `:-password` like every other service, and this one was MISSED when the
+      # default landed — it kept `:?`, and because Compose interpolates the whole
+      # document before profile filtering, an `ops`-profiled service broke every
+      # command in the file. `docker compose up` failed with only a
+      # DISCORD_TOKEN, which is the exact cliff the default exists to remove.
+      # A test now parses this file and asserts no POSTGRES_PASSWORD
+      # interpolation is mandatory, because nothing else in CI reads compose.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
       - REDIS_URL=redis://redis:6379
     depends_on:
       postgres:

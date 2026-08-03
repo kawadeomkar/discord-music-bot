@@ -63,6 +63,13 @@ COPY migrations/ ./migrations/
 # tier with FileNotFoundError while passing everywhere else — which is how a check
 # ends up skipped instead of fixed.
 COPY justfile ./
+# And the same again for the default-password coupling. The literal lives in four
+# places no Python import can reach — compose, the build preflight, the env
+# template and the generator — so the tests read those files to prove they have
+# not drifted, and setup_env.sh is executed against a temp copy to prove it
+# tightens .env's mode. All four have to be in the image or those guards are
+# container-tier failures rather than assertions.
+COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
