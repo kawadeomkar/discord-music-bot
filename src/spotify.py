@@ -45,8 +45,25 @@ _ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst 
 _PLAYLIST_FIELDS = "next,total,items(track(type,name,artists(name)))"
 # aiohttp's default is ClientTimeout(total=300) — one hung page would hold the
 # per-guild collection lock (musicbot.py) for five minutes. 30s is generous
-# for a single JSON page.
+# for a single JSON page. Bounds ONE request, not a stream: the drain's own
+# wall-clock cap lives in musicbot._COLLECTION_DRAIN_TIMEOUT_SECS.
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# 429 handling. Pagination turned one request per command into ceil(total/100),
+# and the collection lock is per guild, so nothing bounds the app-wide rate
+# against a single client-credentials app. The semaphore caps concurrent calls
+# process-wide (the per-guild lock cannot); the retries absorb the transient
+# 429 that a burst earns. Loop-agnostic since 3.10, so module scope is safe.
+_MAX_CONCURRENT_REQUESTS = 10
+_MAX_429_RETRIES = 3
+# Spotify's Retry-After on a sustained burst can be minutes. Anything past this
+# is not worth holding the enqueue lock for — surface it and let the user retry.
+# _MAX_429_RETRIES * this (30s) stays under musicbot._COLLECTION_DRAIN_TIMEOUT_SECS
+# (45s), so ONE rate-limited page can be absorbed inside a drain's budget while
+# sustained limiting trips the drain bound instead. Both report honestly; keep
+# the inequality if either moves.
+_MAX_RETRY_AFTER_SECS = 10.0
+_request_slots = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
@@ -168,6 +185,47 @@ class SpotifyAuthError(Exception):
         )
 
 
+class SpotifyRateLimitError(Exception):
+    """Spotify returned 429 and the bounded retries did not clear it.
+
+    Distinct from a generic request failure because the caller's advice differs:
+    a rate-limited drain must NOT tell the user to re-run the command — the
+    re-run refetches every page from 1 and doubles the load that earned the 429.
+    """
+
+    def __init__(self, retry_after: Optional[float] = None) -> None:
+        self.retry_after = retry_after
+        super().__init__(
+            "Spotify is rate-limiting this bot"
+            + (f"; retry after {retry_after:.0f}s" if retry_after else "")
+        )
+
+    @property
+    def user_message(self) -> str:
+        """The only text from this error safe to show a user — the raw args
+        carry the endpoint and params."""
+        if self.retry_after:
+            return (
+                f"Spotify is rate-limiting the bot right now. "
+                f"Try again in about {self.retry_after:.0f} seconds."
+            )
+        return "Spotify is rate-limiting the bot right now. Try again shortly."
+
+
+def _retry_after_secs(resp: aiohttp.ClientResponse) -> Optional[float]:
+    """Retry-After in seconds, or None when absent/unparseable. Spotify sends
+    the delta-seconds form; the HTTP-date form is not parsed (we would rather
+    fall back to the default backoff than mis-parse a date into a long sleep).
+    """
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except TypeError, ValueError:
+        return None
+
+
 class Spotify:
     """Thin async client for the Spotify Web API: handles client-credentials
     auth (with auto-refresh) and Redis-backed caching of track/playlist/artist/
@@ -251,21 +309,51 @@ class Spotify:
             headers = {}
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        async with self._session_factory(
-            json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
-        ) as session:
-            resp = await session.request(
-                http_method, endpoint_route, headers=headers, data=data, params=params
+        retry_after: Optional[float] = None
+        for attempt in range(_MAX_429_RETRIES + 1):
+            # The semaphore is the only app-wide bound: the collection lock is
+            # per guild, so N guilds draining concurrently would otherwise
+            # multiply the request rate against one client-credentials app.
+            async with _request_slots:
+                async with self._session_factory(
+                    json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
+                ) as session:
+                    resp = await session.request(
+                        http_method,
+                        endpoint_route,
+                        headers=headers,
+                        data=data,
+                        params=params,
+                    )
+                    if resp.status in (200, 201):
+                        return await resp.json(content_type=None)
+                    if resp.status in (401, 403):
+                        # Credential/token rejection — distinct from other non-2xx
+                        # codes so validate() can tell "bad credentials" from
+                        # "request failed".
+                        raise SpotifyAuthError(
+                            resp.status, f"endpoint: {endpoint_route}"
+                        )
+                    if resp.status != 429:
+                        raise Exception(
+                            f"endpoint: {endpoint_route} stat: {resp.status} "
+                            f"params: {params}"
+                        )
+                    retry_after = _retry_after_secs(resp)
+            # Slot released before sleeping: holding it would idle a slot every
+            # other caller could be using.
+            if attempt == _MAX_429_RETRIES:
+                break
+            delay = min(
+                retry_after if retry_after is not None else 2.0**attempt,
+                _MAX_RETRY_AFTER_SECS,
             )
-            if resp.status in (200, 201):
-                return await resp.json(content_type=None)
-            if resp.status in (401, 403):
-                # Credential/token rejection — distinct from other non-2xx codes
-                # so validate() can tell "bad credentials" from "request failed".
-                raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
-            raise Exception(
-                f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+            log.warning(
+                f"spotify 429 on {endpoint_route}; retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{_MAX_429_RETRIES})"
             )
+            await asyncio.sleep(delay)
+        raise SpotifyRateLimitError(retry_after)
 
     async def validate(self, track_id: str) -> None:
         """Exercise the configured credentials against the live Spotify API: force a

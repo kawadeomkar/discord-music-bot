@@ -30,6 +30,7 @@ from src.musicbot import (
     _ENQUEUE_MAX_WAITERS,
     _ENQUEUE_WAIT_SECS,
     _GuildEnqueueLock,
+    _StreamDrain,
     _check_voice_permissions,
     _is_collection,
     _typing_keepalive,
@@ -39,7 +40,12 @@ from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
 from src.sources import SoundcloudSource, SpotifySource, SpotifyType, YTSource, YTType
 from src.musicplayer import InterjectOutcome, _PLAYBACK_GATE_TIMEOUT
-from src.spotify import SpotifyAuthError, SpotifyCollection, TrackPage
+from src.spotify import (
+    SpotifyAuthError,
+    SpotifyCollection,
+    SpotifyRateLimitError,
+    TrackPage,
+)
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -4617,6 +4623,44 @@ class TestBeginStreamEnqueue:
         mock_ctx.message.add_reaction.assert_not_awaited()
         await resolved.aclose()
 
+    async def test_buffered_drain_timeout_queues_what_arrived(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The buffered drain holds the playback gate, so it must be bounded.
+
+        Left unbounded it can run to the gate's own 300s timeout, which tears
+        the player down and refuses the finished put_front — losing the whole
+        collection after five minutes of silence. Timing out keeps what
+        arrived.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=500)
+
+        async def _slow() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            yield _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False)
+            await asyncio.sleep(30)  # never arrives within the budget
+            yield _spage(col, ["never A"], is_last=True)
+
+        resolved = ResolvedSpotifyStream(SpotifyType.PLAYLIST, _slow())
+        mp = _stream_mp(music_bot, mock_ctx, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", 0.05):
+            drain = await music_bot._begin_stream_enqueue(
+                mock_ctx, resolved, mp, front=True
+            )
+
+        assert drain is None  # buffered path never returns a tail
+        mp.queue_put_front.assert_awaited_once()
+        assert len(mp.queue_put_front.await_args.args[0]) == 200
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("taking too long" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
     async def test_notification_failure_keeps_the_drain(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -4923,6 +4967,79 @@ class TestDrainStreamTail:
         final = mock_ctx.send.call_args_list[-1].kwargs["embed"].description
         assert "Queueing stopped" in final
         assert "200 songs" in final
+
+    async def test_tail_timeout_keeps_what_queued_and_releases(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The tail holds the per-guild enqueue lock, so it must be bounded.
+
+        Unbounded, a slow collection stalls -shuffle and every YouTube-playlist
+        enqueue in the guild until they are declined at _ENQUEUE_WAIT_SECS. It
+        returns rather than raising: the songs already queued ARE queued, so
+        play's handler must not report the command as failed.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=400)
+
+        async def _slow() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            await asyncio.sleep(30)
+            yield _spage(col, ["never A"], is_last=True)
+
+        resolved = ResolvedSpotifyStream(SpotifyType.PLAYLIST, _slow())
+        mp = _stream_mp(music_bot, mock_ctx)
+        drain = _StreamDrain(
+            resolved=resolved,
+            generation=0,
+            enqueued=100,
+            total=400,
+            completion_notice=True,
+        )
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", 0.05):
+            await music_bot._drain_stream_tail(mock_ctx, mp, drain)
+
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("taking too long" in (d or "") for d in notices), notices
+        # The completion notice must NOT also fire — the drain did not complete.
+        assert not any("finished queueing" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
+    async def test_rate_limited_tail_does_not_advise_rerunning(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The generic failure copy says "re-running will re-add the first N".
+        For a 429 that is the worst possible advice: the re-run refetches every
+        page from 1 and doubles the load that earned the limit."""
+        col = _scollection(SpotifyType.PLAYLIST, total=400)
+
+        async def _limited() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            raise SpotifyRateLimitError(7.0)
+
+        resolved = ResolvedSpotifyStream(SpotifyType.PLAYLIST, _limited())
+        mp = _stream_mp(music_bot, mock_ctx)
+        drain = _StreamDrain(
+            resolved=resolved,
+            generation=0,
+            enqueued=100,
+            total=400,
+            completion_notice=True,
+        )
+
+        await music_bot._drain_stream_tail(mock_ctx, mp, drain)
+
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("rate-limiting" in (d or "") for d in notices), notices
+        assert not any("Re-running" in (d or "") for d in notices), notices
+        await resolved.aclose()
 
     async def test_midstream_failure_sends_honest_notice_and_raises(
         self, music_bot: MusicBot, mock_ctx: MagicMock

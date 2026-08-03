@@ -31,7 +31,13 @@ from src.sources import (
     parse_input,
     spotify_titles_to_ytsearch,
 )
-from src.spotify import Spotify, SpotifyAuthError, SpotifyCollection, TrackPage
+from src.spotify import (
+    Spotify,
+    SpotifyAuthError,
+    SpotifyCollection,
+    SpotifyRateLimitError,
+    TrackPage,
+)
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -117,6 +123,16 @@ _ENQUEUE_WAIT_SECS = 60.0
 # user spamming -play with collections would otherwise pile up unbounded
 # waiters that all fire into the queue at once when the drain finishes.
 _ENQUEUE_MAX_WAITERS = 5
+# Wall-clock ceiling on a whole collection drain. _HTTP_TIMEOUT bounds ONE
+# request (30s), so without this a 100-page playlist could legally take 3000s
+# — and both drains run inside something already bounded: the buffered one
+# holds the playback gate (300s, after which the loop tears the player down and
+# the finished put_front is refused, discarding everything), and the streaming
+# tail holds the per-guild enqueue lock, stalling -shuffle and YouTube-playlist
+# enqueues behind Spotify network I/O until they are declined at
+# _ENQUEUE_WAIT_SECS. Under both, so neither is ever reached by a slow drain.
+# Timing out keeps what already arrived; it never discards it.
+_COLLECTION_DRAIN_TIMEOUT_SECS = 45.0
 
 
 class _GuildEnqueueLock:
@@ -585,9 +601,10 @@ class MusicBot(commands.Cog):
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
-        if isinstance(e, ExtractionError):
-            # Show the user-safe line, not the raw message, which can carry
-            # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
+        if isinstance(e, (ExtractionError, SpotifyRateLimitError)):
+            # Show the user-safe line, not the raw message: yt-dlp's carries
+            # bug-report boilerplate, and a rate-limit needs to say "wait",
+            # not name an endpoint. See each class's user_message.
             detail = e.user_message
         else:
             detail = f"**{type(e).__name__}:** {e}"
@@ -795,9 +812,27 @@ class MusicBot(commands.Cog):
             # the Redis mirror too: qsize()==0 with a mirror ghost must buffer,
             # or the append lands behind an entry the next LPOP wrongly retires.
             titles = list(page1.titles)
+            truncated = False
             async with contextlib.aclosing(resolved.pages) as pages:
-                async for page in pages:
-                    titles.extend(page.titles)
+                # aclosing OUTSIDE the timeout: on expiry the generator is
+                # suspended at an await inside __anext__, and aclose() must run
+                # after the cancellation has been converted, not during it.
+                try:
+                    async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                        async for page in pages:
+                            titles.extend(page.titles)
+                except TimeoutError:
+                    # Keep what arrived rather than discarding it: this drain
+                    # holds the playback gate, and running to the gate's own
+                    # 300s timeout tears the player down and refuses the
+                    # put_front below — losing the whole collection after a
+                    # five-minute silence.
+                    truncated = True
+                    log.warning(
+                        f"buffered {noun} drain hit "
+                        f"{_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s; queueing "
+                        f"{len(titles)} of ~{collection.total}"
+                    )
             if not titles:
                 raise ValueError(f"The {noun} has no queueable tracks")
             ok = await mp.queue_put_front(
@@ -814,6 +849,17 @@ class MusicBot(commands.Cog):
             await self._notify_stream_enqueued(
                 ctx, resolved.kind, collection, titles, enqueued=len(titles)
             )
+            if truncated:
+                with contextlib.suppress(Exception):
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"The {noun} was taking too long to load — queued "
+                            f"the first {len(titles)} "
+                            f"{pluralize(len(titles), 'song')}. Run the command "
+                            f"again to add the rest.",
+                            discord.Color.orange(),
+                        )
+                    )
             return None
 
         # Streaming path: page 1 in now, tail after the gate opens. prefetch
@@ -966,33 +1012,72 @@ class MusicBot(commands.Cog):
         span.set_attribute("spotify.total", drain.total)
         try:
             async with contextlib.aclosing(drain.resolved.pages) as pages:
-                async for page in pages:
-                    ok = await mp.queue_put(
-                        spotify_titles_to_ytsearch(page.titles),
-                        prefetch=False,
-                        expected_generation=drain.generation,
-                    )
-                    if not ok:
-                        # A clear/teardown landed: the collection this page
-                        # belongs to was deleted. Abandon without refilling —
-                        # the H2 regression this design exists to prevent.
-                        log.info("collection drain abandoned: queue invalidated")
-                        # Teardown-neutral copy: of the five doors that bump
-                        # the generation, only -clear empties the queue — the
-                        # others (-stop, kick, alone-timer, gate timeout)
-                        # deliberately leave pages 1..k persisted (review M5).
-                        with contextlib.suppress(Exception):
-                            await ctx.send(
-                                embed=notice_embed(
-                                    f"Queueing stopped after {drain.enqueued} "
-                                    f"{pluralize(drain.enqueued, 'song')} — "
-                                    "the queue was cleared or playback was "
-                                    "stopped.",
-                                    discord.Color.orange(),
+                # Bounded because this drain holds the per-guild enqueue lock:
+                # unbounded, a slow collection stalls -shuffle and every
+                # YouTube-playlist enqueue in the guild until they are declined
+                # at _ENQUEUE_WAIT_SECS. aclosing sits outside so aclose() runs
+                # after the cancellation is converted, not during it.
+                async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                    async for page in pages:
+                        ok = await mp.queue_put(
+                            spotify_titles_to_ytsearch(page.titles),
+                            prefetch=False,
+                            expected_generation=drain.generation,
+                        )
+                        if not ok:
+                            # A clear/teardown landed: the collection this page
+                            # belongs to was deleted. Abandon without refilling —
+                            # the H2 regression this design exists to prevent.
+                            log.info("collection drain abandoned: queue invalidated")
+                            # Teardown-neutral copy: of the five doors that bump
+                            # the generation, only -clear empties the queue — the
+                            # others (-stop, kick, alone-timer, gate timeout)
+                            # deliberately leave pages 1..k persisted (review M5).
+                            with contextlib.suppress(Exception):
+                                await ctx.send(
+                                    embed=notice_embed(
+                                        f"Queueing stopped after {drain.enqueued} "
+                                        f"{pluralize(drain.enqueued, 'song')} — "
+                                        "the queue was cleared or playback was "
+                                        "stopped.",
+                                        discord.Color.orange(),
+                                    )
                                 )
-                            )
-                        return
-                    drain.enqueued += len(page.titles)
+                            return
+                        drain.enqueued += len(page.titles)
+        except TimeoutError:
+            # Budget spent. What is queued stays queued and the command ends
+            # here rather than holding the enqueue lock any longer — every
+            # other queue command in the guild is waiting on it.
+            log.warning(
+                f"collection drain hit {_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s "
+                f"after {drain.enqueued} songs"
+            )
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')} — the rest was taking "
+                        f"too long to load. Run the command again to add the "
+                        f"remainder.",
+                        discord.Color.orange(),
+                    )
+                )
+            return
+        except SpotifyRateLimitError as e:
+            # Deliberately NOT the generic "re-running will re-add" copy below:
+            # a re-run refetches every page from 1 and doubles the load that
+            # earned the 429. Tell them to wait instead.
+            log.warning(f"collection drain rate-limited after {drain.enqueued} songs")
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')}. {e.user_message}",
+                        discord.Color.orange(),
+                    )
+                )
+            return
         except Exception:
             # H3 → honest notice, no resume machinery: resume-from-offset is
             # unsound for playlists (an edit shifts every offset — the same

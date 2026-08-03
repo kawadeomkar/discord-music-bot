@@ -14,10 +14,14 @@ from src.sources import SpotifyType
 from src.spotify import (
     _ALBUM_PAGE_CONCURRENCY,
     _HTTP_TIMEOUT,
+    _MAX_429_RETRIES,
+    _MAX_CONCURRENT_REQUESTS,
+    _MAX_RETRY_AFTER_SECS,
     _PLAYLIST_FIELDS,
     _collection_from_cache,
     Spotify,
     SpotifyAuthError,
+    SpotifyRateLimitError,
     TrackPage,
 )
 
@@ -206,6 +210,121 @@ def _resp(status: int, payload: dict[str, Any]) -> AsyncMock:
     resp.status = status
     resp.json = AsyncMock(return_value=payload)
     return resp
+
+
+def _resp_429(retry_after: Optional[str] = None) -> AsyncMock:
+    resp = AsyncMock()
+    resp.status = 429
+    resp.headers = {} if retry_after is None else {"Retry-After": retry_after}
+    return resp
+
+
+class TestRateLimitHandling:
+    """429s are retried with Retry-After rather than surfacing raw.
+
+    Pagination turned one request per command into ceil(total/100) and the
+    collection lock is per guild, so nothing else bounds the app-wide rate
+    against a single client-credentials app.
+    """
+
+    async def test_retries_after_429_then_succeeds(self, spotify: Spotify) -> None:
+        session = _make_mock_session(AsyncMock())
+        session.request = AsyncMock(
+            side_effect=[_resp_429("0.5"), _resp(200, {"ok": True})]
+        )
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        with patch("src.spotify.asyncio.sleep", new=AsyncMock()) as sleep:
+            got = await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        assert got == {"ok": True}
+        assert session.request.await_count == 2
+        sleep.assert_awaited_once_with(0.5)
+
+    async def test_exhausted_retries_raise_rate_limit_error(
+        self, spotify: Spotify
+    ) -> None:
+        """The error type is what stops the drain telling the user to re-run —
+        a re-run refetches every page and doubles the load that earned the 429."""
+        session = _make_mock_session(_resp_429("3"))
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock()),
+            pytest.raises(SpotifyRateLimitError) as excinfo,
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        assert excinfo.value.retry_after == 3.0
+        assert "try again in about 3 seconds" in excinfo.value.user_message.lower()
+        # The endpoint must not reach the user-facing text.
+        assert "api.spotify.com" not in excinfo.value.user_message
+        assert session.request.await_count == _MAX_429_RETRIES + 1
+
+    async def test_retry_after_is_capped(self, spotify: Spotify) -> None:
+        """Spotify can answer with minutes; the enqueue lock is not worth
+        holding that long."""
+        session = _make_mock_session(_resp_429("600"))
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock()) as sleep,
+            pytest.raises(SpotifyRateLimitError),
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        assert [c.args[0] for c in sleep.await_args_list] == [
+            _MAX_RETRY_AFTER_SECS
+        ] * _MAX_429_RETRIES
+
+    async def test_missing_retry_after_falls_back_to_backoff(
+        self, spotify: Spotify
+    ) -> None:
+        session = _make_mock_session(_resp_429())
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock()) as sleep,
+            pytest.raises(SpotifyRateLimitError) as excinfo,
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        assert excinfo.value.retry_after is None
+        assert [c.args[0] for c in sleep.await_args_list] == [1.0, 2.0, 4.0]
+
+    async def test_concurrent_calls_are_bounded_process_wide(
+        self, spotify: Spotify
+    ) -> None:
+        """The collection lock is per guild, so only this semaphore stops N
+        draining guilds multiplying the rate against one Spotify app."""
+        in_flight = 0
+        peak = 0
+
+        async def slow_request(*a: Any, **kw: Any) -> AsyncMock:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return _resp(200, {"ok": True})
+
+        session = _make_mock_session(AsyncMock())
+        session.request = AsyncMock(side_effect=slow_request)
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        await asyncio.gather(
+            *(
+                spotify.http_call("https://api.spotify.com/v1/albums/a1")
+                for _ in range(_MAX_CONCURRENT_REQUESTS * 3)
+            )
+        )
+
+        assert peak <= _MAX_CONCURRENT_REQUESTS
 
 
 class TestSpotifyValidate:
