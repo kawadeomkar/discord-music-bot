@@ -9,9 +9,9 @@
 # The split across stages is a time budget, and it is the whole design:
 #
 #   pre-commit  ruff (~0.13s) + trivia    fast enough to never think about
-#   pre-push    just check (~24s)         the "will CI pass" gate, once per push
+#   pre-push    just check (~28s)         the "will CI pass" gate, once per push
 #
-# pyright (6s) and pytest (14s) are deliberately NOT on pre-commit. A hook slow
+# pyright (~8s) and pytest (~26s) are deliberately NOT on pre-commit. A hook slow
 # enough to interrupt your train of thought is a hook that teaches you to reach
 # for --no-verify, and that habit costs more than the checks ever caught.
 #
@@ -77,7 +77,7 @@ repos:
   - repo: local
     hooks:
       - id: just-check
-        name: just check (ruff + pyright + pytest)
+        name: just check (parallel)
         # `language: system` runs this against git's ambient PATH, so `just` must be
         # installed system-wide -- see the README's Requirements. Do NOT "fix" that
         # with `language: python` + `additional_dependencies: [rust-just]`:
@@ -98,6 +98,16 @@ repos:
         # only deletions produces exactly that — the gate would report "Skipped"
         # on precisely the change most likely to break the build.
         always_run: true
+        # pre-commit renders one dotted status line per HOOK, and it runs hooks
+        # strictly sequentially — so N live status lines would mean N sequential
+        # hooks, which is exactly the ~36s this gate stopped paying when `check`
+        # went concurrent. `verbose` buys the granularity back without the time:
+        # pre-commit prints a passing hook's output too, and `check` ends with a
+        # per-task ✓/✗ recap. One line while it runs, six once it lands.
+        #
+        # Splitting this into one hook per tool is therefore a real trade, not an
+        # oversight — it would restore live per-tool lines at full sequential cost.
+        verbose: true
         stages: [pre-push]
 
       # Keeps the task file canonically formatted, which `make` had no equivalent

@@ -382,10 +382,103 @@ pins:
 # imports. Dropping it was intentional, not an oversight; this note exists because
 # the diff that dropped it did not say so.
 #
+# The check set, in the order their results are recapped. A variable rather than a
+# dependency list because `check` runs them concurrently and has to name them twice
+# (fan out, then recap) — two literal lists would be two definitions of the gate, and
+# the second one to be updated would silently stop being checked. CI still invokes the
+# recipes individually, so this list is not what makes them run there.
+CHECKS := "fmt-justfile pins fmt-check lint types test"
+
 # [doc] and not a trailing `#` line — see the note on test-report.
+#
+# Concurrent, and deliberately WITHOUT fail-fast. Sequentially this is the sum of every
+# recipe (~36s); concurrently it is pytest's solo time (~26s), because pyright's ~8s
+# fits entirely inside pytest's window and the four fast checks cost ~1.3s combined.
+# pytest is therefore the floor — no arrangement here beats it without xdist.
+#
+# Not `[parallel]`, which would express exactly this and was tried first. It shares one
+# stdout across the dependencies, and pytest writes progress continuously for 26s, so a
+# concurrent tool's diagnostics land INSIDE them — an observed run spliced a pyright
+# error between two of pytest's dots, where nobody would ever read it. Each task's
+# output is captured to a file and replayed grouped for that reason. The status lines
+# are the only thing written live, one printf each so they stay line-atomic.
+#
+# No fail-fast is a deliberate reversal of what the sequential form did: a lint failure
+# used to hide whatever pyright and pytest would have said, so a fix-push cycle
+# discovered the failures one at a time. Everything runs, everything is reported, and
+# the cost is that a check failing at 0.2s still pays the full ~26s.
+#
+# The `_tools` guards are ordinary sequential dependencies so they resolve BEFORE the
+# fan-out. Under `[parallel]` just de-duplicates them by (recipe, arguments) and they
+# run once; a fan-out into child `just` processes cannot, and under DOCKER=1 that means
+# four children racing `test-image-rebuild` on the same tag. Resolving them up front
+# leaves the children with a warm image and nothing to build.
 [doc("What CI's lint and test jobs run — run this before pushing")]
 [group('check')]
-check: fmt-justfile pins fmt-check lint types test
+check: (_tools 'ruff') (_tools 'pyright') (_tools 'pytest')
+    #!/usr/bin/env bash
+    # No `-e`: a failing task must not abort the recipe before the rest are reaped.
+    set -uo pipefail
+
+    JUST=({{ quote(just_executable()) }} --justfile {{ quote(justfile()) }})
+    read -ra names <<< "{{ CHECKS }}"
+
+    # Escapes only when stdout is a terminal. pre-commit captures the hook's output, and
+    # a recap full of literal \033[32m is worse than an uncoloured one.
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+        red=$'\033[31m'; green=$'\033[32m'; bold=$'\033[1m'; off=$'\033[0m'
+    else
+        red=''; green=''; bold=''; off=''
+    fi
+
+    log_dir="$(mktemp -d)"
+    trap 'rm -rf "$log_dir"' EXIT
+
+    # Flush left, no indent, and that is not a style choice: pre-commit prints a hook's
+    # captured output as out.strip(), which eats the leading whitespace of the FIRST
+    # line only — an indented recap arrived with its first row shifted two columns out
+    # of line with the other five.
+    status_line() {  # name rc secs
+        if [ "$2" = 0 ]; then
+            printf '%s✓%s %-14s %4ss\n' "$green" "$off" "$1" "$3"
+        else
+            printf '%s✗%s %-14s %4ss  (exit %s)\n' "$red" "$off" "$1" "$3" "$2"
+        fi
+    }
+
+    for n in "${names[@]}"; do
+        {
+            start=$SECONDS
+            "${JUST[@]}" "$n" > "$log_dir/$n.out" 2>&1
+            rc=$?
+            secs=$((SECONDS - start))
+            printf '%s\n' "$rc" > "$log_dir/$n.rc"
+            printf '%s\n' "$secs" > "$log_dir/$n.t"
+            status_line "$n" "$rc" "$secs"
+        } &
+    done
+    wait
+
+    # Failing output, grouped and in CHECKS order rather than completion order, so a
+    # given failure is always in the same place regardless of how the run interleaved.
+    fail=0
+    for n in "${names[@]}"; do
+        rc="$(cat "$log_dir/$n.rc")"
+        [ "$rc" = 0 ] && continue
+        fail=1
+        printf '\n%s%s── %s failed (exit %s) %s%s\n' "$bold" "$red" "$n" "$rc" "──" "$off"
+        cat "$log_dir/$n.out"
+    done
+
+    # Recap only on failure: the live lines have scrolled past the diagnostics by now,
+    # and on a green run they already said everything this would.
+    if [ "$fail" != 0 ]; then
+        printf '\n'
+        for n in "${names[@]}"; do
+            status_line "$n" "$(cat "$log_dir/$n.rc")" "$(cat "$log_dir/$n.t")"
+        done
+    fi
+    exit "$fail"
 
 # `test`, plus the coverage/JUnit artifacts CI's PR-comment action consumes. Defined in
 # terms of `test` rather than repeating the pytest invocation, so this can never become
