@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from src.sources import SpotifyType
 from src.spotify import (
     _ALBUM_PAGE_CONCURRENCY,
+    _ALBUM_TTL,
     _HTTP_TIMEOUT,
     _MAX_429_RETRIES,
     _MAX_CONCURRENT_REQUESTS,
@@ -841,6 +842,35 @@ class TestAlbumStream:
         assert len(pages) == 1
         assert pages[0].titles == [] and pages[0].is_last
 
+    async def test_empty_album_is_not_cached(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
+        """Immutability makes a genuinely empty album safe to cache, but it
+        does nothing for a malformed or partial response — the likelier
+        explanation, and one that would stick for 24h."""
+        api, _ = _album_api("albempty2", total=0, page1_limit=50)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            await _drain(spotify.album_stream("albempty2"))
+
+        assert await fake_redis.get("spotify:album_tracks:albempty2") is None
+
+    async def test_single_page_album_is_cached(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
+        """The early-return write covers every album that fits one page — i.e.
+        essentially all of them. Only the multi-page write was asserted, so
+        deleting this one cost a Spotify call per play with a green suite."""
+        api, _ = _album_api("alb1p", total=11, page1_limit=50)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)) as call:
+            await _drain(spotify.album_stream("alb1p"))
+            first_calls = call.await_count
+            # A second stream must be served entirely from the cache.
+            pages = await _drain(spotify.album_stream("alb1p"))
+            assert call.await_count == first_calls
+
+        assert await fake_redis.ttl("spotify:album_tracks:alb1p") == _ALBUM_TTL
+        assert len([t for p in pages for t in p.titles]) == 11
+
     async def test_fanout_concurrency_capped(self, spotify: Spotify) -> None:
         api, _ = _album_api("albcap", total=976, page1_limit=50)
         active = 0
@@ -1034,6 +1064,18 @@ class TestPlaylistStream:
         weird: list[dict[str, Any]] = [
             {"track": None},
             {"track": {"type": "episode", "name": "Podcast Ep 1"}},
+            # Disqualified by `type` ALONE — it carries a name and artists, so
+            # the name/artists guard below would pass it straight through. The
+            # only item in this list that isolates the `type` check; without it
+            # the guard can be deleted with the suite still green, and episodes
+            # queue as arbitrary YouTube search hits.
+            {
+                "track": {
+                    "type": "episode",
+                    "name": "Podcast Ep 2",
+                    "artists": [{"name": "Host"}],
+                }
+            },
             {"track": {"name": "Maskless Episode"}},  # no type, no artists
             {"track": {"type": "track", "name": "", "artists": [{"name": "A"}]}},
         ]
@@ -1042,6 +1084,49 @@ class TestPlaylistStream:
             pages = await _drain(spotify.playlist_stream("plweird"))
         titles = [t for p in pages for t in p.titles]
         assert titles == ["T0 A", "T1 A", "T2 A"]
+
+    async def test_empty_playlist_yields_one_empty_last_page(
+        self, spotify: Spotify
+    ) -> None:
+        """Ported from main's deleted test_playlist_empty_items_returns_empty_list;
+        TestAlbumStream had an equivalent, the playlist side never did."""
+        api, _ = _playlist_api("plempty", total=0)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            pages = await _drain(spotify.playlist_stream("plempty"))
+        assert len(pages) == 1
+        assert pages[0].titles == [] and pages[0].is_last
+
+    async def test_empty_playlist_is_not_cached(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
+        """A negative cache here repeats "no queueable tracks" for an hour.
+
+        _PLAYLIST_TTL is 1h *because* playlists are user-editable, and the edit
+        that matters most is the one the error prompts: the user is told the
+        playlist is empty, adds songs, retries — and gets the cached emptiness
+        back. Not caching it costs one request.
+        """
+        api, _ = _playlist_api("plempty2", total=0)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            await _drain(spotify.playlist_stream("plempty2"))
+
+        assert await fake_redis.get("spotify:playlist_tracks:plempty2") is None
+
+    async def test_all_episode_playlist_is_not_cached(
+        self, spotify: Spotify, fake_redis: aioredis.Redis
+    ) -> None:
+        """Same rule via the skip guards: every item filtered out is still an
+        empty result, and the playlist can gain a real track a minute later."""
+        episodes: list[dict[str, Any]] = [
+            {"track": {"type": "episode", "name": f"Ep {i}", "artists": []}}
+            for i in range(3)
+        ]
+        api, _ = _playlist_api("plpods", total=0, extra_items=episodes)
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
+            pages = await _drain(spotify.playlist_stream("plpods"))
+
+        assert [t for p in pages for t in p.titles] == []
+        assert await fake_redis.get("spotify:playlist_tracks:plpods") is None
 
     async def test_multi_artist_track_renders_all_artists(
         self, spotify: Spotify

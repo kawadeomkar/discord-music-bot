@@ -459,13 +459,17 @@ class Spotify:
         if tracks.get("next") is None:
             yield TrackPage(collection=collection, titles=page1, is_last=True)
             # Reached only when the consumer drains past the last page — see
-            # the cache-discipline comment above.
-            await cache_set(
-                self._redis,
-                cache_key,
-                _collection_to_cache(collection, all_titles),
-                _ALBUM_TTL,
-            )
+            # the cache-discipline comment above. Empty is never cached: album
+            # immutability makes a real empty album safe to cache, but it does
+            # nothing for a malformed or partial response, which is the far
+            # likelier explanation — and that one would stick for 24h.
+            if all_titles:
+                await cache_set(
+                    self._redis,
+                    cache_key,
+                    _collection_to_cache(collection, all_titles),
+                    _ALBUM_TTL,
+                )
             return
 
         # The first page's stride is Spotify's choice on a limit-less endpoint
@@ -582,6 +586,13 @@ class Spotify:
             if next_url is None:
                 break
             resp = await self._playlist_page(next_url)
+        if not all_titles:
+            # Never cache "empty". _PLAYLIST_TTL is 1h *because* playlists are
+            # user-editable, and the edit that matters most is the one that
+            # follows this result: the user is told "no queueable tracks", adds
+            # songs, retries — and a cached empty answer repeats the error for
+            # an hour. The cost of not caching it is one request.
+            return
         await cache_set(
             self._redis,
             cache_key,

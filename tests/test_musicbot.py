@@ -5,6 +5,7 @@ import redis.asyncio as aioredis
 import asyncio
 import contextlib
 import orjson
+import structlog.testing
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
@@ -4243,6 +4244,54 @@ class TestPlayAdmission:
         assert not entry.lock.locked()
 
 
+class TestResolvedSpotifyStreamAclose:
+    """aclose()'s already-settled arms. Both run on the mainline Spotify-outage
+    path (`-play <collection>` with page 1 failing), and both are guarded
+    against the *other* terminal state — a task is done for three different
+    reasons and .exception() is only legal for one of them."""
+
+    async def test_failed_page1_exception_is_retrieved_and_logged(self) -> None:
+        """Left unretrieved, the page-1 failure surfaces only as an opaque
+        "exception was never retrieved" at GC, detached from the command that
+        caused it."""
+
+        async def _boom() -> AsyncGenerator[TrackPage]:
+            raise SpotifyAuthError(401, "page 1 failed")
+            yield  # pragma: no cover - unreachable, makes this a generator
+
+        resolved = ResolvedSpotifyStream(SpotifyType.ALBUM, _boom())
+        with contextlib.suppress(SpotifyAuthError):
+            await resolved.first_page
+        assert resolved.first_page.done() and not resolved.first_page.cancelled()
+
+        with structlog.testing.capture_logs() as logs:
+            await resolved.aclose()
+
+        assert any("abandoned page-1 fetch had failed" in str(e) for e in logs), logs
+
+    async def test_cancelled_page1_does_not_raise(self) -> None:
+        """The `not cancelled()` guard: .exception() on a CANCELLED task RAISES
+        CancelledError rather than returning it, so dropping the guard turns an
+        already-failing teardown into a second, unrelated error."""
+        started = asyncio.Event()
+
+        async def _slow() -> AsyncGenerator[TrackPage]:
+            started.set()
+            await asyncio.sleep(30)
+            yield _spage(
+                _scollection(SpotifyType.ALBUM, total=1), ["T A"], is_last=True
+            )
+
+        resolved = ResolvedSpotifyStream(SpotifyType.ALBUM, _slow())
+        await started.wait()
+        resolved.first_page.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await resolved.first_page
+        assert resolved.first_page.cancelled()
+
+        await resolved.aclose()  # must not raise
+
+
 class TestPlayStreamIntegration:
     """-play <collection> driven end-to-end through the REAL glue: play()'s
     command body, a real ResolvedSpotifyStream from the real queue_source, a
@@ -4264,6 +4313,41 @@ class TestPlayStreamIntegration:
         music_bot.mps[mock_ctx.guild.id] = music_player
         music_bot.spotify.album_stream = MagicMock(return_value=pages)
         mock_ctx.message.content = f"-play {self._URL}"
+
+    async def test_page1_failure_reports_and_closes_the_generator(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """Spotify down on the page-1 call — the mainline outage path.
+
+        queue_source returns the stream with its page-1 task already in flight,
+        so the raise happens at `await resolved.first_page`, drain stays None,
+        and _play_resolved's finally must aclose() the generator AND retrieve
+        the task's exception. It was uncovered: a regression there is swallowed
+        by the enclosing suppress, leaving the generator to asyncgen-hook
+        finalization — whose warning is a hard failure under
+        filterwarnings=["error"], which is what makes this test meaningful.
+        """
+
+        async def _boom() -> AsyncGenerator[TrackPage]:
+            raise SpotifyAuthError(401, "page 1 failed")
+            yield  # pragma: no cover - unreachable, makes this a generator
+
+        self._wire(music_bot, music_player, mock_ctx, _boom())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
+
+        assert music_player.queue.qsize() == 0
+        # The lock is released even though the command failed.
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        errors = [
+            c.kwargs["embed"]
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert errors, "the user was told nothing"
 
     async def test_album_play_drains_all_pages_to_queue_and_mirror_in_order(
         self,
@@ -4557,6 +4641,10 @@ class TestBeginStreamEnqueue:
         assert "Queued album — 200% Electronica" in embed.title
         assert "ESPRIT 空想, George Clanton" in embed.description
         assert "11 songs" in embed.description
+        # The track list is the confirmation the user actually reads; main had
+        # an equivalent assertion that was deleted with Spotify.playlist(), and
+        # without it queue_message(titles) can be dropped with a green suite.
+        assert "T0 A" in embed.description
         assert embed.thumbnail.url == "https://i.scdn.co/image/640"
         await resolved.aclose()
 
@@ -4580,6 +4668,7 @@ class TestBeginStreamEnqueue:
         assert drain is not None
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Queued playlist — 3 songs" in embed.title
+        assert "A x" in embed.description  # see the album test's note
         await resolved.aclose()
 
     async def test_empty_collection_raises_before_anything_queues(
