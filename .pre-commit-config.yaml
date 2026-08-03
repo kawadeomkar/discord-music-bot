@@ -76,37 +76,88 @@ repos:
 
   - repo: local
     hooks:
-      - id: just-check
-        name: just check (parallel)
-        # `language: system` runs this against git's ambient PATH, so `just` must be
-        # installed system-wide -- see the README's Requirements. Do NOT "fix" that
-        # with `language: python` + `additional_dependencies: [rust-just]`:
-        # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
-        # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
-        # inside a venv containing only `just`. Measured, not theorised.
-        #
-        # Unlike `make`, this CAN fail for want of the runner. A push from a GUI
-        # client with a minimal PATH may not find `just`; --no-verify is the escape
-        # hatch, as it always was.
-        entry: just check
+      # These five ARE `just check`'s dependency list, one hook each, in its order.
+      #
+      # Why five hooks and not one: pre-commit renders one dotted status line per HOOK
+      # and runs hooks strictly sequentially, so the number of live status lines is the
+      # number of hooks — nothing inside a hook can produce one. It also CAPTURES a
+      # hook's output and replays it only after that hook exits (commands/run.py, the
+      # `out.strip()` at the end of _run_single_hook), so a hook that printed at t=0,
+      # t=3 and t=6 was measured emitting all three lines at t+6. No amount of
+      # concurrency inside a single hook — GNU parallel, `[parallel]`, `xargs -P` —
+      # changes either fact.
+      #
+      # Why not SIX hooks: `types` and `test` are fused into `check-heavy` because
+      # pyright's ~8s hides entirely inside pytest's ~26s. Separating them would buy a
+      # sixth line for ~8s of wall clock. The four below cost ~1.3s combined, so their
+      # lines are nearly free — that asymmetry is the whole design, and it is measured
+      # rather than assumed. See the HEAVY comment in the justfile.
+      #
+      # Keep this list in step with `check`'s dependencies; `just --dump --dump-format
+      # json` prints them if you need to diff the two.
+      #
+      # `language: system` runs these against git's ambient PATH, so `just` must be
+      # installed system-wide -- see the README's Requirements. Do NOT "fix" that
+      # with `language: python` + `additional_dependencies: [rust-just]`:
+      # pre-commit sets VIRTUAL_ENV to the isolated hook env, the justfile's
+      # VENV_BIN follows $VIRTUAL_ENV, and every tool would then be looked up
+      # inside a venv containing only `just`. Measured, not theorised.
+      #
+      # Unlike `make`, these CAN fail for want of the runner. A push from a GUI
+      # client with a minimal PATH may not find `just`; --no-verify is the escape
+      # hatch, as it always was.
+      #
+      # Every one of them needs pass_filenames: false and always_run: true. The first
+      # because pyright is a whole-program analysis and the test suite is not
+      # partitioned by path, so passing filenames would be meaningless; the second
+      # because pre-commit SKIPS a hook whose filename list came out empty, and a push
+      # containing only deletions produces exactly that — the gate would report
+      # "Skipped" on precisely the change most likely to break the build.
+      #
+      # No fail_fast on any of them, deliberately: a red push should report every
+      # failure at once rather than one per fix-push cycle.
+      - id: just-fmt-justfile
+        name: justfile format
+        entry: just fmt-justfile
         language: system
-        # Whole-repo gate: pyright is a whole-program analysis and the test suite
-        # is not partitioned by path, so passing filenames would be meaningless.
         pass_filenames: false
-        # always_run is the necessary partner to pass_filenames: false. pre-commit
-        # skips a hook whose filename list came out empty, and a push containing
-        # only deletions produces exactly that — the gate would report "Skipped"
-        # on precisely the change most likely to break the build.
         always_run: true
-        # pre-commit renders one dotted status line per HOOK, and it runs hooks
-        # strictly sequentially — so N live status lines would mean N sequential
-        # hooks, which is exactly the ~36s this gate stopped paying when `check`
-        # went concurrent. `verbose` buys the granularity back without the time:
-        # pre-commit prints a passing hook's output too, and `check` ends with a
-        # per-task ✓/✗ recap. One line while it runs, six once it lands.
-        #
-        # Splitting this into one hook per tool is therefore a real trade, not an
-        # oversight — it would restore live per-tool lines at full sequential cost.
+        stages: [pre-push]
+
+      - id: just-pins
+        name: version pins
+        entry: just pins
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-fmt-check
+        name: ruff format
+        entry: just fmt-check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-lint
+        name: ruff lint
+        entry: just lint
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+      - id: just-check-heavy
+        name: pyright + pytest (concurrent)
+        entry: just check-heavy
+        language: system
+        pass_filenames: false
+        always_run: true
+        # The one hook covering two tools, so it is the one that has to say which of
+        # them failed — and on a green run, that pyright was not silently skipped.
+        # `verbose` makes pre-commit print a PASSING hook's output too, which is where
+        # check-heavy's per-task ✓/✗ recap lands.
         verbose: true
         stages: [pre-push]
 
