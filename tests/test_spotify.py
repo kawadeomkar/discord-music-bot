@@ -722,7 +722,7 @@ async def _drain(gen: Any) -> list[TrackPage]:
 class TestCollectionFromCache:
     """The cache-read wire discipline: a wrong-TYPED field means garbage and
     the whole entry is a miss (re-fetched, never rendered), while MISSING
-    optional fields — an older build's entry — stay readable (review M10)."""
+    optional fields — an older build's entry — stay readable."""
 
     def test_non_dict_is_a_miss(self) -> None:
         assert _collection_from_cache(SpotifyType.ALBUM, "cid", ["list"]) is None
@@ -801,7 +801,7 @@ class TestAlbumStream:
         """The `or len(page1)` arm of the stride derivation: a response with
         no `limit` field derives the stride from the page itself — a fallback
         of 50 would skip every track between the real page-1 end and offset
-        50 (review L6)."""
+        50."""
         calls: list[dict[str, Any]] = []
 
         async def api(
@@ -1009,7 +1009,7 @@ class TestPlaylistStream:
         self, spotify: Spotify
     ) -> None:
         """Nothing else pins the URL itself — a typo'd endpoint would pass
-        every mask/cursor assertion (review L7; ports the deleted
+        every mask/cursor assertion (ports the deleted
         test_playlist_calls_correct_endpoint)."""
         api, calls = _playlist_api("plendpoint", total=5)
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
@@ -1022,7 +1022,7 @@ class TestPlaylistStream:
     ) -> None:
         """The page-limit boundary: exactly 100 tracks with next=null is one
         call — the album 50/51 boundaries had this pin, the playlist path did
-        not (review L12)."""
+        not."""
         api, calls = _playlist_api("pl100", total=100)
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
             pages = await _drain(spotify.playlist_stream("pl100"))
@@ -1036,7 +1036,7 @@ class TestPlaylistStream:
     ) -> None:
         """A cursor-page failure after page 1 must abandon without caching a
         truncated collection — the album fanout had this guard, the playlist
-        path did not (review L8)."""
+        path did not."""
         calls: list[str] = []
 
         async def api(

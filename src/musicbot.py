@@ -106,9 +106,8 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
-# Bounds on the per-guild collection-enqueue lock
-# (docs/SPOTIFY_ALBUM_SUPPORT_PLAN.md §3.5.3 — the design doc every bare
-# "design §" reference in this file means).
+# Bounds on the per-guild collection-enqueue lock.
+# See docs/ARCHITECTURE.md#queue-invariant.
 # A FIFO that can be entered but not exited is worse than no FIFO; each bound
 # closes a failure mode the naive version has.
 #
@@ -133,6 +132,7 @@ _ENQUEUE_MAX_WAITERS = 5
 # enqueues behind Spotify network I/O until they are declined at
 # _ENQUEUE_WAIT_SECS. Under both, so neither is ever reached by a slow drain.
 # Timing out keeps what already arrived; it never discards it.
+# See docs/ARCHITECTURE.md#queue-invariant.
 _COLLECTION_DRAIN_TIMEOUT_SECS = 45.0
 
 
@@ -144,7 +144,7 @@ class _GuildEnqueueLock:
     max_concurrency semaphore was rejected for this job: per-Command buckets
     can't serialize play against shuffle, ctx.invoke bypasses prepare() (the
     -playnow→play delegation would escape it), and its acquire fast-path
-    barges past just-woken waiters (design doc §3.5.2).
+    barges past just-woken waiters.
     """
 
     __slots__ = ("lock", "waiters")
@@ -159,7 +159,7 @@ class ResolvedSpotifyStream:
     FLIGHT: queue_source starts it as a task, so the first HTTP round-trip
     runs concurrently with whatever the caller does next — for -play's
     front path that is the voice-join handshake, keeping the Spotify call
-    inside the join overlap instead of serializing after it (design §3.1).
+    inside the join overlap instead of serializing after it.
 
     Not a dataclass: it owns a live task and a generator and must be closed
     exactly once — aclose() or a full drain, never neither. Abandoning the
@@ -187,7 +187,7 @@ class ResolvedSpotifyStream:
             # Retrieved but not re-raised: the abandon paths run because
             # something else already failed. Left unretrieved, the task's
             # exception surfaces only as an opaque "exception was never
-            # retrieved" at GC (review L1).
+            # retrieved" at GC.
             log.info(
                 f"abandoned page-1 fetch had failed: {self.first_page.exception()!r}"
             )
@@ -216,7 +216,7 @@ class _StreamDrain:
     resolved: ResolvedSpotifyStream
     generation: int  # snapshot the compare-and-put checks every page against
     enqueued: int
-    total: int  # collection.total — an upper bound for playlists (§3.3)
+    total: int  # collection.total — an upper bound for playlists
     completion_notice: bool  # multi-page playlist: report the real count at the end
 
 
@@ -231,7 +231,7 @@ def _is_collection(
     single batch put would otherwise land between a Spotify stream's pages and
     split the collection. Single tracks and searches never take the lock —
     they append at the current tail immediately, accepted interleaving
-    (design §6: an immediate single can even land ahead of a collection that
+    (an immediate single can even land ahead of a collection that
     arrived earlier and is still waiting).
     """
     if isinstance(source, SpotifySource):
@@ -709,7 +709,7 @@ class MusicBot(commands.Cog):
             # cannot barge past a live waiter. It CAN still park: during a
             # release→wakeup handoff locked() reads False while waiters are
             # queued, and Lock.acquire() then joins that queue. The timeout
-            # keeps the bounded-wait guarantee in that window (review M3);
+            # keeps the bounded-wait guarantee in that window;
             # skipping the waiting notice is deliberate — this path is the
             # uncontended 99% case.
             try:
@@ -805,7 +805,7 @@ class MusicBot(commands.Cog):
         gen = mp.queue.generation
 
         if front and await mp.queue.has_restored_backlog():
-            # Buffered path (design §3.4 row 3): restored entries exist, so the
+            # Buffered path: restored entries exist, so the
             # collection must land AHEAD of them via ONE put_front — successive
             # streamed put_fronts would invert page order. The whole drain runs
             # under the gate hold; this is the one case that keeps the old
@@ -844,7 +844,7 @@ class MusicBot(commands.Cog):
             if not ok:
                 log.info("buffered collection enqueue abandoned: queue invalidated")
                 # Tell the user — they waited through the full fetch, and a
-                # silently swallowed -play reads as a dead bot (review M6).
+                # silently swallowed -play reads as a dead bot.
                 await _send_queueing_stopped(ctx, noun)
                 return None
             await self._notify_stream_enqueued(
@@ -954,7 +954,7 @@ class MusicBot(commands.Cog):
         """The enqueue embed for a streamed collection. Albums get their own
         embed — name, artists, count and cover art all ride the same
         GET /v1/albums/{id} call that produced page 1. Playlists cannot have
-        name/art (§3.3/M2) and say "~total" until the drain reports the real
+        name/art and say "~total" until the drain reports the real
         enqueued count — total is an upper bound because episode/null items
         are skipped, never queued."""
         if kind is SpotifyType.ALBUM:
@@ -995,7 +995,7 @@ class MusicBot(commands.Cog):
         the first song is already starting, so nothing here is on the
         time-to-first-song path. Runs as the command task on purpose: no
         background task means no sixth cleanup() entry, no cross-coroutine
-        lock handoff, and command-error reporting for free (design §3.5).
+        lock handoff, and command-error reporting for free.
         background_typing is still active throughout — the typing indicator
         doubling as a "still queueing" signal is intended.
 
@@ -1028,12 +1028,12 @@ class MusicBot(commands.Cog):
                         if not ok:
                             # A clear/teardown landed: the collection this page
                             # belongs to was deleted. Abandon without refilling —
-                            # the H2 regression this design exists to prevent.
+                            # the regression this design exists to prevent.
                             log.info("collection drain abandoned: queue invalidated")
                             # Teardown-neutral copy: of the five doors that bump
                             # the generation, only -clear empties the queue — the
                             # others (-stop, kick, alone-timer, gate timeout)
-                            # deliberately leave pages 1..k persisted (review M5).
+                            # deliberately leave pages 1..k persisted.
                             with contextlib.suppress(Exception):
                                 await ctx.send(
                                     embed=notice_embed(
@@ -1080,9 +1080,9 @@ class MusicBot(commands.Cog):
                 )
             return
         except Exception:
-            # H3 → honest notice, no resume machinery: resume-from-offset is
+            # Honest notice, no resume machinery: resume-from-offset is
             # unsound for playlists (an edit shifts every offset — the same
-            # §2.5 argument that forbids concurrent playlist fanout). The
+            # argument that forbids concurrent playlist fanout). The
             # suppress keeps a failed notice send from masking the real error,
             # which play's error path is about to report.
             with contextlib.suppress(Exception):
@@ -1100,7 +1100,7 @@ class MusicBot(commands.Cog):
         if drain.completion_notice:
             # Suppressed: a failed SEND of the success notice must not reach
             # play's error handler, which would report a fully successful
-            # enqueue as "Failed to queue song" (review M4).
+            # enqueue as "Failed to queue song".
             with contextlib.suppress(Exception):
                 await ctx.send(
                     embed=notice_embed(
@@ -1182,7 +1182,7 @@ class MusicBot(commands.Cog):
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 # A real album; the old playlist example was an editorial
                 # (37i9…) playlist, which Spotify 404s for third-party apps —
-                # a documented example that could never work (§2.3).
+                # a documented example that could never work.
                 "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
                 "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
                 "-p https://soundcloud.com/artist/track",
@@ -1279,7 +1279,7 @@ class MusicBot(commands.Cog):
                 # of any queue restored from Redis (a -stop leaves its queue
                 # persisted). -play on a disconnected bot means "play this",
                 # not "play whatever was left over"; the persisted entries
-                # resume behind it. docs/PLAYBACK_GATE_PLAN.md.
+                # resume behind it.
                 front = not ctx.voice_client
                 if front:
                     # Hold the playback gate across the join below — join
@@ -1301,7 +1301,7 @@ class MusicBot(commands.Cog):
                         # Captured BEFORE awaiting the join: if the join (or a
                         # cancellation delivered there) raises, the finally
                         # below must still aclose() the stream — its page-1
-                        # task is already in flight (review M2).
+                        # task is already in flight.
                         if isinstance(qobj, ResolvedSpotifyStream):
                             resolved_stream = qobj
                         await join_task
@@ -1310,13 +1310,12 @@ class MusicBot(commands.Cog):
                             join_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError, Exception):
                                 await join_task
-                        # Full cleanup (not just disconnect) — cog_before_invoke already
-                        # created a MusicPlayer and started its loop() task. Without
-                        # cleanup() that task runs as a zombie for up to 300s waiting on
-                        # queue.get(), and store.clear_connection() is never called,
-                        # which would trigger spurious crash recovery on restart.
-                        # cleanup() also bumps the queue generation, so a
-                        # half-started stream of ours is invalidated with it.
+                        # Full cleanup, not just disconnect: cog_before_invoke
+                        # already started a MusicPlayer's loop(), which would
+                        # zombie for up to 300s on queue.get() with
+                        # clear_connection() never firing — spurious crash
+                        # recovery on restart. It also bumps the queue
+                        # generation, invalidating a half-started stream.
                         if ctx.guild is not None:
                             with contextlib.suppress(Exception):
                                 await self.cleanup(ctx.guild)
@@ -1331,10 +1330,10 @@ class MusicBot(commands.Cog):
                 log.info(f"Voice client: {ctx.voice_client}")
 
                 if front:
-                    # Ordering is load-bearing: put_front LPUSHes the Redis
-                    # mirror, while restore_entries replays entries that are
-                    # already on that list in memory only. Inserting before
-                    # restore has read its snapshot double-queues this song.
+                    # Order matters: put_front LPUSHes the mirror, while
+                    # restore_entries replays already-listed entries in memory
+                    # only, so inserting before restore reads its snapshot would
+                    # double-queue this song.
                     await mp.wait_for_restore()
 
                 if isinstance(qobj, QueueObject):
@@ -1347,8 +1346,8 @@ class MusicBot(commands.Cog):
 
             # Stack exited: the gate is open and the first song is starting.
             # The tail still runs INSIDE this command — no background task, no
-            # sixth cleanup() entry, no cross-coroutine lock handoff (design
-            # §3.5); play()'s error handler covers tail failures for free.
+            # sixth cleanup() entry, no cross-coroutine lock handoff;
+            # play()'s error handler covers tail failures for free.
             if drain is not None:
                 await self._drain_stream_tail(ctx, mp, drain)
         finally:
@@ -1730,7 +1729,7 @@ class MusicBot(commands.Cog):
         try:
             mp = self.get_mp(ctx)
             async with background_typing(ctx):
-                # Serialized tier (design §3.5.1): shuffle waits for an
+                # Serialized tier: shuffle waits for an
                 # in-flight collection drain because its semantics need the
                 # COMPLETE collection — run mid-stream it would reorder only
                 # the pages that have arrived, and the tail would then append
@@ -1746,7 +1745,7 @@ class MusicBot(commands.Cog):
                     # popped. Shuffling the dead player would rebuild the
                     # Redis mirror from its snapshot — resurrecting (and
                     # scrambling) a queue that -stop deliberately left
-                    # persisted (review M1).
+                    # persisted.
                     assert ctx.guild is not None
                     if self.mps.get(ctx.guild.id) is not mp:
                         await ctx.send(

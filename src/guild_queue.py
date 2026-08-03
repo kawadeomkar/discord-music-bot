@@ -175,7 +175,7 @@ class GuildQueue:
         of refilling a queue the user just emptied (or a guild being torn
         down). The check happens INSIDE put()'s mutex hold — reading this
         property and then calling put() without expected_generation is a
-        TOCTOU bug, not an alternative."""
+        TOCTOU bug, not an alternative. See docs/ARCHITECTURE.md#queue-invariant."""
         return self._generation
 
     async def bump_generation(self) -> None:

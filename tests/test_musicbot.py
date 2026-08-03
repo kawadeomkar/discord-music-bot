@@ -502,7 +502,7 @@ class TestQueueSource:
         assert result.kind is SpotifyType.ALBUM
         music_bot.spotify.album_stream.assert_called_once_with("aid123")
         # album_stream chosen, not playlist_stream — the two endpoints and
-        # unwraps differ (§2.1); routing an album through playlist_stream
+        # unwraps differ; routing an album through playlist_stream
         # would KeyError on the missing ["track"] wrapper.
         await result.aclose()
 
@@ -1396,9 +1396,9 @@ class TestCleanup:
     async def test_cleanup_bumps_generation_before_cancelling_tasks(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """The bump-FIRST ordering is load-bearing, not incidental: bumped
-        after the cancellations, a drain page parked on the queue mutex can
-        commit to the mirror of a guild mid-teardown (review M8)."""
+        """Bumping before the cancellations is what stops a page landing after
+        teardown: bumped after, a drain page parked on the queue mutex commits
+        to the mirror of a guild mid-teardown."""
         events: list[str] = []
 
         async def parked() -> None:
@@ -3981,7 +3981,7 @@ class TestPlaynow:
 
         music_bot.spotify.album_stream.assert_called_once_with("6WgSCcRfaXuBVfM2TpV0Kl")
         # Page-1-only, pinned against a MULTI-page stream: a mutation that
-        # drains everything before taking track 1 fetches page 2 (review L10).
+        # drains everything before taking track 1 fetches page 2.
         assert consumed == [0]
         ys.assert_awaited_once()
         assert ys.call_args.args[1] == "ytsearch:Iridescence ESPRIT 空想"
@@ -4071,7 +4071,7 @@ class TestPlaynow:
         assert order == ["prefetch", "interject"]
 
 
-# ── Streamed collection enqueue (docs/SPOTIFY_ALBUM_EXECUTION_PLAN.md Phase 4) ─
+# ── Streamed collection enqueue ──────────────────────────────────────────────
 
 
 class TestIsCollection:
@@ -4176,8 +4176,7 @@ class TestAcquireEnqueueSlot:
         """During asyncio.Lock's release→wakeup handoff, locked() reads False
         while the woken waiter is still queued, so the fast path's acquire()
         parks behind it. It must park BOUNDED — without the timeout this call
-        blocks unboundedly with no notice, no cap, no waiter count
-        (review M3)."""
+        blocks unboundedly with no notice, no cap, no waiter count."""
         monkeypatch.setattr("src.musicbot._ENQUEUE_WAIT_SECS", 0.05)
         entry = music_bot._enqueue_locks.setdefault(
             mock_ctx.guild.id, _GuildEnqueueLock()
@@ -4233,7 +4232,7 @@ class TestPlayAdmission:
 
         music_bot._play_resolved.assert_awaited_once()
         # Held ACROSS the body — an acquire-release-immediately would pass a
-        # released-after check alone (review L9) — then released.
+        # released-after check alone — then released.
         assert held_during_body == [True]
         entry = music_bot._enqueue_locks[mock_ctx.guild.id]
         assert not entry.lock.locked()
@@ -4319,7 +4318,7 @@ class TestPlayStreamIntegration:
     real GuildQueue, and the fake-redis mirror. Every other class in this file
     mocks at least one of those layers, which left the dispatch in
     _play_resolved, the gate/tail ordering, and the cross-page mirror order
-    pinned by nothing (branch review H1/M11)."""
+    pinned by nothing."""
 
     _URL = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
 
@@ -4557,7 +4556,7 @@ class TestPlayStreamIntegration:
     ) -> None:
         """M5→b's other half: a single -play issued mid-drain neither waits on
         the collection lock nor lands after the still-arriving collection — it
-        appends at the CURRENT tail, between pages (review L9)."""
+        appends at the CURRENT tail, between pages."""
         col = _scollection(SpotifyType.ALBUM, total=6)
         pages = [
             _spage(col, ["T0 A", "T1 A"], is_last=False),
@@ -4714,7 +4713,7 @@ class TestBeginStreamEnqueue:
     ) -> None:
         """A clear/teardown landed between the generation snapshot and the
         put: nothing was queued, so no enqueue embed and no 👍 — but the user
-        is told, not silently swallowed (review M6)."""
+        is told, not silently swallowed."""
         col = _scollection(SpotifyType.ALBUM, total=11)
         resolved = ResolvedSpotifyStream(
             SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
@@ -4866,8 +4865,8 @@ class TestBeginStreamEnqueue:
         assert [y.ytsearch for y in args[0]] == [f"ytsearch:T{i} A" for i in range(150)]
         assert kwargs["prefetch"] is False
         assert kwargs["expected_generation"] == 3
-        # The success side is user-visible too: embed + 👍 (review M7 —
-        # inverting the refusal guard would silence exactly this).
+        # The success side is user-visible too: embed + 👍 — inverting the
+        # refusal guard would silence exactly this.
         assert mock_ctx.send.await_count == 1
         assert "150 songs" in mock_ctx.send.call_args.kwargs["embed"].title
         mock_ctx.message.add_reaction.assert_awaited_once()
@@ -4902,7 +4901,7 @@ class TestBeginStreamEnqueue:
     ) -> None:
         """A playlist whose first 100 items are all skipped (episodes/nulls)
         yields an EMPTY non-last page 1: that streams on — only an empty LAST
-        page means the collection has nothing (review M12). Tightening the
+        page means the collection has nothing. Tightening the
         guard to `not page1.titles` kills such playlists."""
         col = _scollection(SpotifyType.PLAYLIST, total=101)
         pages = [
@@ -4923,8 +4922,8 @@ class TestBeginStreamEnqueue:
     async def test_album_embed_title_is_truncated(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Discord rejects >256-char embed titles; truncate_embed_title on the
-        album name is load-bearing, not decorative (review L11)."""
+        """Discord rejects >256-char embed titles, failing the whole send, so
+        the album name goes through truncate_embed_title."""
         col = _scollection(SpotifyType.ALBUM, total=1, name="X" * 300)
         resolved = ResolvedSpotifyStream(
             SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
@@ -4970,7 +4969,7 @@ class TestDrainStreamTail:
     ) -> None:
         """A Discord error sending the SUCCESS notice must not escape to
         play's error handler, which would report a fully successful enqueue
-        as 'Failed to queue song' (review M4)."""
+        as 'Failed to queue song'."""
         col = _scollection(SpotifyType.PLAYLIST, total=200)
         pages = [
             _spage(col, ["T0 A"], is_last=False),
@@ -5156,7 +5155,7 @@ class TestDrainStreamTail:
     ) -> None:
         """H3 → (c): partial failure reports what landed and what a re-run
         does. No resume machinery — resume-from-offset is unsound for
-        playlists (mutability shifts offsets, §2.5)."""
+        playlists (mutability shifts offsets)."""
         col = _scollection(SpotifyType.PLAYLIST, total=300)
         pages = [
             _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
@@ -5204,7 +5203,7 @@ class TestShuffleSerialized:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """A leaked slot is forever: every later collection/-shuffle in the
-        guild eats the full wait timeout then declines (review M9)."""
+        guild eats the full wait timeout then declines."""
         entry = _GuildEnqueueLock()
         await entry.lock.acquire()
         music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
@@ -5223,7 +5222,7 @@ class TestShuffleSerialized:
         """The wait can end BECAUSE of a teardown (cleanup() aborts the drain
         holding the slot). Shuffling the popped player would rebuild the Redis
         mirror from a dead snapshot — resurrecting a queue -stop deliberately
-        left persisted (review M1)."""
+        left persisted."""
         entry = _GuildEnqueueLock()
         await entry.lock.acquire()
         music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)

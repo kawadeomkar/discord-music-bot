@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record.
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,730 tests plus two opt-in integration tiers (testcontainers): a 46-test `pg` tier and a 33-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,890 tests plus two opt-in integration tiers (testcontainers): a 46-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -428,6 +428,11 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   on / never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
+- `put`/`put_front` take an optional `expected_generation` and return a bool: the
+  compare-and-put a streamed collection enqueues each page under. The check runs
+  **inside** the same mutex hold as the mutation — checked outside, an entire
+  `clear()` fits between check and put. A refused put touches NO leg and returns
+  False; generation-blind callers omit it and are never refused.
 
 ### Redis schema and persistence model
 
@@ -680,6 +685,8 @@ Per-guild synchronization primitives and what they protect:
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
 | claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject) |
+| `MusicBot._enqueue_locks[guild]` | one streamed collection enqueue per guild. Only collections and `-shuffle` take it (singles never wait); it lives on the **cog**, not MusicPlayer, because `cleanup()` destroys players and a lock destroyed mid-wait orphans its waiters. Bounded on both sides — `_ENQUEUE_WAIT_SECS` (60s, which MUST stay under `_PLAYBACK_GATE_TIMEOUT`) and `_ENQUEUE_MAX_WAITERS` |
+| `GuildQueue.generation` (compare-and-put) | a streamed collection's pages landing after the queue they belong to was cleared or torn down. `clear()`/`bump_generation()` increment it; every page enqueues with `expected_generation=` and is refused if it moved. **Reading the property and then calling `put()` without `expected_generation` is a TOCTOU bug, not an alternative** — the check must share the mutex hold with the mutation |
 
 One known, documented, accepted race remains open (ISSUE header in guild_queue.py): a
 bulk mutation can land between `try_commit_dequeue()` releasing the mutex and the start

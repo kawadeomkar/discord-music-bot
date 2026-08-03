@@ -1092,7 +1092,7 @@ class TestGenerationCounter:
     ) -> None:
         """An all-filtered collection page enqueues []: that is success, not
         an abandon — a False here would stop a live drain with a spurious
-        'queue was cleared' notice (review M12). No leg is touched either
+        'queue was cleared' notice. No leg is touched either
         way."""
         assert await gq.put([], batch=True, expected_generation=gq.generation) is True
         assert await gq.put([], batch=True) is True  # generation-blind callers too

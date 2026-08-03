@@ -1291,6 +1291,33 @@ interleaving silently eats the new head.
 Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
 and `-help` both say 3 (tracked by an in-code FIXME).
 
+**The generation counter.** A Spotify collection enqueues over many pages spread across
+seconds, so a `-clear` or a teardown can land *between* two pages. Without a guard the
+drain's tail refills the queue the user just emptied. `GuildQueue.generation` is a plain
+counter incremented by `clear()` and by `bump_generation()`; `cleanup()` calls the latter
+at the single teardown choke point, so `-stop`, a kick, the alone-timer, the gate timeout
+and `play`'s error path are all covered by one bump. Every streamed page enqueues with
+`put(..., expected_generation=snapshot)`, which returns `False` and touches **no leg** if
+the counter moved.
+
+Two placement rules are load-bearing:
+
+1. **The check runs inside the same mutex hold as the mutation.** Read the property and
+   call `put()` without `expected_generation` and an entire `clear()` — which runs wholly
+   under that mutex — fits between the check and the write.
+2. **The snapshot is taken only after confirming the player is still the guild's live
+   one.** `cleanup()` pops the player from `mps` *before* awaiting `bump_generation()`, so
+   a snapshot taken after the pop reads the post-teardown value and every page then
+   matches and commits onto a dead guild's persisted mirror.
+
+**Drain bounds.** `_HTTP_TIMEOUT` bounds one request, not a stream, so both collection
+drains run under `_COLLECTION_DRAIN_TIMEOUT_SECS`. That ceiling sits below the two things
+the drains are nested inside: the 300s playback gate (the buffered front path holds it,
+and reaching the gate's own timeout tears the player down and refuses the finished
+`put_front`, losing the collection) and `_ENQUEUE_WAIT_SECS` (the streaming tail holds the
+per-guild enqueue lock, stalling `-shuffle` and YouTube-playlist enqueues behind Spotify
+I/O). Timing out keeps what already arrived and reports a partial enqueue.
+
 ### Now Playing host model
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the

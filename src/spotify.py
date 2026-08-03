@@ -30,18 +30,17 @@ _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
 _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h — albums are immutable once released
 
-# Collection paging (docs/SPOTIFY_ALBUM_SUPPORT_PLAN.md §2). The limits are
-# Spotify's, not ours: 51 on an album-tracks request and 101 on a playlist
-# request are both HTTP 400. _ALBUM_PAGE_LIMIT applies only to the explicit
+# Collection paging. The limits are Spotify's, not ours: 51 on an album-tracks
+# request and 101 on a playlist request are both HTTP 400. _ALBUM_PAGE_LIMIT applies only to the explicit
 # /albums/{id}/tracks?limit= requests WE issue — the first page arrives inside
 # GET /v1/albums/{id}, whose stride is Spotify's choice and must be read off
 # the response (album_stream), never assumed.
 _ALBUM_PAGE_LIMIT = 50
 _PLAYLIST_PAGE_LIMIT = 100
-_ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst (§2.5)
+_ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst
 # `type` is in the mask so the unwrap can reject podcast episodes by name;
 # `next`/`total` are what the shipped mask omitted — the omission was the
-# entire >100-track truncation bug (§2.4).
+# entire >100-track truncation bug.
 _PLAYLIST_FIELDS = "next,total,items(track(type,name,artists(name)))"
 # aiohttp's default is ClientTimeout(total=300) — one hung page would hold the
 # per-guild collection lock (musicbot.py) for five minutes. 30s is generous
@@ -144,7 +143,7 @@ def _collection_from_cache(
     so entries written by an older build stay readable — but a field of the
     WRONG TYPE is garbage, not an older build, and the whole entry is a miss:
     a corrupt `total` would otherwise flow uncoerced into embed copy
-    (guild_state.py's wire discipline; review M10)."""
+    (guild_state.py's wire discipline)."""
     if not isinstance(raw, dict):
         return None
     titles = raw.get("titles")
@@ -473,7 +472,7 @@ class Spotify:
             release_date=resp.get("release_date"),
         )
         # Album items ARE the track (SimplifiedTrackObject) — no ["track"]
-        # wrapper, no episodes, so no unwrap guard (§2.1).
+        # wrapper, no episodes, so no unwrap guard.
         page1 = [_track_search_title(t) for t in tracks.get("items") or []]
         all_titles = list(page1)
         if tracks.get("next") is None:
@@ -553,7 +552,7 @@ class Spotify:
 
         Pages sequentially via the `next` cursor — REQUIRED because playlists
         are mutable: an edit landing between two offset requests shifts every
-        later offset and silently duplicates or drops tracks (§2.5). `next`
+        later offset and silently duplicates or drops tracks. `next`
         carries the fields mask forward, so following it needs no
         re-parameterisation. Following it at all is the fix for the
         >100-track silent-truncation bug: the old mask omitted `next`
@@ -624,7 +623,7 @@ class Spotify:
     async def _playlist_page(self, next_url: str) -> Any:
         """One cursor-following playlist page — traced for the same reason as
         _album_page: per-page drain time stays attributable in the trace. The
-        URL is Spotify's own `next` value, followed verbatim (§2.4)."""
+        URL is Spotify's own `next` value, followed verbatim."""
         trace.get_current_span().set_attribute("spotify.page_url", next_url)
         return await self.http_call(next_url)
 

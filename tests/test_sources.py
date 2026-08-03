@@ -117,7 +117,7 @@ class TestParseUrlSpotify:
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
 
     def test_spotify_album(self) -> None:
-        # The incident URL (docs/SPOTIFY_ALBUM_SUPPORT_PLAN.md §1): this exact
+        # The incident URL: this exact
         # link used to raise "Unknown Spotify track type: ['album', …]".
         url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
         result = parse_url(url, f"-play {url}")
@@ -160,7 +160,7 @@ class TestParseUrlSpotify:
 
     def test_unknown_spotify_type_suppresses_exception_chain(self) -> None:
         """`from None`: the enum-lookup ValueError is an implementation detail;
-        chaining it doubles the traceback in every error log (§1's incident)."""
+        chaining it doubles the traceback in every error log."""
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
         with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
             parse_url(url, f"-play {url}")
