@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.5.1, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.7.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -23,7 +23,7 @@ The boundary is a rule, not a preference: durable records go to Postgres (when t
 operator opted in), runtime and cache state stays in Redis forever. Reads follow the
 same rule in BOTH modes — `-history` is served from the capped Redis list alone (50
 entries per guild, exactly the command's ceiling, written ahead of the archive), and
-Postgres backs the commands that need the permanent record.
+Postgres backs the commands that need the permanent record (`-leaderboard`).
 
 | | |
 |---|---|
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record.
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,730 tests plus two opt-in integration tiers (testcontainers): a 46-test `pg` tier and a 33-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,830 tests plus two opt-in integration tiers (testcontainers): a 62-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -445,6 +445,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
+| `leaderboard:{guild_id}:{days}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
@@ -876,8 +877,8 @@ bind-mounted) but the runtime image does.
 
 **Add a history-entry field**: `HistoryEntry` in guild_state.py (with a default) →
 **add it to exactly one domain tuple in guild_state.py — `_TEXT_FIELDS`, `_INT4_FIELDS`
-(`integer` columns) or `_INT8_FIELDS` (`bigint`) — or `__post_init__` silently does not
-clamp it and the schema lock has a hole** (a test asserts every field is covered, so
+(`integer` columns), `_INT8_FIELDS` (`bigint`) or `_EPOCH_FIELDS` (`timestamptz`) — or
+`__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
 forgetting fails the suite rather than shipping) → `to_redis`/`parse_history_entry`
 (`.get(..., default)`, so pre-migration wire entries still parse) → the column in
 `migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
