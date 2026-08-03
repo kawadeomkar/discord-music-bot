@@ -96,11 +96,10 @@ class TestPostgresUrl:
     def test_empty_string_counts_as_unset(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An exported-but-empty `POSTGRES_URL=` must read as absent, same rule
-        as the Spotify credentials above. `""` is not None, so without the guard
-        the Optional[str] return type is a lie and whether an empty DSN is
-        caught depends on each caller spelling its check as truthiness rather
-        than `is None`."""
+        """An exported-but-empty `POSTGRES_URL=` must read as absent, same rule as
+        the Spotify credentials above: `""` is not None, so without the guard the
+        Optional[str] return type is a lie and catching an empty DSN depends on
+        each caller spelling its check as truthiness rather than `is None`."""
         monkeypatch.setenv("POSTGRES_URL", "")
         assert postgres_url() is None
 
@@ -114,13 +113,10 @@ class TestPostgresUrl:
 
 
 class TestHistoryArchiveEnabled:
-    """The consent gate for long-term storage.
-
-    Two rules under test, each bought by a failure direction. Fail-closed:
-    absence of a choice must mean no collection, so unset and empty are False.
-    Strict parse: a lenient anything-but-true-is-False rule turns a typo into
-    an operator who believes they enabled archiving while every play goes
-    unrecorded — so garbage raises, naming the variable.
+    """The consent gate for long-term storage. Fail-closed: absence of a choice
+    must mean no collection, so unset and empty are False. Strict parse: a
+    lenient anything-but-true-is-False rule turns a typo into an operator who
+    believes archiving is on while every play goes unrecorded, so garbage raises.
     """
 
     @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES"])
@@ -175,9 +171,8 @@ class TestHistoryArchiveEnabled:
 class TestIntEnv:
     """The parser behind both archive tunables.
 
-    It runs at import, before main() has configured structlog or OTel, so its
-    failure modes are stderr tracebacks in a compose restart loop rather than
-    log lines. That is why empty is tolerated and bad input is not.
+    It runs at import, before structlog or OTel exist, so its failures are stderr
+    tracebacks in a compose restart loop — hence empty is tolerated, garbage is not.
     """
 
     def test_unset_returns_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,12 +194,10 @@ class TestIntEnv:
         assert _int_env("KNOB", 0) == 5000
 
     def test_negative_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """-1 is the universal "no limit" idiom, so it is exactly what an
-        operator reaches for to spell out HISTORY_OUTBOX_MAX's default. It means
-        the opposite downstream: the drainer's cap check treats it as an active
-        cap of -1, computes dropped = depth + 1, and trims the outbox to empty
-        on every cycle — on a HEALTHY system, since the cap is enforced on the
-        drain success path too. Every un-archived play, gone every ~30s."""
+        """-1 is the universal "no limit" idiom, so it is what an operator reaches
+        for to spell out HISTORY_OUTBOX_MAX's default. Downstream it means the
+        opposite: the drainer treats it as an active cap, computes
+        dropped = depth + 1, and trims the outbox to empty every cycle."""
         monkeypatch.setenv("KNOB", "-1")
         with pytest.raises(ValueError, match="KNOB must be >= 0"):
             _int_env("KNOB", 0)
@@ -224,10 +217,9 @@ class TestIntEnv:
 class TestArchiveTunables:
     """The env -> constant path, which asserting the defaults alone cannot pin.
 
-    `assert HISTORY_OUTBOX_MAX == 0` passes even if the constant stops reading
-    its variable entirely (a plain literal is also 0), and it fails on any
-    machine where the documented variable happens to be exported. Reloading
-    under a controlled environment fixes both.
+    `assert HISTORY_OUTBOX_MAX == 0` passes even if the constant stops reading its
+    variable (a plain literal is also 0), and fails wherever that variable happens
+    to be exported. Reloading under a controlled environment fixes both.
     """
 
     @pytest.fixture(autouse=True)
@@ -281,15 +273,12 @@ class TestArchiveTunables:
 
 
 class TestDefaultPostgresPassword:
-    """compose defaults POSTGRES_PASSWORD so `docker compose up` works with only
-    a Discord token. The bot has to be able to tell that it did.
+    """compose defaults POSTGRES_PASSWORD so `docker compose up` works with only a
+    Discord token, and the bot has to be able to tell that it did.
 
-    Scoped to DSNs this project's tooling assembles from `.env`, which is the
-    only supported place the password is set. Shapes asyncpg accepts but compose
-    and `just run` cannot emit (`?password=`, `PGPASSWORD`, an unescaped `@` in
-    the password) are deliberately undetected — see using_default_postgres_password
-    for the ladder that would have to come back if an external Postgres ever
-    becomes supported.
+    Scoped to the DSNs this project's tooling assembles from `.env`, the only
+    supported place the password is set — shapes asyncpg accepts but compose and
+    `just run` cannot emit are deliberately undetected (see the function).
     """
 
     def test_true_when_the_dsn_carries_the_default(
@@ -331,9 +320,8 @@ class TestDefaultPostgresPassword:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # asyncpg unquotes the netloc password, so an escaped form is the same
-        # credential and must not slip past. Note the detector has to unquote it
-        # ITSELF: SplitResult.password does not percent-decode, which is the
-        # opposite of what an earlier version of this comment claimed.
+        # credential and must not slip past. The detector has to unquote it
+        # ITSELF: SplitResult.password does not percent-decode.
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://musicbot:%70assword@127.0.0.1:5432/musicbot"
         )
@@ -346,12 +334,10 @@ class TestDefaultPostgresPassword:
             "postgresql://",
             "postgresql://user@host/db",
             "://[bad",
-            # The one that actually reaches the except arm. urlsplit only raises
-            # on a malformed IPv6 literal in the NETLOC — and "://[bad" has no
-            # "//" prefix, so its bracket lands in the path and the check never
-            # runs. Every other case above returns normally, which meant the
-            # `except ValueError` branch was dead to the whole suite: deleting
-            # it, and making it `return True`, both passed 1,681 tests.
+            # The one that actually reaches the except arm: urlsplit only raises
+            # on a malformed IPv6 literal in the NETLOC, and every other case
+            # above returns normally. Without it the `except ValueError` branch
+            # was dead — deleting it, and making it `return True`, both passed.
             "postgresql://[::1@h/db",
         ],
     )
@@ -367,20 +353,17 @@ class TestDefaultPostgresPassword:
 # ── The compose contract ──────────────────────────────────────────────────────
 #
 # Nothing else in CI or tests/ reads docker-compose.yml, which is how a missed
-# `${POSTGRES_PASSWORD:?}` on the db-backfill service shipped: it broke
-# `docker compose up` for a token-only stack — the exact thing the default
-# exists to enable — while every test, ruff and pyright stayed green.
+# `${POSTGRES_PASSWORD:?}` on db-backfill shipped: it broke `docker compose up`
+# for a token-only stack while every test, ruff and pyright stayed green.
 _COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
 
 
 def _compose_directives() -> str:
     """docker-compose.yml with comment lines removed.
 
-    Comments matter here: the file DESCRIBES the old mandatory form
-    (`${VAR:?}`) while explaining why the default replaced it, so a naive scan
-    of the raw text reports a violation that does not exist. Stripping whole
-    comment lines is enough — Compose has no inline-comment-after-value form
-    that would need finer handling in this file.
+    The file DESCRIBES the old mandatory form (`${VAR:?}`) in comments, so a naive
+    scan of the raw text reports a violation that does not exist. Whole-line
+    stripping is enough — Compose has no inline-comment-after-value form here.
     """
     return "\n".join(
         line
@@ -404,69 +387,61 @@ def _service_block(name: str) -> str:
 
 
 class TestComposeArchiveProfile:
-    """The deployment half of the opt-in archive: postgres and db-migrate
-    exist in the model only while the `archive` profile is active, and a
-    token-only `docker compose up` deploys no long-term storage at all.
-    Invisible to every other check — nothing in CI parses compose — so the
-    contract is asserted against the real file, like the password tests
-    above (empirical findings: docs/HISTORY_ARCHIVE_OPT_IN_PLAN.md §2)."""
+    """The deployment half of the opt-in archive: postgres and db-migrate exist in
+    the model only while the `archive` profile is active, so a token-only
+    `docker compose up` deploys no long-term storage. Nothing in CI parses
+    compose, so the contract is asserted against the real file."""
 
     def test_postgres_and_db_migrate_are_archive_profiled(self) -> None:
-        # The profile IS the deployment gate: without it, a default `up`
+        # The profile is the deployment gate: without it, a default `up`
         # deploys a database nobody opted in to and the consent story is
         # app-side only.
         for service in ("postgres", "db-migrate"):
             assert 'profiles: ["archive"]' in _service_block(service), service
 
     def test_the_bot_does_not_depend_on_the_profiled_services(self) -> None:
-        """REGRESSION GUARD (F1): an un-profiled service with depends_on on a
-        profiled one makes the WHOLE project invalid while the profile is
-        inactive — even `docker compose config` fails ("depends on undefined
-        service") — so re-adding either dependency breaks token-only `up`
-        outright, invisibly to every other check. Reproduced on Compose
-        v5.3.1."""
+        """regression guard: an un-profiled service with depends_on on a profiled
+        one makes the whole project invalid while the profile is inactive — even
+        `docker compose config` fails ("depends on undefined service") — so
+        re-adding either dependency breaks token-only `up` outright."""
         bot = _service_block("discord-music-bot")
         depends = re.search(r"depends_on:\n((?:      .*\n)*)", bot)
         assert depends is not None
         assert "postgres" not in depends.group(1)
         assert "db-migrate" not in depends.group(1)
-        # redis stays: it is un-profiled, so F1 does not apply to it.
+        # redis stays: it is un-profiled, so the rule does not apply to it.
         assert "redis:" in depends.group(1)
 
     def test_db_backfill_stays_on_ops_not_archive(self) -> None:
-        """`up` starts EVERY service of an active profile, so db-backfill
-        joining `archive` would run the backfill — a full Redis keyspace
-        walk — on every enabled `up`. It keeps its own profile and runs only
-        when explicitly targeted (`docker compose run` auto-activates a
-        target's own profiles)."""
+        """`up` starts every service of an active profile, so db-backfill joining
+        `archive` would run a full Redis keyspace walk on every enabled `up`. Its
+        own profile means it runs only when explicitly targeted (`docker compose
+        run` auto-activates a target's own profiles)."""
         backfill = _service_block("db-backfill")
         assert 'profiles: ["ops"]' in backfill
         assert "archive" not in backfill
 
     def test_just_down_activates_the_archive_profile(self) -> None:
-        """`docker compose down` with the profile inactive removes only
-        un-profiled containers and leaves a running postgres behind (F4), so
-        the justfile recipe must pass --profile archive. Greps the justfile —
-        the same cannot-import-shell reasoning as the preflight test above."""
+        """`docker compose down` with the profile inactive removes only un-profiled
+        containers and leaves a running postgres behind, so the justfile recipe
+        must pass --profile archive. Greps the justfile — the same
+        cannot-import-a-shell-script reasoning as the preflight test below."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
         assert "docker compose --profile archive down" in justfile
 
 
 class TestComposeMatchesTheDefault:
-    """The two halves of the first-run promise, asserted against the real file.
-
+    """The two halves of the first-run promise, asserted against the real file:
     `docker compose up` must work with nothing configured but DISCORD_TOKEN, and
     the password it falls back to must be the one the bot warns about. Both are
     invisible to every other check in the repo.
     """
 
     def test_no_postgres_password_interpolation_is_mandatory(self) -> None:
-        """REGRESSION: db-backfill kept `:?` when the other three services moved.
-
-        Compose interpolates the WHOLE document before profile filtering, so an
-        `ops`-profiled service with a mandatory variable fails `up`, `ps`,
-        `logs` and `config` alike. Reproduced under `env -u POSTGRES_PASSWORD`:
-        "required variable POSTGRES_PASSWORD is missing a value".
+        """regression: db-backfill kept `:?` when the other three services moved.
+        Compose interpolates the whole document before profile filtering, so an
+        `ops`-profiled service with a mandatory variable fails `up`, `ps`, `logs`
+        and `config` alike.
         """
         mandatory = re.findall(
             r"\$\{POSTGRES_PASSWORD:\?[^}]*\}", _compose_directives()
@@ -475,10 +450,9 @@ class TestComposeMatchesTheDefault:
 
     def test_every_fallback_is_the_password_the_bot_warns_about(self) -> None:
         """The drift check. DEFAULT_POSTGRES_PASSWORD is duplicated across
-        config.py, build_common.sh and three compose services with nothing
-        holding them together — and drift here fails OPEN: change compose's
-        fallback alone and the detector goes permanently silent while the
-        deployment still runs on a known credential.
+        config.py, build_common.sh and three compose services with nothing holding
+        them together, and drift fails open: change compose's fallback alone and
+        the detector goes permanently silent on a known credential.
         """
         fallbacks = set(
             re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", _compose_directives())
@@ -489,13 +463,10 @@ class TestComposeMatchesTheDefault:
         assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
 
     def test_the_build_preflight_checks_for_the_same_password(self) -> None:
-        """build_common.sh hardcodes the literal too, and it is the fifth copy.
-
-        Nothing sourced it from anywhere, so drifting compose's fallback would
-        leave the build-time warning checking for a value no deployment uses —
-        silently, and in the fail-open direction, exactly like the detector.
-        A shell script cannot import config.py, so the coupling is asserted here
-        instead of enforced there.
+        """build_common.sh hardcodes the literal too — the fifth copy. Drifting
+        compose's fallback would leave the build-time warning checking for a value
+        no deployment uses, silently and fail-open. A shell script cannot import
+        config.py, so the coupling is asserted here instead of enforced there.
         """
         preflight = (
             Path(__file__).resolve().parent.parent / "build_common.sh"
@@ -503,17 +474,11 @@ class TestComposeMatchesTheDefault:
         assert f'= "{DEFAULT_POSTGRES_PASSWORD}"' in preflight
 
     def test_the_justfile_dsn_uses_the_same_default(self) -> None:
-        """The SIXTH copy, and the only one nothing held.
-
-        `_dotenv` grew `${POSTGRES_PASSWORD:-password}` with the comment "Keep
-        this default in step with docker-compose.yml's" — a stated coupling with
-        nothing enforcing it, while the three tests around this one cover
-        config.py, build_common.sh and the compose interpolations. Rotate the
-        default in those three and every test stays green while `just run`,
-        `just db-migrate` and `just db-backfill` build a DSN the database
-        rejects. The archive connects lazily, so `just run` starts fine and
-        surfaces it much later as a drainer backoff loop — the exact two-step
-        trap the justfile comment above it was written to prevent.
+        """The SIXTH copy, and the only one nothing held: `_dotenv`'s
+        `${POSTGRES_PASSWORD:-password}` states the coupling in a comment with
+        nothing enforcing it. Rotate the default in the three copies the tests
+        above cover and every test stays green while `just run`/`db-*` build a
+        DSN the database rejects — surfacing later as a drainer backoff loop.
         """
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
         fallbacks = set(re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", justfile))
@@ -523,7 +488,7 @@ class TestComposeMatchesTheDefault:
     def test_the_bot_and_the_migration_tiers_all_carry_a_default(self) -> None:
         # Count rather than merely "none mandatory": a service whose
         # POSTGRES_URL was deleted outright would also pass the first test.
-        # Three interpolations = the bot, the postgres service, and the two
+        # Four interpolations = the bot, the postgres service, and the two
         # one-shots' DSNs.
         assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4
 
@@ -532,16 +497,10 @@ class TestSetupEnvTightensTheEnvFile:
     """setup_env.sh is the escape hatch from the shared default, so the file it
     writes the replacement into must not be world-readable.
 
-    Run rather than grepped, unlike the drift checks above. The behaviour is an
+    Run rather than grepped, unlike the drift checks above: the behaviour is an
     interaction between `stat`, `chmod` and `mv` across two platforms' stat
-    spellings, and a source-text assertion would hold just as well for a
-    `chmod go-rwx` placed on the wrong side of the `mv` (that one dies with a
-    non-zero exit rather than silently, but only because the temp file is gone
-    by then — nothing about the grep would have told you which).
-
-    The script `cd`s to its own directory, so it is copied into a tmpdir first:
-    pointed at the checkout it would rewrite the developer's real .env and mint
-    a password the running Postgres was never initialized with.
+    spellings, which no source-text assertion pins. Copied into a tmpdir first —
+    the script `cd`s to its own directory and would otherwise rewrite the real .env.
     """
 
     @staticmethod

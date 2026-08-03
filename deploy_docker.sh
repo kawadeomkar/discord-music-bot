@@ -83,7 +83,7 @@ if ! docker image inspect "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# NOTE (merge-time, docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §8.3): when the k8s
+# NOTE (merge-time): when the k8s
 # stack lands, its "is a bot pod already live in a cluster?" guard belongs HERE,
 # immediately below — one Discord token means one live process, and this is the
 # line that starts one. It currently sits in that branch's build_docker.sh, which

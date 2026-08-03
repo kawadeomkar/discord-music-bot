@@ -9,7 +9,6 @@
 # those three names, with build_runtime_image variadic — it passes one SHA tag
 # where the compose path passes two. Renaming or re-signaturing one of them turns
 # that branch's merge into a rewrite under conflict markers, months from now.
-# Rationale: docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §4.1.
 #
 # git_sha_tag is ADDITIVE — new callers may use it, the three names above keep
 # working untouched, so the k8s merge is unaffected by its existence.

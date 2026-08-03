@@ -30,21 +30,16 @@ _ALBUM_TTL = 86400  # 24h
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
-    """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify
-    track object resolves to. Shared by track() and playlist() so a single
-    track and a playlist entry render their search titles identically."""
+    """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify track
+    resolves to. Shared by track() and playlist() so both render it identically."""
     return track["name"] + "".join(f" {a['name']}" for a in track["artists"])
 
 
 class SpotifyAuthError(Exception):
-    """Spotify rejected the configured client credentials.
-
-    Raised for the two responses that actually indicate bad credentials: a
-    non-2xx from the token endpoint (the client-credentials grant failed) and a
-    401/403 from an API call (the resulting token was refused). Deliberately
-    NOT raised for network errors, timeouts, or other HTTP codes (404, 5xx) —
-    those say nothing about credential validity. Startup validation keys off
-    this distinction: only this error disables the Spotify source.
+    """Spotify rejected the configured client credentials. Raised only for the two
+    responses that actually indicate that: a non-2xx token grant, and a 401/403 from an
+    API call. Not for network errors, timeouts or other codes (404, 5xx) — those say
+    nothing about validity, and startup validation disables the source only on this.
     """
 
     def __init__(self, status: int, detail: str = "") -> None:
@@ -84,16 +79,11 @@ class Spotify:
     async def _refresh_token(
         self, use_cache: bool = True, strict: bool = False
     ) -> None:
-        """Fetch a fresh access token via the client-credentials flow and update expiry.
-
-        `use_cache=False` skips the Redis-cached token and always hits the auth
-        endpoint, so the configured client_id/secret are genuinely exercised
-        rather than a token minted from earlier credentials — used by validate().
-
-        `strict=True` raises SpotifyAuthError on a non-2xx grant response instead
-        of letting the missing-`access_token` KeyError surface. Off by default so
-        the runtime path (and its tests) are unchanged; validate() opts in so it
-        can distinguish rejected credentials from other failures."""
+        """Fetch a fresh access token via client-credentials and update expiry.
+        `use_cache=False` bypasses the Redis-cached token so the configured
+        client_id/secret are genuinely exercised; `strict=True` raises SpotifyAuthError
+        on a non-2xx grant instead of a missing-`access_token` KeyError. Both are opted
+        into by validate(); the runtime path keeps the defaults."""
         if use_cache and self._redis is not None:
             cached = await spotify_token_get_with_ttl(self._redis)
             if cached is not None:
@@ -126,17 +116,10 @@ class Spotify:
         data: Optional[dict[str, str]] = None,
         http_method: str = "GET",
     ) -> Any:
-        """Make an authenticated request to the Spotify API, refreshing the
-        token first if it has expired. Raises on any non-2xx response.
-
-        `Any` here is deliberate, and the asymmetry with yt-dlp's `YTDLVideoInfo`
-        is the point. That schema exists because `src/` reads ~19 *named* fields
-        off one known info-dict shape on the playback hot path, so a wrong
-        assumption there breaks playback. This returns whatever the requested
-        endpoint returns — the shape is chosen by the caller's URL, so there is no
-        single schema to write. The two callers that do read named fields
-        (`track()`, `playlist()`) narrow to `str` / `list[str]` at their own
-        boundary, which is where the shape is actually known.
+        """Make an authenticated request to the Spotify API, refreshing the token first
+        if it has expired. Raises on any non-2xx response. `Any` is deliberate, unlike
+        yt-dlp's `YTDLVideoInfo`: the response shape is chosen by the caller's URL, so
+        the two callers that read named fields narrow at their own boundary instead.
         """
         if time.time() > self.token_expiry:
             async with self._auth_lock:
@@ -162,20 +145,12 @@ class Spotify:
             )
 
     async def validate(self, track_id: str) -> None:
-        """Exercise the configured credentials against the live Spotify API.
-
-        Forces a fresh client-credentials token (bypassing any Redis-cached one,
-        so the client_id/secret themselves are tested — not a token minted from
-        earlier credentials), then fetches a known track.
-
-        Raises SpotifyAuthError *only* when Spotify rejects the credentials
-        themselves: a non-2xx token grant (`strict=True`) or a 401/403 on the
-        track call. Every other failure propagates as its own type — a network
-        error, a timeout, a non-auth HTTP code, or an unexpected response shape
-        (ValueError) — and means "could not verify", not "invalid". The caller
-        keys its enable/disable decision off that distinction.
-
-        Intended for a one-shot startup probe; it mutates no feature flag itself."""
+        """Exercise the configured credentials against the live Spotify API: force a
+        fresh token (bypassing the Redis cache, so client_id/secret themselves are
+        tested), then fetch a known track. Raises SpotifyAuthError *only* when Spotify
+        rejects the credentials; everything else — network error, timeout, non-auth
+        code, unexpected shape — propagates as its own type and means "could not
+        verify", not "invalid". A startup probe; it mutates no feature flag itself."""
         async with self._auth_lock:
             await self._refresh_token(use_cache=False, strict=True)
         endpoint = self.spotify_endpoint + f"v1/tracks/{track_id}"
@@ -222,13 +197,10 @@ class Spotify:
 
         async def fetch() -> list[str]:
             # FIXME: Spotify playlists over 100 tracks are silently truncated.
-            # /v1/playlists/{id}/tracks is a paged endpoint returning 100 items per
-            # page. This call reads the first page only and never follows the `next`
-            # cursor, so a 300-track playlist queues its first 100 tracks and the user
-            # is told the playlist was queued — no error, no warning, no indication that
-            # two thirds of it is missing.
-            # Fix: add `next` to the fields mask (it is excluded by the mask today) and
-            # follow the cursor until it comes back null.
+            # This reads only the first page and never follows the `next` cursor,
+            # so a 300-track playlist queues 100 and reports success.
+            # Fix: add `next` to the fields mask (excluded today) and follow the
+            # cursor until it returns null.
             endpoint = self.spotify_endpoint + f"v1/playlists/{pid}/tracks"
             resp = await self.http_call(
                 endpoint, params={"fields": "items(track(name,artists(name)))"}
@@ -245,12 +217,10 @@ class Spotify:
 
     @_tracer.start_as_current_span("spotify.artists")
     async def artists(self, ids: Union[list[str], str]) -> Any:
-        """Return raw Spotify artist objects for one or more artist IDs, cached for 24h.
-
-        Untyped by intent: "raw" means the upstream object verbatim, and nothing
-        in `src/` reads a field off it (this method and `albums()` have no
-        production callers). A TypedDict here would be a guess at Spotify's
-        schema with no consumer to check it against — see `http_call`.
+        """Return raw Spotify artist objects for one or more artist IDs, cached 24h.
+        Untyped by intent: nothing in `src/` reads a field off it (this and `albums()`
+        have no production callers), so a TypedDict would be a guess at Spotify's schema
+        with no consumer to check it — see `http_call`.
         """
         if isinstance(ids, str):
             ids = [ids]
@@ -270,9 +240,7 @@ class Spotify:
     @_tracer.start_as_current_span("spotify.albums")
     async def albums(self, ids: Union[list[str], str]) -> Any:
         """Return raw Spotify album objects for one or more album IDs, cached for 24h.
-
-        Untyped for the same reason as `artists()` above.
-        """
+        Untyped for the same reason as `artists()` above."""
         if isinstance(ids, str):
             ids = [ids]
         trace.get_current_span().set_attribute("spotify.album_ids", ",".join(ids))

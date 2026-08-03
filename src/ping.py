@@ -1,12 +1,9 @@
-"""The `-ping` health dashboard: dependency probes, rendering, and the live-edit loop.
+"""The `-ping` health dashboard: dependency probes, rendering, live-edit loop.
 
-One feature, one module. The three sections below are separated by rules rather
-than by files: an earlier split put the probes in src/diagnostics.py so a healthz
-endpoint could reuse them, but src/healthz.py is deliberately a dumb liveness probe
-(it must NOT fail on dependency health, or a Redis blip becomes a pod restart loop),
-so that second consumer never existed. Full design: docs/PING_METADATA_PLAN.md.
-
-src/musicbot.py holds only the command registration and delegates in here.
+One feature, one module — the sections below are separated by rules, not files. The
+probes are deliberately not shared with a healthz endpoint: healthz must stay a dumb
+liveness probe, or a Redis blip becomes a pod restart loop. src/musicbot.py holds only
+the command registration and delegates in here.
 """
 
 import asyncio
@@ -35,10 +32,8 @@ from yt_dlp.version import __version__ as _YTDLP_VERSION
 
 from src import telemetry
 
-# Live-edit loop tunables (see run_health_dashboard), env-overridable for
-# slow/remote deployments. Defined in config.py rather than here so there is
-# one answer to "what does this bot read from the environment?" — see
-# docs/PING_METADATA_PLAN.md §5.2/§8.
+# Live-edit loop tunables (see run_health_dashboard), env-overridable. Defined in
+# config.py so there is one answer to "what does this bot read from the environment?".
 from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
     ENVIRONMENT,
@@ -58,14 +53,11 @@ log = get_logger(__name__)
 # SECTION 1 · PROBES & VERSIONS — infrastructure, no Discord message concepts
 # ════════════════════════════════════════════════════════════════════════════
 # Nothing below this rule until SECTION 2 knows about embeds, channels or ctx. Each
-# probe is an ``async def`` returning a ProbeResult and never raising out: a dead
-# dependency becomes DOWN, so the caller's loop can always render. The one exception
-# it lets through is CancelledError — the live-edit loop cancels still-pending probes
-# at its deadline and flips them to FAILED itself.
+# probe returns a ProbeResult and never raises out (a dead dependency becomes DOWN),
+# except CancelledError: the deadline path cancels stragglers and flips them to FAILED.
 
-# Throwaway key the Redis probe writes to prove the write path is open (see
-# probe_redis). Namespaced away from guild:* / spotify:* and self-expiring, so it
-# never accumulates and can't collide with real state.
+# Throwaway key the Redis probe writes to prove the write path is open. Namespaced away
+# from guild:* / spotify:* and self-expiring, so it never accumulates or collides.
 _REDIS_HEALTH_KEY = "health:ping"
 _REDIS_HEALTH_TTL_SECS = 30
 
@@ -86,22 +78,12 @@ class ProbeState(Enum):
 
 
 class ArchiveHealth(Protocol):
-    """The only thing the Postgres row needs from the play-history archive: a
-    way to prove its database answers.
-
-    Declared structurally here rather than imported from history_archive.py so
-    this module keeps its "no dependency on the tiers it reports on" shape —
-    probe_redis takes a bare Redis handle for the same reason, and ping.py stays
-    out of asyncpg's import graph. PostgresHistoryArchive satisfies it by
-    having the method; nothing has to inherit anything.
-
-    It is deliberately NOT the raw asyncpg.Pool this parameter used to be typed
-    for. The pool is created lazily on first archive use, so a just-started bot
-    has none, and a pool-shaped probe would have to report the required
-    Postgres tier as "not configured" — or force the caller to open a
-    connection before the dashboard's skeleton embed could send. Asking the
-    archive instead moves both problems inside the probe task, where the
-    timing already belongs.
+    """The only thing the Postgres row needs from the play-history archive: a way to
+    prove its database answers. Declared structurally rather than imported from
+    history_archive.py so ping.py stays out of asyncpg's import graph. Deliberately not
+    the raw asyncpg.Pool: the pool is created lazily on first archive use, so a
+    just-started bot has none and a pool-shaped probe would report the tier as
+    "not configured".
     """
 
     async def health_check(self) -> None: ...
@@ -116,12 +98,9 @@ class ProbeResult:
 
 
 def _error_detail(e: Exception) -> str:
-    """A short, renderable reason for a failed probe.
-
-    Server-side Redis errors lead with an uppercase code — MISCONF (persistence
-    broken), OOM (maxmemory + noeviction), READONLY (replica) — which says far
-    more to an operator than the redis-py exception class ("ResponseError").
-    Falls back to the exception class name for everything else.
+    """A short, renderable reason for a failed probe. Server-side Redis errors lead with
+    an uppercase code — MISCONF (persistence broken), OOM, READONLY (replica) — which
+    tells an operator far more than the redis-py class name. Falls back to that name.
     """
     head = str(e).split(maxsplit=1)[0] if str(e) else ""
     if head.isalpha() and head.isupper() and 2 < len(head) <= 12:
@@ -130,10 +109,9 @@ def _error_detail(e: Exception) -> str:
 
 
 async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResult:
-    """Run a probe body, time it, and classify the outcome.
-
-    Never raises except for CancelledError (which the deadline path relies on to
-    flip a cancelled probe to FAILED). Any other failure becomes a DOWN result.
+    """Run a probe body, time it, classify the outcome. Never raises except
+    CancelledError, which the deadline path relies on to flip a cancelled probe to
+    FAILED; every other failure becomes DOWN.
     """
     start = time.perf_counter()
     try:
@@ -151,14 +129,10 @@ async def _timed(label: str, body: Callable[[], Awaitable[object]]) -> ProbeResu
 
 
 async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
-    """PING *and* a throwaway write.
-
-    PING alone is misleading: Redis keeps serving reads while refusing writes —
-    MISCONF after a failed bgsave (observed live: full disk → every guild's state
-    write failing while -ping still showed green), OOM under maxmemory+noeviction,
-    READONLY on a replica. The bot writes guild state, queues and history
-    constantly, so a probe that never writes isn't measuring what the bot needs.
-    One short-TTL key, self-expiring, is enough to exercise the write path.
+    """PING *and* a throwaway write. PING alone is misleading: Redis keeps serving reads
+    while refusing writes — MISCONF after a failed bgsave (observed live: a full disk
+    failed every guild's state write while -ping stayed green), OOM under
+    maxmemory+noeviction, READONLY on a replica. One short-TTL key exercises writes.
     """
     if redis is None:
         return ProbeResult("Redis", ProbeState.NA)
@@ -173,17 +147,13 @@ async def probe_redis(redis: Optional[aioredis.Redis]) -> ProbeResult:
 async def probe_spotify(
     spotify: Optional[Spotify], status: SpotifyStatus = SpotifyStatus.ENABLED
 ) -> ProbeResult:
-    """Spotify's row, which reports the *source's* usability, not just reachability.
-
-    `status` is the outcome of the startup credential probe (MusicBot._spotify_status):
-    it is the only thing that can tell "configured but Spotify rejected the
-    credentials" apart from "reachable but slow", and it does so without spending a
-    doomed API call. It defaults to ENABLED so a caller that has no status to offer
-    still gets the plain reachability probe.
+    """Spotify's row: the *source's* usability, not just reachability. `status` (from
+    MusicBot._spotify_status' startup probe) separates "configured but rejected" from
+    "reachable but slow" without spending a doomed API call; it defaults to enabled so a
+    caller with no status still gets the plain reachability probe.
     """
-    # spotify is None when the bot was started without Spotify credentials (the
-    # feature is off entirely); a non-None client with empty creds is the same story
-    # from a probe's point of view. Both are "not configured" → N/A, not a failure.
+    # None client (started without credentials) and a client with empty creds are
+    # the same story here: "not configured" → N/A, not a failure.
     if (
         spotify is None
         or status is SpotifyStatus.DISABLED
@@ -191,15 +161,14 @@ async def probe_spotify(
     ):
         return ProbeResult("Spotify API", ProbeState.NA, detail="not configured")
     if status is SpotifyStatus.INVALID:
-        # Credentials were present at startup and Spotify rejected them. Probing
-        # would only re-earn the same 401 a second time, so report the known cause.
+        # Rejected at startup — probing would only re-earn the same 401.
         return ProbeResult(
             "Spotify API", ProbeState.DOWN, detail="credentials rejected"
         )
 
     async def _do() -> None:
         # Reachability without spending quota: a tiny authenticated GET that also
-        # exercises the token-refresh path. Confirms auth + data plane.
+        # exercises the token-refresh path, confirming auth + data plane.
         await spotify.http_call(
             spotify.spotify_endpoint + "v1/browse/categories", params={"limit": 1}
         )
@@ -208,18 +177,11 @@ async def probe_spotify(
 
 
 async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
-    """The play-history archive's Postgres row.
-
-    A None archive splits on the flag. With the archive disabled
-    (HISTORY_ARCHIVE_ENABLED off — the ship default) setup_hook deliberately
-    built no archive, and the row must say so rather than shrug: OFF,
-    "deliberately disabled", the same state the OTEL row uses. The operator's
-    choice is visible on the dashboard instead of reading like a fault.
-
-    None with the flag ON means the bot was built without an archive some
-    other way — reachable only in tests and in a cog constructed outside
-    MusicBotApp, since setup_hook builds the tier whenever the flag is on —
-    and that stays NA: "constructed without an archive", not "off".
+    """The play-history archive's Postgres row. A None archive splits on the flag:
+    disabled (HISTORY_ARCHIVE_ENABLED off, the ship default) means setup_hook
+    deliberately built no archive, so the row says OFF and reads as a choice rather than
+    a fault. None with the flag ON is a bot built without an archive some other way —
+    tests, or a cog constructed outside MusicBotApp — and stays NA.
     """
     if archive is None:
         if not history_archive_enabled():
@@ -232,19 +194,17 @@ async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
 async def probe_otel() -> ProbeResult:
     if telemetry._tracer_provider is None:
         return ProbeResult("OTEL collector", ProbeState.OFF)
-    # urlparse only fills .hostname/.port when a scheme is present. Operators
-    # often set OTEL_EXPORTER_OTLP_ENDPOINT scheme-less ("collector:4317"), which
-    # would parse to hostname=None and silently probe localhost. Prepend "//" when
-    # no scheme is present so we connect to the endpoint they actually configured.
+    # urlparse fills .hostname/.port only with a scheme present, and operators often set
+    # OTEL_EXPORTER_OTLP_ENDPOINT scheme-less ("collector:4317"), which parses to
+    # hostname=None and silently probes localhost. Prepend "//" so we hit the real one.
     raw = telemetry._OTLP_ENDPOINT
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
     host, port = parsed.hostname or "localhost", parsed.port or 4317
 
     async def _do() -> None:
-        # gRPC OTLP has no cheap app-level ping; a TCP connect proves the port is
-        # accepting connections. Liveness signal only (not a real OTLP handshake),
-        # and — unlike the auto-instrumented Redis/aiohttp probes — it emits no
-        # child span, so this row won't appear in the ping's fan-out trace.
+        # gRPC OTLP has no cheap app-level ping, so a TCP connect proves only that the
+        # port accepts connections. It emits no child span, so this row never appears
+        # in the ping's fan-out trace.
         _, writer = await asyncio.open_connection(host, port)
         writer.close()
         await writer.wait_closed()
@@ -256,13 +216,10 @@ async def probe_otel() -> ProbeResult:
 
 
 def bot_version() -> str:
-    """The bot's own version, cached for process lifetime.
-
-    Read from pyproject.toml (copied into the runtime image), not installed dist
-    metadata: the container installs deps with `poetry install --no-root`, so the
-    project itself is never a metadata-bearing distribution and
-    importlib.metadata.version() would raise PackageNotFoundError. Falls back to
-    dist metadata for a wheel install that ships no pyproject.toml, then "unknown".
+    """The bot's own version, cached for process lifetime. From pyproject.toml (copied
+    into the runtime image), not dist metadata: the container installs with `poetry
+    install --no-root`, so metadata.version() would raise PackageNotFoundError. Falls
+    back to dist metadata for a wheel install shipping no pyproject.toml, then "unknown".
     """
     global _bot_version_cache
     if _bot_version_cache is not None:
@@ -309,11 +266,9 @@ def ffmpeg_version() -> str:
 
 
 async def collect_versions() -> dict[str, str]:
-    """All versions for the embed's Versions block. ffmpeg's first (uncached) call
-    shells out, so it runs in the default executor to keep the loop unblocked;
-    every other value is a dict lookup. The single await here also gives the
-    already-scheduled immediate probes (NA/OFF) a chance to complete so the
-    skeleton send can pre-drain them (docs/PING_METADATA_PLAN.md §6 step 2)."""
+    """All versions for the embed's Versions block. ffmpeg's first call shells out, so it
+    goes to the default executor; the rest are dict lookups. This single await also lets
+    the already-scheduled immediate probes (NA/OFF) complete for the skeleton send."""
     loop = asyncio.get_running_loop()
     ffmpeg = await loop.run_in_executor(None, ffmpeg_version)
     return {
@@ -328,13 +283,12 @@ async def collect_versions() -> dict[str, str]:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 · RENDERING — ProbeResults to a Discord embed
 # ════════════════════════════════════════════════════════════════════════════
-# docs/PING_METADATA_PLAN.md §6.2. Pure presentation: takes the values SECTION 1
-# produces and decides dots, colours and layout. No I/O.
+# Pure presentation: takes the values SECTION 1 produces and decides dots, colours
+# and layout. No I/O.
 
-# One band table drives BOTH the status dot and the embed accent so a probe can't
-# show, say, a green dot under a yellow accent. These bands (≤100/≤200) differ on
-# purpose from util.latency_color's (≤50/≤100/≤200), which backs the lighter
-# send_latency_line reply — don't swap one for the other.
+# One band table drives both the status dot and the embed accent, so a green dot can't
+# appear under a yellow accent. These bands (≤100/≤200) differ on purpose from
+# util.latency_color's (≤50/≤100/≤200), which backs send_latency_line — don't swap them.
 _LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
     (100, "🟢", 0x44FF44),
     (200, "🟡", 0xFFD000),
@@ -355,10 +309,9 @@ _PING_WARN = 0xE67E22
 
 
 def _latency_band(ms: float) -> tuple[str, int]:
-    # Total over every float, INCLUDING nan (nan <= cap is always False): fall back
-    # to the worst band so an unknown latency can never StopIteration. discord.py's
-    # Client.latency is nan whenever the gateway ws is down (reconnect window), which
-    # is exactly when -ping is most likely to be run.
+    # Total over every float INCLUDING nan (nan <= cap is always False): fall back to
+    # the worst band so an unknown latency can never StopIteration. discord.py's
+    # Client.latency is nan while the gateway ws is down — exactly when -ping runs.
     return next(
         ((dot, hue) for cap, dot, hue in _LATENCY_BANDS if ms <= cap),
         _LATENCY_BANDS[-1][1:],
@@ -381,17 +334,9 @@ def _ping_value(r: ProbeResult) -> str:
         ProbeState.DOWN: "down",
         ProbeState.FAILED: "failed",
     }[r.state]
-    # A bare "down" makes an operator go read logs; the reason (MISCONF, OOM,
-    # ConnectionError) is the actionable half and costs one short parenthetical.
-    # An n/a row gets the same treatment when it has a reason to give — "not
-    # configured" is why an optional dependency is dark, and it costs nothing.
-    # OFF carries its detail for the same reason NA does, and it was omitted by
-    # oversight rather than by design: probe_postgres sets
-    # detail="archive disabled" and its docstring says the row "must say so
-    # rather than shrug", but the renderer dropped it, so the field was dead
-    # data and the row was indistinguishable from any other OFF. A test
-    # asserted the detail on the ProbeResult, which looked like coverage of
-    # exactly that claim while pinning something no user could see.
+    # A bare "down" sends an operator to the logs; the reason (MISCONF, OOM,
+    # ConnectionError) is the actionable half. NA and OFF get the same treatment when
+    # they have one — probe_postgres's "archive disabled" marks an opted-out row.
     if r.state in (ProbeState.DOWN, ProbeState.NA, ProbeState.OFF) and r.detail:
         return f"{word} ({r.detail})"
     return word
@@ -407,12 +352,11 @@ def render_ping_embed(
     discord_ms: float,
     span: Span,
 ) -> discord.Embed:
-    """Build the live health embed from the current probe results + versions.
-
-    Accent: any down/failed → red; else any still-pending → blurple; else the
-    worst OK latency's band colour (same bands as the dots)."""
-    # discord.py reports nan latency while the gateway ws is reconnecting — show it
-    # as down (red) rather than a bogus number, matching the old latency_color(nan).
+    """Build the live health embed from the current probe results + versions. Accent:
+    any down/failed → red; else any still-pending → blurple; else the worst OK latency's
+    band colour (same bands as the dots)."""
+    # nan latency means the gateway ws is reconnecting — show down (red) rather
+    # than a bogus number.
     disc = (
         ProbeResult("Discord gateway", ProbeState.DOWN, detail="reconnecting")
         if math.isnan(discord_ms)
@@ -452,29 +396,15 @@ def render_ping_embed(
 
 
 def default_password_embed() -> Optional[discord.Embed]:
-    """A standing warning that the Postgres password is still the compose
-    default, or None when it is not.
+    """A standing warning that the Postgres password is still the compose default, or
+    None when it is not.
 
-    Rendered on EVERY -ping rather than once at startup, deliberately. The
-    startup log is seen once and usually by whoever already knows; this is the
-    surface an operator looks at repeatedly, so it is the one that keeps the
-    problem visible until it is fixed.
-
-    Static — nothing here changes between ticks — so the dashboard's
-    edit-on-change loop is unaffected: it still diffs only the health embed.
-
-    IT READS THE DSN, NOT THE SERVER, and the remedy below is ordered around
-    that limit. `setup_env.sh --force` changes only the DSN, so performing it
-    first clears this warning while Postgres still accepts the old password —
-    the control switching itself off mid-remedy, in the window where it is most
-    needed. Changing the server first means the warning survives until the fix
-    is genuinely complete. A detector that could not be fooled would attempt a
-    connection with DEFAULT_POSTGRES_PASSWORD instead of parsing a string.
-
-    Gated on the archive flag, like setup_hook's startup ERROR: with the
-    archive disabled there is no deployed Postgres for the bot to warn about,
-    and a credential advisory for a database that isn't there is noise that
-    trains operators to ignore warnings.
+    Rendered on every -ping rather than once at startup: this is the surface an operator
+    returns to, so it keeps the problem visible until it is fixed. IT reads the DSN, not
+    the SERVER, which is why the remedy below is ordered — `setup_env.sh --force` first
+    would clear the warning while Postgres still accepts the old password. Gated on the
+    archive flag, like setup_hook's startup ERROR: with the archive disabled there is no
+    deployed Postgres to warn about, and an advisory for an absent database is noise.
     """
     if not history_archive_enabled():
         return None
@@ -516,8 +446,8 @@ def default_password_embed() -> Optional[discord.Embed]:
 
 
 def _ping_embed_changed(new: discord.Embed, old: discord.Embed) -> bool:
-    """True when a re-render actually differs — the only things that move are the
-    two field values, the colour, and the footer, all captured by to_dict()."""
+    """True when a re-render actually differs. Only the two field values, the
+    colour and the footer move, and to_dict() captures all of them."""
     return new.to_dict() != old.to_dict()
 
 
@@ -525,11 +455,9 @@ async def _safe_edit(
     message: discord.Message, embeds: list[discord.Embed]
 ) -> Optional[discord.Embed]:
     """Edit a message, tolerating a host the user deleted mid-loop (mirrors
-    musicplayer._progress_updater). Returns the HEALTH embed on success (the
-    caller diffs against that one alone), None if the message is gone.
-
-    Takes the full embed list because the warning above rides along on every
-    edit; dropping it would make it flicker away on the first tick."""
+    musicplayer._progress_updater). Returns the HEALTH embed on success — the caller
+    diffs against that one alone — or None if the message is gone. Takes the full embed
+    list because the warning rides along on every edit; dropping it would flicker."""
     try:
         await message.edit(embeds=embeds)
         return embeds[-1]
@@ -543,10 +471,9 @@ async def _safe_edit(
 
 
 async def send_latency_line(ctx: commands.Context, bot_latency: float) -> None:
-    """The lightweight one-line WS-latency reply. Used by -join (and cold -play,
-    via join) so the common connect path never pays for the full health dashboard
-    — see docs/PING_METADATA_PLAN.md §2.3. Sent through ctx.send so it still
-    honours the Now Playing host machinery."""
+    """The lightweight one-line WS-latency reply. Used by -join (and cold -play via
+    join) so the common connect path never pays for the full dashboard. Sent through
+    ctx.send, so it still honours the Now Playing host machinery."""
     ms = bot_latency * 1000
     await send_embed(
         ctx,
@@ -563,27 +490,23 @@ async def run_health_dashboard(
     redis: Optional[aioredis.Redis],
     spotify: Optional[Spotify],
     spotify_status: SpotifyStatus = SpotifyStatus.ENABLED,
-    # No default, unlike spotify_status: `redis` and `spotify` are also
-    # required-but-Optional, and for the same reason. A default of None would let
-    # a new caller silently render the required Postgres tier as "n/a" by simply
-    # forgetting the argument — which is exactly the bug this parameter had while
-    # it was a pool nobody passed.
+    # No default, unlike spotify_status: `redis` and `spotify` are required-but-Optional
+    # for the same reason — a default of None would let a new caller silently render an
+    # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
 ) -> None:
-    """Optimistic-send + live-edit health dashboard (docs/PING_METADATA_PLAN.md §5).
-
-    Fires a skeleton embed immediately, then edits it in place each tick as probes
-    return; a hard deadline fails any straggler. Runs inside the caller's span.
-    Exceptions propagate — the command owns the user-facing error reply.
+    """Optimistic-send + live-edit health dashboard: sends a skeleton embed immediately,
+    then edits in place each tick as probes return, with a hard deadline failing any
+    straggler. Runs inside the caller's span and lets exceptions propagate — the command
+    owns the user-facing error reply.
     """
     span = trace.get_current_span()
     loop = asyncio.get_running_loop()
     tasks: dict[str, asyncio.Task[ProbeResult]] = {}
 
     def _drain() -> bool:
-        """Fold every finished probe task into `results`; True if a row moved.
-        Only genuinely-completed tasks are done() here (cancellation happens at
-        the deadline/finally), so .result() never re-raises."""
+        """Fold every finished probe into `results`; True if a row moved. Only
+        genuinely-completed tasks are done() here, so .result() never re-raises."""
         changed = False
         for label in [lbl for lbl in pending if tasks[lbl].done()]:
             results[label] = tasks[label].result()
@@ -592,9 +515,8 @@ async def run_health_dashboard(
         return changed
 
     try:
-        # 1. launch probes INSIDE try so `finally` cancels them no matter where
-        #    a later await raises. create_task copies the otel context, so child
-        #    probe spans (auto-instrumented Redis/aiohttp) nest under bot.ping.
+        # 1. launch inside try so `finally` cancels them wherever a later await raises.
+        #    create_task copies the otel context, so probe spans nest under bot.ping.
         tasks = {
             "Redis": asyncio.create_task(probe_redis(redis)),
             "Spotify API": asyncio.create_task(probe_spotify(spotify, spotify_status)),
@@ -604,49 +526,38 @@ async def run_health_dashboard(
         results = {label: ProbeResult(label, ProbeState.PENDING) for label in tasks}
         pending = set(tasks)
 
-        # 2. instant data + skeleton. collect_versions() awaits (executor hop),
-        #    which lets the immediate NA/OFF probes complete; pre-drain them so
-        #    those rows never flash "pending…" for a tick.
+        # 2. instant data + skeleton. collect_versions()'s executor hop lets the
+        #    immediate NA/OFF probes complete; pre-drain so no row flashes "pending…".
         versions = await collect_versions()
         _drain()
         discord_ms = bot_latency * 1000
         last = render_ping_embed(results, versions, discord_ms, span)
-        # Computed once: it is static, so it costs nothing per tick and cannot
-        # make _ping_embed_changed see a difference that is not there.
+        # Computed once: it is static, so it cannot make _ping_embed_changed see a
+        # difference that is not there.
         #
-        # OWNER ONLY. -ping has no permission gate and answers to `-status`,
-        # `-health`, `-l` — so this advisory, which names the credential and
-        # confirms that THIS host is running on it, was being handed to every
-        # member of every guild the bot is in, and left in Discord's retained
-        # history. The value is a public constant in a GPL repo, so the leak was
-        # never the string; it was the free confirmation of which hosts are
-        # worth trying, delivered to exactly the population most likely to try.
-        #
-        # Restricting it costs nothing the design relied on: the advisory exists
-        # for the person who can act on it, and for a self-hosted bot the
-        # application owner IS that person. The startup ERROR still fires on
+        # OWNER only. -ping has no permission gate, so this advisory — which names the
+        # credential and confirms this host runs on it — would otherwise reach every
+        # member of every guild and stay in Discord's retained history. The value is a
+        # public constant in a GPL repo, so the leak was never the string but the free
+        # confirmation of which hosts are worth trying. The startup ERROR still fires on
         # every boot for anyone reading logs.
         #
-        # ORDER IS LOAD-BEARING, not style. is_owner() is not a local predicate:
-        # MusicBotApp passes neither owner_id nor owner_ids, so discord.py falls
-        # through to application_info() — a REST GET, retried up to 5 times over
-        # ~25s on a 5xx, and it raises rather than returning False. Written as
-        # `embed() if await is_owner() else None` the await runs FIRST and
-        # UNCONDITIONALLY, which put a network round trip (and a new failure
-        # mode) ahead of the skeleton send this function promises is immediate —
-        # so the health dashboard broke exactly when Discord was degraded, which
-        # is when it gets run. PING_DEADLINE_SECS does not bound it; that clock
-        # starts after the send. Ask the cheap, local, always-correct question
-        # first: with the archive off — the ship default — the embed is None on
-        # its first line and the owner check is never reached at all.
+        # Order matters here. is_owner() is not a local predicate:
+        # MusicBotApp passes neither owner_id nor owner_ids, so discord.py falls through
+        # to application_info() — a REST GET, retried up to 5 times over ~25s on a 5xx,
+        # and it raises rather than returning False. Written as `embed() if await
+        # is_owner() else None` the await runs first and unconditionally, putting a
+        # network round trip ahead of the skeleton send this function promises is
+        # immediate, and PING_DEADLINE_SECS does not bound it (that clock starts after
+        # the send). Ask the cheap, local question first.
         warning = default_password_embed()
         if warning is not None and not await ctx.bot.is_owner(ctx.author):
             warning = None
-        message = await ctx.channel.send(  # bypass NP host (§5.3)
+        message = await ctx.channel.send(  # bypass NP host
             embeds=[e for e in (warning, last) if e is not None]
         )
 
-        # 3. live-edit loop: tick, drain, edit-on-change; exit early when done.
+        # 3. Live-edit loop: tick, drain, edit-on-change; exit early when done.
         deadline = loop.time() + PING_DEADLINE_SECS
         while pending and (remaining := deadline - loop.time()) > 0:
             await asyncio.sleep(min(PING_TICK_SECS, remaining))
@@ -658,9 +569,9 @@ async def run_health_dashboard(
                     )
                     last = edited or last
 
-        # 4. deadline: fail only what is STILL pending. Re-check done() first —
-        #    a probe can finish during step 3's final edit await, and flipping
-        #    it to FAILED unconditionally would report a healthy dep as red.
+        # 4. deadline: fail only what is STILL pending. Re-check done() first — a
+        #    probe can finish during step 3's final edit await, and flipping it to
+        #    FAILED unconditionally would report a healthy dep as red.
         if pending:
             for label in pending:
                 if tasks[label].done():

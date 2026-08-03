@@ -373,7 +373,7 @@ The Compose stack runs the bot plus its supporting services:
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: deployed only with the `archive` profile active (`COMPOSE_PROFILES=archive`) |
 | `db-migrate` | One-shot schema migration for the archive — same `archive` profile |
 | `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `docker compose run --rm db-backfill` |
-| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works ([details](docs/PO_TOKEN_SIDECAR_PLAN.md)); optional — the bot degrades gracefully without it |
+| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works; optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
 ```bash
@@ -827,8 +827,7 @@ owned by a `GuildQueue` domain class. Redis also stores the current song and pla
 position, which is how the bot survives crashes: on startup it detects interrupted
 sessions, rejoins voice, and resumes the queue.
 
-The full reference lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); the
-[docs index](docs/README.md) tracks design documents and plans.
+The full reference lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ### Project structure
 
@@ -854,7 +853,7 @@ tests/                 # one test_*.py per src/ module, plus:
 ├── helpers.py         # test-only builders
 └── test_context.py    # Discord context doubles
 
-docs/                  # architecture reference + design docs (see docs/README.md)
+docs/                  # architecture reference + design docs
 ```
 
 Most modules have a matching `tests/test_<name>.py`. `config.py` and `telemetry.py`

@@ -1,11 +1,8 @@
 """Tests for src/backfill_history.py — moving pre-archive Redis history into
-Postgres.
-
-The two properties that matter and that no other test covers: legacy entries
-(written before HistoryEntry carried a guild_id) must be stamped from their
-KEY, or every guild's old rows collide with every other guild's on the
-(guild_id, played_at, webpage_url) dedup index; and the run must be resumable,
-because a backfill over a real deployment's history will be interrupted.
+Postgres. Two properties no other test covers: legacy entries (written before
+HistoryEntry carried a guild_id) must be stamped from their KEY or every guild's
+old rows collide on the (guild_id, played_at, webpage_url) dedup index, and the
+run must be resumable because a real deployment's backfill gets interrupted.
 """
 
 import sys
@@ -51,10 +48,9 @@ class CollectingArchive:
 
     async def health_check(self) -> None:
         # Not on the HistoryArchive protocol — _run holds the concrete
-        # PostgresHistoryArchive and preflights it before the walk, so that the
-        # dry run learns whether the destination is reachable at all. A double
-        # without this reports the preflight failing, which is the correct
-        # signal: it means the fake is not modelling what the CLI uses.
+        # PostgresHistoryArchive and preflights it before the walk, so a dry run
+        # learns whether the destination is reachable at all. A double without
+        # this fails the preflight, which is the correct signal.
         self.health_checks += 1
 
     async def record_rejection(
@@ -64,16 +60,10 @@ class CollectingArchive:
         trace_id: str = "",
         wire: Optional[bytes] = None,
     ) -> None:
-        # The backfill never calls this — it is here only because backfill()
-        # takes the whole HistoryArchive protocol, which is the union of three
-        # consumers' needs (GuildHistory reads, the backfill writes, the drainer
-        # does both plus rejections). A rejection recorded from here would be a
-        # bug, so it raises rather than collecting.
-        #
-        # `wire` arrived with the archive's dead-letter fix: the drainer parks
-        # the DELIVERED bytes rather than a re-serialization. Irrelevant to this
-        # double's behaviour, but the signature has to match or the protocol
-        # check fails — which is the point of keeping the full shape here.
+        # The backfill never calls this; it is here because backfill() takes the
+        # whole HistoryArchive protocol. A rejection from here would be a bug, so
+        # it raises rather than collecting. `wire` (the delivered bytes the
+        # drainer parks) is in the signature only so the protocol shape matches.
         raise AssertionError("the backfill must not record rejections")
 
     async def close(self) -> None:
@@ -102,13 +92,10 @@ class TestBackfill:
     async def test_concurrent_plays_cannot_slide_entries_out_of_the_window(
         self, fake_redis: Redis
     ) -> None:
-        """REGRESSION: paging used head-relative indices (`lrange(key, start,
-        start + page - 1)`) while push_history LPUSHes at the HEAD, so every
-        song that finished mid-run shifted the window and the oldest entries
-        fell out unread — reproduced as 3 songs during a 10-entry backfill
-        skipping OLD0/OLD1/OLD2 while the report still said 10. Cutover then
-        LTRIMs the list, so those plays were gone for good.
-        """
+        """regression: head-relative paging (`lrange(key, start, start+page-1)`)
+        against a list push_history LPUSHes into, so every song finishing mid-run
+        shifted the window and the oldest entries fell out unread while the
+        report still claimed them. Cutover then LTRIMs: gone for good."""
         key = GUILD_HISTORY_KEY.format(guild_id=7)
         await _seed(fake_redis, 7, *(_entry(n, guild_id=7) for n in range(10)))
 
@@ -181,18 +168,15 @@ class TestBackfill:
 
     async def test_never_touches_the_outbox(self, fake_redis: Redis) -> None:
         # Routing a historical backlog through the outbox would bury the live
-        # drain behind it — the whole reason this writes to the archive direct.
-        #
-        # XLEN, not LLEN: the outbox became a stream, and LLEN on the key this
-        # test cares about answers 0 while it is absent (passing for the wrong
-        # reason) and raises WRONGTYPE the moment it is not (failing for the
-        # wrong reason). Neither reports the thing the test is named after.
+        # drain behind it — the reason this writes to the archive direct. XLEN,
+        # not LLEN: the outbox is a stream, and LLEN answers 0 while the key is
+        # absent and raises WRONGTYPE once it is not, so it reports neither.
         await _seed(fake_redis, 1, _entry(1))
         await backfill(fake_redis, CollectingArchive())
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
     async def test_leaves_the_redis_lists_intact(self, fake_redis: Redis) -> None:
-        # Non-destructive: Phase C's trim is a separate, later, gated step.
+        # Non-destructive: the cutover trim is a separate, later, gated step.
         await _seed(fake_redis, 1, _entry(1), _entry(2))
         await backfill(fake_redis, CollectingArchive())
         assert await fake_redis.llen(GUILD_HISTORY_KEY.format(guild_id=1)) == 2
@@ -210,22 +194,11 @@ class TestBackfill:
     async def test_legacy_poison_arrives_already_clamped(
         self, fake_redis: Redis
     ) -> None:
-        """The PREMISE this tool relies on, characterised at its boundary.
-
-        Renamed from test_sanitizes_poison_entries, whose comment said "the
-        backfill has to apply it too" — the opposite of what the source says
-        ("No sanitize call"), left over from a revision where `_sanitize_entry`
-        was called here. Nothing in this module sanitizes anything; every
-        assertion below holds before a single line of backfill_history runs,
-        because parse_history_entry constructs a HistoryEntry and
-        __post_init__ clamps.
-
-        Kept rather than deleted, and kept HERE rather than moved to
-        test_guild_state, because it is the assumption that lets this module
-        hand legacy bytes straight to executemany. If the clamp ever moves or
-        weakens, this is the test that should make the backfill's reviewer
-        look — the drainer has _isolate as a backstop and this tool does not.
-        """
+        """The PREMISE this tool relies on: nothing in this module sanitizes.
+        parse_history_entry constructs a HistoryEntry and __post_init__ clamps,
+        which is what lets legacy bytes go straight to executemany. Kept here
+        rather than in test_guild_state because the drainer has _isolate as a
+        backstop and this tool does not — if the clamp weakens, this must fail."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await fake_redis.lpush(
             key, orjson.dumps({"title": "bad\x00title", "played_at": 1e18})
@@ -236,10 +209,10 @@ class TestBackfill:
         assert archive.rows[0].played_at == 0.0  # absurd epoch → sentinel
 
     async def test_an_all_corrupt_page_writes_nothing(self, fake_redis: Redis) -> None:
-        # The `entries and` half of the write guard: no test produced a page
-        # whose entries were ALL corrupt, so dropping it survived. Harmless
-        # today (insert_batch early-returns on empty), but branch coverage
-        # reports the line as fully branched, so the gap is invisible.
+        # The `entries and` half of the write guard: no other test produces a
+        # page whose entries are all corrupt. Harmless today (insert_batch
+        # early-returns on empty), but branch coverage reports the line as fully
+        # branched, so the gap would be invisible.
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         for _ in range(3):
             await fake_redis.lpush(key, b"not json")
@@ -254,43 +227,31 @@ class TestBackfill:
     async def test_corrupt_entries_log_their_bytes(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """`corrupt: N` was the entire forensic record of entries the archive
-        build is about to trim away.
-
-        This is where the backfill has to diverge from the drainer, which drops
-        corrupt entries just as quietly: an unparseable OUTBOX entry still has
-        its twin on the history list, so nothing is lost. Here that list IS the
-        copy. Logging is the only durable record left.
-        """
+        """`corrupt: N` is otherwise the entire forensic record of entries the
+        archive build is about to trim away. The drainer can drop a corrupt
+        OUTBOX entry quietly — its twin is still on the history list — but here
+        that list is the copy, so logging is the only durable record left."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await fake_redis.lpush(key, b'{"deliberately": "unparseable"')
         await backfill(fake_redis, CollectingArchive())
 
         assert "corrupt history entry" in caplog.text
-        assert "deliberately" in caplog.text  # the BYTES, not just a count
+        assert "deliberately" in caplog.text  # the bytes, not just a count
         assert "guild:1:history" in caplog.text  # and where they were
         assert any(r.levelname == "ERROR" for r in caplog.records)
 
     async def test_a_list_that_shrinks_from_the_tail_is_flagged(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Reconciliation in the direction that can mean loss.
-
-        `attempted` exceeding `total` is normal — the last page's clamped
-        window picks up concurrent pushes, which dedup absorbs. Coming up SHORT
-        means entries the initial LLEN counted were never read, which only a
-        tail-side shrink causes. Nothing shrinks these lists from the tail
-        today; the bot's own LTRIM does, and the entries it eats are the
-        OLDEST — exactly the ones this tool exists to save. Simulated here with
-        RPOP between pages.
-
-        The VERDICT is the assertion that matters. This test used to check the
-        log line alone, and that is precisely how the defect shipped: the
-        shrink was detected, warned about, and then folded into `guilds` as a
-        guild that had moved in full, so `ok` stayed True and the tool exited 0
-        over plays it had just watched disappear — while the README tells the
-        operator to gate an irreversible deploy on that exit code.
-        """
+        """Reconciliation in the direction that can mean loss. `attempted`
+        exceeding `total` is normal — the last page's clamped window picks up
+        concurrent pushes, which dedup absorbs. Coming up SHORT means entries the
+        initial LLEN counted were never read, which only a tail-side shrink
+        causes: the bot's own LTRIM eats the oldest entries, exactly the ones
+        this tool exists to save (simulated with RPOP between pages). The VERDICT
+        is what matters — warning about the shrink while still counting the guild
+        as moved leaves `ok` True, and an irreversible deploy is gated on that
+        exit code."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
         real_lrange = fake_redis.lrange
@@ -306,27 +267,21 @@ class TestBackfill:
 
         assert "trimmed from the tail" in caplog.text
         assert report.short_guilds == 1
-        # NOT counted as backfilled: that number is what the summary reports.
+        # Not counted as backfilled: that number is what the summary reports.
         assert report.guilds == 0
         assert not report.ok
 
     async def test_a_trim_that_keeps_the_length_is_still_caught(
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The steady-state trim, which no count can see.
-
-        push_history LPUSHes and LTRIMs in ONE transaction, so a list already at
-        HISTORY_CACHE_LIMIT keeps its length exactly while every song end
-        destroys one unread tail entry. `attempted + corrupt < total` is
-        therefore always false here — the old reconciliation was structurally
-        blind to it — yet pre-archive plays are being lost the whole time.
-
-        This is not an exotic race: it is the shape of every active guild on a
-        deployment already running this build with the archive off, i.e. exactly
-        the population the README's "enable the archive later" flow sends to
-        this tool. Caught by comparing the OLDEST entry's bytes across the walk
-        rather than counting.
-        """
+        """The steady-state trim, which no count can see. push_history LPUSHes
+        and LTRIMs in one transaction, so a list already at HISTORY_CACHE_LIMIT
+        keeps its length exactly while every song end destroys one unread tail
+        entry: `attempted + corrupt < total` is always false, yet pre-archive
+        plays are being lost throughout. That is the shape of every active guild
+        on a deployment running with the archive off — exactly the population the
+        enable-it-later flow sends here. Caught by comparing the oldest entry's
+        bytes across the walk rather than by counting."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(6)))
         real_lrange = fake_redis.lrange
@@ -374,16 +329,13 @@ class TestBackfill:
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The offset is the forensic half of the only record these plays get.
-
         A page runs newest→oldest internally while `start` advances
         oldest→newest, so the distance from the oldest end is
-        `start + (len-1-i)`. The old expression walked the page the wrong way
-        and mixed a guild-cumulative `corrupt` with a page-local
-        `len(entries)`: on this list — 5 entries, the OLDEST corrupt — it
-        reported tail offset 4, pointing the operator at a healthy entry.
-        """
+        `start + (len-1-i)`. Walking the page the wrong way, or mixing a
+        guild-cumulative `corrupt` with a page-local `len(entries)`, points the
+        operator at a healthy entry."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
-        # LPUSH order: the FIRST pushed ends up oldest (tail offset 0).
+        # LPUSH order: the first pushed ends up oldest (tail offset 0).
         await fake_redis.lpush(key, b"not json")
         for n in range(1, 5):
             await fake_redis.lpush(key, serialize_history_entry(_entry(n, guild_id=1)))
@@ -396,10 +348,8 @@ class TestBackfill:
         self, fake_redis: Redis, caplog: pytest.LogCaptureFixture
     ) -> None:
         # config.py sizes an entry at ~420 bytes and a realistic one measures
-        # 545, so the old 400-byte cap stopped mid-thumbnail and never reached
-        # uploader / played_at / message_id — the fields needed to attribute
-        # the play. Build something comfortably past the old cap and assert the
-        # tail of it survives.
+        # 545, so a 400-byte dump cap stops mid-thumbnail and never reaches
+        # uploader / played_at / message_id — the fields that attribute the play.
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         marker = "END-OF-PAYLOAD-MARKER"
         wire = b'{"title": "' + b"x" * 600 + marker.encode() + b'"'  # unparseable
@@ -412,14 +362,11 @@ class TestBackfill:
     async def test_a_key_returned_twice_by_scan_is_counted_once(
         self, fake_redis: Redis, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """SCAN is at-LEAST-once: a rehash can hand back the same key again.
-
-        The rows are idempotent so nothing durable breaks, but `guilds`,
-        `scanned` and `attempted` double — and README tells the operator to
-        verify those counts against `SELECT count(*) FROM play_history` before
-        an irreversible deploy, while the module docstring calls them "the only
-        signal".
-        """
+        """SCAN is at-LEAST-once: a rehash can hand back the same key again. The
+        rows are idempotent so nothing durable breaks, but `guilds`, `scanned`
+        and `attempted` would double — and the operator checks those counts
+        against `SELECT count(*) FROM play_history` before an irreversible
+        deploy."""
         await _seed(fake_redis, 1, _entry(1, guild_id=1), _entry(2, guild_id=1))
         key = GUILD_HISTORY_KEY.format(guild_id=1).encode()
 
@@ -440,9 +387,8 @@ class TestBackfill:
     async def test_each_page_is_inserted_oldest_first(self, fake_redis: Redis) -> None:
         # insert_batch documents "Insert oldest-first". A page arrives
         # newest→oldest while pages advance oldest→newest, so unreversed the
-        # global order was neither — and this tool and the drainer could touch
-        # overlapping keys in opposite orders, which is how a deadlock costs a
-        # whole guild here rather than one row.
+        # global order is neither — and this tool and the drainer touching
+        # overlapping keys in opposite orders deadlocks a whole guild's batch.
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
         archive = CollectingArchive()
 
@@ -461,16 +407,12 @@ class TestBackfill:
         assert report.attempted == 0
 
     async def test_only_history_keys_are_read(self, fake_redis: Redis) -> None:
-        """The key pattern is a safety predicate, and nothing pinned it — the
-        mutation `_HISTORY_KEY_MATCH = "*"` passed every test, because no test
-        seeded a non-history key.
-
-        It matters more than "it would crash on WRONGTYPE" suggests, because
-        parse_history_entry accepts ANY json object and defaults every field:
-        `guild:{id}:queue` is also a LIST, so a pattern drift in that direction
-        inserts never-played songs, counted as `attempted` rather than
-        `corrupt` — no crash, no signal, wrong rows in the durable record.
-        """
+        """The key pattern is a safety predicate that `_HISTORY_KEY_MATCH = "*"`
+        would satisfy in every other test here. It matters more than "it would
+        crash on WRONGTYPE" suggests: parse_history_entry accepts any json object
+        and defaults every field, and `guild:{id}:queue` is also a list — so a
+        drift that way inserts never-played songs counted as `attempted`, with no
+        crash, no signal, and wrong rows in the durable record."""
         await _seed(fake_redis, 1, _entry(1, guild_id=1))
         # One of every other key family in the Redis schema.
         await fake_redis.hset("guild:1:state", "volume", "50")
@@ -492,15 +434,12 @@ class TestBackfill:
         self, fake_redis: Redis, bad_id: str, caplog: pytest.LogCaptureFixture
     ) -> None:
         """This tool is the only place that can manufacture an out-of-domain
-        guild_id, and HistoryEntry.__post_init__ CLAMPS rather than validates:
-        `-1` floors to 0 and 2**63 clamps to int8max. play_history's CHECK is
-        strictly `> 0`, so a stamped 0 is constructible and NOT insertable —
-        and executemany is atomic, so it costs the whole batch.
-
-        The clamp is why parseability was not enough. Skipping beats clamping:
-        a key that cannot be attributed to a guild has no correct destination,
-        and inventing one files real plays under the wrong guild silently.
-        """
+        guild_id, and HistoryEntry.__post_init__ clamps rather than validates:
+        `-1` floors to 0, 2**63 clamps to int8max. play_history's CHECK is
+        strictly `> 0`, so a stamped 0 is constructible and not insertable — and
+        executemany is atomic, so it costs the whole batch. Skipping beats
+        clamping: an unattributable key has no correct destination, and inventing
+        one files real plays under the wrong guild silently."""
         await fake_redis.lpush(
             f"guild:{bad_id}:history", serialize_history_entry(_entry(1))
         )
@@ -520,19 +459,13 @@ class TestBackfill:
     async def test_every_guild_is_enumerated_past_one_scan_page(
         self, fake_redis: Redis
     ) -> None:
-        """SCAN is a CURSOR. Every other test here seeds one or two guilds, so
-        a single non-cursor `scan(...)` page passes all of them — measured: the
-        mutation survived all 18.
-
-        Against 250 guilds one `SCAN COUNT 100` page returns 100 keys and a
-        non-zero cursor, so that regression silently skips 150 guilds' entire
-        pre-archive history. Enumeration is the one primitive with no
-        downstream safety net: a guild the scan never yields produces no
-        corrupt count, no log line, and no discrepancy in the report — and the
-        bot then trims the only copy. fakeredis models the cursor
-        faithfully, so nothing about this needs a real server.
-
-        Seeded past `count=100` on purpose; a smaller number proves nothing.
+        """SCAN is a CURSOR, and every other test here seeds one or two guilds,
+        so a single non-cursor `scan(...)` page would pass them all. Against 250
+        guilds one `SCAN COUNT 100` page returns 100 keys and a non-zero cursor,
+        silently skipping 150 guilds' entire pre-archive history. Enumeration has
+        no downstream safety net: an unyielded guild produces no corrupt count,
+        no log line and no discrepancy — and the bot then trims the only copy.
+        Seeded past `count=100` on purpose; fakeredis models the cursor faithfully.
         """
         seeded = 250
         for gid in range(1, seeded + 1):
@@ -547,13 +480,10 @@ class TestBackfill:
 
 
 class FailingArchive(CollectingArchive):
-    """An archive that refuses one guild's rows.
-
-    The real PostgresHistoryArchive raises on everything ("callers own the
-    error policy") and uses executemany, so one bad row costs the whole batch.
-    CollectingArchive cannot fail at all, which left every failure path here
-    unpinned — a mutation swallowing insert_batch errors passed all 18 tests.
-    """
+    """An archive that refuses one guild's rows. The real PostgresHistoryArchive
+    raises on everything ("callers own the error policy") and uses executemany,
+    so one bad row costs the whole batch — and CollectingArchive cannot fail at
+    all, which leaves every failure path here unpinned."""
 
     def __init__(self, fail_guild: int) -> None:
         super().__init__()
@@ -566,22 +496,17 @@ class FailingArchive(CollectingArchive):
 
 
 class TestFailureContainment:
-    """What happens when a guild does not move.
-
-    The tool runs once, by hand, immediately before the step that trims the
-    lists it reads — so "did all of it move?" is the only question, and these
-    pin that it can always be answered.
-    """
+    """What happens when a guild does not move. The tool runs once, by hand,
+    immediately before the step that trims the lists it reads — so "did all of it
+    move?" is the only question, and these pin that it can always be answered."""
 
     async def test_one_failing_guild_does_not_abort_the_others(
         self, fake_redis: Redis
     ) -> None:
-        """REGRESSION: every error propagated out of backfill(), so the first
-        failure ended the run — and because _run's summary print sits after its
-        try/finally, the operator got a bare traceback with no report at all.
-        Which guilds were skipped depended on Redis' hash order, so it differed
-        between runs.
-        """
+        """regression: every error propagated out of backfill(), so the first
+        failure ended the run — and since _run's summary print sits after its
+        try/finally, the operator got a bare traceback and no report. Which
+        guilds were skipped followed Redis' hash order, so it varied per run."""
         for gid in (1, 2, 3):
             await _seed(fake_redis, gid, _entry(1, guild_id=gid))
         archive = FailingArchive(fail_guild=2)
@@ -589,7 +514,7 @@ class TestFailureContainment:
         report = await backfill(fake_redis, archive)
 
         assert report.failed_guilds == 1
-        assert report.guilds == 2  # the two that moved IN FULL, not all three
+        assert report.guilds == 2  # the two that moved IN full, not all three
         assert {e.guild_id for e in archive.rows} == {1, 3}
         assert not report.ok
 
@@ -626,9 +551,9 @@ class TestFailureContainment:
 
 
 class TestCli:
-    """`_run`/`main` were 0% covered, including --dry-run — a flag that runs by
-    hand against production Redis at the most irreversible moment of the
-    migration, and whose whole promise is that it touches nothing."""
+    """`_run`/`main`, including --dry-run — a flag run by hand against production
+    Redis at the most irreversible moment of the migration, whose whole promise
+    is that it touches nothing."""
 
     @pytest.fixture
     def wired(
@@ -670,13 +595,9 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """The operator-facing half of the containment fix.
-
-        A partially-applied run must be impossible to mistake for a complete
-        one — by exit code for anything scripted, and in words for the human
-        reading the terminal. Previously an insert failure produced a traceback
-        and NO summary, because the print sits after the try/finally.
-        """
+        """The operator-facing half of containment: a partially-applied run must
+        be impossible to mistake for a complete one — by exit code for anything
+        scripted, and in words for the human reading the terminal."""
         archive = FailingArchive(fail_guild=2)
         monkeypatch.setenv("POSTGRES_URL", "postgresql://stub")
         monkeypatch.setattr(backfill_history, "create_redis_pool", lambda: MagicMock())
@@ -708,15 +629,11 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """ "0 entries scanned" and "wrong Redis" are otherwise the same output.
-
-        REDIS_URL defaults silently to localhost, so forgetting it produces a
-        clean run, exit 0, and a report that reads as "nothing to migrate" —
-        immediately before the step that destroys the source. Naming both
-        endpoints is the only thing that distinguishes them.
-
-        Redacted because operators paste this output into tickets.
-        """
+        """ "0 entries scanned" and "wrong Redis" are otherwise the same output:
+        REDIS_URL defaults silently to localhost, so forgetting it gives a clean
+        run, exit 0 and "nothing to migrate" immediately before the step that
+        destroys the source. Naming both endpoints is the only thing that
+        distinguishes them; redacted because operators paste this into tickets."""
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://bot:hunter2@db.internal/musicbot"
         )
@@ -736,17 +653,12 @@ class TestCli:
         wired: CollectingArchive,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """The ordering violation the docs call unrecoverable, which nothing can
-        detect.
-
-        There is nothing to assert a gate on, because there is no gate: the cap
-        is unconditional, and the state it produces is unobservable after the
-        fact. A guild's list sitting at HISTORY_CACHE_LIMIT is what a trimmed
-        guild AND a healthy migrated guild both look like, so no check here
-        could tell an operator they ran this too late. The notice is therefore
-        printed on every run, including the successful path — which is the one
-        place an operator is still reading.
-        """
+        """The unrecoverable ordering violation, which nothing can detect. There
+        is no gate to assert on: the cap is unconditional and the state it
+        produces is unobservable afterwards — a list sitting at
+        HISTORY_CACHE_LIMIT looks the same whether the guild was trimmed or
+        migrated cleanly. So the notice prints on every run, including the
+        successful path, which is the one an operator is still reading."""
         await _seed(fake_redis, 1, _entry(1, guild_id=1))
         assert await backfill_history._run(dry_run=False) == 0
         out = capsys.readouterr().out
@@ -759,17 +671,12 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """REGRESSION: --dry-run validated nothing about Postgres.
-
-        The archive pool is lazy — connect and the schema-version check live in
-        _ensure(), reached only from insert_batch, which a dry run never calls.
-        So a rehearsal against a dead host, wrong credentials or an unmigrated
-        schema walked the whole keyspace and reported success with exit 0,
-        which is precisely the thing the rehearsal exists to catch.
-
-        Also asserts it fails BEFORE reading anything: learning this after
-        scanning a million entries teaches the same lesson minutes later.
-        """
+        """regression: --dry-run validated nothing about Postgres. The archive
+        pool is lazy — connect and the schema-version check live in _ensure(),
+        reached only from insert_batch, which a dry run never calls — so a
+        rehearsal against a dead host, wrong credentials or an unmigrated schema
+        walked the whole keyspace and exited 0. Also asserts it fails before
+        reading anything."""
         archive = CollectingArchive()
         monkeypatch.setattr(
             archive,
@@ -810,7 +717,7 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        # The other INCOMPLETE verdict, and it has to read differently: with a
+        # The other incomplete verdict, and it has to read differently: with a
         # failed guild the population is known, whereas here an unknown number
         # were never looked at, which makes the printed counts a floor.
         def exploding_scan_iter(*args: Any, **kwargs: Any) -> Any:
@@ -830,14 +737,11 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """The exit code is the contract the README gates the deploy on.
-
-        This is the case that used to print a clean summary and exit 0 having
-        just watched plays be destroyed, so anything scripting
-        `just db-backfill && ./build_docker.sh` proceeded straight into the
-        irreversible step. It is also the only verdict that must NOT promise a
-        re-run fixes it — what has been trimmed is gone.
-        """
+        """The exit code is the contract the deploy is gated on. This case used
+        to print a clean summary and exit 0 having just watched plays be
+        destroyed, so `just db-backfill && ./build_docker.sh` walked straight
+        into the irreversible step. It is also the only verdict that must not
+        promise a re-run fixes it — what has been trimmed is gone."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
         real_lrange = fake_redis.lrange
@@ -877,12 +781,10 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A run can fail in more than one way at once.
-
-        These were an if/elif chain, so the first reason won and the rest were
-        invisible — and an operator who fixes only the reported one re-runs
-        straight into the next, on a tool whose next step is irreversible.
-        """
+        """A run can fail in more than one way at once. As an if/elif chain the
+        first reason won and the rest were invisible — and an operator who fixes
+        only the reported one re-runs straight into the next, on a tool whose
+        next step is irreversible."""
         key = GUILD_HISTORY_KEY.format(guild_id=1)
         await _seed(fake_redis, 1, *(_entry(n, guild_id=1) for n in range(4)))
         await fake_redis.lpush("guild:0:history", serialize_history_entry(_entry(9)))
@@ -890,7 +792,7 @@ class TestCli:
 
         async def shrinking_lrange(name: Any, start: int, end: int) -> Any:
             out = await real_lrange(name, start, end)
-            # scan_iter yields BYTES keys, so this has to normalise before
+            # scan_iter yields bytes keys, so this has to normalise before
             # comparing — matching str against bytes silently never fires.
             if (name.decode() if isinstance(name, bytes) else name) == key:
                 await fake_redis.rpop(key)
@@ -934,16 +836,12 @@ class TestCli:
         wired: CollectingArchive,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """The message, not just the behaviour. Mutations that make the summary
-        lie — swapping a counter, or hardcoding the verb so a dry run claims
-        "submitted" — survived every behavioural test, and this line is what the
-        operator reads before deciding the migration is done.
-
-        EVERY COUNT IS DISTINCT here on purpose: 3 scanned, 2 submitted, 1
-        corrupt, 1 guild. An earlier version of this test seeded two clean
-        entries, so `attempted == scanned` and swapping those two fields in the
-        f-string was undetectable — the test asserted a lying summary was fine.
-        """
+        """The summary message, not just the behaviour: a swapped counter or a
+        hardcoded verb ("submitted" on a dry run) survives every behavioural
+        test, and this line is what the operator reads before deciding the
+        migration is done. Every COUNT is distinct on purpose — 3 scanned, 2
+        submitted, 1 corrupt, 1 guild — because with `attempted == scanned` the
+        two fields can be swapped in the f-string undetectably."""
         await _seed(fake_redis, 5, _entry(1, guild_id=5), _entry(2, guild_id=5))
         await fake_redis.lpush(GUILD_HISTORY_KEY.format(guild_id=5), b"not json")
 
@@ -965,7 +863,7 @@ class TestCli:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The mutation this kills: `asyncio.run(_run(False))`. It leaves every
-        test green while `just db-backfill --dry-run` WRITES every historical
+        test green while `just db-backfill --dry-run` writes every historical
         entry instead of counting them."""
         seen: list[bool] = []
         real_run = backfill_history._run

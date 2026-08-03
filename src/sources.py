@@ -12,10 +12,9 @@ class URLSource(Enum):
     SPOTIFY = "spotify"
     YOUTUBE = "youtube"
     SOUNDCLOUD = "soundcloud"
-    # Any other host we don't special-case (tiktok, twitter/x, vimeo, bandcamp,
-    # twitch clips, …). We don't maintain the list — yt-dlp's ~1800 extractors are
-    # the source of truth, so the URL is handed straight to it and only rejected if
-    # yt-dlp itself reports the site as unsupported (see YTDL.yt_source).
+    # Any host we don't special-case (tiktok, vimeo, bandcamp, …). yt-dlp's ~1800
+    # extractors are the source of truth, so the URL goes straight to it and is rejected
+    # only if yt-dlp reports the site unsupported (see YTDL.yt_source).
     OTHER = "other"
 
 
@@ -40,12 +39,9 @@ class SpotifySource:
 
 @dataclass(frozen=True)
 class YTSource:
-    """
-    :param url: YT URL
-    :param ytsearch: youtube search
-    :param ts: timestamp
-    :param list_id: YouTube playlist ID (present when type == YTType.PLAYLIST)
-    """
+    """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
+    `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
+    when type == YTType.PLAYLIST."""
 
     url: Optional[str] = None
     ytsearch: Optional[str] = None
@@ -57,20 +53,16 @@ class YTSource:
 
     @property
     def playlist_url(self) -> str:
-        """The canonical playlist URL for a type=PLAYLIST source: the original
-        URL if one was pasted, else rebuilt from list_id. The single spelling
-        of the `url or ".../playlist?list={list_id}"` fallback the enqueue,
-        playnow, and resolve paths all need."""
+        """Canonical playlist URL for a type=PLAYLIST source: the pasted URL, else
+        rebuilt from list_id. One spelling for the enqueue/playnow/resolve paths."""
         return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
 
 
 @dataclass(frozen=True)
 class SoundcloudSource:
     # TODO: SoundCloud timestamp links are ignored, so the track always starts at 0:00.
-    # parse_url() extracts the `t`/`ts` query param for youtube.com only, so this ts
-    # field is never populated for a SoundCloud URL. A user who pastes a SoundCloud link
-    # with a timestamp gets no seek and no explanation — the identical link shape works
-    # for YouTube, which makes the inconsistency look like a bug rather than a gap.
+    # parse_url() reads `t`/`ts` for youtube.com only, so this field is never
+    # populated — silently, for a link shape that works on YouTube.
     url: str
     ts: Optional[int] = None
     process: bool = False
@@ -84,18 +76,9 @@ def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
 def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """
-    Parse a URL into a source dataclass. Raises ValueError if no domain is matched.
-
-    domain regex (4 groups):
-        group 1/2: http/www prefix
-        group 3: domain
-        group 4: path
-
-    :param url: URL to be parsed
-    :param message: full message content (used for Spotify si param extraction)
-    :return: source
-    """
+    """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
+    `message` is the full message content. domain regex groups: 1/2 = http/www prefix,
+    3 = domain, 4 = path."""
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
     args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
@@ -131,37 +114,24 @@ def parse_url(
     elif domain in ("soundcloud.com",):
         return SoundcloudSource(url, process=True)
     elif "." in domain:
-        # Not a host we special-case, but it looks like a real domain. Rather than
-        # maintain a whitelist of yt-dlp's ~1800 supported sites, hand the raw URL to
-        # yt-dlp and let it decide: a supported site (tiktok, vimeo, twitch clips, …)
-        # just plays, and a genuinely unsupported one surfaces yt-dlp's own
-        # "Unsupported URL" as a clear message from YTDL.yt_source. Routed exactly like
-        # a bare YouTube watch URL — resolved to a QueueObject in queue_source before it
-        # ever reaches the queue — so no downstream path needs to know it's generic.
+        # Looks like a real domain but isn't special-cased: hand it to yt-dlp rather
+        # than maintain a whitelist, so an unsupported site surfaces yt-dlp's own
+        # "Unsupported URL" via YTDL.yt_source. Routed like a bare YouTube watch URL, so
+        # nothing downstream needs to know it's generic.
         return YTSource(url=url, process=True, stype=URLSource.OTHER)
     else:
-        # The domain regex matched but the "host" has no dot (e.g. "98" from a search
-        # term like "98/99"). That's not a URL — raise ValueError so parse_input falls
-        # back to a YouTube search instead of shipping a bogus host to yt-dlp.
+        # Regex matched but the "host" has no dot (e.g. "98" from the search term
+        # "98/99"). ValueError makes parse_input fall back to a YouTube search.
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
 def parse_input(
     user_input: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """
-    Top-level entry point for command input. Tries parse_url; falls back to ytsearch.
-
-    Only attempts parse_url when the command argument is a single word (a bare
-    link) — URLs never contain spaces, so multi-word input is always a search
-    query. A single-word search term that happens to contain a slash (e.g. "98/99")
-    still reaches parse_url, but its dotless "host" raises ValueError there and is
-    caught below, falling back to search rather than being shipped to yt-dlp.
-
-    :param user_input: the URL or search term from the command argument
-    :param message: full message content (used to extract the search query)
-    :return: source
-    """
+    """Top-level entry point for command input: tries parse_url, falls back to ytsearch.
+    parse_url is attempted only for single-word input, since URLs never contain spaces; a
+    single-word term with a slash ("98/99") still reaches it but raises ValueError on the
+    dotless host and falls back to search."""
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:
