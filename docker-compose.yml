@@ -93,10 +93,13 @@ services:
     #                       pushed. It is normally near-empty and grows precisely
     #                       during a Postgres outage, i.e. exactly when eviction
     #                       pressure is highest.
-    #   guild:{id}:history  the full per-guild list, PERSISTed. Nothing trims
-    #                       it and nothing gives it a TTL, so every play it
-    #                       holds is a primary copy — one lost to eviction is
-    #                       lost outright.
+    #   guild:{id}:history  the per-guild display window, capped at 50 entries
+    #                       and PERSISTed. It is the ONLY source -history reads,
+    #                       so evicting one answers a guild with silence despite
+    #                       a full Postgres archive behind it. Bounded by length
+    #                       rather than by time on purpose: ~24 KB per guild,
+    #                       permanently, instead of a TTL that would expire a
+    #                       quiet guild's history out from under the command.
     #
     # There used to be a third, history:outbox:dlq. The schema lock retired it:
     # rows Postgres refuses now land in the play_history_rejected TABLE, which

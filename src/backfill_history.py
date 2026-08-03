@@ -20,10 +20,17 @@ Safe to re-run and safe to interrupt: ON CONFLICT DO NOTHING makes every insert
 idempotent, so a run that dies half-way is resumed simply by running it again.
 Order within a guild does not matter — reads sort on played_at.
 
-This must run BEFORE the change that caps those lists (it arrives next, and
-does not exist yet: today push_history still leaves them unbounded). Once it
-ships, a guild's list is trimmed to HISTORY_CACHE_LIMIT at that guild's next
-song end, destroying the only copy of exactly the entries this exists to move.
+This must run BEFORE the archive build is deployed. push_history LTRIMs each
+guild's list to HISTORY_CACHE_LIMIT on every write, so the first song a guild
+plays under that build destroys the only copy of exactly the entries this exists
+to move. The window is per guild and it opens at that guild's next song end —
+there is no flag to check and nothing to undo, which is why the ordering lives
+in the upgrade procedure (README) rather than in a runtime switch.
+
+Nothing here can detect that it already happened: a guild's list sitting at
+exactly HISTORY_CACHE_LIMIT is also what a healthy migrated guild looks like.
+The counts this prints are the only signal, and they are only meaningful when
+the run precedes the deploy.
 """
 
 import argparse
@@ -40,6 +47,7 @@ from src.guild_state import parse_history_entry
 from src.history_archive import HistoryArchive, PostgresHistoryArchive
 from src.redis_client import (
     GUILD_HISTORY_KEY,
+    HISTORY_CACHE_LIMIT,
     close_redis_pool,
     create_redis_pool,
     get_redis,
@@ -97,7 +105,7 @@ class BackfillReport:
     # is data this tool understood and rejected, while a failure here means an
     # unknown amount of that guild's history did not move. The two must not be
     # summed into one "problems" number, because only this one makes the run
-    # INCOMPLETE — and completeness is what gates the change that destroys the
+    # INCOMPLETE — and completeness is what gates the deploy that destroys the
     # source. `ok` below is the single question the operator is actually asking.
     failed_guilds: int = 0
     # True when enumeration itself died, i.e. an unknown number of guilds were
@@ -109,7 +117,7 @@ class BackfillReport:
     def ok(self) -> bool:
         """Did every guild this run could see move in full?
 
-        The one thing that may gate the capping change. Deliberately a
+        The one thing that may gate the deploy. Deliberately a
         property rather than a caller-side expression: the check has to change
         in one place when a future failure mode is added to this report.
         """
@@ -175,7 +183,7 @@ async def backfill(
     - A transient fault on one guild no longer discards the walk. Against a
       real deployment this is hours of work.
     - The report stays truthful: `failed_guilds` names how much did not move,
-      and `ok` is what may gate the capping change.
+      and `ok` is what may gate the deploy.
     - A systemic fault (schema drift, a dead database) fails every guild rather
       than the first one, which tells the operator the SCOPE instead of just
       the first symptom. It is noisier by design.
@@ -223,7 +231,7 @@ async def _backfill_one(
             # index right by one and entries slide out of the window unread —
             # measured: 3 songs during a 10-entry backfill silently skipped the
             # 3 OLDEST, while the report still said 10. That is unrecoverable,
-            # because the capping change then LTRIMs the list this was the
+            # because the archive build then LTRIMs the list this was the
             # only copy of.
             # Tail-relative indices are stable under head pushes; the worst a
             # concurrent play can now do is make us re-read a page, which the
@@ -238,13 +246,17 @@ async def _backfill_one(
                     # The BYTES, not just a count. parse_history_entry logs
                     # only its exception, so `corrupt: 3` in the summary was
                     # otherwise the entire forensic record of three plays the
-                    # capping change is about to trim away.
+                    # archive build is about to trim away.
                     #
                     # This is where the backfill diverges from the drainer,
-                    # which drops corrupt entries just as quietly: an outbox
-                    # entry that fails to parse still has its twin on the
-                    # guild:{id}:history list, so nothing is lost. Here that
-                    # list IS the copy, and the next migration step trims it.
+                    # which drops corrupt entries just as quietly. That
+                    # asymmetry used to be harmless: an outbox entry that fails
+                    # to parse still had its twin on an unbounded
+                    # guild:{id}:history list, so the drainer lost nothing.
+                    # With the list capped that escape is gone — the twin
+                    # survives only HISTORY_CACHE_LIMIT further plays — so this
+                    # log line is the pattern the drainer's corrupt-entry path
+                    # should follow too, not a local quirk of this tool.
                     # Logging is the only durable record left — deliberately
                     # not play_history_rejected, which means "Postgres refused
                     # this row" and whose emptiness `just db-rejects` reports
@@ -306,9 +318,11 @@ async def _backfill_one(
     # and picks up entries pushed during the run, which the dedup index absorbs.
     # Coming up SHORT is the opposite — it means entries the initial LLEN
     # counted were not read back, which only a tail-side shrink can cause.
-    # Nothing shrinks these lists from the tail today, so this is latent; it
-    # goes live the moment the capping LTRIM ships, and by then the entries it
-    # would eat are the oldest, i.e. exactly the ones this tool exists to save.
+    # This is LIVE, not latent: push_history LTRIMs on every song end — from
+    # the tail, eating the oldest entries, i.e. exactly the ones this tool
+    # exists to save. A backfill racing a live bot running the archive build is
+    # precisely the ordering mistake the module docstring describes, and this
+    # warning is how a single guild's share of it becomes visible.
     if attempted + corrupt < total:
         log.warning(
             f"guild {guild_id}: read {attempted + corrupt} of {total} entries "
@@ -358,6 +372,19 @@ async def _run(dry_run: bool) -> int:
     # the same. This is the only line that tells them apart.
     print(f"source (Redis):     {_redacted(os.getenv('REDIS_URL', _DEFAULT_REDIS))}")
     print(f"destination (PG):   {_redacted(url)}")
+    # THE ORDERING NOTICE. It is unconditional because it is unverifiable: the
+    # bot trims every list to HISTORY_CACHE_LIMIT at each guild's next song end,
+    # and a trimmed list is indistinguishable from a short one. An operator who
+    # runs this after deploying sees entries scanned, "N guild(s) backfilled"
+    # and exit 0 — a clean-looking run over whatever the trim left. Saying so
+    # every time is the only warning that can be given.
+    print(
+        f"note:               the archive build caps these lists at "
+        f"{HISTORY_CACHE_LIMIT} entries per guild, from each\n"
+        f"                    guild's next song end. Run this BEFORE deploying "
+        f"it; anything older\n"
+        f"                    than that window is unrecoverable once it has."
+    )
     try:
         # PREFLIGHT, and it is what makes --dry-run mean anything. The archive
         # pool is lazy — _ensure() (connect + schema-version check) is reached
@@ -398,7 +425,7 @@ async def _run(dry_run: bool) -> int:
         f"(submitted counts rows sent, not rows stored — duplicates collapse)"
     )
     # The completeness verdict, stated rather than left for the operator to
-    # infer from a count. This is the line that gates the capping change, so it says
+    # infer from a count. This is the line that gates the deploy, so it says
     # what to do rather than only what happened — and the exit code carries the
     # same answer for anything driving this from a script.
     if report.scan_aborted:
@@ -406,15 +433,15 @@ async def _run(dry_run: bool) -> int:
             "INCOMPLETE: the scan for history keys aborted, so an unknown "
             "number of guilds were never read. The counts above are a floor, "
             "not a total. Fix the cause and re-run — re-running is safe. Do "
-            "NOT ship the change that caps these lists.",
+            "NOT deploy the archive build until this reports a clean run.",
             file=sys.stderr,
         )
     elif report.failed_guilds:
         print(
             f"INCOMPLETE: {report.failed_guilds} guild(s) FAILED and their "
             "history did not move (see the errors above). Re-running is safe "
-            "and retries them. Do NOT ship the change that caps these lists "
-            "until this reports 0 failures.",
+            "and retries them. Do NOT deploy the archive build until this "
+            "reports 0 failures.",
             file=sys.stderr,
         )
     return 0 if report.ok else 1
@@ -440,8 +467,9 @@ Safe to re-run and safe to interrupt: every insert is idempotent, so a run that
 dies part-way is resumed by running it again. Exits non-zero if any guild
 failed — re-run until it reports 0 failures.
 
-MUST complete before the change that caps the Redis lists this reads from.
-Anything missed before that point is unrecoverable.
+MUST complete before the archive build is deployed: it caps the Redis lists this
+reads from, at each guild's next song end. Anything missed by then is
+unrecoverable.
 """
 
 

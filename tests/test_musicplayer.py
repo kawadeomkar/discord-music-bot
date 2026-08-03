@@ -25,6 +25,7 @@ from src.musicplayer import (
     _fmt_total_duration,
     _requester_mention,
 )
+from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
 from src.util import fmt_duration
 from src.youtube import QueueObject, YTDL
@@ -1888,18 +1889,19 @@ class TestMusicPlayerInitialState:
 
 
 class TestRedisHelpers:
-    async def test_redis_push_history_unbounded(
+    async def test_redis_push_history_caps_the_list(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
-        # Full history retention: the Redis list must never be trimmed
-        # (docs/HISTORY_OVERHAUL_PLAN.md §4).
+        # Bounded retention: the list is a fixed window of the newest plays,
+        # not a full record. Postgres keeps everything; this is what -history
+        # reads, and it is capped at exactly that command's ceiling.
         assert music_player.store is not None
-        for i in range(55):
+        for i in range(HISTORY_CACHE_LIMIT + 5):
             await music_player.store.push_history(
                 HistoryEntry(title=f"Song {i}", webpage_url=f"url{i}")
             )
         items = await fake_redis.lrange(music_player.store.history_key(), 0, -1)
-        assert len(items) == 55
+        assert len(items) == HISTORY_CACHE_LIMIT
 
     async def test_store_set_volume_updates_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
