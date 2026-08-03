@@ -181,6 +181,46 @@ services:
       postgres:
         condition: service_healthy
 
+  db-backfill:
+    # One-shot migration of pre-archive Redis history into Postgres, run BY HAND:
+    #
+    #   docker compose run --rm db-backfill --dry-run
+    #   docker compose run --rm db-backfill
+    #
+    # Exists because the justfile recipe needs a local venv, and the production
+    # host this README describes has only Docker — which left the one mandatory
+    # pre-deploy step impossible to run there. Every other db-* operation
+    # already has a container path (db-migrate is a service; db-rejects/backup/
+    # restore go through `docker compose exec postgres`).
+    #
+    # `profiles:` is what keeps it out of `docker compose up`. Unlike db-migrate
+    # this must NEVER run automatically: it is a once-per-deployment operator
+    # decision immediately before an irreversible step, not a startup task. A
+    # service without a profile would run on every `up` — harmless today because
+    # the insert is idempotent, but it would put a full keyspace walk on the
+    # startup path of every deploy.
+    profiles: ["ops"]
+    image: discord-music-bot:${GIT_SHA:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: "no"
+    # No `container_name`: `docker compose run` generates its own, and a fixed
+    # one makes a second invocation collide with the first's stopped container.
+    entrypoint: ["python", "-m", "src.backfill_history"]
+    environment:
+      # Both tiers by service name — same reasoning as db-migrate above. REDIS_URL
+      # matters more here than anywhere else: this is the only tool that treats
+      # Redis as the SOURCE, so pointing it at the wrong one reports "0 entries
+      # scanned" and exits 0, which reads as "nothing to migrate".
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:?}@postgres:5432/${POSTGRES_DB:-musicbot}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
   bgutil-pot-provider:
     # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
     # client (docs/PO_TOKEN_SIDECAR_PLAN.md). Version must match the

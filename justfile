@@ -473,7 +473,8 @@ _dotenv := '''
     # bundled stack synthesises the bot's URL inside compose (docker-compose.yml
     # builds it from POSTGRES_USER/PASSWORD/DB), so it never lands in .env — and
     # without this every recipe below died with "POSTGRES_URL is not set" on the
-    # exact stack the README tells you to run.
+    # exact stack the README tells you to run, including db-backfill, which is
+    # the mandatory step before the history lists are capped.
     if [ -z "${POSTGRES_URL:-}" ] && [ -n "${POSTGRES_PASSWORD:-}" ]; then
         export POSTGRES_URL="postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}"
     fi
@@ -516,6 +517,23 @@ db-migrate:
     {{ _dotenv }}
     {{ quote(VENV_BIN / 'python') }} -m src.db_migrate
 
+# Copy pre-archive history off the Redis lists into Postgres. Idempotent and
+# resumable (ON CONFLICT DO NOTHING). MUST run before the change that caps the
+# history lists, which trims the only other copy of exactly what this moves.
+#
+# This leg needs a local venv. On a Docker-only host use the compose one-shot,
+# which is the same image and the same module:
+#
+#   docker compose run --rm db-backfill --dry-run
+#
+# (It sits behind the `ops` profile so it never runs on `docker compose up` —
+# unlike db-migrate, this is an operator decision, not a startup task.)
+[doc('Backfill pre-archive Redis history into Postgres (--dry-run to preview)')]
+[group('database')]
+db-backfill *ARGS:
+    #!/usr/bin/env bash
+    {{ _dotenv }}
+    {{ quote(VENV_BIN / 'python') }} -m src.backfill_history "$@"
 # The one Redis-side operator recipe. It exists because XLEN alone cannot tell
 # apart four states that call for four different responses, and working that out
 # by hand during an incident is the wrong time to learn the commands:
