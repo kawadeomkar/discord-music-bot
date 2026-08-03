@@ -31,6 +31,11 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
 - **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
   persistent play history
+- **Opt-in play-history archive** — off by default, and a default deployment keeps
+  nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
+  deployed at all. One flag (`HISTORY_ARCHIVE_ENABLED=true`) makes a deploy bring up
+  Postgres, apply the schema, and record every play permanently
+  ([details](#operating-the-play-history-archive))
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
 - **Rich `-help`** — a custom man-page-style help command with aliases, examples,
   and per-command notes
@@ -139,9 +144,10 @@ without editing any tracked file. If port 5432 is
 already taken on your machine, set `POSTGRES_HOST_PORT` — the bot uses host
 networking, so it reaches the database through the published port.
 
-The schema is applied by a migration runner, not by the bot. An archive-enabled
-`docker compose up` runs it for you as a one-shot `db-migrate` service; against an
-external Postgres, run it yourself:
+The schema is applied by a migration runner, not by the bot, and **every deploy
+applies pending migrations before the new bot starts** — so a `git pull` that brings
+schema changes needs no extra step, and re-running applies nothing. Against an
+external Postgres, or to migrate without deploying:
 
 ```bash
 just db-migrate            # apply pending migrations
@@ -316,7 +322,7 @@ run `just check`.
 
 | Recipe | Does |
 |---|---|
-| `just db-migrate` | Apply pending play-history schema migrations |
+| `just db-migrate` | Apply pending play-history schema migrations — every deploy does this too, so this is for external databases and out-of-band runs |
 | `just db-backfill [--dry-run]` | Copy pre-archive Redis history into Postgres — **run once, before deploying this build** (the 50-entry cap applies in both archive modes — see [Upgrading to 2.5.0](#upgrading-to-250)) |
 | `just db-backfill-docker [--dry-run]` | The same, through the Compose one-shot — for hosts with Docker and no Python toolchain |
 | `just db-rejects [count]` | List play_history rows Postgres refused (expected: nothing) |
@@ -334,7 +340,7 @@ external one. A value already exported in your shell wins over `.env`, so
 
 | Recipe | Does |
 |---|---|
-| `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. Deploys Postgres too when `HISTORY_ARCHIVE_ENABLED=true` |
+| `just up [sha]` | Deploy an already-built image — HEAD's by default, or the given SHA. With `HISTORY_ARCHIVE_ENABLED=true` it also deploys Postgres and applies pending migrations first, aborting the deploy if they fail |
 | `just down` | Stop the compose stack (volumes are kept) |
 | `just restart` | Restart the running bot in place — does **not** pick up a new image |
 | `just logs [args]` | Follow the bot's logs (`just logs --tail 50`) |
@@ -373,7 +379,7 @@ The Compose stack runs the bot plus its supporting services:
 | `discord-music-bot` | The bot itself (host networking) |
 | `redis` | Redis 7 with AOF persistence — queue/state/cache storage |
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: on the `archive` profile, which the deploy tooling activates when `HISTORY_ARCHIVE_ENABLED=true` |
-| `db-migrate` | One-shot schema migration for the archive — same `archive` profile |
+| `db-migrate` | One-shot schema migration for the archive — same `archive` profile. Every deploy runs it before recreating the bot, and `docker compose up` runs it too; re-running applies nothing |
 | `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `just db-backfill-docker` |
 | `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works ([details](docs/PO_TOKEN_SIDECAR_PLAN.md)); optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
@@ -412,6 +418,11 @@ docker images discord-music-bot --format '{{.Tag}}\t{{.CreatedSince}}'
 
 The script refuses to deploy a tag it cannot find locally rather than letting
 Compose build one from your working tree and label it with that SHA.
+
+A rollback re-runs the *older* image's migrations, which is a no-op: every version it
+knows about is already applied, and a database ahead of that image is accepted with a
+note rather than refused. Rolling back the code does not roll back the schema — nothing
+here drops columns, which is what makes an older build safe against a newer database.
 
 A tag identifies exactly what was built. Building from anything other than a clean
 checkout produces `<git-sha>-dirty.<digest>`, so a tag never identifies a commit it
@@ -459,8 +470,10 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 
 ## Upgrading to 2.5.0
 
-**Read this before deploying 2.5.0 over an existing install, whether or not you use the
-archive.** One change here destroys data on upgrade, and it is not opt-in.
+**Read this before deploying 2.5.0 or any later build over an install that predates it,
+whether or not you use the archive.** One change here destroys data on upgrade, and it is
+not opt-in. (The heading names the release that introduced the cap; every build since
+carries it.)
 
 This build caps every guild's Redis history list at **50 entries** — the same number
 `-history` can display. Earlier builds never trimmed that list, so an established
@@ -600,14 +613,23 @@ play that was never inserted.
 
 ### Schema
 
+**Every deploy applies pending migrations before the new bot starts**, so a `git pull`
+that brings schema changes needs no extra step — `just up`, `./deploy_docker.sh` and
+`./build_docker.sh` all run them and abort the deploy if they fail, leaving the running
+bot untouched. Out-of-band runs (an external database, or applying a migration without
+deploying) go through the recipe:
+
 ```bash
 just db-migrate            # apply pending migrations (idempotent, concurrency-safe)
 ```
 
-Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. On its first
-connection it reads `schema_migrations` and refuses to serve a database older than the
-version it was built for, naming this command. A *newer* database is accepted with a
-warning — migrations are additive, so rolling the bot back must not become an outage.
+Migrations live in `migrations/NNNN_name.sql`; the bot never runs DDL. Each version is
+recorded in `schema_migrations` inside the same transaction as its own DDL, under an
+advisory lock, so re-running applies nothing and two runners racing is fine — that is
+what makes it safe on every deploy. On its first connection the bot reads that table and
+refuses to serve a database older than the version it was built for, naming this command.
+A *newer* database is accepted with a warning by both the bot and the migration runner —
+migrations are additive, so rolling the bot back must not become an outage.
 
 ### Backfilling history that predates the archive
 

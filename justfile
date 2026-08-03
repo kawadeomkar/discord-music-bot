@@ -567,6 +567,10 @@ run:
 
 # Apply pending schema migrations — the bot refuses to start against an
 # unmigrated database (PostgresHistoryArchive._assert_schema_version).
+#
+# Every deploy already runs this (deploy_docker.sh, before the bot is
+# recreated), so this recipe is for external databases and out-of-band runs.
+# Re-running applies nothing: versions are recorded in schema_migrations.
 [doc('Apply pending play-history schema migrations')]
 [group('database')]
 db-migrate:
@@ -605,7 +609,10 @@ db-backfill-docker *ARGS:
         echo "Set HISTORY_ARCHIVE_ENABLED=true in .env and deploy first (just up)." >&2
         exit 1
     fi
-    docker compose run --rm db-backfill "$@"
+    # Same reason as the deploy's migration step: the service's DSN is the
+    # compose-network one, and .env's POSTGRES_URL is the host form.
+    resolve_external_postgres_env
+    docker compose run --rm ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-backfill "$@"
 
 # The one Redis-side operator recipe. It exists because XLEN alone cannot tell
 # apart four states that call for four different responses, and working that out

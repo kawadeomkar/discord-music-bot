@@ -107,9 +107,37 @@ if [ "$ARCHIVE_ENABLED" -eq 0 ] \
     echo "         Archived rows survive in the postgres-data volume either way." >&2
 fi
 
+# Migrate BEFORE the bot is recreated, and gate the deploy on it. A `git pull`
+# can bring new migrations with new code, and the bot refuses to archive against
+# a schema older than its build (SchemaVersionError) — so a deploy that started
+# the new bot first would archive nothing until someone noticed.
+#
+# Idempotent by construction: src/db_migrate.py records each version in
+# schema_migrations inside the same transaction as its DDL and skips what is
+# already there, so every deploy after the first is a no-op that exits 0. A
+# database NEWER than this image is not an error either (rollbacks).
+#
+# `run --rm` rather than leaving it to `up`: `run` reports the runner's exit
+# status, which is what makes this a gate. Its depends_on starts postgres and
+# waits for healthy first. -T because deploys are not always interactive.
+if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+    echo "Applying play-history migrations from $TAG"
+    # Empty unless POSTGRES_URL names a database off this host — the compose
+    # service's own DSN addresses postgres by service name, and .env's is the
+    # host form, which is unreachable from inside the container.
+    resolve_external_postgres_env
+    if ! docker compose run --rm -T ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-migrate; then
+        echo "Migration failed — NOT deploying $TAG." >&2
+        echo "The running bot is untouched. Fix the database, then re-run this." >&2
+        echo "Inspect with: just compose logs postgres" >&2
+        exit 1
+    fi
+fi
+
 echo "Deploying $TAG (ENVIRONMENT=$ENVIRONMENT)"
 # Only the bot's own container is recreated — Redis, the POT sidecar and
 # otel-lgtm are unchanged by a new bot tag, so compose leaves them running.
-# With the archive enabled, COMPOSE_PROFILES also brings up postgres and the
-# db-migrate one-shot (idempotent — it exits 0 when the schema is current).
+# With the archive enabled this also starts postgres and the db-migrate service;
+# the migration above has already run, so that one is a no-op second pass. It is
+# left in the model deliberately, for operators who drive compose directly.
 docker compose up -d

@@ -653,8 +653,13 @@ class TestArchiveProfileDerivation:
 
     def test_the_deploy_resolves_before_it_starts_containers(self) -> None:
         # Order, not presence: an export after `docker compose up` is a no-op.
+        # Anchored for the reason the migration-ordering test spells out — the
+        # file quotes this command inside comments too, and matching one of
+        # those checks an ordering nobody cares about.
         text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
-        assert text.index("resolve_archive_profile") < text.index("docker compose up")
+        up = re.search(r"^docker compose up -d", text, re.M)
+        assert up is not None
+        assert text.index("resolve_archive_profile") < up.start()
 
     def test_the_bot_receives_the_same_flag_it_deploys_on(self) -> None:
         """The compose file must pass HISTORY_ARCHIVE_ENABLED through VALUELESSLY.
@@ -665,13 +670,144 @@ class TestArchiveProfileDerivation:
         assert re.search(r"^\s*- HISTORY_ARCHIVE_ENABLED$", _compose_directives(), re.M)
 
     def test_an_external_postgres_needs_no_tracked_file_edit(self) -> None:
-        """The bot and both one-shots build their DSN as ${POSTGRES_URL:-<parts>},
-        so a URL in .env wins. The old instruction was to comment out these
-        lines, which conflicted on every `git pull`."""
+        """The BOT's DSN is ${POSTGRES_URL:-<parts>}, so a URL in .env wins. The
+        old instruction was to comment out that line, which conflicted on every
+        `git pull`.
+
+        Exactly one service, and that is the invariant. The bot has host
+        networking, so .env's loopback DSN is right for it. The two compose-network
+        one-shots must NOT take it: 127.0.0.1 inside them is themselves, and
+        giving them .env's URL broke the migration with connection refused
+        against a healthy database. They address postgres by service name, and
+        the deploy passes a genuinely external DSN in explicitly.
+        """
         overridable = re.findall(
             r"- POSTGRES_URL=\$\{POSTGRES_URL:-", _compose_directives()
         )
-        assert len(overridable) == 3
+        assert len(overridable) == 1
+        for service in ("db-migrate", "db-backfill"):
+            block = _service_block(service)
+            assert "POSTGRES_URL=${POSTGRES_URL" not in block, service
+            assert "@postgres:5432" in block, service
+
+    def test_every_deploy_migrates_before_it_starts_the_new_bot(self) -> None:
+        """A `git pull` can bring new migrations with new code, so the deploy
+        applies them — and BEFORE `up`, because the bot refuses to archive
+        against a schema older than its build. Recreating the bot first would
+        leave it archiving nothing until someone read the logs."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        # The `up` anchored to the start of a line is the COMMAND; the file also
+        # quotes `docker compose up -d` inside comments, and matching one of
+        # those instead made this pass on ordering it never checked.
+        up = re.search(r"^docker compose up -d", text, re.M)
+        migrate = re.search(r"docker compose run --rm -T .*db-migrate", text)
+        assert up is not None and migrate is not None
+        assert migrate.start() < up.start()
+
+    def test_the_migration_step_is_gated_on_the_archive_being_enabled(self) -> None:
+        # No archive, no database, nothing to migrate — the step must sit inside
+        # the ARCHIVE_ENABLED branch, not run unconditionally.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        branch = re.search(
+            r'if \[ "\$ARCHIVE_ENABLED" -eq 1 \]; then\n(.*?)\nfi\n', text, re.S
+        )
+        assert branch is not None
+        assert "db-migrate" in branch.group(1)
+
+    def test_a_failed_migration_stops_the_deploy(self) -> None:
+        """The gate is the point: `run --rm` reports the runner's exit status,
+        and a non-zero one must leave the running bot untouched rather than
+        deploy code against a schema that was not applied."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        assert re.search(
+            r"if ! docker compose run --rm -T .*db-migrate; then(?:.|\n)*?exit 1", text
+        )
+
+    @staticmethod
+    def _external_env(tmp_path: Path, dotenv: str = "", **env: str) -> str:
+        """What resolve_external_postgres_env would add to a `docker compose run`."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "source ./build_common.sh; resolve_external_postgres_env; "
+                'printf "%s" "${EXTERNAL_PG_ENV[*]-}"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://u:p@127.0.0.1:5432/db",
+            "postgresql://u:p@localhost:5432/db",
+            "postgres://u:p@127.0.0.1/db",
+            "postgresql://u:p@[::1]:5432/db",
+            "postgresql://127.0.0.1:5432/db",
+            # A literal `@` in the password: credentials are stripped to the LAST
+            # one, or the host reads as `ss@127.0.0.1` and this misfires in the
+            # only direction that breaks a working deployment.
+            "postgresql://u:p@ss@127.0.0.1:5432/db",
+        ],
+    )
+    def test_a_loopback_dsn_is_never_handed_to_a_container(
+        self, url: str, tmp_path: Path
+    ) -> None:
+        """This is the regression. .env holds the HOST-form DSN — the
+        host-networked bot needs one, and `just run` derives one — and passing it
+        into a compose-network container points that container at itself. The
+        symptom was the migration failing with connection refused while postgres
+        was healthy, which reads as a database problem and is not one."""
+        assert self._external_env(tmp_path, POSTGRES_URL=url) == ""
+
+    @pytest.mark.parametrize(
+        "url",
+        ["postgresql://u:p@db.example.com:5432/hist", "postgresql://u:p@10.0.0.5/hist"],
+    )
+    def test_an_external_dsn_is_passed_through(self, url: str, tmp_path: Path) -> None:
+        # Otherwise the deploy's migration gate silently migrates the BUNDLED
+        # database while the bot runs against the external one — the schema
+        # error surfaces later, at runtime, as a refusal to archive.
+        assert (
+            self._external_env(tmp_path, POSTGRES_URL=url) == f"-e POSTGRES_URL={url}"
+        )
+
+    def test_no_url_means_the_service_default_stands(self, tmp_path: Path) -> None:
+        # The bundled stack, which is the common case: the compose file's own
+        # service-name DSN is correct and nothing should override it.
+        assert self._external_env(tmp_path) == ""
+
+    def test_the_url_is_read_from_dotenv_too(self, tmp_path: Path) -> None:
+        assert (
+            self._external_env(
+                tmp_path, dotenv="POSTGRES_URL=postgresql://u:p@db.example.com/hist\n"
+            )
+            == "-e POSTGRES_URL=postgresql://u:p@db.example.com/hist"
+        )
+
+    @pytest.mark.parametrize(
+        ("path", "command"),
+        [
+            ("deploy_docker.sh", "docker compose run --rm -T"),
+            ("justfile", "docker compose run --rm"),
+        ],
+    )
+    def test_both_container_one_shots_resolve_the_external_dsn(
+        self, path: str, command: str
+    ) -> None:
+        """db-migrate (deploy) and db-backfill (recipe) are the two commands that
+        run this image against the archive from inside the compose network."""
+        text = (Path(__file__).resolve().parent.parent / path).read_text()
+        assert "resolve_external_postgres_env" in text
+        assert f'{command} ${{EXTERNAL_PG_ENV[@]+"${{EXTERNAL_PG_ENV[@]}}"}}' in text
 
     def test_the_docs_no_longer_ship_a_second_switch(self) -> None:
         """`.env.example` is copied verbatim into .env by setup_env.sh, so a

@@ -154,7 +154,7 @@ def main() -> int:
         )
         return 1
     version = asyncio.run(migrate(url))
-    if version != EXPECTED_SCHEMA_VERSION:
+    if version < EXPECTED_SCHEMA_VERSION:
         # Only reachable when migrations/ and this module disagree — i.e. a
         # partial checkout or a hand-edited migrations directory.
         print(
@@ -163,6 +163,19 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    if version > EXPECTED_SCHEMA_VERSION:
+        # A newer database is NOT an error, mirroring
+        # PostgresHistoryArchive._assert_schema_version: migrations are additive,
+        # so an older build reads a newer schema fine. This is the rollback case,
+        # and deploy_docker.sh gates the deploy on this exit status — refusing
+        # here would turn a routine rollback into an outage, which is exactly
+        # what the bot's own tolerance was written to avoid.
+        print(
+            f"Note: schema is at version {version}, ahead of this build's "
+            f"{EXPECTED_SCHEMA_VERSION}. Continuing — migrations are additive, "
+            f"but this build is older than the database."
+        )
+        return 0
     print(f"play-history schema at version {version}")
     return 0
 

@@ -248,6 +248,38 @@ resolve_archive_profile() {
     export COMPOSE_PROFILES ARCHIVE_ENABLED
 }
 
+# resolve_external_postgres_env — fill EXTERNAL_PG_ENV with `-e POSTGRES_URL=…`
+# when the configured DSN names a database a CONTAINER can reach, and leave it
+# empty otherwise. For `docker compose run` of db-migrate / db-backfill.
+#
+# Those two address postgres by service name, which is correct for the bundled
+# stack and wrong for an external database. Passing POSTGRES_URL through
+# unconditionally is also wrong, and worse, because .env normally holds the
+# HOST-form DSN the host-networked bot and `just run` need: 127.0.0.1 inside a
+# compose-network container is that container, so the migration fails with
+# connection refused on a database that is running fine.
+#
+# Loopback is the discriminator, and it errs toward the service name: an
+# unparsed or unusual DSN yields no override, i.e. the bundled behaviour that
+# worked before any of this existed.
+resolve_external_postgres_env() {
+    EXTERNAL_PG_ENV=()
+    local url host
+    url="${POSTGRES_URL:-$(_env_value POSTGRES_URL .env)}"
+    [ -n "$url" ] || return 0
+    # Order matters: scheme, then path/query, THEN credentials, then the port.
+    # Credentials are stripped to the LAST `@` so a password containing one does
+    # not leave `ss@127.0.0.1` looking like an external host — but only after the
+    # path is gone, or a `@` in a database name would eat the host instead.
+    # Brackets last, for the IPv6 `[::1]:5432` form.
+    host="$(printf '%s' "$url" \
+        | sed -E 's#^[a-zA-Z0-9+.-]+://##; s#[/?].*$##; s#^.*@##; s#:[^:]*$##; s#^\[|\]$##g')"
+    case "$host" in
+        "" | localhost | ::1 | 127.*) return 0 ;;
+    esac
+    EXTERNAL_PG_ENV=(-e "POSTGRES_URL=$url")
+}
+
 # warn_default_postgres_password — compose-path preflight, called only from
 # build_docker.sh: the k8s path takes its secret from a Secret, not .env.
 #
