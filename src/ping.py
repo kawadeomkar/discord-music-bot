@@ -45,6 +45,7 @@ from src.config import (
     PING_DEADLINE_SECS,
     PING_TICK_SECS,
     SpotifyStatus,
+    history_archive_enabled,
     using_default_postgres_password,
 )
 from src.spotify import Spotify
@@ -209,11 +210,20 @@ async def probe_spotify(
 async def probe_postgres(archive: Optional[ArchiveHealth]) -> ProbeResult:
     """The play-history archive's Postgres row.
 
-    None means the bot was built without an archive — only reachable in tests
-    and in a cog constructed outside MusicBotApp, since the tier is required
-    (MusicBotApp.setup_hook refuses to start without POSTGRES_URL).
+    A None archive splits on the flag. With the archive disabled
+    (HISTORY_ARCHIVE_ENABLED off — the ship default) setup_hook deliberately
+    built no archive, and the row must say so rather than shrug: OFF,
+    "deliberately disabled", the same state the OTEL row uses. The operator's
+    choice is visible on the dashboard instead of reading like a fault.
+
+    None with the flag ON means the bot was built without an archive some
+    other way — reachable only in tests and in a cog constructed outside
+    MusicBotApp, since setup_hook builds the tier whenever the flag is on —
+    and that stays NA: "constructed without an archive", not "off".
     """
     if archive is None:
+        if not history_archive_enabled():
+            return ProbeResult("Postgres", ProbeState.OFF, detail="archive disabled")
         return ProbeResult("Postgres", ProbeState.NA)
 
     return await _timed("Postgres", archive.health_check)
@@ -375,7 +385,14 @@ def _ping_value(r: ProbeResult) -> str:
     # ConnectionError) is the actionable half and costs one short parenthetical.
     # An n/a row gets the same treatment when it has a reason to give — "not
     # configured" is why an optional dependency is dark, and it costs nothing.
-    if r.state in (ProbeState.DOWN, ProbeState.NA) and r.detail:
+    # OFF carries its detail for the same reason NA does, and it was omitted by
+    # oversight rather than by design: probe_postgres sets
+    # detail="archive disabled" and its docstring says the row "must say so
+    # rather than shrug", but the renderer dropped it, so the field was dead
+    # data and the row was indistinguishable from any other OFF. A test
+    # asserted the detail on the ProbeResult, which looked like coverage of
+    # exactly that claim while pinning something no user could see.
+    if r.state in (ProbeState.DOWN, ProbeState.NA, ProbeState.OFF) and r.detail:
         return f"{word} ({r.detail})"
     return word
 
@@ -453,7 +470,14 @@ def default_password_embed() -> Optional[discord.Embed]:
     needed. Changing the server first means the warning survives until the fix
     is genuinely complete. A detector that could not be fooled would attempt a
     connection with DEFAULT_POSTGRES_PASSWORD instead of parsing a string.
+
+    Gated on the archive flag, like setup_hook's startup ERROR: with the
+    archive disabled there is no deployed Postgres for the bot to warn about,
+    and a credential advisory for a database that isn't there is noise that
+    trains operators to ignore warnings.
     """
+    if not history_archive_enabled():
+        return None
     if not using_default_postgres_password():
         return None
     embed = discord.Embed(
@@ -602,9 +626,22 @@ async def run_health_dashboard(
         # for the person who can act on it, and for a self-hosted bot the
         # application owner IS that person. The startup ERROR still fires on
         # every boot for anyone reading logs.
-        warning = (
-            default_password_embed() if await ctx.bot.is_owner(ctx.author) else None
-        )
+        #
+        # ORDER IS LOAD-BEARING, not style. is_owner() is not a local predicate:
+        # MusicBotApp passes neither owner_id nor owner_ids, so discord.py falls
+        # through to application_info() — a REST GET, retried up to 5 times over
+        # ~25s on a 5xx, and it raises rather than returning False. Written as
+        # `embed() if await is_owner() else None` the await runs FIRST and
+        # UNCONDITIONALLY, which put a network round trip (and a new failure
+        # mode) ahead of the skeleton send this function promises is immediate —
+        # so the health dashboard broke exactly when Discord was degraded, which
+        # is when it gets run. PING_DEADLINE_SECS does not bound it; that clock
+        # starts after the send. Ask the cheap, local, always-correct question
+        # first: with the archive off — the ship default — the embed is None on
+        # its first line and the owner check is never reached at all.
+        warning = default_password_embed()
+        if warning is not None and not await ctx.bot.is_owner(ctx.author):
+            warning = None
         message = await ctx.channel.send(  # bypass NP host (§5.3)
             embeds=[e for e in (warning, last) if e is not None]
         )

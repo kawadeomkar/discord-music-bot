@@ -51,8 +51,11 @@ from typing import Any, cast
 import pytest
 import redis.asyncio as aioredis
 
+from redis.exceptions import OutOfMemoryError
+
 from src.guild_state import HistoryEntry
 from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
     HISTORY_OUTBOX_GROUP,
     HISTORY_OUTBOX_KEY,
@@ -321,6 +324,21 @@ class TestWrongTypeIsAResponseError:
         await redis.lpush(HISTORY_OUTBOX_KEY, b"pre-R1 list entry")
         with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
             await redis.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: b"x"})
+
+    async def test_outbox_depth_against_a_list_raises_wrongtype(
+        self, redis: aioredis.Redis
+    ) -> None:
+        # The DISABLED arm's leg of the same condition. setup_hook's
+        # leftover-outbox probe calls outbox_depth (XLEN) and downgrades a
+        # ResponseError to a warning instead of aborting, so the class matters
+        # there too — and this is the pairing for the other two above.
+        #
+        # Unlike XADD, fakeredis models XLEN-against-a-list correctly, so the
+        # unit test can and now does stage the real shape; this pins that the
+        # real server agrees rather than leaving that inferred.
+        await redis.lpush(HISTORY_OUTBOX_KEY, b"pre-R1 list entry")
+        with pytest.raises(aioredis.ResponseError, match="WRONGTYPE"):
+            await outbox_depth(redis)
 
     async def test_the_documented_remedy_works(self, redis: aioredis.Redis) -> None:
         # The upgrade note says: stop the bot, DEL history:outbox, start it.
@@ -609,6 +627,85 @@ class TestOutboxKeyIsNonEvictable:
         # with no error and no log line.
         await _push(redis, 1)
         assert await redis.ttl(HISTORY_OUTBOX_KEY) == -1
+
+
+class TestHistoryWritePathAgainstARealServer:
+    """The push path, which this branch rewrote and the tier did not follow.
+
+    push_history went from LPUSH+PERSIST+XADD to LPUSH+LTRIM+PERSIST+conditional
+    XADD, plus an OOM recovery — and gained no real-server coverage at all. That
+    matters here more than usual: the unit tier's LTRIM assertions run against
+    fakeredis, where `xtrim(approximate=True)` and several other stream
+    behaviours diverge (see this module's docstring), and the OOM path is
+    literally untestable there because fakeredis has no maxmemory concept.
+    """
+
+    async def test_the_list_is_capped_and_never_expires(
+        self, redis: aioredis.Redis
+    ) -> None:
+        # An oversized list left by a build that did not cap — the shape every
+        # upgrading deployment has — must come down on the first write and stay
+        # PERSISTed. Golden rule 12: bounded by LENGTH, never by time.
+        store = GuildRedisStore(redis, guild_id=42)
+        key = store.history_key()
+        for n in range(HISTORY_CACHE_LIMIT + 25):
+            await redis.lpush(key, _entry(n).to_redis())
+        await redis.expire(key, 3600)  # an inherited TTL from an older build
+
+        await store.push_history(_entry(999))
+
+        assert await redis.llen(key) == HISTORY_CACHE_LIMIT
+        assert await redis.ttl(key) == -1  # PERSIST self-healed it
+        newest = cast(list[bytes], await redis.lrange(key, 0, 0))
+        assert b"Song 999" in newest[0]
+
+    async def test_the_disabled_archive_never_creates_the_outbox(
+        self, redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The consent gate, against a real server: absent, not merely empty.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        store = GuildRedisStore(redis, guild_id=42)
+        for n in range(5):
+            await store.push_history(_entry(n))
+
+        assert await redis.exists(HISTORY_OUTBOX_KEY) == 0
+        assert await redis.llen(store.history_key()) == 5
+
+    async def test_lpush_is_denyoom_but_a_bare_ltrim_is_not(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The empirical claim the OOM recovery is built on.
+
+        push_history's `except OutOfMemoryError` exists because LPUSH carries
+        Redis' `denyoom` flag while LTRIM does not — so at maxmemory the
+        transaction is refused at queue time and EXEC aborts, yet the one
+        command that could free memory is still allowed. The unit test
+        simulates the refusal by monkeypatching Pipeline.execute against
+        fakeredis, which has no maxmemory at all, so it asserts call ORDER and
+        nothing about what the server permits. If LTRIM were ever denyoom too,
+        the recovery would be dead code and every play during an outage lost
+        silently — with that test still green.
+
+        This is the only place the claim can actually be checked.
+        """
+        store = GuildRedisStore(redis, guild_id=42)
+        key = store.history_key()
+        for n in range(HISTORY_CACHE_LIMIT + 50):
+            await redis.lpush(key, _entry(n).to_redis())
+
+        used = cast(dict[str, Any], await redis.info("memory"))["used_memory"]
+        await redis.config_set("maxmemory-policy", "noeviction")
+        await redis.config_set("maxmemory", str(int(used * 0.9)))
+        try:
+            with pytest.raises(OutOfMemoryError):
+                await redis.lpush(key, _entry(998).to_redis())
+            # …and the trim is still permitted, which is what makes the
+            # recovery possible at all.
+            await redis.ltrim(key, 0, HISTORY_CACHE_LIMIT - 1)
+            assert await redis.llen(key) == HISTORY_CACHE_LIMIT
+        finally:
+            await redis.config_set("maxmemory", "0")
+            await redis.config_set("maxmemory-policy", "noeviction")
 
 
 class TestRefPolicyIsNotAvailableYet:

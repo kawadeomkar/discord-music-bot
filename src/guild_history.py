@@ -9,10 +9,13 @@ together: every add() lands on the deque and the Redis list in one step, and
 restore() refills the deque from the newest slice of the list.
 
 WRITES fan out to a third place, READS do not, and that asymmetry is the whole
-design. add() also XADDs every entry onto the global Postgres outbox stream — in
-the same pipeline as the list push — and nudges the drainer, which archives it
-into play_history. Postgres is never awaited on the write path: the
-outbox/drainer split keeps the playback loop on Redis-only latency.
+design. While the archive is enabled (HISTORY_ARCHIVE_ENABLED — the opt-in
+consent gate for long-term storage), add() also XADDs every entry onto the
+global Postgres outbox stream — in the same pipeline as the list push — and
+nudges the drainer, which archives it into play_history. Postgres is never
+awaited on the write path: the outbox/drainer split keeps the playback loop on
+Redis-only latency. With the archive disabled (the default) there is no
+drainer, on_outbox_push is None, and the two legs above are the whole story.
 
 But recent() never asks Postgres. -history is a display command with a fixed
 window (musicbot.HISTORY_MAX_LIMIT, pinned to HISTORY_CACHE_LIMIT), and the
@@ -65,34 +68,43 @@ class GuildHistory:
         self,
         store: Optional[GuildRedisStore],
         *,
-        on_outbox_push: Callable[[], None],
+        on_outbox_push: Optional[Callable[[], None]],
     ) -> None:
-        # on_outbox_push is REQUIRED: the Postgres tier is not optional, so
-        # there is no shape of this object that writes history without an outbox
-        # consumer behind it. It is the drainer's notify — a sync callable so
-        # add() stays Redis-only and never awaits the archive.
+        # on_outbox_push is the drainer's notify — a sync callable so add()
+        # stays Redis-only and never awaits the archive. Optional but carrying
+        # NO default: None means the archive tier is disabled
+        # (HISTORY_ARCHIVE_ENABLED is off, so no drainer exists to nudge), and
+        # every constructor site must say so explicitly rather than fall into
+        # it — silently not archiving is the failure mode the opt-in flag's
+        # strict parsing exists to prevent.
         #
         # No archive and no guild_id here any more. Both existed only for the
         # Postgres leg of recent(); the entry's own guild_id is stamped one layer
         # up by HistoryEntry.from_song, which is where the outbox needs it.
         #
-        # store IS Optional, and that is a different axis: Redis may be
+        # store IS Optional on a different, independent axis: Redis may be
         # unconfigured, in which case there is no wire to push to at all — and
-        # -history then falls through to the in-memory deque alone.
+        # -history then falls through to the in-memory deque alone. The two
+        # axes compose: store None / notify set degrades to memory-only (the
+        # outbox never sees entries Redis never saw); store set / notify None
+        # keeps the display list while writing nothing durable.
         self._store = store
         self._entries: deque[HistoryEntry] = deque(maxlen=HISTORY_CACHE_LIMIT)
         self._on_outbox_push = on_outbox_push
 
     async def add(self, entry: HistoryEntry) -> None:
-        """Record one played song on all three legs — in-memory cache, the
-        Redis display list, and the Postgres outbox (the latter two in one
-        pipeline). Degrades gracefully when the store is None or the push
-        fails (GuildRedisStore logs, never raises; a notify after a failed
-        push just drains an empty outbox)."""
+        """Record one played song on every configured leg — the in-memory
+        cache, the Redis display list, and (while the archive is enabled) the
+        Postgres outbox, the latter two in one pipeline. Degrades gracefully
+        when the store is None or the push fails (GuildRedisStore logs, never
+        raises; a notify after a failed push just drains an empty outbox).
+        With no notify there is no drainer to nudge — the archive tier is
+        disabled (HISTORY_ARCHIVE_ENABLED)."""
         self._entries.append(entry)
         if self._store is not None:
             await self._store.push_history(entry)
-            self._on_outbox_push()
+            if self._on_outbox_push is not None:
+                self._on_outbox_push()
 
     def restore(self, newest_first: Sequence[HistoryEntry]) -> None:
         """Populate from persisted history after a restart. In-memory leg
@@ -109,9 +121,16 @@ class GuildHistory:
         docstring. The command's ceiling (HISTORY_MAX_LIMIT in musicbot.py) is
         pinned to HISTORY_CACHE_LIMIT, push_history LTRIMs the list to exactly
         that many entries and PERSISTs it, and get_history() reads that whole
-        window, so the Redis leg alone provably contains every play this
+        window, so the Redis leg alone carries a slot for every play this
         command can be asked for. There is nothing an archive read could add
         except rows older than the window.
+
+        "A slot for every play", not "every play": with the ceiling equal to the
+        window there is no headroom, so an entry that occupies a slot without
+        yielding a renderable play — one get_history drops as corrupt, or one
+        the dedup below collapses — returns a page one short. Argued where the
+        constant is defined; noted here because this is the function that would
+        be blamed for the short page.
 
         The deque is not a duplicate of that argument, it is what answers when
         Redis cannot. It covers the two cases the list leg misses: no store
@@ -146,14 +165,36 @@ class GuildHistory:
         if limit <= 0:
             return []
         merged: list[HistoryEntry] = []
-        seen: set[tuple[float, str]] = set()
+        seen: set[HistoryEntry] = set()
 
         def take(entries: Sequence[HistoryEntry]) -> None:
             """Append what this leg adds. FIRST leg to carry an entry wins."""
             for entry in entries:
-                key = (entry.played_at, entry.webpage_url)
-                if key not in seen:
-                    seen.add(key)
+                # THE WHOLE ENTRY IS THE IDENTITY, not (played_at, url).
+                #
+                # The question this key answers is "have I already seen THIS
+                # play on the other leg?", and both legs carry the same object's
+                # values — the deque holds what add() appended, the list holds
+                # it through orjson, which round-trips a double without loss —
+                # so a full-value comparison answers it exactly.
+                #
+                # The narrower key answered a different question badly.
+                # played_at defaults to 0.0 in parse_history_entry and is forced
+                # there by __post_init__ for NaN/out-of-range, so EVERY entry
+                # predating the timestamped wire format carries the same value;
+                # keyed on (0.0, url), two genuinely distinct plays of one song
+                # — different requester, different duration, anything — collapse
+                # into one. That drops a real play from -history and returns a
+                # page one short of --limit, where the pre-cap code showed both.
+                #
+                # Two plays that are identical in every field AND both missing a
+                # timestamp still collapse. That ambiguity is irreducible: there
+                # is nothing left to tell them apart. It is also strictly rarer
+                # than what it replaces, and it fails toward the harmless side —
+                # a duplicate row is visible and reportable, a missing play is
+                # neither.
+                if entry not in seen:
+                    seen.add(entry)
                     merged.append(entry)
 
         # Bound to a local: the narrowing from the `is not None` test does not
@@ -173,6 +214,14 @@ class GuildHistory:
         # the concatenation is very nearly ordered already — but only very
         # nearly, since the deque can hold an entry the Redis read missed.
         # Sort explicitly rather than rely on that.
+        #
+        # A 0.0 (unknown) timestamp therefore sorts last, and that is CORRECT
+        # rather than the flaw it looks like: the only way to hold one is to
+        # predate the wire format that records played_at, so "unknown time"
+        # and "older than everything with a time" are the same population. The
+        # cap ages them out within HISTORY_CACHE_LIMIT further plays anyway.
+        # list.sort is stable, so entries sharing a timestamp — including all
+        # the unknowns — keep the leg order they arrived in.
         merged.sort(key=lambda e: e.played_at, reverse=True)
         return merged[:limit]
 

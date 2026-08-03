@@ -21,6 +21,12 @@ services:
       # POSTGRES_URL coming from env_file — to point at an EXTERNAL Postgres
       # instead, comment this line out and set POSTGRES_URL in .env directly.
       #
+      # Interpolated EVEN when the archive is disabled: Compose interpolates
+      # the whole document before profile filtering, so the bot receives this
+      # DSN whether or not the `archive` profile deploys postgres behind it.
+      # The bot ignores it unless HISTORY_ARCHIVE_ENABLED=true and logs one
+      # INFO saying so — enablement is the flag, never URL presence.
+      #
       # `${POSTGRES_PASSWORD:-password}` deliberately DOES default. This used to
       # be Compose's mandatory `${VAR:?}` form, which failed `up` outright — a
       # correct instinct that made the very first command in the README unusable
@@ -48,35 +54,18 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      postgres:
-        # The archive is a required tier, so this is a real dependency. It is
-        # not load-bearing for correctness — the asyncpg pool is lazy and the
-        # drainer backs off, so the bot survives a Postgres that is slow or
-        # briefly down — but waiting for healthy keeps a cold `up` from opening
-        # with a burst of connection-refused backoff logging.
-        condition: service_healthy
-      db-migrate:
-        # started, NOT service_completed_successfully.
-        #
-        # The bot no longer creates its own schema; it verifies the version and
-        # refuses to ARCHIVE against an unmigrated database
-        # (PostgresHistoryArchive._assert_schema_version). Waiting for the
-        # one-shot to exit 0 makes `up` on a fresh volume work end to end — but
-        # it also means a corrupt volume, a wrong password or one bad migration
-        # stops the music bot from starting AT ALL, and postgres carries
-        # restart: always, so a crash-looping database holds that gate open
-        # indefinitely.
-        #
-        # That inverts this project's posture. Redis backs queue persistence,
-        # crash recovery and every cache, and it is optional and degrades
-        # gracefully; Postgres stores *history*. The failure mode of a history
-        # archive must not be "no music". Ordering is all that is actually
-        # needed: the migration starts first, the lazy pool means the bot does
-        # no Postgres IO at startup, and the drainer's backoff plus the
-        # actionable SchemaVersionError cover the window where it has not
-        # finished. `just db-migrate` remains the way to see migration failures
-        # directly.
-        condition: service_started
+      # postgres / db-migrate are deliberately NOT here, and cannot be: both
+      # live behind the `archive` profile, and Compose rejects the ENTIRE
+      # project — even `docker compose config` — when an un-profiled service
+      # depends_on a profiled one while the profile is inactive. Re-adding
+      # either breaks token-only `docker compose up` outright; a
+      # compose-contract test in tests/test_config.py pins this. The
+      # dependency was never load-bearing for correctness anyway — the asyncpg
+      # pool is lazy and the drainer backs off with an actionable
+      # SchemaVersionError — so an enabled cold `up` merely opens with a brief
+      # burst of connection-refused/backoff logging while postgres and the
+      # migration one-shot come up. `just db-migrate` remains the way to see
+      # migration failures directly.
       # otel-lgtm is intentionally NOT in depends_on.
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
@@ -97,7 +86,11 @@ services:
     #                       logs; the drainer just finds fewer entries than were
     #                       pushed. It is normally near-empty and grows precisely
     #                       during a Postgres outage, i.e. exactly when eviction
-    #                       pressure is highest.
+    #                       pressure is highest. Written only while the archive
+    #                       is enabled (HISTORY_ARCHIVE_ENABLED); disabled — the
+    #                       default — the key is never created, but the policy
+    #                       must still protect a leftover from an earlier
+    #                       enabled run.
     #   guild:{id}:history  the per-guild display window, capped at 50 entries
     #                       and PERSISTed. It is the ONLY source -history reads,
     #                       so evicting one answers a guild with silence despite
@@ -129,8 +122,16 @@ services:
       retries: 5
 
   postgres:
-    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). Required —
-    # MusicBotApp.setup_hook refuses to start without POSTGRES_URL.
+    # Durable home of play history (docs/POSTGRES_HISTORY_PLAN.md). OPT-IN:
+    # long-term storage of user data is a choice the operator makes, so this
+    # service exists in the model only while the `archive` profile is active —
+    # COMPOSE_PROFILES=archive in .env, set alongside
+    # HISTORY_ARCHIVE_ENABLED=true (the pair is documented in .env.example; the
+    # profile deploys the database, the flag makes the bot use it). A default
+    # `docker compose up` starts no Postgres and archives nothing. While the
+    # archive IS enabled, MusicBotApp.setup_hook requires POSTGRES_URL and
+    # refuses to start without it.
+    profiles: ["archive"]
     image: postgres:18-alpine
     container_name: discord-postgres
     restart: always
@@ -169,7 +170,8 @@ services:
       retries: 5
 
   db-migrate:
-    # One-shot schema migration, run to completion before the bot starts.
+    # One-shot schema migration for the opt-in archive — `archive` profile,
+    # same as postgres above: no archive, no schema to migrate.
     #
     # The bot image, not a postgres client image: the runner is src/db_migrate.py
     # and the migrations ship in that image, so there is exactly one definition
@@ -180,6 +182,7 @@ services:
     # inherit nothing, but a copy-paste of `restart: always` from the services
     # above would turn a successful one-shot into a crash loop of successful
     # exits, and depends_on: service_completed_successfully would never settle.
+    profiles: ["archive"]
     image: discord-music-bot:${GIT_SHA:-latest}
     build:
       context: .
@@ -214,6 +217,16 @@ services:
     # service without a profile would run on every `up` — harmless today because
     # the insert is idempotent, but it would put a full keyspace walk on the
     # startup path of every deploy.
+    #
+    # `ops`, deliberately NOT `archive`: `up` starts EVERY service of an active
+    # profile, so joining `archive` would run the backfill on every enabled
+    # `up` — the exact thing this comment forbids. `docker compose run`
+    # auto-activates a targeted service's own profiles, so the explicit
+    # invocations above keep working with the archive enabled
+    # (COMPOSE_PROFILES=archive from .env supplies postgres). With the archive
+    # DISABLED they fail at service resolution (`no such service: postgres`,
+    # exit 1) — curt, but honest: a backfill into a database that isn't
+    # deployed is meaningless.
     profiles: ["ops"]
     image: discord-music-bot:${GIT_SHA:-latest}
     build:

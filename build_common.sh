@@ -203,14 +203,24 @@ _env_value() {
 # file's declared "Fixed API" above names only resolve_environment,
 # run_test_gate and build_runtime_image.
 #
-# The play-history archive is a required tier, but the password is NOT: compose
-# falls back to a known default so `docker compose up` works with nothing
-# configured but DISCORD_TOKEN. So this warns rather than exits — a build that
-# refused to proceed would put back the first-run cliff the default removed.
+# The password is not required even when archiving: compose falls back to a
+# known default so `docker compose up` works with nothing configured but
+# DISCORD_TOKEN. So this warns rather than exits — a build that refused to
+# proceed would put back the first-run cliff the default removed.
 #
 # The bot repeats the warning at startup and on every -ping, which are the
 # surfaces an operator actually watches; this one just catches it earlier, at
 # build time, with the same remedy.
+#
+# Skipped when nothing suggests a Postgres is deployed. The archive is opt-in
+# (HISTORY_ARCHIVE_ENABLED + the `archive` compose profile), and a credential
+# warning about a database that isn't there is noise. The gate is an OR of
+# BOTH .env lines, deliberately wider than the bot's own flag-only gate: in
+# the drift case — profile active, flag off — postgres runs idle with the
+# default password and the bot's warnings are all silenced, so this preflight
+# is the one surface left that can still say so. The string comparisons are
+# dumb on purpose (truthy spellings / substring on the profile list); they
+# mirror config.py's parser without importing it.
 warn_default_postgres_password() {
     local env_file=".env"
     if [ ! -f "$env_file" ]; then
@@ -223,6 +233,25 @@ warn_default_postgres_password() {
         echo "         will fail regardless of any default. Run ./setup_env.sh." >&2
         return 0
     fi
+    # The ENVIRONMENT WINS over .env, mirroring Compose's own precedence. Both
+    # of these are read by Compose from the process environment first, so
+    # `COMPOSE_PROFILES=archive ./build_docker.sh` with a token-only .env really
+    # does deploy Postgres — and reading the file alone made this preflight
+    # return 0 and say nothing, which is a silent miss in the one function whose
+    # entire job is not to miss one.
+    local flag profiles
+    flag="${HISTORY_ARCHIVE_ENABLED:-$(_env_value HISTORY_ARCHIVE_ENABLED "$env_file")}"
+    flag="$(printf '%s' "$flag" | tr '[:upper:]' '[:lower:]')"
+    profiles="${COMPOSE_PROFILES:-$(_env_value COMPOSE_PROFILES "$env_file")}"
+    case "$flag" in
+        true | 1 | yes) : ;; # archive enabled — warn below
+        *)
+            case "$profiles" in
+                *archive*) : ;; # drift case: postgres deployed anyway — warn below
+                *) return 0 ;;  # no archive, no deployed postgres — nothing to warn about
+            esac
+            ;;
+    esac
     local value
     value="$(_env_value POSTGRES_PASSWORD "$env_file")"
     if [ -z "$value" ] || [ "$value" = "password" ]; then

@@ -17,6 +17,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
+from src import config
 from src.guild_state import (
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -86,7 +87,19 @@ GUILD_TTL = 86400
 # PERSISTs it, so the list is exactly a bounded, permanent window of the newest
 # plays. -history is served from that window alone (guild_history.recent), which
 # is why musicbot.HISTORY_MAX_LIMIT is pinned to this constant: the command can
-# never ask for more than the window provably holds.
+# never ask for more SLOTS than the window holds.
+#
+# "Slots", not "plays" — the equality leaves no headroom, so anything that costs
+# a slot without yielding a renderable play shortens the answer by one. Two
+# things can: a corrupt entry (get_history drops it) and a duplicate (recent()
+# dedups it). The second is reachable, if unlikely — create_redis_pool sets
+# retry_on_error with an ExponentialBackoff, and the LPUSH is not idempotent, so
+# a timeout after the server applied EXEC re-sends the whole pipeline and the
+# entry lands twice. `-history --limit 50` then returns 49 for a guild that has
+# played 50. Deliberately NOT solved by trimming to a margin above the ceiling:
+# that would break the "retention cap == display cap" identity the command's own
+# help copy now states to users, to hide a one-row shortfall in a page nobody
+# reaches. Stated here instead of claimed away.
 #
 # Raising it therefore costs Redis memory in all three roles at once — roughly
 # 487 B per entry per guild, permanently, since nothing expires it. Postgres
@@ -356,9 +369,13 @@ async def ensure_outbox_group(redis: aioredis.Redis) -> None:
     @_guild_op method, so its XADD failure is one warning per song and takes
     guild:{id}:history down with it (both legs share one MULTI/EXEC). XLEN
     would raise too, so depth reads -1 and the backlog alarm can never fire
-    either. Hence the startup abort — it matches setup_hook's existing refusal
-    to run without POSTGRES_URL: a bot that cannot durably record what it plays
-    must not serve.
+    either. Hence the startup abort — it matches setup_hook's refusal to run
+    an ENABLED archive without POSTGRES_URL: a bot the operator opted into
+    archiving with must not serve while it cannot durably record what it
+    plays. (Enabled mode only. With the archive disabled setup_hook never
+    calls this — creating the group would MKSTREAM the non-evictable key into
+    existence — and a mis-shaped key is inert, downgraded to a startup
+    warning by the leftover-outbox probe.)
 
     id="0" is NOT redis-py's default (it defaults to "$", which silently skips
     every entry already in the stream). MKSTREAM removes any separate
@@ -910,12 +927,26 @@ class GuildRedisStore:
     # store method swallows the error and logs, so persistence silently degrades rather
     # than crashing).
     #
-    # Only ONE of the two can still get there. The history lists are non-evictable but
-    # BOUNDED — HISTORY_CACHE_LIMIT entries per guild, trimmed on every write — so their
-    # total is a function of guild count, not of how long the bot has run: ~24 KB per
-    # guild, ~24 MB across a thousand of them. That is a capacity-planning number rather
-    # than a leak, and it is the trade the -history read path buys with it (the list is
-    # the only thing that serves the command, so it must survive an idle day).
+    # Only ONE of the two can still get there BY GROWING. The history lists are
+    # non-evictable but BOUNDED — HISTORY_CACHE_LIMIT entries per guild, trimmed on every
+    # write — so their total is a function of guild count, not of how long the bot has
+    # run: ~24 KB per guild, ~24 MB across a thousand of them. That is a capacity-planning
+    # number rather than a leak, and it is the trade the -history read path buys with it
+    # (the list is the only thing that serves the command, so it must survive an idle day).
+    #
+    # WITH ONE CAVEAT that the "function of guild count" phrasing hides: the trim is
+    # LAZY. It runs inside push_history and nowhere else — grep GUILD_HISTORY_KEY: the
+    # only other readers are get_history and get_playback_snapshot (both LRANGE) and the
+    # backfill's scan. So a guild that stops playing keeps whatever oversized list it
+    # already had, forever, and no TTL path touches it. On a deployment upgrading from a
+    # build that never trimmed, a dormant guild holding 100k entries is ~49 MB of the
+    # bundled 256mb maxmemory, permanently, in a key volatile-lru can never evict. The
+    # bound above therefore holds for lists THIS build has written since the upgrade;
+    # the residue is bounded by history-at-upgrade, not by guild count, and only a
+    # further play (or a manual DEL) reclaims it. README's "Upgrading to 2.5.0" is where
+    # operators are told; note that db-backfill — the one tool that would surface these
+    # keys — hard-requires POSTGRES_URL, so an opted-out deployment has nothing that
+    # even names them.
     #
     # The OUTBOX is the unbounded one, and no flag bounds it by default: near-empty
     # whenever the drainer is keeping up, but it grows for the whole duration of a
@@ -930,16 +961,23 @@ class GuildRedisStore:
     # row and no log line (see docker-compose.yml redis command).
     @_guild_op(default=None)
     async def push_history(self, entry: HistoryEntry) -> None:
-        """LPUSH one entry, cap and PERSIST the list, and mirror the entry onto
-        the Postgres outbox — one transaction, one round trip, no branches.
+        """LPUSH one entry, cap and PERSIST the list, and — while the archive
+        is enabled — mirror the entry onto the Postgres outbox: one
+        transaction, one round trip, one branch.
 
         The list is a bounded, permanent window of the newest HISTORY_CACHE_LIMIT
         plays: LTRIM on every write, PERSIST so nothing expires it. Those two
-        commands are the whole retention policy, and they are unconditional.
+        commands are the whole retention policy, and they are unconditional —
+        identical whether the archive is enabled or not, because the display
+        list is runtime state and HISTORY_ARCHIVE_ENABLED gates only the
+        durable tier.
 
-        BOUNDED because Postgres is the durable record — the archive holds every
-        play, so Redis has no reason to keep a second unbounded copy, and an
-        unbounded non-evictable key is the OOM shape the note above describes.
+        BOUNDED because an unbounded non-evictable key is the OOM shape the
+        note above describes — and, while the archive is enabled, because
+        Postgres is the durable record that holds every play, so Redis has no
+        reason to keep a second unbounded copy. With the archive disabled the
+        window IS the whole retained record, which is the deal the operator
+        chose: the opt-in exists so that nothing outlives it.
 
         PERMANENT because -history reads this list and nothing else
         (guild_history.recent). An idle TTL here would mean a guild that goes a
@@ -965,13 +1003,15 @@ class GuildRedisStore:
         never gains a TTL — see the eviction note above and docker-compose.yml's
         volatile-lru comment.
 
-        The same wire bytes are also XADDed onto the HISTORY_OUTBOX_KEY stream
-        in the same (transactional) pipeline, for the Postgres drainer.
-        Unconditional: the archive is a required tier, so there is always a
-        drainer behind the outbox. The two legs share one
+        While the archive is enabled (HISTORY_ARCHIVE_ENABLED — the opt-in
+        consent gate for long-term storage), the same wire bytes are also
+        XADDed onto the HISTORY_OUTBOX_KEY stream in the same (transactional)
+        pipeline, for the Postgres drainer. Disabled — the default — the leg
+        is absent: nothing accumulates for a drainer that does not exist, and
+        the outbox key is never created. The two legs share one
         serialize_history_entry call so they cannot drift and song-end pays only
         one orjson.dumps. Song-end still costs exactly ONE Redis round trip for
-        both legs and never awaits Postgres — the property
+        every leg and never awaits Postgres — the property
         docs/POSTGRES_HISTORY_PLAN.md calls the single most important one in the
         design.
 
@@ -982,7 +1022,8 @@ class GuildRedisStore:
         pre-R1 list at this key fails the XADD leg with WRONGTYPE and would be
         swallowed into one warning per song — which is why
         ensure_outbox_group() aborts at STARTUP instead. That is the only place
-        the signal can be loud.
+        the signal can be loud. (Enabled mode; disabled, there is no XADD leg
+        to fail and a mis-shaped key is inert.)
 
         The outbox leg is idempotent under a re-sent transaction (a duplicate
         stream entry collapses on the archive's unique index); the
@@ -1005,21 +1046,45 @@ class GuildRedisStore:
             #
             # A bare LTRIM is allowed at the cap (it is not denyoom) and frees
             # the memory immediately, so the one command that could make room is
-            # exactly the one that can still run. Do it, then retry once: the
-            # push now has room and the play is not lost.
+            # exactly the one that can still run.
+            #
+            # WHAT THE RETRY CAN AND CANNOT DO. This used to claim "the push now
+            # has room and the play is not lost", which is only true for a list
+            # this build has not trimmed yet. At the steady state the trim frees
+            # NOTHING — measured against redis:7-alpine at maxmemory 3mb: the
+            # bare LTRIM was allowed, llen stayed 50, the retry aborted again and
+            # the play was dropped. So the recovery is real exactly once per
+            # guild per upgrade (an oversized legacy list), and after that the
+            # retry is a second attempt in case memory freed elsewhere, not a
+            # guarantee. Say which case happened rather than logging a recovery
+            # that did not occur.
             #
             # Reachable even though the lists are capped: the outbox is what
             # grows without bound during a Postgres outage, and it fills the
-            # instance for every key. Recovering a list this build has already
-            # trimmed to 50 frees little, but the retry is what matters — with
-            # @_guild_op swallowing OutOfMemoryError into one warning per song,
-            # the alternative is a silently dropped play.
-            log.warning(
-                f"guild {self.guild_id}: Redis is at maxmemory and refused the "
-                f"history write; trimming to {HISTORY_CACHE_LIMIT} entries and "
-                f"retrying"
-            )
-            await self.redis.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            # instance for every key. The retry still matters — with @_guild_op
+            # swallowing OutOfMemoryError into one warning per song, the
+            # alternative is a silently dropped play.
+            #
+            # LLEN first, not LTRIM first: reads are not denyoom, and skipping a
+            # trim that provably frees nothing removes a round trip from a path
+            # that runs per song end for every guild while Redis is full.
+            length = await self.redis.llen(self.history_key())
+            if length > HISTORY_CACHE_LIMIT:
+                log.warning(
+                    f"guild {self.guild_id}: Redis is at maxmemory and refused "
+                    f"the history write; trimming {length} entries to "
+                    f"{HISTORY_CACHE_LIMIT} and retrying"
+                )
+                await self.redis.ltrim(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
+            else:
+                log.warning(
+                    f"guild {self.guild_id}: Redis is at maxmemory and refused "
+                    f"the history write. This guild's list is already at the "
+                    f"{HISTORY_CACHE_LIMIT}-entry cap, so trimming would free "
+                    f"nothing — retrying once, but this play is likely LOST. "
+                    f"Free memory (usually: drain history:outbox by restoring "
+                    f"Postgres) or raise maxmemory."
+                )
             await self._push_history_pipeline(wire)
 
     async def _push_history_pipeline(self, wire: bytes) -> None:
@@ -1044,7 +1109,20 @@ class GuildRedisStore:
         # time never does. PERSIST because -history has no other source, and
         # because it clears an inherited TTL from an older build in one write.
         pipe.persist(self.history_key())
-        pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
+        # The outbox leg is the pipeline's ONE conditional command: the flag is
+        # the consent gate for long-term storage, and with the archive disabled
+        # nothing may accumulate for a drainer that does not exist — the XADD
+        # would even MKSTREAM-like create the non-evictable key on first write.
+        # Read per call (config's call-time convention, no hot path: once per
+        # song end), through the module so tests can patch either the function
+        # or the environment. A garbage value must never FIRST surface here:
+        # @_guild_op would swallow the parser's ValueError into one warning per
+        # song, so setup_hook is required to read the flag before anything else
+        # consumes it — by the time a song ends, the process has already proven
+        # the value parses (history_archive_enabled's validation-placement
+        # rule).
+        if config.history_archive_enabled():
+            pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 
     @_guild_op(default_factory=list)

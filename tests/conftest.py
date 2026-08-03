@@ -141,8 +141,17 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv and wins. Same shape as the ytdlp seam and the structlog
     contextvar reset above: make the suite mean what it says regardless of the
     shell it runs in.
+
+    HISTORY_ARCHIVE_ENABLED is pinned TRUE — the suite default deliberately
+    inverts the ship default (False). The enabled configuration exercises
+    strictly more code (the outbox XADD leg, the notify, the drainer wiring)
+    and hundreds of existing assertions encode it; the shipped default is
+    covered by explicit disabled-mode tests that monkeypatch the variable per
+    case, which wins over this fixture (same MonkeyPatch instance, later call).
+    See docs/HISTORY_ARCHIVE_OPT_IN_PLAN.md D9.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -253,6 +262,20 @@ def mock_bot(mock_guild: MagicMock) -> MagicMock:
     bot.latency = 0.05
     bot.is_closed.return_value = False
     bot.wait_until_ready = AsyncMock()
+    # Declared, never auto-vivified. MusicPlayer.__init__ reads
+    # bot.history_drainer to decide whether GuildHistory gets a real outbox
+    # notify or None, and an auto-vivified MagicMock attribute answers
+    # `is not None` with True — so every player built from this fixture takes
+    # the archive-ENABLED arm, and the disabled arm (which is the SHIP DEFAULT)
+    # would be exercised by nothing in the suite at all. That is not
+    # hypothetical: dropping the None guard from musicplayer.py once passed the
+    # entire suite while bricking every -play in the default configuration.
+    #
+    # Spelling the enabled shape out keeps it a deliberate choice rather than an
+    # accident of MagicMock; TestOutboxNotifyWiring in test_musicplayer.py
+    # covers BOTH arms against the real constructor.
+    bot.history_archive = MagicMock()
+    bot.history_drainer = MagicMock()
     # No create_task mock needed — MusicPlayer.start() is never called in tests
     return bot
 

@@ -18,6 +18,7 @@ from src.config import (
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     _int_env,
+    history_archive_enabled,
     postgres_url,
     spotify_enabled,
     using_default_postgres_password,
@@ -110,6 +111,65 @@ class TestPostgresUrl:
         assert postgres_url() is None
         monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
         assert postgres_url() == "postgresql://u@h/db"
+
+
+class TestHistoryArchiveEnabled:
+    """The consent gate for long-term storage.
+
+    Two rules under test, each bought by a failure direction. Fail-closed:
+    absence of a choice must mean no collection, so unset and empty are False.
+    Strict parse: a lenient anything-but-true-is-False rule turns a typo into
+    an operator who believes they enabled archiving while every play goes
+    unrecorded — so garbage raises, naming the variable.
+    """
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES"])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "False", "0", "no", "NO"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_unset_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`HISTORY_ARCHIVE_ENABLED=` is the bare KEY= shape .env.example
+        models for POSTGRES_PASSWORD — same tolerance rule as _int_env."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_surrounding_whitespace_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "  true  ")
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "ture", "2", "y", "t"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Includes near-misses an operator would plausibly type (`on`, `y`,
+        `enabled`): every one silently disables archiving under a lenient
+        parser, which is the failure the strict parse exists to prevent."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        with pytest.raises(ValueError, match="HISTORY_ARCHIVE_ENABLED"):
+            history_archive_enabled()
+
+    def test_read_at_call_time_not_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        assert history_archive_enabled() is True
 
 
 class TestIntEnv:
@@ -329,6 +389,69 @@ def _compose_directives() -> str:
     )
 
 
+def _service_block(name: str) -> str:
+    """The directive lines of one top-level compose service (comments already
+    stripped). Regex, not a YAML parser, on the same terms as everything else
+    in this file: nothing in the repo's dependency set reads YAML, and adding
+    a parser for a contract test would be the tail wagging the dog."""
+    match = re.search(
+        rf"^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)",
+        _compose_directives(),
+        re.S | re.M,
+    )
+    assert match is not None, f"service {name} not found in docker-compose.yml"
+    return match.group(1)
+
+
+class TestComposeArchiveProfile:
+    """The deployment half of the opt-in archive: postgres and db-migrate
+    exist in the model only while the `archive` profile is active, and a
+    token-only `docker compose up` deploys no long-term storage at all.
+    Invisible to every other check — nothing in CI parses compose — so the
+    contract is asserted against the real file, like the password tests
+    above (empirical findings: docs/HISTORY_ARCHIVE_OPT_IN_PLAN.md §2)."""
+
+    def test_postgres_and_db_migrate_are_archive_profiled(self) -> None:
+        # The profile IS the deployment gate: without it, a default `up`
+        # deploys a database nobody opted in to and the consent story is
+        # app-side only.
+        for service in ("postgres", "db-migrate"):
+            assert 'profiles: ["archive"]' in _service_block(service), service
+
+    def test_the_bot_does_not_depend_on_the_profiled_services(self) -> None:
+        """REGRESSION GUARD (F1): an un-profiled service with depends_on on a
+        profiled one makes the WHOLE project invalid while the profile is
+        inactive — even `docker compose config` fails ("depends on undefined
+        service") — so re-adding either dependency breaks token-only `up`
+        outright, invisibly to every other check. Reproduced on Compose
+        v5.3.1."""
+        bot = _service_block("discord-music-bot")
+        depends = re.search(r"depends_on:\n((?:      .*\n)*)", bot)
+        assert depends is not None
+        assert "postgres" not in depends.group(1)
+        assert "db-migrate" not in depends.group(1)
+        # redis stays: it is un-profiled, so F1 does not apply to it.
+        assert "redis:" in depends.group(1)
+
+    def test_db_backfill_stays_on_ops_not_archive(self) -> None:
+        """`up` starts EVERY service of an active profile, so db-backfill
+        joining `archive` would run the backfill — a full Redis keyspace
+        walk — on every enabled `up`. It keeps its own profile and runs only
+        when explicitly targeted (`docker compose run` auto-activates a
+        target's own profiles)."""
+        backfill = _service_block("db-backfill")
+        assert 'profiles: ["ops"]' in backfill
+        assert "archive" not in backfill
+
+    def test_just_down_activates_the_archive_profile(self) -> None:
+        """`docker compose down` with the profile inactive removes only
+        un-profiled containers and leaves a running postgres behind (F4), so
+        the justfile recipe must pass --profile archive. Greps the justfile —
+        the same cannot-import-shell reasoning as the preflight test above."""
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        assert "docker compose --profile archive down" in justfile
+
+
 class TestComposeMatchesTheDefault:
     """The two halves of the first-run promise, asserted against the real file.
 
@@ -378,6 +501,24 @@ class TestComposeMatchesTheDefault:
             Path(__file__).resolve().parent.parent / "build_common.sh"
         ).read_text()
         assert f'= "{DEFAULT_POSTGRES_PASSWORD}"' in preflight
+
+    def test_the_justfile_dsn_uses_the_same_default(self) -> None:
+        """The SIXTH copy, and the only one nothing held.
+
+        `_dotenv` grew `${POSTGRES_PASSWORD:-password}` with the comment "Keep
+        this default in step with docker-compose.yml's" — a stated coupling with
+        nothing enforcing it, while the three tests around this one cover
+        config.py, build_common.sh and the compose interpolations. Rotate the
+        default in those three and every test stays green while `just run`,
+        `just db-migrate` and `just db-backfill` build a DSN the database
+        rejects. The archive connects lazily, so `just run` starts fine and
+        surfaces it much later as a drainer backoff loop — the exact two-step
+        trap the justfile comment above it was written to prevent.
+        """
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        fallbacks = set(re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", justfile))
+        assert len(fallbacks) >= 1  # non-empty guard, as above
+        assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
 
     def test_the_bot_and_the_migration_tiers_all_carry_a_default(self) -> None:
         # Count rather than merely "none mandatory": a service whose

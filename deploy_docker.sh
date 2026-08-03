@@ -16,6 +16,23 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# This script is the one that STARTS containers, so it is the one that has to
+# carry the credential preflight. build_docker.sh also calls it, but only
+# build_docker.sh — and `just up`, a rollback, and the README's own enable and
+# disable procedures (`docker compose up -d`) all reach a running Postgres
+# without ever passing through it. That left the drift case — `archive` profile
+# active, HISTORY_ARCHIVE_ENABLED off — with no warning anywhere at all: the
+# bot's startup ERROR and its -ping row are both gated on the flag, so a
+# default-credential database holding the full play archive ran silently, which
+# is precisely the case build_common.sh's wider OR-gate was written to catch.
+#
+# Deliberately NOT deduplicated against build_docker.sh's earlier call. That one
+# fires before ~24s of checks and a full image build so the operator learns
+# early; by the time those have scrolled past, this one puts the warning back on
+# screen immediately before the containers start. Same text, two moments that
+# both matter. It only warns — see build_common.sh for why refusing would be
+# wrong — so repeating it costs nothing but a line.
+warn_default_postgres_password
 
 # Default matches what build_docker.sh / `just image` actually tagged, `-dirty`
 # suffix included — otherwise `just up` after a dirty build looks for a clean-SHA

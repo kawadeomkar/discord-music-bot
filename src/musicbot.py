@@ -94,8 +94,11 @@ HISTORY_MIN_LIMIT = 1
 # GuildHistory.recent() serves this command from the Redis list alone, and
 # get_history() reads exactly the newest HISTORY_CACHE_LIMIT entries. The read
 # is complete only because that window is at least as deep as anything this
-# command can ask for: every play among the true newest `limit` is then
-# guaranteed to be in it. Raising this above HISTORY_CACHE_LIMIT would not fail
+# command can ask for: every play among the true newest `limit` occupies a slot
+# in it. Slots, not plays — the equality leaves no headroom, so a corrupt or
+# duplicated entry costs a slot and shortens the page by one (see the
+# HISTORY_CACHE_LIMIT comment in redis_client.py, which is where that trade is
+# argued). Raising this above HISTORY_CACHE_LIMIT would not fail
 # anywhere — it would silently return a short page, having asked for depth the
 # window does not carry. Raise both together or neither.
 # See docs/HISTORY_OVERHAUL_PLAN.md §5 and GuildHistory.recent's docstring.
@@ -203,10 +206,11 @@ class MusicBot(commands.Cog):
         # attributes: history_archive below is the same HACK for the same reason, and
         # is spelled the same way deliberately — one idiom and one FIXME beats two.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        # The play-history archive, read only by -ping's Postgres row. Always present
-        # in a real bot: setup_hook builds it (refusing to start without POSTGRES_URL)
-        # BEFORE load_extension constructs this cog, so the None branch is reachable
-        # only from tests and a cog built outside MusicBotApp. Typed as the narrow
+        # The play-history archive, read only by -ping's Postgres row. Present
+        # exactly when the archive is enabled: setup_hook builds it (requiring
+        # POSTGRES_URL) BEFORE load_extension constructs this cog when
+        # HISTORY_ARCHIVE_ENABLED is true, and leaves it None — the disabled
+        # default — otherwise. Typed as the narrow
         # ArchiveHealth protocol, not PostgresHistoryArchive — the Postgres row is all
         # this class does with it, so that is all it should be able to do with it.
         self.history_archive: Optional[ArchiveHealth] = getattr(
@@ -1343,16 +1347,26 @@ class MusicBot(commands.Cog):
         aliases=["h"],
         brief="show recently played songs",
         usage="[--limit N]",
+        # Interpolated, not spelled out: this copy asserts the retention window,
+        # and HISTORY_MAX_LIMIT is that window (it IS HISTORY_CACHE_LIMIT — see
+        # the constant above). A hand-typed number here is how the previous copy
+        # came to promise permanent retention months after the list was capped.
         help=(
             "Lists the songs already played in this server, most recent first.\n\n"
-            "`--limit N` controls how many are shown (1-50, default 10). History "
-            "is stored per server, survives a bot restart, and is kept "
-            "permanently — the limit here is a display cap (Discord renders one "
-            "embed per song), not how much is retained."
+            f"`--limit N` controls how many are shown ({HISTORY_MIN_LIMIT}-"
+            f"{HISTORY_MAX_LIMIT}, default 10). History is stored per server and "
+            f"survives a bot restart, but only the newest {HISTORY_MAX_LIMIT} plays "
+            f"are kept — so `--limit {HISTORY_MAX_LIMIT}` shows the whole record."
         ),
         extras={
             "category": "Queue",
             "examples": ["-history", "-h", "-history --limit 25"],
+            "note": (
+                f"The newest {HISTORY_MAX_LIMIT} plays are everything this command "
+                "can read. If this server's host has turned on the optional "
+                "long-term archive, plays are also recorded there permanently — "
+                f"but `-history` always serves the {HISTORY_MAX_LIMIT}-play window."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
