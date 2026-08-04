@@ -33,6 +33,7 @@ from src.musicbot import (
     _check_voice_permissions,
     _LEADERBOARD_CACHE_TTL_SECS,
     _leaderboard_cache_key,
+    _leaderboard_embed,
     _leaderboard_from_cache,
     _leaderboard_to_cache,
     _typing_keepalive,
@@ -2042,12 +2043,18 @@ def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> RequesterL
 
 
 def _song(
-    n: int, *, title: str | None = None, url: str | None = None, plays: int = 2
+    n: int,
+    *,
+    title: str | None = None,
+    url: str | None = None,
+    plays: int = 2,
+    query_source: str = "",
 ) -> SongLeader:
     return SongLeader(
         title=f"Song {n}" if title is None else title,
         webpage_url=f"https://yt.com/v={n}" if url is None else url,
         duration_secs=210,
+        query_source=query_source,
         plays=plays,
         played_secs=400,
     )
@@ -2435,6 +2442,68 @@ class TestLeaderboardCommand:
         assert "could not be reached" in embed.description
 
 
+class TestLeaderboardQuerySourceRendering:
+    """The "· via X" tail. It answers what the host chip beside the link cannot:
+    the chip names where the URL goes, this names how the song was asked for,
+    and for Spotify and plaintext search those two disagree."""
+
+    @pytest.mark.parametrize(
+        "token,expected",
+        [
+            ("spotify.com", "· via Spotify"),
+            ("search", "· via search"),
+            ("youtube.com", "· via YouTube"),
+            ("soundcloud.com", "· via SoundCloud"),
+            # The open tail: no dataclass per site, so an unmapped host renders
+            # as itself.
+            ("tiktok.com", "· via tiktok.com"),
+            ("artist.bandcamp.com", "· via artist.bandcamp.com"),
+        ],
+    )
+    def test_token_renders_as_a_labelled_tail(self, token: str, expected: str) -> None:
+        embed = _leaderboard_embed(_board(songs=[_song(1, query_source=token)]))
+        assert embed is not None and embed.description is not None
+        assert expected in embed.description
+
+    def test_unknown_source_drops_the_segment_entirely(self) -> None:
+        # Every pre-feature row carries "", so printing "via unknown" would be
+        # the loudest thing on a board of legacy plays.
+        embed = _leaderboard_embed(_board(songs=[_song(1, query_source="")]))
+        assert embed is not None and embed.description is not None
+        assert "via" not in embed.description
+
+    def test_a_spotify_play_is_distinguishable_from_a_search(self) -> None:
+        # The point of the column: both rows carry a youtube.com URL, so the
+        # host chip is identical and only this tail separates them.
+        embed = _leaderboard_embed(
+            _board(
+                songs=[
+                    _song(
+                        1,
+                        url="https://youtube.com/watch?v=1",
+                        query_source="spotify.com",
+                    ),
+                    _song(
+                        2, url="https://youtube.com/watch?v=2", query_source="search"
+                    ),
+                ]
+            )
+        )
+        assert embed is not None and embed.description is not None
+        assert embed.description.count("`youtube.com`") == 2
+        assert "· via Spotify" in embed.description
+        assert "· via search" in embed.description
+
+    def test_a_token_the_clamp_let_through_is_still_sanitized(self) -> None:
+        # Defence in depth: the domain excludes markdown, but the renderer is
+        # the boundary and must not rely on the producer.
+        embed = _leaderboard_embed(
+            _board(songs=[_song(1, query_source="a*b_c`d")]),
+        )
+        assert embed is not None and embed.description is not None
+        assert "a*b_c`d" not in embed.description
+
+
 class TestLeaderboardCache:
     """The 60s Redis cache. It is what bounds Postgres to one aggregate pass per
     guild per window per minute — max_concurrency only serializes, it does not
@@ -2558,7 +2627,7 @@ class TestLeaderboardCache:
         # valid-looking board — the codec defaults missing fields rather than
         # rejecting them.
         key = _leaderboard_cache_key(7, 30, 10)
-        assert key == "leaderboard:v1:7:30:10"
+        assert key == "leaderboard:v2:7:30:10"
         assert _leaderboard_cache_key(7, 30, 25) != key
 
     def test_codec_caps_an_oversized_cached_board(self) -> None:
