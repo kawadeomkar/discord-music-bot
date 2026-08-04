@@ -7,13 +7,14 @@ import dataclasses
 import re
 import time
 from typing import Any, Never, cast
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 import orjson
 import pytest
 
+from src.guild_queue import QueueItem
 from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
 from src.musicplayer import (
     MusicPlayer,
@@ -2404,6 +2405,50 @@ class TestEnqueueStamps:
         jumper = QueueObject("https://yt.com/v=new", "New", mock_author)
         await music_player.queue_put_front(jumper)
         assert jumper.queue_position == 1
+
+    async def test_live_song_and_its_resume_tail_count_once(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        # Post-interjection the interrupted song is BOTH current_song and, as its
+        # resume tail, an entry on the display. It is one song, so a new arrival
+        # waits behind two — counting it twice would stamp 3.
+        mock_song.webpage_url = "https://yt.com/v=live"
+        music_player.current_song = mock_song
+        await music_player.queue.put_front(
+            [
+                QueueObject("https://yt.com/v=now", "Now", mock_author),
+                QueueObject(
+                    "https://yt.com/v=live", "Live", mock_author, is_resume=True
+                ),
+            ]
+        )
+        later = QueueObject("https://yt.com/v=later", "Later", mock_author)
+        await music_player.queue_put(later)
+        assert later.queue_position == 2
+
+    @pytest.mark.parametrize("front", [False, True])
+    async def test_stamp_runs_while_the_queue_mutex_is_held(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        front: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The whole point of the stamp hook: a depth read outside the mutex can
+        # be invalidated by a clear/shuffle landing before the insert does.
+        locked: list[bool] = []
+        original = MusicPlayer._stamp_at_depth
+
+        def spy(
+            player: MusicPlayer, items: Sequence[QueueItem], queued_ahead: int
+        ) -> list[QueueItem]:
+            locked.append(player.queue._mutex.locked())
+            return original(player, items, queued_ahead)
+
+        monkeypatch.setattr(MusicPlayer, "_stamp_at_depth", spy)
+        enqueue = music_player.queue_put_front if front else music_player.queue_put
+        await enqueue(queue_obj)
+        assert locked == [True]
 
     async def test_already_stamped_item_is_not_restamped(
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock

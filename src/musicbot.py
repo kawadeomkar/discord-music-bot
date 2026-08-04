@@ -1011,10 +1011,10 @@ class MusicBot(commands.Cog):
             # "now", and this window can be seconds long with songs queued behind.
             # Reset the marker or a normally queued song triggers replace semantics.
             qobj.interjected = False
-            # This path goes straight to the queue, so it stamps its own enqueue:
-            # nothing is playing, so the song is next up at position 0.
-            qobj.queued_at = time.time()
-            await mp.queue.put_front([qobj])
+            # The player's wrapper, not queue.put_front directly: it stamps the
+            # enqueue under the queue mutex like every other user-facing insert.
+            # prefetch=False — the stream URL was warmed above.
+            await mp.queue_put_front(qobj, prefetch=False)
             await asyncio.gather(
                 send_embed(
                     ctx,

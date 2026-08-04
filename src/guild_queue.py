@@ -36,7 +36,7 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from enum import Enum, auto
 from typing import Optional, Union
 
@@ -65,6 +65,15 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
+
+
+# Called by put()/put_front() while the bulk-mutation mutex is held, with the
+# number of entries already ahead of the insert point. Returns the list to
+# actually enqueue, so a stamper may replace frozen items. See
+# MusicPlayer._stamp_at_depth — the depth is passed in rather than read back off
+# the queue because reading it outside the mutex is what lets a concurrent
+# enqueue shift it between the read and the insert.
+StampFn = Callable[[Sequence[QueueItem], int], list[QueueItem]]
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -156,31 +165,47 @@ class GuildQueue:
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
-    async def put(self, items: Sequence[QueueItem], *, batch: bool = False) -> None:
+    async def put(
+        self,
+        items: Sequence[QueueItem],
+        *,
+        batch: bool = False,
+        stamp: Optional[StampFn] = None,
+    ) -> list[QueueItem]:
         """Enqueue on all three legs: in-memory puts first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
         land, resurrecting them as ghosts the next dequeue LPOPs instead of its own
         entry. batch=True pushes every entry in one round-trip (bulk playlist);
-        batch=False one RPUSH per entry."""
+        batch=False one RPUSH per entry.
+
+        `stamp` runs under the mutex against the display depth and may replace
+        items; the enqueued list is returned for callers that need the result."""
         async with self._mutex:
-            for item in items:
+            if stamp is not None:
+                items = stamp(items, len(self._display))
+            queued = list(items)
+            for item in queued:
                 await self._pending.put(item)
                 self._display.append(item)
-            if self._store is None:
-                return
-            entries = [_to_entry(item) for item in items]
-            if not entries:
-                return
+            if self._store is None or not queued:
+                return queued
+            entries = [_to_entry(item) for item in queued]
             if batch:
                 await self._store.push_queue_batch(entries)
             else:
                 for entry in entries:
                     await self._store.push_queue(entry)
+            return queued
 
-    async def put_front(self, items: Sequence[QueueItem]) -> None:
+    async def put_front(
+        self, items: Sequence[QueueItem], *, stamp: Optional[StampFn] = None
+    ) -> list[QueueItem]:
         """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
+
+        `stamp` runs under the mutex against the in-flight head count — the only
+        thing a front insertion lands behind — and may replace items.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
         the inserted items on the display leg and forces the mirror down the
@@ -196,17 +221,19 @@ class GuildQueue:
         dequeued item sits uncommitted at the display head.
         """
         if not items:
-            return
-        new_items = list(items)
+            return []
         async with self._mutex:
             drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
+            if stamp is not None:
+                items = stamp(items, len(in_flight))
+            new_items = list(items)
             for item in new_items + drained:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + new_items + drained)
 
             if self._store is None:
-                return
+                return new_items
             if in_flight:
                 entries = [
                     _to_entry(s)
@@ -221,6 +248,7 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
+            return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
     # Callers with a prefetch task (MusicPlayer) must cancel it before any of
@@ -361,6 +389,17 @@ class GuildQueue:
 
     def peek_next(self) -> Optional[QueueItem]:
         return self._display[0] if self._display else None
+
+    def has_resume_tail(self, webpage_url: str) -> bool:
+        """True when the display already carries the resume tail an interjection
+        left behind for `webpage_url`. That entry and the live song are the SAME
+        play, so anything counting queue depth must count them once."""
+        return any(
+            isinstance(item, QueueObject)
+            and item.is_resume
+            and item.webpage_url == webpage_url
+            for item in self._display
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 

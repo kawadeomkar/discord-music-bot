@@ -828,9 +828,12 @@ class MusicPlayer:
 
     def _stamp_enqueue(self, items: list[QueueItem], *, base: int) -> list[QueueItem]:
         """Stamp queued_at/queue_position on items entering a queue for the first
-        time, `base` songs behind the front. Stamp-once: a non-zero queued_at means
-        this item is being re-queued (requeue_front, a restored entry, a
-        neutralized prefetch) and keeps the position it was originally given.
+        time, `base` songs behind the front.
+
+        Stamp-once: a non-zero queued_at is left alone. No path re-enqueues an
+        already-stamped item through here today — requeue_front, restore and the
+        neutralized prefetch all bypass it — so the guard is what keeps a future
+        one from silently renumbering a song against a depth it never waited.
 
         QueueObject is mutated in place, as prefetch already does; YTSource is
         frozen, so it is replaced — callers must use the returned list.
@@ -850,13 +853,22 @@ class MusicPlayer:
                 stamped.append(item)
         return stamped
 
-    def _queue_depth_ahead(self) -> int:
-        """Songs a new arrival would wait behind: everything on display plus the
-        one playing. display_items(), not qsize(): display is what -queue shows the
-        requester, and it leads _pending by the in-flight head mid-dequeue."""
-        return len(self.queue.display_items()) + (
-            1 if self.current_song is not None else 0
-        )
+    def _stamp_at_depth(
+        self, items: Sequence[QueueItem], queued_ahead: int
+    ) -> list[QueueItem]:
+        """GuildQueue stamp hook: songs a new arrival waits behind are the entries
+        already ahead of the insert point plus the one playing. `queued_ahead`
+        comes from the queue under its bulk-mutation mutex, so a concurrent
+        enqueue cannot shift the depth between reading it and the insert landing.
+
+        The live song is NOT counted when its resume tail is already queued: after
+        an interjection that entry is the same play as current_song, and counting
+        both puts a new arrival one song too deep."""
+        base = queued_ahead
+        current = self.current_song
+        if current is not None and not self.queue.has_resume_tail(current.webpage_url):
+            base += 1
+        return self._stamp_enqueue(list(items), base=base)
 
     async def queue_put(
         self,
@@ -874,8 +886,9 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        items = self._stamp_enqueue(items, base=self._queue_depth_ahead())
-        await self.queue.put(items, batch=not prefetch)
+        items = await self.queue.put(
+            items, batch=not prefetch, stamp=self._stamp_at_depth
+        )
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -899,12 +912,9 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        # Front insertion waits only on the live song, if any — the persisted
-        # entries it jumps ahead of are behind it, not in front.
-        items = self._stamp_enqueue(
-            items, base=1 if self.current_song is not None else 0
-        )
-        await self.queue.put_front(items)
+        # Front insertion waits only on the live song and an in-flight head — the
+        # persisted entries it jumps ahead of are behind it, not in front.
+        items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):

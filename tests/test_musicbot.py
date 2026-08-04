@@ -4121,7 +4121,7 @@ class TestPlaynow:
         enqueue every track right after the first-track-only notice. The user still
         gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
-        live_mp.queue.put_front = AsyncMock()
+        live_mp.queue_put_front = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         mock_ctx.invoke = AsyncMock()
@@ -4131,7 +4131,9 @@ class TestPlaynow:
         await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_not_awaited()
-        live_mp.queue.put_front.assert_awaited_once_with([qobj])
+        # The player's wrapper, so the insert is stamped under the queue mutex;
+        # the stream was already warmed, so it must not prefetch again.
+        live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
         # The interjection marker must not leak onto a normally queued song —
         # a later -playnow would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False
