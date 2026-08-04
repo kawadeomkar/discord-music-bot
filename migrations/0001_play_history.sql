@@ -1,21 +1,23 @@
 -- The play-history schema: the durable long-term home for every played song,
 -- plus the reject table that catches anything the server refuses.
 --
--- Deliberately ONE migration. No bot has ever opened a Postgres connection, so
--- there is no database whose schema this has to evolve, and a pre-release
--- sequence of ALTER steps would describe upgrades that never happened to
--- anyone. While that holds, this file is edited IN PLACE.
+-- Deliberately ONE migration. No deployment holds this schema, so there is no
+-- database whose shape this has to evolve, and a sequence of ALTER steps would
+-- describe upgrades that never happened to anyone. While that holds, this file
+-- is edited IN PLACE.
 --
--- The window closes when the first release whose bot actually reads the archive
--- ships (the stack/4 durable-tier work — setup_hook requiring POSTGRES_URL and
--- constructing PostgresHistoryArchive). From then on every change becomes a new
--- numbered migration, because from then on the ALTERs are real. Note this is
--- NOT "the first tagged release": v1.3.0 and v1.4.0 already ship this file, and
--- editing it stayed safe only because their bots never connected to Postgres.
+-- The trigger for freezing it is a DEPLOYED database, not a tagged release:
+-- v1.3.0 onward all ship this file and v2.4.0 onward all connect, yet editing
+-- it stays safe for exactly as long as no instance has run one. Once one has,
+-- every change becomes a new numbered migration, because from then on the
+-- ALTERs are real.
 --
--- Consequence: IF NOT EXISTS makes this whole file a no-op against a database
--- that already holds these tables, so a dev box on an earlier shape does NOT
--- get updated — drop the tables (or the volume) and re-run.
+-- Consequence while the window is open: migrate() skips a version already in
+-- schema_migrations WITHOUT reading the file, and IF NOT EXISTS makes the DDL a
+-- no-op anyway, so a database on an earlier shape does NOT get updated and
+-- still reports version 1. Dropping the tables is not enough either — the
+-- ledger row survives and the re-run applies nothing. Drop the database (or the
+-- compose volume) and re-run.
 --
 -- The zero-value convention ("0 / empty string = unknown") carries over from
 -- the wire format — no NULLs. Deliberate: unique indexes treat NULLs as
@@ -47,6 +49,26 @@ CREATE TABLE IF NOT EXISTS play_history (
     thumbnail      text        NOT NULL DEFAULT '',
     uploader       text        NOT NULL DEFAULT '',
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
+
+    -- When the song was first added to the queue (epoch 0 = unknown, the same
+    -- sentinel as played_at) and how many songs were ahead of it then, counting
+    -- the one playing. 0 = played immediately, which is also what an entry
+    -- written before these fields existed parses as.
+    queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
+    queue_position integer     NOT NULL DEFAULT 0,
+
+    -- How the song was asked for: the literal 'search' for a plaintext term, or
+    -- the host of the link that was pasted ('spotify.com', 'youtube.com',
+    -- 'tiktok.com', …). '' = unknown, which is what every row written before this
+    -- column parses as.
+    --
+    -- NOT derivable from webpage_url, which is why it is stored: a Spotify link
+    -- resolves to a YouTube title search and archives with a youtube.com URL, as
+    -- does a plaintext search, so those two and a pasted YouTube link are
+    -- indistinguishable there. Classified at parse time in src/sources.py and
+    -- carried on the queue entry, so a Spotify PLAYLIST track — resolved to a
+    -- YouTube URL only at dequeue — still records where it came from.
+    query_source   text        NOT NULL DEFAULT '',
 
     -- When the row reached Postgres, as opposed to when the song was played.
     -- played_at is a client clock captured at song end and can be arbitrarily
@@ -92,7 +114,30 @@ CREATE TABLE IF NOT EXISTS play_history (
     CONSTRAINT play_history_requester_valid   CHECK (requester_id >= 0),
     CONSTRAINT play_history_played_secs_valid CHECK (played_secs >= 0),
     CONSTRAINT play_history_duration_valid    CHECK (duration_secs >= 0),
-    CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0)
+    CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0),
+    CONSTRAINT play_history_queue_position_valid CHECK (queue_position >= 0),
+
+    -- Both timestamps carry the same domain the wire validator clamps them to
+    -- (_EPOCH_FIELDS against _TS_MAX in src/guild_state.py). Without these the
+    -- epoch-0 floor that -leaderboard's all-time cutoff relies on is asserted
+    -- only in Python, so a pre-epoch played_at would sort ahead of every real
+    -- play and no constraint would catch the validator regressing. The bounds
+    -- are to_timestamp() of the same epoch seconds the validator uses —
+    -- to_timestamp(double precision) is IMMUTABLE, so a CHECK may call it.
+    CONSTRAINT play_history_played_at_valid CHECK (
+        played_at BETWEEN to_timestamp(0) AND to_timestamp(253402300799)
+    ),
+    CONSTRAINT play_history_queued_at_valid CHECK (
+        queued_at BETWEEN to_timestamp(0) AND to_timestamp(253402300799)
+    ),
+
+    -- Unlike title and uploader, this column never holds third-party text: every
+    -- value is minted by src/sources.py's normalizer, so anything outside the
+    -- domain is a producer defect rather than an unusual song. HistoryEntry
+    -- clamps to '' on the same pattern (_SLUG_FIELDS), so this cannot fire.
+    CONSTRAINT play_history_query_source_valid CHECK (
+        query_source ~ '^[a-z0-9.-]{0,64}$'
+    )
 );
 
 -- Dedup for at-least-once delivery (drainer redelivery) and backfill overlap.

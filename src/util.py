@@ -117,11 +117,16 @@ def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
 EMBED_TITLE_LIMIT = 256
 
 
+def truncate(text: str, limit: int) -> str:
+    """Clip to `limit` characters, ellipsizing if clipped."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
-    if len(title) <= EMBED_TITLE_LIMIT:
-        return title
-    return title[: EMBED_TITLE_LIMIT - 1] + "…"
+    return truncate(title, EMBED_TITLE_LIMIT)
 
 
 def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:

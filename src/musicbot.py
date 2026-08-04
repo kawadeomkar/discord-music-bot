@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass
 from itertools import islice
 from typing import (
@@ -8,7 +9,7 @@ from typing import (
     Union,
     assert_never,
 )
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 
 import discord
 from discord.ext import commands
@@ -20,8 +21,18 @@ from src.config import (
     SpotifyStatus,
     spotify_enabled,
 )
+from src import leaderboard
+from src.leaderboard import LeaderboardFlags
+from src.history_archive import (
+    ArchiveReader,
+)
 from src.musicplayer import MusicPlayer
-from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
+from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
+    GuildRedisStore,
+    cache_get,
+    cache_set,
+)
 from src.sources import (
     SoundcloudSource,
     SpotifySource,
@@ -29,6 +40,7 @@ from src.sources import (
     YTSource,
     YTType,
     parse_input,
+    query_source_of,
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify, SpotifyAuthError
@@ -40,7 +52,7 @@ from opentelemetry.context import Context
 from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
-from src.ping import ArchiveHealth, run_health_dashboard, send_latency_line
+from src.ping import run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
@@ -96,6 +108,16 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
+    """Write the parse-time classification onto resolved songs.
+
+    Applied after resolution rather than threaded through yt_source/yt_playlist:
+    those are the extraction API, and this is the same seam MusicPlayer uses to
+    copy the enqueue stamps onto what yt_source builds."""
+    for qobj in qobjs:
+        qobj.query_source = token
 
 
 @dataclass
@@ -185,12 +207,12 @@ class MusicBot(commands.Cog):
         # this cycle), or a Protocol carrying `redis: Optional[aioredis.Redis]`;
         # history_archive below is the same HACK and the same fix covers both.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        # The play-history archive, read only by -ping's Postgres row. Present exactly
-        # when the archive is enabled: setup_hook builds it (requiring POSTGRES_URL)
-        # before load_extension constructs this cog, and leaves it None otherwise.
-        # Typed as the narrow ArchiveHealth protocol — the Postgres row is all this
-        # class does with it.
-        self.history_archive: Optional[ArchiveHealth] = getattr(
+        # The play-history archive's read surface. Present exactly when the archive
+        # is enabled: setup_hook builds it (requiring POSTGRES_URL) before
+        # load_extension constructs this cog, and leaves it None otherwise. Typed as
+        # ArchiveReader — -ping's Postgres row and -leaderboard's aggregate are all
+        # this class does with it.
+        self.history_archive: Optional[ArchiveReader] = getattr(
             bot, "history_archive", None
         )
         # Spotify is optional: only build the client when credentials are present. When
@@ -439,6 +461,7 @@ class MusicBot(commands.Cog):
         ctx: commands.Context,
         e: Exception,
         title: str = "Command failed",
+        detail: Optional[str] = None,
     ) -> None:
         # The failure log lives here so 15 command bodies don't each repeat it.
         # exc_info=True still captures the live traceback — this runs inside the
@@ -448,12 +471,17 @@ class MusicBot(commands.Cog):
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
-        if isinstance(e, ExtractionError):
-            # Show the user-safe line, not the raw message, which can carry
-            # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
-            detail = e.user_message
-        else:
-            detail = f"**{type(e).__name__}:** {e}"
+        # A caller-supplied detail wins: rendering the exception is safe for
+        # user-input failures, but a command whose exceptions come from
+        # infrastructure would publish what the operator sees — a DSN host and
+        # port, or a runbook naming a just recipe — to whoever ran it.
+        if detail is None:
+            if isinstance(e, ExtractionError):
+                # Show the user-safe line, not the raw message, which can carry
+                # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
+                detail = e.user_message
+            else:
+                detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
@@ -472,15 +500,17 @@ class MusicBot(commands.Cog):
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
         a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
+            # Titles, not QueueObjects — spotify_playlist_to_ytsearch stamps the
+            # YTSources they become.
             return ResolvedSpotifyPlaylist(
                 await self._require_spotify().playlist(source.id)
             )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            return ResolvedYoutubePlaylist(
-                await YTDL.yt_playlist(source.playlist_url, ctx.author)
-            )
+            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            _stamp_query_source(tracks, query_source_of(source))
+            return ResolvedYoutubePlaylist(tracks)
         else:
             ts: Optional[int] = None
             search: str
@@ -493,7 +523,9 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+            qobj = await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+            _stamp_query_source([qobj], query_source_of(source))
+            return qobj
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -735,14 +767,19 @@ class MusicBot(commands.Cog):
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(titles[:1])[0]
-            return await YTDL.yt_source(
+            # Both playlist branches resolve directly rather than through
+            # queue_source, so each stamps its own result.
+            qobj = await YTDL.yt_source(
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )
+            _stamp_query_source([qobj], query_source_of(yts))
+            return qobj
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
             if not tracks:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
+            _stamp_query_source(tracks[:1], query_source_of(source))
             return tracks[0]
         qobj = await self.queue_source(ctx, source)
         assert isinstance(qobj, QueueObject)
@@ -849,7 +886,10 @@ class MusicBot(commands.Cog):
             # "now", and this window can be seconds long with songs queued behind.
             # Reset the marker or a normally queued song triggers replace semantics.
             qobj.interjected = False
-            await mp.queue.put_front([qobj])
+            # The player's wrapper, not queue.put_front directly: it stamps the
+            # enqueue under the queue mutex like every other user-facing insert.
+            # prefetch=False — the stream URL was warmed above.
+            await mp.queue_put_front(qobj, prefetch=False)
             await asyncio.gather(
                 send_embed(
                     ctx,
@@ -1327,6 +1367,114 @@ class MusicBot(commands.Cog):
                 )
         except Exception as e:
             await self._command_error(ctx, e)
+
+    @commands.command(
+        name="leaderboard",
+        aliases=["lb", "top"],
+        brief="top listeners and songs (long-term archive)",
+        usage="[--days N]",
+        help=(
+            "Shows this server's top 10 listeners and top 10 songs, ranked by "
+            "total listening time (song and play counts included).\n\n"
+            "`--days N` limits both boards to the last N days; without it they "
+            "are all-time. The numbers come from this server's long-term play "
+            "archive, so they cover every song since the archive was enabled — "
+            "not just the recent plays `-history` shows. A song that just "
+            "finished can take a moment to appear."
+        ),
+        extras={
+            "category": "Queue",
+            "examples": ["-leaderboard", "-lb", "-leaderboard --days 30"],
+            "note": (
+                "Available only when this server's host has enabled the "
+                "optional long-term archive."
+            ),
+        },
+    )
+    # No validate_commands: reading a leaderboard needs no voice channel (-ping
+    # is the precedent). One in flight per guild, wait=False, so command spam is
+    # declined rather than queued — the 60s cache bounds the rate, this bounds
+    # concurrency against the pool the drainer also draws from.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @_tracer.start_as_current_span("bot.leaderboard")
+    async def leaderboard(
+        self, ctx: commands.Context, *, flags: LeaderboardFlags
+    ) -> None:
+        try:
+            # Locals: ctx.guild is a property and history_archive an attribute,
+            # so narrowing on either would not survive the awaits below.
+            guild = ctx.guild
+            archive = self.history_archive
+            if guild is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "Leaderboards are per server — use this in a server channel.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if archive is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "This server's host has not enabled the long-term play "
+                        "archive, so there is no leaderboard data.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if not 0 <= flags.days <= leaderboard.MAX_DAYS:
+                await ctx.send(
+                    embed=notice_embed(
+                        f"--days must be between 1 and {leaderboard.MAX_DAYS}. "
+                        "Omit it, or pass 0, for all-time.",
+                        discord.Color.red(),
+                    )
+                )
+                return
+            key = leaderboard.cache_key(guild.id, flags.days, leaderboard.TOP_N)
+            board = leaderboard.from_cache(
+                await cache_get(self.redis, key), top_n=leaderboard.TOP_N
+            )
+            if board is None:
+                since = time.time() - flags.days * 86400 if flags.days else 0.0
+                async with background_typing(ctx):
+                    board = await archive.leaderboard(
+                        guild.id, leaderboard.TOP_N, since_epoch=since
+                    )
+                await cache_set(
+                    self.redis,
+                    key,
+                    leaderboard.to_cache(board),
+                    leaderboard.CACHE_TTL_SECS,
+                )
+            embed = leaderboard.build_embed(board, days=flags.days, guild=guild)
+            if embed is None:
+                window = (
+                    f"in the last {flags.days} {pluralize(flags.days, 'day')}"
+                    if flags.days
+                    else "yet"
+                )
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Nothing has been archived {window} — play something first!",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            await ctx.send(embed=embed)
+        except Exception as e:
+            # Fixed copy rather than the exception text: this is the only command
+            # whose failures come from infrastructure, so the default detail would
+            # publish the archive's host and port, or SchemaVersionError's
+            # operator runbook, to the channel. -ping reduces the same class for
+            # the same reason (ping._error_detail). The trace footer still joins
+            # the report to the span, and the full exception is logged there.
+            await self._command_error(
+                ctx,
+                e,
+                title="Leaderboard unavailable",
+                detail="The long-term archive could not be reached. Try again in a moment.",
+            )
 
     @commands.command(
         name="jump",

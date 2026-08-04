@@ -154,6 +154,31 @@ class TestGuildStateDataFromRedis:
     def test_interjected_missing_is_false(self) -> None:
         assert GuildStateData.from_redis({}).current_song_interjected is False
 
+    def test_enqueue_stamps_parse(self) -> None:
+        data = GuildStateData.from_redis(
+            {
+                b"current_song_queued_at": b"1752530000.5",
+                b"current_song_queue_position": b"3",
+            }
+        )
+        assert data.current_song_queued_at == 1752530000.5
+        assert data.current_song_queue_position == 3
+
+    def test_enqueue_stamps_missing_are_zero(self) -> None:
+        # Pre-feature state hashes carry neither field.
+        data = GuildStateData.from_redis({})
+        assert data.current_song_queued_at == 0.0
+        assert data.current_song_queue_position == 0
+
+    def test_query_source_parses(self) -> None:
+        data = GuildStateData.from_redis(
+            {b"current_song_query_source": b"soundcloud.com"}
+        )
+        assert data.current_song_query_source == "soundcloud.com"
+
+    def test_query_source_missing_is_unknown(self) -> None:
+        assert GuildStateData.from_redis({}).current_song_query_source == ""
+
 
 class TestGuildStateDataProperties:
     def test_has_active_connection_true_with_both_ids(self) -> None:
@@ -356,23 +381,45 @@ class TestNowPlayingDataImmutability:
 # written before the -playnow flags existed (parsed as False).
 
 _PLAYNOW_FLAGS_FALSE = b'"interjected":false,"is_resume":false,"start_paused":false'
+_ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
+_QUERY_SOURCE_UNKNOWN = b'"query_source":""'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
     + _PLAYNOW_FLAGS_FALSE
+    + b","
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
     + b"}"
 )
 _GOLDEN_QOBJ_BARE = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=2","title":"Bare","requester_id":42,"ts":null,"user_input":null,"duration":null,"uploader":null,"thumbnail":null,"persisted":true,'
     + _PLAYNOW_FLAGS_FALSE
+    + b","
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
     + b"}"
 )
 _GOLDEN_QOBJ_UNPERSISTED = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=4","title":"Crashed","requester_id":8,"ts":95,"user_input":null,"duration":180,"uploader":null,"thumbnail":null,"persisted":false,'
     + _PLAYNOW_FLAGS_FALSE
+    + b","
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
     + b"}"
 )
 _GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
-_GOLDEN_YTSOURCE = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
+_GOLDEN_YTSOURCE = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null,'
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
+    + b"}"
+)
+# Written before the enqueue stamps existed: the reader defaults both to 0.
+_GOLDEN_YTSOURCE_PRE_STAMPS = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
 
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
@@ -478,6 +525,42 @@ class TestSongQueueEntryWire:
         assert entry.start_paused is True
         assert entry.interjected is False
 
+    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
+        # Entries written before the enqueue stamps existed default both to 0.
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        assert isinstance(entry, SongQueueEntry)
+        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
+
+    def test_enqueue_stamps_round_trip(self) -> None:
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Golden Song",
+            requester=_requester_stub(222222222222222222),
+            queued_at=1752530000.5,
+            queue_position=4,
+        )
+        entry = SongQueueEntry.from_queue_object(item)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert parsed == entry
+        assert isinstance(parsed, SongQueueEntry)
+        assert (parsed.queued_at, parsed.queue_position) == (1752530000.5, 4)
+
+    def test_query_source_round_trips(self) -> None:
+        item = QueueObject(
+            webpage_url="https://yt.com/v=1",
+            title="Golden Song",
+            requester=_requester_stub(222222222222222222),
+            query_source="tiktok.com",
+        )
+        parsed = parse_queue_entry(SongQueueEntry.from_queue_object(item).to_redis())
+        assert isinstance(parsed, SongQueueEntry)
+        assert parsed.query_source == "tiktok.com"
+
+    def test_reader_defaults_query_source_on_a_pre_feature_entry(self) -> None:
+        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.query_source == ""
+
 
 class TestSearchQueueEntryWire:
     def test_writer_matches_golden_bytes(self) -> None:
@@ -496,6 +579,35 @@ class TestSearchQueueEntryWire:
         source = YTSource(ytsearch="ytsearch:x", url=None, process=True, ts=None)
         entry = SearchQueueEntry.from_ytsource(source)
         assert entry == SearchQueueEntry(ytsearch="ytsearch:x", process=True)
+
+    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
+        # Searches written before the enqueue stamps existed must still parse.
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
+        assert isinstance(entry, SearchQueueEntry)
+        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
+        assert entry.query_source == ""
+
+    def test_query_source_round_trips_through_the_lazy_resolve(self) -> None:
+        # The leg that makes a Spotify playlist track archive as Spotify: these
+        # entries sit in Redis unresolved and become YouTube URLs at dequeue, so
+        # nothing downstream could recover the classification.
+        source = YTSource(
+            ytsearch="ytsearch:x", process=True, query_source="spotify.com"
+        )
+        entry = SearchQueueEntry.from_ytsource(source)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.query_source == "spotify.com"
+
+    def test_enqueue_stamps_round_trip(self) -> None:
+        source = YTSource(
+            ytsearch="ytsearch:x", queued_at=1752530000.5, queue_position=7
+        )
+        entry = SearchQueueEntry.from_ytsource(source)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert parsed == entry
+        assert isinstance(parsed, SearchQueueEntry)
+        assert (parsed.queued_at, parsed.queue_position) == (1752530000.5, 7)
 
 
 class TestParseQueueEntryCorrupt:
@@ -530,6 +642,9 @@ def _history_entry(**overrides: Any) -> HistoryEntry:
         uploader="Chan",
         played_at=1752530000.0,
         message_id=999999999999999999,
+        queued_at=1752529000.0,
+        queue_position=2,
+        query_source="youtube.com",
     )
     fields.update(overrides)
     return HistoryEntry(**fields)
@@ -545,7 +660,9 @@ class TestHistoryEntryWire:
             b'"duration_secs":242,"played_secs":225,"requester_id":42,'
             b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
             b'"uploader":"Chan","played_at":1752530000.0,'
-            b'"message_id":999999999999999999}'
+            b'"message_id":999999999999999999,'
+            b'"queued_at":1752529000.0,"queue_position":2,'
+            b'"query_source":"youtube.com"}'
         )
 
     def test_round_trip(self) -> None:
@@ -564,7 +681,11 @@ class TestHistoryEntryWire:
             b'"uploader":"Chan","played_at":1752530000.0}'
         )
         assert parse_history_entry(pre_postgres) == _history_entry(
-            guild_id=0, message_id=0
+            guild_id=0,
+            message_id=0,
+            queued_at=0.0,
+            queue_position=0,
+            query_source="",
         )
 
     def test_pre_message_id_entry_parses_with_message_id_zero(self) -> None:
@@ -578,7 +699,24 @@ class TestHistoryEntryWire:
             b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
             b'"uploader":"Chan","played_at":1752530000.0}'
         )
-        assert parse_history_entry(pre_message_id) == _history_entry(message_id=0)
+        assert parse_history_entry(pre_message_id) == _history_entry(
+            message_id=0, queued_at=0.0, queue_position=0, query_source=""
+        )
+
+    def test_pre_enqueue_stamp_entry_parses_with_zero_stamps(self) -> None:
+        # The newest mixed-build case: a writer that predates queued_at /
+        # queue_position. Both default to the "unknown" zero value.
+        pre_stamps = (
+            b'{"guild_id":111111111111111111,"title":"Song Title",'
+            b'"webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0,'
+            b'"message_id":999999999999999999}'
+        )
+        assert parse_history_entry(pre_stamps) == _history_entry(
+            queued_at=0.0, queue_position=0, query_source=""
+        )
 
     def test_snowflake_guild_id_survives_round_trip(self) -> None:
         entry = _history_entry(guild_id=222222222222222222)
@@ -650,6 +788,9 @@ class TestHistoryEntryDomain:
             uploader="chan",
             played_at=1000.0,
             message_id=333333333333333333,
+            queued_at=900.0,
+            queue_position=3,
+            query_source="spotify.com",
         )
         assert dataclasses.asdict(entry) == {
             "guild_id": 42,
@@ -663,6 +804,9 @@ class TestHistoryEntryDomain:
             "uploader": "chan",
             "played_at": 1000.0,
             "message_id": 333333333333333333,
+            "queued_at": 900.0,
+            "queue_position": 3,
+            "query_source": "spotify.com",
         }
 
     def test_nul_stripped_from_every_text_field(self) -> None:
@@ -701,9 +845,27 @@ class TestHistoryEntryDomain:
         # written as a range test rather than two explicit bounds checks.
         assert HistoryEntry(guild_id=1, played_at=played_at).played_at == 0.0
 
+    @pytest.mark.parametrize(
+        "queued_at",
+        [1e18, -1e12, float("nan"), float("inf")],
+        ids=["huge", "negative", "nan", "inf"],
+    )
+    def test_out_of_range_queued_at_collapses_to_unknown_sentinel(
+        self, queued_at: float
+    ) -> None:
+        # queued_at rides _EPOCH_FIELDS, so it clamps exactly like played_at.
+        assert HistoryEntry(guild_id=1, queued_at=queued_at).queued_at == 0.0
+
+    def test_negative_queue_position_clamps_to_zero(self) -> None:
+        # int4 domain, and play_history's CHECK is >= 0.
+        assert HistoryEntry(guild_id=1, queue_position=-3).queue_position == 0
+
     def test_timestamptz_ceiling_is_accepted_unchanged(self) -> None:
         # The bound is inclusive: 9999-12-31T23:59:59Z is a legal timestamptz.
         assert HistoryEntry(guild_id=1, played_at=253402300799.0).played_at == (
+            253402300799.0
+        )
+        assert HistoryEntry(guild_id=1, queued_at=253402300799.0).queued_at == (
             253402300799.0
         )
 
@@ -751,10 +913,49 @@ class TestHistoryEntryDomain:
         """The lock is only closed if every field is in it. A field added to the
         dataclass but not to a domain tuple is silently unvalidated — and would
         be found by a production CHECK violation instead of by this test."""
-        from src.guild_state import _INT4_FIELDS, _INT8_FIELDS, _TEXT_FIELDS
+        from src.guild_state import (
+            _EPOCH_FIELDS,
+            _INT4_FIELDS,
+            _INT8_FIELDS,
+            _SLUG_FIELDS,
+            _TEXT_FIELDS,
+        )
 
-        covered = {*_TEXT_FIELDS, *_INT4_FIELDS, *_INT8_FIELDS, "played_at"}
+        covered = {
+            *_TEXT_FIELDS,
+            *_INT4_FIELDS,
+            *_INT8_FIELDS,
+            *_EPOCH_FIELDS,
+            *_SLUG_FIELDS,
+        }
         assert {f.name for f in dataclasses.fields(HistoryEntry)} == covered
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("search", "search"),
+            ("youtube.com", "youtube.com"),
+            ("artist.bandcamp.com", "artist.bandcamp.com"),
+            ("", ""),
+            # Every producer defect clamps to the unknown sentinel rather than
+            # reaching the column, which is what keeps 0001's CHECK unfireable.
+            ("Spotify.COM", ""),
+            ("a" * 65, ""),
+            ("evil.com](http://x)", ""),
+            ("nul\x00.com", ""),
+            ("two words", ""),
+        ],
+    )
+    def test_query_source_is_clamped_to_the_column_domain(
+        self, value: str, expected: str
+    ) -> None:
+        assert HistoryEntry(guild_id=1, query_source=value).query_source == expected
+
+    def test_query_source_rejects_a_non_string_like_every_text_field(self) -> None:
+        """__post_init__ coerces nothing — storing a row reading "None" would be
+        worse than the TypeError. Matches the documented behaviour of title."""
+        with pytest.raises(TypeError):
+            HistoryEntry(guild_id=1, query_source=cast(str, object()))
 
     def test_every_clamped_entry_survives_the_wire(self) -> None:
         # End-to-end: anything __post_init__ produces must also serialize and
@@ -785,6 +986,9 @@ def _history_song_stub(**overrides: Any) -> YTDL:
         position_secs=225.0,
         thumbnail="https://img/x.jpg",
         requester=SimpleNamespace(id=333, display_name="Omkar"),
+        queued_at=1752529000.0,
+        queue_position=2,
+        query_source="youtube.com",
     )
     fields.update(overrides)
     return cast(YTDL, SimpleNamespace(**fields))
@@ -810,6 +1014,9 @@ class TestHistoryEntryFromSong:
             uploader="Test Channel",
             played_at=1752530000.0,
             message_id=444444444444444444,
+            queued_at=1752529000.0,
+            queue_position=2,
+            query_source="youtube.com",
         )
 
     def test_guild_id_and_message_id_are_required_keywords(self) -> None:
@@ -927,6 +1134,38 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=None)
         assert entry is not None
         assert entry.interjected is False
+
+    def test_enqueue_stamps_survive_crash(self) -> None:
+        # Recovery re-queues the song but does not re-queue the play: it keeps
+        # the position it was originally given, so the archive stays truthful.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_queued_at=1752530000.5,
+            current_song_queue_position=3,
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert (entry.queued_at, entry.queue_position) == (1752530000.5, 3)
+
+    def test_enqueue_stamps_default_to_unknown(self) -> None:
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
+
+    def test_query_source_survives_crash(self) -> None:
+        # The classification is only knowable at parse time, so a crash is the one
+        # place it can be lost — and it would be lost silently, and only for
+        # crashed plays.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_query_source="spotify.com",
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert entry.query_source == "spotify.com"
 
 
 class TestGuildPlaybackSnapshot:

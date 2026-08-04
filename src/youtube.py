@@ -547,6 +547,15 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
+    # ── Enqueue stamps, written once by MusicPlayer and carried thereafter ──
+    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
+    # stamped", which is what makes stamping idempotent across re-queues.
+    queued_at: float = 0.0
+    # Songs ahead of it then, counting the one playing (0 = played immediately).
+    queue_position: int = 0
+    # How the song was asked for — "search", or the host of the pasted link.
+    # Classified by src.sources at parse time and carried from there; "" = unknown.
+    query_source: str = ""
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
@@ -583,6 +592,9 @@ class YTDL(discord.FFmpegOpusAudio):
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
+        queued_at: float = 0.0,
+        queue_position: int = 0,
+        query_source: str = "",
     ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -596,6 +608,11 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
+        # Enqueue stamps carried from the QueueObject so the history entry this
+        # song produces records where it started, not when it played.
+        self.queued_at: float = queued_at
+        self.queue_position: int = queue_position
+        self.query_source: str = query_source
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -807,6 +824,9 @@ class YTDL(discord.FFmpegOpusAudio):
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
+            queued_at=qo.queued_at,
+            queue_position=qo.queue_position,
+            query_source=qo.query_source,
         )
 
     @classmethod

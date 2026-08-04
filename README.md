@@ -70,6 +70,7 @@ details, aliases, and examples.
 | `-queue` | `q` | List the songs waiting to play (up to 10) |
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
 | `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
+| `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
 | `-shuffle` | — | Randomly reorder the queue (needs 3+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
 | `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
@@ -123,9 +124,11 @@ bgutil POT provider, and `grafana/otel-lgtm` (a ~1 GB pull the first time).
 
 **Long-term storage is opt-in.** By default the bot archives nothing: plays live
 only in a capped per-guild Redis list (the newest 50, serving `-history`), and no
-Postgres is deployed at all. Opting in — `HISTORY_ARCHIVE_ENABLED=true` in
-`.env`, then `just up` — permanently records every play (guild id, user id,
-title, timestamp) in Postgres until you erase the volume. That is a decision the
+Postgres is deployed at all — so `-leaderboard`, which aggregates over the
+permanent record, replies with a notice instead of a board. Opting in —
+`HISTORY_ARCHIVE_ENABLED=true` in `.env`, then `just up` — permanently records
+every play (guild id, user id, title, timestamp) in Postgres until you erase the
+volume. That is a decision the
 deployer makes explicitly, never a side effect of `docker compose up`: the deploy
 tooling derives Compose's `archive` profile from that one flag, and a raw
 `docker compose up` deploys the default stack whatever the flag says. The

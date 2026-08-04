@@ -15,6 +15,7 @@ lives here so the type and the domain it promises cannot drift apart.
 
 import logging
 import math
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Self, Union
 
@@ -42,6 +43,13 @@ class StateField:
     # "1" when the playing song was queued via -playnow — preserves replace
     # semantics across a crash mid-interjection.
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
+    # Stamped at enqueue and carried, never restamped, so a crash-recovered song
+    # still archives the position it was originally queued at.
+    CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
+    CURRENT_SONG_QUEUE_POSITION: Final[str] = "current_song_queue_position"
+    # Same reason: without it a song recovered after a crash archives as unknown,
+    # silently and only for crashed plays.
+    CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
@@ -142,6 +150,9 @@ class GuildStateData:
     current_song_uploader: str | None = None
     current_song_requester_id: int | None = None
     current_song_interjected: bool = False
+    current_song_queued_at: float = 0.0
+    current_song_queue_position: int = 0
+    current_song_query_source: str = ""
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
@@ -210,6 +221,15 @@ class GuildStateData:
             current_song_interjected=(
                 _b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1"
             ),
+            # `or` coalescing is safe on these two: the zero value IS the default,
+            # unlike total_pause_seconds below.
+            current_song_queued_at=(
+                _b_float(raw, StateField.CURRENT_SONG_QUEUED_AT) or 0.0
+            ),
+            current_song_queue_position=(
+                _b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0
+            ),
+            current_song_query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),
@@ -325,6 +345,12 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
+    # Enqueue stamps, carried on both entry types — absent on pre-feature
+    # entries, parsed as the 0 defaults.
+    QUEUED_AT: Final[str] = "queued_at"
+    QUEUE_POSITION: Final[str] = "queue_position"
+    # Parse-time classification, carried on both entry types (see sources.py).
+    QUERY_SOURCE: Final[str] = "query_source"
     # "ytsource" entries
     YTSEARCH: Final[str] = "ytsearch"
     URL: Final[str] = "url"
@@ -364,6 +390,11 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
+    # Enqueue stamps (0 = unknown / played immediately), see QueueObject.
+    queued_at: float = 0.0
+    queue_position: int = 0
+    # How it was asked for ("" = unknown), see QueueObject.
+    query_source: str = ""
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -381,6 +412,9 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
+            query_source=item.query_source,
         )
 
     @classmethod
@@ -398,6 +432,9 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             interjected=song.interjected,
+            queued_at=song.queued_at,
+            queue_position=song.queue_position,
+            query_source=song.query_source,
         )
 
     @classmethod
@@ -427,6 +464,9 @@ class SongQueueEntry:
             # -playnow after recovery still replaces it (no resume entry) rather
             # than stacking one.
             interjected=state.current_song_interjected,
+            queued_at=state.current_song_queued_at,
+            queue_position=state.current_song_queue_position,
+            query_source=state.current_song_query_source,
         )
 
     def to_redis(self) -> bytes:
@@ -447,6 +487,9 @@ class SongQueueEntry:
                 QueueEntryField.INTERJECTED: self.interjected,
                 QueueEntryField.IS_RESUME: self.is_resume,
                 QueueEntryField.START_PAUSED: self.start_paused,
+                QueueEntryField.QUEUED_AT: self.queued_at,
+                QueueEntryField.QUEUE_POSITION: self.queue_position,
+                QueueEntryField.QUERY_SOURCE: self.query_source,
             }
         )
 
@@ -454,13 +497,20 @@ class SongQueueEntry:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SearchQueueEntry:
     """An unresolved search at rest ("ytsource" on the wire) — e.g. a Spotify
-    playlist track awaiting yt-dlp resolution. Holds exactly the four YTSource
-    fields the wire persists; the rest default on rehydration."""
+    playlist track awaiting yt-dlp resolution. Holds exactly the YTSource fields
+    the wire persists; the rest default on rehydration."""
 
     ytsearch: str | None = None
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
+    # Enqueue stamps: searches are stamped like resolved songs, so a Spotify
+    # playlist track keeps its position through the resolve at dequeue.
+    queued_at: float = 0.0
+    queue_position: int = 0
+    # Likewise for the classification — this is the leg that makes a Spotify
+    # playlist track archive as Spotify and not as the YouTube URL it becomes.
+    query_source: str = ""
 
     @classmethod
     def from_ytsource(cls, source: YTSource) -> Self:
@@ -469,6 +519,9 @@ class SearchQueueEntry:
             url=source.url,
             process=source.process,
             ts=source.ts,
+            queued_at=source.queued_at,
+            queue_position=source.queue_position,
+            query_source=source.query_source,
         )
 
     def to_redis(self) -> bytes:
@@ -479,6 +532,9 @@ class SearchQueueEntry:
                 QueueEntryField.URL: self.url,
                 QueueEntryField.PROCESS: self.process,
                 QueueEntryField.TS: self.ts,
+                QueueEntryField.QUEUED_AT: self.queued_at,
+                QueueEntryField.QUEUE_POSITION: self.queue_position,
+                QueueEntryField.QUERY_SOURCE: self.query_source,
             }
         )
 
@@ -503,6 +559,9 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 url=d.get(QueueEntryField.URL),
                 process=d.get(QueueEntryField.PROCESS),
                 ts=d.get(QueueEntryField.TS),
+                queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
+                queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
+                query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
             )
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],
@@ -517,6 +576,9 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             interjected=d.get(QueueEntryField.INTERJECTED, False),
             is_resume=d.get(QueueEntryField.IS_RESUME, False),
             start_paused=d.get(QueueEntryField.START_PAUSED, False),
+            queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
+            queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
+            query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")
@@ -539,6 +601,9 @@ class HistoryEntryField:
     UPLOADER: Final[str] = "uploader"
     PLAYED_AT: Final[str] = "played_at"
     MESSAGE_ID: Final[str] = "message_id"
+    QUEUED_AT: Final[str] = "queued_at"
+    QUEUE_POSITION: Final[str] = "queue_position"
+    QUERY_SOURCE: Final[str] = "query_source"
 
 
 # The play_history column domain (migrations/0001_play_history.sql), mirrored here
@@ -552,11 +617,27 @@ _TEXT_FIELDS: Final[tuple[str, ...]] = (
     "thumbnail",
     "uploader",
 )
-_INT4_FIELDS: Final[tuple[str, ...]] = ("duration_secs", "played_secs")
+_INT4_FIELDS: Final[tuple[str, ...]] = (
+    "duration_secs",
+    "played_secs",
+    "queue_position",
+)
 _INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id", "message_id")
+# Machine-generated tokens (src.sources.query_source_of), never raw user text: a
+# lowercase host, or the literal "search". Anything else is a producer defect, so
+# it clamps to the unknown sentinel rather than being stored — which is what lets
+# play_history CHECK the same domain without the constraint ever firing.
+_SLUG_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9.-]{0,64}")
+_SLUG_FIELDS: Final[tuple[str, ...]] = ("query_source",)
+# The timestamptz columns: clamped to the epoch sentinel rather than to a bound,
+# since a value outside the range is a corrupt clock, not a large one.
+_EPOCH_FIELDS: Final[tuple[str, ...]] = ("played_at", "queued_at")
 _INT4_MAX: Final[int] = 2**31 - 1
 _INT8_MAX: Final[int] = 2**63 - 1
-_TS_MAX: Final[float] = 253402300799.0  # 9999-12-31T23:59:59Z, the timestamptz ceiling
+# 9999-12-31T23:59:59Z. Public because it is the epoch domain of the play_history
+# timestamptz columns, not just this validator's: history_archive clamps cutoffs to
+# it, and migrations/0001_play_history.sql spells the same value into its CHECKs.
+TS_MAX: Final[float] = 253402300799.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -588,6 +669,16 @@ class HistoryEntry:
     uploader: str = ""
     played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
+    queued_at: float = 0.0  # unix epoch when first enqueued; 0 = unknown
+    # Songs ahead of it at that moment, counting the one playing. 0 means it
+    # played immediately — and is also what a pre-feature entry parses as.
+    queue_position: int = 0
+    # How the song was asked for: "search", or the host of the link that was
+    # pasted. "" = unknown, which is what every pre-feature entry parses as.
+    # Classified at parse time (src.sources) because it is not recoverable from
+    # webpage_url — a Spotify link and a plaintext search both resolve to a
+    # YouTube watch URL.
+    query_source: str = ""
 
     def __post_init__(self) -> None:
         """Normalize into the play_history column domain at construction.
@@ -629,8 +720,14 @@ class HistoryEntry:
             value_int: int = getattr(self, name)
             if not 0 <= value_int <= ceiling:
                 object.__setattr__(self, name, min(max(value_int, 0), ceiling))
-        if not 0.0 <= self.played_at <= _TS_MAX:
-            object.__setattr__(self, "played_at", 0.0)
+        for name in _EPOCH_FIELDS:
+            value_epoch: float = getattr(self, name)
+            if not 0.0 <= value_epoch <= TS_MAX:
+                object.__setattr__(self, name, 0.0)
+        for name in _SLUG_FIELDS:
+            value_slug: str = getattr(self, name)
+            if _SLUG_RE.fullmatch(value_slug) is None:
+                object.__setattr__(self, name, "")
 
     @classmethod
     def from_song(
@@ -665,6 +762,9 @@ class HistoryEntry:
             uploader=song.uploader or "",
             played_at=played_at,
             message_id=message_id,
+            queued_at=song.queued_at,
+            queue_position=song.queue_position,
+            query_source=song.query_source,
         )
 
     def to_redis(self) -> bytes:
@@ -683,6 +783,9 @@ class HistoryEntry:
                 HistoryEntryField.UPLOADER: self.uploader,
                 HistoryEntryField.PLAYED_AT: self.played_at,
                 HistoryEntryField.MESSAGE_ID: self.message_id,
+                HistoryEntryField.QUEUED_AT: self.queued_at,
+                HistoryEntryField.QUEUE_POSITION: self.queue_position,
+                HistoryEntryField.QUERY_SOURCE: self.query_source,
             }
         )
 
@@ -719,6 +822,9 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
             uploader=str(entry.get(HistoryEntryField.UPLOADER) or ""),
             played_at=float(entry.get(HistoryEntryField.PLAYED_AT) or 0.0),
             message_id=int(entry.get(HistoryEntryField.MESSAGE_ID) or 0),
+            queued_at=float(entry.get(HistoryEntryField.QUEUED_AT) or 0.0),
+            queue_position=int(entry.get(HistoryEntryField.QUEUE_POSITION) or 0),
+            query_source=str(entry.get(HistoryEntryField.QUERY_SOURCE) or ""),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt history entry dropped: {e}")

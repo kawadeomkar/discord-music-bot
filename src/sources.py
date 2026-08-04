@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Union
+from typing import Final, Optional, Union
 
 from src.util import get_logger
 
@@ -16,6 +16,31 @@ class URLSource(Enum):
     # extractors are the source of truth, so the URL goes straight to it and is rejected
     # only if yt-dlp reports the site unsupported (see YTDL.yt_source).
     OTHER = "other"
+    # No URL was given at all — the input is a plaintext search term.
+    SEARCH = "search"
+
+
+# The persisted "how was this asked for" token, archived per play as
+# play_history.query_source. Constants for the services parse_url special-cases
+# rather than a parsed host, so youtu.be collapses onto the service it is and
+# only the generic branch parses a hostname at all.
+QUERY_SOURCE_YOUTUBE: Final[str] = "youtube.com"
+QUERY_SOURCE_SPOTIFY: Final[str] = "spotify.com"
+QUERY_SOURCE_SOUNDCLOUD: Final[str] = "soundcloud.com"
+QUERY_SOURCE_SEARCH: Final[str] = "search"
+
+# The token domain, mirrored by play_history's query_source CHECK. Bounded here
+# because this is the only producer: HistoryEntry clamps anything else to the
+# unknown sentinel rather than storing it.
+_QUERY_HOST_RE: Final[re.Pattern[str]] = re.compile(r"[a-z0-9.-]{1,64}")
+
+
+def normalize_query_host(host: str) -> str:
+    """A parsed host as the archive stores it: lowercased, leading `www.` dropped,
+    empty when it is not host-shaped. parse_url's domain group admits `_`, `+` and
+    `|`, so this filters rather than merely formats."""
+    cleaned = host.strip().lower().removeprefix("www.")
+    return cleaned if _QUERY_HOST_RE.fullmatch(cleaned) else ""
 
 
 class SpotifyType(Enum):
@@ -50,6 +75,16 @@ class YTSource:
     stype: URLSource = URLSource.YOUTUBE
     type: YTType = YTType.TRACK
     list_id: Optional[str] = None
+    # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
+    # so MusicPlayer stamps by building a replace()d copy.
+    queued_at: float = 0.0
+    queue_position: int = 0
+    # How the song was asked for, set at parse time (see query_source_of). The one
+    # source type that carries it: this covers pasted links, plaintext searches and
+    # Spotify-playlist tracks alike, and it is the only one that survives into Redis
+    # (as SearchQueueEntry), so a lazily-resolved Spotify track still archives as
+    # Spotify rather than as the YouTube URL it resolves into.
+    query_source: str = ""
 
     @property
     def playlist_url(self) -> str:
@@ -69,8 +104,31 @@ class SoundcloudSource:
     stype: URLSource = URLSource.SOUNDCLOUD
 
 
+def query_source_of(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> str:
+    """The query-source token for a parsed input. YTSource carries its own; the
+    other two are consumed at resolve time and never persisted, so their token is
+    a constant of their type and they need no field."""
+    if isinstance(source, YTSource):
+        return source.query_source
+    if isinstance(source, SpotifySource):
+        return QUERY_SOURCE_SPOTIFY
+    return QUERY_SOURCE_SOUNDCLOUD
+
+
 def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
-    return [YTSource(ytsearch=f"ytsearch:{title}", process=True) for title in titles]
+    """Spotify playlist tracks as lazy YouTube searches. The Spotify token is
+    stamped here because it is the last point that knows where these came from —
+    each resolves to a YouTube URL at dequeue."""
+    return [
+        YTSource(
+            ytsearch=f"ytsearch:{title}",
+            process=True,
+            query_source=QUERY_SOURCE_SPOTIFY,
+        )
+        for title in titles
+    ]
 
 
 def parse_url(
@@ -100,9 +158,14 @@ def parse_url(
                 list_id = v
         if list_id is not None:
             return YTSource(
-                url, ts=ts, process=False, type=YTType.PLAYLIST, list_id=list_id
+                url,
+                ts=ts,
+                process=False,
+                type=YTType.PLAYLIST,
+                list_id=list_id,
+                query_source=QUERY_SOURCE_YOUTUBE,
             )
-        return YTSource(url, ts=ts, process=False)
+        return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
         try:
@@ -117,8 +180,14 @@ def parse_url(
         # Looks like a real domain but isn't special-cased: hand it to yt-dlp rather
         # than maintain a whitelist, so an unsupported site surfaces yt-dlp's own
         # "Unsupported URL" via YTDL.yt_source. Routed like a bare YouTube watch URL, so
-        # nothing downstream needs to know it's generic.
-        return YTSource(url=url, process=True, stype=URLSource.OTHER)
+        # nothing downstream needs to know it's generic. The host is what distinguishes
+        # tiktok from vimeo in the archive, so it is the only branch that parses one.
+        return YTSource(
+            url=url,
+            process=True,
+            stype=URLSource.OTHER,
+            query_source=normalize_query_host(domain),
+        )
     else:
         # Regex matched but the "host" has no dot (e.g. "98" from the search term
         # "98/99"). ValueError makes parse_input fall back to a YouTube search.
@@ -139,4 +208,9 @@ def parse_input(
         except ValueError:
             pass
     ytsearch = " ".join(args)
-    return YTSource(ytsearch=f"ytsearch:{ytsearch}", process=True)
+    return YTSource(
+        ytsearch=f"ytsearch:{ytsearch}",
+        process=True,
+        stype=URLSource.SEARCH,
+        query_source=QUERY_SOURCE_SEARCH,
+    )
