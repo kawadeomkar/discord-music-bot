@@ -206,6 +206,8 @@ src/
 ├── guild_queue.py    # GuildQueue — the three synchronized queue representations + bulk-mutation mutex
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
+├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
+│                     # the command itself stays on the cog)
 ├── db_migrate.py     # SQL migration runner (`python -m src.db_migrate`, EXPECTED_SCHEMA_VERSION)
 ├── backfill_history.py # ONE-SHOT operator script: pre-archive Redis history → Postgres, direct
 │                     # (not via the outbox). Run BEFORE deploying this build — see below
@@ -712,7 +714,9 @@ read that header first.
 ## Testing
 
 - Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
-  exception — it has no test file), plus `conftest.py` (shared fixtures/seams),
+  exception — it has no test file; `test_leaderboard.py` also owns the cog command
+  that drives it, since splitting the renderer's tests from the command's would make
+  a reader check two files to learn what one board looks like), plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
   `telemetry.py` are the two intentionally-least-covered modules.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs

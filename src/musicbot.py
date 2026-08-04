@@ -1,10 +1,8 @@
 import asyncio
 import contextlib
-import re
 import time
 from dataclasses import dataclass
 from itertools import islice
-from urllib.parse import urlsplit
 from typing import (
     Any,
     Optional,
@@ -23,11 +21,10 @@ from src.config import (
     SpotifyStatus,
     spotify_enabled,
 )
+from src import leaderboard
+from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
-    Leaderboard,
-    RequesterLeader,
-    SongLeader,
 )
 from src.musicplayer import MusicPlayer
 from src.redis_client import (
@@ -37,10 +34,6 @@ from src.redis_client import (
     cache_set,
 )
 from src.sources import (
-    QUERY_SOURCE_SEARCH,
-    QUERY_SOURCE_SOUNDCLOUD,
-    QUERY_SOURCE_SPOTIFY,
-    QUERY_SOURCE_YOUTUBE,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -72,7 +65,6 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
-    truncate,
     get_logger,
 )
 
@@ -118,44 +110,6 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
-LEADERBOARD_TOP_N = 10
-LEADERBOARD_MAX_DAYS = 3650
-# Bounds Postgres to one aggregate pass per guild per window per minute, whatever
-# the table size. TTL'd, so the key is a legitimate volatile-lru eviction
-# candidate — losing it costs one re-query.
-_LEADERBOARD_CACHE_TTL_SECS = 60
-# Bumped on any change to the cached shape. The codec defaults missing fields
-# rather than rejecting them, so without this a rolling deploy would decode an
-# old entry into a valid-looking board with wrong values.
-_LEADERBOARD_CACHE_VERSION = 2
-# Masked-link label budget. escape_markdown can double it, so 50 holds all twenty
-# lines under 3 KB — inside the 4096-char description limit, and inside the 6000
-# characters Discord counts across EVERY embed in the message, which this shares
-# with the ≤2-embed Now Playing block MusicContext.send prepends. The "· via
-# <source>" tail adds at most 20 characters to each of the ten song lines.
-_LEADERBOARD_TITLE_MAX = 50
-# Past this the URL is dropped from the line rather than budgeted for.
-_LEADERBOARD_URL_MAX = 150
-# The link's host, rendered beside the label.
-_LEADERBOARD_HOST_MAX = 32
-# Display names for the query-source tokens sources.py mints for the services it
-# special-cases. Everything else is a bare host and renders as itself.
-_QUERY_SOURCE_LABELS: dict[str, str] = {
-    QUERY_SOURCE_SEARCH: "search",
-    QUERY_SOURCE_SPOTIFY: "Spotify",
-    QUERY_SOURCE_YOUTUBE: "YouTube",
-    QUERY_SOURCE_SOUNDCLOUD: "SoundCloud",
-}
-# Characters that end a masked link early: a newline splits the line and leaks
-# the rest of the markdown as its own text, and U+2028/9 do the same on some
-# clients. Flattened rather than dropped so words do not run together.
-_LABEL_UNSAFE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-class LeaderboardFlags(commands.FlagConverter, prefix="--", delimiter=" "):
-    days: int = 0  # 0 = all-time; otherwise a rolling now - N*86400 window
-
-
 def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
     """Write the parse-time classification onto resolved songs.
 
@@ -164,196 +118,6 @@ def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
     copy the enqueue stamps onto what yt_source builds."""
     for qobj in qobjs:
         qobj.query_source = token
-
-
-def _leaderboard_cache_key(guild_id: int, days: int, top_n: int) -> str:
-    """Keyed by row count as well as window: raising LEADERBOARD_TOP_N must not
-    render a short board from a cache entry the previous limit produced."""
-    return f"leaderboard:v{_LEADERBOARD_CACHE_VERSION}:{guild_id}:{days}:{top_n}"
-
-
-def _leaderboard_to_cache(board: Leaderboard) -> dict:
-    """Plain dicts for orjson. Field names spelled out so a dataclass rename
-    cannot silently change the cache shape."""
-    return {
-        "requesters": [
-            {
-                "requester_id": r.requester_id,
-                "requester_name": r.requester_name,
-                "plays": r.plays,
-                "played_secs": r.played_secs,
-            }
-            for r in board.requesters
-        ],
-        "songs": [
-            {
-                "title": s.title,
-                "webpage_url": s.webpage_url,
-                "duration_secs": s.duration_secs,
-                "query_source": s.query_source,
-                "plays": s.plays,
-                "played_secs": s.played_secs,
-            }
-            for s in board.songs
-        ],
-    }
-
-
-def _leaderboard_from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
-    """Rebuild a cached Leaderboard. None means MALFORMED, never "empty": an
-    empty board is a valid cached value and caching it is what stops an idle
-    guild re-querying Postgres on every invocation. Do not test truthiness.
-
-    Both boards are capped at `top_n` on the way in: the entry is decoded before
-    anything checks its size, so the cap is what stops an oversized value —
-    written by another build, or by anything else holding the key — from
-    rendering more rows than the command promises."""
-    if not isinstance(raw, dict):
-        return None
-    try:
-        return Leaderboard(
-            requesters=tuple(
-                RequesterLeader(
-                    requester_id=int(r["requester_id"]),
-                    requester_name=str(r.get("requester_name", "")),
-                    plays=int(r["plays"]),
-                    played_secs=int(r["played_secs"]),
-                )
-                for r in raw.get("requesters", [])[:top_n]
-            ),
-            songs=tuple(
-                SongLeader(
-                    title=str(s.get("title", "")),
-                    webpage_url=str(s.get("webpage_url", "")),
-                    duration_secs=int(s.get("duration_secs", 0)),
-                    query_source=str(s.get("query_source", "")),
-                    plays=int(s["plays"]),
-                    played_secs=int(s["played_secs"]),
-                )
-                for s in raw.get("songs", [])[:top_n]
-            ),
-        )
-    except KeyError, TypeError, ValueError:
-        return None
-
-
-def _sanitize_leaderboard_label(text: str) -> str:
-    """Render-safe archive text — a song title or a requester's stored name.
-    Flatten the control characters that end a line early, cap, neutralize the
-    brackets that break a masked link (escape_markdown does not cover them),
-    then escape the rest so the text cannot bold or strike its line.
-
-    Cap BEFORE escaping: escaping first and cutting after can split an escape
-    pair and leave a trailing backslash that eats the next character. The cap
-    ellipsizes — two songs sharing a 50-character prefix would otherwise render
-    as the same line."""
-    flattened = _LABEL_UNSAFE.sub(" ", text)
-    clipped = truncate(flattened, _LEADERBOARD_TITLE_MAX)
-    return discord.utils.escape_markdown(clipped.replace("[", "(").replace("]", ")"))
-
-
-def _leaderboard_link_host(url: str) -> str:
-    """Host of a song's link, empty when it has none. Rendered beside the label
-    because both halves of a masked link come from the archive: without it a
-    played song's title can name a destination its URL does not go to."""
-    try:
-        host = urlsplit(url).hostname or ""
-    except ValueError:
-        return ""
-    return host.removeprefix("www.")[:_LEADERBOARD_HOST_MAX]
-
-
-def _leaderboard_line_requester(
-    rank: int, r: RequesterLeader, guild: Optional[discord.Guild]
-) -> str:
-    """A mention while the requester is still in the guild, their archived name
-    once they leave — Discord renders a mention for a non-member as a raw id."""
-    who = f"<@{r.requester_id}>"
-    if guild is not None and guild.get_member(r.requester_id) is None:
-        who = _sanitize_leaderboard_label(r.requester_name) or "unknown"
-    # "listened" labels the ranking key. A bare clock reads as a track length,
-    # which is the other duration on the songs board two lines down.
-    return (
-        f"**{rank}.** {who} — {fmt_duration(r.played_secs)} listened · "
-        f"{r.plays} {pluralize(r.plays, 'song')}"
-    )
-
-
-def _leaderboard_source_label(token: str) -> str:
-    """Display name for a query-source token. Known services get their own
-    spelling; anything else is a host, which reads fine as itself (tiktok.com).
-    Empty stays empty — the caller drops the segment rather than printing
-    "unknown", which every pre-feature row would carry."""
-    return _QUERY_SOURCE_LABELS.get(token, token)
-
-
-def _leaderboard_line_song(rank: int, s: SongLeader) -> str:
-    # A blank title is a real archived value (the zero-value convention), and an
-    # empty masked-link label renders as an invisible link.
-    title = _sanitize_leaderboard_label(s.title) or "Unknown"
-    url = s.webpage_url
-    # A paren, whitespace or control character inside a masked-link URL ends the
-    # markdown early; such URLs (and over-long ones) render as a plain title.
-    linkable = (
-        url
-        and len(url) <= _LEADERBOARD_URL_MAX
-        and not any(c in url for c in "() \t")
-        and not _LABEL_UNSAFE.search(url)
-    )
-    if linkable:
-        host = _leaderboard_link_host(url)
-        label = f"[{title}]({url})" + (f" `{host}`" if host else "")
-    else:
-        label = title
-    # Both clocks are labelled: the first is the ranking key (time this server
-    # spent on the song), the second the track's own length, and unlabelled they
-    # render as two interchangeable durations.
-    line = (
-        f"**{rank}.** {label} — {fmt_duration(s.played_secs)} listened · "
-        f"{s.plays} {pluralize(s.plays, 'play')} · track {fmt_duration(s.duration_secs)}"
-    )
-    # The host chip names where the LINK goes; this names how the song was
-    # ASKED for, which webpage_url cannot answer — a Spotify link and a
-    # plaintext search both resolve to youtube.com.
-    source = _sanitize_leaderboard_label(_leaderboard_source_label(s.query_source))
-    return f"{line} · via {source}" if source else line
-
-
-def _leaderboard_embed(
-    board: Leaderboard, *, days: int = 0, guild: Optional[discord.Guild] = None
-) -> Optional[discord.Embed]:
-    """One embed, both boards in the DESCRIPTION: an embed field caps at 1024
-    characters and ten masked-link lines do not reliably fit, while the 4096-char
-    description does. Sections render independently; both empty -> None, and the
-    caller sends the nothing-archived notice."""
-    sections: list[str] = []
-    if board.requesters:
-        rows = [
-            _leaderboard_line_requester(i, r, guild)
-            for i, r in enumerate(board.requesters, start=1)
-        ]
-        sections.append("**Top listeners**\n" + "\n".join(rows))
-    if board.songs:
-        rows = [
-            _leaderboard_line_song(i, s) for i, s in enumerate(board.songs, start=1)
-        ]
-        sections.append("**Top songs**\n" + "\n".join(rows))
-    if not sections:
-        return None
-    # The period is always named, including all-time. FlagConverter silently
-    # defaults days=0 for every input it does not recognise — `--days=7`, a bare
-    # `--days`, a positional `7` — so an unnamed title would render a dropped
-    # window as an all-time board the requester reads as their window.
-    period = f"last {days} {pluralize(days, 'day')}" if days else "all time"
-    embed = discord.Embed(
-        title=f"🏆 Leaderboard — {period}",
-        description="\n\n".join(sections),
-        color=discord.Color.gold(),
-    )
-    embed.set_footer(
-        text="Totals cover songs saved to this server's long-term archive."
-    )
-    return embed
 
 
 @dataclass
@@ -1658,32 +1422,32 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            if not 0 <= flags.days <= LEADERBOARD_MAX_DAYS:
+            if not 0 <= flags.days <= leaderboard.MAX_DAYS:
                 await ctx.send(
                     embed=notice_embed(
-                        f"--days must be between 1 and {LEADERBOARD_MAX_DAYS}. "
+                        f"--days must be between 1 and {leaderboard.MAX_DAYS}. "
                         "Omit it, or pass 0, for all-time.",
                         discord.Color.red(),
                     )
                 )
                 return
-            key = _leaderboard_cache_key(guild.id, flags.days, LEADERBOARD_TOP_N)
-            board = _leaderboard_from_cache(
-                await cache_get(self.redis, key), top_n=LEADERBOARD_TOP_N
+            key = leaderboard.cache_key(guild.id, flags.days, leaderboard.TOP_N)
+            board = leaderboard.from_cache(
+                await cache_get(self.redis, key), top_n=leaderboard.TOP_N
             )
             if board is None:
                 since = time.time() - flags.days * 86400 if flags.days else 0.0
                 async with background_typing(ctx):
                     board = await archive.leaderboard(
-                        guild.id, LEADERBOARD_TOP_N, since_epoch=since
+                        guild.id, leaderboard.TOP_N, since_epoch=since
                     )
                 await cache_set(
                     self.redis,
                     key,
-                    _leaderboard_to_cache(board),
-                    _LEADERBOARD_CACHE_TTL_SECS,
+                    leaderboard.to_cache(board),
+                    leaderboard.CACHE_TTL_SECS,
                 )
-            embed = _leaderboard_embed(board, days=flags.days, guild=guild)
+            embed = leaderboard.build_embed(board, days=flags.days, guild=guild)
             if embed is None:
                 window = (
                     f"in the last {flags.days} {pluralize(flags.days, 'day')}"
