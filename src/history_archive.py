@@ -641,7 +641,9 @@ class HistoryOutboxDrainer:
     # Bounds one _enforce_cap pass's XRANGE. minid discovery needs the ID of the
     # (page+1)-th oldest entry and XRANGE has no ID-only form, so the reply
     # carries bodies: uncapped, a 500k backlog would haul the entire overage over
-    # the socket in one ~240 MB reply. 10k entries ≈ 5 MB at the measured ~487 B.
+    # the socket in one reply hundreds of MB wide. 10k entries ≈ 5 MB — a typical
+    # YouTube entry serializes to ~470-540 B, of which 49 B is the
+    # queued_at/queue_position pair.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0

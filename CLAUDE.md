@@ -445,7 +445,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
-| `leaderboard:{guild_id}:{days}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). TTL'd, so eviction-safe |
+| `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
@@ -651,8 +651,8 @@ closes it, `cog_command_error` records onto it). `_DiscordGatewayFilter` drops
 discord.py-internal HTTP spans. Redis and aiohttp are auto-instrumented. Spans embed
 their `trace_id` in error-embed footers (`trace_footer`) so a user report can be joined
 to a trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
-probing Discord/Redis/Spotify/OTEL and reporting bot/yt-dlp/ffmpeg versions;
-`max_concurrency(1, guild)`.
+probing Discord/Redis/Spotify/Postgres/OTEL and reporting bot/yt-dlp/ffmpeg
+versions; `max_concurrency(1, guild)`.
 
 ## Concurrency model — quick reference
 
