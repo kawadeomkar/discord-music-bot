@@ -2082,6 +2082,20 @@ class TestPopQueueAndStartSong:
         assert restored.current_song_queued_at == 1752530000.5
         assert restored.current_song_queue_position == 3
 
+    async def test_parks_the_query_source(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # Only knowable at parse time, so the state hash is the sole place a
+        # crash-recovered song can read it back from.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(query_source="spotify.com"), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_query_source"] == b"spotify.com"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_query_source == "spotify.com"
+
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:

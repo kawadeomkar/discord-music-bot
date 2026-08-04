@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS play_history (
     queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
     queue_position integer     NOT NULL DEFAULT 0,
 
+    -- How the song was asked for: the literal 'search' for a plaintext term, or
+    -- the host of the link that was pasted ('spotify.com', 'youtube.com',
+    -- 'tiktok.com', …). '' = unknown, which is what every row written before this
+    -- column parses as.
+    --
+    -- NOT derivable from webpage_url, which is why it is stored: a Spotify link
+    -- resolves to a YouTube title search and archives with a youtube.com URL, as
+    -- does a plaintext search, so those two and a pasted YouTube link are
+    -- indistinguishable there. Classified at parse time in src/sources.py and
+    -- carried on the queue entry, so a Spotify PLAYLIST track — resolved to a
+    -- YouTube URL only at dequeue — still records where it came from.
+    query_source   text        NOT NULL DEFAULT '',
+
     -- When the row reached Postgres, as opposed to when the song was played.
     -- played_at is a client clock captured at song end and can be arbitrarily
     -- far in the past for backfilled or long-buffered entries, so this is what
@@ -116,6 +129,14 @@ CREATE TABLE IF NOT EXISTS play_history (
     ),
     CONSTRAINT play_history_queued_at_valid CHECK (
         queued_at BETWEEN to_timestamp(0) AND to_timestamp(253402300799)
+    ),
+
+    -- Unlike title and uploader, this column never holds third-party text: every
+    -- value is minted by src/sources.py's normalizer, so anything outside the
+    -- domain is a producer defect rather than an unusual song. HistoryEntry
+    -- clamps to '' on the same pattern (_SLUG_FIELDS), so this cannot fire.
+    CONSTRAINT play_history_query_source_valid CHECK (
+        query_source ~ '^[a-z0-9.-]{0,64}$'
     )
 );
 
