@@ -37,6 +37,7 @@ from src.util import (
     record_span_error,
     send_embed,
     trace_footer,
+    truncate,
     truncate_embed_title,
     get_logger,
 )
@@ -248,8 +249,18 @@ def _fmt_finish_time(duration_secs: int) -> str:
 _FIELD_PLACEHOLDER = "—"
 
 
+# Nothing bounds a yt-dlp uploader string, and Discord counts every character in
+# every embed of a message against one 6000-char budget — which the NP block
+# shares with whatever response MusicContext.send prepends it to (a full
+# -leaderboard is ~2.5 KB of that). A field over 1024 characters is a 400 on its
+# own. Both are bounded here rather than at the call sites.
+_FIELD_VALUE_MAX = 200
+# Same budget, for the one queue line the "Up next" embed renders.
+_NEXT_UP_TITLE_MAX = 200
+
+
 def _field_value(value: str) -> str:
-    return value or _FIELD_PLACEHOLDER
+    return truncate(value, _FIELD_VALUE_MAX) if value else _FIELD_PLACEHOLDER
 
 
 def _build_now_playing_base_embed(
@@ -536,10 +547,15 @@ class MusicPlayer:
         est_str = _fmt_eta(est_dt, walk.uncertain)
 
         if isinstance(item, QueueObject):
-            title = item.title or "Unknown"
+            # Capped for the same reason _field_value is: a -queue page renders
+            # ten of these into one 4096-char description, and the "Up next"
+            # embed renders one into a block sharing a message-wide budget.
+            title = truncate(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
             requester = _requester_mention(item.requester)
             dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
-            channel = item.uploader or "Unknown channel"
+            channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or (
+                "Unknown channel"
+            )
             if item.is_resume and item.ts:
                 ts_note = f"  ·  ⏮ resumes at `{fmt_duration(item.ts)}`"
             elif item.ts:

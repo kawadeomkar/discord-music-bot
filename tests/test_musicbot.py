@@ -23,12 +23,18 @@ from src.guild_state import HistoryEntry
 from src.musicbot import (
     HISTORY_MAX_LIMIT,
     LEADERBOARD_MAX_DAYS,
+    LEADERBOARD_TOP_N,
     HistoryFlags,
+    LeaderboardFlags,
     MusicBot,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
+    _LEADERBOARD_CACHE_TTL_SECS,
+    _leaderboard_cache_key,
+    _leaderboard_from_cache,
+    _leaderboard_to_cache,
     _typing_keepalive,
     background_typing,
 )
@@ -1932,6 +1938,11 @@ def _lb_flags(days: int = 0) -> SimpleNamespace:
     return SimpleNamespace(days=days)
 
 
+def _lb_key(guild_id: int, days: int) -> str:
+    """The cache key the command writes, at the command's own row limit."""
+    return _leaderboard_cache_key(guild_id, days, LEADERBOARD_TOP_N)
+
+
 def _board(
     requesters: list[RequesterLeader] | None = None,
     songs: list[SongLeader] | None = None,
@@ -2083,22 +2094,113 @@ class TestLeaderboardCommand:
         desc = mock_ctx.send.call_args[1]["embed"].description
         assert "x" * 50 in desc and "x" * 51 not in desc
 
+    async def test_departed_requester_renders_the_archived_name(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Discord renders a mention for a non-member as a raw id, so the name the
+        # archive kept is the only thing that still identifies them.
+        mock_ctx.guild.get_member = MagicMock(return_value=None)
+        music_bot.history_archive = _fake_archive(_board([_requester(1)]))
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        assert "user1" in desc and "<@1>" not in desc
+
+    async def test_archived_name_cannot_inject_markdown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.get_member = MagicMock(return_value=None)
+        leader = RequesterLeader(
+            requester_id=1,
+            requester_name="**boss**\nfake line",
+            plays=1,
+            played_secs=10,
+        )
+        music_bot.history_archive = _fake_archive(_board([leader]))
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        listeners = desc.split("**Top listeners**\n", 1)[1]
+        assert listeners.count("\n") == 0
+        assert "\\*\\*boss\\*\\*" in listeners
+
+    async def test_title_control_characters_cannot_break_the_line(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # A newline inside a masked-link label ends the link there and renders
+        # the rest of the markdown — `](url)` included — as its own line.
+        music_bot.history_archive = _fake_archive(
+            _board(songs=[_song(1, title="Real\n**Top songs**\r\x07 fake")])
+        )
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        songs = desc.split("**Top songs**\n", 1)[1]
+        assert songs.count("\n") == 0
+        assert not any(c in songs for c in "\n\r\x07")
+
+    async def test_title_is_capped_before_it_is_escaped(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Escaping first and cutting after can split a `\*` pair and leave a
+        # trailing backslash that eats the character following the label.
+        music_bot.history_archive = _fake_archive(
+            _board(songs=[_song(1, title="*" * 80)])
+        )
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        # 50 asterisks survive the cap, each escaped — so 100 characters, and no
+        # unescaped asterisk anywhere to open a bold run.
+        assert "\\*" * 50 in desc
+        assert "\\*" * 51 not in desc
+
+    async def test_link_host_is_shown_next_to_the_label(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Label and target both come from the archive, so nothing else stops a
+        # played song's title from naming a destination it does not go to.
+        music_bot.history_archive = _fake_archive(
+            _board(
+                songs=[
+                    _song(1, title="youtube.com/watch", url="https://www.evil.test/x")
+                ]
+            )
+        )
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        # www. stripped, and the host is outside the label the title controls.
+        assert "](https://www.evil.test/x) `evil.test`" in desc
+
     @pytest.mark.parametrize(
         "url",
-        ["https://yt.com/a(b)", "https://yt.com/a b", "https://yt.com/" + "x" * 200],
-        ids=["parens", "space", "too-long"],
+        [
+            "https://yt.com/a(b)",
+            "https://yt.com/a b",
+            "https://yt.com/" + "x" * 200,
+            "https://yt.com/a\nb",
+            "",
+        ],
+        ids=["parens", "space", "too-long", "newline", "empty"],
     )
     async def test_unlinkable_urls_fall_back_to_a_plain_title(
         self, music_bot: MusicBot, mock_ctx: MagicMock, url: str
     ) -> None:
-        # A paren or whitespace ends masked-link markdown early, leaving the rest
-        # of the URL as visible text.
+        # A paren, whitespace or control character ends masked-link markdown
+        # early, leaving the rest of the URL as visible text. An empty URL would
+        # render `[Song 1]()`, a broken link with nowhere to go.
         music_bot.history_archive = _fake_archive(_board(songs=[_song(1, url=url)]))
         await command_callback(MusicBot.leaderboard)(
             music_bot, mock_ctx, flags=_lb_flags()
         )
         desc = mock_ctx.send.call_args[1]["embed"].description
-        assert url not in desc
+        assert "](" not in desc
         assert "Song 1" in desc
 
     async def test_full_board_stays_inside_the_description_limit(
@@ -2233,7 +2335,7 @@ class TestLeaderboardCache:
                 music_bot, mock_ctx, flags=_lb_flags()
             )
         archive.leaderboard.assert_awaited_once()
-        assert await fake_redis.get(f"leaderboard:{mock_ctx.guild.id}:0") is not None
+        assert await fake_redis.get(_lb_key(mock_ctx.guild.id, 0)) is not None
 
     async def test_windows_are_cached_separately(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Redis
@@ -2249,8 +2351,8 @@ class TestLeaderboardCache:
         )
         assert archive.leaderboard.await_count == 2
         gid = mock_ctx.guild.id
-        assert await fake_redis.get(f"leaderboard:{gid}:0") is not None
-        assert await fake_redis.get(f"leaderboard:{gid}:30") is not None
+        assert await fake_redis.get(_lb_key(gid, 0)) is not None
+        assert await fake_redis.get(_lb_key(gid, 30)) is not None
 
     async def test_an_empty_board_is_cached_and_served(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Redis
@@ -2280,7 +2382,7 @@ class TestLeaderboardCache:
         music_bot.redis = fake_redis
         archive = _fake_archive(_board([_requester(1)]))
         music_bot.history_archive = archive
-        await fake_redis.set(f"leaderboard:{mock_ctx.guild.id}:0", blob)
+        await fake_redis.set(_lb_key(mock_ctx.guild.id, 0), blob)
         await command_callback(MusicBot.leaderboard)(
             music_bot, mock_ctx, flags=_lb_flags()
         )
@@ -2316,6 +2418,44 @@ class TestLeaderboardCache:
             )
         assert archive.leaderboard.await_count == 2
 
+    async def test_entry_expires_after_the_documented_ttl(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Redis
+    ) -> None:
+        # The TTL is the whole rate limit, and it is also what keeps the key a
+        # legitimate volatile-lru eviction candidate. An entry written without
+        # one would pin a board forever and join the non-evictable set.
+        music_bot.redis = fake_redis
+        music_bot.history_archive = _fake_archive(_board([_requester(1)]))
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        ttl = await fake_redis.ttl(_lb_key(mock_ctx.guild.id, 0))
+        assert 0 < ttl <= _LEADERBOARD_CACHE_TTL_SECS
+
+    def test_key_carries_the_row_limit_and_a_version(self) -> None:
+        # Raising LEADERBOARD_TOP_N must not render a short board off an entry
+        # the previous limit wrote, and a shape change must not decode into a
+        # valid-looking board — the codec defaults missing fields rather than
+        # rejecting them.
+        key = _leaderboard_cache_key(7, 30, 10)
+        assert key == "leaderboard:v1:7:30:10"
+        assert _leaderboard_cache_key(7, 30, 25) != key
+
+    def test_codec_caps_an_oversized_cached_board(self) -> None:
+        # The entry is decoded before anything checks its size, so nothing else
+        # stops another build's (or anything else's) larger value from rendering
+        # more rows than the command promises.
+        raw = _leaderboard_to_cache(
+            _board(
+                [_requester(i) for i in range(1, 30)],
+                [_song(i) for i in range(30)],
+            )
+        )
+        board = _leaderboard_from_cache(raw, top_n=LEADERBOARD_TOP_N)
+        assert board is not None
+        assert len(board.requesters) == LEADERBOARD_TOP_N
+        assert len(board.songs) == LEADERBOARD_TOP_N
+
 
 class TestLeaderboardMetadata:
     def test_aliases_and_category(self) -> None:
@@ -2327,6 +2467,24 @@ class TestLeaderboardMetadata:
         # by the drain — both belong in the copy rather than in a support thread.
         note = (MusicBot.leaderboard.extras or {}).get("note", "")
         assert "archive" in note
+
+    def test_help_copy_matches_the_row_limit(self) -> None:
+        # The copy promises a specific number of rows and the query enforces it;
+        # raising one without the other quietly makes the help wrong.
+        copy = f"{MusicBot.leaderboard.help} {MusicBot.leaderboard.brief}"
+        assert str(LEADERBOARD_TOP_N) in copy
+
+    def test_days_flag_defaults_to_all_time(self) -> None:
+        # The flags class is what the dispatcher actually constructs; every other
+        # test hands the body a stand-in, so nothing else would notice a renamed
+        # flag or a changed default.
+        assert LeaderboardFlags.__commands_flags__["days"].default == 0
+
+    async def test_days_flag_parses_from_a_real_invocation(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        flags = await LeaderboardFlags.convert(mock_ctx, "--days 30")
+        assert flags.days == 30
         assert "moment to appear" in (MusicBot.leaderboard.help or "")
 
 
