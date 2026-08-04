@@ -9,7 +9,7 @@ from typing import (
     Union,
     assert_never,
 )
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 
 import discord
 from discord.ext import commands
@@ -40,6 +40,7 @@ from src.sources import (
     YTSource,
     YTType,
     parse_input,
+    query_source_of,
     spotify_playlist_to_ytsearch,
 )
 from src.spotify import Spotify, SpotifyAuthError
@@ -107,6 +108,16 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
+    """Write the parse-time classification onto resolved songs.
+
+    Applied after resolution rather than threaded through yt_source/yt_playlist:
+    those are the extraction API, and this is the same seam MusicPlayer uses to
+    copy the enqueue stamps onto what yt_source builds."""
+    for qobj in qobjs:
+        qobj.query_source = token
 
 
 @dataclass
@@ -489,15 +500,17 @@ class MusicBot(commands.Cog):
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
         a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
+            # Titles, not QueueObjects — spotify_playlist_to_ytsearch stamps the
+            # YTSources they become.
             return ResolvedSpotifyPlaylist(
                 await self._require_spotify().playlist(source.id)
             )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            return ResolvedYoutubePlaylist(
-                await YTDL.yt_playlist(source.playlist_url, ctx.author)
-            )
+            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            _stamp_query_source(tracks, query_source_of(source))
+            return ResolvedYoutubePlaylist(tracks)
         else:
             ts: Optional[int] = None
             search: str
@@ -510,7 +523,9 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+            qobj = await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+            _stamp_query_source([qobj], query_source_of(source))
+            return qobj
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -752,14 +767,19 @@ class MusicBot(commands.Cog):
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(titles[:1])[0]
-            return await YTDL.yt_source(
+            # Both playlist branches resolve directly rather than through
+            # queue_source, so each stamps its own result.
+            qobj = await YTDL.yt_source(
                 ctx.author, yts.ytsearch or "", redis=self.redis
             )
+            _stamp_query_source([qobj], query_source_of(yts))
+            return qobj
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
             if not tracks:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
+            _stamp_query_source(tracks[:1], query_source_of(source))
             return tracks[0]
         qobj = await self.queue_source(ctx, source)
         assert isinstance(qobj, QueueObject)
