@@ -1890,13 +1890,14 @@ class TestHistoryCommand:
         raises nothing — it silently starts returning short pages."""
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
-    @pytest.mark.parametrize("name", ["history", "ping"])
+    @pytest.mark.parametrize("name", ["history", "ping", "leaderboard"])
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
         NP block), so unbounded concurrent renders rate-limit a guild out of its own
         channel — and deleting the decorator that prevents it left the suite green.
         `wait=False` is half the point: queueing the extra invocations still issues
-        every send, so they must be declined outright."""
+        every send, so they must be declined outright. `-leaderboard` carries it for
+        a second reason: it draws on the same Postgres pool as the drainer."""
         guard = getattr(MusicBot, name)._max_concurrency
         assert guard is not None
         assert guard.number == 1
