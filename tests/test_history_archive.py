@@ -348,6 +348,7 @@ _COLUMNS = (
     "message_id",
     "queued_at",
     "queue_position",
+    "query_source",
 )
 
 
@@ -628,6 +629,7 @@ class TestLeaderboardQuery:
                     "webpage_url": "https://yt.com/v=1",
                     "title": "Song",
                     "duration_secs": 210,
+                    "query_source": "spotify.com",
                     "plays": 2,
                     "played_secs": 400,
                 }
@@ -646,6 +648,7 @@ class TestLeaderboardQuery:
                     title="Song",
                     webpage_url="https://yt.com/v=1",
                     duration_secs=210,
+                    query_source="spotify.com",
                     plays=2,
                     played_secs=400,
                 ),

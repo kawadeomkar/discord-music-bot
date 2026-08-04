@@ -169,6 +169,7 @@ def _play(
     played_secs: int = 100,
     duration_secs: int = 200,
     played_at: float,
+    query_source: str = "",
 ) -> HistoryEntry:
     """A leaderboard fixture row: everything the aggregates group or rank by is
     a parameter, and played_at is required because play_history_dedup collapses
@@ -182,6 +183,7 @@ def _play(
         requester_id=requester_id,
         requester_name=requester_name,
         played_at=played_at,
+        query_source=query_source,
     )
 
 
@@ -541,13 +543,16 @@ class TestSchemaLock:
             # played_at would sort ahead of every real play unremarked.
             ("played_at", -1.0, "play_history_played_at_valid"),
             ("queued_at", -1.0, "play_history_queued_at_valid"),
+            # Unlike title/uploader this column holds only machine-minted
+            # tokens, so an out-of-domain value means the normalizer regressed.
+            ("query_source", "NOT A HOST", "play_history_query_source_valid"),
         ],
     )
     async def test_constraints_catch_a_validator_regression(
         self,
         archive: PostgresHistoryArchive,
         field: str,
-        value: float,
+        value: object,
         constraint: str,
     ) -> None:
         # Backward: bypass the validator and the database still refuses. Every
@@ -785,6 +790,27 @@ class TestEnqueueStampColumns:
         assert (got.queued_at, got.queue_position) == (0.0, 0)
 
 
+class TestQuerySourceColumn:
+    """The classification reaches Postgres. Its whole value is telling apart
+    three inputs that share a webpage_url, so a value dropped between the wire
+    and the INSERT reads back as a plain legacy row and looks like nothing
+    happened."""
+
+    async def test_token_survives_the_round_trip(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch([replace(_entry(1), query_source="spotify.com")])
+        (got,) = await archive.recent(42, 10)
+        assert got.query_source == "spotify.com"
+
+    async def test_unstamped_entry_reads_back_as_unknown(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch([replace(_entry(2), query_source="")])
+        (got,) = await archive.recent(42, 10)
+        assert got.query_source == ""
+
+
 class TestLeaderboard:
     """The aggregates against a real server. fakeredis has no Postgres and
     mocking fetch() would only assert the mock, so every SQL semantic —
@@ -834,6 +860,28 @@ class TestLeaderboard:
         assert song.title == "New Title"
         assert song.duration_secs == 210
         assert (song.plays, song.played_secs) == (2, 30)
+
+    async def test_songs_show_the_newest_query_source(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # One song is reachable several ways — pasted once, searched the next
+        # time. The board resolves it through the same LATERAL that picks the
+        # title, so the label means "how it was most recently asked for".
+        await archive.insert_batch(
+            [
+                _play(
+                    url="u/1",
+                    played_secs=10,
+                    played_at=1000.0,
+                    query_source="spotify.com",
+                ),
+                _play(
+                    url="u/1", played_secs=20, played_at=2000.0, query_source="search"
+                ),
+            ]
+        )
+        (song,) = (await archive.leaderboard(42, 10)).songs
+        assert song.query_source == "search"
 
     async def test_songs_ranked_by_played_secs(
         self, archive: PostgresHistoryArchive

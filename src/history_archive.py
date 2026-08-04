@@ -79,15 +79,15 @@ _INSERT_SQL = """
 INSERT INTO play_history (guild_id, title, webpage_url, duration_secs,
                           played_secs, requester_id, requester_name,
                           thumbnail, uploader, played_at, message_id,
-                          queued_at, queue_position)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                          queued_at, queue_position, query_source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (guild_id, played_at, webpage_url) DO NOTHING
 """
 
 _RECENT_SQL = """
 SELECT guild_id, title, webpage_url, duration_secs, played_secs,
        requester_id, requester_name, thumbnail, uploader, played_at, message_id,
-       queued_at, queue_position
+       queued_at, queue_position, query_source
 FROM play_history
 WHERE guild_id = $1
 ORDER BY played_at DESC, id DESC
@@ -152,10 +152,11 @@ WITH top AS (
     ORDER BY played_secs DESC, plays DESC, webpage_url
     LIMIT $2
 )
-SELECT t.webpage_url, l.title, l.duration_secs, t.plays, t.played_secs
+SELECT t.webpage_url, l.title, l.duration_secs, l.query_source,
+       t.plays, t.played_secs
 FROM top t
 CROSS JOIN LATERAL (
-    SELECT p.title, p.duration_secs
+    SELECT p.title, p.duration_secs, p.query_source
     FROM play_history p
     WHERE p.guild_id = $1 AND p.webpage_url = t.webpage_url
     ORDER BY p.played_at DESC, p.id DESC
@@ -221,6 +222,7 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
         entry.message_id,
         datetime.fromtimestamp(entry.queued_at, tz=timezone.utc),
         entry.queue_position,
+        entry.query_source,
     )
 
 
@@ -239,6 +241,7 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
         message_id=row["message_id"],
         queued_at=row["queued_at"].timestamp(),
         queue_position=row["queue_position"],
+        query_source=row["query_source"],
     )
 
 
@@ -255,12 +258,15 @@ class RequesterLeader:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SongLeader:
-    """One row of the -leaderboard songs board, grouped by webpage_url. title
-    and duration_secs are the most recent values seen for that URL."""
+    """One row of the -leaderboard songs board, grouped by webpage_url. title,
+    duration_secs and query_source are the most recent values seen for that URL —
+    one song can be reached several ways, and the LATERAL resolves the winners
+    against their newest play."""
 
     title: str
     webpage_url: str
     duration_secs: int
+    query_source: str = ""
     plays: int
     played_secs: int
 
@@ -472,6 +478,7 @@ class PostgresHistoryArchive:
                     title=r["title"],
                     webpage_url=r["webpage_url"],
                     duration_secs=r["duration_secs"],
+                    query_source=r["query_source"],
                     plays=r["plays"],
                     played_secs=r["played_secs"],
                 )
