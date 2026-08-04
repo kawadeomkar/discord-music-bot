@@ -22,8 +22,10 @@ from src.guild_history import GuildHistory
 from src.guild_state import HistoryEntry
 from src.musicbot import (
     HISTORY_MAX_LIMIT,
+    EmptyPlaylistError,
     HistoryFlags,
     MusicBot,
+    PlaylistIndexError,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
@@ -460,6 +462,169 @@ class TestQuerySourceStamping:
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.query_source for t in result.tracks] == ["youtube.com"] * 3
 
+    @staticmethod
+    def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
+        return [
+            QueueObject(f"https://yt.com/watch?v=v{i}", f"T{i}", author)
+            for i in range(count)
+        ]
+
+    async def test_playlist_index_drops_the_tracks_before_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A link copied at position 4 queues from #4, not from the top."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 6)
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert [t.title for t in result.tracks] == ["T3", "T4", "T5"]
+        assert result.skipped == 3
+
+    async def test_playlist_index_1_queues_everything(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """index=1 is the first song, so it drops nothing — the common shape,
+        since YouTube stamps it onto a share copied at the top."""
+        url = "https://www.youtube.com/watch?v=v0&list=PLabc&index=1"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 3)
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert len(result.tracks) == 3
+        assert result.skipped == 0
+
+    async def test_playlist_index_past_the_end_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Not a silent empty enqueue: an out-of-range index would otherwise
+        report "Queued playlist — 0 songs" and queue nothing."""
+        url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 3)
+        with (
+            patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
+            pytest.raises(PlaylistIndexError) as excinfo,
+        ):
+            await music_bot.queue_source(mock_ctx, source)
+        assert (excinfo.value.index, excinfo.value.total) == (9, 3)
+
+    async def test_empty_playlist_raises_instead_of_queueing_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The same guard -playnow already had: a playlist that resolves to
+        nothing is an error, not a successful enqueue of zero songs."""
+        url = "https://www.youtube.com/playlist?list=PLabc"
+        source = parse_input(url, f"-play {url}")
+        with (
+            patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[])),
+            pytest.raises(EmptyPlaylistError),
+        ):
+            await music_bot.queue_source(mock_ctx, source)
+
+    async def test_playlist_timestamp_applies_to_the_linked_video(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`t=` names an offset into the `v=` video, and `index=` makes that
+        video the head of the queue — so the offset lands on it."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4&t=90"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 6)
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert result.tracks[0].title == "T3"
+        assert result.tracks[0].ts == 90
+        assert all(t.ts is None for t in result.tracks[1:])
+
+    async def test_playlist_timestamp_ignored_when_head_is_a_different_video(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """No index, so the queue starts at track 1 — which is not the video the
+        offset belongs to. Seeking it would start the wrong song mid-way."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&t=30"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 6)
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert all(t.ts is None for t in result.tracks)
+
+    async def test_playlist_index_error_embed_names_both_numbers(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The embed the user actually sees: their index and the real length,
+        rendered from user_message rather than as "ValueError: …"."""
+        await music_bot._command_error(
+            mock_ctx, PlaylistIndexError(99, 16), title="Failed to queue song"
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "**#99**" in embed.description
+        assert "**16 songs**" in embed.description
+        assert "1 to 16" in embed.description
+        assert "PlaylistIndexError" not in embed.description
+
+    async def test_playlist_index_error_singular_total(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A one-song playlist offers no range — "from 1 to 1" would read as a
+        bug in the message rather than as advice."""
+        message = PlaylistIndexError(4, 1).user_message
+        assert "**1 song**" in message
+        assert "1 to 1" not in message
+
+    async def test_empty_playlist_embed_explains_itself(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """EmptyPlaylistError renders as advice, not as "ValueError: …" — the
+        same treatment as its PlaylistIndexError sibling."""
+        await music_bot._command_error(
+            mock_ctx, EmptyPlaylistError(), title="Failed to queue song"
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "no songs I can queue" in embed.description
+        assert "ValueError" not in embed.description
+        assert "EmptyPlaylistError" not in embed.description
+
+    async def test_playnow_honours_the_playlist_index(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-playnow interjects the track the link was copied at, not track 1."""
+        url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 5)
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert result.title == "T2"
+        notice = mock_ctx.send.await_args.kwargs["embed"].description
+        assert "#3" in notice
+
+    async def test_playnow_index_past_the_end_reports_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-playnow shares the guard, and its own error path renders the same
+        embed under its own title."""
+        url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
+        source = parse_input(url, f"-play {url}")
+        tracks = self._yt_tracks(mock_ctx.author, 3)
+        with (
+            patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
+            pytest.raises(PlaylistIndexError) as excinfo,
+        ):
+            await music_bot._resolve_playnow_source(mock_ctx, source)
+
+        await music_bot._command_error(
+            mock_ctx, excinfo.value, title="Failed to play song now"
+        )
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert embed.title == "Failed to play song now"
+        assert "**#9**" in embed.description
+        assert "**3 songs**" in embed.description
+
     async def test_playnow_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -670,6 +835,46 @@ class TestEnqueuePlaylist:
         assert "2 songs" in embed.title
         assert source.url in embed.description
         assert "Track 1" in embed.description
+
+    async def test_yt_embed_states_the_skipped_songs(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A shorter queue than the playlist needs an explanation, and only the
+        user's own `index=` provides one."""
+        source = YTSource(
+            url="https://www.youtube.com/watch?v=x&list=PLtest&index=4",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+            index=4,
+        )
+        qobjs = [QueueObject("https://yt.com/watch?v=4", "Track 4", mock_ctx.author)]
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs, skipped=3), mp
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Starting at #4" in embed.description
+        assert "skipped 3 earlier songs" in embed.description
+
+    async def test_yt_embed_omits_the_skip_line_when_nothing_was_skipped(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        mp = self._make_enqueue_mp(mock_ctx)
+
+        await music_bot._enqueue_playlist(
+            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+        )
+
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Starting at" not in embed.description
 
     async def test_yt_singular_song_count_in_title(
         self, music_bot: MusicBot, mock_ctx: MagicMock
