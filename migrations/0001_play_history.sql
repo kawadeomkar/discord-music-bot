@@ -102,7 +102,21 @@ CREATE TABLE IF NOT EXISTS play_history (
     CONSTRAINT play_history_played_secs_valid CHECK (played_secs >= 0),
     CONSTRAINT play_history_duration_valid    CHECK (duration_secs >= 0),
     CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0),
-    CONSTRAINT play_history_queue_position_valid CHECK (queue_position >= 0)
+    CONSTRAINT play_history_queue_position_valid CHECK (queue_position >= 0),
+
+    -- Both timestamps carry the same domain the wire validator clamps them to
+    -- (_EPOCH_FIELDS against _TS_MAX in src/guild_state.py). Without these the
+    -- epoch-0 floor that -leaderboard's all-time cutoff relies on is asserted
+    -- only in Python, so a pre-epoch played_at would sort ahead of every real
+    -- play and no constraint would catch the validator regressing. The bounds
+    -- are to_timestamp() of the same epoch seconds the validator uses —
+    -- to_timestamp(double precision) is IMMUTABLE, so a CHECK may call it.
+    CONSTRAINT play_history_played_at_valid CHECK (
+        played_at BETWEEN to_timestamp(0) AND to_timestamp(253402300799)
+    ),
+    CONSTRAINT play_history_queued_at_valid CHECK (
+        queued_at BETWEEN to_timestamp(0) AND to_timestamp(253402300799)
+    )
 );
 
 -- Dedup for at-least-once delivery (drainer redelivery) and backfill overlap.

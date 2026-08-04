@@ -187,7 +187,7 @@ def _leaderboard_from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]
         return None
     try:
         return Leaderboard(
-            requesters=[
+            requesters=tuple(
                 RequesterLeader(
                     requester_id=int(r["requester_id"]),
                     requester_name=str(r.get("requester_name", "")),
@@ -195,8 +195,8 @@ def _leaderboard_from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]
                     played_secs=int(r["played_secs"]),
                 )
                 for r in raw.get("requesters", [])[:top_n]
-            ],
-            songs=[
+            ),
+            songs=tuple(
                 SongLeader(
                     title=str(s.get("title", "")),
                     webpage_url=str(s.get("webpage_url", "")),
@@ -205,7 +205,7 @@ def _leaderboard_from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]
                     played_secs=int(s["played_secs"]),
                 )
                 for s in raw.get("songs", [])[:top_n]
-            ],
+            ),
         )
     except KeyError, TypeError, ValueError:
         return None

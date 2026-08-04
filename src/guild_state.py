@@ -606,7 +606,10 @@ _INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id", "message_id"
 _EPOCH_FIELDS: Final[tuple[str, ...]] = ("played_at", "queued_at")
 _INT4_MAX: Final[int] = 2**31 - 1
 _INT8_MAX: Final[int] = 2**63 - 1
-_TS_MAX: Final[float] = 253402300799.0  # 9999-12-31T23:59:59Z, the timestamptz ceiling
+# 9999-12-31T23:59:59Z. Public because it is the epoch domain of the play_history
+# timestamptz columns, not just this validator's: history_archive clamps cutoffs to
+# it, and migrations/0001_play_history.sql spells the same value into its CHECKs.
+TS_MAX: Final[float] = 253402300799.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -685,7 +688,7 @@ class HistoryEntry:
                 object.__setattr__(self, name, min(max(value_int, 0), ceiling))
         for name in _EPOCH_FIELDS:
             value_epoch: float = getattr(self, name)
-            if not 0.0 <= value_epoch <= _TS_MAX:
+            if not 0.0 <= value_epoch <= TS_MAX:
                 object.__setattr__(self, name, 0.0)
 
     @classmethod

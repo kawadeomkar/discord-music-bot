@@ -1018,6 +1018,16 @@ backend for a single large group — enough to OOM a co-resident Postgres. Aggre
 first and resolving the ten winners through `LATERAL` keeps it a `HashAggregate` with
 no temp files and no per-group state (300k rows: 880 ms → 53 ms, identical output).
 
+The `LATERAL` leg rides `play_history_recent` and then filters, so it walks back to each
+winner's newest play: cheap for a song still in rotation, proportional to the guild's
+history for one that ranks on old plays alone. That worst case measured 111 ms at 300k
+rows — still 8× better than the ordered-aggregate form. A
+`(guild_id, webpage_url, played_at DESC, id DESC)` index would turn the walk into an
+exact seek, at write amplification on an append-only table the drainer writes to
+continuously; not worth it at these numbers. The leg deliberately carries no cutoff:
+the totals are about the window, the title is the song's current name, so a play
+outside the window still supplies it (pinned by `test_windowed_board_names_a_song_by_its_newest_title`).
+
 **Three bounds, because this is the pool's only user-triggered traffic.** `max_concurrency(1, guild)`
 serializes per guild; a 60 s Redis cache (`leaderboard:v{n}:{guild_id}:{days}:{top_n}`) collapses
 repeats of the *same* window, though `--days` is a 0–3650 axis so it is not a rate
@@ -1112,7 +1122,8 @@ outright, and `cog_command_error` renders the resulting `MaxConcurrencyReached` 
 notice rather than an error embed.
 
 The single-leg rule is specifically about **`-history`'s recent-window read**, not
-about the archive being unreadable. `-leaderboard` (see below) is a production reader
+about the archive being unreadable. `-leaderboard` (see
+[the archive tier](#history-archive-tier) above) is a production reader
 of `play_history` and is the first: it aggregates over unbounded history, which the
 50-entry window cannot answer, and the read-path rule sanctions exactly that —
 Postgres backs the commands that need the permanent record.

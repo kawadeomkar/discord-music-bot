@@ -1948,7 +1948,7 @@ def _board(
     requesters: list[RequesterLeader] | None = None,
     songs: list[SongLeader] | None = None,
 ) -> Leaderboard:
-    return Leaderboard(requesters=requesters or [], songs=songs or [])
+    return Leaderboard(requesters=tuple(requesters or ()), songs=tuple(songs or ()))
 
 
 def _requester(n: int, *, plays: int = 2, played_secs: int = 3600) -> RequesterLeader:

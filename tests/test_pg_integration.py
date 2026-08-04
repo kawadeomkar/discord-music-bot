@@ -536,13 +536,18 @@ class TestSchemaLock:
             ("duration_secs", -1, "play_history_duration_valid"),
             ("message_id", -1, "play_history_message_id_valid"),
             ("queue_position", -1, "play_history_queue_position_valid"),
+            # The epoch floor -leaderboard's all-time cutoff relies on. Without
+            # these CHECKs it is asserted only by the validator, so a pre-epoch
+            # played_at would sort ahead of every real play unremarked.
+            ("played_at", -1.0, "play_history_played_at_valid"),
+            ("queued_at", -1.0, "play_history_queued_at_valid"),
         ],
     )
     async def test_constraints_catch_a_validator_regression(
         self,
         archive: PostgresHistoryArchive,
         field: str,
-        value: int,
+        value: float,
         constraint: str,
     ) -> None:
         # Backward: bypass the validator and the database still refuses. Every
@@ -911,7 +916,7 @@ class TestLeaderboard:
             [_play(url="u/1", requester_id=0, played_secs=90, played_at=1000.0)]
         )
         board = await archive.leaderboard(42, 10)
-        assert board.requesters == []
+        assert board.requesters == ()
         assert [(s.webpage_url, s.played_secs) for s in board.songs] == [("u/1", 90)]
 
     async def test_unknown_url_is_excluded_but_still_counts_for_requesters(
@@ -921,7 +926,7 @@ class TestLeaderboard:
             [_play(url="", requester_id=1, played_secs=90, played_at=1000.0)]
         )
         board = await archive.leaderboard(42, 10)
-        assert board.songs == []
+        assert board.songs == ()
         assert [(r.requester_id, r.played_secs) for r in board.requesters] == [(1, 90)]
 
     async def test_boards_are_per_guild(self, archive: PostgresHistoryArchive) -> None:
@@ -985,7 +990,7 @@ class TestLeaderboard:
         self, archive: PostgresHistoryArchive
     ) -> None:
         board = await archive.leaderboard(42, 10)
-        assert board.requesters == [] and board.songs == []
+        assert board.requesters == () and board.songs == ()
 
     async def test_cutoff_excludes_older_plays(
         self, archive: PostgresHistoryArchive
@@ -1013,8 +1018,8 @@ class TestLeaderboard:
         await archive.insert_batch(
             [_play(url="u/1", requester_id=1, played_secs=90, played_at=0.0)]
         )
-        assert (await archive.leaderboard(42, 10)).requesters != []
-        assert (await archive.leaderboard(42, 10, since_epoch=1.0)).requesters == []
+        assert (await archive.leaderboard(42, 10)).requesters != ()
+        assert (await archive.leaderboard(42, 10, since_epoch=1.0)).requesters == ()
 
 
 class TestRejectionDedup:

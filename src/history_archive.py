@@ -49,7 +49,12 @@ from redis.exceptions import ResponseError
 
 from src import config
 from src.db_migrate import EXPECTED_SCHEMA_VERSION
-from src.guild_state import HistoryEntry, parse_history_entry, serialize_history_entry
+from src.guild_state import (
+    TS_MAX,
+    HistoryEntry,
+    parse_history_entry,
+    serialize_history_entry,
+)
 from src.redis_client import (
     HISTORY_OUTBOX_KEY,
     OutboxEntry,
@@ -99,31 +104,20 @@ VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT play_history_rejected_dedup DO NOTHING
 """
 
-# The -leaderboard aggregates. Sentinel groups are excluded rather than shown:
-# requester_id 0 and webpage_url '' both mean "unknown" and would each merge
-# unrelated plays into one top-10 row. sum() over integer returns bigint, so
-# totals cannot overflow int4. $3 is the period cutoff: to_timestamp(0) for
-# all-time — the wire format's floor, so an inclusive compare excludes nothing
-# — while any real cutoff also excludes the epoch-0 unknown-time rows.
+# The -leaderboard aggregates. Sentinel groups (requester_id 0, webpage_url '')
+# are excluded: each would merge unrelated plays into one top-10 row. $3 is the
+# period cutoff, to_timestamp(0) for all-time.
 #
-# Two passes, not one. The display name/title is the most recent one recorded
-# (titles drift; the id is stable identity), but taking it inline with
-# `(array_agg(x ORDER BY played_at DESC, id DESC))[1]` makes it an ORDERED
-# aggregate, and an ordered aggregate removes hash aggregation from the
-# planner's options entirely. Both boards then plan as GroupAggregate over a
-# full sort of every matching row, and array_agg's state is not work_mem-bounded
-# and cannot spill — measured at 3M rows: 6.8s, 140MB of external merge, and
-# 431MB RSS in one backend for a single large group. Aggregating first and
-# resolving the ten winners through LATERAL keeps it a HashAggregate: same rows,
-# same order, no temp files, and no per-group state.
-#
-# The LATERAL leg rides play_history_recent and filters, so it walks back to each
-# winner's newest play: cheap for a song still in rotation, proportional to the
-# guild's history for one that ranks on old plays alone. Measured at 300k rows,
-# 53ms typical against 111ms for that worst case — both against 880ms before. A
-# (guild_id, webpage_url, played_at DESC, id DESC) index would make it an exact
-# seek, at write amplification on an append-only table; not yet worth it.
-# See docs/ARCHITECTURE.md#history-archive-tier.
+# Two passes, not one, and that is the load-bearing part: taking the display
+# name/title inline as `(array_agg(x ORDER BY ...))[1]` makes it an ORDERED
+# aggregate, which removes hash aggregation from the planner's options entirely
+# and cannot spill. Aggregating first and resolving the ten winners through
+# LATERAL keeps it a HashAggregate. The LATERAL walks back to each winner's
+# newest play, so a song ranking on old plays alone costs more than one still in
+# rotation — measured at 300k rows, 53ms typical against 111ms for that case,
+# both against 880ms for the ordered-aggregate form.
+# Full measurements and the index trade-off:
+# docs/ARCHITECTURE.md#history-archive-tier.
 _TOP_REQUESTERS_SQL = """
 WITH top AS (
     SELECT requester_id,
@@ -199,6 +193,19 @@ _READ_DEADLINE_SECS = 15.0
 _POOL_CLOSE_TIMEOUT_SECS = 5.0
 
 
+def _clamp_epoch(value: float) -> float:
+    """Epoch seconds inside the timestamptz domain HistoryEntry clamps to.
+
+    datetime.fromtimestamp raises OverflowError/OSError past the platform's
+    range, and NaN compares false against every bound — so an unclamped NaN
+    would slip through as an all-time cutoff rather than being rejected. No
+    caller can produce either today (the command validates --days first); this
+    matches the clamping every other conversion in the module already does."""
+    if not value > 0.0:  # False for NaN and for everything at or below the floor
+        return 0.0
+    return min(value, TS_MAX)
+
+
 def _entry_to_row(entry: HistoryEntry) -> tuple:
     return (
         entry.guild_id,
@@ -260,8 +267,10 @@ class SongLeader:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Leaderboard:
-    requesters: list[RequesterLeader]
-    songs: list[SongLeader]
+    # Tuples, like GuildPlaybackSnapshot: frozen=True over a list would freeze
+    # the binding and leave the rows mutable.
+    requesters: tuple[RequesterLeader, ...]
+    songs: tuple[SongLeader, ...]
 
 
 class ArchiveReader(Protocol):
@@ -439,8 +448,8 @@ class PostgresHistoryArchive:
         than the drainer's whole DRAIN_DEADLINE_SECS.
         """
         if limit <= 0:
-            return Leaderboard(requesters=[], songs=[])
-        cutoff = datetime.fromtimestamp(max(0.0, since_epoch), tz=timezone.utc)
+            return Leaderboard(requesters=(), songs=())
+        cutoff = datetime.fromtimestamp(_clamp_epoch(since_epoch), tz=timezone.utc)
         async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
             pool = await self._ensure()
             async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
@@ -449,7 +458,7 @@ class PostgresHistoryArchive:
                 )
                 song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
         return Leaderboard(
-            requesters=[
+            requesters=tuple(
                 RequesterLeader(
                     requester_id=r["requester_id"],
                     requester_name=r["requester_name"],
@@ -457,8 +466,8 @@ class PostgresHistoryArchive:
                     played_secs=r["played_secs"],
                 )
                 for r in requester_rows
-            ],
-            songs=[
+            ),
+            songs=tuple(
                 SongLeader(
                     title=r["title"],
                     webpage_url=r["webpage_url"],
@@ -467,7 +476,7 @@ class PostgresHistoryArchive:
                     played_secs=r["played_secs"],
                 )
                 for r in song_rows
-            ],
+            ),
         )
 
     async def record_rejection(

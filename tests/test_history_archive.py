@@ -20,14 +20,12 @@ from typing import Any, Optional, cast
 
 from redis.asyncio import Redis
 
-from src.guild_state import HistoryEntry, serialize_history_entry
+from src.guild_state import TS_MAX, HistoryEntry, serialize_history_entry
 from src.history_archive import (
     _INSERT_SQL,
     _POISON,
     _READ_CONCURRENCY,
     _RECENT_SQL,
-    _TOP_REQUESTERS_SQL,
-    _TOP_SONGS_SQL,
     HistoryArchive,
     HistoryOutboxDrainer,
     Leaderboard,
@@ -426,7 +424,7 @@ class TestPostgresArchiveWithoutServer:
     async def test_nonpositive_leaderboard_limit_never_connects(self) -> None:
         # Same early-out as recent(): a bogus DSN proves no connect happened.
         archive = PostgresHistoryArchive("postgresql://nope:1/nope")
-        empty = Leaderboard(requesters=[], songs=[])
+        empty = Leaderboard(requesters=(), songs=())
         assert await archive.leaderboard(42, 0) == empty
         assert await archive.leaderboard(42, -1) == empty
 
@@ -479,6 +477,30 @@ class TestLeaderboardQuery:
         pool.acquire = MagicMock(return_value=acquire_cm)
         return pool, conn
 
+    @pytest.mark.parametrize(
+        "since,expected",
+        [
+            (-1.0, 0.0),
+            (float("nan"), 0.0),
+            (float("inf"), TS_MAX),
+            (1e300, TS_MAX),
+            (2000.0, 2000.0),
+        ],
+        ids=["negative", "nan", "inf", "huge", "ordinary"],
+    )
+    async def test_cutoff_is_clamped_into_the_column_domain(
+        self, since: float, expected: float
+    ) -> None:
+        # datetime.fromtimestamp raises past the platform range, and NaN compares
+        # false against every bound — so an unclamped NaN would slip through as
+        # an all-time cutoff rather than being caught.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=since)
+        cutoff = conn.fetch.await_args_list[0].args[3]
+        assert cutoff == datetime.fromtimestamp(expected, tz=timezone.utc)
+
     async def test_both_aggregates_share_one_connection(self) -> None:
         # One acquire, two fetches: the command holds a single connection out of
         # the max_size=4 pool the drainer and -ping also draw from.
@@ -487,10 +509,13 @@ class TestLeaderboardQuery:
         with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
             await archive.leaderboard(42, 10)
         pool.acquire.assert_called_once()
-        assert [c.args[0] for c in conn.fetch.await_args_list] == [
-            _TOP_REQUESTERS_SQL,
-            _TOP_SONGS_SQL,
-        ]
+        # Described, not compared to the constants: asserting the SQL equals the
+        # SQL restates the code. What matters is that both boards ran, in a fixed
+        # order, on the one connection acquired above.
+        sqls = [c.args[0] for c in conn.fetch.await_args_list]
+        assert len(sqls) == 2
+        assert "GROUP BY requester_id" in sqls[0]
+        assert "GROUP BY webpage_url" in sqls[1]
 
     async def test_reads_leave_connections_for_the_writer(self) -> None:
         """Reads are the pool's only user-triggered traffic and are unbounded
@@ -611,20 +636,20 @@ class TestLeaderboardQuery:
         with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
             board = await archive.leaderboard(42, 10)
         assert board == Leaderboard(
-            requesters=[
+            requesters=(
                 RequesterLeader(
                     requester_id=7, requester_name="Omkar", plays=3, played_secs=900
-                )
-            ],
-            songs=[
+                ),
+            ),
+            songs=(
                 SongLeader(
                     title="Song",
                     webpage_url="https://yt.com/v=1",
                     duration_secs=210,
                     plays=2,
                     played_secs=400,
-                )
-            ],
+                ),
+            ),
         )
 
     def test_rows_are_frozen_and_keyword_only(self) -> None:
