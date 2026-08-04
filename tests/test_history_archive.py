@@ -6,6 +6,7 @@ without a server (early-outs, row mapping, close-before-connect).
 """
 
 import asyncio
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,15 +20,19 @@ from typing import Any, Optional, cast
 
 from redis.asyncio import Redis
 
-from src.guild_state import HistoryEntry, serialize_history_entry
+from src.guild_state import TS_MAX, HistoryEntry, serialize_history_entry
 from src.history_archive import (
     _INSERT_SQL,
     _POISON,
+    _READ_CONCURRENCY,
     _RECENT_SQL,
     HistoryArchive,
     HistoryOutboxDrainer,
+    Leaderboard,
     PostgresHistoryArchive,
+    RequesterLeader,
     SchemaVersionError,
+    SongLeader,
     _entry_to_row,
     _row_to_entry,
 )
@@ -416,6 +421,13 @@ class TestPostgresArchiveWithoutServer:
         assert await archive.recent(42, 0) == []
         assert await archive.recent(42, -1) == []
 
+    async def test_nonpositive_leaderboard_limit_never_connects(self) -> None:
+        # Same early-out as recent(): a bogus DSN proves no connect happened.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        empty = Leaderboard(requesters=(), songs=())
+        assert await archive.leaderboard(42, 0) == empty
+        assert await archive.leaderboard(42, -1) == empty
+
     async def test_close_before_connect_is_safe(self) -> None:
         await PostgresHistoryArchive("postgresql://nope:1/nope").close()
 
@@ -445,6 +457,209 @@ class TestPostgresArchiveWithoutServer:
         ):
             with pytest.raises(OSError):
                 await archive.health_check()
+
+
+class TestLeaderboardQuery:
+    """The read path's plumbing: one connection for both aggregates, the epoch →
+    aware-UTC cutoff, and the row → dataclass mapping. The SQL's semantics are
+    the pg tier's job — mocking fetch() here would only assert the mock."""
+
+    @staticmethod
+    def _stubbed_pool(
+        requester_rows: list[dict], song_rows: list[dict]
+    ) -> tuple[MagicMock, MagicMock]:
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=[requester_rows, song_rows])
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        return pool, conn
+
+    @pytest.mark.parametrize(
+        "since,expected",
+        [
+            (-1.0, 0.0),
+            (float("nan"), 0.0),
+            (float("inf"), TS_MAX),
+            (1e300, TS_MAX),
+            (2000.0, 2000.0),
+        ],
+        ids=["negative", "nan", "inf", "huge", "ordinary"],
+    )
+    async def test_cutoff_is_clamped_into_the_column_domain(
+        self, since: float, expected: float
+    ) -> None:
+        # datetime.fromtimestamp raises past the platform range, and NaN compares
+        # false against every bound — so an unclamped NaN would slip through as
+        # an all-time cutoff rather than being caught.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=since)
+        cutoff = conn.fetch.await_args_list[0].args[3]
+        assert cutoff == datetime.fromtimestamp(expected, tz=timezone.utc)
+
+    async def test_both_aggregates_share_one_connection(self) -> None:
+        # One acquire, two fetches: the command holds a single connection out of
+        # the max_size=4 pool the drainer and -ping also draw from.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10)
+        pool.acquire.assert_called_once()
+        # Described, not compared to the constants: asserting the SQL equals the
+        # SQL restates the code. What matters is that both boards ran, in a fixed
+        # order, on the one connection acquired above.
+        sqls = [c.args[0] for c in conn.fetch.await_args_list]
+        assert len(sqls) == 2
+        assert "GROUP BY requester_id" in sqls[0]
+        assert "GROUP BY webpage_url" in sqls[1]
+
+    async def test_reads_leave_connections_for_the_writer(self) -> None:
+        """Reads are the pool's only user-triggered traffic and are unbounded
+        across guilds (max_concurrency serializes per guild, not globally). With
+        max_size=4 and no cap, a burst takes every connection and the drainer's
+        acquire starts timing out — measured at 64 concurrent boards pushing
+        insert_batch to a 10s TimeoutError and into backoff."""
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        live = 0
+        peak = 0
+
+        async def _slow_fetch(*_a: object, **_k: object) -> list[dict]:
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            try:
+                await asyncio.sleep(0)
+                return []
+            finally:
+                live -= 1
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=_slow_fetch)
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await asyncio.gather(*(archive.leaderboard(g, 10) for g in range(12)))
+
+        assert peak <= _READ_CONCURRENCY
+        assert _READ_CONCURRENCY < 4  # the pool's max_size — one is always spare
+
+    async def test_a_slow_read_is_abandoned_rather_than_holding_a_connection(
+        self,
+    ) -> None:
+        # Two statements on one connection are otherwise bounded only by
+        # 2 x command_timeout = 60s, longer than the drainer's whole
+        # DRAIN_DEADLINE_SECS. The deadline covers the wait for a slot too.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+
+        async def _hang(*_a: object, **_k: object) -> list[dict]:
+            await asyncio.sleep(3600)
+            return []
+
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=_hang)
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+
+        with (
+            patch.object(archive, "_ensure", AsyncMock(return_value=pool)),
+            patch("src.history_archive._READ_DEADLINE_SECS", 0.01),
+            pytest.raises(TimeoutError),
+        ):
+            await archive.leaderboard(42, 10)
+        # Released, not leaked: the next caller can still get a slot.
+        assert archive._read_slots._value == _READ_CONCURRENCY
+
+    async def test_all_time_passes_the_epoch_floor(self) -> None:
+        # to_timestamp(0) IS the column floor and the compare is inclusive, so
+        # all-time excludes nothing — including epoch-0 unknown-time rows.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10)
+        assert conn.fetch.await_args_list[0].args[1:] == (
+            42,
+            10,
+            datetime.fromtimestamp(0, tz=timezone.utc),
+        )
+
+    async def test_window_cutoff_is_an_aware_utc_datetime(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=1752530000.0)
+        cutoff = conn.fetch.await_args_list[0].args[3]
+        assert cutoff == datetime.fromtimestamp(1752530000.0, tz=timezone.utc)
+        assert cutoff.tzinfo is timezone.utc
+
+    async def test_negative_since_epoch_floors_at_zero(self) -> None:
+        # datetime.fromtimestamp accepts negatives; the column cannot hold one.
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, conn = self._stubbed_pool([], [])
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            await archive.leaderboard(42, 10, since_epoch=-1e9)
+        assert conn.fetch.await_args_list[0].args[3] == datetime.fromtimestamp(
+            0, tz=timezone.utc
+        )
+
+    async def test_rows_map_onto_the_dataclasses(self) -> None:
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        pool, _ = self._stubbed_pool(
+            [
+                {
+                    "requester_id": 7,
+                    "requester_name": "Omkar",
+                    "plays": 3,
+                    "played_secs": 900,
+                }
+            ],
+            [
+                {
+                    "webpage_url": "https://yt.com/v=1",
+                    "title": "Song",
+                    "duration_secs": 210,
+                    "plays": 2,
+                    "played_secs": 400,
+                }
+            ],
+        )
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            board = await archive.leaderboard(42, 10)
+        assert board == Leaderboard(
+            requesters=(
+                RequesterLeader(
+                    requester_id=7, requester_name="Omkar", plays=3, played_secs=900
+                ),
+            ),
+            songs=(
+                SongLeader(
+                    title="Song",
+                    webpage_url="https://yt.com/v=1",
+                    duration_secs=210,
+                    plays=2,
+                    played_secs=400,
+                ),
+            ),
+        )
+
+    def test_rows_are_frozen_and_keyword_only(self) -> None:
+        row = RequesterLeader(
+            requester_id=1, requester_name="x", plays=1, played_secs=1
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(row, "plays", 2)
+        with pytest.raises(TypeError):
+            SongLeader("t", "u", 1, 1, 1)  # pyright: ignore[reportCallIssue]
 
 
 class TestPostgresArchiveClosedGuard:
@@ -480,6 +695,8 @@ class TestPostgresArchiveClosedGuard:
             await archive.insert_batch([_entry(1)])
         with pytest.raises(RuntimeError, match="closed"):
             await archive.recent(42, 10)
+        with pytest.raises(RuntimeError, match="closed"):
+            await archive.leaderboard(42, 10)
 
     async def test_close_is_idempotent(self) -> None:
         archive = PostgresHistoryArchive("postgresql://nope:1/nope")

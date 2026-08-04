@@ -2,6 +2,9 @@
 Postgres play-history archive — the durable long-term home for every played song.
 
 - HistoryArchive — the protocol the drainer and the backfill tool program against.
+- ArchiveReader — the read side MusicBot holds: -ping's liveness probe and
+  -leaderboard's aggregate. Deliberately separate, so write-surface fakes do not
+  grow a read method they would never call.
 - PostgresHistoryArchive — asyncpg. Connects lazily so startup never blocks on
   Postgres; applies no DDL (migrations/ owns the schema, _ensure verifies it).
 - HistoryOutboxDrainer — Redis outbox STREAM → Postgres: replay this consumer's
@@ -34,6 +37,7 @@ See docs/ARCHITECTURE.md#history-archive-tier.
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol, cast
 
@@ -45,7 +49,12 @@ from redis.exceptions import ResponseError
 
 from src import config
 from src.db_migrate import EXPECTED_SCHEMA_VERSION
-from src.guild_state import HistoryEntry, parse_history_entry, serialize_history_entry
+from src.guild_state import (
+    TS_MAX,
+    HistoryEntry,
+    parse_history_entry,
+    serialize_history_entry,
+)
 from src.redis_client import (
     HISTORY_OUTBOX_KEY,
     OutboxEntry,
@@ -95,6 +104,66 @@ VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT ON CONSTRAINT play_history_rejected_dedup DO NOTHING
 """
 
+# The -leaderboard aggregates. Sentinel groups (requester_id 0, webpage_url '')
+# are excluded: each would merge unrelated plays into one top-10 row. $3 is the
+# period cutoff, to_timestamp(0) for all-time.
+#
+# Two passes, not one, and that is the load-bearing part: taking the display
+# name/title inline as `(array_agg(x ORDER BY ...))[1]` makes it an ORDERED
+# aggregate, which removes hash aggregation from the planner's options entirely
+# and cannot spill. Aggregating first and resolving the ten winners through
+# LATERAL keeps it a HashAggregate. The LATERAL walks back to each winner's
+# newest play, so a song ranking on old plays alone costs more than one still in
+# rotation — measured at 300k rows, 53ms typical against 111ms for that case,
+# both against 880ms for the ordered-aggregate form.
+# Full measurements and the index trade-off:
+# docs/ARCHITECTURE.md#history-archive-tier.
+_TOP_REQUESTERS_SQL = """
+WITH top AS (
+    SELECT requester_id,
+           count(*)         AS plays,
+           sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND requester_id > 0 AND played_at >= $3
+    GROUP BY requester_id
+    ORDER BY played_secs DESC, plays DESC, requester_id
+    LIMIT $2
+)
+SELECT t.requester_id, l.requester_name, t.plays, t.played_secs
+FROM top t
+CROSS JOIN LATERAL (
+    SELECT p.requester_name
+    FROM play_history p
+    WHERE p.guild_id = $1 AND p.requester_id = t.requester_id
+    ORDER BY p.played_at DESC, p.id DESC
+    LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.requester_id
+"""
+
+_TOP_SONGS_SQL = """
+WITH top AS (
+    SELECT webpage_url,
+           count(*)         AS plays,
+           sum(played_secs) AS played_secs
+    FROM play_history
+    WHERE guild_id = $1 AND webpage_url <> '' AND played_at >= $3
+    GROUP BY webpage_url
+    ORDER BY played_secs DESC, plays DESC, webpage_url
+    LIMIT $2
+)
+SELECT t.webpage_url, l.title, l.duration_secs, t.plays, t.played_secs
+FROM top t
+CROSS JOIN LATERAL (
+    SELECT p.title, p.duration_secs
+    FROM play_history p
+    WHERE p.guild_id = $1 AND p.webpage_url = t.webpage_url
+    ORDER BY p.played_at DESC, p.id DESC
+    LIMIT 1
+) l
+ORDER BY t.played_secs DESC, t.plays DESC, t.webpage_url
+"""
+
 _SCHEMA_VERSION_SQL = "SELECT max(version) FROM schema_migrations"
 
 # Cap on the asyncpg message in play_history_rejected.error_detail: enough for
@@ -108,9 +177,33 @@ _COMMAND_TIMEOUT_SECS = 30.0
 # Wait for a free connection. The drainer, -ping's health probe and archive reads
 # share max_size=4, so a stuck consumer must not block everyone else unboundedly.
 _ACQUIRE_TIMEOUT_SECS = 10.0
+# Concurrent -leaderboard reads, against that same max_size=4. Reads are the only
+# user-triggered traffic on this pool and are unbounded across guilds
+# (max_concurrency serializes per guild, not globally), so without a cap a burst
+# takes every connection and the drainer's acquire starts timing out — measured:
+# 64 concurrent boards pushed insert_batch from 11.8ms to a 10s TimeoutError and
+# into backoff. Two leaves two, one for the drainer and one for -ping.
+_READ_CONCURRENCY = 2
+# Whole-operation bound for a read, covering the wait for a slot. Deliberately
+# well under command_timeout: a leaderboard that cannot answer in this long is
+# better failed than left holding a connection the drain needs.
+_READ_DEADLINE_SECS = 15.0
 # Graceful pool shutdown before terminate(). Short: this runs on the shutdown
 # path, ahead of the Redis pool, discord.py's close and the span flush.
 _POOL_CLOSE_TIMEOUT_SECS = 5.0
+
+
+def _clamp_epoch(value: float) -> float:
+    """Epoch seconds inside the timestamptz domain HistoryEntry clamps to.
+
+    datetime.fromtimestamp raises OverflowError/OSError past the platform's
+    range, and NaN compares false against every bound — so an unclamped NaN
+    would slip through as an all-time cutoff rather than being rejected. No
+    caller can produce either today (the command validates --days first); this
+    matches the clamping every other conversion in the module already does."""
+    if not value > 0.0:  # False for NaN and for everything at or below the floor
+        return 0.0
+    return min(value, TS_MAX)
 
 
 def _entry_to_row(entry: HistoryEntry) -> tuple:
@@ -149,6 +242,49 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
     )
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RequesterLeader:
+    """One row of the -leaderboard listeners board. requester_name is the most
+    recent one recorded for that id, so a rename shows the current name."""
+
+    requester_id: int
+    requester_name: str
+    plays: int
+    played_secs: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SongLeader:
+    """One row of the -leaderboard songs board, grouped by webpage_url. title
+    and duration_secs are the most recent values seen for that URL."""
+
+    title: str
+    webpage_url: str
+    duration_secs: int
+    plays: int
+    played_secs: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Leaderboard:
+    # Tuples, like GuildPlaybackSnapshot: frozen=True over a list would freeze
+    # the binding and leave the rows mutable.
+    requesters: tuple[RequesterLeader, ...]
+    songs: tuple[SongLeader, ...]
+
+
+class ArchiveReader(Protocol):
+    """What MusicBot needs from the archive: liveness for -ping's Postgres row
+    and the aggregate behind -leaderboard. Structural, like ping's ArchiveHealth
+    (which it satisfies), so the cog stays fake-able in tests."""
+
+    async def health_check(self) -> None: ...
+
+    async def leaderboard(
+        self, guild_id: int, limit: int, *, since_epoch: float = 0.0
+    ) -> Leaderboard: ...
+
+
 class HistoryArchive(Protocol):
     """The archive surface the drainer (writes) and the backfill tool program
     against — faked in unit tests, implemented by asyncpg below. recent() reads
@@ -185,6 +321,9 @@ class PostgresHistoryArchive:
         self._pool: Optional[asyncpg.Pool] = None
         self._init_lock = asyncio.Lock()
         self._closed = False
+        # Per instance, not module-level: one archive owns one pool, and a
+        # shared counter would leak across tests that build several.
+        self._read_slots = asyncio.Semaphore(_READ_CONCURRENCY)
 
     async def _create_pool(self) -> asyncpg.Pool:
         return await asyncpg.create_pool(
@@ -291,6 +430,54 @@ class PostgresHistoryArchive:
         async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
             rows = await conn.fetch(_RECENT_SQL, guild_id, limit)
         return [_row_to_entry(r) for r in rows]
+
+    async def leaderboard(
+        self, guild_id: int, limit: int, *, since_epoch: float = 0.0
+    ) -> Leaderboard:
+        """Top requesters and songs for one guild, ranked by total played_secs.
+
+        since_epoch 0.0 = all-time; epoch-0 unknown-time rows appear only there,
+        since any real cutoff excludes them by definition. Sentinel groups
+        (requester 0, url '') are excluded — see the SQL constants.
+
+        Bounded twice, because this is the pool's only user-triggered reader and
+        the drainer shares it. _read_slots keeps reads off the last connections
+        so a burst of commands cannot starve the writer, and the deadline covers
+        waiting for a slot as well as the queries — two statements on one
+        connection are otherwise bounded only by 2 x command_timeout, longer
+        than the drainer's whole DRAIN_DEADLINE_SECS.
+        """
+        if limit <= 0:
+            return Leaderboard(requesters=(), songs=())
+        cutoff = datetime.fromtimestamp(_clamp_epoch(since_epoch), tz=timezone.utc)
+        async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
+            pool = await self._ensure()
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
+                requester_rows = await conn.fetch(
+                    _TOP_REQUESTERS_SQL, guild_id, limit, cutoff
+                )
+                song_rows = await conn.fetch(_TOP_SONGS_SQL, guild_id, limit, cutoff)
+        return Leaderboard(
+            requesters=tuple(
+                RequesterLeader(
+                    requester_id=r["requester_id"],
+                    requester_name=r["requester_name"],
+                    plays=r["plays"],
+                    played_secs=r["played_secs"],
+                )
+                for r in requester_rows
+            ),
+            songs=tuple(
+                SongLeader(
+                    title=r["title"],
+                    webpage_url=r["webpage_url"],
+                    duration_secs=r["duration_secs"],
+                    plays=r["plays"],
+                    played_secs=r["played_secs"],
+                )
+                for r in song_rows
+            ),
+        )
 
     async def record_rejection(
         self,
