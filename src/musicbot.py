@@ -67,6 +67,7 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
+    truncate,
     get_logger,
 )
 
@@ -123,7 +124,7 @@ _LEADERBOARD_CACHE_TTL_SECS = 60
 # old entry into a valid-looking board with wrong values.
 _LEADERBOARD_CACHE_VERSION = 1
 # Masked-link label budget. escape_markdown can double it, so 50 holds all twenty
-# lines near 2.5 KB — inside the 4096-char description limit, and inside the 6000
+# lines under 3 KB — inside the 4096-char description limit, and inside the 6000
 # characters Discord counts across EVERY embed in the message, which this shares
 # with the ≤2-embed Now Playing block MusicContext.send prepends.
 _LEADERBOARD_TITLE_MAX = 50
@@ -217,10 +218,12 @@ def _sanitize_leaderboard_label(text: str) -> str:
     then escape the rest so the text cannot bold or strike its line.
 
     Cap BEFORE escaping: escaping first and cutting after can split an escape
-    pair and leave a trailing backslash that eats the next character."""
+    pair and leave a trailing backslash that eats the next character. The cap
+    ellipsizes — two songs sharing a 50-character prefix would otherwise render
+    as the same line."""
     flattened = _LABEL_UNSAFE.sub(" ", text)
-    clipped = flattened[:_LEADERBOARD_TITLE_MAX].replace("[", "(").replace("]", ")")
-    return discord.utils.escape_markdown(clipped)
+    clipped = truncate(flattened, _LEADERBOARD_TITLE_MAX)
+    return discord.utils.escape_markdown(clipped.replace("[", "(").replace("]", ")"))
 
 
 def _leaderboard_link_host(url: str) -> str:
@@ -242,14 +245,18 @@ def _leaderboard_line_requester(
     who = f"<@{r.requester_id}>"
     if guild is not None and guild.get_member(r.requester_id) is None:
         who = _sanitize_leaderboard_label(r.requester_name) or "unknown"
+    # "listened" labels the ranking key. A bare clock reads as a track length,
+    # which is the other duration on the songs board two lines down.
     return (
-        f"**{rank}.** {who} — {fmt_duration(r.played_secs)} · "
+        f"**{rank}.** {who} — {fmt_duration(r.played_secs)} listened · "
         f"{r.plays} {pluralize(r.plays, 'song')}"
     )
 
 
 def _leaderboard_line_song(rank: int, s: SongLeader) -> str:
-    title = _sanitize_leaderboard_label(s.title)
+    # A blank title is a real archived value (the zero-value convention), and an
+    # empty masked-link label renders as an invisible link.
+    title = _sanitize_leaderboard_label(s.title) or "Unknown"
     url = s.webpage_url
     # A paren, whitespace or control character inside a masked-link URL ends the
     # markdown early; such URLs (and over-long ones) render as a plain title.
@@ -264,9 +271,12 @@ def _leaderboard_line_song(rank: int, s: SongLeader) -> str:
         label = f"[{title}]({url})" + (f" `{host}`" if host else "")
     else:
         label = title
+    # Both clocks are labelled: the first is the ranking key (time this server
+    # spent on the song), the second the track's own length, and unlabelled they
+    # render as two interchangeable durations.
     return (
-        f"**{rank}.** {label} — {fmt_duration(s.played_secs)} · "
-        f"{s.plays} {pluralize(s.plays, 'play')} · {fmt_duration(s.duration_secs)}"
+        f"**{rank}.** {label} — {fmt_duration(s.played_secs)} listened · "
+        f"{s.plays} {pluralize(s.plays, 'play')} · track {fmt_duration(s.duration_secs)}"
     )
 
 
@@ -1603,8 +1613,8 @@ class MusicBot(commands.Cog):
             if not 0 <= flags.days <= LEADERBOARD_MAX_DAYS:
                 await ctx.send(
                     embed=notice_embed(
-                        f"--days must be between 1 and {LEADERBOARD_MAX_DAYS}, "
-                        "or omitted for all-time.",
+                        f"--days must be between 1 and {LEADERBOARD_MAX_DAYS}. "
+                        "Omit it, or pass 0, for all-time.",
                         discord.Color.red(),
                     )
                 )

@@ -2093,7 +2093,37 @@ class TestLeaderboardCommand:
             music_bot, mock_ctx, flags=_lb_flags()
         )
         desc = mock_ctx.send.call_args[1]["embed"].description
-        assert "x" * 50 in desc and "x" * 51 not in desc
+        # Ellipsized, not silently cut: two songs sharing a 50-char prefix
+        # would otherwise render as the same line.
+        assert "x" * 49 + "\u2026" in desc
+        assert "x" * 50 not in desc
+
+    async def test_blank_title_falls_back_rather_than_rendering_an_empty_link(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # '' is a real archived title (the zero-value convention), and `[](url)`
+        # renders as an invisible link with nothing to click.
+        music_bot.history_archive = _fake_archive(_board(songs=[_song(1, title="")]))
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        assert "[Unknown](https://yt.com/v=1)" in desc
+
+    async def test_both_song_durations_are_labelled(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # A song row carries two clocks — time this server spent on it and the
+        # track's own length — and unlabelled they are indistinguishable.
+        music_bot.history_archive = _fake_archive(
+            _board([_requester(1)], [_song(1, plays=2)])
+        )
+        await command_callback(MusicBot.leaderboard)(
+            music_bot, mock_ctx, flags=_lb_flags()
+        )
+        desc = mock_ctx.send.call_args[1]["embed"].description
+        assert "6:40 listened · 2 plays · track 3:30" in desc
+        assert "1:00:00 listened · 2 songs" in desc
 
     async def test_departed_requester_renders_the_archived_name(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2155,10 +2185,11 @@ class TestLeaderboardCommand:
             music_bot, mock_ctx, flags=_lb_flags()
         )
         desc = mock_ctx.send.call_args[1]["embed"].description
-        # 50 asterisks survive the cap, each escaped — so 100 characters, and no
-        # unescaped asterisk anywhere to open a bold run.
-        assert "\\*" * 50 in desc
-        assert "\\*" * 51 not in desc
+        # 49 asterisks plus the ellipsis survive the cap, each escaped — so no
+        # unescaped asterisk anywhere to open a bold run, and no dangling
+        # backslash where the cut landed.
+        assert "\\*" * 49 + "\u2026" in desc
+        assert "\\*" * 50 not in desc
 
     async def test_link_host_is_shown_next_to_the_label(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2358,9 +2389,13 @@ class TestLeaderboardCache:
     async def test_an_empty_board_is_cached_and_served(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Redis
     ) -> None:
-        # The regression this guards: a truthiness check for "cache miss" turns
-        # every empty board into a permanent miss, so an idle guild re-queries
-        # Postgres on every invocation.
+        # The regression this guards: treating an empty board as a cache MISS —
+        # by skipping the cache_set for one, or by having the codec answer None
+        # instead of an empty Leaderboard. Either way an idle guild re-queries
+        # Postgres on every invocation. (Not `if not board:` — Leaderboard has no
+        # __bool__, so an instance is always truthy; `board is None` is the check
+        # that decides, which is why the codec's contract is documented as
+        # "None means malformed, never empty".)
         music_bot.redis = fake_redis
         archive = _fake_archive(_board())
         music_bot.history_archive = archive
