@@ -23,6 +23,12 @@ import discord
 from discord.ext import commands
 
 from src.history_archive import Leaderboard, RequesterLeader, SongLeader
+from src.sources import (
+    QUERY_SOURCE_SEARCH,
+    QUERY_SOURCE_SOUNDCLOUD,
+    QUERY_SOURCE_SPOTIFY,
+    QUERY_SOURCE_YOUTUBE,
+)
 from src.util import fmt_duration, pluralize, truncate
 
 TOP_N: Final[int] = 10
@@ -34,16 +40,25 @@ CACHE_TTL_SECS: Final[int] = 60
 # Bumped on any change to the cached shape. The codec defaults missing fields
 # rather than rejecting them, so without this a rolling deploy would decode an
 # old entry into a valid-looking board with wrong values.
-_CACHE_VERSION: Final[int] = 1
+_CACHE_VERSION: Final[int] = 2
 # Masked-link label budget. escape_markdown can double it, so 50 holds all twenty
 # lines under 3 KB — inside the 4096-char description limit, and inside the 6000
 # characters Discord counts across EVERY embed in the message, which this shares
-# with the ≤2-embed Now Playing block MusicContext.send prepends.
+# with the ≤2-embed Now Playing block MusicContext.send prepends. The "· via
+# <source>" tail adds at most 20 characters to each of the ten song lines.
 _TITLE_MAX: Final[int] = 50
 # Past this the URL is dropped from the line rather than budgeted for.
 _URL_MAX: Final[int] = 150
 # The link's host, rendered beside the label.
 _HOST_MAX: Final[int] = 32
+# Display names for the query-source tokens sources.py mints for the services it
+# special-cases. Everything else is a bare host and renders as itself.
+_QUERY_SOURCE_LABELS: Final[dict[str, str]] = {
+    QUERY_SOURCE_SEARCH: "search",
+    QUERY_SOURCE_SPOTIFY: "Spotify",
+    QUERY_SOURCE_YOUTUBE: "YouTube",
+    QUERY_SOURCE_SOUNDCLOUD: "SoundCloud",
+}
 # Characters that end a masked link early: a newline splits the line and leaks
 # the rest of the markdown as its own text, and U+2028/9 do the same on some
 # clients. Flattened rather than dropped so words do not run together.
@@ -78,6 +93,7 @@ def to_cache(board: Leaderboard) -> dict:
                 "title": s.title,
                 "webpage_url": s.webpage_url,
                 "duration_secs": s.duration_secs,
+                "query_source": s.query_source,
                 "plays": s.plays,
                 "played_secs": s.played_secs,
             }
@@ -113,6 +129,7 @@ def from_cache(raw: object, *, top_n: int) -> Optional[Leaderboard]:
                     title=str(s.get("title", "")),
                     webpage_url=str(s.get("webpage_url", "")),
                     duration_secs=int(s.get("duration_secs", 0)),
+                    query_source=str(s.get("query_source", "")),
                     plays=int(s["plays"]),
                     played_secs=int(s["played_secs"]),
                 )
@@ -165,6 +182,14 @@ def _line_requester(
     )
 
 
+def _source_label(token: str) -> str:
+    """Display name for a query-source token. Known services get their own
+    spelling; anything else is a host, which reads fine as itself (tiktok.com).
+    Empty stays empty — the caller drops the segment rather than printing
+    "unknown", which every pre-feature row would carry."""
+    return _QUERY_SOURCE_LABELS.get(token, token)
+
+
 def _line_song(rank: int, s: SongLeader) -> str:
     # A blank title is a real archived value (the zero-value convention), and an
     # empty masked-link label renders as an invisible link.
@@ -186,10 +211,15 @@ def _line_song(rank: int, s: SongLeader) -> str:
     # Both clocks are labelled: the first is the ranking key (time this server
     # spent on the song), the second the track's own length, and unlabelled they
     # render as two interchangeable durations.
-    return (
+    line = (
         f"**{rank}.** {label} — {fmt_duration(s.played_secs)} listened · "
         f"{s.plays} {pluralize(s.plays, 'play')} · track {fmt_duration(s.duration_secs)}"
     )
+    # The host chip names where the LINK goes; this names how the song was
+    # ASKED for, which webpage_url cannot answer — a Spotify link and a
+    # plaintext search both resolve to youtube.com.
+    source = _sanitize_label(_source_label(s.query_source))
+    return f"{line} · via {source}" if source else line
 
 
 def build_embed(
