@@ -866,6 +866,33 @@ class TestYTStream:
 
         assert result.start_offset == 0
 
+    async def test_yt_stream_carries_the_enqueue_stamps(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The only hop from QueueObject into the object the loop plays, and so
+        the only route by which queued_at/queue_position reach
+        HistoryEntry.from_song, the outbox and play_history. Zeroing it left the
+        whole suite green while the feature recorded 0/0 for every play."""
+        fake_data = _fake_ytdl_data()
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            queued_at=1752529000.5,
+            queue_position=4,
+        )
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=fake_data),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            result = await YTDL.yt_stream(qobj, channel)
+
+        assert result.queued_at == 1752529000.5
+        assert result.queue_position == 4
+
 
 class TestStreamUrlTtl:
     def test_caps_ttl_regardless_of_expire(self) -> None:

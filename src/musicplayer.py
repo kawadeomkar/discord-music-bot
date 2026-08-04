@@ -826,6 +826,50 @@ class MusicPlayer:
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
+    def _stamp_enqueue(self, items: list[QueueItem], *, base: int) -> list[QueueItem]:
+        """Stamp queued_at/queue_position on items entering a queue for the first
+        time, `base` songs behind the front.
+
+        Stamp-once: a non-zero queued_at is left alone. No path re-enqueues an
+        already-stamped item through here today — requeue_front, restore and the
+        neutralized prefetch all bypass it — so the guard is what keeps a future
+        one from silently renumbering a song against a depth it never waited.
+
+        QueueObject is mutated in place, as prefetch already does; YTSource is
+        frozen, so it is replaced — callers must use the returned list.
+        """
+        now = time.time()
+        stamped: list[QueueItem] = []
+        for offset, item in enumerate(items):
+            if item.queued_at:
+                stamped.append(item)
+            elif isinstance(item, YTSource):
+                stamped.append(
+                    replace(item, queued_at=now, queue_position=base + offset)
+                )
+            else:
+                item.queued_at = now
+                item.queue_position = base + offset
+                stamped.append(item)
+        return stamped
+
+    def _stamp_at_depth(
+        self, items: Sequence[QueueItem], queued_ahead: int
+    ) -> list[QueueItem]:
+        """GuildQueue stamp hook: songs a new arrival waits behind are the entries
+        already ahead of the insert point plus the one playing. `queued_ahead`
+        comes from the queue under its bulk-mutation mutex, so a concurrent
+        enqueue cannot shift the depth between reading it and the insert landing.
+
+        The live song is NOT counted when its resume tail is already queued: after
+        an interjection that entry is the same play as current_song, and counting
+        both puts a new arrival one song too deep."""
+        base = queued_ahead
+        current = self.current_song
+        if current is not None and not self.queue.has_resume_tail(current.webpage_url):
+            base += 1
+        return self._stamp_enqueue(list(items), base=base)
+
     async def queue_put(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
@@ -842,7 +886,9 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        await self.queue.put(items, batch=not prefetch)
+        items = await self.queue.put(
+            items, batch=not prefetch, stamp=self._stamp_at_depth
+        )
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -866,7 +912,9 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        await self.queue.put_front(items)
+        # Front insertion waits only on the live song and an in-flight head — the
+        # persisted entries it jumps ahead of are behind it, not in front.
+        items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -1336,9 +1384,17 @@ class MusicPlayer:
                     thumbnail=current.thumbnail,
                     is_resume=True,
                     start_paused=was_paused and resume_paused,
+                    # The tail is the same play, so it keeps the interrupted
+                    # song's stamps rather than earning new ones here.
+                    queued_at=current.queued_at,
+                    queue_position=current.queue_position,
                 )
 
-        items = [qobj] if resume is None else [qobj, resume]
+        # Stamped alone, at position 0: it plays immediately by definition, while
+        # the tail keeps the interrupted song's stamps — unknown ones included.
+        items = self._stamp_enqueue([qobj], base=0)
+        if resume is not None:
+            items.append(resume)
         await self.queue.put_front(items)
 
         # Only if the song we measured is still playing: if the loop moved on, the
@@ -1394,9 +1450,10 @@ class MusicPlayer:
             song = None
         if song is None:
             return
-        # Carry the -ss offset and every -playnow flag through the rebuild: dropping
-        # them makes a neutralized resume entry restart from 0:00 (unpaused,
-        # unannounced) and loses an ordinary prefetched song's ?t= offset.
+        # Carry the -ss offset, every -playnow flag and the enqueue stamps through
+        # the rebuild: dropping them makes a neutralized resume entry restart from
+        # 0:00 (unpaused, unannounced), loses an ordinary prefetched song's ?t=
+        # offset, and would let the rebuild be restamped as freshly queued.
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",
@@ -1408,6 +1465,8 @@ class MusicPlayer:
             interjected=song.interjected,
             is_resume=song.is_resume,
             start_paused=song.start_paused,
+            queued_at=song.queued_at,
+            queue_position=song.queue_position,
         )
         self.queue.requeue_front(rebuilt)
         song.cleanup()
@@ -1435,11 +1494,16 @@ class MusicPlayer:
 
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
-            return await YTDL.yt_source(
+            qobj = await YTDL.yt_source(
                 self._require_requester(),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
             )
+            # yt_source builds the QueueObject, so the search's enqueue stamps are
+            # copied onto it here rather than threaded through its signature.
+            qobj.queued_at = source.queued_at
+            qobj.queue_position = source.queue_position
+            return qobj
         return source
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:

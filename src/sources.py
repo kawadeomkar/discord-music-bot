@@ -50,6 +50,10 @@ class YTSource:
     stype: URLSource = URLSource.YOUTUBE
     type: YTType = YTType.TRACK
     list_id: Optional[str] = None
+    # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
+    # so MusicPlayer stamps by building a replace()d copy.
+    queued_at: float = 0.0
+    queue_position: int = 0
 
     @property
     def playlist_url(self) -> str:

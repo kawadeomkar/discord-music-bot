@@ -154,6 +154,8 @@ def _entry(
         thumbnail=f"https://img/{n}.jpg",
         uploader="Chan",
         played_at=1752530000.0 + n if played_at is None else played_at,
+        queued_at=1752529000.0 + n,
+        queue_position=n,
     )
 
 
@@ -183,8 +185,8 @@ class TestMigrations:
     async def test_inserted_at_column_exists_and_defaults(
         self, archive: PostgresHistoryArchive, pg_dsn: str
     ) -> None:
-        # 0002. Not part of HistoryEntry — the default is what fills it, which
-        # is exactly what makes it useful for outage forensics.
+        # Not part of HistoryEntry — the default is what fills it, which is
+        # exactly what makes it useful for outage forensics.
         import asyncpg
 
         await archive.insert_batch([_entry(1)])
@@ -214,12 +216,32 @@ class TestMigrations:
         results = await asyncio.gather(*(migrate(raw_pg_dsn) for _ in range(6)))
         assert results == [EXPECTED_SCHEMA_VERSION] * 6
 
+    async def test_migrated_schema_accepts_every_column_the_archive_writes(
+        self, raw_pg_dsn: str
+    ) -> None:
+        """The runner leaving a USABLE table, not just a version number. Asserting
+        the return value alone cannot see a schema that drifted from _INSERT_SQL —
+        that shape passes the version check and then fails every insert with an
+        UndefinedColumnError the drainer treats as transient and retries forever.
+        Only executing an insert afterwards catches it."""
+        assert await migrate(raw_pg_dsn) == EXPECTED_SCHEMA_VERSION
+        archive = PostgresHistoryArchive(raw_pg_dsn)
+        try:
+            await archive.insert_batch([_entry(7)])
+            rows = await archive.recent(42, 1)
+        finally:
+            await archive.close()
+        assert rows[0].queue_position == 7
+        assert rows[0].queued_at == 1752529007.0
+
     async def test_migrator_upgrades_a_legacy_first_use_ddl_database(
         self, raw_pg_dsn: str
     ) -> None:
         # The upgrade path for deployments created by the OLD first-use DDL:
         # the table already exists, so 0001 must record itself as applied
-        # without failing.
+        # without failing. Shape tolerance only — that DDL never shipped in a
+        # release, so no such database is reachable, and IF NOT EXISTS leaves the
+        # table it created missing every column 0001 grew afterwards.
         import asyncpg
 
         conn = await asyncpg.connect(raw_pg_dsn)
@@ -445,6 +467,12 @@ def _boundary_entries() -> list[HistoryEntry]:
         HistoryEntry(guild_id=7, webpage_url="u/negts", played_at=-1e12),
         HistoryEntry(guild_id=7, webpage_url="u/nan", played_at=float("nan")),
         HistoryEntry(guild_id=7, webpage_url="u/ceil", played_at=253402300799.0),
+        # queued_at rides the same _EPOCH_FIELDS clamp; queue_position is int4.
+        HistoryEntry(guild_id=7, webpage_url="u/qhuge", queued_at=1e300),
+        HistoryEntry(guild_id=7, webpage_url="u/qnan", queued_at=float("nan")),
+        HistoryEntry(guild_id=7, webpage_url="u/qceil", queued_at=253402300799.0),
+        HistoryEntry(guild_id=7, webpage_url="u/qpneg", queue_position=-1),
+        HistoryEntry(guild_id=7, webpage_url="u/qp31", queue_position=2**31),
         # NUL in each text field.
         HistoryEntry(guild_id=7, webpage_url="u/t", title="a\x00b"),
         HistoryEntry(guild_id=7, webpage_url="u/w\x00url"),
@@ -481,13 +509,14 @@ class TestSchemaLock:
             ("played_secs", -1, "play_history_played_secs_valid"),
             ("duration_secs", -1, "play_history_duration_valid"),
             ("message_id", -1, "play_history_message_id_valid"),
+            ("queue_position", -1, "play_history_queue_position_valid"),
         ],
     )
     async def test_constraints_catch_a_validator_regression(
         self,
         archive: PostgresHistoryArchive,
         field: str,
-        value: int,
+        value: float,
         constraint: str,
     ) -> None:
         # Backward: bypass the validator and the database still refuses. Every
@@ -696,6 +725,33 @@ class TestMessageIdColumn:
         await archive.insert_batch([_entry(2)])
         (got,) = await archive.recent(42, 10)
         assert got.message_id == 0
+
+
+class TestEnqueueStampColumns:
+    """queued_at / queue_position reach Postgres. Both default to the unknown
+    zero value, so a value dropped between the wire and the INSERT lands cleanly
+    and reads back indistinguishable from a legacy row — only a round trip
+    against a real server catches it."""
+
+    async def test_stamps_survive_the_round_trip(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        stamped = replace(_entry(1), queued_at=1752529000.25, queue_position=4)
+        await archive.insert_batch([stamped])
+        (got,) = await archive.recent(42, 10)
+        assert got.queued_at == 1752529000.25
+        assert got.queue_position == 4
+
+    async def test_unstamped_entry_reads_back_as_the_unknown_sentinel(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # queued_at 0.0 lands as to_timestamp(0), not NULL — the same sentinel
+        # played_at uses, so the zero-value convention holds across the tier.
+        await archive.insert_batch(
+            [replace(_entry(2), queued_at=0.0, queue_position=0)]
+        )
+        (got,) = await archive.recent(42, 10)
+        assert (got.queued_at, got.queue_position) == (0.0, 0)
 
 
 class TestRejectionDedup:
