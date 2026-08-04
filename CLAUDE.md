@@ -213,7 +213,7 @@ src/
 ├── redis_client.py   # Connection pool, GuildRedisStore (@_guild_op), cache helpers, recovery lock
 ├── youtube.py        # yt-dlp integration: caches, stream probe/heal, YTDL audio source, worker fn
 ├── ytdlp_pool.py     # ProcessPoolExecutor lifecycle: lazy spawn, break-healing, worker log plumbing
-├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource
+├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached)
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── ping.py           # -ping live-editing health dashboard (probes, render, edit loop)
@@ -441,7 +441,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `guild:{id}:state` | hash | 24h | volume, voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
-| `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON, LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
+| `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
@@ -883,9 +883,12 @@ bind-mounted) but the runtime image does.
 
 **Add a history-entry field**: `HistoryEntry` in guild_state.py (with a default) →
 **add it to exactly one domain tuple in guild_state.py — `_TEXT_FIELDS`, `_INT4_FIELDS`
-(`integer` columns), `_INT8_FIELDS` (`bigint`) or `_EPOCH_FIELDS` (`timestamptz`) — or
+(`integer` columns), `_INT8_FIELDS` (`bigint`), `_EPOCH_FIELDS` (`timestamptz`) or
+`_SLUG_FIELDS` (a machine-minted token, clamped to `^[a-z0-9.-]{0,64}$`) — or
 `__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
-forgetting fails the suite rather than shipping) → `to_redis`/`parse_history_entry`
+forgetting fails the suite rather than shipping) → check where the added bytes land
+against the outbox's listpack-node cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
+18 bytes once cost 11% of the OOM runway, and the next 60 may cost nothing) → `to_redis`/`parse_history_entry`
 (`.get(..., default)`, so pre-migration wire entries still parse) → the column in
 `migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
 table definition pre-release (free to validate on an empty table); a separate `NOT VALID`

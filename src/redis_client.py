@@ -796,8 +796,10 @@ class GuildRedisStore:
     # Only the OUTBOX can get there BY GROWING: the history lists are bounded at
     # HISTORY_CACHE_LIMIT entries per guild, trimmed on every write, so their total scales
     # with guild count (~24 KB each), not with runtime. The outbox is near-empty whenever
-    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~487
-    # bytes per play. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
+    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~547
+    # resident bytes per play — 256mb holds ~491k. That figure is a step, not the wire
+    # size: see HistoryOutboxDrainer.CAP_PAGE for the listpack-node cliff behind it, which
+    # a field of 18 bytes can move. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
     # real data loss, since a capped list leaves no second copy. A Redis memory/eviction
     # alarm is still owed.
     #
