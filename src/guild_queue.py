@@ -489,6 +489,7 @@ class GuildQueue:
                 ts=entry.ts,
                 queued_at=entry.queued_at,
                 queue_position=entry.queue_position,
+                query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
@@ -516,4 +517,5 @@ class GuildQueue:
             start_paused=entry.start_paused,
             queued_at=entry.queued_at,
             queue_position=entry.queue_position,
+            query_source=entry.query_source,
         )

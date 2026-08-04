@@ -89,6 +89,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_INTERJECTED,
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
+    StateField.CURRENT_SONG_QUERY_SOURCE,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
@@ -711,6 +712,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
+            StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }

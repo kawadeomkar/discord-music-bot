@@ -73,9 +73,12 @@ def mock_song() -> MagicMock:
     song.is_resume = False
     song.start_paused = False
     # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them into
-    # the play_history column domain.
+    # the play_history column domain. query_source likewise a real string — the
+    # slug clamp regex-matches it and a MagicMock raises TypeError there, exactly
+    # as a MagicMock title would.
     song.queued_at = 0.0
     song.queue_position = 0
+    song.query_source = ""
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -4911,9 +4914,11 @@ class TestLoop:
         song.is_resume = False
         song.start_paused = False
         # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
-        # into the play_history column domain.
+        # into the play_history column domain — query_source too, which the slug
+        # clamp regex-matches.
         song.queued_at = 0.0
         song.queue_position = 0
+        song.query_source = ""
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -5920,9 +5925,11 @@ class TestLoopAdditional:
         song.is_resume = False
         song.start_paused = False
         # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
-        # into the play_history column domain.
+        # into the play_history column domain — query_source too, which the slug
+        # clamp regex-matches.
         song.queued_at = 0.0
         song.queue_position = 0
+        song.query_source = ""
         return song
 
     async def test_update_activity_called_at_song_start_and_end(
