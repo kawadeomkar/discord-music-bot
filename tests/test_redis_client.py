@@ -33,7 +33,9 @@ from src.redis_client import (
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
     GuildRedisStore,
+    _PLAYBACK_POSITION_FIELDS,
     _prev_stream_id,
+    _TRANSIENT_SONG_FIELDS,
     ack_outbox,
     cache_get,
     cache_set,
@@ -2081,6 +2083,19 @@ class TestPopQueueAndStartSong:
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_queued_at == 1752530000.5
         assert restored.current_song_queue_position == 3
+
+    def test_every_parked_field_is_on_a_clear_list(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The start transaction and the two clear paths must name the same
+        fields. A field added to the mapping but to neither tuple survives its
+        own song: nothing reads it while `current_song_url` is absent, so it is
+        invisible until some later change starts trusting it. Asserted as a
+        relationship rather than a list, because enumerating the fields is what
+        already failed — `query_source` was added to both and neither had a test.
+        """
+        parked = set(store._now_playing_state_mapping(_current(), 1000.0))
+        assert parked <= {*_TRANSIENT_SONG_FIELDS, *_PLAYBACK_POSITION_FIELDS}
 
     async def test_parks_the_query_source(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
