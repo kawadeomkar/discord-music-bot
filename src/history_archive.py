@@ -658,8 +658,16 @@ class HistoryOutboxDrainer:
     # (page+1)-th oldest entry and XRANGE has no ID-only form, so the reply
     # carries bodies: uncapped, a 500k backlog would haul the entire overage over
     # the socket in one reply hundreds of MB wide. 10k entries ≈ 5 MB — a typical
-    # YouTube entry serializes to ~470-540 B, of which 49 B is the
-    # queued_at/queue_position pair.
+    # YouTube entry serializes to ~455-470 B, of which 49 B is the
+    # queued_at/queue_position pair and 18-32 B is query_source.
+    #
+    # Resident cost is a STEP, not that wire size: entries pack into listpack
+    # nodes bounded by stream-node-max-bytes (4096), so per-entry memory jumps
+    # whenever a node loses one entry. Measured on redis:7-alpine over 50k
+    # entries, the cliff is at ~440 B of payload — 486.8 B/entry below it, 547.4
+    # above. Adding query_source crossed it, so 256 MB now holds ~491k entries
+    # rather than ~552k (11% less outage runway) for 18 wire bytes. The empty
+    # token pays the same as a full one: the key is on the wire either way.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0
