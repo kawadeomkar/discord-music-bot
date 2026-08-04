@@ -2406,6 +2406,16 @@ class TestEnqueueStamps:
         await music_player.queue_put_front(jumper)
         assert jumper.queue_position == 1
 
+    async def test_stamp_uses_the_same_wall_clock_as_played_at(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        # queued_at lands in a timestamptz column beside played_at, so it has to
+        # be epoch seconds. A monotonic clock would satisfy every "> 0" assertion
+        # here and archive a song queued in 1970.
+        with patch("src.musicplayer.time.time", return_value=1752530000.5):
+            await music_player.queue_put(queue_obj)
+        assert queue_obj.queued_at == 1752530000.5
+
     async def test_live_song_and_its_resume_tail_count_once(
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:

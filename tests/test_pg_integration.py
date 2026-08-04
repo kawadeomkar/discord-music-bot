@@ -830,6 +830,62 @@ class TestLeaderboard:
         assert song.duration_secs == 210
         assert (song.plays, song.played_secs) == (2, 30)
 
+    async def test_songs_ranked_by_played_secs(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Listening time, not play count: a 10-minute mix played twice outranks a
+        # 30-second clip played ten times, which is the whole ranking choice.
+        await archive.insert_batch(
+            [
+                _play(url="u/short", played_secs=30, played_at=1000.0),
+                _play(url="u/short", played_secs=30, played_at=1001.0),
+                _play(url="u/short", played_secs=30, played_at=1002.0),
+                _play(url="u/long", played_secs=600, played_at=1003.0),
+            ]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert [(s.webpage_url, s.played_secs, s.plays) for s in board.songs] == [
+            ("u/long", 600, 1),
+            ("u/short", 90, 3),
+        ]
+
+    async def test_song_ties_break_deterministically(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Equal played_secs -> more plays first, then webpage_url ascending.
+        # Without a total order the ranking assertions flake on plan changes.
+        await archive.insert_batch(
+            [
+                _play(url="u/b", played_secs=50, played_at=1000.0),
+                _play(url="u/b", played_secs=50, played_at=1001.0),
+                _play(url="u/c", played_secs=100, played_at=1002.0),
+                _play(url="u/a", played_secs=100, played_at=1003.0),
+            ]
+        )
+        board = await archive.leaderboard(42, 10)
+        assert [(s.webpage_url, s.plays) for s in board.songs] == [
+            ("u/b", 2),  # same 100 seconds, but two plays
+            ("u/a", 1),  # tie on both -> lower url first
+            ("u/c", 1),
+        ]
+
+    async def test_windowed_board_names_a_song_by_its_newest_title(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # The LATERAL that picks the title deliberately does NOT carry the cutoff:
+        # the totals are about the window, but the title is the song's current
+        # name. A play outside the window still supplies it.
+        await archive.insert_batch(
+            [
+                _play(url="u/1", title="Old Title", played_at=1000.0),
+                _play(url="u/1", title="Renamed", played_at=9000.0),
+            ]
+        )
+        (song,) = (await archive.leaderboard(42, 10, since_epoch=8000.0)).songs
+        assert song.title == "Renamed"
+        (song,) = (await archive.leaderboard(42, 10, since_epoch=500.0)).songs
+        assert song.title == "Renamed"
+
     async def test_newest_requester_name_wins(
         self, archive: PostgresHistoryArchive
     ) -> None:
