@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.7.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.9.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,830 tests plus two opt-in integration tiers (testcontainers): a 62-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,050 tests plus two opt-in integration tiers (testcontainers): a 72-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -338,9 +338,10 @@ PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   Miss → ONE unified stream-opts extraction in the process pool returns identity
   AND a selected playable stream URL, so both the source cache and the stream
   cache are written from a single network round (probe first — see phase 2).
-  Spotify track → title search; Spotify playlist → titles → YTSource ytsearch
-  entries (resolved lazily at dequeue); YouTube playlist → flat extraction to
-  QueueObjects. Enqueue via GuildQueue.put (batch=one round-trip for playlists).
+  Spotify track → title search; Spotify album/playlist → streamed TrackPages of
+  titles → YTSource ytsearch entries (resolved lazily at dequeue); YouTube
+  playlist → flat extraction to QueueObjects. Enqueue via GuildQueue.put
+  (batch=one round-trip for playlists).
   ▼
 PHASE 2 — PREFETCH (background):
   • per-song prefetch_stream task at enqueue (skipped for bulk playlists — N
@@ -429,6 +430,15 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   on / never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
+- `put`/`put_front` take an optional `expected_generation` and an optional `stamp`
+  hook, and return the enqueued items — `None` when refused. The generation is the
+  compare-and-put a streamed collection enqueues each page under; its check runs
+  **inside** the same mutex hold as the mutation — checked outside, an entire
+  `clear()` fits between check and put. A refused put touches NO leg (an empty page
+  returns `[]`, which is success); generation-blind callers omit it and are never
+  refused. `stamp` runs under the same hold, against the depth ahead of the insert
+  point, and MAY REPLACE items — a frozen `YTSource` is stamped by replacement, so
+  the enqueued list is the return value, not the argument.
 
 ### Redis schema and persistence model
 
@@ -449,7 +459,8 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
-| `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
+| `spotify:{track,artist,album}:{id}` | string | 24h | cached lookups |
+| `spotify:{album,playlist}_tracks:{id}` | string | 24h / 1h | drained collection titles, written ONLY when a pager reaches its last page — a partially-consumed stream (`-playnow`, a preemption, an error) can never cache a truncated collection |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
 
 Postgres holds two tables — `play_history`, and `play_history_rejected` (rows the server
@@ -638,9 +649,13 @@ cache-bypassing token grant + fetch of a known track, 10s cap) and only a genuin
 failures are inconclusive and leave it ENABLED. `_require_spotify()` at every dispatch
 raises `SpotifyDisabledError` with a status-specific user-facing message. Client caches
 the bearer token in Redis (TTL = expires_in − 30s, skipped if that margin would exceed
-the token's life) and track/playlist lookups. Spotify content resolves to **YouTube
-searches** (`"<name> <artist1> <artist2>"`); playlist tracks enqueue as lazy
-`SearchQueueEntry`s resolved per-song at dequeue.
+the token's life) and track/collection lookups. Spotify content resolves to **YouTube
+searches** (`"<name> <artist1> <artist2>"`); collection tracks enqueue as lazy
+`SearchQueueEntry`s resolved per-song at dequeue. Albums and playlists stream page by
+page as `TrackPage`s (`album_stream`/`playlist_stream`): an album's page 1 rides the
+single `GET /v1/albums/{id}` that also returns its identity, and later pages fan out
+concurrently — safe ONLY because albums are immutable once released, which is why
+playlists follow the `next` cursor sequentially instead.
 
 ### Observability
 
@@ -677,6 +692,8 @@ Per-guild synchronization primitives and what they protect:
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
 | claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject) |
+| `MusicBot._enqueue_locks[guild]` | one streamed collection enqueue per guild. Only collections and `-shuffle` take it (singles never wait); it lives on the **cog**, not MusicPlayer, because `cleanup()` destroys players and a lock destroyed mid-wait orphans its waiters. Bounded on both sides — `_ENQUEUE_WAIT_SECS` (60s, which MUST stay under `_PLAYBACK_GATE_TIMEOUT`) and `_ENQUEUE_MAX_WAITERS` |
+| `GuildQueue.generation` (compare-and-put) | a streamed collection's pages landing after the queue they belong to was cleared or torn down. `clear()`/`bump_generation()` increment it; every page enqueues with `expected_generation=` and is refused if it moved. **Reading the property and then calling `put()` without `expected_generation` is a TOCTOU bug, not an alternative** — the check must share the mutex hold with the mutation |
 
 One known, documented, accepted race remains open (ISSUE header in guild_queue.py): a
 bulk mutation can land between `try_commit_dequeue()` releasing the mutex and the start
@@ -833,12 +850,10 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | guild_state.py `crashed_position_at` | FIXME | bot downtime counted as playback position; heartbeat fix designed |
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
 | guild_queue.py `shuffle` | FIXME | requires 4 songs but the user-facing message and help say 3 |
-| spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
 | config.py `_git_branch` | TODO | detached-worktree pytest runs die at collection (warning→error) |
 | youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
-| musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
 | musicplayer.py `_PST` | HACK | every guild's ETAs render in US/Pacific — `queue_embed`'s "Est. playing at" and the NP "Estimated finish" quote users elsewhere a clock time that is not theirs, with only the "PST" suffix stopping it from misleading. Fix: per-guild timezone, or Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |

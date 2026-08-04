@@ -2341,6 +2341,108 @@ class TestQueuePutFront:
         mock_prefetch.assert_not_awaited()
 
 
+# ── Queue generation forwarding ───────────────────────────────────────────────
+
+
+class TestQueuePutGenerationForwarding:
+    """queue_put/queue_put_front must FORWARD expected_generation into the real
+    GuildQueue compare-and-put. This glue is pinned nowhere else: musicbot's
+    stream tests mock queue_put, and guild_queue's generation tests bypass
+    MusicPlayer — so silently dropping the forwarding kwarg would disable
+    streamed-collection preemption end-to-end (a cleared queue refilled by a
+    dead drain) with every other suite still green."""
+
+    async def test_stale_generation_put_refused_nothing_touched(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        assert music_player.store is not None
+        gen = music_player.queue.generation
+        await music_player.queue.bump_generation()
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put(queue_obj, expected_generation=gen)
+            await asyncio.sleep(0)
+
+        assert ok is False
+        assert music_player.queue.qsize() == 0
+        assert len(music_player.queue._display) == 0
+        assert await fake_redis.lrange(music_player.store.queue_key(), 0, -1) == []
+        # A refused put spawns no prefetch for a song that was never queued.
+        mock_pf.assert_not_awaited()
+
+    async def test_current_generation_put_succeeds_and_prefetches(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put(
+                queue_obj, expected_generation=music_player.queue.generation
+            )
+            await asyncio.sleep(0)
+
+        assert ok is True
+        assert music_player.queue.qsize() == 1
+        mock_pf.assert_awaited_once()
+
+    async def test_stale_generation_put_front_refused_nothing_touched(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        assert music_player.store is not None
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
+        )
+        gen = music_player.queue.generation
+        await music_player.queue.bump_generation()
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put_front(
+                QueueObject("https://yt.com/v=new", "New", mock_author),
+                expected_generation=gen,
+            )
+            await asyncio.sleep(0)
+
+        assert ok is False
+        assert [queue_object(i).title for i in music_player.queue.display_items()] == [
+            "Old"
+        ]
+        stored = [
+            orjson.loads(raw)["title"]
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert stored == ["Old"]
+        mock_pf.assert_not_awaited()
+
+    async def test_current_generation_put_front_lands_at_head(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
+        )
+
+        ok = await music_player.queue_put_front(
+            QueueObject("https://yt.com/v=new", "New", mock_author),
+            prefetch=False,
+            expected_generation=music_player.queue.generation,
+        )
+
+        assert ok is True
+        assert [queue_object(i).title for i in music_player.queue.display_items()] == [
+            "New",
+            "Old",
+        ]
+
+
 # ── Enqueue stamps ────────────────────────────────────────────────────────────
 
 
@@ -6207,7 +6309,7 @@ class TestInterject:
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
-                interrupted song comes back PLAYING at its pause position
+                interrupted song comes back playing at its pause position
         ."""
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song

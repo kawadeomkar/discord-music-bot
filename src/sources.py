@@ -46,6 +46,7 @@ def normalize_query_host(host: str) -> str:
 class SpotifyType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"
+    ALBUM = "album"
 
 
 class YTType(Enum):
@@ -117,9 +118,9 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches. The Spotify token is
-    stamped here because it is the last point that knows where these came from —
+def spotify_titles_to_ytsearch(titles: list[str]) -> list[YTSource]:
+    """Spotify album or playlist tracks as lazy YouTube searches. The Spotify token
+    is stamped here because it is the last point that knows where these came from —
     each resolves to a YouTube URL at dequeue."""
     return [
         YTSource(
@@ -131,12 +132,23 @@ def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
     ]
 
 
+class UnsupportedSpotifyLinkError(Exception):
+    """A Spotify URL naming a type this bot does not queue (/artist/, /show/, …).
+
+    Deliberately not a ValueError: parse_input catches ValueError and falls back
+    to a YouTube search, which would turn an /artist/ link into a nonsense
+    `ytsearch:https://open.spotify.com/...` query instead of an error the user
+    can act on.
+    """
+
+
 def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
-    `message` is the full message content. domain regex groups: 1/2 = http/www prefix,
-    3 = domain, 4 = path."""
+    """Parse a URL into a source dataclass. Raises ValueError if no domain matches,
+    and UnsupportedSpotifyLinkError for a Spotify link type the bot does not queue
+    (not a ValueError — see that class's docstring). `message` is the full message
+    content. domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
     args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
@@ -171,7 +183,13 @@ def parse_url(
         try:
             spotify_type = SpotifyType(path[0])
         except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
+            supported = ", ".join(t.value for t in SpotifyType)
+            # `from None`: the ValueError above is an implementation detail of
+            # the enum lookup; chaining it turns the user-facing error into a
+            # two-traceback log entry (the exact noise the incident log shows).
+            raise UnsupportedSpotifyLinkError(
+                f"Spotify {path[0]!r} links aren't supported — try a {supported} link"
+            ) from None
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):

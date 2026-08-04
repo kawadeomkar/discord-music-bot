@@ -92,7 +92,15 @@ class GuildQueue:
     (GuildRedisStore logs and never raises) — the in-memory queue keeps working.
     """
 
-    __slots__ = ("_guild", "_store", "_pending", "_display", "_mutex", "_cleared")
+    __slots__ = (
+        "_guild",
+        "_store",
+        "_pending",
+        "_display",
+        "_mutex",
+        "_cleared",
+        "_generation",
+    )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
         self._guild = guild
@@ -101,6 +109,7 @@ class GuildQueue:
         self._display: deque = deque()
         self._mutex = asyncio.Lock()
         self._cleared = False
+        self._generation = 0
 
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
@@ -163,6 +172,61 @@ class GuildQueue:
         self._cleared = False
         return was_cleared
 
+    # ── Stream preemption ─────────────────────────────────────────────────────
+
+    @property
+    def generation(self) -> int:
+        """Monotonic counter of queue invalidations.
+
+        A streamed collection enqueue snapshots this before its first page and
+        passes it back via put(..., expected_generation=...); clear() and
+        bump_generation() increment it, so every later page is refused instead
+        of refilling a queue the user just emptied (or a guild being torn
+        down). The check happens inside put()'s mutex hold — reading this
+        property and then calling put() without expected_generation is a
+        TOCTOU bug, not an alternative. See docs/ARCHITECTURE.md#queue-invariant."""
+        return self._generation
+
+    async def bump_generation(self) -> None:
+        """Invalidate in-flight streamed enqueues without clearing the queue.
+
+        Called by MusicBot.cleanup() — the single teardown choke point: -stop,
+        a kick (on_voice_state_update), the alone-disconnect timer, the 300s
+        playback-gate timeout (MusicPlayer.stop() delegates to cleanup()), and
+        play's own error path all funnel through it. Without this, an orphaned
+        collection drain (which runs in a *command* task cleanup never
+        cancels) keeps RPUSHing this guild's Redis mirror after teardown; a
+        follow-up -play then restores that mirror mid-drain and the in-memory
+        legs desync from Redis — the ghost-head failure put_front's docstring
+        describes, reached through a different door.
+
+        clear() does not call this — it bumps inline under the same mutex hold
+        that drains the legs, so no page can land between the drain and the
+        bump."""
+        async with self._mutex:
+            self._generation += 1
+
+    async def has_restored_backlog(self) -> bool:
+        """True when anything is queued in memory OR on the Redis mirror.
+
+        The front=True streamed-enqueue path uses this to decide
+        append-vs-buffer: "append to an empty queue is front insertion" is
+        only true when the MIRROR is empty too. qsize() alone lies here — two
+        paths leave Redis longer than memory (parse_queue_entry drops a
+        corrupt entry but the raw entry stays on the list; restore_entries
+        drops entries whose requester can't be resolved), and appending behind
+        such a ghost puts the collection where the next commit-time LPOP
+        retires the wrong entry. Conservative on a failed read (None → True):
+        the buffered put_front path is always correct, just slower."""
+        if self._pending.qsize() > 0:
+            return True
+        if self._store is None:
+            return False  # nothing persists at all — append IS front insertion
+        length = await self._store.queue_length()
+        if length is None:
+            return True  # Redis unreadable — take the safe path
+        return length > 0
+
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
     async def put(
@@ -170,8 +234,9 @@ class GuildQueue:
         items: Sequence[QueueItem],
         *,
         batch: bool = False,
+        expected_generation: Optional[int] = None,
         stamp: Optional[StampFn] = None,
-    ) -> list[QueueItem]:
+    ) -> Optional[list[QueueItem]]:
         """Enqueue on all three legs: in-memory puts first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
@@ -179,9 +244,26 @@ class GuildQueue:
         entry. batch=True pushes every entry in one round-trip (bulk playlist);
         batch=False one RPUSH per entry.
 
+        expected_generation is the compare-and-put for streamed collection enqueues:
+        the put refuses (None, no leg touched) if a clear()/bump_generation() landed
+        since the snapshot. The check shares this mutex hold with the enqueue —
+        checked outside, an entire clear() fits between check and put and a full page
+        lands after the clear it should have respected. Generation-blind callers omit
+        it and are never refused.
+
         `stamp` runs under the mutex against the display depth and may replace
-        items; the enqueued list is returned for callers that need the result."""
+        items; the enqueued list is returned for callers that need the result.
+        It runs after the generation check, so a refused page is never stamped —
+        a stamp is once-only, and one spent here would follow the song into the
+        enqueue that does land. Refusal is None, not the empty list: an empty
+        `items` enqueues nothing and still succeeds.
+        """
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return None
             if stamp is not None:
                 items = stamp(items, len(self._display))
             queued = list(items)
@@ -199,8 +281,12 @@ class GuildQueue:
             return queued
 
     async def put_front(
-        self, items: Sequence[QueueItem], *, stamp: Optional[StampFn] = None
-    ) -> list[QueueItem]:
+        self,
+        items: Sequence[QueueItem],
+        *,
+        expected_generation: Optional[int] = None,
+        stamp: Optional[StampFn] = None,
+    ) -> Optional[list[QueueItem]]:
         """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
@@ -219,10 +305,19 @@ class GuildQueue:
         prefetch and awaits it (up to yt-dlp's socket timeout), and interject() runs
         inside that await — its neutralize finds no task to take while the prefetch's
         dequeued item sits uncommitted at the display head.
+
+        expected_generation: same compare-and-put contract as put(), used by the
+        buffered front=True collection path and refused (None, no leg touched) when
+        a clear()/teardown landed after the snapshot.
         """
         if not items:
             return []
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return None
             drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
             if stamp is not None:
@@ -261,9 +356,16 @@ class GuildQueue:
         the cleared-flag under the mutex before draining, so a loop iteration
         holding a prefetched song discards it. The DEL is inside the mutex too:
         released early, a concurrent put()'s mirror writes would land between the
-        drain and the DEL and be wiped."""
+        drain and the DEL and be wiped.
+
+        Bumps the generation under the same hold, so an in-flight streamed collection
+        enqueue is refused from its next page onward — otherwise clearing a 716-track
+        playlist at page 3 drains the queue and the stream's tail refills it with the
+        songs the user just deleted.
+        """
         async with self._mutex:
             self._cleared = True
+            self._generation += 1
             self._drain_pending()
             cleared_items = list(self._display)
             self._display.clear()

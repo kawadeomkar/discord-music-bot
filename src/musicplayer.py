@@ -891,38 +891,58 @@ class MusicPlayer:
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Enqueue and, optionally, kick off stream prefetch. prefetch=False for bulk
         playlist enqueues: the mirror is written in one batch round-trip and no
         per-item tasks spawn, since N concurrent prefetches saturate the pool and
         mint stream URLs that expire before playback reaches them.
-        _prefetch_next_song covers one-ahead prefetch as songs play."""
+        _prefetch_next_song covers one-ahead prefetch as songs play.
+
+        expected_generation forwards GuildQueue.put's compare-and-put for streamed
+        collection pages. A refused put returns False having touched nothing —
+        including spawning no prefetch tasks for songs that were never queued.
+        Generation-blind callers ignore the return value.
+        """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put(
-            items, batch=not prefetch, stamp=self._stamp_at_depth
+        # The queue returns the STAMPED items (frozen ones are replaced, not
+        # mutated), so prefetch must run over what it returned, not what we sent.
+        queued = await self.queue.put(
+            items,
+            batch=not prefetch,
+            expected_generation=expected_generation,
+            stamp=self._stamp_at_depth,
         )
+        if queued is None:
+            return False
         if prefetch and self.store is not None:
-            for item in items:
+            for item in queued:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_put_front(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Insert at the front of the queue, then optionally prefetch. Same contract
         as queue_put(), used when -play runs on a disconnected bot with a persisted
         queue: the requested song plays now, the persisted entries resume behind it.
-        Playlists insert in full and in order, with prefetch=False for the same
-        reason as queue_put()."""
+        Playlists insert in full and in order (put_front preserves the order it is
+        handed), with prefetch=False for the same reason as queue_put().
+
+        expected_generation: same compare-and-put forwarding as queue_put(), for the
+        buffered front=True collection path.
+        """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
@@ -930,13 +950,20 @@ class MusicPlayer:
             items = list(obj)
         # Front insertion waits only on the live song and an in-flight head — the
         # persisted entries it jumps ahead of are behind it, not in front.
-        items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
+        queued = await self.queue.put_front(
+            items,
+            expected_generation=expected_generation,
+            stamp=self._stamp_at_depth,
+        )
+        if queued is None:
+            return False
         if prefetch and self.store is not None:
-            for item in items:
+            for item in queued:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()

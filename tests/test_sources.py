@@ -10,6 +10,7 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSpotifyLinkError,
     URLSource,
     YTSource,
     YTType,
@@ -17,7 +18,7 @@ from src.sources import (
     parse_input,
     parse_url,
     query_source_of,
-    spotify_playlist_to_ytsearch,
+    spotify_titles_to_ytsearch,
 )
 
 
@@ -121,10 +122,56 @@ class TestParseUrlSpotify:
         assert result.type == SpotifyType.TRACK
         assert result.id == "4cOdK2wGLETKBW3PvgPWqT"
 
+    def test_spotify_album(self) -> None:
+        # The incident URL: this exact
+        # link used to raise "Unknown Spotify track type: ['album', …]".
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+        assert result.stype == URLSource.SPOTIFY
+        assert result.process is True
+
+    def test_spotify_album_without_open_subdomain(self) -> None:
+        url = "https://spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_spotify_album_with_si_param(self) -> None:
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl?si=abc123"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
-        with pytest.raises(Exception, match="Unknown Spotify track type"):
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
             parse_url(url, f"-play {url}")
+        # The message names the supported types so the user can act on it.
+        assert "'artist'" in str(exc_info.value)
+        assert "track, playlist, album" in str(exc_info.value)
+
+    def test_unknown_spotify_type_is_not_a_value_error(self) -> None:
+        """Regression guard: parse_input catches ValueError and falls back to a
+        YouTube search. If this error ever becomes a ValueError, an /artist/
+        link silently turns into `ytsearch:https://open.spotify.com/...`."""
+        url = "https://open.spotify.com/show/4rOoJ6Egrf8K2IrywzwOMk"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url, f"-play {url}")
+        assert not isinstance(exc_info.value, ValueError)
+
+    def test_unknown_spotify_type_suppresses_exception_chain(self) -> None:
+        """`from None`: the enum-lookup ValueError is an implementation detail;
+        chaining it doubles the traceback in every error log."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url, f"-play {url}")
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
 
 
 class TestParseUrlSoundcloud:
@@ -240,11 +287,25 @@ class TestParseInput:
         assert result.stype == URLSource.OTHER
         assert result.url == url
 
+    def test_unsupported_spotify_link_propagates(self) -> None:
+        """The fallback-eats-the-error regression guard: an /artist/ link must
+        surface UnsupportedSpotifyLinkError to the caller, not fall back to a
+        `ytsearch:https://…` search the way a ValueError would."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError):
+            parse_input(url, f"-play {url}")
 
-class TestSpotifyPlaylistToYTSearch:
+    def test_spotify_album_url_through_parse_input(self) -> None:
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_input(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type == SpotifyType.ALBUM
+
+
+class TestSpotifyTitlesToYTSearch:
     def test_converts_titles_to_ytsearch(self) -> None:
         titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
-        result = spotify_playlist_to_ytsearch(titles)
+        result = spotify_titles_to_ytsearch(titles)
 
         assert len(result) == 2
         assert all(isinstance(r, YTSource) for r in result)
@@ -253,19 +314,19 @@ class TestSpotifyPlaylistToYTSearch:
 
     def test_all_results_have_process_true(self) -> None:
         titles = ["Song A", "Song B", "Song C"]
-        result = spotify_playlist_to_ytsearch(titles)
+        result = spotify_titles_to_ytsearch(titles)
         assert all(r.process is True for r in result)
 
     def test_empty_list_returns_empty(self) -> None:
-        assert spotify_playlist_to_ytsearch([]) == []
+        assert spotify_titles_to_ytsearch([]) == []
 
     def test_single_title(self) -> None:
-        result = spotify_playlist_to_ytsearch(["Only Song Artist"])
+        result = spotify_titles_to_ytsearch(["Only Song Artist"])
         assert len(result) == 1
         assert result[0].ytsearch == "ytsearch:Only Song Artist"
 
     def test_url_field_is_none(self) -> None:
-        result = spotify_playlist_to_ytsearch(["Song"])
+        result = spotify_titles_to_ytsearch(["Song"])
         assert result[0].url is None
 
 
@@ -402,10 +463,10 @@ class TestQuerySource:
         assert result.stype == URLSource.OTHER
         assert query_source_of(result) == expected
 
-    def test_spotify_playlist_tracks_are_stamped_spotify(self) -> None:
+    def test_spotify_collection_tracks_are_stamped_spotify(self) -> None:
         """The whole reason the token is captured at parse time: these resolve to
         YouTube URLs at dequeue, so nothing downstream could recover it."""
-        sources = spotify_playlist_to_ytsearch(["song one", "song two"])
+        sources = spotify_titles_to_ytsearch(["song one", "song two"])
         assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
 
     def test_uppercase_www_youtube_still_reports_youtube(self) -> None:
