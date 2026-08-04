@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.5.1, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.7.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -23,7 +23,7 @@ The boundary is a rule, not a preference: durable records go to Postgres (when t
 operator opted in), runtime and cache state stays in Redis forever. Reads follow the
 same rule in BOTH modes — `-history` is served from the capped Redis list alone (50
 entries per guild, exactly the command's ceiling, written ahead of the archive), and
-Postgres backs the commands that need the permanent record.
+Postgres backs the commands that need the permanent record (`-leaderboard`).
 
 | | |
 |---|---|
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record.
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,730 tests plus two opt-in integration tiers (testcontainers): a 46-test `pg` tier and a 33-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~1,830 tests plus two opt-in integration tiers (testcontainers): a 62-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -206,6 +206,8 @@ src/
 ├── guild_queue.py    # GuildQueue — the three synchronized queue representations + bulk-mutation mutex
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
+├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
+│                     # the command itself stays on the cog)
 ├── db_migrate.py     # SQL migration runner (`python -m src.db_migrate`, EXPECTED_SCHEMA_VERSION)
 ├── backfill_history.py # ONE-SHOT operator script: pre-archive Redis history → Postgres, direct
 │                     # (not via the outbox). Run BEFORE deploying this build — see below
@@ -445,6 +447,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
+| `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
 | `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
@@ -650,8 +653,8 @@ closes it, `cog_command_error` records onto it). `_DiscordGatewayFilter` drops
 discord.py-internal HTTP spans. Redis and aiohttp are auto-instrumented. Spans embed
 their `trace_id` in error-embed footers (`trace_footer`) so a user report can be joined
 to a trace. `-ping` is a live-editing dashboard (1s tick, 3s deadline, env-tunable)
-probing Discord/Redis/Spotify/OTEL and reporting bot/yt-dlp/ffmpeg versions;
-`max_concurrency(1, guild)`.
+probing Discord/Redis/Spotify/Postgres/OTEL and reporting bot/yt-dlp/ffmpeg
+versions; `max_concurrency(1, guild)`.
 
 ## Concurrency model — quick reference
 
@@ -711,7 +714,9 @@ read that header first.
 ## Testing
 
 - Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
-  exception — it has no test file), plus `conftest.py` (shared fixtures/seams),
+  exception — it has no test file; `test_leaderboard.py` also owns the cog command
+  that drives it, since splitting the renderer's tests from the command's would make
+  a reader check two files to learn what one board looks like), plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
   `telemetry.py` are the two intentionally-least-covered modules.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs
@@ -860,11 +865,17 @@ default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable �
 parse) → `QueueObject` + `GuildQueue._rehydrate` → carry it through
 `_neutralize_prefetch`'s rebuild if playback-relevant.
 
-**Add a schema migration**: **before the first production release, don't** — edit
+**Add a schema migration**: **while no deployment holds the schema, don't** — edit
 `migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
-so a pre-release ALTER sequence would describe upgrades that never happened), then drop
-and re-create the scratch database, since `IF NOT EXISTS` makes the file a no-op against
-one that already holds the tables. After that release: new
+so an ALTER sequence would describe upgrades that never happened), then drop and re-create
+the scratch **database** — not just the tables, since the `schema_migrations` row survives
+them and the re-run applies nothing. The trigger for freezing `0001` is a deployed
+database, not a tagged release. Once one exists, editing a migration fails silently and in
+the worst direction: `migrate()` skips a version already in the ledger without reading the
+file, so the change reaches fresh databases only, the deployed one keeps the old shape and
+still passes the version check, and every insert then raises `UndefinedColumnError` —
+which is not in `_POISON`, so the drainer treats it as transient and redelivers onto the
+non-evictable outbox forever. From that point on: new
 `migrations/NNNN_short_name.sql` (numeric prefix, next
 free number — `discover()` rejects duplicates and orders numerically, so `0010` follows
 `0009`) → bump `EXPECTED_SCHEMA_VERSION` in `src/db_migrate.py` (a test asserts the two
@@ -876,8 +887,8 @@ bind-mounted) but the runtime image does.
 
 **Add a history-entry field**: `HistoryEntry` in guild_state.py (with a default) →
 **add it to exactly one domain tuple in guild_state.py — `_TEXT_FIELDS`, `_INT4_FIELDS`
-(`integer` columns) or `_INT8_FIELDS` (`bigint`) — or `__post_init__` silently does not
-clamp it and the schema lock has a hole** (a test asserts every field is covered, so
+(`integer` columns), `_INT8_FIELDS` (`bigint`) or `_EPOCH_FIELDS` (`timestamptz`) — or
+`__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
 forgetting fails the suite rather than shipping) → `to_redis`/`parse_history_entry`
 (`.get(..., default)`, so pre-migration wire entries still parse) → the column in
 `migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the

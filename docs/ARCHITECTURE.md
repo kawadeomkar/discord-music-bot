@@ -90,7 +90,7 @@ graph TD
 | PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so `web_safari` can serve audio-only formats |
 | Codec | FFmpeg (system, installed in the runtime image) | Decode + re-encode to Opus for Discord |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
-| Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-history`/`-stats` reads, in-app SQL migration runner (`src/db.py`) |
+| Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
 | Serialization | `orjson` | Fast JSON serialization for Redis payloads |
 | HTTP client | `aiohttp` | Spotify REST API calls |
 | JSON (Spotify) | `ujson` | Spotify response deserialization |
@@ -165,7 +165,7 @@ graph TD
     guild_history["src/guild_history.py\nGuildHistory"]
     guild_state["src/guild_state.py\nschema / value objects"]
     history_archive["src/history_archive.py\nPostgresHistoryArchive + drainer"]
-    db["src/db.py\nDatabase + migration runner"]
+    db["src/db_migrate.py\nSQL migration runner"]
     youtube["src/youtube.py\nYTDL + QueueObject"]
     ytdlp_pool["src/ytdlp_pool.py\nYtdlpPool"]
     sources["src/sources.py\nparse_input + source types"]
@@ -213,13 +213,14 @@ graph TD
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
 | `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`) with `from_redis`/`to_redis` converters. Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
 | `db_migrate.py` | The SQL migration runner (`python -m src.db_migrate`, also `just db-migrate`). Forward-only `NNNN_description.sql` files in `migrations/`, ordered numerically, recorded in the `schema_migrations` ledger, each applied in its own transaction under `pg_advisory_xact_lock` (so a migration must be idempotent-safe on retry). Holds `EXPECTED_SCHEMA_VERSION`; the app verifies that version and never applies DDL itself. Every deploy runs it before recreating the bot and aborts on failure; a database ahead of the build exits 0 with a note, matching the archive's own tolerance, so rollbacks deploy. `POSTGRES_MIGRATE_URL` lets migrations run as a higher-privilege role. |
-| `history_archive.py` | Postgres archive + drainer: `HistoryArchive` protocol, `PostgresHistoryArchive` (lazy asyncpg pool, `HistoryEntry`↔row mapping, schema-version check), `HistoryOutboxDrainer` (one supervised task per process: replay this consumer's pending IDs → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL` by ID; at-least-once, deduped by `play_history_dedup`). The outbox is a **stream with a `drainers` consumer group**, so two live drainers are safe by construction. Present only when `HISTORY_ARCHIVE_ENABLED` is true. |
+| `history_archive.py` | Postgres archive + drainer: `HistoryArchive` protocol (writes), `ArchiveReader` protocol (the read surface MusicBot holds: `-ping`'s liveness probe and `-leaderboard`'s aggregate), `PostgresHistoryArchive` (lazy asyncpg pool, `HistoryEntry`↔row mapping, schema-version check, `leaderboard()`), `HistoryOutboxDrainer` (one supervised task per process: replay this consumer's pending IDs → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL` by ID; at-least-once, deduped by `play_history_dedup`). The outbox is a **stream with a `drainers` consumer group**, so two live drainers are safe by construction. Present only when `HISTORY_ARCHIVE_ENABLED` is true. |
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
 | `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
 | `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history keys, pause epochs, recovery gate + lock, atomic start-song transaction). Module-level `cache_get`/`cache_set` and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
+| `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
 | `config.py` | `ENVIRONMENT` (from `$ENVIRONMENT`, else derived from the git branch: `main` → `production`) and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3.0). |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
@@ -235,9 +236,9 @@ graph TD
 | `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`), `id` |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; `QueueItem = Union[QueueObject, YTSource]` is the live-item type |
-| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused` |
+| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused`; both carry the enqueue stamps `queued_at` / `queue_position` |
 | `GuildStateData` / `NowPlayingData` / `GuildPlaybackSnapshot` | `guild_state.py` | Typed snapshots of the state hash, now-playing hash, and the full restore read |
-| `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
+| `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `queued_at`, `queue_position`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
 | `GuildRedisStore` | `redis_client.py` | Per-guild Redis operations namespace |
 
 ---
@@ -262,16 +263,16 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-remove` | `rm` | `url` | Remove **all** queued songs whose YouTube URL matches; reports the removed positions. Without a URL, prints usage. |
 | `-now` | `np`, `rn`, `nowplaying` | — | Display the now-playing embed, rebuilt live for the current song. |
 | `-queue` | `q` | — | Display the next 10 songs with per-song ETA. |
-| `-history` | `h` | `[--limit N] [--user @m]` | Display the last N played songs (default 10), optionally filtered to one member's requests. Served from Postgres with a freshness merge. |
-| `-stats` | — | `[--days N]` | Aggregate playback stats from Postgres: plays, unique songs, time listened, top-5 songs and requesters; `--days` windows the range. |
+| `-history` | `h` | `[--limit N]` | Display the last N played songs (default 10, max 50). Served from the capped Redis list alone, in both archive modes — see [History read path](#history-read-path). |
+| `-leaderboard` | `lb`, `top` | `[--days N]` | Top 10 listeners and top 10 songs for this server, ranked by total listening time; `--days` scopes both boards to a rolling window. Aggregated from the Postgres archive (the first production reader of it) behind a 60 s Redis cache; replies with a notice when the archive is disabled. |
 | `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. |
-| `-ping` | `latency`, `l`, `delay` | — | Gateway latency with a color-coded embed. |
+| `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
 | `-jump` | `j` | — | Stub; replies "currently in development". |
 | `-help` | `commands` | `[command]` | Man-page-styled embed help: the full command list, or detailed help for one command (`-help play`). Aliases resolve too (`-help np`). Rendered by `MusicHelpCommand` (`help.py`). |
 
 **Permission model:**
 
-Every command is gated by `@commands.before_invoke(validate_commands)`. `cog_before_invoke` runs first: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. `validate_commands` then checks:
+Every command that touches playback is gated by `@commands.before_invoke(validate_commands)`. The read-only ones are not: `-ping` and `-leaderboard` answer without the author being in voice (and `-help` is a `HelpCommand`, not a cog command at all). `cog_before_invoke` runs first for all of them: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. `validate_commands` then checks:
 1. The author is a `discord.Member` (not a `discord.User`)
 2. The author is in a voice channel
 3. For non-`play` commands: the bot is in the same voice channel as the author
@@ -613,6 +614,8 @@ All queue state lives behind `GuildQueue` (`guild_queue.py`). Three representati
 
 Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `finish_failed_dequeue`) runs under one bulk-mutation mutex. Bulk mutations carry a dequeued-but-uncommitted head through untouched (`_in_flight_head`), so a shuffle/remove during a multi-second resolve can't retire the wrong entry.
 
+`put`/`put_front` also take an optional `stamp` hook, invoked while the mutex is held with the number of entries already ahead of the insert point, and return the list they enqueued so a stamper may replace frozen items. This is how `queue_position` is computed: reading the depth before taking the mutex let a clear/shuffle land in between and stamp a song against a queue that no longer existed.
+
 `MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) call `_cancel_prefetch()` **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else.
 
 - **Shuffle**: drains all legs under the mutex, `random.shuffle`, re-enqueues, rebuilds the Redis list via `MULTI/EXEC` (`DEL` + `RPUSH` atomically — no empty-key window for a concurrent LPOP). Returns a `ShuffleOutcome` enum.
@@ -750,7 +753,7 @@ sequenceDiagram
 | `current_song` | `Optional[YTDL]` | The `FFmpegOpusAudio` object currently playing |
 | `play_next` | `asyncio.Event` | Set by the `after=` callback (thread-safe via `call_soon_threadsafe`); cleared at the start of each loop iteration |
 | `queue` | `GuildQueue` | All queue state and operations (three legs private to the class) |
-| `history` | `GuildHistory` | Played songs: Postgres `play_history` is the source of truth (via the outbox drain); the in-memory ring (maxlen 50) + TTL'd Redis list are display caches; `recent()` is PG-primary with a freshness merge |
+| `history` | `GuildHistory` | Played songs: the in-memory ring (maxlen 50) and the Redis list are what `recent()` reads — it never touches Postgres. That list carries **no TTL, ever** (PERSISTed, capped by LENGTH); Postgres `play_history` is the durable record behind it, fed by the outbox drain and read only by `-leaderboard` |
 | `play_message` | `Optional[discord.Embed]` | Cached NP embed for `-now`; cleared on song end |
 | `volume` | `float` | 0.0–1.0; applied via FFmpeg `-filter:a volume=` on next song |
 | `store` | `Optional[GuildRedisStore]` | `None` if no Redis configured |
@@ -772,11 +775,12 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
-| `guild:{id}:state` | Hash | 12 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected` (a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
+| `guild:{id}:state` | Hash | 14 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_queued_at/_queue_position` (a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `queued_at`, `queue_position`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
-| `history:outbox` | List | Global (all guilds) write-ahead buffer for the Postgres archive — same `HistoryEntry` wire bytes, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only when `POSTGRES_URL` is set | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
+| `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
+| `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `lock:guild:{id}:recovery` | String | `"1"` (SET NX EX — distributed lock) | 60 s |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
@@ -787,11 +791,11 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 ### Postgres Schema
 
-One table, applied by the in-app migration runner (`src/db.py`; files in `db/migrations/`, `schema_migrations` ledger with sha256 checksums, `pg_advisory_lock` around the run):
+Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz`. **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at` = unknown), because NULLs would break dedup-index semantics.
-- **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key *and* the `-history` read index. `0002`/`0003` add the `-stats` and per-user indexes.
-- `played_at` is µs-granular in Postgres; Python-side identity comparisons quantize through `quantized_played_at()` (`history_archive.py`) so raw `time.time()` values compare equal to their round trip.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz`, `inserted_at timestamptz` (server default; not on the wire), `message_id` (the NP host at song end — a correlation token, not a resolvable pointer), `queued_at timestamptz` and `queue_position` (when the song was first enqueued and how many songs were ahead of it then, counting the one playing; 0 = played immediately, and also what a row predating the fields carries). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
+- **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
 ---
 
@@ -991,6 +995,50 @@ archive disabled the key is inert — `setup_hook` never creates the group (that
 MKSTREAM the non-evictable key into existence) and a leftover is downgraded to a
 warning.
 
+The read side is `-leaderboard`, the only production reader of `play_history` rows
+(`-ping`'s liveness probe is the other user of the pool). Two `GROUP BY` aggregates
+— requesters and songs, both ranked by `sum(played_secs)` — run on **one** pooled
+connection out of the `max_size=4` pool the drainer and `-ping` also draw from.
+Songs group by `webpage_url` rather than title (titles drift, the URL is stable
+identity) and the displayed title is simply the most recent one. The unknown
+sentinels — `requester_id` 0 and `webpage_url` `''` — are excluded, since each would
+merge unrelated plays into one top-10 row. A single `$3` cutoff parameter serves both
+all-time and windowed boards: all-time passes `to_timestamp(0)`, the wire format's
+floor, so the inclusive compare excludes nothing, while any real cutoff also excludes
+epoch-0 unknown-time rows by definition. Entries still in the outbox are ignored: the
+boards lag song end by the drain, which the help copy says rather than promising
+real-time numbers.
+
+**Each aggregate is two passes, and that is load-bearing.** Picking the display
+name/title inline with `(array_agg(x ORDER BY played_at DESC, id DESC))[1]` makes it
+an *ordered* aggregate, and an ordered aggregate removes hash aggregation from the
+planner's options entirely: both boards then plan as `GroupAggregate` over a full sort
+of every matching row, and `array_agg`'s state is not `work_mem`-bounded and cannot
+spill. Measured at 3M rows: 6.8 s, 140 MB of external merge, and 431 MB RSS in one
+backend for a single large group — enough to OOM a co-resident Postgres. Aggregating
+first and resolving the ten winners through `LATERAL` keeps it a `HashAggregate` with
+no temp files and no per-group state (300k rows: 880 ms → 53 ms, identical output).
+
+The `LATERAL` leg rides `play_history_recent` and then filters, so it walks back to each
+winner's newest play: cheap for a song still in rotation, proportional to the guild's
+history for one that ranks on old plays alone. That worst case measured 111 ms at 300k
+rows — still 8× better than the ordered-aggregate form. A
+`(guild_id, webpage_url, played_at DESC, id DESC)` index would turn the walk into an
+exact seek, at write amplification on an append-only table the drainer writes to
+continuously; not worth it at these numbers. The leg deliberately carries no cutoff:
+the totals are about the window, the title is the song's current name, so a play
+outside the window still supplies it (pinned by `test_windowed_board_names_a_song_by_its_newest_title`).
+
+**Three bounds, because this is the pool's only user-triggered traffic.** `max_concurrency(1, guild)`
+serializes per guild; a 60 s Redis cache (`leaderboard:v{n}:{guild_id}:{days}:{top_n}`) collapses
+repeats of the *same* window, though `--days` is a 0–3650 axis so it is not a rate
+limit; and `_READ_CONCURRENCY = 2` against `max_size=4` keeps reads off the last
+connections so a burst cannot starve the drainer — measured, 64 concurrent boards
+pushed `insert_batch` from 11.8 ms to a 10 s acquire timeout and into backoff. A
+`_READ_DEADLINE_SECS` bound covers the whole operation including the wait for a slot,
+since two statements on one connection are otherwise bounded only by
+2 × `command_timeout` — longer than the drainer's entire `DRAIN_DEADLINE_SECS`.
+
 There is **no quarantine counter**. With the schema lock, a data-caused refusal is a
 CHECK violation or a `DataError`, both named in `_POISON`; anything else is genuinely
 transient and redelivers forever rather than being dropped. A growing outbox is the
@@ -1074,9 +1122,16 @@ extra invocations behind the first still issues every send, so they must be decl
 outright, and `cog_command_error` renders the resulting `MaxConcurrencyReached` as a
 notice rather than an error embed.
 
-`PostgresHistoryArchive.recent()` has **no production caller**. It is the durable
-record's read side, exercised by the `pg` tier and available to tooling; the archive's
-own query is served by the `play_history_recent` index with no sort node. Planning it
+The single-leg rule is specifically about **`-history`'s recent-window read**, not
+about the archive being unreadable. `-leaderboard` (see
+[the archive tier](#history-archive-tier) above) is a production reader
+of `play_history` and is the first: it aggregates over unbounded history, which the
+50-entry window cannot answer, and the read-path rule sanctions exactly that —
+Postgres backs the commands that need the permanent record.
+
+`PostgresHistoryArchive.recent()` still has **no production caller**. It is the durable
+record's row-level read side, exercised by the `pg` tier and available to tooling; the
+archive's own query is served by the `play_history_recent` index with no sort node. Planning it
 off `play_history_dedup` instead adds an Incremental Sort that must consume an entire
 equal-`played_at` group before emitting `LIMIT 50` — and with backfilled rows all
 landing on the epoch-0 sentinel those groups are large. Measured 37x slower: p50
@@ -1355,4 +1410,4 @@ With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction 
 
 ### Two-tier data architecture (Redis + Postgres)
 
-The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history` now; future stats/preferences); data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads do not cross it**: `-history` is served from the capped Redis window alone — see [History read path](#history-read-path). The archive is opt-in and a default deployment collects nothing long-term.
+The durable/runtime boundary is drawn once: data a user would miss a week later lives in Postgres (`play_history` now; future stats/preferences); data that only matters to the running player stays in Redis, permanently — the runtime tier is *correctly placed*, not "not yet migrated". Writes cross the boundary through the `history:outbox` Redis **stream**, drained by one background task (replay pending → read new → `INSERT … ON CONFLICT DO NOTHING` → `XACK`+`XDEL`), so the playback loop keeps Redis-only latency, Postgres downtime buffers instead of losing entries, and the dedup unique index makes at-least-once delivery and backfill idempotent by the same mechanism. **Reads follow the same rule**: `-history` shows the recent window and is served from the capped Redis list alone — see [History read path](#history-read-path) — while `-leaderboard` needs the permanent record and is the archive's one reader. The archive is opt-in and a default deployment collects nothing long-term.
