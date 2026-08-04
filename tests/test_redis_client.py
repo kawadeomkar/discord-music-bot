@@ -33,7 +33,9 @@ from src.redis_client import (
     HISTORY_OUTBOX_KEY,
     OUTBOX_FIELD,
     GuildRedisStore,
+    _PLAYBACK_POSITION_FIELDS,
     _prev_stream_id,
+    _TRANSIENT_SONG_FIELDS,
     ack_outbox,
     cache_get,
     cache_set,
@@ -2076,6 +2078,49 @@ class TestPopQueueAndStartSong:
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"current_song_interjected"] == b""
 
+    async def test_parks_the_enqueue_stamps(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The state hash is the parked queue entry, so a crash-recovered song
+        # must find its original enqueue position waiting for it.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(queued_at=1752530000.5, queue_position=3), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_queued_at"] == b"1752530000.5"
+        assert state[b"current_song_queue_position"] == b"3"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_queued_at == 1752530000.5
+        assert restored.current_song_queue_position == 3
+
+    def test_every_parked_field_is_on_a_clear_list(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The start transaction and the two clear paths must name the same
+        fields. A field added to the mapping but to neither tuple survives its
+        own song: nothing reads it while `current_song_url` is absent, so it is
+        invisible until some later change starts trusting it. Asserted as a
+        relationship rather than a list, because enumerating the fields is what
+        already failed — `query_source` was added to both and neither had a test.
+        """
+        parked = set(store._now_playing_state_mapping(_current(), 1000.0))
+        assert parked <= {*_TRANSIENT_SONG_FIELDS, *_PLAYBACK_POSITION_FIELDS}
+
+    async def test_parks_the_query_source(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # Only knowable at parse time, so the state hash is the sole place a
+        # crash-recovered song can read it back from.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(
+            _current(query_source="spotify.com"), 1000.0
+        )
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_query_source"] == b"spotify.com"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_query_source == "spotify.com"
+
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2316,6 +2361,8 @@ class TestClearSongEndState:
                 b"current_song_uploader": b"Some Channel",
                 b"current_song_requester_id": b"42",
                 b"current_song_interjected": b"1",
+                b"current_song_queued_at": b"1752530000.5",
+                b"current_song_queue_position": b"3",
             },
         )
         await store.clear_song_end_state()
@@ -2326,6 +2373,8 @@ class TestClearSongEndState:
         assert b"current_song_uploader" not in state
         assert b"current_song_requester_id" not in state
         assert b"current_song_interjected" not in state
+        assert b"current_song_queued_at" not in state
+        assert b"current_song_queue_position" not in state
 
     async def test_deletes_now_playing_hash(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

@@ -3,6 +3,10 @@
 import pytest
 
 from src.sources import (
+    QUERY_SOURCE_SEARCH,
+    QUERY_SOURCE_SOUNDCLOUD,
+    QUERY_SOURCE_SPOTIFY,
+    QUERY_SOURCE_YOUTUBE,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -10,8 +14,10 @@ from src.sources import (
     URLSource,
     YTSource,
     YTType,
+    normalize_query_host,
     parse_input,
     parse_url,
+    query_source_of,
     spotify_titles_to_ytsearch,
 )
 
@@ -378,3 +384,102 @@ class TestYTSourcePlaylistUrl:
         assert isinstance(reparsed, YTSource)
         assert reparsed.type == YTType.PLAYLIST
         assert reparsed.list_id == "PLround"
+
+
+class TestNormalizeQueryHost:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("tiktok.com", "tiktok.com"),
+            ("www.tiktok.com", "tiktok.com"),
+            ("WWW.TikTok.com", "tiktok.com"),
+            ("  vimeo.com  ", "vimeo.com"),
+            ("music.example.co.uk", "music.example.co.uk"),
+            ("xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
+            ("192.168.1.10", "192.168.1.10"),
+            # parse_url's domain group is `[\w+|\.]+`, so these three really can
+            # reach the normalizer — it filters, it does not merely format.
+            ("bad_host.com", ""),
+            ("bad|host.com", ""),
+            ("bad+host.com", ""),
+            ("", ""),
+            # 64 characters exactly, then one over the column domain.
+            ("a" * 60 + ".com", "a" * 60 + ".com"),
+            ("a" * 61 + ".com", ""),
+        ],
+    )
+    def test_domain(self, raw: str, expected: str) -> None:
+        assert normalize_query_host(raw) == expected
+
+
+class TestQuerySource:
+    """The persisted "how was this asked for" token. The archive cannot recover it
+    from webpage_url: Spotify links and plaintext searches both resolve to a
+    YouTube watch URL and are indistinguishable once played."""
+
+    def test_plaintext_search(self) -> None:
+        result = parse_input("never gonna give you up", "-play never gonna give you up")
+        assert result.stype == URLSource.SEARCH
+        assert query_source_of(result) == QUERY_SOURCE_SEARCH
+
+    def test_youtube_watch_url(self) -> None:
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+
+    def test_youtu_be_collapses_onto_the_service(self) -> None:
+        """A shortener is not a different service."""
+        url = "https://youtu.be/dQw4w9WgXcQ"
+        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+
+    def test_youtube_playlist(self) -> None:
+        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp"
+        assert query_source_of(parse_url(url, f"-play {url}")) == QUERY_SOURCE_YOUTUBE
+
+    def test_spotify_track_link(self) -> None:
+        url = "https://open.spotify.com/track/5WZD6jHtgSSAGK97diNG7y"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert query_source_of(result) == QUERY_SOURCE_SPOTIFY
+
+    def test_soundcloud_link(self) -> None:
+        url = "https://soundcloud.com/artist/track"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SoundcloudSource)
+        assert query_source_of(result) == QUERY_SOURCE_SOUNDCLOUD
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://www.tiktok.com/@user/video/1234567890", "tiktok.com"),
+            ("https://vimeo.com/12345678", "vimeo.com"),
+            ("https://artist.bandcamp.com/track/song", "artist.bandcamp.com"),
+        ],
+    )
+    def test_generic_hosts_keep_their_own_host(self, url: str, expected: str) -> None:
+        """The point of the open tail: tiktok and vimeo are distinguishable
+        without a dataclass apiece."""
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert query_source_of(result) == expected
+
+    def test_spotify_collection_tracks_are_stamped_spotify(self) -> None:
+        """The whole reason the token is captured at parse time: these resolve to
+        YouTube URLs at dequeue, so nothing downstream could recover it."""
+        sources = spotify_titles_to_ytsearch(["song one", "song two"])
+        assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
+
+    def test_uppercase_www_youtube_still_reports_youtube(self) -> None:
+        """parse_url's `www\\.` group is case-sensitive, so this misses the
+        YouTube branch and lands on the generic one — the normalizer still names
+        the service correctly."""
+        url = "https://WWW.youtube.com/watch?v=dQw4w9WgXcQ"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert query_source_of(result) == QUERY_SOURCE_YOUTUBE
+
+    def test_unstamped_ytsource_is_unknown(self) -> None:
+        """A hand-built source (crash recovery, tests, a future call site) reports
+        the unknown sentinel rather than guessing."""
+        assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""

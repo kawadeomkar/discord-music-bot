@@ -39,7 +39,14 @@ from src.musicbot import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.util import latency_color
-from src.sources import SoundcloudSource, SpotifySource, SpotifyType, YTSource, YTType
+from src.sources import (
+    SoundcloudSource,
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+)
 from src.musicplayer import InterjectOutcome, _PLAYBACK_GATE_TIMEOUT
 from src.spotify import (
     SpotifyAuthError,
@@ -554,6 +561,93 @@ class TestQueueSource:
         ):
             result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, QueueObject)
+
+
+class TestQuerySourceStamping:
+    """Every path from parsed input to an enqueueable object stamps the token.
+    yt_source cannot: it is handed a search string, and for Spotify that string
+    is a YouTube title query indistinguishable from a plaintext search."""
+
+    async def test_spotify_track(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
+        fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
+        assert music_bot.spotify is not None
+        music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, QueueObject)
+        assert result.query_source == "spotify.com"
+
+    async def test_plaintext_search(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = parse_input("never gonna give you up", "-play never gonna give you up")
+        fake_qobj = QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, QueueObject)
+        assert result.query_source == "search"
+
+    async def test_generic_host_link(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        url = "https://www.tiktok.com/@user/video/1234567890"
+        source = parse_input(url, f"-play {url}")
+        fake_qobj = QueueObject(url, "Clip", mock_ctx.author)
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, QueueObject)
+        assert result.query_source == "tiktok.com"
+
+    async def test_youtube_playlist_stamps_every_track(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLabc"
+        source = parse_input(url, f"-play {url}")
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"T{i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(mock_ctx, source)
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert [t.query_source for t in result.tracks] == ["youtube.com"] * 3
+
+    async def test_playnow_spotify_playlist_bypasses_queue_source(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # _resolve_playnow_source resolves both collection shapes directly, so a
+        # stamp only in queue_source would leave these two unclassified.
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.PLAYLIST, total=2)
+        music_bot.spotify.playlist_stream = MagicMock(
+            return_value=_sgen([_spage(col, ["Song A", "Song B"], is_last=True)])
+        )
+        fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
+        ):
+            result = await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert result.query_source == "spotify.com"
+
+    async def test_playnow_youtube_playlist_bypasses_queue_source(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        url = "https://www.youtube.com/playlist?list=PLabc"
+        source = parse_input(url, f"-play {url}")
+        tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert result.query_source == "youtube.com"
 
 
 class TestSpotifyDisabled:
@@ -2053,13 +2147,14 @@ class TestHistoryCommand:
         raises nothing — it silently starts returning short pages."""
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
-    @pytest.mark.parametrize("name", ["history", "ping"])
+    @pytest.mark.parametrize("name", ["history", "ping", "leaderboard"])
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
         NP block), so unbounded concurrent renders rate-limit a guild out of its own
         channel — and deleting the decorator that prevents it left the suite green.
         `wait=False` is half the point: queueing the extra invocations still issues
-        every send, so they must be declined outright."""
+        every send, so they must be declined outright. `-leaderboard` carries it for
+        a second reason: it draws on the same Postgres pool as the drainer."""
         guard = getattr(MusicBot, name)._max_concurrency
         assert guard is not None
         assert guard.number == 1
@@ -3884,7 +3979,7 @@ class TestPlaynow:
         enqueue every track right after the first-track-only notice. The user still
         gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
-        live_mp.queue.put_front = AsyncMock()
+        live_mp.queue_put_front = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         mock_ctx.invoke = AsyncMock()
@@ -3894,7 +3989,9 @@ class TestPlaynow:
         await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_not_awaited()
-        live_mp.queue.put_front.assert_awaited_once_with([qobj])
+        # The player's wrapper, so the insert is stamped under the queue mutex;
+        # the stream was already warmed, so it must not prefetch again.
+        live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
         # The interjection marker must not leak onto a normally queued song —
         # a later -playnow would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False

@@ -23,7 +23,16 @@ HELP_COLOR = discord.Color.blurple()
 # verbs first, housekeeping last) — not alphabetically, which put `pause` above `play`.
 CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
     "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
-    "Queue": ("queue", "now", "history", "shuffle", "remove", "clear", "jump"),
+    "Queue": (
+        "queue",
+        "now",
+        "history",
+        "leaderboard",
+        "shuffle",
+        "remove",
+        "clear",
+        "jump",
+    ),
     "Utility": ("help", "join", "ping"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)

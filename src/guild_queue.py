@@ -36,7 +36,7 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from enum import Enum, auto
 from typing import Optional, Union
 
@@ -65,6 +65,15 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
+
+
+# Called by put()/put_front() while the bulk-mutation mutex is held, with the
+# number of entries already ahead of the insert point. Returns the list to
+# actually enqueue, so a stamper may replace frozen items. See
+# MusicPlayer._stamp_at_depth — the depth is passed in rather than read back off
+# the queue because reading it outside the mutex is what lets a concurrent
+# enqueue shift it between the read and the insert.
+StampFn = Callable[[Sequence[QueueItem], int], list[QueueItem]]
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -226,7 +235,8 @@ class GuildQueue:
         *,
         batch: bool = False,
         expected_generation: Optional[int] = None,
-    ) -> bool:
+        stamp: Optional[StampFn] = None,
+    ) -> Optional[list[QueueItem]]:
         """Enqueue on all three legs: in-memory puts first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
@@ -235,43 +245,55 @@ class GuildQueue:
         batch=False one RPUSH per entry.
 
         expected_generation is the compare-and-put for streamed collection enqueues:
-        the put refuses (False, no leg touched) if a clear()/bump_generation() landed
+        the put refuses (None, no leg touched) if a clear()/bump_generation() landed
         since the snapshot. The check shares this mutex hold with the enqueue —
         checked outside, an entire clear() fits between check and put and a full page
         lands after the clear it should have respected. Generation-blind callers omit
         it and are never refused.
+
+        `stamp` runs under the mutex against the display depth and may replace
+        items; the enqueued list is returned for callers that need the result.
+        It runs after the generation check, so a refused page is never stamped —
+        a stamp is once-only, and one spent here would follow the song into the
+        enqueue that does land. Refusal is None, not the empty list: an empty
+        `items` enqueues nothing and still succeeds.
         """
         async with self._mutex:
             if (
                 expected_generation is not None
                 and expected_generation != self._generation
             ):
-                return False
-            for item in items:
+                return None
+            if stamp is not None:
+                items = stamp(items, len(self._display))
+            queued = list(items)
+            for item in queued:
                 await self._pending.put(item)
                 self._display.append(item)
-            if self._store is None:
-                return True
-            entries = [_to_entry(item) for item in items]
-            if not entries:
-                return True
+            if self._store is None or not queued:
+                return queued
+            entries = [_to_entry(item) for item in queued]
             if batch:
                 await self._store.push_queue_batch(entries)
             else:
                 for entry in entries:
                     await self._store.push_queue(entry)
-        return True
+            return queued
 
     async def put_front(
         self,
         items: Sequence[QueueItem],
         *,
         expected_generation: Optional[int] = None,
-    ) -> bool:
+        stamp: Optional[StampFn] = None,
+    ) -> Optional[list[QueueItem]]:
         """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
-        An in-flight head (dequeued but uncommitted) keeps its position ahead of
+        `stamp` runs under the mutex against the in-flight head count — the only
+        thing a front insertion lands behind — and may replace items.
+
+        An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
         the inserted items on the display leg and forces the mirror down the
         rebuild path: its Redis entry still sits at the list head awaiting a
         commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the
@@ -285,26 +307,28 @@ class GuildQueue:
         dequeued item sits uncommitted at the display head.
 
         expected_generation: same compare-and-put contract as put(), used by the
-        buffered front=True collection path and refused (False, no leg touched) when
+        buffered front=True collection path and refused (None, no leg touched) when
         a clear()/teardown landed after the snapshot.
         """
         if not items:
-            return True
-        new_items = list(items)
+            return []
         async with self._mutex:
             if (
                 expected_generation is not None
                 and expected_generation != self._generation
             ):
-                return False
+                return None
             drained = self._drain_pending()
             in_flight = self._in_flight_head(drained_count=len(drained))
+            if stamp is not None:
+                items = stamp(items, len(in_flight))
+            new_items = list(items)
             for item in new_items + drained:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + new_items + drained)
 
             if self._store is None:
-                return True
+                return new_items
             if in_flight:
                 entries = [
                     _to_entry(s)
@@ -319,7 +343,7 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
-        return True
+            return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
     # Callers with a prefetch task (MusicPlayer) must cancel it before any of
@@ -468,6 +492,17 @@ class GuildQueue:
     def peek_next(self) -> Optional[QueueItem]:
         return self._display[0] if self._display else None
 
+    def has_resume_tail(self, webpage_url: str) -> bool:
+        """True when the display already carries the resume tail an interjection
+        left behind for `webpage_url`. That entry and the live song are the SAME
+        play, so anything counting queue depth must count them once."""
+        return any(
+            isinstance(item, QueueObject)
+            and item.is_resume
+            and item.webpage_url == webpage_url
+            for item in self._display
+        )
+
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
     def pop_display_head(self, context: str = "dequeue") -> None:
@@ -554,6 +589,9 @@ class GuildQueue:
                 url=entry.url,
                 process=entry.process,
                 ts=entry.ts,
+                queued_at=entry.queued_at,
+                queue_position=entry.queue_position,
+                query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
@@ -579,4 +617,7 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
+            queued_at=entry.queued_at,
+            queue_position=entry.queue_position,
+            query_source=entry.query_source,
         )

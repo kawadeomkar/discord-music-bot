@@ -5,6 +5,7 @@ queue, the display deque and the Redis mirror agree (persisted=False items live
 on the in-memory legs only, by design)."""
 
 import redis.asyncio as aioredis
+from dataclasses import replace
 from typing import Any
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -599,6 +600,39 @@ class TestRestoreEntries:
         assert item.interjected is False
         assert item.ts == 151
 
+    async def test_enqueue_stamps_rehydrate_on_both_entry_types(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """_rehydrate is the entry → item hop for the whole restored queue, and
+        the stamps must survive it: guild_state's CURRENT_SONG_QUEUED_AT records
+        that they are carried and never restamped, so a crash-recovered song
+        archives the position it was originally queued at. Zeroing either leg
+        left the whole suite green."""
+        mock_guild.get_member.return_value = mock_author
+        song = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester_id=mock_author.id,
+            queued_at=1752529000.5,
+            queue_position=3,
+        )
+        search = SearchQueueEntry(
+            ytsearch="ytsearch:abc",
+            process=True,
+            queued_at=1752529111.5,
+            queue_position=7,
+        )
+        assert await gq.restore_entries([song, search]) == 2
+        restored_song, restored_search = gq.display_items()
+        assert (restored_song.queued_at, restored_song.queue_position) == (
+            1752529000.5,
+            3,
+        )
+        assert (restored_search.queued_at, restored_search.queue_position) == (
+            1752529111.5,
+            7,
+        )
+
     async def test_search_entries_rehydrate_to_ytsource(
         self, gq: GuildQueue, mock_guild: MagicMock
     ) -> None:
@@ -631,6 +665,21 @@ class TestRestoreCrashed:
         assert item.ts == 95
         assert queue_object(item).persisted is False
         assert queue_object(item).requester is mock_author
+
+    async def test_carries_the_enqueue_stamps_of_the_original_enqueue(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        # The crashed song archives where it was queued, not where the restart
+        # put it — it goes to the front on recovery, which is not position 0.
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        entry = replace(
+            self._crashed_entry(mock_author.id),
+            queued_at=1752529000.5,
+            queue_position=6,
+        )
+        assert await gq.restore_crashed(entry, requester_fallback=mock_guild.me)
+        item = queue_object(gq.display_items()[0])
+        assert (item.queued_at, item.queue_position) == (1752529000.5, 6)
 
     async def test_fallback_used_when_member_gone(
         self, gq: GuildQueue, mock_guild: MagicMock
@@ -1031,7 +1080,7 @@ class TestGenerationCounter:
 
         ok = await gq.put([_qobj(1, mock_author)], batch=True, expected_generation=gen)
 
-        assert ok is False
+        assert ok is None
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.llen(store.queue_key()) == 0
@@ -1079,7 +1128,7 @@ class TestGenerationCounter:
             await clearer
             ok = await parked
 
-        assert ok is False
+        assert ok is None
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.llen(store.queue_key()) == 0
@@ -1091,11 +1140,11 @@ class TestGenerationCounter:
         store: GuildRedisStore,
     ) -> None:
         """An all-filtered collection page enqueues []: that is success, not
-        an abandon — a False here would stop a live drain with a spurious
-        'queue was cleared' notice. No leg is touched either
-        way."""
-        assert await gq.put([], batch=True, expected_generation=gq.generation) is True
-        assert await gq.put([], batch=True) is True  # generation-blind callers too
+        an abandon — a None here would stop a live drain with a spurious
+        'queue was cleared' notice. Refusal is None, empty success is [],
+        and no leg is touched either way."""
+        assert await gq.put([], batch=True, expected_generation=gq.generation) == []
+        assert await gq.put([], batch=True) == []  # generation-blind callers too
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.llen(store.queue_key()) == 0
@@ -1107,7 +1156,7 @@ class TestGenerationCounter:
         preempted drain to stop consuming pages."""
         gen = gq.generation
         await gq.bump_generation()
-        assert await gq.put([], batch=True, expected_generation=gen) is False
+        assert await gq.put([], batch=True, expected_generation=gen) is None
 
     async def test_stale_put_front_refused_no_leg_touched(
         self,
@@ -1121,7 +1170,7 @@ class TestGenerationCounter:
 
         ok = await gq.put_front([_qobj(1, mock_author)], expected_generation=gen)
 
-        assert ok is False
+        assert ok is None
         assert gq.qsize() == 0
         assert await fake_redis.llen(store.queue_key()) == 0
 
@@ -1135,7 +1184,7 @@ class TestGenerationCounter:
         ok = await gq.put(
             [_qobj(1, mock_author)], batch=True, expected_generation=gq.generation
         )
-        assert ok is True
+        assert ok is not None
         await _assert_triad_sync(gq, fake_redis, store)
         assert gq.qsize() == 1
 
@@ -1146,12 +1195,12 @@ class TestGenerationCounter:
         unaffected by bumps — -play single after -clear still queues."""
         await gq.clear()
         await gq.bump_generation()
-        assert await gq.put([_qobj(1, mock_author)]) is True
-        assert await gq.put_front([_qobj(2, mock_author)]) is True
+        assert await gq.put([_qobj(1, mock_author)]) is not None
+        assert await gq.put_front([_qobj(2, mock_author)]) is not None
         assert gq.qsize() == 2
 
     async def test_empty_put_front_reports_success(self, gq: GuildQueue) -> None:
-        assert await gq.put_front([]) is True
+        assert await gq.put_front([]) == []
 
     async def test_clear_landing_before_parked_put_refuses_it(
         self,
@@ -1161,7 +1210,7 @@ class TestGenerationCounter:
     ) -> None:
         """The compare-and-put TOCTOU guard: a put that snapshotted its
         generation, then parked on the mutex while a full clear() ran, must
-        resolve False — its page belongs to the collection the clear just
+        resolve to None — its page belongs to the collection the clear just
         deleted. Checked outside the mutex, this page would refill the queue."""
         await gq.put([_qobj(1, mock_author)])
         gen = gq.generation
@@ -1183,7 +1232,7 @@ class TestGenerationCounter:
             release.set()
             await clear_task
 
-        assert await put_task is False
+        assert await put_task is None
         assert gq.qsize() == 0
         assert gq.display_items() == []
 

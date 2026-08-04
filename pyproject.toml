@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.7.0"
+version = "2.9.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -25,7 +25,7 @@ async-timeout = "^5.0.1"
 discord-py = "2.7.1"
 redis = ">=5.0.0"
 orjson = ">=3.9.0"
-aiohttp = ">=3.14.1"
+aiohttp = ">=3.14.3"
 opentelemetry-api = ">=1.27.0"
 opentelemetry-sdk = ">=1.27.0"
 opentelemetry-exporter-otlp-proto-grpc = ">=1.27.0"
@@ -211,6 +211,11 @@ filterwarnings = [
     # discord.py's Command.__init__ still calls asyncio.iscoroutinefunction, deprecated
     # in Python 3.14. Suppress until discord.py switches to inspect.iscoroutinefunction.
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+    # discord.utils.escape_markdown passes re.sub's count positionally, deprecated in
+    # Python 3.13. Scoped to that module so our own calls still fail. Suppress until
+    # discord.py passes it by keyword — Python 3.15 makes it a TypeError, which would
+    # break the function outright.
+    "ignore:'count' is passed as positional argument:DeprecationWarning:discord.utils",
 ]
 
 [tool.coverage.run]
