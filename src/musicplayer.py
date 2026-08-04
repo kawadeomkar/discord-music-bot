@@ -1483,6 +1483,7 @@ class MusicPlayer:
             start_paused=song.start_paused,
             queued_at=song.queued_at,
             queue_position=song.queue_position,
+            query_source=song.query_source,
         )
         self.queue.requeue_front(rebuilt)
         song.cleanup()
@@ -1519,6 +1520,7 @@ class MusicPlayer:
             # copied onto it here rather than threaded through its signature.
             qobj.queued_at = source.queued_at
             qobj.queue_position = source.queue_position
+            qobj.query_source = source.query_source
             return qobj
         return source
 

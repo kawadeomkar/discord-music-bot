@@ -2506,6 +2506,18 @@ class TestEnqueueStamps:
             out = await music_player._resolve_source(source)
         assert (out.queued_at, out.queue_position) == (1752530000.5, 4)
 
+    async def test_resolved_search_carries_its_query_source(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        # A Spotify playlist track: it sat in the queue as a search and resolves
+        # to a YouTube URL here, so this copy is the only thing keeping the
+        # archive from recording it as YouTube.
+        source = YTSource(ytsearch="ytsearch:a song", query_source="spotify.com")
+        resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
+        with patch.object(YTDL, "yt_source", new=AsyncMock(return_value=resolved)):
+            out = await music_player._resolve_source(source)
+        assert out.query_source == "spotify.com"
+
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
 
@@ -6478,6 +6490,36 @@ class TestNeutralizePrefetch:
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
         assert (rebuilt.queued_at, rebuilt.queue_position) == (1752530000.5, 6)
+
+    async def test_completed_task_rebuild_keeps_query_source(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        # Nothing downstream of the rebuild can recover the classification, so
+        # dropping it here would archive an interjected-over song as unknown.
+        original = QueueObject(
+            "https://yt.com/v=orig",
+            "Interrupted Song",
+            mock_author,
+            query_source="spotify.com",
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.query_source = "spotify.com"
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.query_source == "spotify.com"
 
     async def test_completed_task_rebuild_keeps_interjected_flag(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
