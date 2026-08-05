@@ -68,7 +68,7 @@ pytest-cov = "^7.1.0"
 pytest-timeout = "^2.3"
 # For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
 # code; needs Docker.
-testcontainers = ">=4.8"
+testcontainers = ">=4.15.0"
 
 [tool.poetry.group.lint]
 optional = true
