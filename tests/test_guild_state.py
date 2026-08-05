@@ -1272,3 +1272,34 @@ class TestGuildConfig:
         history parsers follow."""
         raw = {ConfigField.DEBUG_MODE.encode(): garbage}
         assert GuildConfig.from_redis(raw).debug_mode is None
+
+
+class TestStoredVolumeMigration:
+    """Volume moved from guild:{id}:state to guild:{id}:config. The fallback is a
+    one-release migration path, not a permanent dual-read: dropping the legacy field
+    outright would have silently reset every deployed guild to 100%."""
+
+    def test_config_wins_when_both_are_present(self) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(volume=0.10),
+            config=GuildConfig(volume=0.75),
+        )
+        assert snapshot.stored_volume == 0.75
+
+    def test_a_legacy_value_is_still_honoured(self) -> None:
+        """The guild set 30% before the deploy; it must come back at 30%."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData(volume=0.30))
+        assert snapshot.stored_volume == 0.30
+
+    def test_nothing_stored_stays_none(self) -> None:
+        """Not 1.0 — restore has to skip the assignment rather than clobber a
+        concurrent -volume with a fabricated default."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData())
+        assert snapshot.stored_volume is None
+
+    def test_an_explicit_zero_is_not_mistaken_for_unset(self) -> None:
+        """0.0 is falsy and a real choice — muted."""
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(), config=GuildConfig(volume=0.0)
+        )
+        assert snapshot.stored_volume == 0.0

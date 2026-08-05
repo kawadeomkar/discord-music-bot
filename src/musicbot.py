@@ -1643,11 +1643,22 @@ class MusicBot(commands.Cog):
                 return
             mp = self.get_mp(ctx)
             mp.volume = volume_pct / 100
+            persisted = False
             if mp.store is not None:
-                await mp.store.set_volume(mp.volume)
+                persisted = await mp.store.set_volume(mp.volume)
+            # Same rule as the debug toggle: the help promises this survives a
+            # restart, so a write that did not land is named rather than rounded
+            # up to success — a level that quietly reverts reads as being ignored.
+            durability = (
+                "It is saved for this server."
+                if persisted
+                else "⚠️ It could not be saved (Redis is unavailable), so it "
+                "applies until the bot restarts."
+            )
             await ctx.send(
                 embed=notice_embed(
-                    f"Set volume to {volume_pct}% (takes effect on next song)",
+                    f"Set volume to {volume_pct}% (takes effect on next song). "
+                    + durability,
                     discord.Color.blue(),
                 )
             )

@@ -19,6 +19,7 @@ from redis.typing import EncodableT, FieldT
 
 from src import config
 from src.guild_state import (
+    ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
@@ -1127,12 +1128,55 @@ class GuildRedisStore:
             config=GuildConfig.from_redis(raw_config),
         )
 
-    @_guild_op(default=None)
-    async def set_volume(self, volume: float) -> None:
-        """Persist the guild volume setting."""
+    @_guild_op(default=False)
+    async def set_volume(self, volume: float) -> bool:
+        """Persist the guild volume setting. True when it actually landed.
+
+        guild:{id}:config is the source of truth — the state hash expires in 24h, so
+        a choice stored there reset any guild that went a day without playing.
+
+        The legacy state field is written TOO, and deliberately NOT deleted, for one
+        release. Deleting it made a rollback silently reset every migrated guild to
+        100%: `just up <older-sha>` is a supported operation here, the older build
+        reads only StateField.VOLUME, and after a migration it would find the field
+        gone — with no log line and no user-visible cause. Dual-writing keeps a fresh
+        value on both sides, so a roll back or forward is a no-op in either
+        direction. Drop this leg, StateField.VOLUME and GuildStateData.volume
+        together in the release after every deployment understands :config.
+        """
+        # Encoded by GuildConfig.to_redis, never by hand: a single-field config
+        # serializes to exactly that field, so the wire format for volume lives in
+        # one place and the setter cannot drift from what from_redis expects.
+        mapping = GuildConfig(volume=volume).to_redis()
         pipe = self.redis.pipeline()
-        pipe.hset(self.state_key(), StateField.VOLUME, str(volume))
+        pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
+        # PERSIST for the same reason set_debug_mode does it: under volatile-lru an
+        # expiring config is a setting that reverts with no log line.
+        pipe.persist(self.config_key())
+        pipe.hset(self.state_key(), StateField.VOLUME, mapping[ConfigField.VOLUME])
+        # The legacy write can CREATE the state hash on a guild whose 24h TTL has
+        # already lapsed, and a state key created without an EXPIRE never expires
+        # again. _exec_with_state_ttl appends that EXPIRE after the writes.
         await self._exec_with_state_ttl(pipe)
+        return True
+
+    @_guild_op(default=False)
+    async def migrate_volume(self, volume: float) -> bool:
+        """Seed :config's volume from the legacy state field, never overwriting.
+
+        HSETNX, not HSET. Restore reads its snapshot and writes this back after an
+        arbitrary number of awaits, so a `-volume` landing inside that window would
+        otherwise be overwritten by the older stored value — durably, and while the
+        user is being told the new one took. Seeding is all a migration ever needs:
+        if a concurrent command already wrote a value there, there is nothing left
+        to migrate and the no-op is the correct outcome.
+        """
+        mapping = GuildConfig(volume=volume).to_redis()
+        pipe = self.redis.pipeline()
+        pipe.hsetnx(self.config_key(), ConfigField.VOLUME, mapping[ConfigField.VOLUME])
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
 
     # Durable per-guild config
 

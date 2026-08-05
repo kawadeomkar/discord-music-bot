@@ -6939,3 +6939,88 @@ class TestPlaynowLoopStart:
         self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
+
+
+class TestVolumeMigratesForwardOnRestore:
+    """The first restore after the deploy SEEDS a pre-move volume into config, so
+    no migration script is needed and the 24h state TTL stops being able to take the
+    setting with it. Seeds, never overwrites — the snapshot it is working from was
+    read an arbitrary number of awaits earlier."""
+
+    async def test_a_legacy_volume_is_restored_and_written_forward(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.30")
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.30
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.3"
+
+    async def test_a_muted_guild_is_restored_and_migrated(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """0.0 is a real choice, not an absence. A truthiness check here brings a
+        muted guild back at 100% AND never migrates it, so it is muted-then-loud on
+        every restart until the state hash expires and the setting is gone."""
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.0")
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.0
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.0"
+
+    async def test_a_config_volume_is_not_rewritten(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Already migrated: restore reads it and leaves it alone rather than
+        spending a write on every recovery for the life of the deployment."""
+        assert music_player.store is not None
+        await music_player.store.set_volume(0.75)
+        with patch.object(
+            type(music_player.store), "migrate_volume", new=AsyncMock()
+        ) as write:
+            await music_player._restore_state()
+        assert music_player.volume == 0.75
+        write.assert_not_awaited()
+
+    async def test_the_forward_write_cannot_clobber_a_concurrent_volume(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Restore reads its snapshot, then writes it back after an arbitrary number
+        of awaits. A `-volume` landing in that window used to be overwritten by the
+        older stored value — durably, while the user was being told the new one took.
+        The seed is HSETNX, so the newer value wins.
+        """
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.30")
+
+        real_snapshot = type(music_player.store).get_playback_snapshot
+
+        async def snapshot_then_user_sets_volume(store: object) -> object:
+            snapshot = await real_snapshot(store)  # pyright: ignore[reportArgumentType]
+            # The window: the snapshot is taken, and only then does -volume run.
+            assert music_player.store is not None
+            await music_player.store.set_volume(0.80)
+            return snapshot
+
+        with patch.object(
+            type(music_player.store),
+            "get_playback_snapshot",
+            new=snapshot_then_user_sets_volume,
+        ):
+            await music_player._restore_state()
+
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.8"
+
+    async def test_a_guild_that_never_set_one_keeps_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        before = music_player.volume
+        await music_player._restore_state()
+        assert music_player.volume == before

@@ -127,7 +127,7 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
     and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
     both archive modes, so evicting or expiring it answers a guild with silence.
-    `guild:{id}:config` holds a guild's DURABLE choices — evicting it silently
+    `guild:{id}:config` holds a guild's DURABLE choices (debug mode, volume) — evicting it silently
     reverts a setting the guild chose, with no log line and no error, which is
     exactly the failure the in-memory version had. It is a fixed handful of fields
     per guild, written only by an explicit command and deleted on guild removal, so
@@ -447,11 +447,11 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | volume, voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
-| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). One field today: `debug_mode` (`"1"`/`"0"`). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Two fields today: `debug_mode` (`"1"`/`"0"`) and `volume`. **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |

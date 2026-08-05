@@ -744,10 +744,19 @@ class MusicPlayer:
                         return
                     guild_state = snapshot.state
 
-                    # Only when a value was actually stored: an unconditional
-                    # assign would clobber a concurrent -volume with the default.
-                    if guild_state.volume is not None:
-                        self.volume = guild_state.volume
+                    stored_volume = snapshot.stored_volume
+                    # Only when a value was actually stored: an unconditional assign
+                    # would clobber a concurrent -volume with the default.
+                    if stored_volume is not None:
+                        self.volume = stored_volume
+                        # Seed a pre-move value forward, once. Volume lived in the
+                        # state hash, which expires in 24h, so leaving it there means
+                        # a guild quiet for a day loses the setting. migrate_volume,
+                        # NOT set_volume: this snapshot was read an arbitrary number
+                        # of awaits ago, and a -volume that landed since must not be
+                        # overwritten by the older value it is carrying.
+                        if snapshot.config.volume is None and self.store is not None:
+                            await self.store.migrate_volume(stored_volume)
 
                     # Display snapshot, so -now works if a song was playing.
                     if snapshot.now_playing is not None:
