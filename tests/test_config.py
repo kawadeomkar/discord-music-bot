@@ -17,6 +17,7 @@ from src.config import (
     DEFAULT_POSTGRES_PASSWORD,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
+    _float_env,
     _int_env,
     history_archive_enabled,
     postgres_url,
@@ -212,6 +213,55 @@ class TestIntEnv:
         monkeypatch.setenv("KNOB", raw)
         with pytest.raises(ValueError, match="KNOB must be an integer"):
             _int_env("KNOB", 0)
+
+
+class TestFloatEnv:
+    """The parser behind the four live-dashboard knobs. Same import-time constraints
+    as _int_env, plus two failure shapes int() cannot express."""
+
+    def test_unset_returns_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KNOB", raising=False)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    def test_parses_a_set_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KNOB", "2.5")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 2.5
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "0.001"])
+    def test_below_the_floor_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tick of 0 makes the dashboard's timed wait return instantly forever —
+        a hot loop for the whole deadline, on the loop carrying voice heartbeats."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be >= 0.05"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
+    def test_non_finite_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """float() accepts all of these. A deadline of inf never expires, so the
+        command holds its max_concurrency slot forever and every later run in that
+        guild answers "already running" — a floor alone would not catch it."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a finite number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["abc", "1.0s", "half"])
+    def test_malformed_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
 
 
 class TestArchiveTunables:
