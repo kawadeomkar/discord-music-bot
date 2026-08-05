@@ -226,6 +226,8 @@ src/
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
 ├── dashboard.py      # optimistic-send + live-edit driver, extracted from -ping
 ├── ping.py           # -ping health dashboard: probes + render (sequencing is dashboard.py)
+├── debug.py          # -debug snapshot + debug-mode toggle parsing; OBSERVATION-ONLY by rule
+│                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT detection (env var or git branch), SpotifyStatus, tunables
 └── util.py           # logger factory, embed helpers, fmt_duration, task helpers
@@ -585,6 +587,11 @@ to keep waiting).
 
 The NP card (embed with a 10-segment live progress bar, edited every
 `NOW_PLAYING_UPDATE_INTERVAL_SECS` = 3.0s) stays glued to the bottom of the channel.
+**The two live dashboards are the documented exception**: `-ping` and `-debug` reply
+through `ctx.channel.send`, not `MusicContext.send`, because a message an edit loop
+owns must not also be the NP host — the progress updater would re-render it every
+3s. So those replies carry no NP block AND do not retire the current host, which
+stays above them until the next ordinary `ctx.send` adopts a new one.
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
 10-embed cap; worst case here is 3), then `_adopt_np_host_if_current` makes that message
@@ -840,6 +847,7 @@ duplicated.
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
+| `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (a Postgres stats query, a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
 | `OTEL_SDK_DISABLED` | `false` | `true` disables tracing/log export (stdout logs remain) |
 | `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` | `discord-music-bot` / `http://localhost:4317` | |
 

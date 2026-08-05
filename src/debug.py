@@ -1,29 +1,50 @@
-"""Debug mode: the footer every reply grows while it is on.
+"""Debug mode: the `-debug` diagnostic snapshot and the footer behind it.
 
 OBSERVATION-ONLY, and that is the whole design constraint. Nothing here changes
 playback, caching, queueing or persistence — only what the bot shows. It is what
 keeps "test with debug on, ship with debug off" a valid methodology: nothing you
 validated changes when the toggle flips.
+
+Every collector degrades to a labeled `unknown`/`n/a` rather than raising (see
+_safe_block) — a debug tool that crashes is worse than no debug tool. src/musicbot.py
+owns only the command registration and the override state; parsing, collection and
+rendering live here, the same split -ping uses.
 """
 
 import asyncio
+import math
 import os
 import resource
+import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import discord
+from discord.ext import commands
 from opentelemetry import trace
 
 from enum import Enum
 
-from src.util import cancel_task, get_logger, trace_id_of, truncate
+from src.config import DEBUG_DEADLINE_SECS, DEBUG_TICK_SECS, ENVIRONMENT
+from src.dashboard import run_live_dashboard
+from src.ping import bot_version, collect_versions
+from src.redis_client import GuildRedisStore
+from src.util import (
+    cancel_task,
+    get_logger,
+    trace_footer,
+    trace_id_of,
+    truncate,
+)
 
 if TYPE_CHECKING:
+    import redis.asyncio as aioredis
+
+    from src.musicplayer import MusicPlayer
     from src.ytdlp_pool import PoolState
 
 log = get_logger(__name__)
@@ -480,3 +501,401 @@ class RuntimeSampler:
             tasks=len(asyncio.all_tasks()),
             pool_workers=pool_state().max_workers,
         )
+
+
+# Stamped at import: the extension loads within seconds of process start, so this
+# is the process's start time for every purpose this command has.
+_PROCESS_START = time.time()
+
+_GIT_PROBE_TIMEOUT_SECS = 2.0
+_git_sha_cache: Optional[str] = None
+
+# Block order in the embed, and which probe fills each deferred one. The mapping is
+# what lets the deadline mark exactly the blocks a straggler owed and no others.
+_BLOCK_ORDER = (
+    "Build",
+    "Versions",
+    "Discord",
+    "This server",
+)
+_PROBE_BLOCKS: dict[str, tuple[str, ...]] = {
+    "build": ("Build",),
+}
+_PENDING_LINES = ["⏳ collecting…"]
+# Named rather than blank: a block that silently vanished would read as "this host
+# has no Build", which is a different and wrong answer.
+_TIMEOUT_LINES = ["⚠️ timed out"]
+
+_OPERATOR_NOTICE = (
+    "-# Host details (configuration, storage, runtime) are shown to the bot owner "
+    "only. Run `-ping` for dependency health."
+)
+
+# Discord's hard caps on an embed field value and its footer text.
+_FIELD_LIMIT = 1024
+FOOTER_LIMIT = 2048
+
+_DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DebugInputs:
+    """What the cog hands the snapshot: state this module cannot reach without
+    importing MusicBot, which would be an import cycle. Later blocks add fields with
+    defaults, so the cog's call site stays one expression."""
+
+    debug_enabled: bool
+    debug_overridden: bool
+    # False only when a toggle's Redis write failed, so the snapshot can say
+    # "this session only" instead of claiming a durability the user was just
+    # warned did not happen. True for a guild that never chose, where the
+    # question does not arise.
+    debug_persisted: bool = True
+    players: int
+    player: Optional["MusicPlayer"] = None
+    redis: Optional["aioredis.Redis"] = None
+    store: Optional[GuildRedisStore] = None
+    # Is the caller the bot owner? Gates every block that describes the HOST rather
+    # than the caller's own server — see _OPERATOR_BLOCKS. Defaults False so a call
+    # site that forgets to ask discloses nothing.
+    operator: bool = False
+    # None = not asked, and only an operator is ever asked. Set symmetrically with
+    # `operator` rather than only when it is True: a row that appears for False and
+    # vanishes for True would make its own absence the answer.
+    default_password: Optional[bool] = None
+
+
+def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
+    """Run a collector, or render why it could not run. The degrade principle made
+    mechanical: no block may take the embed down with it."""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 — a debug collector must never raise out
+        log.warning(f"debug block {label!r} failed: {type(e).__name__}: {e}")
+        return [f"unavailable ({type(e).__name__})"]
+
+
+async def _safe_block_async(
+    label: str, fn: Callable[[], Awaitable[list[str]]]
+) -> list[str]:
+    try:
+        return await fn()
+    except Exception as e:  # noqa: BLE001 — same rule for the collectors that do IO
+        log.warning(f"debug block {label!r} failed: {type(e).__name__}: {e}")
+        return [f"unavailable ({type(e).__name__})"]
+
+
+def _fmt_ms(seconds: float) -> str:
+    """Latency in ms, or the word for a latency that is not a number yet.
+
+    nan is discord.py's gateway-is-reconnecting value and inf is the voice client's
+    before-first-heartbeat value; both would render as garbage arithmetic.
+    """
+    ms = seconds * 1000
+    if math.isnan(ms):
+        return "reconnecting"
+    if math.isinf(ms):
+        return "warming up"
+    return f"{round(ms)} ms"
+
+
+def git_sha() -> str:
+    """The commit this build was made from, cached for process lifetime.
+
+    GIT_SHA is baked into the runtime image (Dockerfile ARG→ENV); the git fallback
+    covers `just run` from a checkout, where there is no image at all. A dirty
+    build's tag is `<sha>-dirty.<digest>` and passes through unchanged, so the bot
+    reports exactly the tag that was deployed.
+    """
+    global _git_sha_cache
+    if _git_sha_cache is not None:
+        return _git_sha_cache
+    baked = (os.environ.get("GIT_SHA") or "").strip()
+    if baked:
+        _git_sha_cache = baked
+        return baked
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_PROBE_TIMEOUT_SECS,
+            check=True,
+        )
+        _git_sha_cache = result.stdout.strip() or "unknown"
+    except Exception as e:  # noqa: BLE001 — no checkout and no ENV is not an error
+        log.debug(f"git sha probe failed: {type(e).__name__}: {e}")
+        _git_sha_cache = "unknown"
+    return _git_sha_cache
+
+
+def build_lines(sha: Optional[str]) -> list[str]:
+    """`sha` is REQUIRED, and resolved by the caller off the event loop.
+
+    Not defaulted to None-then-git_sha(): git_sha() shells out (measured 16ms
+    uncached, most of an audio frame's scheduling slack) and a default made that
+    blocking call reachable from any future caller that forgot. None here means
+    "the caller looked and there is no sha", which renders as unknown.
+    """
+    return [
+        f"version      {bot_version()}",
+        f"commit       {sha if sha is not None else 'unknown'}",
+        f"environment  {ENVIRONMENT}",
+        f"container    {'yes' if _in_container() else 'no'}",
+    ]
+
+
+def version_lines(versions: dict[str, str]) -> list[str]:
+    return [
+        f"bot          {versions['bot']}",
+        f"yt-dlp       {versions['yt-dlp']}",
+        f"ffmpeg       {versions['ffmpeg']}",
+        f"python       {versions['python']}  ·  discord.py {versions['discord.py']}",
+    ]
+
+
+def _mb(value: float) -> str:
+    return f"{value / 1_048_576:.0f} MB"
+
+
+def discord_lines(bot: commands.Bot, *, players: int) -> list[str]:
+    # latencies is AutoShardedClient-only; the single-shard shape is the fallback so
+    # this block works against a plain Bot (and the doubles in tests).
+    latencies = getattr(bot, "latencies", None)
+    if not isinstance(latencies, list):
+        latencies = [(0, bot.latency)]
+    shown = ", ".join(f"#{sid} {_fmt_ms(lat)}" for sid, lat in latencies[:4])
+    if len(latencies) > 4:
+        shown += ", …"
+    return [
+        f"shards       {len(latencies)}",
+        f"gateway      {shown}",
+        f"guilds       {len(bot.guilds)}",
+        f"players      {players}",
+        f"voice        {len(bot.voice_clients)} connected",
+    ]
+
+
+def _voice_latency_text(vc: discord.VoiceClient) -> str:
+    """Voice WS heartbeat latency and its 20-sample average.
+
+    Both are inf (and average_latency raises ZeroDivisionError) until the first ACK,
+    ~5s after joining — discord.py #6430. That window is exactly when a tester looks,
+    since testing starts with a fresh join.
+    """
+    try:
+        latency = _fmt_ms(vc.latency)
+        average = _fmt_ms(vc.average_latency)
+    except ZeroDivisionError:
+        return "warming up"
+    if latency == "warming up":
+        return latency
+    return f"{latency} (avg {average})"
+
+
+def _fence_safe(text: str) -> str:
+    """User-controlled text, made safe to interpolate into a ``` fence.
+
+    A voice-channel name is the only string in this snapshot a user picks, and the
+    "This server" block is public. A name containing a backtick run CLOSES the fence,
+    and Discord renders masked links inside embed field values — so `[Verify your
+    account](https://evil)` in a channel name becomes a clickable link inside a card
+    carrying the bot's own name and avatar. Join-to-create bots hand ordinary members
+    naming rights over their channel, so this needs no elevated permission.
+    unknown_arg_message already refuses to echo user text for this reason; the rule
+    is the same one function over.
+    """
+    return truncate(text.replace("`", "'"), 60)
+
+
+def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> list[str]:
+    mp = inputs.player
+    lines = [
+        f"player       {'yes' if mp is not None else 'no'}",
+        f"queue        {mp.queue.qsize() if mp is not None else 0} queued",
+        f"volume       {round(mp.volume * 100) if mp is not None else 100}%",
+        f"debug        {'on' if inputs.debug_enabled else 'off'} ({source})",
+    ]
+    vc = guild.voice_client
+    if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
+        lines.append("voice        not connected")
+        return lines
+    state = "playing" if vc.is_playing() else "paused" if vc.is_paused() else "idle"
+    lines.append(f"voice        {_fence_safe(vc.channel.name)} · {state}")
+    lines.append(f"voice ws     {_voice_latency_text(vc)}")
+    # connect/speak only: they are the two whose absence looks exactly like a
+    # playback bug rather than a permission problem.
+    perms = vc.channel.permissions_for(guild.me)
+    lines.append(
+        f"perms        connect {'✅' if perms.connect else '⚠️'} · "
+        f"speak {'✅' if perms.speak else '⚠️'}"
+    )
+    return lines
+
+
+def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
+    """Lines as one or more codeblock fields, each within Discord's 1024-char field
+    cap. Splits rather than truncates: a silently clipped config listing is worse
+    than none, since it reads as a complete one."""
+    fence = 8  # "```\n" + "\n```"
+    fields: list[tuple[str, str]] = []
+    chunk: list[str] = []
+    size = 0
+    for line in lines:
+        line = truncate(line, _FIELD_LIMIT - fence)
+        if chunk and size + len(line) + 1 + fence > _FIELD_LIMIT:
+            fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        fields.append((name if not fields else f"{name} (cont.)", _fence(chunk)))
+    return fields
+
+
+def _fence(lines: list[str]) -> str:
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+async def _build_blocks() -> dict[str, list[str]]:
+    """git_sha() shells out to git, so it goes to the default executor — the same
+    hop collect_versions() makes for `ffmpeg -version`, and for the same reason:
+    a subprocess on the event loop stalls voice heartbeats and every other guild.
+
+    Not cancellable, and that is accepted rather than overlooked: cancelling this
+    future does not stop a thread that has already started, so a `git rev-parse`
+    blocked on an index.lock holds one default-executor thread for its full
+    _GIT_PROBE_TIMEOUT_SECS after the deadline gave up on it. Bounded by that
+    timeout, once per process (git_sha caches), and nothing else contends for that
+    executor — the yt-dlp pool has its own.
+    """
+    loop = asyncio.get_running_loop()
+    sha = await loop.run_in_executor(None, git_sha)
+    return {"Build": _safe_block("build", lambda: build_lines(sha))}
+
+
+def instant_blocks(
+    ctx: commands.Context, inputs: DebugInputs, *, source: str
+) -> dict[str, list[str]]:
+    """Everything answerable without IO, so it is on the skeleton send.
+
+    Versions is here rather than gated because -ping already publishes the same
+    tuple to everyone; gating it would hide nothing.
+    """
+    blocks: dict[str, list[str]] = {}
+    guild = ctx.guild
+    if inputs.operator:
+        blocks["Discord"] = _safe_block(
+            "discord", lambda: discord_lines(ctx.bot, players=inputs.players)
+        )
+    if guild is not None:
+        blocks["This server"] = _safe_block(
+            "guild", lambda: guild_lines(guild, inputs, source=source)
+        )
+    return blocks
+
+
+def render_snapshot_embed(
+    ctx: commands.Context,
+    inputs: DebugInputs,
+    *,
+    blocks: dict[str, list[str]],
+    source: str,
+) -> discord.Embed:
+    """One embed from whatever has been collected so far. Pure and cheap: the live
+    loop calls it every tick and throws the result away unless it differs."""
+    embed = discord.Embed(
+        title="\U0001f41e Debug snapshot",
+        description=_snapshot_description(inputs, ctx.guild is not None, source),
+        color=_DEBUG_COLOR,
+    )
+    for name in _BLOCK_ORDER:
+        lines = blocks.get(name)
+        if lines is None:
+            continue
+        for field_name, value in _codeblock_fields(name, lines):
+            embed.add_field(name=field_name, value=value, inline=False)
+    # Published to everyone, while the same value is an operator-gated row in Config
+    # and Build — and on a `just run` deployment it is the git branch name. Known and
+    # inherited rather than decided here: -ping prints this identical footer to every
+    # caller, so gating it would hide nothing the sibling command does not disclose.
+    footer = f"environment: {ENVIRONMENT}"
+    if (tf := trace_footer(trace.get_current_span())) is not None:
+        footer += f" \u00b7 {tf}"
+    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
+    return embed
+
+
+def _snapshot_description(inputs: DebugInputs, in_guild: bool, source: str) -> str:
+    scope = "this server" if in_guild else "direct messages"
+    text = (
+        f"Debug mode is **{'on' if inputs.debug_enabled else 'off'}** for "
+        f"{scope} ({source})."
+    )
+    return text if inputs.operator else f"{text}\n\n{_OPERATOR_NOTICE}"
+
+
+async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> None:
+    """The `-debug` snapshot, sent immediately and filled in as its IO lands.
+
+    A host block costs a round trip somewhere — here, a git subprocess. Collecting
+    it before the first send makes the command look hung on a healthy host and far
+    longer on a sick one, which is exactly when it gets run.
+
+    So the shape is -ping's: skeleton now, edits as blocks land, a deadline that
+    marks stragglers rather than failing the whole card. That last part matters
+    more here than in -ping, because this card grows more blocks and one slow
+    dependency must not be able to take all of them down with it.
+
+    A non-operator has no deferred blocks at all (nothing they see needs IO), so
+    the driver degrades to a single send with no loop.
+    """
+    span = trace.get_current_span()
+    source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
+    blocks = instant_blocks(ctx, inputs, source=source)
+
+    probes: dict[str, Callable[[], Coroutine[Any, Any, dict[str, list[str]]]]] = {}
+    if inputs.operator:
+        probes = {"build": _build_blocks}
+        for names in _PROBE_BLOCKS.values():
+            for name in names:
+                blocks[name] = list(_PENDING_LINES)
+
+    async def _prepare() -> None:
+        """Versions is the one public block that needs a (cached, executor-hopped)
+        call, so it rides the pre-send step exactly as -ping's does."""
+        versions = await collect_versions()
+        blocks["Versions"] = _safe_block("versions", lambda: version_lines(versions))
+
+    def _settle(key: str, outcome: "dict[str, list[str]] | Exception") -> None:
+        if isinstance(outcome, Exception):
+            # _safe_block guards each collector, so reaching here means the probe
+            # itself broke rather than one block. Fail only its own blocks.
+            e = outcome
+            log.warning(f"debug probe {key!r} failed: {type(e).__name__}: {e}")
+            for name in _PROBE_BLOCKS[key]:
+                blocks[name] = [f"unavailable ({type(e).__name__})"]
+            return
+        blocks.update(outcome)
+
+    def _abandon(key: str) -> None:
+        for name in _PROBE_BLOCKS[key]:
+            blocks[name] = list(_TIMEOUT_LINES)
+
+    await run_live_dashboard(
+        ctx,
+        probes=probes,
+        settle=_settle,
+        abandon=_abandon,
+        render=lambda: [
+            render_snapshot_embed(ctx, inputs, blocks=blocks, source=source)
+        ],
+        prepare=_prepare,
+        tick_secs=DEBUG_TICK_SECS,
+        deadline_secs=DEBUG_DEADLINE_SECS,
+    )
+
+    span.set_attribute("debug.enabled", inputs.debug_enabled)
+    span.set_attribute("debug.source", source)
+    span.set_attribute("debug.players", inputs.players)
+    span.set_attribute("debug.operator", inputs.operator)

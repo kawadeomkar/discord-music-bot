@@ -1801,22 +1801,25 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="debug",
         aliases=["dbg"],
-        brief="show or toggle debug mode",
+        brief="diagnostic snapshot; toggle debug mode",
         usage="[--enable | --disable]",
         help=(
-            "Reports whether debug mode is on for this server, and where that came "
-            "from — a choice saved here, or the host's default.\n\n"
-            "`--enable` turns it on for this server, which adds a footer carrying "
-            "the trace id and timing to every reply — paste that id to the operator "
-            "and they can find the exact request in the logs. `--disable` turns it "
-            "back off. The choice is saved for this server and survives restarts; a "
-            "server that has never set it follows the host's default. Toggling needs "
-            "the **Manage Server** permission."
+            "Shows what this bot is running: versions, and Discord/voice state for "
+            "this server. For the bot owner it also fills in the build it came "
+            "from.\n\n"
+            "`--enable` turns debug mode on for this server, which adds a footer "
+            "carrying the trace id and timing to every reply — paste that id to the "
+            "operator and they can find the exact request in the logs. `--disable` "
+            "turns it back off. The choice is saved for this server and survives "
+            "restarts; a server that has never set it follows the host's default. "
+            "Toggling needs the **Manage Server** permission.\n\n"
+            'Where `-ping` answers "are my dependencies up, and how fast?", this '
+            'answers "what is running, and is it configured the way it should be?".'
         ),
         extras={
             "category": "Utility",
             # Read by cog_before_invoke to skip get_mp(): this command reports on a
-            # guild, so manufacturing a player to look at would be the observer
+            # guild's player, so manufacturing one to look at would be the observer
             # changing what it observes.
             "observation_only": True,
             "examples": ["-debug", "-debug --enable", "-debug --disable"],
@@ -1827,8 +1830,8 @@ class MusicBot(commands.Cog):
         },
     )
     # No validate_commands: diagnosing a bot needs no voice channel (-ping's
-    # precedent). One in flight per guild, wait=False; cog_command_error renders
-    # the refusal.
+    # precedent). One in flight per guild, wait=False, since the snapshot does real
+    # IO; cog_command_error renders the refusal.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.debug")
     async def debug(self, ctx: commands.Context, *, arg: str = "") -> None:
@@ -1844,23 +1847,32 @@ class MusicBot(commands.Cog):
             if action is not debug_mode.DebugAction.STATUS:
                 await self._toggle_debug_mode(ctx, action)
                 return
-            guild_id = ctx.guild.id if ctx.guild else None
-            on = self.debug_enabled(guild_id)
-            source = debug_mode.mode_source(
-                guild_id is not None and guild_id in self._debug_overrides,
-                persisted=guild_id not in self._debug_unpersisted,
-            )
-            await ctx.send(
-                embed=notice_embed(
-                    f"Debug mode is **{'on' if on else 'off'}** here ({source}). "
-                    "Replies "
-                    + ("carry" if on else "do not carry")
-                    + " a footer with the trace id and timing.",
-                    discord.Color.blue(),
-                )
-            )
+            inputs = await self._debug_inputs(ctx)
+            # No typing indicator and no ctx.send: the dashboard sends its own
+            # skeleton immediately and edits it as blocks land, so the reply IS the
+            # acknowledgement. It uses channel.send to stay off the Now Playing host,
+            # which an edit loop must not own (src/dashboard.py).
+            await debug_mode.run_debug_dashboard(ctx, inputs)
         except Exception as e:
             await self._command_error(ctx, e)
+
+    async def _debug_inputs(self, ctx: commands.Context) -> "debug_mode.DebugInputs":
+        """Everything the snapshot cannot reach on its own (src/debug.py importing
+        MusicBot would be a cycle)."""
+        guild_id = ctx.guild.id if ctx.guild else None
+        operator = await self._is_owner(ctx)
+        return debug_mode.DebugInputs(
+            debug_enabled=self.debug_enabled(guild_id),
+            debug_overridden=guild_id is not None and guild_id in self._debug_overrides,
+            debug_persisted=guild_id not in self._debug_unpersisted,
+            players=len(self.mps),
+            player=self.mps.get(guild_id) if guild_id is not None else None,
+            redis=self.redis,
+            store=GuildRedisStore(self.redis, guild_id)
+            if self.redis is not None and guild_id is not None
+            else None,
+            operator=operator,
+        )
 
     async def _is_owner(self, ctx: commands.Context) -> bool:
         """Is the caller the bot owner? Fails CLOSED.

@@ -6,15 +6,51 @@ The seam that applies it to real command responses is tested in test_context.py.
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Any, Optional, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from discord.ext import commands
 from opentelemetry import trace as trace_api
 
 from src import debug
+from src.musicplayer import MusicPlayer
+from src.debug import (
+    DebugInputs,
+    _codeblock_fields,
+    discord_lines,
+    guild_lines,
+    run_debug_dashboard,
+)
+
+
+async def _snapshot(ctx: MagicMock, inputs: DebugInputs) -> discord.Embed:
+    """Drive the live dashboard to completion and return the FINAL embed — what a
+    user is looking at once every block has landed. The dashboard sends a skeleton
+    and then edits, so the last edit (or the send, when nothing was deferred) is the
+    finished card."""
+    message = MagicMock(spec=discord.Message)
+    message.edit = AsyncMock()
+    ctx.channel.send = AsyncMock(return_value=message)
+    await run_debug_dashboard(ctx, inputs)
+    call = message.edit.await_args or ctx.channel.send.await_args
+    assert call is not None
+    return cast(discord.Embed, call.kwargs["embeds"][0])
+
+
+async def _skeleton(ctx: MagicMock, inputs: DebugInputs) -> discord.Embed:
+    """The FIRST embed the user sees, before any deferred block has landed."""
+    message = MagicMock(spec=discord.Message)
+    message.edit = AsyncMock()
+    ctx.channel.send = AsyncMock(return_value=message)
+    await run_debug_dashboard(ctx, inputs)
+    call = ctx.channel.send.await_args
+    assert call is not None
+    return cast(discord.Embed, call.kwargs["embeds"][0])
 
 
 class TestDebugFooter:
@@ -426,3 +462,452 @@ class TestFooterRuntimeSegment:
 
     def test_no_snapshot_yields_no_runtime_segment(self) -> None:
         assert debug.debug_footer(elapsed_ms=1, shard_id=0) == "🐞 1 ms · shard 0"
+
+
+class TestSafeBlock:
+    async def test_a_broken_collector_does_not_take_the_embed_down(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The degrade principle: every collector is wrapped, because a debug tool
+        that crashes is worse than no debug tool."""
+        mock_ctx.guild = None
+        with patch.object(debug, "build_lines", side_effect=RuntimeError("boom")):
+            embed = await _snapshot(
+                mock_ctx,
+                DebugInputs(
+                    debug_enabled=False,
+                    debug_overridden=False,
+                    players=0,
+                    operator=True,
+                ),
+            )
+        build = next(f for f in embed.fields if f.name == "Build")
+        assert "unavailable (RuntimeError)" in (build.value or "")
+        # The neighbouring blocks are untouched — one broken collector costs one row.
+        assert [f.name for f in embed.fields].count("Discord") == 1
+
+
+class TestCodeblockFields:
+    def test_short_block_is_one_field(self) -> None:
+        fields = _codeblock_fields("Config", ["a", "b"])
+        assert fields == [("Config", "```\na\nb\n```")]
+
+    def test_long_block_splits_rather_than_truncating(self) -> None:
+        """Discord's field cap is 1024. A config listing clipped in place would
+        read as a complete one, which is worse than showing none."""
+        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
+        fields = _codeblock_fields("Config", lines)
+        assert len(fields) > 1
+        assert all(len(value) <= 1024 for _, value in fields)
+        assert fields[1][0] == "Config (cont.)"
+        rendered = "".join(value for _, value in fields)
+        for line in lines:
+            assert line in rendered
+
+
+class TestDiscordBlock:
+    def test_falls_back_to_single_shard_shape(self, mock_bot: MagicMock) -> None:
+        """`latencies` is AutoShardedClient-only; a plain Bot (and every MagicMock,
+        which auto-vivifies it into something that is not a list) takes this arm."""
+        lines = "\n".join(discord_lines(mock_bot, players=2))
+        assert "shards       1" in lines
+        assert "#0 50 ms" in lines
+        assert "players      2" in lines
+
+    def test_renders_every_shard(self, mock_bot: MagicMock) -> None:
+        mock_bot.latencies = [(0, 0.041), (1, 0.038)]
+        lines = "\n".join(discord_lines(mock_bot, players=0))
+        assert "shards       2" in lines
+        assert "#0 41 ms, #1 38 ms" in lines
+
+    def test_reconnecting_shard_is_not_rendered_as_a_number(
+        self, mock_bot: MagicMock
+    ) -> None:
+        mock_bot.latencies = [(0, float("nan"))]
+        assert "reconnecting" in "\n".join(discord_lines(mock_bot, players=0))
+
+
+class TestGuildBlock:
+    def _inputs(self, player: object = None) -> DebugInputs:
+        return DebugInputs(
+            debug_enabled=True,
+            debug_overridden=True,
+            players=1,
+            player=cast(Optional[MusicPlayer], player),
+        )
+
+    def test_reports_no_player_and_no_voice(self, mock_guild: MagicMock) -> None:
+        mock_guild.voice_client = None
+        lines = "\n".join(
+            guild_lines(mock_guild, self._inputs(), source="saved here"),
+        )
+        assert "player       no" in lines
+        assert "voice        not connected" in lines
+        assert "debug        on (saved here)" in lines
+
+    def test_reports_player_queue_and_volume(
+        self, mock_guild: MagicMock, music_player: MagicMock
+    ) -> None:
+        mock_guild.voice_client = None
+        music_player.volume = 0.5
+        lines = "\n".join(
+            guild_lines(
+                mock_guild, self._inputs(player=music_player), source="saved here"
+            )
+        )
+        assert "player       yes" in lines
+        assert "queue        0 queued" in lines
+        assert "volume       50%" in lines
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "```[Verify your account](https://evil.example)```",
+            "`` ` ``",
+            "```\n@everyone\n```",
+            "x" * 200,
+        ],
+    )
+    def test_a_channel_name_cannot_break_out_of_the_code_fence(
+        self, mock_guild: MagicMock, name: str
+    ) -> None:
+        """A voice-channel name is the only user-controlled string in the snapshot,
+        and `This server` is the block every guild member can see. A backtick run
+        closes the fence, and Discord renders masked links inside embed field values
+        — a clickable attacker link inside a card carrying the bot's name and avatar.
+        Join-to-create bots hand ordinary members naming rights, so it needs no
+        permission at all."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = name
+        vc.average_latency = 0.02
+        mock_guild.voice_client = vc
+
+        rendered = "\n".join(guild_lines(mock_guild, self._inputs(), source="x"))
+
+        assert "`" not in rendered
+        # The cap is half the control: an unbounded name pushes the rest of the
+        # block past Discord's 1024-char field limit and the send 400s.
+        assert max(len(line) for line in rendered.splitlines()) < 120
+
+    def test_voice_latency_warming_up_is_not_an_error(
+        self, mock_guild: MagicMock
+    ) -> None:
+        """discord.py #6430: both reads are inf, and average_latency raises
+        ZeroDivisionError, until the first ACK ~5s after joining — exactly the
+        window a tester looks at, since testing starts with a fresh join."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = "General"
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.latency = float("inf")
+        type(vc).average_latency = property(
+            lambda _: (_ for _ in ()).throw(ZeroDivisionError())
+        )
+        mock_guild.voice_client = vc
+        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
+        assert "voice ws     warming up" in lines
+
+    def test_missing_voice_permissions_are_flagged(self, mock_guild: MagicMock) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = "General"
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.latency = 0.021
+        vc.average_latency = 0.023
+        perms = MagicMock(spec=discord.Permissions)
+        perms.connect = True
+        perms.speak = False
+        vc.channel.permissions_for.return_value = perms
+        mock_guild.voice_client = vc
+        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
+        assert "voice        General · playing" in lines
+        assert "voice ws     21 ms (avg 23 ms)" in lines
+        assert "connect ✅" in lines
+        assert "speak ⚠️" in lines
+
+
+class TestSnapshotEmbed:
+    async def test_renders_every_block_in_a_guild(self, mock_ctx: MagicMock) -> None:
+        """Order is fixed by _BLOCK_ORDER, so a block added later has to choose its
+        place rather than landing wherever the dict happened to put it."""
+        mock_ctx.guild.voice_client = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=False,
+                debug_overridden=False,
+                players=1,
+                operator=True,
+            ),
+        )
+        assert [f.name for f in embed.fields] == [
+            "Build",
+            "Versions",
+            "Discord",
+            "This server",
+        ]
+
+    async def test_dm_omits_the_guild_block(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert "This server" not in [f.name for f in embed.fields]
+        assert embed.description is not None
+        assert "direct messages" in embed.description
+        assert "(host default)" in embed.description
+
+    async def test_footer_carries_environment(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert embed.footer.text is not None
+        assert embed.footer.text.startswith("environment: ")
+
+
+class TestCommandRegistration:
+    def test_registered_under_utility_with_self_documenting_extras(self) -> None:
+        from src.help import CATEGORY_COMMANDS
+        from src.musicbot import MusicBot
+
+        command = MusicBot.debug
+        assert isinstance(command, commands.Command)
+        assert command.name == "debug"
+        assert "dbg" in command.aliases
+        assert command.extras["category"] == "Utility"
+        assert command.extras["examples"]
+        assert "debug" in CATEGORY_COMMANDS["Utility"]
+
+
+class TestGitSha:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(debug, "_git_sha_cache", None)
+
+    def test_baked_env_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The deployed case: GIT_SHA is an ENV in the runtime image, because an
+        OCI label is invisible from inside the container."""
+        monkeypatch.setenv("GIT_SHA", "abc1234-dirty.deadbeef")
+        assert debug.git_sha() == "abc1234-dirty.deadbeef"
+
+    def test_falls_back_to_the_checkout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`just run` from a checkout has no image and therefore no baked SHA.
+
+        The subprocess is faked rather than really run: the runtime image copies
+        src/ and pyproject.toml but no .git, so a real `git rev-parse` succeeds
+        under `just test` and fails under `just container-test`.
+        """
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        monkeypatch.setattr(
+            debug.subprocess,
+            "run",
+            MagicMock(return_value=SimpleNamespace(stdout="a1b2c3d\n")),
+        )
+        assert debug.git_sha() == "a1b2c3d"
+
+    def test_real_checkout_answers_when_there_is_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unfaked, so the argv itself is exercised — but skipped where there is
+        no checkout, which is exactly the runtime image."""
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        if not Path(__file__).resolve().parent.parent.joinpath(".git").exists():
+            pytest.skip("no git checkout (runtime image)")
+        assert re.fullmatch(r"[0-9a-f]{7,40}", debug.git_sha())
+
+    def test_no_env_and_no_git_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        monkeypatch.setattr(
+            debug.subprocess, "run", MagicMock(side_effect=OSError("no git"))
+        )
+        assert debug.git_sha() == "unknown"
+
+    def test_cached_for_process_lifetime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GIT_SHA", "first")
+        assert debug.git_sha() == "first"
+        monkeypatch.setenv("GIT_SHA", "second")
+        assert debug.git_sha() == "first"
+
+
+def _redis_info(**overrides: object) -> dict[str, object]:
+    """A realistic INFO reply. fakeredis does not implement INFO at all — it raises
+    ResponseError — so every Redis-block test supplies its own."""
+    info: dict[str, object] = {
+        "used_cpu_sys": 1.0,
+        "used_cpu_user": 2.0,
+        "used_memory": 44040192,
+        "maxmemory": 268435456,
+        "mem_fragmentation_ratio": 1.08,
+        "maxmemory_policy": "volatile-lru",
+        "connected_clients": 3,
+        "instantaneous_ops_per_sec": 148,
+        "keyspace_hits": 870,
+        "keyspace_misses": 130,
+        "evicted_keys": 0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_last_write_status": "ok",
+        "db0": {"keys": 1284, "expires": 1192, "avg_ttl": 0},
+    }
+    info.update(overrides)
+    return info
+
+
+class TestOperatorGate:
+    """`-debug` is reachable by any user in any guild, and by DM. Everything that
+    describes the HOST rather than the caller's own server is owner-only."""
+
+    _HOST_BLOCKS = ("Build", "Discord")
+
+    async def test_non_operator_sees_only_versions_and_their_own_server(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.voice_client = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=3),
+        )
+        assert [f.name for f in embed.fields] == ["Versions", "This server"]
+
+    async def test_non_operator_never_reaches_a_host_collector(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Not just absent from the embed — never collected. A gate that renders
+        the block and then drops it still reads the host, and still pays the IO."""
+        mock_ctx.guild.voice_client = None
+        with (
+            patch.object(debug, "discord_lines") as discord_block,
+            patch.object(debug, "build_lines") as build,
+        ):
+            await _snapshot(
+                mock_ctx,
+                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+            )
+        for collector in (discord_block, build):
+            collector.assert_not_called()
+
+    async def test_a_non_operators_snapshot_carries_no_host_detail(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The disclosure this gate exists for. The sentinel stands in for every
+        host-describing row."""
+        mock_ctx.guild.voice_client = None
+        with patch.object(debug, "discord_lines", return_value=["shards  sentinel"]):
+            embed = await _snapshot(
+                mock_ctx,
+                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+            )
+        assert "sentinel" not in str(embed.to_dict())
+
+    async def test_a_non_operator_is_told_why_rather_than_left_guessing(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert embed.description is not None
+        assert "bot owner" in embed.description
+        assert "-ping" in embed.description
+
+    async def test_the_operator_notice_is_absent_for_an_operator(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=False,
+                debug_overridden=False,
+                players=0,
+                operator=True,
+            ),
+        )
+        assert embed.description is not None
+        assert "bot owner" not in embed.description
+
+    @pytest.mark.parametrize("block", _HOST_BLOCKS)
+    async def test_every_host_block_is_absent_for_a_non_operator(
+        self, mock_ctx: MagicMock, block: str
+    ) -> None:
+        """Parametrized per block so a block added later has to decide which side of
+        this gate it is on rather than defaulting to public."""
+        mock_ctx.guild.voice_client = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert block not in [f.name for f in embed.fields]
+
+
+class TestTheSnapshotDoesNotWaitForItsIO:
+    """-debug sends a skeleton and fills it in. The point is that a sick dependency
+    delays one BLOCK, not the whole reply."""
+
+    @staticmethod
+    def _operator(**kw: Any) -> DebugInputs:
+        return DebugInputs(
+            debug_enabled=False, debug_overridden=False, players=0, operator=True, **kw
+        )
+
+    async def test_the_instant_blocks_are_already_filled_in_the_skeleton(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Discord needs no IO, so making the user wait for it would be pure loss.
+        Versions rides prepare()."""
+        mock_ctx.guild.voice_client = None
+        embed = await _skeleton(mock_ctx, self._operator())
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "shards" in rendered["Discord"]
+        assert "collecting" not in rendered["Versions"]
+
+    async def test_the_send_happens_before_a_slow_block_resolves(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The whole contract: the skeleton is out while Build is still shelling
+        out to git."""
+        mock_ctx.guild.voice_client = None
+        gate = asyncio.Event()
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        mock_ctx.channel.send = AsyncMock(return_value=message)
+
+        async def slow_build() -> dict[str, list[str]]:
+            await gate.wait()
+            return {"Build": ["commit  abc123"]}
+
+        with patch.object(debug, "_build_blocks", slow_build):
+            task = asyncio.create_task(run_debug_dashboard(mock_ctx, self._operator()))
+            async with asyncio.timeout(3):
+                while mock_ctx.channel.send.await_count == 0:
+                    await asyncio.sleep(0)
+                call = mock_ctx.channel.send.await_args
+                assert call is not None
+                sent = call.kwargs["embeds"][0]
+                assert "collecting" in next(
+                    f.value or "" for f in sent.fields if f.name == "Build"
+                )
+                gate.set()
+                await task
+
+    async def test_a_probe_that_raises_degrades_to_its_own_blocks(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """_safe_block guards each collector, so a raise here means the PROBE broke.
+        It must cost its own blocks and nothing else."""
+        mock_ctx.guild.voice_client = None
+
+        async def boom() -> dict[str, list[str]]:
+            raise RuntimeError("probe exploded")
+
+        with patch.object(debug, "_build_blocks", boom):
+            embed = await _snapshot(mock_ctx, self._operator())
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "unavailable" in rendered["Build"]
+        assert "shards" in rendered["Discord"]

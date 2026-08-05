@@ -3955,15 +3955,16 @@ class TestDebugCommand:
     """The `-debug` command surface: toggle semantics, per-guild scoping, and the
     argument grammar."""
 
-    async def test_status_reports_the_mode_and_where_it_came_from(
+    async def test_status_sends_the_snapshot(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """A bare on/off is half an answer: the user needs to know whether this
-        server chose it or is following the host."""
+        """channel.send, not ctx.send: the snapshot is a live-edited dashboard now,
+        and an edit loop must not own the Now Playing host."""
+        mock_ctx.guild.voice_client = None
         await command_callback(MusicBot.debug)(music_bot, mock_ctx)
-        embed = mock_ctx.send.call_args[1]["embed"]
-        assert "**off**" in embed.description
-        assert "host default" in embed.description
+        mock_ctx.channel.send.assert_awaited_once()
+        embed = mock_ctx.channel.send.call_args.kwargs["embeds"][0]
+        assert embed.title == "🐞 Debug snapshot"
 
     async def test_enable_then_disable_round_trips(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4007,12 +4008,10 @@ class TestDebugCommand:
     async def test_dm_status_still_renders(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """A DM has no guild to scope a choice to, so it follows the host default
-        and says so rather than refusing."""
         mock_ctx.guild = None
         await command_callback(MusicBot.debug)(music_bot, mock_ctx)
-        embed = mock_ctx.send.call_args[1]["embed"]
-        assert "host default" in embed.description
+        embed = mock_ctx.channel.send.call_args.kwargs["embeds"][0]
+        assert embed.title == "🐞 Debug snapshot"
 
     async def test_bad_argument_answers_with_usage(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4021,6 +4020,18 @@ class TestDebugCommand:
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "--enable" in embed.description
         assert music_bot._debug_overrides == {}
+
+    async def test_collection_failure_becomes_an_error_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The command body's try/except → _command_error, like every other
+        command: a broken snapshot must not surface as a silent no-reply."""
+        with patch("src.debug.run_debug_dashboard", side_effect=RuntimeError("boom")):
+            await command_callback(MusicBot.debug)(music_bot, mock_ctx)
+        # The failure reply still goes through ctx.send — _command_error is not a
+        # dashboard, so it keeps the ordinary NP-host-aware path.
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert embed.title == "Command failed"
 
 
 class TestDebugTogglePermission:
@@ -4073,6 +4084,15 @@ class TestDebugTogglePermission:
         mock_ctx.bot.is_owner = AsyncMock(return_value=True)
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
         assert music_bot.debug_enabled(mock_ctx.guild.id) is True
+
+    async def test_reading_the_snapshot_stays_open_to_a_plain_member(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        self._plain_member(mock_ctx)
+        mock_ctx.guild.voice_client = None
+        await command_callback(MusicBot.debug)(music_bot, mock_ctx)
+        embed = mock_ctx.channel.send.call_args.kwargs["embeds"][0]
+        assert embed.title == "🐞 Debug snapshot"
 
 
 class TestDebugObservesWithoutCreating:

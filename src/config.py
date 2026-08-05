@@ -89,6 +89,16 @@ PING_DEADLINE_SECS: float = _float_env(
     "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
 )
 
+# The same two knobs for -debug's live-edit loop (src/dashboard.py drives both).
+# A longer deadline than -ping's: these collectors do strictly more work per block
+# — a Postgres stats query and a Prometheus round trip, against -ping's single
+# reachability probe — and a block that misses the deadline renders "timed out"
+# rather than being retried, so cutting it short loses real data.
+DEBUG_TICK_SECS: float = _float_env("DEBUG_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+DEBUG_DEADLINE_SECS: float = _float_env(
+    "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
+)
+
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
     """Parse an integer knob from the environment, or raise a named error.
