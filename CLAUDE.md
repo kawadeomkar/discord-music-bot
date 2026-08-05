@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.8.1, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.9.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -119,16 +119,22 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 11. **`pytest` filterwarnings is `error`.** Any new `DeprecationWarning` fails the suite.
     Add a targeted `ignore:` entry in `[tool.pytest.ini_options]` only with a comment
     explaining what upstream fix removes it (see the existing audioop entry).
-12. **Redis eviction policy is `volatile-lru` on purpose.** Two keys carry no TTL
-    and neither may become an eviction candidate. `history:outbox` holds plays that
+12. **Redis eviction policy is `volatile-lru` on purpose.** Three keys carry no TTL
+    and none may become an eviction candidate. `history:outbox` holds plays that
     are not durable in Postgres yet (written only while the archive is enabled — when
     it is off the key is never created, but the policy must still protect a leftover
     from an earlier enabled run); evicting one loses that play with no error, no
     `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
     and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
     both archive modes, so evicting or expiring it answers a guild with silence.
+    `guild:{id}:config` holds a guild's DURABLE choices — evicting it silently
+    reverts a setting the guild chose, with no log line and no error, which is
+    exactly the failure the in-memory version had. It is a fixed handful of fields
+    per guild, written only by an explicit command and deleted on guild removal, so
+    it scales with guild count and not with runtime.
     Never switch the compose Redis to `allkeys-lru`, and never put a TTL on the
-    history key: it is bounded by LENGTH, never by time.
+    history or config keys: history is bounded by LENGTH, and config is bounded by
+    the number of settings that exist.
 
 ## Commands
 
@@ -445,6 +451,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). One field today: `debug_mode` (`"1"`/`"0"`). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
@@ -819,6 +826,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | git branch (`main`→`production`) | set explicitly in CI/Docker/worktrees |
+| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every response with a trace/timing/runtime footer. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |

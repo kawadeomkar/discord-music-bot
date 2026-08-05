@@ -119,7 +119,7 @@ Five containers are defined in [docker-compose.yml](../docker-compose.yml):
 
 Redis is configured with:
 - `appendonly yes` + `appendfsync everysec` — data survives container restarts with at most 1 second of loss
-- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Two keys deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres) and `guild:{id}:history` (the capped, PERSISTed window `-history` reads). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
+- `maxmemory 256mb` + `maxmemory-policy volatile-lru` — **only TTL-carrying keys are eviction candidates**. Caches (`ytdl:*`, `spotify:*`) and the `guild:{id}:{state,queue,now_playing}` keys carry TTLs and are reconstructible or re-creatable. **Three kinds of key deliberately carry none** and must never become candidates: `history:outbox` (plays not yet durable in Postgres), `guild:{id}:history` (the capped, PERSISTed window `-history` reads) and `guild:{id}:config` (a guild's durable choices — evicting one silently reverts a setting the guild made). Never switch to `allkeys-*` — see [Redis memory bounds](#redis-memory-bounds)
 
 ```mermaid
 graph LR
@@ -785,6 +785,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
+| `guild:{id}:config` | Hash | 1 field → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `lock:guild:{id}:recovery` | String | `"1"` (SET NX EX — distributed lock) | 60 s |
@@ -1166,15 +1167,18 @@ socket read timeout. A slow tier must cost depth, never an error embed.
 
 ### Redis memory bounds
 
-Two kinds of key carry no TTL and are therefore never eviction candidates under
-`volatile-lru`: `guild:{id}:history` and `history:outbox`. Once they fill
+Three kinds of key carry no TTL and are therefore never eviction candidates under
+`volatile-lru`: `guild:{id}:history`, `guild:{id}:config` and `history:outbox`. Once they fill
 `maxmemory` with no TTL-bearing key left to evict, Redis rejects **every** write
 with OOM — state, queue and cache alike — and each store method swallows it and
 logs, so persistence degrades silently rather than crashing.
 
 Only the **outbox** can reach that state by growing. The history lists are bounded
 at `HISTORY_CACHE_LIMIT` per guild, so their total scales with guild count
-(~24 KB each, ~24 MB across a thousand), not with runtime. The outbox is near-empty
+(~24 KB each, ~24 MB across a thousand), not with runtime. The config hashes are
+bounded by the number of settings that exist — a handful of bytes per guild that has
+chosen one — so they scale with guild count even more weakly and cannot grow on their
+own at all. The outbox is near-empty
 whenever the drainer keeps up and grows for the whole duration of a Postgres
 outage, at ~487 bytes per play — so the bundled 256 MB budget holds roughly 525k
 un-archived plays. `HISTORY_OUTBOX_MAX` is the opt-in bound on it; it defaults to
@@ -1428,7 +1432,7 @@ Discord requires sharding at 2500+ guilds. `AutoShardedBot` negotiates shards au
 
 ### `volatile-lru` eviction policy
 
-With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). The one deliberately TTL-less key, `history:outbox`, holds played-song entries not yet drained to Postgres and must never be evicted; an `allkeys-*` policy would let memory pressure silently destroy not-yet-durable history, which is why the compose file pins the policy with a do-not-change comment.
+With 256 MB `maxmemory` and `volatile-lru`, only TTL-carrying keys are eviction candidates — all caches and all `guild:*` runtime keys, every one reconstructible (caches) or re-creatable (runtime state). Three kinds of key are deliberately TTL-less and must never be evicted: `history:outbox`, which holds played-song entries not yet drained to Postgres; `guild:{id}:history`, the capped window `-history` reads and the only source it has; and `guild:{id}:config`, which holds each guild's durable choices, where an eviction is a setting silently reverting with no log line. An `allkeys-*` policy would let memory pressure destroy not-yet-durable history or a guild's settings, which is why the compose file pins the policy with a do-not-change comment.
 
 ### Two-tier data architecture (Redis + Postgres)
 

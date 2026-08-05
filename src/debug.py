@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Optional
 import discord
 from opentelemetry import trace
 
+from enum import Enum
+
 from src.util import cancel_task, get_logger, trace_id_of, truncate
 
 if TYPE_CHECKING:
@@ -31,7 +33,70 @@ FOOTER_LIMIT = 2048
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 1 · FOOTER DECORATION
+# SECTION 1 · TOGGLE PARSING
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class DebugAction(Enum):
+    """What a `-debug` invocation asks for."""
+
+    STATUS = "status"
+    ENABLE = "enable"
+    DISABLE = "disable"
+
+
+_ACTIONS: dict[str, DebugAction] = {
+    "": DebugAction.STATUS,
+    "--enable": DebugAction.ENABLE,
+    "--disable": DebugAction.DISABLE,
+}
+
+DEBUG_USAGE = "`-debug`, `-debug --enable`, `-debug --disable`"
+
+
+def parse_debug_arg(arg: str) -> Optional[DebugAction]:
+    """The action `arg` names, or None when it names none.
+
+    Hand-parsed rather than a FlagConverter: these are valueless switches, which the
+    converter's `--flag value` grammar cannot express, and a missing-dashes `-debug
+    enable` gets a helpful answer here (see unknown_arg_message) instead of a FlagError
+    raised before the command body ever runs.
+    """
+    return _ACTIONS.get(arg.strip().lower())
+
+
+def unknown_arg_message(arg: str) -> str:
+    """The reply for an unparseable argument.
+
+    Deliberately does not echo the argument back: rendering user text into an embed
+    the bot sends is a mention-injection surface, and the did-you-mean branch already
+    covers the realistic typo.
+    """
+    cleaned = arg.strip().lower()
+    if f"--{cleaned}" in _ACTIONS:
+        return f"Did you mean `-debug --{cleaned}`? Options take two dashes."
+    return f"Unknown option. Usage: {DEBUG_USAGE}"
+
+
+def mode_source(overridden: bool, *, persisted: bool = True) -> str:
+    """Why debug mode is in its current state — the half of the answer a bare on/off
+    does not give. Renders inside "Debug mode is **on** for this server (...)", so
+    it stays short enough not to repeat the sentence around it.
+
+    Three states, not two. "saved here" is a stored choice that outlives restarts;
+    "host default" means this guild has never set one and follows DEBUG_MODE, so
+    changing that variable moves it and setting it here would pin it. "this session
+    only" is a toggle whose Redis write failed: the toggle already warned the user,
+    and reporting it as "saved here" one message later would make the command whose
+    job is to describe reality contradict the one that just changed it.
+    """
+    if not overridden:
+        return "host default"
+    return "saved here" if persisted else "this session only"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 2 · FOOTER DECORATION
 # ════════════════════════════════════════════════════════════════════════════
 # What debug mode actually does to ordinary traffic: every command response grows
 # a footer identifying the request. The trace id is the point — it is already the

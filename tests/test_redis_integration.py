@@ -36,6 +36,7 @@ Isolation: there is no throwaway-database-per-test equivalent to the pg tier's
 assumes it owns the server it is pointed at.
 """
 
+import asyncio
 import os
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -48,6 +49,7 @@ from redis.exceptions import OutOfMemoryError
 
 from src.guild_state import HistoryEntry
 from src.redis_client import (
+    read_guild_configs,
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
     HISTORY_OUTBOX_GROUP,
@@ -714,3 +716,61 @@ class TestRefPolicyIsNotAvailableYet:
             await redis.execute_command(
                 "XTRIM", HISTORY_OUTBOX_KEY, "MINID", ids[1], "ACKED"
             )
+
+
+class TestConfigReadsSurviveTheConnectionCap:
+    """The divergence this tier exists for. fakeredis has no connection pool, so a
+    per-guild fan-out looks perfect there and fails on a real server the moment a
+    bot passes `max_connections` guilds — silently, because @_guild_op turns the
+    pool's error into an all-unset config that reads as "this guild never chose"."""
+
+    @staticmethod
+    async def _client(redis_url: str) -> tuple[aioredis.Redis, Any]:
+        pool = aioredis.ConnectionPool.from_url(
+            redis_url, max_connections=20, decode_responses=False
+        )
+        return aioredis.Redis(connection_pool=pool), pool
+
+    async def test_the_naive_per_guild_fanout_really_does_lose_guilds(
+        self, redis_url: str
+    ) -> None:
+        """The bug, pinned. Not hypothetical and not a timing artefact: the pool
+        RAISES `MaxConnectionsError` rather than queueing (that is
+        BlockingConnectionPool), and the raise happens before `call_with_retry`, so
+        the configured retry never applies. Exactly `max_connections` survive."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            naive = await asyncio.gather(
+                *(GuildRedisStore(client, g).get_config() for g in ids)
+            )
+
+            assert sum(c.debug_mode is True for c in naive) == 20
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_read_guild_configs_resolves_every_guild(
+        self, redis_url: str
+    ) -> None:
+        """And the fix, against the same server and the same cap."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            configs = await read_guild_configs(client, ids)
+
+            assert sorted(configs) == ids
+            assert all(c.debug_mode is True for c in configs.values())
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()

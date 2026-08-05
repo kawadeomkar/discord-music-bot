@@ -209,6 +209,12 @@ def mock_ctx(
     # -ping's default-password advisory). AsyncMock is required — a bare
     # MagicMock attribute is unawaitable and every such command dies with TypeError.
     ctx.bot.is_owner = AsyncMock(return_value=True)
+    # Explicit, for the same reason mock_author pins guild_permissions: a bare
+    # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
+    # command would look like it carried every flag. cog_before_invoke reads
+    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # auto-mock there silently exempts the whole suite.
+    ctx.command.extras = {}
     return ctx
 
 
@@ -367,5 +373,11 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # mode on, every response grows a footer and the suite's embed assertions
     # would be asserting against decorated output everywhere.
     cog._debug_default = False
+    cog._debug_overrides = {}
+    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
+    # read before it cannot apply an older value on top.
+    cog._debug_toggle_seq = 0
+    cog._debug_toggled_at = {}
+    cog._debug_unpersisted = set()
     cog._runtime_sampler = RuntimeSampler()
     return cog

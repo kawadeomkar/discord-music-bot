@@ -36,6 +36,12 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     # added there has to be mirrored here or every test in this file dies on
     # AttributeError the first time the send path reads it.
     cog._debug_default = False
+    cog._debug_overrides = {}
+    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
+    # read before it cannot apply an older value on top.
+    cog._debug_toggle_seq = 0
+    cog._debug_toggled_at = {}
+    cog._debug_unpersisted = set()
     cog._runtime_sampler = RuntimeSampler()
     return cog
 
@@ -231,9 +237,7 @@ class TestDebugDecoration:
 
     @staticmethod
     def _enable(cog: MusicBot, guild_id: int) -> None:
-        """One seam for "this guild has debug on", so the tests below do not have
-        to care how that is decided."""
-        cog._debug_default = True
+        cog._debug_overrides[guild_id] = True
 
     async def test_off_leaves_embeds_untouched(
         self, mctx: MusicContext, live_mp: MagicMock
@@ -365,6 +369,16 @@ class TestDebugDecoration:
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)
         assert len(own.footer.text or "") == 2048
+
+    async def test_per_guild_scope_holds_at_the_send_seam(
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+    ) -> None:
+        """An enable in one server must not decorate another's replies."""
+        self._enable(music_bot_cog, 4242424242)
+        own = discord.Embed(title="Queue")
+        with _parent_send(MagicMock(spec=discord.Message)):
+            await mctx.send(embed=own)
+        assert own.footer.text is None
 
     async def test_no_cog_loaded_is_not_an_error(
         self, mctx: MusicContext, mock_bot: MagicMock

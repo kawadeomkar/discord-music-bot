@@ -12,6 +12,8 @@ import pytest
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
+    ConfigField,
+    GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
@@ -1239,3 +1241,34 @@ class TestQueueEntryImmutability:
         entry = SearchQueueEntry()
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(entry, "url", "x")
+
+
+class TestGuildConfig:
+    """Durable per-guild preferences. The tri-state is the whole design: "never
+    chose" has to stay distinguishable from "chose off", or a guild that opted out
+    while DEBUG_MODE=true would silently opt back in."""
+
+    def test_nothing_stored_is_unset_not_off(self) -> None:
+        assert GuildConfig.from_redis({}).debug_mode is None
+
+    @pytest.mark.parametrize(("stored", "expected"), [(b"1", True), (b"0", False)])
+    def test_a_stored_choice_round_trips(self, stored: bytes, expected: bool) -> None:
+        raw = {ConfigField.DEBUG_MODE.encode(): stored}
+        config = GuildConfig.from_redis(raw)
+        assert config.debug_mode is expected
+        assert GuildConfig(debug_mode=expected).to_redis() == {
+            ConfigField.DEBUG_MODE: stored.decode()
+        }
+
+    def test_unset_writes_no_field_at_all(self) -> None:
+        """Absent, not a sentinel — otherwise the read path cannot tell the two
+        apart and the tri-state collapses on the first round trip."""
+        assert GuildConfig().to_redis() == {}
+
+    @pytest.mark.parametrize("garbage", [b"", b"true", b"yes", b"2", b"\xff"])
+    def test_an_unparseable_value_reads_as_unset(self, garbage: bytes) -> None:
+        """This key outlives builds. One field written by a future version must cost
+        the guild its default, not its whole config — the same rule the queue and
+        history parsers follow."""
+        raw = {ConfigField.DEBUG_MODE.encode(): garbage}
+        assert GuildConfig.from_redis(raw).debug_mode is None
