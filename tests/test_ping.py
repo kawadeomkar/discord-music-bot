@@ -14,7 +14,7 @@ from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from src import ping, telemetry
+from src import dashboard, ping, telemetry
 from src.config import SpotifyStatus
 from src.ping import (
     ProbeResult,
@@ -102,6 +102,30 @@ class TestPingCommand:
         mock_ctx.channel.send.assert_awaited_once()
         assert "embeds" in mock_ctx.channel.send.call_args.kwargs
         mock_ctx.send.assert_not_awaited()
+
+    async def test_a_probe_that_raises_costs_its_row_not_the_whole_board(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """_timed guards a probe's BODY, not everything a probe does — probe_otel
+        parses a URL first. A settle callback runs on the driver's own task, so an
+        unguarded raise there took the board down before it was ever sent.
+        """
+        message = _ping_message(mock_ctx)
+
+        async def exploding() -> ping.ProbeResult:
+            raise ValueError("port could not be cast")
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 1.0)),
+            patch("src.ping.probe_otel", exploding),
+        ):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        mock_ctx.channel.send.assert_awaited_once()  # the board still exists
+        call = message.edit.await_args or mock_ctx.channel.send.await_args
+        rendered = str(_health_embed(call).to_dict())
+        assert "OTEL collector" in rendered
+        assert ProbeState.FAILED.value in rendered
 
     async def test_all_resolved_settles_in_the_send_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -872,27 +896,16 @@ class TestDefaultPasswordWarningReachesTheWire:
         assert len(embeds) == 2
         assert "Default database password" in (embeds[0].title or "")
 
-    async def test_safe_edit_returns_the_health_card_not_the_advisory(self) -> None:
-        """_safe_edit's return feeds the change-diffing loop, so it must be the
-        HEALTH card — the only embed that moves. Returning embeds[0] diffs against
-        the STATIC advisory and edits every tick. Asserted directly: the dashboard
-        reaches this line only when a probe resolves late, so a whole-command test
-        of it passes for the wrong reason whenever the probes are fast."""
-        message = MagicMock(spec=discord.Message)
-        message.edit = AsyncMock()
+    async def test_the_advisory_rides_along_on_every_edit(self) -> None:
+        """The advisory is static and the health card moves, so the driver diffs the
+        whole embed LIST. Dropping the advisory from an edit would make it flicker;
+        diffing only the card would edit every tick for no change. Both live in
+        tests/test_dashboard.py now — this asserts the pairing survives the seam."""
         warning = discord.Embed(title="⚠️ Default database password in use")
         health = discord.Embed(title="Health")
-
-        returned = await ping._safe_edit(message, [warning, health])
-
-        assert returned is health
-
-    async def test_safe_edit_returns_none_when_the_host_is_gone(self) -> None:
-        # The other arm: a user deleting the dashboard message mid-loop must not
-        # take the command down with it.
-        message = MagicMock(spec=discord.Message)
-        message.edit = AsyncMock(side_effect=discord.NotFound(MagicMock(), "gone"))
-        assert await ping._safe_edit(message, [discord.Embed(title="x")]) is None
+        assert not dashboard.embeds_changed([warning, health], [warning, health])
+        moved = discord.Embed(title="Health", description="redis 3 ms")
+        assert dashboard.embeds_changed([warning, moved], [warning, health])
 
 
 class TestTheAdvisoryIsForTheOperator:
