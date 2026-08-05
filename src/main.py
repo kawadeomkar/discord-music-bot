@@ -115,6 +115,7 @@ class MusicContext(commands.Context):
             if active is not None
             else None,
             shard_id=self.guild.shard_id if self.guild else None,
+            runtime=cog.runtime_snapshot,
         )
 
     def _music_cog(self) -> Optional["MusicBot"]:

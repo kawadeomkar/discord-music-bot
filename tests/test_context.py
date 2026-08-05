@@ -13,6 +13,7 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src.config import SpotifyStatus
+from src.debug import RuntimeSampler
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
 from tests.helpers import mocked
@@ -35,6 +36,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     # added there has to be mirrored here or every test in this file dies on
     # AttributeError the first time the send path reads it.
     cog._debug_default = False
+    cog._runtime_sampler = RuntimeSampler()
     return cog
 
 

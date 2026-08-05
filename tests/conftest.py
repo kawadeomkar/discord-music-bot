@@ -15,6 +15,7 @@ from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
+from src.debug import RuntimeSampler
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -366,4 +367,5 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # mode on, every response grows a footer and the suite's embed assertions
     # would be asserting against decorated output everywhere.
     cog._debug_default = False
+    cog._runtime_sampler = RuntimeSampler()
     return cog

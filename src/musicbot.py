@@ -23,6 +23,7 @@ from src.config import (
     debug_mode_default,
     spotify_enabled,
 )
+from src import debug as debug_mode
 from src import leaderboard
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
@@ -211,6 +212,7 @@ class MusicBot(commands.Cog):
         "_alone_timers",
         "_restore_tasks",
         "_debug_default",
+        "_runtime_sampler",
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -257,6 +259,10 @@ class MusicBot(commands.Cog):
         # what makes a garbage value abort startup inside load_extension rather than
         # surfacing later from somewhere that swallows it.
         self._debug_default: bool = debug_mode_default()
+        # One sampler per cog, never module state: a module global outlives a cog
+        # reload and would leak its task. cog_load is what starts it (see
+        # RuntimeSampler.apply for why load, not only toggles).
+        self._runtime_sampler = debug_mode.RuntimeSampler()
         if self._debug_default and ENVIRONMENT == "production":
             # Debug modes announce themselves in production; the convention is
             # Flask's and Django's. Observation-only, so this is an advisory, not
@@ -272,9 +278,17 @@ class MusicBot(commands.Cog):
         discord.py awaits this inside setup_hook, before the bot connects, so
         anything awaited here delays it. The probe is a live network call, spawned
         fire-and-forget; _spotify_status stays optimistically enabled meanwhile."""
+        # At load, not only on toggles — RuntimeSampler.apply's docstring has the
+        # reason.
+        self._sync_runtime_sampler()
         if self.spotify is None:
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
+
+    async def cog_unload(self) -> None:
+        """Stop the runtime sampler unconditionally. A reload that left it running
+        would drip /proc reads for the life of the process."""
+        await self._runtime_sampler.aclose()
 
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited). Only
@@ -1649,6 +1663,16 @@ class MusicBot(commands.Cog):
         whole send path later.
         """
         return self._debug_default
+
+    @property
+    def runtime_snapshot(self) -> Optional["debug_mode.RuntimeSnapshot"]:
+        """The rolling runtime metrics the debug footer prints, or None before the
+        sampler's first tick. Read by MusicContext.send."""
+        return self._runtime_sampler.snapshot
+
+    def _sync_runtime_sampler(self) -> None:
+        """Run the sampler exactly while debug mode is on somewhere."""
+        self._runtime_sampler.apply(wanted=self._debug_default)
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 
