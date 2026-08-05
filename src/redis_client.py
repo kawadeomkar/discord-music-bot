@@ -32,6 +32,7 @@ from src.guild_state import (
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
+    valid_timezone,
 )
 from src.util import get_logger
 
@@ -1212,6 +1213,36 @@ class GuildRedisStore:
         pipe.hset(
             self.config_key(),
             mapping=_hset_mapping(GuildConfig(debug_mode=enabled).to_redis()),
+        )
+        pipe.persist(self.config_key())
+        await pipe.execute()
+        return True
+
+    @_guild_op(default=False)
+    async def set_timezone(self, name: str) -> bool:
+        """Persist the IANA zone this guild renders ETAs in. True when it landed.
+
+        Stores the name as given rather than a resolved ZoneInfo — see
+        GuildConfig.tzinfo for why resolution is deferred to read time. No caller
+        yet by design: this is the write half of the planned `-options key value`
+        command, and shipping it with the field keeps the schema, the store and the
+        tests in one change rather than three.
+
+        Validated here because this will be the FIRST user-typed string to reach
+        guild:{id}:config — a key that is PERSISTed, excluded from every TTL path
+        and non-evictable by design. An unusable name stored here fails silently:
+        the write succeeds, the command reports success, and the guild's ETAs stay
+        on the default forever. `-options` should still call valid_timezone itself
+        so it can tell the user WHY; False here cannot say whether the name was bad
+        or Redis was down.
+        """
+        if not valid_timezone(name):
+            log.warning(f"[guild:{self.guild_id}] refusing unusable timezone {name!r}")
+            return False
+        pipe = self.redis.pipeline()
+        pipe.hset(
+            self.config_key(),
+            mapping=_hset_mapping(GuildConfig(timezone=name).to_redis()),
         )
         pipe.persist(self.config_key())
         await pipe.execute()

@@ -2,6 +2,7 @@
 
 import redis.asyncio as aioredis
 import asyncio
+from zoneinfo import ZoneInfo
 import contextlib
 import dataclasses
 import re
@@ -15,7 +16,12 @@ import orjson
 import pytest
 
 from src.guild_queue import QueueItem
-from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
+from src.guild_state import (
+    DEFAULT_TIMEZONE,
+    HistoryEntry,
+    NowPlayingData,
+    SongQueueEntry,
+)
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -218,12 +224,21 @@ class TestRequesterMention:
 
 class TestFmtFinishTime:
     def test_matches_clock_format(self) -> None:
-        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) PST$", _fmt_finish_time(90))
+        """PST or PDT: the suffix follows the zone's own abbreviation now, so half
+        the year US/Pacific is legitimately PDT."""
+        rendered = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) P[SD]T$", rendered)
+
+    def test_the_suffix_follows_the_configured_zone(self) -> None:
+        """A guild set to London must not be quoted London time labelled PST — the
+        suffix was a hardcoded literal before the zone became configurable."""
+        rendered = _fmt_finish_time(90, ZoneInfo("Europe/London"))
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
 
     def test_no_uncertainty_prefix(self) -> None:
         # Unlike _fmt_eta(), a song's own remaining duration is never
         # uncertain — no "~" prefix and no bold markdown wrapping.
-        result = _fmt_finish_time(90)
+        result = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
         assert not result.startswith("~")
         assert "**" not in result
 
@@ -1257,7 +1272,7 @@ class TestResumeNoticeEmbed:
 class TestEstimatedPlayingAt:
     def test_matches_clock_format(self, music_player: MusicPlayer) -> None:
         result = music_player.estimated_playing_at()
-        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*$", result)
+        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*$", result)
 
     def test_uncertain_when_current_song_has_no_duration_secs(
         self, music_player: MusicPlayer
@@ -1526,7 +1541,7 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         requester_line = described(embed).split("\n")[-1]
         assert re.search(
-            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) PST$",
+            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) P[SD]T$",
             requester_line,
         )
 
@@ -4672,7 +4687,7 @@ class TestBuildNextUpEmbed:
         embed = music_player._build_next_up_embed()
         assert embed is not None
         assert "Est. playing at" in described(embed)
-        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*", described(embed))
+        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*", described(embed))
 
     def test_eta_matches_current_song_estimated_finish(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -6746,9 +6761,9 @@ class TestEstimatedFinishUsesRemaining:
         from src.musicplayer import _fmt_finish_time
 
         live_song.start_offset = 100  # 110s of the 210s song remain
-        before = _fmt_finish_time(110)
+        before = _fmt_finish_time(110, music_player.timezone)
         embed = music_player._build_now_playing_embed(live_song)
-        after = _fmt_finish_time(110)
+        after = _fmt_finish_time(110, music_player.timezone)
         assert (before in described(embed)) or (after in described(embed))
 
     def test_position_override_shrinks_remaining(
@@ -6756,11 +6771,11 @@ class TestEstimatedFinishUsesRemaining:
     ) -> None:
         from src.musicplayer import _fmt_finish_time
 
-        before = _fmt_finish_time(10)
+        before = _fmt_finish_time(10, music_player.timezone)
         embed = music_player._build_now_playing_embed(
             live_song, position_override=200.0
         )
-        after = _fmt_finish_time(10)
+        after = _fmt_finish_time(10, music_player.timezone)
         assert (before in described(embed)) or (after in described(embed))
 
 
@@ -7024,3 +7039,39 @@ class TestVolumeMigratesForwardOnRestore:
         before = music_player.volume
         await music_player._restore_state()
         assert music_player.volume == before
+
+
+class TestGuildTimezoneOnRestore:
+    """ETAs follow the guild's stored zone instead of a hardcoded Pacific."""
+
+    async def test_a_stored_zone_is_adopted(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        assert music_player.store is not None
+        await music_player.store.set_timezone("Europe/London")
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_a_guild_with_no_zone_keeps_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo(DEFAULT_TIMEZONE)
+
+    async def test_an_unusable_stored_zone_degrades_to_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """Rendering must not raise on a name the host's tz database lost."""
+        assert music_player.store is not None
+        await music_player.store.set_timezone("Mars/Olympus")
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo(DEFAULT_TIMEZONE)
+
+    async def test_the_eta_renders_in_the_guilds_zone(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """End to end: the suffix is the zone's own abbreviation, so a London guild
+        is never quoted London time labelled PST."""
+        music_player.timezone = ZoneInfo("Europe/London")
+        rendered = _fmt_finish_time(90, music_player.timezone)
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
