@@ -21,9 +21,14 @@ from src import debug
 from src.musicplayer import MusicPlayer
 from src.debug import (
     DebugInputs,
+    _CONFIG_ALLOWLIST,
+    _ConfigKind,
     _codeblock_fields,
+    config_lines,
     discord_lines,
     guild_lines,
+    redact_url,
+    render_config_value,
     run_debug_dashboard,
 )
 
@@ -630,6 +635,38 @@ class TestGuildBlock:
 
 
 class TestSnapshotEmbed:
+    async def test_no_credential_reaches_the_embed(
+        self, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end guard on the whole rendered surface, not just the row
+        renderer: the embed is built to be pasted into an issue.
+
+        `operator=True` and a guild are load-bearing, not incidental. Config is the
+        only block that reads any of these three variables and it sits behind the
+        operator gate, so the earlier non-operator DM version of this test asserted
+        three credentials were absent from a card that never read them — which is
+        why the render of Config is asserted first.
+        """
+        mock_ctx.guild.voice_client = None
+        monkeypatch.setenv("DISCORD_TOKEN", "tok-should-never-render")
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://bot:pw-secret@db:5432/musicbot"
+        )
+        monkeypatch.setenv("REDIS_URL", "redis://cacheuser:cachepw@cache:6379")
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=False, debug_overridden=False, players=0, operator=True
+            ),
+        )
+        names = [f.name for f in embed.fields]
+        assert "Config" in names and "This server" in names
+        # to_dict(), not the field values: description and footer are rendered
+        # surface too.
+        rendered = str(embed.to_dict())
+        for leaked in ("tok-should-never-render", "pw-secret", "cachepw"):
+            assert leaked not in rendered
+
     async def test_renders_every_block_in_a_guild(self, mock_ctx: MagicMock) -> None:
         """Order is fixed by _BLOCK_ORDER, so a block added later has to choose its
         place rather than landing wherever the dict happened to put it."""
@@ -643,9 +680,15 @@ class TestSnapshotEmbed:
                 operator=True,
             ),
         )
-        assert [f.name for f in embed.fields] == [
+        names = [f.name for f in embed.fields]
+        # Config outgrew Discord's 1024-char field cap once it carried -debug's own
+        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
+        # block's position rather than moving to the end.
+        assert names == [
             "Build",
             "Versions",
+            "Config",
+            "Config (cont.)",
             "Discord",
             "This server",
         ]
@@ -764,7 +807,7 @@ class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that
     describes the HOST rather than the caller's own server is owner-only."""
 
-    _HOST_BLOCKS = ("Build", "Discord")
+    _HOST_BLOCKS = ("Build", "Config", "Discord")
 
     async def test_non_operator_sees_only_versions_and_their_own_server(
         self, mock_ctx: MagicMock
@@ -783,6 +826,7 @@ class TestOperatorGate:
         the block and then drops it still reads the host, and still pays the IO."""
         mock_ctx.guild.voice_client = None
         with (
+            patch.object(debug, "config_lines") as config,
             patch.object(debug, "discord_lines") as discord_block,
             patch.object(debug, "build_lines") as build,
         ):
@@ -790,7 +834,7 @@ class TestOperatorGate:
                 mock_ctx,
                 DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
             )
-        for collector in (discord_block, build):
+        for collector in (config, discord_block, build):
             collector.assert_not_called()
 
     async def test_a_non_operators_snapshot_carries_no_host_detail(
@@ -859,11 +903,12 @@ class TestTheSnapshotDoesNotWaitForItsIO:
     async def test_the_instant_blocks_are_already_filled_in_the_skeleton(
         self, mock_ctx: MagicMock
     ) -> None:
-        """Discord needs no IO, so making the user wait for it would be pure loss.
-        Versions rides prepare()."""
+        """Config and Discord need no IO, so making the user wait for them would be
+        pure loss. Versions rides prepare()."""
         mock_ctx.guild.voice_client = None
         embed = await _skeleton(mock_ctx, self._operator())
         rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "ENVIRONMENT" in rendered["Config"]
         assert "shards" in rendered["Discord"]
         assert "collecting" not in rendered["Versions"]
 
@@ -911,3 +956,149 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         rendered = {f.name: (f.value or "") for f in embed.fields}
         assert "unavailable" in rendered["Build"]
         assert "shards" in rendered["Discord"]
+
+
+class TestRedactUrl:
+    def test_userinfo_is_replaced(self) -> None:
+        assert (
+            redact_url("postgresql://bot:hunter2@db.internal:5432/musicbot")
+            == "postgresql://***@db.internal:5432/musicbot"
+        )
+
+    def test_credentialless_url_is_untouched(self) -> None:
+        assert redact_url("redis://localhost:6379") == "redis://localhost:6379"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "collector.prod.internal.corp:4317",
+            "pot-sidecar.prod.internal.corp:4416",
+            "cache.internal:6379",
+            # One slash, so there is no authority to rewrite AND the host lands in
+            # .path — replacing .netloc alone leaves it visible.
+            "http:/host.internal:9090/x",
+        ],
+    )
+    def test_hide_host_does_not_fail_open_on_a_schemeless_url(self, raw: str) -> None:
+        """urlsplit only fills .netloc when it sees `//`. Without it the host lands
+        in .scheme/.path, so rewriting .netloc wrote `***` into a slot that was never
+        carrying the host — publishing internal topology beside a marker that reads
+        as "this was redacted". Operators DO write these scheme-less; ping.probe_otel
+        carries the same normalisation and says so."""
+        redacted = redact_url(raw, hide_host=True)
+        assert "internal" not in redacted
+        assert "4317" not in redacted and "4416" not in redacted
+        assert "6379" not in redacted and "9090" not in redacted
+
+    def test_hide_host_still_keeps_the_shape_of_a_normal_url(self) -> None:
+        """The guard above must not flatten the ordinary case: an operator still
+        needs to see which protocol is configured."""
+        assert (
+            redact_url("redis://user:pw@cache.internal:6379/0", hide_host=True)
+            == "redis://***/0"
+        )
+
+    @pytest.mark.parametrize(
+        "key", ["password", "api_key", "auth", "X-Token", "client_secret"]
+    )
+    def test_credential_query_values_are_replaced(self, key: str) -> None:
+        """asyncpg honours `?password=` as readily as userinfo, so the query string
+        is the second place a DSN hides a credential."""
+        redacted = redact_url(f"postgresql://db/musicbot?{key}=hunter2&sslmode=require")
+        assert "hunter2" not in redacted
+        assert "***" in redacted
+        assert "sslmode=require" in redacted
+
+    def test_a_fragment_is_marked_rather_than_echoed(self) -> None:
+        """urlsplit puts everything after a stray `#` into .fragment, so it is the
+        one component neither the userinfo nor the query redaction reaches. Marked
+        rather than dropped, so the row still says something was there."""
+        redacted = redact_url("redis://host:6379/0#pw=hunter2")
+        assert redacted == "redis://host:6379/0#***"
+        assert "hunter2" not in redacted
+
+    def test_unparseable_url_degrades(self) -> None:
+        assert redact_url("http://[::1") == "unparseable"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "redis://u:pw@host:99999/0",  # out of range
+            "redis://u:pw@host:abc/0",  # not a number
+        ],
+    )
+    def test_a_bad_port_degrades_instead_of_raising(self, url: str) -> None:
+        """`.port` is LAZY: urlsplit accepts these and raises on dereference. With
+        the guard around the parse alone, the ValueError escaped past it — and since
+        the whole Config block is one collector, one typo'd port in .env replaced all
+        of it with "unavailable (ValueError)" exactly while someone was diagnosing
+        that host.
+        """
+        assert redact_url(url) == "unparseable"
+        assert "pw" not in redact_url(url)
+
+
+class TestConfigAllowlist:
+    def test_credentials_render_presence_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for var in _CONFIG_ALLOWLIST:
+            if var.kind is not _ConfigKind.SECRET:
+                continue
+            monkeypatch.setenv(var.name, "super-secret-value")
+            rendered = render_config_value(var)
+            assert rendered == "set"
+            monkeypatch.delenv(var.name)
+            assert render_config_value(var) == "unset"
+
+    def test_every_credential_bearing_var_is_declared_secret(self) -> None:
+        """The allowlist is decided by hand rather than by pattern-match, so this
+        pins the review decision: these four carry credentials and must never
+        render a value, POSTGRES_URL because it embeds the password in its DSN."""
+        secrets = {v.name for v in _CONFIG_ALLOWLIST if v.kind is _ConfigKind.SECRET}
+        assert secrets == {
+            "DISCORD_TOKEN",
+            "SPOTIFY_CLIENT_ID",
+            "SPOTIFY_CLIENT_SECRET",
+            "POSTGRES_URL",
+        }
+
+    def test_url_values_are_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Credential AND host. The card is posted in the channel the operator typed
+        in, so `cache:6379` is internal topology published to everyone there."""
+        monkeypatch.setenv("REDIS_URL", "redis://user:pw@cache:6379/0")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
+        rendered = render_config_value(var)
+        assert "pw" not in rendered
+        assert "cache" not in rendered and "6379" not in rendered
+        assert rendered == "redis://***/0"
+
+    def test_a_local_host_is_redacted_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unconditionally, or the presence of `***` would itself say "remote"."""
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
+        assert "localhost" not in render_config_value(var)
+
+    def test_unset_shows_the_value_in_force(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset knob is not "nothing" — it is the default, and the default is
+        what an operator is validating against."""
+        monkeypatch.delenv("YTDLP_POOL_WORKERS", raising=False)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
+        assert render_config_value(var) == "4 (default)"
+
+    def test_unlisted_variable_never_renders(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The allowlist's whole point: a knob added later opts in at review time,
+        so a future secret cannot leak by simply existing."""
+        monkeypatch.setenv("SOME_FUTURE_SECRET", "leaked")
+        assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
+        assert "leaked" not in "\n".join(config_lines())
+
+    def test_no_duplicate_rows(self) -> None:
+        names = [v.name for v in _CONFIG_ALLOWLIST]
+        assert len(names) == len(set(names))

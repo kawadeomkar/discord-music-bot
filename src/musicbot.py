@@ -1805,8 +1805,8 @@ class MusicBot(commands.Cog):
         usage="[--enable | --disable]",
         help=(
             "Shows what this bot is running: versions, and Discord/voice state for "
-            "this server. For the bot owner it also fills in the build it came "
-            "from.\n\n"
+            "this server. For the bot owner it also fills in host details — the "
+            "build it came from and how it is configured.\n\n"
             "`--enable` turns debug mode on for this server, which adds a footer "
             "carrying the trace id and timing to every reply — paste that id to the "
             "operator and they can find the exact request in the logs. `--disable` "
@@ -1825,7 +1825,8 @@ class MusicBot(commands.Cog):
             "examples": ["-debug", "-debug --enable", "-debug --disable"],
             "note": (
                 "Debug mode is per server and only changes what is DISPLAYED — "
-                "never how the bot plays, queues or stores anything."
+                "never how the bot plays, queues or stores anything. Credentials "
+                "are never shown, only whether they are set."
             ),
         },
     )

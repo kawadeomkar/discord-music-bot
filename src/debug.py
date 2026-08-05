@@ -21,6 +21,7 @@ import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import TYPE_CHECKING, Any, Optional
 
 import discord
@@ -29,6 +30,7 @@ from opentelemetry import trace
 
 from enum import Enum
 
+from src import config
 from src.config import DEBUG_DEADLINE_SECS, DEBUG_TICK_SECS, ENVIRONMENT
 from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
@@ -503,6 +505,193 @@ class RuntimeSampler:
         )
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 3 · CONFIG ALLOWLIST
+# ════════════════════════════════════════════════════════════════════════════
+# An env var absent from _CONFIG_ALLOWLIST does not render at all, so a knob added
+# later opts in at review time and a future secret can never leak by default.
+# Django's debug-page scrub convention, decided by hand instead of by pattern-match.
+
+
+class _ConfigKind(Enum):
+    VALUE = "value"  # rendered as configured
+    SECRET = "secret"  # presence only — the value never renders
+    URL = "url"  # userinfo and credential-bearing query params stripped
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ConfigVar:
+    name: str
+    kind: _ConfigKind
+    # What the bot uses when the variable is unset, as text. Read from config's own
+    # resolved constants where there is one, so this can't drift from the real default.
+    fallback: Optional[str] = None
+
+
+_CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
+    _ConfigVar(name="ENVIRONMENT", kind=_ConfigKind.VALUE, fallback=ENVIRONMENT),
+    _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
+    _ConfigVar(
+        name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
+    ),
+    _ConfigVar(
+        name="HISTORY_OUTBOX_MAX",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.HISTORY_OUTBOX_MAX),
+    ),
+    _ConfigVar(
+        name="POSTGRES_STATEMENT_CACHE",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.POSTGRES_STATEMENT_CACHE),
+    ),
+    _ConfigVar(name="YTDLP_POOL_WORKERS", kind=_ConfigKind.VALUE, fallback="4"),
+    _ConfigVar(
+        name="NOW_PLAYING_UPDATE_INTERVAL_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
+    ),
+    _ConfigVar(
+        name="PING_TICK_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PING_TICK_SECS),
+    ),
+    _ConfigVar(
+        name="PING_DEADLINE_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.PING_DEADLINE_SECS),
+    ),
+    _ConfigVar(
+        name="DEBUG_TICK_SECS", kind=_ConfigKind.VALUE, fallback=str(DEBUG_TICK_SECS)
+    ),
+    _ConfigVar(
+        name="DEBUG_DEADLINE_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(DEBUG_DEADLINE_SECS),
+    ),
+    _ConfigVar(
+        name="POT_PROVIDER_URL", kind=_ConfigKind.URL, fallback="http://127.0.0.1:4416"
+    ),
+    _ConfigVar(name="OTEL_SDK_DISABLED", kind=_ConfigKind.VALUE, fallback="false"),
+    _ConfigVar(
+        name="OTEL_SERVICE_NAME", kind=_ConfigKind.VALUE, fallback="discord-music-bot"
+    ),
+    _ConfigVar(
+        name="OTEL_EXPORTER_OTLP_ENDPOINT",
+        kind=_ConfigKind.URL,
+        fallback="http://localhost:4317",
+    ),
+    _ConfigVar(
+        name="REDIS_URL", kind=_ConfigKind.URL, fallback="redis://localhost:6379"
+    ),
+    _ConfigVar(name="DEBUG_PROMETHEUS_URL", kind=_ConfigKind.URL),
+    # Credential-bearing: presence only, never the value. POSTGRES_URL is here rather
+    # than under URL because it embeds the password in its userinfo.
+    _ConfigVar(name="DISCORD_TOKEN", kind=_ConfigKind.SECRET),
+    _ConfigVar(name="SPOTIFY_CLIENT_ID", kind=_ConfigKind.SECRET),
+    _ConfigVar(name="SPOTIFY_CLIENT_SECRET", kind=_ConfigKind.SECRET),
+    _ConfigVar(name="POSTGRES_URL", kind=_ConfigKind.SECRET),
+)
+
+# Substrings marking a query parameter whose value is a credential. Matched against
+# the lowercased key, so `api_key` and `X-Auth-Token` are both caught.
+_CREDENTIAL_QUERY_KEYS = (
+    "pass",  # also covers passwd / password
+    "pwd",
+    "secret",
+    "token",
+    "key",
+    "auth",
+    "sig",
+    "cred",
+)
+
+
+def redact_url(raw: str, *, hide_host: bool = False) -> str:
+    """A URL safe to render: userinfo replaced with `***`, credential-bearing query
+    values replaced with `***`. Those are the two places a DSN hides a password —
+    asyncpg honours `?password=` as readily as userinfo."""
+    # The whole body is guarded, not just urlsplit. `.port` is a LAZY property:
+    # urlsplit("redis://h:99999/0") succeeds and the ValueError fires on dereference,
+    # so a try around the parse alone never caught the one input that needed it — one
+    # typo'd port in .env replaced all of Config with "unavailable (ValueError)",
+    # precisely while someone was diagnosing that host.
+    try:
+        # Normalise a scheme-less value to an authority BEFORE splitting. Without
+        # the "//", urlsplit puts the host in .scheme/.path and leaves .netloc
+        # empty, so every rewrite below — including hide_host's — lands in a slot
+        # that was never carrying the host, and the host survives verbatim next to
+        # a `***` that reads as "this was redacted". Operators do write these
+        # scheme-less: ping.probe_otel carries the same normalisation and says so.
+        parts = urlsplit(raw if "://" in raw else f"//{raw}")
+        netloc = parts.netloc
+        if parts.username is not None or parts.password is not None:
+            host = parts.hostname or ""
+            netloc = f"***@{host}:{parts.port}" if parts.port else f"***@{host}"
+        if hide_host:
+            # The snapshot is posted in the channel the operator typed in, so this
+            # block has to survive being read by everyone there. A host:port pair is
+            # internal topology even with no credential on it. Redacted
+            # UNCONDITIONALLY, including for localhost: redacting only remote hosts
+            # would make the presence of `***` the disclosure instead.
+            if "://" not in raw:
+                # Without a scheme there is no authority to rewrite, and the host
+                # can land in .path as well ("http:/host:9090/x"), so replacing one
+                # component would leave it visible beside a `***` that claims it was
+                # hidden. Nothing in a value this shape is safe to echo.
+                return "***"
+            netloc = "***"
+        query = parts.query
+        if query:
+            # safe="*" so the redaction marker survives quoting as `***` rather than
+            # arriving as %2A%2A%2A, which reads like data rather than a redaction.
+            query = urlencode(
+                [
+                    (k, "***" if _is_credential_key(k) else v)
+                    for k, v in parse_qsl(query, keep_blank_values=True)
+                ],
+                safe="*",
+            )
+        # A fragment is never meaningful in any allowlisted URL, and urlsplit puts
+        # everything after a stray `#` there — so it is the one component that can
+        # carry a credential past both redactions above. Marked, not dropped, so
+        # the row still says something was there.
+        fragment = "***" if parts.fragment else ""
+        return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+    except ValueError:
+        return "unparseable"
+
+
+def _is_credential_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(token in lowered for token in _CREDENTIAL_QUERY_KEYS)
+
+
+def render_config_value(var: _ConfigVar) -> str:
+    """One allowlist row's value, redacted per its kind."""
+    raw = os.environ.get(var.name)
+    if var.kind is _ConfigKind.SECRET:
+        # Presence only, always. This block has to stay safe to screenshot into an
+        # issue; a value here is one paste away from a leaked credential.
+        return "set" if (raw or "").strip() else "unset"
+    if raw is None or not raw.strip():
+        return "unset" if var.fallback is None else f"{var.fallback} (default)"
+    if var.kind is _ConfigKind.URL:
+        return redact_url(raw.strip(), hide_host=True)
+    return raw.strip()
+
+
+def config_lines() -> list[str]:
+    width = max(len(var.name) for var in _CONFIG_ALLOWLIST) + 2
+    return [
+        f"{var.name:<{width}}{render_config_value(var)}" for var in _CONFIG_ALLOWLIST
+    ]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 4 · COLLECTORS — one block of lines each, none of them raising
+# ════════════════════════════════════════════════════════════════════════════
+
+
 # Stamped at import: the extension loads within seconds of process start, so this
 # is the process's start time for every purpose this command has.
 _PROCESS_START = time.time()
@@ -515,6 +704,7 @@ _git_sha_cache: Optional[str] = None
 _BLOCK_ORDER = (
     "Build",
     "Versions",
+    "Config",
     "Discord",
     "This server",
 )
@@ -785,6 +975,7 @@ def instant_blocks(
     blocks: dict[str, list[str]] = {}
     guild = ctx.guild
     if inputs.operator:
+        blocks["Config"] = _safe_block("config", config_lines)
         blocks["Discord"] = _safe_block(
             "discord", lambda: discord_lines(ctx.bot, players=inputs.players)
         )
