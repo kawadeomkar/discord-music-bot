@@ -279,6 +279,58 @@ class Leaderboard:
     songs: tuple[SongLeader, ...]
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ArchiveStats:
+    """What -debug's Postgres block shows. Sizes in bytes.
+
+    Row counts are planner ESTIMATES from pg_stat_user_tables, never COUNT(*):
+    play_history is unbounded by design, so an exact count is a full scan on the
+    largest table in the deployment for one line of a diagnostic embed.
+    """
+
+    database_bytes: int
+    table_bytes: int
+    rows_estimate: int
+    rejected_estimate: int
+    connections: int
+    max_connections: int
+    shared_buffers: str
+    cache_hit_ratio: float
+
+
+# One row, deliberately: this feeds one embed field and a second round trip buys
+# nothing. to_regclass + COALESCE rather than a bare relation name so a database
+# migrated past the version that owns these tables degrades to zeros instead of
+# raising UndefinedTable at the one moment an operator is trying to diagnose it.
+_STATS_SQL = """
+SELECT
+    pg_database_size(current_database())                        AS database_bytes,
+    COALESCE(
+        pg_total_relation_size(to_regclass('public.play_history')), 0
+    )                                                           AS table_bytes,
+    COALESCE((
+        SELECT n_live_tup FROM pg_stat_user_tables
+        WHERE relname = 'play_history'
+    ), 0)                                                       AS rows_estimate,
+    COALESCE((
+        SELECT n_live_tup FROM pg_stat_user_tables
+        WHERE relname = 'play_history_rejected'
+    ), 0)                                                       AS rejected_estimate,
+    (
+        SELECT count(*) FROM pg_stat_activity
+        WHERE datname = current_database()
+    )                                                           AS connections,
+    current_setting('max_connections')::int                     AS max_connections,
+    current_setting('shared_buffers')                           AS shared_buffers,
+    COALESCE((
+        SELECT CASE WHEN blks_hit + blks_read > 0
+                    THEN blks_hit::float8 / (blks_hit + blks_read)
+                    ELSE 0 END
+        FROM pg_stat_database WHERE datname = current_database()
+    ), 0)                                                       AS cache_hit_ratio
+"""
+
+
 class ArchiveReader(Protocol):
     """What MusicBot needs from the archive: liveness for -ping's Postgres row
     and the aggregate behind -leaderboard. Structural, like ping's ArchiveHealth
@@ -529,6 +581,29 @@ class PostgresHistoryArchive:
                 f"play rejected AND unrecordable ({type(e).__name__}: {e}); "
                 f"payload={payload!r}"
             )
+
+    async def stats(self) -> ArchiveStats:
+        """Size, row estimates and connection/cache state, for -debug's Postgres
+        block. Raises on any failure — the caller renders the degraded row.
+
+        Bounded through _read_slots and the read deadline like leaderboard(): this
+        is user-triggered and shares the pool the drainer writes through, and a
+        diagnostic command must never be the thing that starves the archive.
+        """
+        async with asyncio.timeout(_READ_DEADLINE_SECS), self._read_slots:
+            pool = await self._ensure()
+            async with pool.acquire(timeout=_ACQUIRE_TIMEOUT_SECS) as conn:
+                row = await conn.fetchrow(_STATS_SQL)
+        return ArchiveStats(
+            database_bytes=row["database_bytes"],
+            table_bytes=row["table_bytes"],
+            rows_estimate=row["rows_estimate"],
+            rejected_estimate=row["rejected_estimate"],
+            connections=row["connections"],
+            max_connections=row["max_connections"],
+            shared_buffers=row["shared_buffers"],
+            cache_hit_ratio=row["cache_hit_ratio"],
+        )
 
     async def health_check(self) -> None:
         """Prove the archive's database is reachable and answering. Raises on any

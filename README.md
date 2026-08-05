@@ -82,7 +82,7 @@ details, aliases, and examples.
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
-| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build details are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer carrying the trace id and timing on every reply — and need **Manage Server** |
+| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build, configuration, runtime and storage are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer carrying the trace id and timing on every reply — and need **Manage Server** |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs

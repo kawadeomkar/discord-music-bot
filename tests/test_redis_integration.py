@@ -774,3 +774,79 @@ class TestConfigReadsSurviveTheConnectionCap:
             await client.flushdb()
             await client.aclose()
             await pool.disconnect()
+
+
+class TestDebugBlockFieldNames:
+    """The INFO fields -debug's Redis block and check rows read, against a real
+    server.
+
+    This is divergence 7 for the list above, and the worst-shaped one: fakeredis
+    does not implement INFO AT ALL — it raises ResponseError("unknown command") —
+    so the unit tier can only exercise the block against a dict this repo wrote
+    itself. A field renamed or misspelled renders "unknown"/"?" forever and every
+    unit test still passes, because they assert against our own fixture.
+    """
+
+    async def test_every_field_the_block_reads_exists(
+        self, redis: aioredis.Redis
+    ) -> None:
+        info = cast(dict[str, Any], await redis.info())
+        for field in (
+            "used_cpu_sys",
+            "used_cpu_user",
+            "used_memory",
+            "maxmemory",
+            "maxmemory_policy",
+            "mem_fragmentation_ratio",
+            "connected_clients",
+            "instantaneous_ops_per_sec",
+            "keyspace_hits",
+            "keyspace_misses",
+            "evicted_keys",
+            "rdb_last_bgsave_status",
+            # The AOF half of the persistence check. Absent here it defaults to
+            # "unknown", which the check treats as HEALTHY — so a rename makes the
+            # row permanently inert rather than red, and the compose Redis runs AOF.
+            "aof_last_write_status",
+        ):
+            assert field in info, f"INFO has no {field!r} — the debug row is dead"
+
+    async def test_keyspace_shape_is_a_per_db_mapping(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """`persistent = DBSIZE - expires` depends on this shape; a flat key would
+        silently make every key look persistent."""
+        await redis.set("persistent-key", b"1")
+        await redis.set("expiring-key", b"1", ex=60)
+        info = cast(dict[str, Any], await redis.info())
+        db = info["db0"]
+        assert isinstance(db, dict)
+        assert db["keys"] == 2
+        assert db["expires"] == 1
+        assert await redis.dbsize() - db["expires"] == 1
+
+    async def test_cpu_counters_are_cumulative_floats(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The block computes a RATE from two reads, which requires these to be
+        monotonically increasing seconds rather than an instantaneous gauge."""
+        first = cast(dict[str, Any], await redis.info())
+        for _ in range(500):
+            await redis.set("churn", b"1")
+        second = cast(dict[str, Any], await redis.info())
+        before = first["used_cpu_sys"] + first["used_cpu_user"]
+        after = second["used_cpu_sys"] + second["used_cpu_user"]
+        assert isinstance(after, float)
+        assert after >= before
+
+    async def test_history_ttl_reports_the_persist_invariant(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """-debug's check row asserts push_history's unconditional PERSIST. -1 is
+        no expiry, -2 is no such key — a guild that has played nothing."""
+        store = GuildRedisStore(redis, 424242)
+        assert await store.history_ttl() == -2
+        await redis.rpush(store.history_key(), b"{}")
+        assert await store.history_ttl() == -1
+        await redis.expire(store.history_key(), 3600)
+        assert 0 < cast(int, await store.history_ttl()) <= 3600

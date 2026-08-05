@@ -7,6 +7,7 @@ The seam that applies it to real command responses is tested in test_context.py.
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, cast
@@ -14,10 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import pytest
+from redis.asyncio import Redis
 from discord.ext import commands
 from opentelemetry import trace as trace_api
 
 from src import debug
+from src.history_archive import ArchiveStats
 from src.musicplayer import MusicPlayer
 from src.debug import (
     DebugInputs,
@@ -56,6 +59,19 @@ async def _skeleton(ctx: MagicMock, inputs: DebugInputs) -> discord.Embed:
     call = ctx.channel.send.await_args
     assert call is not None
     return cast(discord.Embed, call.kwargs["embeds"][0])
+
+
+def _archive_stats() -> ArchiveStats:
+    return ArchiveStats(
+        database_bytes=1,
+        table_bytes=1,
+        rows_estimate=1,
+        rejected_estimate=0,
+        connections=1,
+        max_connections=100,
+        shared_buffers="128MB",
+        cache_hit_ratio=0.99,
+    )
 
 
 class TestDebugFooter:
@@ -338,6 +354,13 @@ class TestCpuPercent:
         first = debug.CpuSample(seconds=5.0, monotonic=1.0, scope="process", cores=1)
         second = debug.CpuSample(seconds=4.0, monotonic=2.0, scope="process", cores=1)
         assert debug.cpu_percent(first, second) == 0.0
+
+    def test_the_sampling_window_is_never_zero(self) -> None:
+        """CPU% is a rate and exists only ACROSS a window. Shrinking this constant to
+        0.0 looks like removing a half-second of latency and nothing in the suite
+        goes red, but both CPU rows then divide over scheduling noise — and it is the
+        loop-lag measurement too, which becomes a reading of nothing."""
+        assert debug._CPU_WINDOW_SECS > 0
 
 
 class TestRuntimeSampler:
@@ -689,7 +712,10 @@ class TestSnapshotEmbed:
             "Versions",
             "Config",
             "Config (cont.)",
+            "Runtime",
             "Discord",
+            "Redis",
+            "Postgres",
             "This server",
         ]
 
@@ -807,7 +833,7 @@ class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that
     describes the HOST rather than the caller's own server is owner-only."""
 
-    _HOST_BLOCKS = ("Build", "Config", "Discord")
+    _HOST_BLOCKS = ("Build", "Config", "Runtime", "Discord", "Redis", "Postgres")
 
     async def test_non_operator_sees_only_versions_and_their_own_server(
         self, mock_ctx: MagicMock
@@ -827,6 +853,8 @@ class TestOperatorGate:
         mock_ctx.guild.voice_client = None
         with (
             patch.object(debug, "config_lines") as config,
+            patch.object(debug, "runtime_lines") as runtime,
+            patch.object(debug, "redis_lines") as redis_block,
             patch.object(debug, "discord_lines") as discord_block,
             patch.object(debug, "build_lines") as build,
         ):
@@ -834,7 +862,7 @@ class TestOperatorGate:
                 mock_ctx,
                 DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
             )
-        for collector in (config, discord_block, build):
+        for collector in (config, runtime, redis_block, discord_block, build):
             collector.assert_not_called()
 
     async def test_a_non_operators_snapshot_carries_no_host_detail(
@@ -1102,3 +1130,137 @@ class TestConfigAllowlist:
     def test_no_duplicate_rows(self) -> None:
         names = [v.name for v in _CONFIG_ALLOWLIST]
         assert len(names) == len(set(names))
+
+
+class TestRuntimeBlock:
+    async def test_uptime_is_a_plain_duration_not_discord_markup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every row in this block is rendered inside a ``` fence, and Discord prints
+        markup there as its literal source: the row read `uptime <t:1785881580:R>` to
+        every operator who ran it, rather than "2 hours ago"."""
+        monkeypatch.setattr(debug, "_PROCESS_START", time.time() - 3725)
+        line = next(line for line in debug.runtime_lines() if line.startswith("uptime"))
+        assert "<t:" not in line
+        assert line == "uptime       1:02:05"
+
+
+class TestRedisBlock:
+    def _samples(
+        self, **overrides: object
+    ) -> tuple[debug.RedisSample, debug.RedisSample]:
+        first = debug.RedisSample(info=_redis_info(**overrides), monotonic=100.0)
+        second = debug.RedisSample(
+            info=_redis_info(used_cpu_sys=1.005, used_cpu_user=2.005, **overrides),
+            monotonic=101.0,
+        )
+        return first, second
+
+    def test_renders_cpu_before_mem(self) -> None:
+        first, second = self._samples()
+        lines = debug.redis_lines(first, second, dbsize=1284)
+        assert lines[0].startswith("cpu")
+        assert lines[1].startswith("mem")
+
+    def test_cpu_is_a_rate_across_the_window(self) -> None:
+        first, second = self._samples()
+        # 0.01 cpu-seconds over 1 wall second = 1%. No core normalization: Redis
+        # is effectively single-threaded, so 100% is one saturated core.
+        assert "1.0%" in debug.redis_lines(first, second, dbsize=0)[0]
+
+    def test_memory_percent_is_against_maxmemory(self) -> None:
+        """maxmemory is the threshold volatile-lru acts at, so the % reads as the
+        eviction runway rather than as host pressure."""
+        first, second = self._samples()
+        assert "42 MB / 256 MB (16%)" in debug.redis_lines(first, second, dbsize=0)[1]
+
+    def test_no_maxmemory_renders_absolute_only(self) -> None:
+        first, second = self._samples(maxmemory=0)
+        assert "(no maxmemory)" in debug.redis_lines(first, second, dbsize=0)[1]
+
+    def test_persistent_keys_are_total_minus_expires(self) -> None:
+        """The no-TTL population is exactly the set golden rule 12 protects."""
+        first, second = self._samples()
+        keys = next(
+            line
+            for line in debug.redis_lines(first, second, dbsize=1284)
+            if "keys" in line
+        )
+        assert "1284 total · 92 persistent" in keys
+
+    def test_degrades_when_info_is_unavailable(self) -> None:
+        lines = debug.redis_lines(None, None, dbsize=None)
+        assert len(lines) == 1
+        assert "unavailable" in lines[0]
+
+    async def test_read_sample_swallows_a_dead_redis(self) -> None:
+        redis = MagicMock()
+        redis.info = AsyncMock(side_effect=ConnectionError("down"))
+        assert await debug.read_redis_sample(redis) is None
+
+    async def test_read_sample_of_none_redis_is_none(self) -> None:
+        assert await debug.read_redis_sample(None) is None
+
+    async def test_read_sample_stamps_the_clock_it_was_taken_at(self) -> None:
+        """The success path — untested until now, including its timestamp. Redis's
+        CPU% is the gap between two of these, so a constant `monotonic` divides by a
+        zero-or-fixed window and pins that row to garbage without failing anything.
+        """
+        redis = MagicMock()
+        redis.info = AsyncMock(return_value=_redis_info())
+        before = time.monotonic()
+        sample = await debug.read_redis_sample(redis)
+        assert sample is not None
+        assert sample.info["maxmemory_policy"] == "volatile-lru"
+        assert before <= sample.monotonic <= time.monotonic()
+
+    async def test_dbsize_counts_the_keys(self, fake_redis: Redis) -> None:
+        """The `keys` row's whole content. A hardcoded 0 or None reads as an
+        empty/unknown keyspace on every host forever, which is exactly what a
+        collector nobody executes looks like."""
+        for i in range(3):
+            await fake_redis.set(f"guild:{i}:state", "x")
+        assert await debug._dbsize(fake_redis) == 3
+
+    async def test_dbsize_without_redis_is_unknown(self) -> None:
+        assert await debug._dbsize(None) is None
+
+    async def test_dbsize_swallows_a_dead_redis(self) -> None:
+        """A key count is a row, not a failure: it must not take the Redis block
+        (or its sibling Checks) down with it."""
+        redis = MagicMock()
+        redis.dbsize = AsyncMock(side_effect=ConnectionError("down"))
+        assert await debug._dbsize(redis) is None
+
+
+class TestPostgresBlock:
+    def _stats(self) -> ArchiveStats:
+        return ArchiveStats(
+            database_bytes=134217728,
+            table_bytes=100663296,
+            rows_estimate=412083,
+            rejected_estimate=0,
+            connections=3,
+            max_connections=100,
+            shared_buffers="128MB",
+            cache_hit_ratio=0.994,
+        )
+
+    async def test_renders_the_archive_stats(self) -> None:
+        archive = MagicMock()
+        archive.stats = AsyncMock(return_value=self._stats())
+        lines = "\n".join(await debug.postgres_lines(archive, archive_enabled=True))
+        assert "db 128 MB" in lines
+        assert "play_history 96 MB" in lines
+        assert "~412083 plays · 0 rejected" in lines
+        assert "3 / 100" in lines
+        assert "hit rate 99.4%" in lines
+
+    async def test_disabled_archive_reads_as_a_choice(self) -> None:
+        """Mirrors -ping's OFF row: the ship default made this choice, and it must
+        not read as a fault."""
+        lines = await debug.postgres_lines(None, archive_enabled=False)
+        assert lines == ["off (archive disabled)"]
+
+    async def test_enabled_but_absent_archive_is_na(self) -> None:
+        assert await debug.postgres_lines(None, archive_enabled=True) == ["n/a"]

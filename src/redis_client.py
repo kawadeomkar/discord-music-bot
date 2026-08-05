@@ -974,6 +974,17 @@ class GuildRedisStore:
             pipe.xadd(HISTORY_OUTBOX_KEY, {OUTBOX_FIELD: wire})
         await pipe.execute()
 
+    @_guild_op(default=None)
+    async def history_ttl(self) -> Optional[int]:
+        """This guild's history list TTL, in redis's own vocabulary: -1 is no
+        expiry (the invariant golden rule 12 protects) and -2 is no such key.
+
+        Exists for -debug's check row, which asserts the PERSIST that push_history
+        applies on every write. On the SWALLOWING side of the split — None means
+        Redis did not answer, and the row renders unknown rather than failing.
+        """
+        return int(await self.redis.ttl(self.history_key()))
+
     @_guild_op(default_factory=list)
     async def get_history(self) -> list[HistoryEntry]:
         """Return up to HISTORY_CACHE_LIMIT history entries newest-first.

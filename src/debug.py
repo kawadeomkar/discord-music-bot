@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol, cast
 
 import discord
 from discord.ext import commands
@@ -37,6 +37,7 @@ from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore
 from src.util import (
     cancel_task,
+    fmt_duration,
     get_logger,
     trace_footer,
     trace_id_of,
@@ -45,6 +46,8 @@ from src.util import (
 
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
+
+    from src.history_archive import ArchiveStats
 
     from src.musicplayer import MusicPlayer
     from src.ytdlp_pool import PoolState
@@ -194,6 +197,16 @@ def decorate_embeds(
         embed.set_footer(
             text=truncate(text, FOOTER_LIMIT), icon_url=embed.footer.icon_url
         )
+
+
+async def _dbsize(redis: Optional["aioredis.Redis"]) -> Optional[int]:
+    if redis is None:
+        return None
+    try:
+        return int(await redis.dbsize())
+    except Exception as e:  # noqa: BLE001 — a key count is a row, not a failure
+        log.warning(f"debug DBSIZE failed: {type(e).__name__}: {e}")
+        return None
 
 
 def _in_container() -> bool:
@@ -692,11 +705,30 @@ def config_lines() -> list[str]:
 # ════════════════════════════════════════════════════════════════════════════
 
 
+class ArchiveStatsReader(Protocol):
+    """The one thing -debug's Postgres block needs, declared structurally — exactly
+    like ping's ArchiveHealth, and declared HERE for the same reason that one lives
+    in ping.py. Importing it from history_archive.py instead put `import asyncpg` in
+    this module's runtime graph and made the decoupling it claimed a fiction; the
+    ArchiveStats annotation stays behind TYPE_CHECKING so it is a type, not an edge.
+    """
+
+    async def stats(self) -> "ArchiveStats": ...
+
+
 # Stamped at import: the extension loads within seconds of process start, so this
 # is the process's start time for every purpose this command has.
 _PROCESS_START = time.time()
 
+# The CPU sampling window. Long enough that a short burst does not read as 100%,
+# short enough to sit inside a command's latency budget — and it is also the
+# loop-lag measurement, so the two share one wait.
+_CPU_WINDOW_SECS = 0.5
 _GIT_PROBE_TIMEOUT_SECS = 2.0
+# Bound on the whole Redis probe, window included. The pool sets no socket_timeout,
+# so a server that accepts the socket and never answers would otherwise run to the
+# dashboard deadline and take its two blocks down at the very end.
+_REDIS_PROBE_TIMEOUT_SECS = _CPU_WINDOW_SECS + 3.0
 _git_sha_cache: Optional[str] = None
 
 # Block order in the embed, and which probe fills each deferred one. The mapping is
@@ -705,10 +737,16 @@ _BLOCK_ORDER = (
     "Build",
     "Versions",
     "Config",
+    "Runtime",
     "Discord",
+    "Redis",
+    "Postgres",
     "This server",
 )
 _PROBE_BLOCKS: dict[str, tuple[str, ...]] = {
+    "runtime": ("Runtime",),
+    "redis": ("Redis",),
+    "postgres": ("Postgres",),
     "build": ("Build",),
 }
 _PENDING_LINES = ["⏳ collecting…"]
@@ -745,6 +783,8 @@ class DebugInputs:
     player: Optional["MusicPlayer"] = None
     redis: Optional["aioredis.Redis"] = None
     store: Optional[GuildRedisStore] = None
+    archive: Optional[ArchiveStatsReader] = None
+    archive_enabled: bool = False
     # Is the caller the bot owner? Gates every block that describes the HOST rather
     # than the caller's own server — see _OPERATOR_BLOCKS. Defaults False so a call
     # site that forgets to ask discloses nothing.
@@ -844,6 +884,49 @@ def version_lines(versions: dict[str, str]) -> list[str]:
     ]
 
 
+def runtime_lines(
+    *,
+    cpu: Optional[float] = None,
+    cpu_scope: str = "",
+    cpu_total: Optional[float] = None,
+    cores: Optional[float] = None,
+    memory: Optional[MemoryReading] = None,
+    lag_ms: Optional[float] = None,
+    tasks: Optional[int] = None,
+) -> list[str]:
+    # A plain duration, NOT a `<t:…:R>` timestamp: every row here is rendered inside
+    # a ``` fence, where Discord prints markup as its literal source — the row read
+    # `uptime <t:1785881580:R>` to every operator who ran it.
+    lines = [f"uptime       {fmt_duration(int(time.time() - _PROCESS_START))}"]
+    if cpu is None:
+        lines.append("cpu          unknown")
+    else:
+        total = f" · {fmt_duration(int(cpu_total))} total" if cpu_total else ""
+        lines.append(f"cpu          {cpu:.1f}% of {cores:g} cpus ({cpu_scope}){total}")
+    if memory is None:
+        lines.append("mem          unknown")
+    else:
+        pct = f" ({memory.percent:.0f}%)" if memory.percent is not None else ""
+        limit = f" / {_mb(memory.limit_bytes)}" if memory.limit_bytes else ""
+        lines.append(
+            f"mem          {_mb(memory.used_bytes)}{limit}{pct} · "
+            f"{memory.label} ({memory.scope})"
+        )
+    lag = f" · lag {lag_ms:.1f} ms" if lag_ms is not None else ""
+    # "loop tasks", not "bot tasks": all_tasks() is loop-global and counts
+    # discord.py's internals too. `tasks` is passed in by the caller, counted BEFORE
+    # the dashboard launches its own probes — counting it here would run inside one
+    # of them and inflate by however many are still in flight, which is exactly the
+    # error an operator reading this number to spot a task leak cannot afford.
+    count = len(asyncio.all_tasks()) if tasks is None else tasks
+    lines.append(f"loop         {count} loop tasks{lag}")
+    state = pool_state()
+    spawned = "spawned" if state.spawned else "not spawned"
+    healed = f" · {state.generation} generations" if state.generation > 1 else ""
+    lines.append(f"yt-dlp pool  {state.max_workers} workers · {spawned}{healed}")
+    return lines
+
+
 def _mb(value: float) -> str:
     return f"{value / 1_048_576:.0f} MB"
 
@@ -923,6 +1006,137 @@ def guild_lines(guild: discord.Guild, inputs: DebugInputs, *, source: str) -> li
     return lines
 
 
+# ── Dependencies: everything in-protocol ──────────────────────────────────────
+# The bot cannot read another container's /proc or cgroup, so a dependency's
+# metrics exist here only if its wire protocol reports them. Redis reports plenty
+# over INFO; Postgres answers the database's own questions over SQL and nothing
+# about its container (see the Prometheus row for that half).
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RedisSample:
+    info: dict[str, Any]
+    monotonic: float
+
+
+async def read_redis_sample(redis: Optional["aioredis.Redis"]) -> Optional[RedisSample]:
+    """One INFO read, or None when Redis is absent or unreachable. Two of these
+    bracketing a window give Redis's CPU%, the same way the bot's own is measured.
+    """
+    if redis is None:
+        return None
+    try:
+        info = cast(dict[str, Any], await redis.info())
+    except Exception as e:  # noqa: BLE001 — a down dependency is a row, not a failure
+        log.warning(f"debug redis INFO failed: {type(e).__name__}: {e}")
+        return None
+    return RedisSample(info=info, monotonic=time.monotonic())
+
+
+def redis_lines(
+    first: Optional[RedisSample],
+    second: Optional[RedisSample],
+    *,
+    dbsize: Optional[int],
+) -> list[str]:
+    if second is None:
+        return ["unavailable (no INFO — Redis down or not configured)"]
+    info = second.info
+    lines: list[str] = []
+    # No core normalization: Redis is effectively single-threaded, so 100% is one
+    # saturated core and the number means the same on any host.
+    used_cpu = _redis_cpu(first, second)
+    lines.append(
+        "cpu          unknown" if used_cpu is None else f"cpu          {used_cpu:.1f}%"
+    )
+    used = info.get("used_memory")
+    maxmemory = info.get("maxmemory") or 0
+    frag = info.get("mem_fragmentation_ratio")
+    if used is None:
+        lines.append("mem          unknown")
+    else:
+        # The % is against maxmemory because that is the threshold volatile-lru
+        # acts at — it reads as the eviction runway, not as host pressure.
+        ceiling = (
+            f" / {_mb(maxmemory)} ({used / maxmemory * 100:.0f}%)"
+            if maxmemory
+            else " (no maxmemory)"
+        )
+        frag_text = f" · frag {frag:.2f}" if isinstance(frag, (int, float)) else ""
+        lines.append(f"mem          {_mb(used)}{ceiling}{frag_text}")
+    expires = sum(
+        db.get("expires", 0)
+        for key, db in info.items()
+        if key.startswith("db") and isinstance(db, dict)
+    )
+    if dbsize is None:
+        lines.append("keys         unknown")
+    else:
+        # The persistent population is exactly what golden rule 12 protects —
+        # history lists and the outbox — so its size is the number worth watching.
+        lines.append(
+            f"keys         {dbsize} total · {max(0, dbsize - expires)} persistent"
+        )
+    hits = info.get("keyspace_hits", 0)
+    misses = info.get("keyspace_misses", 0)
+    rate = f"{hits / (hits + misses) * 100:.0f}%" if hits + misses else "n/a"
+    lines.append(
+        f"clients      {info.get('connected_clients', '?')} · "
+        f"{info.get('instantaneous_ops_per_sec', '?')} ops/sec"
+    )
+    lines.append(
+        f"cache        hit rate {rate} · evicted {info.get('evicted_keys', '?')}"
+    )
+    return lines
+
+
+def _redis_cpu(
+    first: Optional[RedisSample], second: Optional[RedisSample]
+) -> Optional[float]:
+    if first is None or second is None:
+        return None
+    wall = second.monotonic - first.monotonic
+    if wall <= 0:
+        return None
+
+    def total(sample: RedisSample) -> Optional[float]:
+        sys_cpu = sample.info.get("used_cpu_sys")
+        user_cpu = sample.info.get("used_cpu_user")
+        if not isinstance(sys_cpu, (int, float)) or not isinstance(
+            user_cpu, (int, float)
+        ):
+            return None
+        return float(sys_cpu) + float(user_cpu)
+
+    before, after = total(first), total(second)
+    if before is None or after is None:
+        return None
+    return max(0.0, (after - before) / wall * 100)
+
+
+async def postgres_lines(
+    archive: Optional[ArchiveStatsReader],
+    *,
+    archive_enabled: bool,
+) -> list[str]:
+    if archive is None:
+        # Mirrors -ping's OFF row: the default deployment made a choice, and a
+        # missing archive must read as that choice rather than as a fault.
+        return ["off (archive disabled)" if not archive_enabled else "n/a"]
+    stats = await archive.stats()
+    return [
+        f"storage      db {_mb(stats.database_bytes)} · "
+        f"play_history {_mb(stats.table_bytes)}",
+        # Estimates, not COUNT(*): play_history is unbounded by design. A non-zero
+        # rejected count means __post_init__'s clamp regressed — `just db-rejects`.
+        f"rows         ~{stats.rows_estimate} plays · "
+        f"{stats.rejected_estimate} rejected",
+        f"conns        {stats.connections} / {stats.max_connections}",
+        f"cache        buffers {stats.shared_buffers} · "
+        f"hit rate {stats.cache_hit_ratio * 100:.1f}%",
+    ]
+
+
 def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
     """Lines as one or more codeblock fields, each within Discord's 1024-char field
     cap. Splits rather than truncates: a silently clipped config listing is worse
@@ -945,6 +1159,81 @@ def _codeblock_fields(name: str, lines: list[str]) -> list[tuple[str, str]]:
 
 def _fence(lines: list[str]) -> str:
     return "```\n" + "\n".join(lines) + "\n```"
+
+
+async def _runtime_blocks(tasks: int) -> dict[str, list[str]]:
+    """Runtime alone, and deliberately touching NO IO.
+
+    cpu_before/cpu_after bracket a single window and that window IS the loop-lag
+    measurement, so the CPU rate and the lag describe the same interval — that is
+    why these two stay together. Redis used to share the window and does NOT belong
+    here: its sample was awaited BEFORE cpu_after, so a Redis that accepted the
+    socket and never answered hid uptime, memory, task count and pool state behind
+    it, and the block then claimed IT had timed out. Everything this block reads
+    (os.times, /proc, pool_state) is local and cannot block, so it must be able to
+    render while every dependency is down — that is the state -debug exists for.
+
+    The Redis probe runs its own window CONCURRENTLY with this one, so the wall
+    clock is unchanged; only the failure coupling is gone.
+    """
+    # Known and accepted skew: on the `process` scope os.times() counts REAPED
+    # children, and the build probe may reap `git rev-parse` inside this window.
+    # Measured at 0.17-0.50% on 12 cores (~2-6% on a single-core container), and
+    # only where GIT_SHA is not baked into the image — i.e. `just run`, not a deploy.
+    cpu_before = read_cpu_sample()
+    lag_ms = await measure_loop_lag(_CPU_WINDOW_SECS)
+    cpu_after = read_cpu_sample()
+    return {
+        "Runtime": _safe_block(
+            "runtime",
+            lambda: runtime_lines(
+                cpu=cpu_percent(cpu_before, cpu_after),
+                cpu_scope=cpu_after.scope,
+                cpu_total=cpu_after.seconds,
+                cores=cpu_after.cores,
+                memory=read_memory(),
+                lag_ms=lag_ms,
+                tasks=tasks,
+            ),
+        ),
+    }
+
+
+async def _redis_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
+    """Redis and Checks — one probe, because Checks reads the same post-window
+    snapshot the Redis rates are computed from, and re-reading it would let the two
+    blocks disagree about the same instant.
+
+    Bounded explicitly: the pool sets socket_connect_timeout but no socket_timeout,
+    so without this the dashboard deadline is the only thing standing between a
+    black-holed Redis and a probe that never returns. Failing here costs these two
+    blocks and nothing else.
+    """
+    async with asyncio.timeout(_REDIS_PROBE_TIMEOUT_SECS):
+        redis_before = await read_redis_sample(inputs.redis)
+        await asyncio.sleep(_CPU_WINDOW_SECS)
+        # DBSIZE has no ordering relationship with the second INFO, so it rides
+        # alongside it rather than costing its own round trip after it.
+        redis_after, dbsize = await asyncio.gather(
+            read_redis_sample(inputs.redis), _dbsize(inputs.redis)
+        )
+    return {
+        "Redis": _safe_block(
+            "redis", lambda: redis_lines(redis_before, redis_after, dbsize=dbsize)
+        ),
+    }
+
+
+async def _postgres_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
+    return {
+        "Postgres": await _safe_block_async(
+            "postgres",
+            lambda: postgres_lines(
+                inputs.archive,
+                archive_enabled=inputs.archive_enabled,
+            ),
+        )
+    }
 
 
 async def _build_blocks() -> dict[str, list[str]]:
@@ -1029,14 +1318,16 @@ def _snapshot_description(inputs: DebugInputs, in_guild: bool, source: str) -> s
 async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> None:
     """The `-debug` snapshot, sent immediately and filled in as its IO lands.
 
-    A host block costs a round trip somewhere — here, a git subprocess. Collecting
-    it before the first send makes the command look hung on a healthy host and far
-    longer on a sick one, which is exactly when it gets run.
+    Every host block costs a round trip somewhere — Redis, Postgres, a git
+    subprocess — plus a half-second CPU sampling window that no amount of
+    concurrency removes. Collecting all of it before the first send made the command
+    look hung for the better part of a second on a healthy host, and far longer on a
+    sick one, which is exactly when it gets run.
 
     So the shape is -ping's: skeleton now, edits as blocks land, a deadline that
     marks stragglers rather than failing the whole card. That last part matters
-    more here than in -ping, because this card grows more blocks and one slow
-    dependency must not be able to take all of them down with it.
+    more here than in -ping — this command has many blocks and one slow dependency
+    used to take all of them down with it.
 
     A non-operator has no deferred blocks at all (nothing they see needs IO), so
     the driver degrades to a single send with no loop.
@@ -1045,9 +1336,17 @@ async def run_debug_dashboard(ctx: commands.Context, inputs: DebugInputs) -> Non
     source = mode_source(inputs.debug_overridden, persisted=inputs.debug_persisted)
     blocks = instant_blocks(ctx, inputs, source=source)
 
+    # Counted here, before the driver creates its probe tasks — see runtime_lines.
+    loop_tasks = len(asyncio.all_tasks())
+
     probes: dict[str, Callable[[], Coroutine[Any, Any, dict[str, list[str]]]]] = {}
     if inputs.operator:
-        probes = {"build": _build_blocks}
+        probes = {
+            "runtime": lambda: _runtime_blocks(loop_tasks),
+            "redis": lambda: _redis_blocks(inputs),
+            "postgres": lambda: _postgres_blocks(inputs),
+            "build": _build_blocks,
+        }
         for names in _PROBE_BLOCKS.values():
             for name in names:
                 blocks[name] = list(_PENDING_LINES)

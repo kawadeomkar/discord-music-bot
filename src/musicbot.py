@@ -8,6 +8,7 @@ from typing import (
     Optional,
     Union,
     assert_never,
+    cast,
 )
 from collections.abc import AsyncGenerator, Coroutine, Sequence
 
@@ -18,6 +19,7 @@ import redis.asyncio as aioredis
 
 from src.config import (
     ENVIRONMENT,
+    history_archive_enabled,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     debug_mode_default,
@@ -1805,8 +1807,8 @@ class MusicBot(commands.Cog):
         usage="[--enable | --disable]",
         help=(
             "Shows what this bot is running: versions, and Discord/voice state for "
-            "this server. For the bot owner it also fills in host details — the "
-            "build it came from and how it is configured.\n\n"
+            "this server. For the bot owner it also fills in host details — build, "
+            "configuration, uptime and storage.\n\n"
             "`--enable` turns debug mode on for this server, which adds a footer "
             "carrying the trace id and timing to every reply — paste that id to the "
             "operator and they can find the exact request in the logs. `--disable` "
@@ -1861,6 +1863,7 @@ class MusicBot(commands.Cog):
         """Everything the snapshot cannot reach on its own (src/debug.py importing
         MusicBot would be a cycle)."""
         guild_id = ctx.guild.id if ctx.guild else None
+        archive_enabled = history_archive_enabled()
         operator = await self._is_owner(ctx)
         return debug_mode.DebugInputs(
             debug_enabled=self.debug_enabled(guild_id),
@@ -1872,6 +1875,12 @@ class MusicBot(commands.Cog):
             store=GuildRedisStore(self.redis, guild_id)
             if self.redis is not None and guild_id is not None
             else None,
+            # Structural: PostgresHistoryArchive satisfies ArchiveStatsReader, and
+            # a cog built without an archive (tests, disabled tier) passes None.
+            archive=cast(
+                Optional["debug_mode.ArchiveStatsReader"], self.history_archive
+            ),
+            archive_enabled=archive_enabled,
             operator=operator,
         )
 
