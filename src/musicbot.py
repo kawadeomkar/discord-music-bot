@@ -122,6 +122,21 @@ def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
         qobj.query_source = token
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ActiveCommand:
+    """The bookkeeping cog_before_invoke opens and cog_after_invoke closes.
+
+    `token` is what otel_context.attach() returned and detach() requires back
+    (`object` does not satisfy it). `started` is monotonic and exists for the debug
+    footer, which reports elapsed time AT EACH SEND — so a command that sends twice
+    shows two increasing numbers, timing its phases.
+    """
+
+    span: Span
+    token: Token[Context]
+    started: float
+
+
 @dataclass
 class ResolvedSpotifyPlaylist:
     """A Spotify playlist resolved to track titles — still needs per-title
@@ -234,9 +249,8 @@ class MusicBot(commands.Cog):
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
-        # id(ctx) → (span, the token otel_context.attach() returns and detach()
-        # requires back — `object` does not satisfy it).
-        self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
+        # id(ctx) → the in-flight command's span, otel token and start time.
+        self._active_spans: dict[int, ActiveCommand] = {}
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
         # Debug mode's host-wide default. The env var is read ONCE, here, which is
@@ -381,7 +395,9 @@ class MusicBot(commands.Cog):
             },
         )
         token = otel_context.attach(trace.set_span_in_context(span))
-        self._active_spans[id(ctx)] = (span, token)
+        self._active_spans[id(ctx)] = ActiveCommand(
+            span=span, token=token, started=time.monotonic()
+        )
 
         try:
             if ctx.guild is None:
@@ -414,22 +430,20 @@ class MusicBot(commands.Cog):
         from structlog.contextvars import clear_contextvars
 
         clear_contextvars()
-        pair = self._active_spans.pop(id(ctx), None)
-        if pair:
-            span, token = pair
-            span.end()
-            otel_context.detach(token)
+        active = self._active_spans.pop(id(ctx), None)
+        if active:
+            active.span.end()
+            otel_context.detach(active.token)
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """discord.py hook run when a command raises: records the error on the
         active span and, for errors with no other user-visible output, notifies the user.
         """
         # Peek, don't pop: cog_after_invoke runs after this and ends the span.
-        pair = self._active_spans.get(id(ctx))
-        if pair:
-            span, _ = pair
-            span.record_exception(error)
-            span.set_status(StatusCode.ERROR, str(error))
+        active = self._active_spans.get(id(ctx))
+        if active:
+            active.span.record_exception(error)
+            active.span.set_status(StatusCode.ERROR, str(error))
 
         # validate_commands sends its own message before raising CommandError, so
         # only handle errors that produce no user-visible output.
