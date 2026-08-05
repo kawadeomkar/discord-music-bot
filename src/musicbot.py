@@ -17,8 +17,10 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from src.config import (
+    ENVIRONMENT,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
+    debug_mode_default,
     spotify_enabled,
 )
 from src import leaderboard
@@ -193,6 +195,7 @@ class MusicBot(commands.Cog):
         "_active_spans",
         "_alone_timers",
         "_restore_tasks",
+        "_debug_default",
     )
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -236,6 +239,19 @@ class MusicBot(commands.Cog):
         self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
         self._alone_timers: dict[int, asyncio.Task] = {}
         self._restore_tasks: set[asyncio.Task] = set()
+        # Debug mode's host-wide default. The env var is read ONCE, here, which is
+        # what makes a garbage value abort startup inside load_extension rather than
+        # surfacing later from somewhere that swallows it.
+        self._debug_default: bool = debug_mode_default()
+        if self._debug_default and ENVIRONMENT == "production":
+            # Debug modes announce themselves in production; the convention is
+            # Flask's and Django's. Observation-only, so this is an advisory, not
+            # a refusal — but a production deployment should have chosen it.
+            log.warning(
+                "DEBUG_MODE is on in production: every command response will "
+                "carry a debug footer (trace id, timings, runtime metrics). "
+                "Nothing about playback changes. Unset DEBUG_MODE to turn it off."
+            )
 
     async def cog_load(self) -> None:
         """Kick off Spotify credential validation without blocking startup.
@@ -1603,6 +1619,22 @@ class MusicBot(commands.Cog):
             )
         except Exception as e:
             await self._command_error(ctx, e)
+
+    # ── Debug mode ────────────────────────────────────────────────────────────
+
+    def debug_enabled(self, guild_id: Optional[int]) -> bool:
+        """Whether debug mode is on for this guild — the one query surface for it.
+
+        DEBUG_MODE is the host-wide default. It is read SYNCHRONOUSLY and from
+        memory on purpose: MusicContext.send calls this on every reply, so anything
+        that needed IO here would put it on the hot path of every command.
+
+        Takes a guild id already, even though nothing varies by guild yet: this is
+        the seam a per-guild override slots into, and every caller passing one from
+        the start is what keeps that from becoming a signature change across the
+        whole send path later.
+        """
+        return self._debug_default
 
     # ── Alone-channel disconnect ──────────────────────────────────────────────
 

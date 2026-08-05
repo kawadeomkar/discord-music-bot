@@ -102,8 +102,13 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     drainer wiring) and hundreds of assertions encode it. Don't change this to
     the ship default — disabled-mode tests monkeypatch the flag per case and win
     over this fixture (same MonkeyPatch instance, later call).
+
+    DEBUG_MODE is scrubbed rather than pinned, because here the ship default is
+    the one hundreds of embed assertions encode: with it on, every response grows
+    a debug footer. Debug-on tests monkeypatch it (or set an override) per case.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
@@ -357,4 +362,8 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()
+    # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
+    # mode on, every response grows a footer and the suite's embed assertions
+    # would be asserting against decorated output everywhere.
+    cog._debug_default = False
     return cog

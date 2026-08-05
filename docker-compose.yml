@@ -21,6 +21,11 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
       #
+      # Off by default; `true` starts every server with debug mode on. Valueless
+      # on purpose like ENVIRONMENT above — an unset variable here leaves
+      # env_file's value intact and a set one wins.
+      - DEBUG_MODE
+      #
       # Built from the same POSTGRES_* vars as the postgres service below, so
       # the password lives in exactly one place (.env). Pointing at an EXTERNAL
       # Postgres needs no edit here: POSTGRES_URL from .env (or the environment)
