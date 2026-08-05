@@ -20,6 +20,7 @@ from src.config import (
     _float_env,
     _int_env,
     debug_mode_default,
+    debug_prometheus_url,
     history_archive_enabled,
     postgres_url,
     spotify_enabled,
@@ -571,6 +572,39 @@ class TestComposeBakesTheCommit:
         assert 'GIT_SHA="${GIT_SHA:-unknown}"' in preflight
 
 
+class TestComposeDebugPrometheusUrl:
+    """A VALUED `environment:` entry beats env_file AND the process environment, so
+    a bare literal here would silently override the .env setting .env.example tells
+    operators to use. That is how the knob shipped inert."""
+
+    def test_the_url_is_interpolated_not_hardcoded(self) -> None:
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${DEBUG_PROMETHEUS_URL" in line, line
+
+    def test_it_defaults_rather_than_requiring_the_variable(self) -> None:
+        """`:-` not `:?`: unset must degrade that one -debug row to `n/a`, never
+        fail the whole `up`."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert ":-" in line and ":?" not in line
+
+    def test_the_published_port_is_a_variable_and_loopback_only(self) -> None:
+        """9090 is exactly the port an already-installed local Prometheus owns, and
+        a collision fails the entire `up` — same reasoning as POSTGRES_HOST_PORT."""
+        lgtm = _service_block("otel-lgtm")
+        line = next(ln for ln in lgtm.splitlines() if ":9090" in ln)
+        assert "127.0.0.1:" in line
+        assert "${PROMETHEUS_HOST_PORT" in line
+
+    def test_the_default_url_follows_the_published_port(self) -> None:
+        """Two knobs that must agree: moving the port without moving the URL points
+        the bot at a port nothing listens on."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${PROMETHEUS_HOST_PORT:-9090}" in line
+
+
 class TestComposeMatchesTheDefault:
     """The two halves of the first-run promise, asserted against the real file:
     `docker compose up` must work with nothing configured but DISCORD_TOKEN, and
@@ -958,3 +992,22 @@ class TestSetupEnvTightensTheEnvFile:
         # Narrowing only: go-rwx clears bits and never sets them, so an operator
         # who chose 400 keeps 400.
         assert self._run(0o400, tmp_path) == 0o400
+
+
+class TestDebugPrometheusUrl:
+    """The opt-in knob behind -debug's container-metrics row. Unset is the
+    feature being off, not a misconfiguration."""
+
+    def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DEBUG_PROMETHEUS_URL", raising=False)
+        assert debug_prometheus_url() is None
+
+    def test_empty_reads_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bare `KEY=` shape .env models elsewhere, and compose interpolates
+        an unset variable to exactly that."""
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", "   ")
+        assert debug_prometheus_url() is None
+
+    def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
+        assert debug_prometheus_url() == "http://localhost:9090"

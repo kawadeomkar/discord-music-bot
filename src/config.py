@@ -189,18 +189,39 @@ def history_archive_enabled() -> bool:
 
 
 def debug_mode_default() -> bool:
-    """The process-wide default for debug mode.
+    """The process-wide default for debug mode — what a guild gets before anyone
+    runs `-debug --enable`.
 
     Debug mode is observation-only: it decorates responses with trace/timing
     metadata and nothing else, so this is safe to leave on. Read ONCE, by
     MusicBot.__init__, which is what makes a garbage value abort startup inside
     load_extension.
 
+    This is the default for a guild that has never chosen, and only for as long as
+    it has not: `-debug --enable/--disable` persists to guild:{id}:config and WINS
+    over this value from then on, across restarts. Changing this env var moves every
+    guild that never chose and none that did.
+
     Parsed by the same strict table as history_archive_enabled — unset and empty
     are False, and a typo raises rather than silently reading as off — so there is
     one boolean grammar in this file rather than two.
     """
     return _parse_bool_env("DEBUG_MODE")
+
+
+def debug_prometheus_url() -> Optional[str]:
+    """Base URL of a Prometheus that holds this deployment's container metrics, or
+    None (the default) to leave the feature off.
+
+    -debug's Postgres block reads container CPU/memory from here, because the bot
+    cannot see another container's cgroup and Postgres reports no OS metrics over
+    SQL. Compose supplies it once otel-lgtm's Prometheus port is published; unset,
+    the row degrades to `n/a (no metrics source)` and nothing else changes.
+
+    Read at call time, like postgres_url, and `or None` collapses unset and
+    exported-but-empty into one absent case.
+    """
+    return (os.environ.get("DEBUG_PROMETHEUS_URL") or "").strip() or None
 
 
 def postgres_url() -> Optional[str]:

@@ -19,11 +19,13 @@ import redis.asyncio as aioredis
 
 from src.config import (
     ENVIRONMENT,
-    history_archive_enabled,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
     debug_mode_default,
+    debug_prometheus_url,
+    history_archive_enabled,
     spotify_enabled,
+    using_default_postgres_password,
 )
 from src import debug as debug_mode
 from src import leaderboard
@@ -216,9 +218,6 @@ class MusicBot(commands.Cog):
         "_restore_tasks",
         "_debug_default",
         "_debug_overrides",
-        "_debug_toggle_seq",
-        "_debug_toggled_at",
-        "_debug_unpersisted",
         "_runtime_sampler",
     )
 
@@ -313,7 +312,8 @@ class MusicBot(commands.Cog):
 
     async def cog_unload(self) -> None:
         """Stop the runtime sampler unconditionally. A reload that left it running
-        would drip /proc reads for the life of the process.
+        would drip /proc reads for the life of the process. The shared Prometheus
+        session goes with it, or a reload leaks a connector per load.
 
         The background tasks go FIRST: _load_debug_overrides ends in
         _sync_runtime_sampler, so one still in flight would restart the sampler
@@ -321,6 +321,7 @@ class MusicBot(commands.Cog):
         """
         await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
         await self._runtime_sampler.aclose()
+        await debug_mode.close_prometheus_session()
 
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited). Only
@@ -1707,10 +1708,6 @@ class MusicBot(commands.Cog):
     def debug_enabled(self, guild_id: Optional[int]) -> bool:
         """Whether debug mode is on for this guild — the one query surface for it.
 
-        DEBUG_MODE is the host-wide default. It is read SYNCHRONOUSLY and from
-        memory on purpose: MusicContext.send calls this on every reply, so anything
-        that needed IO here would put it on the hot path of every command.
-
         DEBUG_MODE is the default every guild starts from: set it and all of them
         are on unless they opted out; leave it false or unset and each guild turns
         itself on with `-debug --enable`. A guild with no stored choice (and every
@@ -1808,7 +1805,7 @@ class MusicBot(commands.Cog):
         help=(
             "Shows what this bot is running: versions, and Discord/voice state for "
             "this server. For the bot owner it also fills in host details — build, "
-            "configuration, uptime and storage.\n\n"
+            "configuration, uptime, storage and health checks.\n\n"
             "`--enable` turns debug mode on for this server, which adds a footer "
             "carrying the trace id and timing to every reply — paste that id to the "
             "operator and they can find the exact request in the logs. `--disable` "
@@ -1865,6 +1862,15 @@ class MusicBot(commands.Cog):
         guild_id = ctx.guild.id if ctx.guild else None
         archive_enabled = history_archive_enabled()
         operator = await self._is_owner(ctx)
+        # Asked symmetrically — not only when the password IS the default — because a
+        # row that renders for False and vanishes for True makes its own absence the
+        # answer. Moot while the whole Checks block is owner-only, and it stays right
+        # if that ever loosens.
+        default_password = (
+            (using_default_postgres_password() and archive_enabled)
+            if operator
+            else None
+        )
         return debug_mode.DebugInputs(
             debug_enabled=self.debug_enabled(guild_id),
             debug_overridden=guild_id is not None and guild_id in self._debug_overrides,
@@ -1881,7 +1887,9 @@ class MusicBot(commands.Cog):
                 Optional["debug_mode.ArchiveStatsReader"], self.history_archive
             ),
             archive_enabled=archive_enabled,
+            prometheus_url=debug_prometheus_url(),
             operator=operator,
+            default_password=default_password,
         )
 
     async def _is_owner(self, ctx: commands.Context) -> bool:

@@ -1119,6 +1119,7 @@ class GuildRedisStore:
         pipe.hgetall(self.now_playing_key())
         pipe.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
         # Config rides along rather than costing restore a second round trip: the
+        # guild's stored volume is needed at exactly this moment, and the
         # all-or-nothing contract above should cover it too.
         pipe.hgetall(self.config_key())
         raw_state, raw_queue, raw_np, raw_history, raw_config = await pipe.execute()
@@ -1162,8 +1163,6 @@ class GuildRedisStore:
         mapping = GuildConfig(volume=volume).to_redis()
         pipe = self.redis.pipeline()
         pipe.hset(self.config_key(), mapping=_hset_mapping(mapping))
-        # PERSIST for the same reason set_debug_mode does it: under volatile-lru an
-        # expiring config is a setting that reverts with no log line.
         pipe.persist(self.config_key())
         pipe.hset(self.state_key(), StateField.VOLUME, mapping[ConfigField.VOLUME])
         # The legacy write can CREATE the state hash on a guild whose 24h TTL has

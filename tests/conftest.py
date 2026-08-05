@@ -167,6 +167,12 @@ def mock_author() -> MagicMock:
     member.mention = "<@222222222222222222>"
     member.voice = MagicMock()
     member.voice.channel = MagicMock(spec=discord.VoiceChannel)
+    # Set explicitly, not left to the spec. `spec=discord.Member` auto-mocks
+    # guild_permissions, so every attribute on it answers with a TRUTHY MagicMock —
+    # a permission check would pass here even if the code had deleted it. A test
+    # that means "denied" has to say so by setting this False.
+    member.guild_permissions = MagicMock(spec=discord.Permissions)
+    member.guild_permissions.manage_guild = True
     return member
 
 

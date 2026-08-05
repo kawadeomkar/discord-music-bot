@@ -2,10 +2,10 @@
 
 import redis.asyncio as aioredis
 import asyncio
-from zoneinfo import ZoneInfo
 import contextlib
 import dataclasses
 import re
+from zoneinfo import ZoneInfo
 import time
 from typing import Any, Never, cast
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -1988,8 +1988,8 @@ class TestRedisHelpers:
     ) -> None:
         assert music_player.store is not None
         await music_player.store.set_volume(0.75)
-        state = await fake_redis.hgetall(music_player.store.state_key())
-        assert state[b"volume"] == b"0.75"
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.75"
 
     async def test_redis_pop_queue_removes_first_item(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -4876,7 +4876,12 @@ class TestRestoreStateTtlRefresh:
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         assert music_player.store is not None
-        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.8")
+        # A realistic state hash: volume alone would be MIGRATED out of it by the
+        # restore below (see stored_volume), leaving an empty hash that Redis deletes
+        # — so the TTL this test is about would have nothing to sit on.
+        await fake_redis.hset(
+            music_player.store.state_key(), b"voice_channel_id", b"321"
+        )
         await fake_redis.expire(music_player.store.state_key(), 10)
 
         await music_player._restore_state()

@@ -1,19 +1,20 @@
-"""Debug mode's footer: what every reply grows while the mode is on.
-
-Observation-only by rule, so what is asserted here is entirely what is DISPLAYED.
-The seam that applies it to real command responses is tested in test_context.py.
-"""
+"""Tests for src/debug.py — argument parsing, the config redaction table, and the
+snapshot's collectors. The redaction tests are the load-bearing ones: this embed is
+built to be screenshotted into an issue, so a value that should never render is a
+credential leak rather than a cosmetic bug."""
 
 import asyncio
 import os
 import re
 import time
 from pathlib import Path
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import orjson
 import pytest
 from redis.asyncio import Redis
 from discord.ext import commands
@@ -23,16 +24,19 @@ from src import debug
 from src.history_archive import ArchiveStats
 from src.musicplayer import MusicPlayer
 from src.debug import (
+    DebugAction,
     DebugInputs,
     _CONFIG_ALLOWLIST,
     _ConfigKind,
     _codeblock_fields,
+    run_debug_dashboard,
     config_lines,
     discord_lines,
     guild_lines,
+    parse_debug_arg,
     redact_url,
     render_config_value,
-    run_debug_dashboard,
+    unknown_arg_message,
 )
 
 
@@ -74,56 +78,535 @@ def _archive_stats() -> ArchiveStats:
     )
 
 
-class TestDebugFooter:
-    """Every segment is optional because every one has a genuine absent case: a
-    send outside any command has no elapsed time, a DM has no shard, and an
-    unsampled span has no trace id."""
+class TestParseDebugArg:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("", DebugAction.STATUS),
+            ("   ", DebugAction.STATUS),
+            ("--enable", DebugAction.ENABLE),
+            ("  --ENABLE ", DebugAction.ENABLE),
+            ("--disable", DebugAction.DISABLE),
+        ],
+    )
+    def test_accepted_forms(self, raw: str, expected: DebugAction) -> None:
+        assert parse_debug_arg(raw) is expected
 
-    def test_nothing_known_renders_nothing(self) -> None:
-        """An empty string, not a lone marker — a footer that says only "🐞" is
-        noise on every reply and tells the operator nothing."""
-        assert debug.debug_footer() == ""
+    @pytest.mark.parametrize(
+        "raw", ["enable", "-enable", "--enabled", "--enable please", "on", "--verbose"]
+    )
+    def test_everything_else_is_unparseable(self, raw: str) -> None:
+        assert parse_debug_arg(raw) is None
 
-    def test_elapsed_and_shard_render(self) -> None:
-        footer = debug.debug_footer(elapsed_ms=12.4, shard_id=3)
-        assert "12 ms" in footer
-        assert "shard 3" in footer
+    @pytest.mark.parametrize("raw", ["enable", "DISABLE", " disable "])
+    def test_missing_dashes_gets_a_pointed_hint(self, raw: str) -> None:
+        """The realistic typo. A FlagConverter would have answered this with a
+        FlagError raised before the body ever ran, which is why the parse is by hand."""
+        assert f"--{raw.strip().lower()}" in unknown_arg_message(raw)
 
-    def test_shard_zero_is_not_mistaken_for_absent(self) -> None:
-        """Shard 0 is a real shard and falsy; `is not None` is what separates them."""
-        assert "shard 0" in debug.debug_footer(shard_id=0)
+    def test_unknown_argument_is_never_echoed_back(self) -> None:
+        """User text rendered into an embed the BOT sends is a mention-injection
+        surface — discord.py's default allowed_mentions permits @everyone."""
+        message = unknown_arg_message("@everyone `oops`")
+        assert "@everyone" not in message
+        assert debug.DEBUG_USAGE in message
 
-    def test_an_embeds_own_footer_is_kept(self) -> None:
-        embed = discord.Embed(description="x")
-        embed.set_footer(text="Requested by someone")
-        debug.decorate_embeds([embed], elapsed_ms=5.0)
-        text = embed.footer.text or ""
-        assert text.startswith("Requested by someone")
-        assert "5 ms" in text
 
-    def test_an_icon_url_survives_decoration(self) -> None:
-        """set_footer replaces the whole footer object, so the icon has to be
-        carried across explicitly or every decorated reply silently loses it."""
-        embed = discord.Embed(description="x")
-        embed.set_footer(text="by someone", icon_url="https://example.invalid/a.png")
-        debug.decorate_embeds([embed], elapsed_ms=5.0)
-        assert embed.footer.icon_url == "https://example.invalid/a.png"
+class TestRedactUrl:
+    def test_userinfo_is_replaced(self) -> None:
+        assert (
+            redact_url("postgresql://bot:hunter2@db.internal:5432/musicbot")
+            == "postgresql://***@db.internal:5432/musicbot"
+        )
 
-    def test_an_embed_with_nothing_to_add_is_left_alone(self) -> None:
-        embed = discord.Embed(description="x")
-        debug.decorate_embeds([embed])
-        assert embed.footer.text is None
+    def test_credentialless_url_is_untouched(self) -> None:
+        assert redact_url("redis://localhost:6379") == "redis://localhost:6379"
 
-    def test_the_footer_is_truncated_to_discords_cap(self) -> None:
-        embed = discord.Embed(description="x")
-        embed.set_footer(text="A" * (debug.FOOTER_LIMIT + 500))
-        debug.decorate_embeds([embed], elapsed_ms=1.0)
-        assert len(embed.footer.text or "") <= debug.FOOTER_LIMIT
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "collector.prod.internal.corp:4317",
+            "pot-sidecar.prod.internal.corp:4416",
+            "cache.internal:6379",
+            # One slash, so there is no authority to rewrite AND the host lands in
+            # .path — replacing .netloc alone leaves it visible.
+            "http:/host.internal:9090/x",
+        ],
+    )
+    def test_hide_host_does_not_fail_open_on_a_schemeless_url(self, raw: str) -> None:
+        """urlsplit only fills .netloc when it sees `//`. Without it the host lands
+        in .scheme/.path, so rewriting .netloc wrote `***` into a slot that was never
+        carrying the host — publishing internal topology beside a marker that reads
+        as "this was redacted". Operators DO write these scheme-less; ping.probe_otel
+        carries the same normalisation and says so."""
+        redacted = redact_url(raw, hide_host=True)
+        assert "internal" not in redacted
+        assert "4317" not in redacted and "4416" not in redacted
+        assert "6379" not in redacted and "9090" not in redacted
 
-    def test_every_embed_in_the_list_is_decorated(self) -> None:
-        embeds = [discord.Embed(description=str(i)) for i in range(3)]
-        debug.decorate_embeds(embeds, elapsed_ms=7.0)
-        assert all("7 ms" in (e.footer.text or "") for e in embeds)
+    def test_hide_host_still_keeps_the_shape_of_a_normal_url(self) -> None:
+        """The guard above must not flatten the ordinary case: an operator still
+        needs to see which protocol is configured."""
+        assert (
+            redact_url("redis://user:pw@cache.internal:6379/0", hide_host=True)
+            == "redis://***/0"
+        )
+
+    @pytest.mark.parametrize(
+        "key", ["password", "api_key", "auth", "X-Token", "client_secret"]
+    )
+    def test_credential_query_values_are_replaced(self, key: str) -> None:
+        """asyncpg honours `?password=` as readily as userinfo, so the query string
+        is the second place a DSN hides a credential."""
+        redacted = redact_url(f"postgresql://db/musicbot?{key}=hunter2&sslmode=require")
+        assert "hunter2" not in redacted
+        assert "***" in redacted
+        assert "sslmode=require" in redacted
+
+    def test_a_fragment_is_marked_rather_than_echoed(self) -> None:
+        """urlsplit puts everything after a stray `#` into .fragment, so it is the
+        one component neither the userinfo nor the query redaction reaches. Marked
+        rather than dropped, so the row still says something was there."""
+        redacted = redact_url("redis://host:6379/0#pw=hunter2")
+        assert redacted == "redis://host:6379/0#***"
+        assert "hunter2" not in redacted
+
+    def test_unparseable_url_degrades(self) -> None:
+        assert redact_url("http://[::1") == "unparseable"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "redis://u:pw@host:99999/0",  # out of range
+            "redis://u:pw@host:abc/0",  # not a number
+        ],
+    )
+    def test_a_bad_port_degrades_instead_of_raising(self, url: str) -> None:
+        """`.port` is LAZY: urlsplit accepts these and raises on dereference. With
+        the guard around the parse alone, the ValueError escaped past it — and since
+        the whole Config block is one collector, one typo'd port in .env replaced all
+        of it with "unavailable (ValueError)" exactly while someone was diagnosing
+        that host.
+        """
+        assert redact_url(url) == "unparseable"
+        assert "pw" not in redact_url(url)
+
+
+class TestConfigAllowlist:
+    def test_credentials_render_presence_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for var in _CONFIG_ALLOWLIST:
+            if var.kind is not _ConfigKind.SECRET:
+                continue
+            monkeypatch.setenv(var.name, "super-secret-value")
+            rendered = render_config_value(var)
+            assert rendered == "set"
+            monkeypatch.delenv(var.name)
+            assert render_config_value(var) == "unset"
+
+    def test_every_credential_bearing_var_is_declared_secret(self) -> None:
+        """The allowlist is decided by hand rather than by pattern-match, so this
+        pins the review decision: these four carry credentials and must never
+        render a value, POSTGRES_URL because it embeds the password in its DSN."""
+        secrets = {v.name for v in _CONFIG_ALLOWLIST if v.kind is _ConfigKind.SECRET}
+        assert secrets == {
+            "DISCORD_TOKEN",
+            "SPOTIFY_CLIENT_ID",
+            "SPOTIFY_CLIENT_SECRET",
+            "POSTGRES_URL",
+        }
+
+    def test_url_values_are_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Credential AND host. The card is posted in the channel the operator typed
+        in, so `cache:6379` is internal topology published to everyone there."""
+        monkeypatch.setenv("REDIS_URL", "redis://user:pw@cache:6379/0")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
+        rendered = render_config_value(var)
+        assert "pw" not in rendered
+        assert "cache" not in rendered and "6379" not in rendered
+        assert rendered == "redis://***/0"
+
+    def test_a_local_host_is_redacted_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unconditionally, or the presence of `***` would itself say "remote"."""
+        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
+        assert "localhost" not in render_config_value(var)
+
+    def test_unset_shows_the_value_in_force(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset knob is not "nothing" — it is the default, and the default is
+        what an operator is validating against."""
+        monkeypatch.delenv("YTDLP_POOL_WORKERS", raising=False)
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
+        assert render_config_value(var) == "4 (default)"
+
+    def test_unlisted_variable_never_renders(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The allowlist's whole point: a knob added later opts in at review time,
+        so a future secret cannot leak by simply existing."""
+        monkeypatch.setenv("SOME_FUTURE_SECRET", "leaked")
+        assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
+        assert "leaked" not in "\n".join(config_lines())
+
+    def test_no_duplicate_rows(self) -> None:
+        names = [v.name for v in _CONFIG_ALLOWLIST]
+        assert len(names) == len(set(names))
+
+
+class TestCodeblockFields:
+    def test_short_block_is_one_field(self) -> None:
+        fields = _codeblock_fields("Config", ["a", "b"])
+        assert fields == [("Config", "```\na\nb\n```")]
+
+    def test_long_block_splits_rather_than_truncating(self) -> None:
+        """Discord's field cap is 1024. A config listing clipped in place would
+        read as a complete one, which is worse than showing none."""
+        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
+        fields = _codeblock_fields("Config", lines)
+        assert len(fields) > 1
+        assert all(len(value) <= 1024 for _, value in fields)
+        assert fields[1][0] == "Config (cont.)"
+        rendered = "".join(value for _, value in fields)
+        for line in lines:
+            assert line in rendered
+
+
+class TestDiscordBlock:
+    def test_falls_back_to_single_shard_shape(self, mock_bot: MagicMock) -> None:
+        """`latencies` is AutoShardedClient-only; a plain Bot (and every MagicMock,
+        which auto-vivifies it into something that is not a list) takes this arm."""
+        lines = "\n".join(discord_lines(mock_bot, players=2))
+        assert "shards       1" in lines
+        assert "#0 50 ms" in lines
+        assert "players      2" in lines
+
+    def test_renders_every_shard(self, mock_bot: MagicMock) -> None:
+        mock_bot.latencies = [(0, 0.041), (1, 0.038)]
+        lines = "\n".join(discord_lines(mock_bot, players=0))
+        assert "shards       2" in lines
+        assert "#0 41 ms, #1 38 ms" in lines
+
+    def test_reconnecting_shard_is_not_rendered_as_a_number(
+        self, mock_bot: MagicMock
+    ) -> None:
+        mock_bot.latencies = [(0, float("nan"))]
+        assert "reconnecting" in "\n".join(discord_lines(mock_bot, players=0))
+
+
+class TestGuildBlock:
+    def _inputs(self, player: object = None) -> DebugInputs:
+        return DebugInputs(
+            debug_enabled=True,
+            debug_overridden=True,
+            players=1,
+            player=cast(Optional[MusicPlayer], player),
+        )
+
+    def test_reports_no_player_and_no_voice(self, mock_guild: MagicMock) -> None:
+        mock_guild.voice_client = None
+        lines = "\n".join(
+            guild_lines(mock_guild, self._inputs(), source="saved here"),
+        )
+        assert "player       no" in lines
+        assert "voice        not connected" in lines
+        assert "debug        on (saved here)" in lines
+
+    def test_reports_player_queue_and_volume(
+        self, mock_guild: MagicMock, music_player: MagicMock
+    ) -> None:
+        mock_guild.voice_client = None
+        music_player.volume = 0.5
+        lines = "\n".join(
+            guild_lines(
+                mock_guild, self._inputs(player=music_player), source="saved here"
+            )
+        )
+        assert "player       yes" in lines
+        assert "queue        0 queued" in lines
+        assert "volume       50%" in lines
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "```[Verify your account](https://evil.example)```",
+            "`` ` ``",
+            "```\n@everyone\n```",
+            "x" * 200,
+        ],
+    )
+    def test_a_channel_name_cannot_break_out_of_the_code_fence(
+        self, mock_guild: MagicMock, name: str
+    ) -> None:
+        """A voice-channel name is the only user-controlled string in the snapshot,
+        and `This server` is the block every guild member can see. A backtick run
+        closes the fence, and Discord renders masked links inside embed field values
+        — a clickable attacker link inside a card carrying the bot's name and avatar.
+        Join-to-create bots hand ordinary members naming rights, so it needs no
+        permission at all."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = name
+        vc.average_latency = 0.02
+        mock_guild.voice_client = vc
+
+        rendered = "\n".join(guild_lines(mock_guild, self._inputs(), source="x"))
+
+        assert "`" not in rendered
+        # The cap is half the control: an unbounded name pushes the rest of the
+        # block past Discord's 1024-char field limit and the send 400s.
+        assert max(len(line) for line in rendered.splitlines()) < 120
+
+    def test_voice_latency_warming_up_is_not_an_error(
+        self, mock_guild: MagicMock
+    ) -> None:
+        """discord.py #6430: both reads are inf, and average_latency raises
+        ZeroDivisionError, until the first ACK ~5s after joining — exactly the
+        window a tester looks at, since testing starts with a fresh join."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = "General"
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        vc.latency = float("inf")
+        type(vc).average_latency = property(
+            lambda _: (_ for _ in ()).throw(ZeroDivisionError())
+        )
+        mock_guild.voice_client = vc
+        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
+        assert "voice ws     warming up" in lines
+
+    def test_missing_voice_permissions_are_flagged(self, mock_guild: MagicMock) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock(spec=discord.VoiceChannel)
+        vc.channel.name = "General"
+        vc.is_playing.return_value = True
+        vc.is_paused.return_value = False
+        vc.latency = 0.021
+        vc.average_latency = 0.023
+        perms = MagicMock(spec=discord.Permissions)
+        perms.connect = True
+        perms.speak = False
+        vc.channel.permissions_for.return_value = perms
+        mock_guild.voice_client = vc
+        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
+        assert "voice        General · playing" in lines
+        assert "voice ws     21 ms (avg 23 ms)" in lines
+        assert "connect ✅" in lines
+        assert "speak ⚠️" in lines
+
+
+class TestSafeBlock:
+    async def test_a_broken_collector_does_not_take_the_embed_down(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The degrade principle: every collector is wrapped, because a debug tool
+        that crashes is worse than no debug tool."""
+        mock_ctx.guild = None
+        with patch.object(debug, "build_lines", side_effect=RuntimeError("boom")):
+            embed = await _snapshot(
+                mock_ctx,
+                DebugInputs(
+                    debug_enabled=False,
+                    debug_overridden=False,
+                    players=0,
+                    operator=True,
+                ),
+            )
+        build = next(f for f in embed.fields if f.name == "Build")
+        assert "unavailable (RuntimeError)" in (build.value or "")
+        assert [f.name for f in embed.fields].count("Config") == 1
+
+
+class TestTheSnapshotDoesNotWaitForItsIO:
+    """-debug went from collect-everything-then-send to skeleton-then-fill. The
+    point is that a sick dependency delays one BLOCK, not the whole reply."""
+
+    @staticmethod
+    def _operator(**kw: Any) -> DebugInputs:
+        return DebugInputs(
+            debug_enabled=False, debug_overridden=False, players=0, operator=True, **kw
+        )
+
+    async def test_the_skeleton_shows_placeholders_for_blocks_still_collecting(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The runtime and redis probes each own a half-second window, so none of
+        their blocks can have landed by the first send."""
+        mock_ctx.guild.voice_client = None
+        embed = await _skeleton(mock_ctx, self._operator())
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        for probe in ("runtime", "redis"):
+            for name in debug._PROBE_BLOCKS[probe]:
+                assert "collecting" in rendered[name], name
+
+    async def test_a_block_that_can_answer_instantly_skips_the_placeholder(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The pre-drain. A disabled archive answers "off" without any IO, and
+        flashing "collecting…" at it for a full tick would be a lie."""
+        mock_ctx.guild.voice_client = None
+        embed = await _skeleton(mock_ctx, self._operator())
+        postgres = next(f.value or "" for f in embed.fields if f.name == "Postgres")
+        assert "collecting" not in postgres
+        assert "archive disabled" in postgres
+
+    async def test_the_instant_blocks_are_already_filled_in_the_skeleton(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Config and Discord need no IO, so making the user wait for them would be
+        pure loss. Versions rides prepare()."""
+        mock_ctx.guild.voice_client = None
+        embed = await _skeleton(mock_ctx, self._operator())
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "ENVIRONMENT" in rendered["Config"]
+        assert "shards" in rendered["Discord"]
+        assert "collecting" not in rendered["Versions"]
+
+    async def test_the_send_happens_before_a_slow_block_resolves(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.voice_client = None
+        gate = asyncio.Event()
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        mock_ctx.channel.send = AsyncMock(return_value=message)
+
+        async def slow_stats() -> Any:
+            await gate.wait()
+            return _archive_stats()
+
+        archive = MagicMock()
+        archive.stats = slow_stats
+        task = asyncio.create_task(
+            run_debug_dashboard(
+                mock_ctx, self._operator(archive=archive, archive_enabled=True)
+            )
+        )
+        async with asyncio.timeout(3):
+            while mock_ctx.channel.send.await_count == 0:
+                await asyncio.sleep(0)
+            # Sent, and Postgres is still a placeholder — the contract.
+            call = mock_ctx.channel.send.await_args
+            assert call is not None
+            sent = call.kwargs["embeds"][0]
+            assert "collecting" in next(
+                f.value or "" for f in sent.fields if f.name == "Postgres"
+            )
+            gate.set()
+            await task
+
+    async def test_a_block_that_misses_the_deadline_says_so(
+        self, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The improvement over one all-or-nothing timeout: a hung dependency costs
+        its own block and nothing else."""
+        mock_ctx.guild.voice_client = None
+        monkeypatch.setattr(debug, "DEBUG_DEADLINE_SECS", 0.3)
+        monkeypatch.setattr(debug, "DEBUG_TICK_SECS", 0.01)
+        # The sampler owns a real window; shrink it so only the hung probe is
+        # slow enough to miss the deadline.
+        monkeypatch.setattr(debug, "_CPU_WINDOW_SECS", 0.0)
+
+        async def never() -> Any:
+            await asyncio.Event().wait()
+
+        archive = MagicMock()
+        archive.stats = never
+        embed = await _snapshot(
+            mock_ctx, self._operator(archive=archive, archive_enabled=True)
+        )
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "timed out" in rendered["Postgres"]
+        # Every other block still landed — that is the whole point.
+        assert "timed out" not in rendered["Runtime"]
+        assert "uptime" in rendered["Runtime"]
+
+    async def test_a_probe_that_raises_degrades_to_its_own_blocks(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.voice_client = None
+        with patch.object(debug, "_dbsize", side_effect=RuntimeError("boom")):
+            embed = await _snapshot(mock_ctx, self._operator())
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        for name in debug._PROBE_BLOCKS["redis"]:
+            assert "unavailable (RuntimeError)" in rendered[name], name
+        assert "version" in rendered["Build"]  # a different probe, unaffected
+
+    async def test_a_dead_redis_does_not_blank_the_runtime_block(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Regression: Runtime reads os.times/proc/pool_state and needs no Redis at
+        all, but it used to share a probe whose FIRST await was an unbounded Redis
+        read. A Redis that accepted the socket and never answered hid uptime, memory,
+        task count and pool state, and the block then claimed IT had timed out — in
+        exactly the state -debug exists to diagnose.
+        """
+
+        async def never(*_a: object, **_k: object) -> None:
+            await asyncio.Event().wait()
+
+        mock_ctx.guild.voice_client = None
+        redis = MagicMock()
+        redis.info = never
+        redis.dbsize = never
+        with patch.object(debug, "_REDIS_PROBE_TIMEOUT_SECS", 0.05):
+            embed = await _snapshot(mock_ctx, self._operator(redis=redis))
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "uptime" in rendered["Runtime"]
+        assert "timed out" not in rendered["Runtime"]
+        assert "unavailable" not in rendered["Runtime"]
+
+    async def test_a_non_operator_needs_no_loop_at_all(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Nothing a non-operator sees costs IO, so the driver degrades to one send
+        with no edits — no placeholders, no deadline wait."""
+        mock_ctx.guild.voice_client = None
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        mock_ctx.channel.send = AsyncMock(return_value=message)
+        await run_debug_dashboard(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        mock_ctx.channel.send.assert_awaited_once()
+        message.edit.assert_not_awaited()
+        call = mock_ctx.channel.send.await_args
+        assert call is not None
+        sent = call.kwargs["embeds"][0]
+        assert "collecting" not in str(sent.to_dict())
+
+    async def test_it_stays_off_the_now_playing_host(self, mock_ctx: MagicMock) -> None:
+        """channel.send, not ctx.send: an edited message must not be the NP host,
+        whose progress updater re-renders it every few seconds."""
+        mock_ctx.guild.voice_client = None
+        await _snapshot(mock_ctx, self._operator())
+        mock_ctx.send.assert_not_awaited()
+        mock_ctx.channel.send.assert_awaited_once()
+
+    async def test_git_sha_is_resolved_off_the_event_loop(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """git_sha() shells out; on the loop it would stall the skeleton send it is
+        supposed to be racing."""
+        mock_ctx.guild.voice_client = None
+        seen: list[str] = []
+        real_run_in_executor = asyncio.get_running_loop().run_in_executor
+
+        async def spy(executor: Any, fn: Any, *args: Any) -> Any:
+            seen.append(getattr(fn, "__name__", ""))
+            return await real_run_in_executor(executor, fn, *args)
+
+        with patch.object(
+            asyncio.get_running_loop(), "run_in_executor", side_effect=spy
+        ):
+            await _snapshot(mock_ctx, self._operator())
+        assert "git_sha" in seen
 
 
 class TestTraceIdInTheFooter:
@@ -171,11 +654,204 @@ class TestTraceIdInTheFooter:
         assert self.HEX in debug.debug_footer(span=span, skip_trace=False)
         assert self.HEX not in debug.debug_footer(span=span, skip_trace=True)
 
-    def test_an_unsampled_span_contributes_nothing(self) -> None:
-        """INVALID_SPAN has an all-zero trace id, which trace_id_of reports as "".
-        Rendering it would put a meaningless id in front of a user who is being
-        told to paste it to an operator."""
-        assert debug.debug_footer(span=trace_api.INVALID_SPAN) == ""
+    async def test_the_snapshot_footer_carries_it_too(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        with patch.object(trace_api, "get_current_span", return_value=self._span()):
+            embed = await _snapshot(
+                mock_ctx,
+                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+            )
+        assert self.HEX in (embed.footer.text or "")
+
+
+class TestOperatorGate:
+    """`-debug` is reachable by any user in any guild, and by DM. Everything that
+    describes the HOST rather than the caller's own server is owner-only."""
+
+    _HOST_BLOCKS = ("Build", "Config", "Runtime", "Discord", "Redis", "Postgres",
+                    "Checks")  # fmt: skip
+
+    async def test_non_operator_sees_only_versions_and_their_own_server(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.guild.voice_client = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=3),
+        )
+        assert [f.name for f in embed.fields] == ["Versions", "This server"]
+
+    async def test_non_operator_never_reaches_a_host_collector(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Not just absent from the embed — never collected. A gate that renders
+        the block and then drops it still reads the secrets, and still pays the IO."""
+        mock_ctx.guild.voice_client = None
+        with (
+            patch.object(debug, "config_lines") as config,
+            patch.object(debug, "runtime_lines") as runtime,
+            patch.object(debug, "redis_lines") as redis_block,
+            patch.object(debug, "build_lines") as build,
+            patch.object(debug, "checks_lines") as checks,
+        ):
+            await _snapshot(
+                mock_ctx,
+                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+            )
+        for collector in (config, runtime, redis_block, build, checks):
+            collector.assert_not_called()
+
+    async def test_a_non_operators_snapshot_carries_no_configured_value(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The disclosure this gate exists for: internal hostnames and ports. The
+        sentinel stands in for every URL-kind row."""
+        mock_ctx.guild.voice_client = None
+        with patch.object(
+            debug, "config_lines", return_value=["REDIS_URL  redis://sentinel:6379"]
+        ):
+            embed = await _snapshot(
+                mock_ctx,
+                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+            )
+        assert "sentinel" not in str(embed.to_dict())
+
+    async def test_a_non_operator_is_told_why_rather_than_left_guessing(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert embed.description is not None
+        assert "bot owner" in embed.description
+        assert "-ping" in embed.description
+
+    async def test_the_operator_notice_is_absent_for_an_operator(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=False,
+                debug_overridden=False,
+                players=0,
+                operator=True,
+            ),
+        )
+        assert embed.description is not None
+        assert "bot owner" not in embed.description
+
+    @pytest.mark.parametrize("block", _HOST_BLOCKS)
+    async def test_every_host_block_is_operator_only(
+        self, mock_ctx: MagicMock, block: str
+    ) -> None:
+        """Parametrized so a block added later must decide which side it is on:
+        appending it to the operator branch without adding it here fails nothing,
+        but adding it to the PUBLIC branch fails this."""
+        mock_ctx.guild.voice_client = None
+        public = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert block not in [f.name for f in public.fields]
+
+
+class TestSnapshotEmbed:
+    async def test_renders_every_block_in_a_guild(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild.voice_client = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=True, debug_overridden=True, players=3, operator=True
+            ),
+        )
+        names = [f.name for f in embed.fields]
+        # Config outgrew Discord's 1024-char field cap once it carried -debug's own
+        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
+        # block's position rather than moving to the end.
+        assert names == [
+            "Build",
+            "Versions",
+            "Config",
+            "Config (cont.)",
+            "Runtime",
+            "Discord",
+            "Redis",
+            "Postgres",
+            "This server",
+            "Checks",
+        ]
+        assert embed.description is not None
+        assert "**on**" in embed.description
+        assert "(saved here)" in embed.description
+
+    async def test_dm_omits_the_guild_block(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert "This server" not in [f.name for f in embed.fields]
+        assert embed.description is not None
+        assert "direct messages" in embed.description
+        assert "(host default)" in embed.description
+
+    async def test_no_credential_reaches_the_embed(
+        self, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end guard on the whole rendered surface, not just the row
+        renderer: the embed is built to be pasted into an issue.
+
+        `operator=True` and a guild are load-bearing, not incidental. Config is the
+        only block that reads any of these three variables and it sits behind the
+        operator gate, so the earlier non-operator DM version of this test asserted
+        three credentials were absent from a card that never read them — which is
+        why the render of Config is asserted first.
+        """
+        mock_ctx.guild.voice_client = None
+        monkeypatch.setenv("DISCORD_TOKEN", "tok-should-never-render")
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://bot:pw-secret@db:5432/musicbot"
+        )
+        monkeypatch.setenv("REDIS_URL", "redis://cacheuser:cachepw@cache:6379")
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=False, debug_overridden=False, players=0, operator=True
+            ),
+        )
+        names = [f.name for f in embed.fields]
+        assert "Config" in names and "This server" in names
+        # to_dict(), not the field values: description and footer are rendered
+        # surface too.
+        rendered = str(embed.to_dict())
+        for leaked in ("tok-should-never-render", "pw-secret", "cachepw"):
+            assert leaked not in rendered
+
+    async def test_footer_carries_environment(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert embed.footer.text is not None
+        assert embed.footer.text.startswith("environment: ")
+
+
+class TestCommandRegistration:
+    def test_registered_under_utility_with_self_documenting_extras(self) -> None:
+        from src.help import CATEGORY_COMMANDS
+        from src.musicbot import MusicBot
+
+        command = MusicBot.debug
+        assert isinstance(command, commands.Command)
+        assert command.name == "debug"
+        assert "dbg" in command.aliases
+        assert command.extras["category"] == "Utility"
+        assert command.extras["examples"]
+        assert "debug" in CATEGORY_COMMANDS["Utility"]
 
 
 class TestCgroupReaders:
@@ -363,6 +1039,340 @@ class TestCpuPercent:
         assert debug._CPU_WINDOW_SECS > 0
 
 
+class TestRuntimeBlock:
+    async def test_uptime_is_a_plain_duration_not_discord_markup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every row in this block is rendered inside a ``` fence, and Discord prints
+        markup there as its literal source: the row read `uptime <t:1785881580:R>` to
+        every operator who ran it, rather than "2 hours ago"."""
+        monkeypatch.setattr(debug, "_PROCESS_START", time.time() - 3725)
+        line = next(line for line in debug.runtime_lines() if line.startswith("uptime"))
+        assert "<t:" not in line
+        assert line == "uptime       1:02:05"
+
+
+class TestGitSha:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(debug, "_git_sha_cache", None)
+
+    def test_baked_env_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The deployed case: GIT_SHA is an ENV in the runtime image, because an
+        OCI label is invisible from inside the container."""
+        monkeypatch.setenv("GIT_SHA", "abc1234-dirty.deadbeef")
+        assert debug.git_sha() == "abc1234-dirty.deadbeef"
+
+    def test_falls_back_to_the_checkout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`just run` from a checkout has no image and therefore no baked SHA.
+
+        The subprocess is faked rather than really run: the runtime image copies
+        src/ and pyproject.toml but no .git, so a real `git rev-parse` succeeds
+        under `just test` and fails under `just container-test`.
+        """
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        monkeypatch.setattr(
+            debug.subprocess,
+            "run",
+            MagicMock(return_value=SimpleNamespace(stdout="a1b2c3d\n")),
+        )
+        assert debug.git_sha() == "a1b2c3d"
+
+    def test_real_checkout_answers_when_there_is_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unfaked, so the argv itself is exercised — but skipped where there is
+        no checkout, which is exactly the runtime image."""
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        if not Path(__file__).resolve().parent.parent.joinpath(".git").exists():
+            pytest.skip("no git checkout (runtime image)")
+        assert re.fullmatch(r"[0-9a-f]{7,40}", debug.git_sha())
+
+    def test_no_env_and_no_git_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        monkeypatch.setattr(
+            debug.subprocess, "run", MagicMock(side_effect=OSError("no git"))
+        )
+        assert debug.git_sha() == "unknown"
+
+    def test_cached_for_process_lifetime(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GIT_SHA", "first")
+        assert debug.git_sha() == "first"
+        monkeypatch.setenv("GIT_SHA", "second")
+        assert debug.git_sha() == "first"
+
+
+def _redis_info(**overrides: object) -> dict[str, object]:
+    """A realistic INFO reply. fakeredis does not implement INFO at all — it raises
+    ResponseError — so every Redis-block test supplies its own."""
+    info: dict[str, object] = {
+        "used_cpu_sys": 1.0,
+        "used_cpu_user": 2.0,
+        "used_memory": 44040192,
+        "maxmemory": 268435456,
+        "mem_fragmentation_ratio": 1.08,
+        "maxmemory_policy": "volatile-lru",
+        "connected_clients": 3,
+        "instantaneous_ops_per_sec": 148,
+        "keyspace_hits": 870,
+        "keyspace_misses": 130,
+        "evicted_keys": 0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_last_write_status": "ok",
+        "db0": {"keys": 1284, "expires": 1192, "avg_ttl": 0},
+    }
+    info.update(overrides)
+    return info
+
+
+class TestRedisBlock:
+    def _samples(
+        self, **overrides: object
+    ) -> tuple[debug.RedisSample, debug.RedisSample]:
+        first = debug.RedisSample(info=_redis_info(**overrides), monotonic=100.0)
+        second = debug.RedisSample(
+            info=_redis_info(used_cpu_sys=1.005, used_cpu_user=2.005, **overrides),
+            monotonic=101.0,
+        )
+        return first, second
+
+    def test_renders_cpu_before_mem(self) -> None:
+        first, second = self._samples()
+        lines = debug.redis_lines(first, second, dbsize=1284)
+        assert lines[0].startswith("cpu")
+        assert lines[1].startswith("mem")
+
+    def test_cpu_is_a_rate_across_the_window(self) -> None:
+        first, second = self._samples()
+        # 0.01 cpu-seconds over 1 wall second = 1%. No core normalization: Redis
+        # is effectively single-threaded, so 100% is one saturated core.
+        assert "1.0%" in debug.redis_lines(first, second, dbsize=0)[0]
+
+    def test_memory_percent_is_against_maxmemory(self) -> None:
+        """maxmemory is the threshold volatile-lru acts at, so the % reads as the
+        eviction runway rather than as host pressure."""
+        first, second = self._samples()
+        assert "42 MB / 256 MB (16%)" in debug.redis_lines(first, second, dbsize=0)[1]
+
+    def test_no_maxmemory_renders_absolute_only(self) -> None:
+        first, second = self._samples(maxmemory=0)
+        assert "(no maxmemory)" in debug.redis_lines(first, second, dbsize=0)[1]
+
+    def test_persistent_keys_are_total_minus_expires(self) -> None:
+        """The no-TTL population is exactly the set golden rule 12 protects."""
+        first, second = self._samples()
+        keys = next(
+            line
+            for line in debug.redis_lines(first, second, dbsize=1284)
+            if "keys" in line
+        )
+        assert "1284 total · 92 persistent" in keys
+
+    def test_degrades_when_info_is_unavailable(self) -> None:
+        lines = debug.redis_lines(None, None, dbsize=None)
+        assert len(lines) == 1
+        assert "unavailable" in lines[0]
+
+    async def test_read_sample_swallows_a_dead_redis(self) -> None:
+        redis = MagicMock()
+        redis.info = AsyncMock(side_effect=ConnectionError("down"))
+        assert await debug.read_redis_sample(redis) is None
+
+    async def test_read_sample_of_none_redis_is_none(self) -> None:
+        assert await debug.read_redis_sample(None) is None
+
+    async def test_read_sample_stamps_the_clock_it_was_taken_at(self) -> None:
+        """The success path — untested until now, including its timestamp. Redis's
+        CPU% is the gap between two of these, so a constant `monotonic` divides by a
+        zero-or-fixed window and pins that row to garbage without failing anything.
+        """
+        redis = MagicMock()
+        redis.info = AsyncMock(return_value=_redis_info())
+        before = time.monotonic()
+        sample = await debug.read_redis_sample(redis)
+        assert sample is not None
+        assert sample.info["maxmemory_policy"] == "volatile-lru"
+        assert before <= sample.monotonic <= time.monotonic()
+
+    async def test_dbsize_counts_the_keys(self, fake_redis: Redis) -> None:
+        """The `keys` row's whole content. A hardcoded 0 or None reads as an
+        empty/unknown keyspace on every host forever, which is exactly what a
+        collector nobody executes looks like."""
+        for i in range(3):
+            await fake_redis.set(f"guild:{i}:state", "x")
+        assert await debug._dbsize(fake_redis) == 3
+
+    async def test_dbsize_without_redis_is_unknown(self) -> None:
+        assert await debug._dbsize(None) is None
+
+    async def test_dbsize_swallows_a_dead_redis(self) -> None:
+        """A key count is a row, not a failure: it must not take the Redis block
+        (or its sibling Checks) down with it."""
+        redis = MagicMock()
+        redis.dbsize = AsyncMock(side_effect=ConnectionError("down"))
+        assert await debug._dbsize(redis) is None
+
+
+class TestPostgresBlock:
+    def _stats(self) -> ArchiveStats:
+        return ArchiveStats(
+            database_bytes=134217728,
+            table_bytes=100663296,
+            rows_estimate=412083,
+            rejected_estimate=0,
+            connections=3,
+            max_connections=100,
+            shared_buffers="128MB",
+            cache_hit_ratio=0.994,
+        )
+
+    async def test_renders_the_archive_stats(self) -> None:
+        archive = MagicMock()
+        archive.stats = AsyncMock(return_value=self._stats())
+        lines = "\n".join(await debug.postgres_lines(archive, archive_enabled=True))
+        assert "db 128 MB" in lines
+        assert "play_history 96 MB" in lines
+        assert "~412083 plays · 0 rejected" in lines
+        assert "3 / 100" in lines
+        assert "hit rate 99.4%" in lines
+
+    async def test_disabled_archive_reads_as_a_choice(self) -> None:
+        """Mirrors -ping's OFF row: the ship default made this choice, and it must
+        not read as a fault."""
+        lines = await debug.postgres_lines(None, archive_enabled=False)
+        assert lines == ["off (archive disabled)"]
+
+    async def test_enabled_but_absent_archive_is_na(self) -> None:
+        assert await debug.postgres_lines(None, archive_enabled=True) == ["n/a"]
+
+
+class TestChecksBlock:
+    async def _lines(
+        self,
+        *,
+        info_overrides: Optional[dict[str, object]] = None,
+        sample: object = "default",
+        redis: object = "default",
+        store: Optional[object] = None,
+        archive_enabled: bool = True,
+        default_password: Optional[bool] = None,
+        depth: int = 0,
+    ) -> str:
+        if sample == "default":
+            sample = debug.RedisSample(
+                info=_redis_info(**(info_overrides or {})), monotonic=1.0
+            )
+        if redis == "default":
+            redis = MagicMock()
+        with patch.object(debug, "outbox_depth", AsyncMock(return_value=depth)):
+            return "\n".join(
+                await debug.checks_lines(
+                    cast(Any, sample),
+                    redis=cast(Any, redis),
+                    store=cast(Any, store),
+                    archive_enabled=archive_enabled,
+                    default_password=default_password,
+                )
+            )
+
+    async def test_correct_eviction_policy_passes(self) -> None:
+        assert "✅ eviction" in await self._lines()
+
+    async def test_wrong_eviction_policy_is_flagged(self) -> None:
+        """Golden rule 12: allkeys-lru can evict history:outbox and the history
+        lists, which is silent, unrecoverable data loss."""
+        lines = await self._lines(info_overrides={"maxmemory_policy": "allkeys-lru"})
+        assert "⚠️ eviction" in lines
+        assert "must be volatile-lru" in lines
+
+    async def test_failed_bgsave_is_flagged(self) -> None:
+        """The early warning for the MISCONF incident: Redis keeps serving READS
+        after a failed bgsave while refusing every write."""
+        lines = await self._lines(info_overrides={"rdb_last_bgsave_status": "err"})
+        assert "⚠️ persistence" in lines
+
+    async def test_failed_aof_write_is_flagged(self) -> None:
+        """The AOF half, which no test ever drove red. The compose Redis runs AOF,
+        and the failure mode is silent in the safe-looking direction: a misspelled
+        key defaults to "unknown", which this check reads as healthy, so the row
+        goes permanently inert rather than permanently warning."""
+        lines = await self._lines(info_overrides={"aof_last_write_status": "err"})
+        assert "⚠️ persistence" in lines
+        assert "aof err" in lines
+
+    async def test_no_info_cannot_verify(self) -> None:
+        assert "❔ redis" in await self._lines(sample=None)
+
+    async def test_stranded_outbox_with_the_archive_off(self) -> None:
+        lines = await self._lines(archive_enabled=False, depth=7)
+        assert "⚠️ outbox" in lines
+        assert "7 stranded" in lines
+
+    async def test_outbox_depth_with_the_archive_on_is_not_an_alarm(self) -> None:
+        lines = await self._lines(archive_enabled=True, depth=7)
+        assert "✅ outbox" in lines
+        assert "draining" in lines
+
+    async def test_a_raising_outbox_helper_is_caught_here(self) -> None:
+        """The outbox helpers RAISE by design (golden rule 5's split) because the
+        drainer's backoff loop is their error handler — every other consumer owns
+        its own try/except."""
+        with patch.object(
+            debug, "outbox_depth", AsyncMock(side_effect=RuntimeError("WRONGTYPE"))
+        ):
+            lines = "\n".join(
+                await debug.checks_lines(
+                    debug.RedisSample(info=_redis_info(), monotonic=1.0),
+                    redis=cast(Any, MagicMock()),
+                    store=None,
+                    archive_enabled=True,
+                    default_password=None,
+                )
+            )
+        assert "❔ outbox" in lines
+        assert "RuntimeError" in lines
+
+    async def test_history_ttl_invariant(self) -> None:
+        store = MagicMock()
+        store.history_ttl = AsyncMock(return_value=-1)
+        assert "✅ history ttl" in await self._lines(store=store)
+
+    async def test_history_ttl_present_is_a_violation(self) -> None:
+        """push_history PERSISTs that key unconditionally; a TTL there answers a
+        guild with silence once it expires."""
+        store = MagicMock()
+        store.history_ttl = AsyncMock(return_value=3600)
+        lines = await self._lines(store=store)
+        assert "⚠️ history ttl" in lines
+        assert "expires in 3600s" in lines
+
+    async def test_history_ttl_unknown_when_redis_is_down(self) -> None:
+        """@_guild_op swallows and returns the default, so None means "did not
+        answer" — not "no TTL"."""
+        store = MagicMock()
+        store.history_ttl = AsyncMock(return_value=None)
+        assert "❔ history ttl" in await self._lines(store=store)
+
+    async def test_default_password_row_is_owner_only(self) -> None:
+        """None means "not asked" — a non-owner's snapshot must not confirm which
+        credential this host runs on."""
+        assert "db password" not in await self._lines(default_password=None)
+        assert "⚠️ db password" in await self._lines(default_password=True)
+        assert "✅ db password" in await self._lines(default_password=False)
+
+    async def test_the_default_password_warning_carries_no_detail(self) -> None:
+        """The wording IS the mitigation, so the whole row is asserted rather than
+        its presence. DEFAULT_POSTGRES_PASSWORD is a literal in this public repo and
+        this card is posted in the channel the operator typed in, so spelling the
+        warning out publishes the credential itself; -ping carries the full sentence
+        for the operator alone."""
+        lines = await self._lines(default_password=True)
+        row = next(line for line in lines.splitlines() if "db password" in line)
+        assert row == "⚠️ db password   see -ping"
+
+
 class TestRuntimeSampler:
     async def test_starts_from_the_env_default_with_no_toggle(self) -> None:
         """A DEBUG_MODE=true deployment fires no enable transition ever, so a
@@ -492,14 +1502,348 @@ class TestFooterRuntimeSegment:
         assert debug.debug_footer(elapsed_ms=1, shard_id=0) == "🐞 1 ms · shard 0"
 
 
-class TestSafeBlock:
-    async def test_a_broken_collector_does_not_take_the_embed_down(
+class TestContainerMetrics:
+    """The Postgres container's CPU/memory, read from the metrics plane.
+
+    Metric names and the label are the OTel docker_stats receiver's as Prometheus
+    renames them — verified against the running stack, and NOT cAdvisor's
+    `container_cpu_usage_seconds_total{name=...}`, which is what a reader who
+    knows the cAdvisor convention would expect.
+    """
+
+    @staticmethod
+    def _payload(*series: tuple[str, str]) -> dict[str, Any]:
+        return {
+            "status": "success",
+            "data": {
+                "resultType": "vector",
+                "result": [
+                    {
+                        "metric": {
+                            "__name__": name,
+                            "container_name": "discord-postgres",
+                        },
+                        "value": [1785881580.874, value],
+                    }
+                    for name, value in series
+                ],
+            },
+        }
+
+    @staticmethod
+    def _session(
+        payload: object,
+        *,
+        raises: Optional[Exception] = None,
+        body: Optional[bytes] = None,
+    ) -> MagicMock:
+        """The process-wide session double.
+
+        Serves BYTES, not .json(): the reader takes a capped body off the stream, so
+        that a 2s timeout cannot be turned into an unbounded buffer by whatever is
+        listening on the configured port. `read(n)` HONOURS n, like the real stream
+        does — a double that ignored it would make the cap unobservable.
+        """
+        response = MagicMock()
+        response.raise_for_status = MagicMock(side_effect=raises)
+        if body is None:
+            body = b"" if payload is None else orjson.dumps(payload)
+        served: bytes = body
+        response.content = MagicMock()
+        response.content.read = AsyncMock(side_effect=lambda n: served[:n])
+        get_cm = MagicMock()
+        get_cm.__aenter__ = AsyncMock(return_value=response)
+        get_cm.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get = MagicMock(return_value=get_cm)
+        return session
+
+    def _patch_session(
+        self, monkeypatch: pytest.MonkeyPatch, session: MagicMock
+    ) -> AsyncMock:
+        factory = AsyncMock(return_value=session)
+        monkeypatch.setattr(debug, "_prometheus_session", factory)
+        return factory
+
+    async def test_reads_all_three_series_in_one_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = self._payload(
+            ("container_cpu_utilization_ratio", "3.14"),
+            ("container_memory_usage_total_bytes", "100663296"),
+            ("container_memory_usage_limit_bytes", "536870912"),
+        )
+        session = self._session(payload)
+        self._patch_session(monkeypatch, session)
+        metrics = await debug.read_container_metrics(
+            "http://localhost:9090", "discord-postgres"
+        )
+        assert metrics is not None
+        assert metrics.cpu_percent == 3.14
+        assert metrics.used_bytes == 100663296
+        assert metrics.limit_bytes == 536870912
+
+    async def test_query_selects_the_pinned_container_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the label the query matches EVERY container. The name is
+        pinned in docker-compose.yml and nothing joins the two — a rename there
+        silently empties this row."""
+        session = self._session(self._payload())
+        self._patch_session(monkeypatch, session)
+        await debug.read_container_metrics("http://localhost:9090/", "discord-postgres")
+        call = session.get.call_args
+        assert call.args[0] == "http://localhost:9090/api/v1/query"
+        query = call.kwargs["params"]["query"]
+        assert 'container_name="discord-postgres"' in query
+        for metric in debug._CONTAINER_METRICS:
+            assert metric in query
+
+    async def test_unset_knob_is_the_feature_being_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No knob means no request AT ALL. Asserting only the return value cannot
+        tell "the feature is off" from "the feature crashed" — without the guard,
+        None.rstrip() raises inside the broad except and this still answers None,
+        while every -debug on a deployment with no Prometheus logs a warning.
+        """
+        factory = self._patch_session(monkeypatch, self._session(self._payload()))
+        assert await debug.read_container_metrics(None, "discord-postgres") is None
+        assert await debug.read_container_metrics("", "discord-postgres") is None
+        factory.assert_not_awaited()
+
+    async def test_absent_series_is_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An archive-disabled deployment runs no postgres container at all, so
+        an empty result is the ordinary answer."""
+        self._patch_session(monkeypatch, self._session(self._payload()))
+        assert (
+            await debug.read_container_metrics(
+                "http://localhost:9090", "discord-postgres"
+            )
+            is None
+        )
+
+    async def test_a_timeout_degrades(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._patch_session(
+            monkeypatch, self._session(None, raises=TimeoutError("slow"))
+        )
+        assert (
+            await debug.read_container_metrics(
+                "http://localhost:9090", "discord-postgres"
+            )
+            is None
+        )
+
+    async def test_malformed_series_are_skipped_not_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = self._payload(
+            ("container_cpu_utilization_ratio", "not-a-number"),
+            ("container_memory_usage_total_bytes", "1048576"),
+        )
+        self._patch_session(monkeypatch, self._session(payload))
+        metrics = await debug.read_container_metrics(
+            "http://localhost:9090", "discord-postgres"
+        )
+        assert metrics is not None
+        assert metrics.cpu_percent is None
+        assert metrics.used_bytes == 1048576
+
+    async def test_the_body_is_taken_off_the_stream_with_a_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`.json()` would buffer whatever arrives inside the 2s timeout. The read
+        has to ask for a bounded number of bytes, and one more than the cap so the
+        overflow is detectable at all."""
+        session = self._session(self._payload(("container_cpu_utilization_ratio", "1")))
+        self._patch_session(monkeypatch, session)
+        await debug.read_container_metrics("http://localhost:9090", "discord-postgres")
+        read = session.get.return_value.__aenter__.return_value.content.read
+        read.assert_awaited_once_with(debug._PROMETHEUS_MAX_BYTES + 1)
+
+    async def test_an_oversized_body_is_refused_rather_than_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ClientTimeout bounds TIME, not BYTES, and the default target is a loopback
+        port on a host-networked bot — anything that can bind :9090 could feed this
+        gigabytes.
+
+        The REASON is asserted, not the return value: a truncated body fails to parse
+        and answers None either way, so dropping the cap check is invisible from the
+        outside. This is the one observable that separates them.
+        """
+        self._patch_session(
+            monkeypatch,
+            self._session(None, body=b"x" * (debug._PROMETHEUS_MAX_BYTES + 1)),
+        )
+        with patch.object(debug, "log") as log:
+            assert (
+                await debug.read_container_metrics(
+                    "http://localhost:9090", "discord-postgres"
+                )
+                is None
+            )
+        assert "exceeded" in log.warning.call_args.args[0]
+
+    def test_rendered_lines_put_cpu_before_mem(self) -> None:
+        lines = debug._container_lines(
+            debug.ContainerMetrics(
+                cpu_percent=3.14, used_bytes=100663296, limit_bytes=536870912
+            )
+        )
+        assert lines[0] == "cpu          3.1% — prometheus"
+        assert lines[1] == "mem          96 MB / 512 MB (19%) — prometheus"
+
+    def test_no_source_says_so_rather_than_showing_zero(self) -> None:
+        """Zero would be a number an operator acts on; the absence must be named."""
+        lines = debug._container_lines(None)
+        assert all("n/a (no metrics source)" in line for line in lines)
+
+
+class TestPrometheusSession:
+    """The session factory itself, which nothing executed: every TestContainerMetrics
+    case patches `_prometheus_session` away, so the timeout, the cache and the close
+    all survived deletion."""
+
+    @pytest.fixture(autouse=True)
+    async def _isolate_the_session_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> AsyncIterator[None]:
+        """Start from an empty process-wide cache and never leave a real
+        ClientSession unclosed — aiohttp warns on collection, and this suite runs
+        with filterwarnings = error."""
+        monkeypatch.setattr(debug, "_prometheus_session_cache", None)
+        yield
+        await debug.close_prometheus_session()
+
+    async def test_the_session_carries_the_query_timeout(self) -> None:
+        """aiohttp's default total timeout is FIVE MINUTES. Without this kwarg a
+        black-holed metrics endpoint holds the Postgres probe far past -debug's own
+        8s deadline, and the compose comment calls that port unauthenticated."""
+        session = await debug._prometheus_session()
+        assert session.timeout.total == debug._PROMETHEUS_TIMEOUT_SECS
+
+    async def test_one_session_serves_the_process(self) -> None:
+        """A session per query paid an extra connect every time — a full TCP (plus
+        TLS) handshake against anything not on loopback."""
+        first = await debug._prometheus_session()
+        assert await debug._prometheus_session() is first
+
+    async def test_a_closed_session_is_replaced(self) -> None:
+        """cog_unload closes it; the next -debug must not be handed the corpse."""
+        first = await debug._prometheus_session()
+        await first.close()
+        second = await debug._prometheus_session()
+        assert second is not first and not second.closed
+
+    async def test_close_really_closes_and_clears_the_cache(self) -> None:
+        """The one test that drove cog_unload had a None cache, so a no-op body was
+        green while leaking a connector per reload."""
+        session = await debug._prometheus_session()
+        await debug.close_prometheus_session()
+        assert session.closed
+        assert debug._prometheus_session_cache is None
+
+    async def test_closing_twice_is_safe(self) -> None:
+        """cog_unload can run after a teardown that already closed it."""
+        await debug._prometheus_session()
+        await debug.close_prometheus_session()
+        await debug.close_prometheus_session()
+        assert debug._prometheus_session_cache is None
+
+
+class TestPostgresBlockWithContainerMetrics:
+    async def test_container_rows_lead_the_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        archive = MagicMock()
+        archive.stats = AsyncMock(
+            return_value=ArchiveStats(
+                database_bytes=1,
+                table_bytes=1,
+                rows_estimate=0,
+                rejected_estimate=0,
+                connections=1,
+                max_connections=100,
+                shared_buffers="128MB",
+                cache_hit_ratio=1.0,
+            )
+        )
+        monkeypatch.setattr(
+            debug,
+            "read_container_metrics",
+            AsyncMock(
+                return_value=debug.ContainerMetrics(
+                    cpu_percent=3.1, used_bytes=1048576, limit_bytes=2097152
+                )
+            ),
+        )
+        lines = await debug.postgres_lines(
+            archive, archive_enabled=True, prometheus_url="http://localhost:9090"
+        )
+        assert lines[0].startswith("cpu")
+        assert lines[1].startswith("mem")
+        assert lines[2].startswith("storage")
+
+    async def test_sql_still_answers_when_the_metrics_stack_is_down(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Why the block is hybrid rather than all-PromQL: an LGTM outage costs
+        one line, not the whole block."""
+        archive = MagicMock()
+        archive.stats = AsyncMock(
+            return_value=ArchiveStats(
+                database_bytes=134217728,
+                table_bytes=1,
+                rows_estimate=7,
+                rejected_estimate=0,
+                connections=1,
+                max_connections=100,
+                shared_buffers="128MB",
+                cache_hit_ratio=1.0,
+            )
+        )
+        monkeypatch.setattr(
+            debug, "read_container_metrics", AsyncMock(return_value=None)
+        )
+        lines = "\n".join(
+            await debug.postgres_lines(
+                archive, archive_enabled=True, prometheus_url=None
+            )
+        )
+        assert "n/a (no metrics source)" in lines
+        assert "db 128 MB" in lines
+        assert "~7 plays" in lines
+
+
+class TestGuardsMutationTestingFound:
+    """Small guards whose absence a green suite could not distinguish.
+
+    Each of these survived a mutation run: the behaviour was correct, but nothing
+    asserted it, so the next edit to that line would have shipped silently.
+    """
+
+    async def test_an_async_collector_degrades_like_a_sync_one(self) -> None:
+        """_safe_block guards the sync collectors and had a test; the ASYNC wrapper
+        did not. Without it a raise inside checks_lines escapes to the probe, which
+        fails the probe's ENTIRE block set — so one broken collector would take
+        Redis down with Checks instead of costing only its own field."""
+
+        async def boom() -> list[str]:
+            raise RuntimeError("collector broke")
+
+        assert await debug._safe_block_async("checks", boom) == [
+            "unavailable (RuntimeError)"
+        ]
+
+    async def test_one_broken_collector_leaves_its_sibling_block_intact(
         self, mock_ctx: MagicMock
     ) -> None:
-        """The degrade principle: every collector is wrapped, because a debug tool
-        that crashes is worse than no debug tool."""
-        mock_ctx.guild = None
-        with patch.object(debug, "build_lines", side_effect=RuntimeError("boom")):
+        """The consequence, end to end: Checks and Redis share a probe."""
+        mock_ctx.guild.voice_client = None
+        with patch.object(debug, "checks_lines", side_effect=RuntimeError("boom")):
             embed = await _snapshot(
                 mock_ctx,
                 DebugInputs(
@@ -509,758 +1853,121 @@ class TestSafeBlock:
                     operator=True,
                 ),
             )
-        build = next(f for f in embed.fields if f.name == "Build")
-        assert "unavailable (RuntimeError)" in (build.value or "")
-        # The neighbouring blocks are untouched — one broken collector costs one row.
-        assert [f.name for f in embed.fields].count("Discord") == 1
+        rendered = {f.name: (f.value or "") for f in embed.fields}
+        assert "unavailable (RuntimeError)" in rendered["Checks"]
+        # Redis still renders its OWN degradation (there is no Redis in this
+        # fixture) rather than inheriting the sibling collector's failure.
+        assert "RuntimeError" not in rendered["Redis"]
 
+    async def test_the_first_sample_reports_no_cpu_rather_than_zero(self) -> None:
+        """A rate needs two samples. Reporting 0.0% on the first tick tells an
+        operator "idle" at the exact moment they are investigating load."""
+        sampler = debug.RuntimeSampler()
+        snapshot = sampler._sample(1.5)
+        assert snapshot.cpu_percent is None
 
-class TestCodeblockFields:
-    def test_short_block_is_one_field(self) -> None:
-        fields = _codeblock_fields("Config", ["a", "b"])
-        assert fields == [("Config", "```\na\nb\n```")]
-
-    def test_long_block_splits_rather_than_truncating(self) -> None:
-        """Discord's field cap is 1024. A config listing clipped in place would
-        read as a complete one, which is worse than showing none."""
-        lines = [f"KNOB_{i:03d}  value" for i in range(120)]
-        fields = _codeblock_fields("Config", lines)
-        assert len(fields) > 1
-        assert all(len(value) <= 1024 for _, value in fields)
-        assert fields[1][0] == "Config (cont.)"
-        rendered = "".join(value for _, value in fields)
-        for line in lines:
-            assert line in rendered
-
-
-class TestDiscordBlock:
-    def test_falls_back_to_single_shard_shape(self, mock_bot: MagicMock) -> None:
-        """`latencies` is AutoShardedClient-only; a plain Bot (and every MagicMock,
-        which auto-vivifies it into something that is not a list) takes this arm."""
-        lines = "\n".join(discord_lines(mock_bot, players=2))
-        assert "shards       1" in lines
-        assert "#0 50 ms" in lines
-        assert "players      2" in lines
-
-    def test_renders_every_shard(self, mock_bot: MagicMock) -> None:
-        mock_bot.latencies = [(0, 0.041), (1, 0.038)]
-        lines = "\n".join(discord_lines(mock_bot, players=0))
-        assert "shards       2" in lines
-        assert "#0 41 ms, #1 38 ms" in lines
-
-    def test_reconnecting_shard_is_not_rendered_as_a_number(
-        self, mock_bot: MagicMock
-    ) -> None:
-        mock_bot.latencies = [(0, float("nan"))]
-        assert "reconnecting" in "\n".join(discord_lines(mock_bot, players=0))
-
-
-class TestGuildBlock:
-    def _inputs(self, player: object = None) -> DebugInputs:
-        return DebugInputs(
-            debug_enabled=True,
-            debug_overridden=True,
-            players=1,
-            player=cast(Optional[MusicPlayer], player),
+    async def test_a_guild_that_has_played_nothing_is_not_an_alarm(self) -> None:
+        """TTL -2 is "no such key" — an ordinary fresh guild, not a violation of the
+        PERSIST invariant. Rendering it as a warning cries wolf on the most common
+        state of a new deployment, and a check row that cries wolf gets ignored."""
+        store = MagicMock()
+        store.history_ttl = AsyncMock(return_value=-2)
+        lines = await debug.checks_lines(
+            None,
+            redis=None,
+            store=store,
+            archive_enabled=False,
+            default_password=None,
         )
+        row = next(line for line in lines if "history ttl" in line)
+        assert "no history yet" in row
+        assert "⚠️" not in row
 
-    def test_reports_no_player_and_no_voice(self, mock_guild: MagicMock) -> None:
-        mock_guild.voice_client = None
-        lines = "\n".join(
-            guild_lines(mock_guild, self._inputs(), source="saved here"),
+    def test_a_username_only_url_is_still_redacted(self) -> None:
+        """`redis://admin@host` carries no password, but the username is still a
+        credential half and renders in an owner-visible block."""
+        assert "admin" not in debug.redact_url("redis://admin@host:6379")
+
+    async def test_an_rdb_only_redis_does_not_fail_the_persistence_check(self) -> None:
+        """A Redis with no AOF omits aof_last_write_status entirely. Treating the
+        absent field as failure pins this row to a permanent warning."""
+        sample = debug.RedisSample(
+            info={"maxmemory_policy": "volatile-lru", "rdb_last_bgsave_status": "ok"},
+            monotonic=0.0,
         )
-        assert "player       no" in lines
-        assert "voice        not connected" in lines
-        assert "debug        on (saved here)" in lines
-
-    def test_reports_player_queue_and_volume(
-        self, mock_guild: MagicMock, music_player: MagicMock
-    ) -> None:
-        mock_guild.voice_client = None
-        music_player.volume = 0.5
-        lines = "\n".join(
-            guild_lines(
-                mock_guild, self._inputs(player=music_player), source="saved here"
-            )
+        lines = await debug.checks_lines(
+            sample,
+            redis=None,
+            store=None,
+            archive_enabled=False,
+            default_password=None,
         )
-        assert "player       yes" in lines
-        assert "queue        0 queued" in lines
-        assert "volume       50%" in lines
+        row = next(line for line in lines if "persistence" in line)
+        assert "⚠️" not in row
 
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "```[Verify your account](https://evil.example)```",
-            "`` ` ``",
-            "```\n@everyone\n```",
-            "x" * 200,
-        ],
-    )
-    def test_a_channel_name_cannot_break_out_of_the_code_fence(
-        self, mock_guild: MagicMock, name: str
-    ) -> None:
-        """A voice-channel name is the only user-controlled string in the snapshot,
-        and `This server` is the block every guild member can see. A backtick run
-        closes the fence, and Discord renders masked links inside embed field values
-        — a clickable attacker link inside a card carrying the bot's name and avatar.
-        Join-to-create bots hand ordinary members naming rights, so it needs no
-        permission at all."""
+    def test_a_footer_with_nothing_to_say_is_empty(self) -> None:
+        """Not a bare mark. A DM reply in the first seconds after DEBUG_MODE=true has
+        no elapsed time, no shard and no snapshot — the marker alone is noise."""
+        assert debug.debug_footer() == ""
+
+    def test_a_warming_up_voice_client_does_not_claim_an_average(self) -> None:
+        """latency is inf until the first heartbeat ACK. If average_latency happens
+        to answer anyway, "warming up (avg 3 ms)" is a contradiction."""
         vc = MagicMock(spec=discord.VoiceClient)
-        vc.channel = MagicMock(spec=discord.VoiceChannel)
-        vc.channel.name = name
-        vc.average_latency = 0.02
-        mock_guild.voice_client = vc
-
-        rendered = "\n".join(guild_lines(mock_guild, self._inputs(), source="x"))
-
-        assert "`" not in rendered
-        # The cap is half the control: an unbounded name pushes the rest of the
-        # block past Discord's 1024-char field limit and the send 400s.
-        assert max(len(line) for line in rendered.splitlines()) < 120
-
-    def test_voice_latency_warming_up_is_not_an_error(
-        self, mock_guild: MagicMock
-    ) -> None:
-        """discord.py #6430: both reads are inf, and average_latency raises
-        ZeroDivisionError, until the first ACK ~5s after joining — exactly the
-        window a tester looks at, since testing starts with a fresh join."""
-        vc = MagicMock(spec=discord.VoiceClient)
-        vc.channel = MagicMock(spec=discord.VoiceChannel)
-        vc.channel.name = "General"
-        vc.is_playing.return_value = False
-        vc.is_paused.return_value = False
         vc.latency = float("inf")
-        type(vc).average_latency = property(
-            lambda _: (_ for _ in ()).throw(ZeroDivisionError())
+        vc.average_latency = 0.003
+        assert debug._voice_latency_text(vc) == "warming up"
+
+    def test_the_shard_list_is_capped_with_a_marker(self) -> None:
+        """An unbounded list would push the block past Discord's field cap on a
+        many-shard bot; the marker is what says the list was cut."""
+        bot = MagicMock()
+        bot.latencies = [(i, 0.05) for i in range(9)]
+        line = next(
+            line for line in debug.discord_lines(bot, players=0) if "gateway" in line
         )
-        mock_guild.voice_client = vc
-        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
-        assert "voice ws     warming up" in lines
+        assert line.count("#") == 4
+        assert "…" in line
 
-    def test_missing_voice_permissions_are_flagged(self, mock_guild: MagicMock) -> None:
-        vc = MagicMock(spec=discord.VoiceClient)
-        vc.channel = MagicMock(spec=discord.VoiceChannel)
-        vc.channel.name = "General"
-        vc.is_playing.return_value = True
-        vc.is_paused.return_value = False
-        vc.latency = 0.021
-        vc.average_latency = 0.023
-        perms = MagicMock(spec=discord.Permissions)
-        perms.connect = True
-        perms.speak = False
-        vc.channel.permissions_for.return_value = perms
-        mock_guild.voice_client = vc
-        lines = "\n".join(guild_lines(mock_guild, self._inputs(), source="saved here"))
-        assert "voice        General · playing" in lines
-        assert "voice ws     21 ms (avg 23 ms)" in lines
-        assert "connect ✅" in lines
-        assert "speak ⚠️" in lines
-
-
-class TestSnapshotEmbed:
-    async def test_no_credential_reaches_the_embed(
-        self, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """End-to-end guard on the whole rendered surface, not just the row
-        renderer: the embed is built to be pasted into an issue.
-
-        `operator=True` and a guild are load-bearing, not incidental. Config is the
-        only block that reads any of these three variables and it sits behind the
-        operator gate, so the earlier non-operator DM version of this test asserted
-        three credentials were absent from a card that never read them — which is
-        why the render of Config is asserted first.
-        """
-        mock_ctx.guild.voice_client = None
-        monkeypatch.setenv("DISCORD_TOKEN", "tok-should-never-render")
-        monkeypatch.setenv(
-            "POSTGRES_URL", "postgresql://bot:pw-secret@db:5432/musicbot"
+    async def test_the_password_row_is_silent_without_a_database(self) -> None:
+        """A ✅ "db password not the default" on a deployment that runs no Postgres
+        at all is an answer to a question nobody asked."""
+        lines = await debug.checks_lines(
+            None,
+            redis=None,
+            store=None,
+            archive_enabled=False,
+            default_password=False,
         )
-        monkeypatch.setenv("REDIS_URL", "redis://cacheuser:cachepw@cache:6379")
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(
-                debug_enabled=False, debug_overridden=False, players=0, operator=True
-            ),
-        )
-        names = [f.name for f in embed.fields]
-        assert "Config" in names and "This server" in names
-        # to_dict(), not the field values: description and footer are rendered
-        # surface too.
-        rendered = str(embed.to_dict())
-        for leaked in ("tok-should-never-render", "pw-secret", "cachepw"):
-            assert leaked not in rendered
+        assert not any("db password" in line for line in lines)
 
-    async def test_renders_every_block_in_a_guild(self, mock_ctx: MagicMock) -> None:
-        """Order is fixed by _BLOCK_ORDER, so a block added later has to choose its
-        place rather than landing wherever the dict happened to put it."""
-        mock_ctx.guild.voice_client = None
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(
-                debug_enabled=False,
-                debug_overridden=False,
-                players=1,
-                operator=True,
-            ),
-        )
-        names = [f.name for f in embed.fields]
-        # Config outgrew Discord's 1024-char field cap once it carried -debug's own
-        # loop tunables, so _codeblock_fields splits it — the continuation keeps the
-        # block's position rather than moving to the end.
-        assert names == [
-            "Build",
-            "Versions",
-            "Config",
-            "Config (cont.)",
-            "Runtime",
-            "Discord",
-            "Redis",
-            "Postgres",
-            "This server",
-        ]
-
-    async def test_dm_omits_the_guild_block(self, mock_ctx: MagicMock) -> None:
-        mock_ctx.guild = None
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
-        )
-        assert "This server" not in [f.name for f in embed.fields]
-        assert embed.description is not None
-        assert "direct messages" in embed.description
-        assert "(host default)" in embed.description
-
-    async def test_footer_carries_environment(self, mock_ctx: MagicMock) -> None:
-        mock_ctx.guild = None
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
-        )
-        assert embed.footer.text is not None
-        assert embed.footer.text.startswith("environment: ")
-
-
-class TestCommandRegistration:
-    def test_registered_under_utility_with_self_documenting_extras(self) -> None:
-        from src.help import CATEGORY_COMMANDS
-        from src.musicbot import MusicBot
-
-        command = MusicBot.debug
-        assert isinstance(command, commands.Command)
-        assert command.name == "debug"
-        assert "dbg" in command.aliases
-        assert command.extras["category"] == "Utility"
-        assert command.extras["examples"]
-        assert "debug" in CATEGORY_COMMANDS["Utility"]
-
-
-class TestGitSha:
-    @pytest.fixture(autouse=True)
-    def _clear_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(debug, "_git_sha_cache", None)
-
-    def test_baked_env_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The deployed case: GIT_SHA is an ENV in the runtime image, because an
-        OCI label is invisible from inside the container."""
-        monkeypatch.setenv("GIT_SHA", "abc1234-dirty.deadbeef")
-        assert debug.git_sha() == "abc1234-dirty.deadbeef"
-
-    def test_falls_back_to_the_checkout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`just run` from a checkout has no image and therefore no baked SHA.
-
-        The subprocess is faked rather than really run: the runtime image copies
-        src/ and pyproject.toml but no .git, so a real `git rev-parse` succeeds
-        under `just test` and fails under `just container-test`.
-        """
-        monkeypatch.delenv("GIT_SHA", raising=False)
-        monkeypatch.setattr(
-            debug.subprocess,
-            "run",
-            MagicMock(return_value=SimpleNamespace(stdout="a1b2c3d\n")),
-        )
-        assert debug.git_sha() == "a1b2c3d"
-
-    def test_real_checkout_answers_when_there_is_one(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Unfaked, so the argv itself is exercised — but skipped where there is
-        no checkout, which is exactly the runtime image."""
-        monkeypatch.delenv("GIT_SHA", raising=False)
-        if not Path(__file__).resolve().parent.parent.joinpath(".git").exists():
-            pytest.skip("no git checkout (runtime image)")
-        assert re.fullmatch(r"[0-9a-f]{7,40}", debug.git_sha())
-
-    def test_no_env_and_no_git_is_unknown(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.delenv("GIT_SHA", raising=False)
-        monkeypatch.setattr(
-            debug.subprocess, "run", MagicMock(side_effect=OSError("no git"))
-        )
-        assert debug.git_sha() == "unknown"
-
-    def test_cached_for_process_lifetime(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("GIT_SHA", "first")
-        assert debug.git_sha() == "first"
-        monkeypatch.setenv("GIT_SHA", "second")
-        assert debug.git_sha() == "first"
-
-
-def _redis_info(**overrides: object) -> dict[str, object]:
-    """A realistic INFO reply. fakeredis does not implement INFO at all — it raises
-    ResponseError — so every Redis-block test supplies its own."""
-    info: dict[str, object] = {
-        "used_cpu_sys": 1.0,
-        "used_cpu_user": 2.0,
-        "used_memory": 44040192,
-        "maxmemory": 268435456,
-        "mem_fragmentation_ratio": 1.08,
-        "maxmemory_policy": "volatile-lru",
-        "connected_clients": 3,
-        "instantaneous_ops_per_sec": 148,
-        "keyspace_hits": 870,
-        "keyspace_misses": 130,
-        "evicted_keys": 0,
-        "rdb_last_bgsave_status": "ok",
-        "aof_last_write_status": "ok",
-        "db0": {"keys": 1284, "expires": 1192, "avg_ttl": 0},
-    }
-    info.update(overrides)
-    return info
-
-
-class TestOperatorGate:
-    """`-debug` is reachable by any user in any guild, and by DM. Everything that
-    describes the HOST rather than the caller's own server is owner-only."""
-
-    _HOST_BLOCKS = ("Build", "Config", "Runtime", "Discord", "Redis", "Postgres")
-
-    async def test_non_operator_sees_only_versions_and_their_own_server(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.guild.voice_client = None
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=3),
-        )
-        assert [f.name for f in embed.fields] == ["Versions", "This server"]
-
-    async def test_non_operator_never_reaches_a_host_collector(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """Not just absent from the embed — never collected. A gate that renders
-        the block and then drops it still reads the host, and still pays the IO."""
-        mock_ctx.guild.voice_client = None
-        with (
-            patch.object(debug, "config_lines") as config,
-            patch.object(debug, "runtime_lines") as runtime,
-            patch.object(debug, "redis_lines") as redis_block,
-            patch.object(debug, "discord_lines") as discord_block,
-            patch.object(debug, "build_lines") as build,
-        ):
-            await _snapshot(
-                mock_ctx,
-                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+    def test_a_second_decoration_does_not_stack_two_trace_ids(self) -> None:
+        """_command_error writes "trace: <id>"; the footer writes "trace <id>". Only
+        the first spelling had a test, so the second arm could be dropped silently."""
+        embed = discord.Embed(title="x")
+        trace_id = 0x4BF92F3577B34DA6A3CE929D0E0E4736
+        hex_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        span = trace_api.NonRecordingSpan(
+            trace_api.SpanContext(
+                trace_id=trace_id,
+                span_id=0x00F067AA0BA902B7,
+                is_remote=False,
+                trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
             )
-        for collector in (config, runtime, redis_block, discord_block, build):
-            collector.assert_not_called()
-
-    async def test_a_non_operators_snapshot_carries_no_host_detail(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """The disclosure this gate exists for. The sentinel stands in for every
-        host-describing row."""
-        mock_ctx.guild.voice_client = None
-        with patch.object(debug, "discord_lines", return_value=["shards  sentinel"]):
-            embed = await _snapshot(
-                mock_ctx,
-                DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
-            )
-        assert "sentinel" not in str(embed.to_dict())
-
-    async def test_a_non_operator_is_told_why_rather_than_left_guessing(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
         )
-        assert embed.description is not None
-        assert "bot owner" in embed.description
-        assert "-ping" in embed.description
+        embed.set_footer(text=f"trace {hex_id}")
+        debug.decorate_embeds([embed], span=span, elapsed_ms=1.0, shard_id=None)
+        assert (embed.footer.text or "").count(hex_id) == 1
 
-    async def test_the_operator_notice_is_absent_for_an_operator(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(
-                debug_enabled=False,
-                debug_overridden=False,
-                players=0,
-                operator=True,
-            ),
-        )
-        assert embed.description is not None
-        assert "bot owner" not in embed.description
+    def test_each_skeleton_gets_its_own_placeholder_list(self) -> None:
+        """Shared mutable default: two concurrent -debug invocations would otherwise
+        write into one another's blocks."""
+        first = list(debug._PENDING_LINES)
+        first.append("mutated")
+        assert debug._PENDING_LINES == ["⏳ collecting…"]
 
-    @pytest.mark.parametrize("block", _HOST_BLOCKS)
-    async def test_every_host_block_is_absent_for_a_non_operator(
-        self, mock_ctx: MagicMock, block: str
-    ) -> None:
-        """Parametrized per block so a block added later has to decide which side of
-        this gate it is on rather than defaulting to public."""
-        mock_ctx.guild.voice_client = None
-        embed = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
-        )
-        assert block not in [f.name for f in embed.fields]
-
-
-class TestTheSnapshotDoesNotWaitForItsIO:
-    """-debug sends a skeleton and fills it in. The point is that a sick dependency
-    delays one BLOCK, not the whole reply."""
-
-    @staticmethod
-    def _operator(**kw: Any) -> DebugInputs:
-        return DebugInputs(
-            debug_enabled=False, debug_overridden=False, players=0, operator=True, **kw
-        )
-
-    async def test_the_instant_blocks_are_already_filled_in_the_skeleton(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """Config and Discord need no IO, so making the user wait for them would be
-        pure loss. Versions rides prepare()."""
-        mock_ctx.guild.voice_client = None
-        embed = await _skeleton(mock_ctx, self._operator())
-        rendered = {f.name: (f.value or "") for f in embed.fields}
-        assert "ENVIRONMENT" in rendered["Config"]
-        assert "shards" in rendered["Discord"]
-        assert "collecting" not in rendered["Versions"]
-
-    async def test_the_send_happens_before_a_slow_block_resolves(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """The whole contract: the skeleton is out while Build is still shelling
-        out to git."""
-        mock_ctx.guild.voice_client = None
-        gate = asyncio.Event()
-        message = MagicMock(spec=discord.Message)
-        message.edit = AsyncMock()
-        mock_ctx.channel.send = AsyncMock(return_value=message)
-
-        async def slow_build() -> dict[str, list[str]]:
-            await gate.wait()
-            return {"Build": ["commit  abc123"]}
-
-        with patch.object(debug, "_build_blocks", slow_build):
-            task = asyncio.create_task(run_debug_dashboard(mock_ctx, self._operator()))
-            async with asyncio.timeout(3):
-                while mock_ctx.channel.send.await_count == 0:
-                    await asyncio.sleep(0)
-                call = mock_ctx.channel.send.await_args
-                assert call is not None
-                sent = call.kwargs["embeds"][0]
-                assert "collecting" in next(
-                    f.value or "" for f in sent.fields if f.name == "Build"
-                )
-                gate.set()
-                await task
-
-    async def test_a_probe_that_raises_degrades_to_its_own_blocks(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """_safe_block guards each collector, so a raise here means the PROBE broke.
-        It must cost its own blocks and nothing else."""
-        mock_ctx.guild.voice_client = None
-
-        async def boom() -> dict[str, list[str]]:
-            raise RuntimeError("probe exploded")
-
-        with patch.object(debug, "_build_blocks", boom):
-            embed = await _snapshot(mock_ctx, self._operator())
-        rendered = {f.name: (f.value or "") for f in embed.fields}
-        assert "unavailable" in rendered["Build"]
-        assert "shards" in rendered["Discord"]
-
-
-class TestRedactUrl:
-    def test_userinfo_is_replaced(self) -> None:
-        assert (
-            redact_url("postgresql://bot:hunter2@db.internal:5432/musicbot")
-            == "postgresql://***@db.internal:5432/musicbot"
-        )
-
-    def test_credentialless_url_is_untouched(self) -> None:
-        assert redact_url("redis://localhost:6379") == "redis://localhost:6379"
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            "collector.prod.internal.corp:4317",
-            "pot-sidecar.prod.internal.corp:4416",
-            "cache.internal:6379",
-            # One slash, so there is no authority to rewrite AND the host lands in
-            # .path — replacing .netloc alone leaves it visible.
-            "http:/host.internal:9090/x",
-        ],
-    )
-    def test_hide_host_does_not_fail_open_on_a_schemeless_url(self, raw: str) -> None:
-        """urlsplit only fills .netloc when it sees `//`. Without it the host lands
-        in .scheme/.path, so rewriting .netloc wrote `***` into a slot that was never
-        carrying the host — publishing internal topology beside a marker that reads
-        as "this was redacted". Operators DO write these scheme-less; ping.probe_otel
-        carries the same normalisation and says so."""
-        redacted = redact_url(raw, hide_host=True)
-        assert "internal" not in redacted
-        assert "4317" not in redacted and "4416" not in redacted
-        assert "6379" not in redacted and "9090" not in redacted
-
-    def test_hide_host_still_keeps_the_shape_of_a_normal_url(self) -> None:
-        """The guard above must not flatten the ordinary case: an operator still
-        needs to see which protocol is configured."""
-        assert (
-            redact_url("redis://user:pw@cache.internal:6379/0", hide_host=True)
-            == "redis://***/0"
-        )
-
-    @pytest.mark.parametrize(
-        "key", ["password", "api_key", "auth", "X-Token", "client_secret"]
-    )
-    def test_credential_query_values_are_replaced(self, key: str) -> None:
-        """asyncpg honours `?password=` as readily as userinfo, so the query string
-        is the second place a DSN hides a credential."""
-        redacted = redact_url(f"postgresql://db/musicbot?{key}=hunter2&sslmode=require")
-        assert "hunter2" not in redacted
-        assert "***" in redacted
-        assert "sslmode=require" in redacted
-
-    def test_a_fragment_is_marked_rather_than_echoed(self) -> None:
-        """urlsplit puts everything after a stray `#` into .fragment, so it is the
-        one component neither the userinfo nor the query redaction reaches. Marked
-        rather than dropped, so the row still says something was there."""
-        redacted = redact_url("redis://host:6379/0#pw=hunter2")
-        assert redacted == "redis://host:6379/0#***"
-        assert "hunter2" not in redacted
-
-    def test_unparseable_url_degrades(self) -> None:
-        assert redact_url("http://[::1") == "unparseable"
-
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "redis://u:pw@host:99999/0",  # out of range
-            "redis://u:pw@host:abc/0",  # not a number
-        ],
-    )
-    def test_a_bad_port_degrades_instead_of_raising(self, url: str) -> None:
-        """`.port` is LAZY: urlsplit accepts these and raises on dereference. With
-        the guard around the parse alone, the ValueError escaped past it — and since
-        the whole Config block is one collector, one typo'd port in .env replaced all
-        of it with "unavailable (ValueError)" exactly while someone was diagnosing
-        that host.
-        """
-        assert redact_url(url) == "unparseable"
-        assert "pw" not in redact_url(url)
-
-
-class TestConfigAllowlist:
-    def test_credentials_render_presence_only(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        for var in _CONFIG_ALLOWLIST:
-            if var.kind is not _ConfigKind.SECRET:
-                continue
-            monkeypatch.setenv(var.name, "super-secret-value")
-            rendered = render_config_value(var)
-            assert rendered == "set"
-            monkeypatch.delenv(var.name)
-            assert render_config_value(var) == "unset"
-
-    def test_every_credential_bearing_var_is_declared_secret(self) -> None:
-        """The allowlist is decided by hand rather than by pattern-match, so this
-        pins the review decision: these four carry credentials and must never
-        render a value, POSTGRES_URL because it embeds the password in its DSN."""
-        secrets = {v.name for v in _CONFIG_ALLOWLIST if v.kind is _ConfigKind.SECRET}
-        assert secrets == {
-            "DISCORD_TOKEN",
-            "SPOTIFY_CLIENT_ID",
-            "SPOTIFY_CLIENT_SECRET",
-            "POSTGRES_URL",
-        }
-
-    def test_url_values_are_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Credential AND host. The card is posted in the channel the operator typed
-        in, so `cache:6379` is internal topology published to everyone there."""
-        monkeypatch.setenv("REDIS_URL", "redis://user:pw@cache:6379/0")
-        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
-        rendered = render_config_value(var)
-        assert "pw" not in rendered
-        assert "cache" not in rendered and "6379" not in rendered
-        assert rendered == "redis://***/0"
-
-    def test_a_local_host_is_redacted_too(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Unconditionally, or the presence of `***` would itself say "remote"."""
-        monkeypatch.setenv("REDIS_URL", "redis://localhost:6379")
-        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "REDIS_URL")
-        assert "localhost" not in render_config_value(var)
-
-    def test_unset_shows_the_value_in_force(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An unset knob is not "nothing" — it is the default, and the default is
-        what an operator is validating against."""
-        monkeypatch.delenv("YTDLP_POOL_WORKERS", raising=False)
-        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
-        assert render_config_value(var) == "4 (default)"
-
-    def test_unlisted_variable_never_renders(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The allowlist's whole point: a knob added later opts in at review time,
-        so a future secret cannot leak by simply existing."""
-        monkeypatch.setenv("SOME_FUTURE_SECRET", "leaked")
-        assert "SOME_FUTURE_SECRET" not in "\n".join(config_lines())
-        assert "leaked" not in "\n".join(config_lines())
-
-    def test_no_duplicate_rows(self) -> None:
-        names = [v.name for v in _CONFIG_ALLOWLIST]
-        assert len(names) == len(set(names))
-
-
-class TestRuntimeBlock:
-    async def test_uptime_is_a_plain_duration_not_discord_markup(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Every row in this block is rendered inside a ``` fence, and Discord prints
-        markup there as its literal source: the row read `uptime <t:1785881580:R>` to
-        every operator who ran it, rather than "2 hours ago"."""
-        monkeypatch.setattr(debug, "_PROCESS_START", time.time() - 3725)
-        line = next(line for line in debug.runtime_lines() if line.startswith("uptime"))
-        assert "<t:" not in line
-        assert line == "uptime       1:02:05"
-
-
-class TestRedisBlock:
-    def _samples(
-        self, **overrides: object
-    ) -> tuple[debug.RedisSample, debug.RedisSample]:
-        first = debug.RedisSample(info=_redis_info(**overrides), monotonic=100.0)
-        second = debug.RedisSample(
-            info=_redis_info(used_cpu_sys=1.005, used_cpu_user=2.005, **overrides),
-            monotonic=101.0,
-        )
-        return first, second
-
-    def test_renders_cpu_before_mem(self) -> None:
-        first, second = self._samples()
-        lines = debug.redis_lines(first, second, dbsize=1284)
-        assert lines[0].startswith("cpu")
-        assert lines[1].startswith("mem")
-
-    def test_cpu_is_a_rate_across_the_window(self) -> None:
-        first, second = self._samples()
-        # 0.01 cpu-seconds over 1 wall second = 1%. No core normalization: Redis
-        # is effectively single-threaded, so 100% is one saturated core.
-        assert "1.0%" in debug.redis_lines(first, second, dbsize=0)[0]
-
-    def test_memory_percent_is_against_maxmemory(self) -> None:
-        """maxmemory is the threshold volatile-lru acts at, so the % reads as the
-        eviction runway rather than as host pressure."""
-        first, second = self._samples()
-        assert "42 MB / 256 MB (16%)" in debug.redis_lines(first, second, dbsize=0)[1]
-
-    def test_no_maxmemory_renders_absolute_only(self) -> None:
-        first, second = self._samples(maxmemory=0)
-        assert "(no maxmemory)" in debug.redis_lines(first, second, dbsize=0)[1]
-
-    def test_persistent_keys_are_total_minus_expires(self) -> None:
-        """The no-TTL population is exactly the set golden rule 12 protects."""
-        first, second = self._samples()
-        keys = next(
-            line
-            for line in debug.redis_lines(first, second, dbsize=1284)
-            if "keys" in line
-        )
-        assert "1284 total · 92 persistent" in keys
-
-    def test_degrades_when_info_is_unavailable(self) -> None:
-        lines = debug.redis_lines(None, None, dbsize=None)
-        assert len(lines) == 1
-        assert "unavailable" in lines[0]
-
-    async def test_read_sample_swallows_a_dead_redis(self) -> None:
-        redis = MagicMock()
-        redis.info = AsyncMock(side_effect=ConnectionError("down"))
-        assert await debug.read_redis_sample(redis) is None
-
-    async def test_read_sample_of_none_redis_is_none(self) -> None:
-        assert await debug.read_redis_sample(None) is None
-
-    async def test_read_sample_stamps_the_clock_it_was_taken_at(self) -> None:
-        """The success path — untested until now, including its timestamp. Redis's
-        CPU% is the gap between two of these, so a constant `monotonic` divides by a
-        zero-or-fixed window and pins that row to garbage without failing anything.
-        """
-        redis = MagicMock()
-        redis.info = AsyncMock(return_value=_redis_info())
-        before = time.monotonic()
-        sample = await debug.read_redis_sample(redis)
-        assert sample is not None
-        assert sample.info["maxmemory_policy"] == "volatile-lru"
-        assert before <= sample.monotonic <= time.monotonic()
-
-    async def test_dbsize_counts_the_keys(self, fake_redis: Redis) -> None:
-        """The `keys` row's whole content. A hardcoded 0 or None reads as an
-        empty/unknown keyspace on every host forever, which is exactly what a
-        collector nobody executes looks like."""
-        for i in range(3):
-            await fake_redis.set(f"guild:{i}:state", "x")
-        assert await debug._dbsize(fake_redis) == 3
-
-    async def test_dbsize_without_redis_is_unknown(self) -> None:
-        assert await debug._dbsize(None) is None
-
-    async def test_dbsize_swallows_a_dead_redis(self) -> None:
-        """A key count is a row, not a failure: it must not take the Redis block
-        (or its sibling Checks) down with it."""
-        redis = MagicMock()
-        redis.dbsize = AsyncMock(side_effect=ConnectionError("down"))
-        assert await debug._dbsize(redis) is None
-
-
-class TestPostgresBlock:
-    def _stats(self) -> ArchiveStats:
-        return ArchiveStats(
-            database_bytes=134217728,
-            table_bytes=100663296,
-            rows_estimate=412083,
-            rejected_estimate=0,
-            connections=3,
-            max_connections=100,
-            shared_buffers="128MB",
-            cache_hit_ratio=0.994,
-        )
-
-    async def test_renders_the_archive_stats(self) -> None:
-        archive = MagicMock()
-        archive.stats = AsyncMock(return_value=self._stats())
-        lines = "\n".join(await debug.postgres_lines(archive, archive_enabled=True))
-        assert "db 128 MB" in lines
-        assert "play_history 96 MB" in lines
-        assert "~412083 plays · 0 rejected" in lines
-        assert "3 / 100" in lines
-        assert "hit rate 99.4%" in lines
-
-    async def test_disabled_archive_reads_as_a_choice(self) -> None:
-        """Mirrors -ping's OFF row: the ship default made this choice, and it must
-        not read as a fault."""
-        lines = await debug.postgres_lines(None, archive_enabled=False)
-        assert lines == ["off (archive disabled)"]
-
-    async def test_enabled_but_absent_archive_is_na(self) -> None:
-        assert await debug.postgres_lines(None, archive_enabled=True) == ["n/a"]
+    async def test_the_outbox_row_says_so_when_there_is_no_redis(self) -> None:
+        """Distinct from a Redis that answered zero — the broad except below would
+        otherwise swallow the AttributeError and report the same thing."""
+        row = await debug._outbox_check(None, archive_enabled=True)
+        assert "no Redis" in row

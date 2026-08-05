@@ -367,6 +367,19 @@ pins:
         fail=1
     fi
 
+    # -debug selects the Postgres container's Prometheus series by container_name.
+    # A rename in compose does not fail anything: the query simply matches no series
+    # and the cpu/mem row renders "n/a (no metrics source)" forever, which reads as
+    # "no metrics stack" rather than "wrong name". Anchored to the postgres service
+    # so another service's container_name cannot satisfy it.
+    py_pgname="$(sed -n 's/^_POSTGRES_CONTAINER = "\(.*\)"$/\1/p' src/debug.py)"
+    compose_pgname="$(awk '/^  postgres:/{f=1} f && /container_name:/{print $2; exit}' docker-compose.yml)"
+    if [ -z "$py_pgname" ] || [ "$py_pgname" != "$compose_pgname" ]; then
+        echo "postgres container name drift: src/debug.py=[$py_pgname] docker-compose.yml=[$compose_pgname]" >&2
+        echo "  -debug's Postgres cpu/mem row selects on this label." >&2
+        fail=1
+    fi
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing

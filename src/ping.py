@@ -1,7 +1,7 @@
 """The `-ping` health dashboard: dependency probes and rendering.
 
 The SEQUENCING is not here. Sending a skeleton immediately and editing it as probes
-land is `src/dashboard.py`; this module supplies the probes,
+land is `src/dashboard.py`, shared with `-debug`; this module supplies the probes,
 the rows and the four callbacks that driver calls back into. What stays together
 here is one feature's probes and its rendering, separated by rules rather than
 files. The probes are deliberately not shared with a healthz endpoint: healthz must
@@ -493,7 +493,7 @@ async def run_health_dashboard(
     straggler. Runs inside the caller's span and lets exceptions propagate — the command
     owns the user-facing error reply.
 
-    The sequencing lives in src/dashboard.py; what stays here is
+    The sequencing lives in src/dashboard.py, shared with -debug; what stays here is
     what a row IS and how the board is drawn.
     """
     span = trace.get_current_span()

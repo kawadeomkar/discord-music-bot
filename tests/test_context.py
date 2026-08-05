@@ -32,9 +32,8 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()
-    # Same shape __init__ builds. This fixture bypasses __init__, so a field
-    # added there has to be mirrored here or every test in this file dies on
-    # AttributeError the first time the send path reads it.
+    # Off by default: send() asks the cog on every response, so a debug-on cog
+    # here would decorate the embeds these attach tests compare.
     cog._debug_default = False
     cog._debug_overrides = {}
     # Same shape __init__ builds: the toggle stamps these so a hydration pass that
