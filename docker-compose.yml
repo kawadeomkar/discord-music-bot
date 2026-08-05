@@ -5,6 +5,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into the image as an ENV so the running bot can report the commit
+        # it is on (-debug); the OCI label is invisible from inside a container.
+        # `unknown` rather than empty, exactly as build_common.sh's
+        # build_runtime_image defaults it — the TAG below falls back to `latest`
+        # instead, because a tag has to name something pullable.
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
     network_mode: host
@@ -204,6 +211,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Not optional here: this service shares the bot's `image:` name, so a
+        # build without the arg retags that image from a GIT_SHA-less build and
+        # -debug reports `unknown` for a commit it knows.
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: discord-postgres-migrate
     restart: "no"
     command: ["python", "-m", "src.db_migrate"]
@@ -260,6 +272,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Same image name as the bot and db-migrate, so the same arg — see the
+        # db-migrate build above.
+        GIT_SHA: ${GIT_SHA:-unknown}
     restart: "no"
     # No `container_name`: `docker compose run` generates its own, and a fixed
     # one makes a second invocation collide with the first's stopped container.

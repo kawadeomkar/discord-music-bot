@@ -473,6 +473,23 @@ def _service_block(name: str) -> str:
     return match.group(1)
 
 
+def _building_services() -> dict[str, str]:
+    """name → block, for every top-level service that declares a `build:`. Named
+    rather than listed so a fourth build block has to satisfy the same contract
+    as the three that exist."""
+    # Scoped to the `services:` mapping: the top-level `volumes:` names sit at the
+    # same indent and would otherwise be looked up as services and not found.
+    section = re.search(
+        r"^services:\n(.*?)(?=^\S|\Z)", _compose_directives(), re.S | re.M
+    )
+    assert section is not None, "docker-compose.yml has no services: mapping"
+    blocks = {
+        name: _service_block(name)
+        for name in re.findall(r"^  (\S+):$", section.group(1), re.M)
+    }
+    return {n: b for n, b in blocks.items() if re.search(r"^    build:$", b, re.M)}
+
+
 class TestComposeArchiveProfile:
     """The deployment half of the opt-in archive: postgres and db-migrate exist in
     the model only while the `archive` profile is active, so a token-only
@@ -515,6 +532,43 @@ class TestComposeArchiveProfile:
         cannot-import-a-shell-script reasoning as the preflight test below."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
         assert "docker compose --profile archive down" in justfile
+
+
+class TestComposeBakesTheCommit:
+    """`-debug` reports the commit it is running by reading the GIT_SHA ENV baked
+    into the image — the OCI label the Dockerfile also stamps is invisible from
+    inside a container. compose's build blocks passed no `args:` at all, so
+    anything built through compose answered `unknown` while wearing a SHA tag."""
+
+    def test_every_service_that_builds_passes_the_commit(self) -> None:
+        """The three build blocks tag ONE image name, so `docker compose build`
+        builds that name three times and the last write wins: a block missing the
+        arg silently retags the bot's image from a GIT_SHA-less build."""
+        building = _building_services()
+        # Non-empty guard: a helper that matched nothing passes the loop.
+        assert len(building) >= 3, building
+        for name, block in building.items():
+            assert "image: discord-music-bot:" in block, name
+            assert "GIT_SHA: ${GIT_SHA:-unknown}" in block, name
+
+    def test_the_fallback_is_readable_rather_than_empty_or_mandatory(self) -> None:
+        """A bare `${GIT_SHA}` bakes an empty string, which -debug renders as a
+        blank commit; `:?` would fail `up` for everyone who builds outside the
+        deploy scripts. The image TAG's own `:-latest` is a different question —
+        a tag has to name something pullable."""
+        fallbacks = set(
+            re.findall(r"GIT_SHA: \$\{GIT_SHA([^}]*)\}", _compose_directives())
+        )
+        assert fallbacks == {":-unknown"}
+
+    def test_the_deploy_script_bakes_the_same_fallback(self) -> None:
+        """compose and build_common.sh are two independent paths onto one image
+        name, and neither can read the other's default. Drift means the same
+        unbuilt-from-a-deploy image reports two different things."""
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert 'GIT_SHA="${GIT_SHA:-unknown}"' in preflight
 
 
 class TestComposeMatchesTheDefault:

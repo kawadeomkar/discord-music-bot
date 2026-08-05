@@ -797,6 +797,10 @@ image:
     # inside an argument does not trip `set -e` (the caller's status is what counts),
     # so a git failure would have built and tagged `discord-music-bot:`.
     tag="$(git_sha_tag)"
+    # Exported, not just tagged: the same string is baked into the image as
+    # GIT_SHA so the running bot can report the commit it was built from
+    # (build_docker.sh already exports it; this path did not).
+    export GIT_SHA="$tag"
     build_runtime_image "{{ IMAGE }}:latest" "{{ IMAGE }}:$tag"
 
 # Deploy an already-built image; pass a git sha to roll back

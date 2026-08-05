@@ -809,6 +809,14 @@ about its commit. `just restart` restarts the existing container and does NOT pi
 new image. Compose runs the bot with **host networking**; a named `ytdlp-cache` volume
 persists yt-dlp's player-JS/challenge cache across restarts.
 
+`GIT_SHA` is both the deploy tag and a build-arg baked into the runtime image, as an
+`ENV` **and** an `org.opencontainers.image.revision` label — the ENV is the one the
+process can read (labels are invisible from inside the container), which is what lets
+`-debug` report the commit it is running. `build_runtime_image()` is the single
+`--build-arg` seam; every caller must **export** `GIT_SHA` before calling it, and CI
+passes `github.sha`. Not a seventh `just pins` pair: the value is derived, not
+duplicated.
+
 ## Configuration reference (all env vars; `.env` for compose)
 
 | Variable | Default | Notes |
@@ -827,6 +835,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | git branch (`main`→`production`) | set explicitly in CI/Docker/worktrees |
 | `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every response with a trace/timing/runtime footer. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
+| `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
