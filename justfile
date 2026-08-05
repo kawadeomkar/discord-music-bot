@@ -817,7 +817,10 @@ down:
     # just-disabled-the-archive case where the operator most expects the
     # database to stop. Activating a profile whose services have no containers
     # is a no-op, so the always-disabled case is unaffected.
-    docker compose --profile archive down
+    #
+    # `metrics` is here for the same reason: it gates the docker-socket sidecar,
+    # and a `down` that leaves THAT running is the one to get right.
+    docker compose --profile archive --profile metrics down
 
 # NOT a deploy. `docker compose restart` stops and starts the EXISTING container with
 # the image it already has, so a newly built image is not picked up — the old help text

@@ -121,6 +121,15 @@ jobs:
       - name: version pins agree
         run: .venv/bin/just pins
 
+      # The tracked JSON — the 2354-line Grafana dashboard — is parsed by nothing
+      # else here, and a truncated one first fails at Grafana's provisioning step
+      # inside a container. `.pre-commit-config.yaml`'s check-json covers it for a
+      # clone with hooks installed; this is the enforcement copy, same split ruff
+      # already has. stdlib json, like resolve-env's tomllib: nothing to install,
+      # and `-t` names the file that failed.
+      - name: JSON files parse
+        run: git ls-files -z '*.json' | xargs -0 -r -t -I{} python3 -m json.tool {} /dev/null
+
       - name: ruff format --check
         run: .venv/bin/just fmt-check
 

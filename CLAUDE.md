@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.7.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.8.1, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -98,10 +98,19 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    `docker-compose.yml` (compared tier↔ci and compose↔ci, so all three agree). The
    compose legs are anchored to the named service, not `head -1`, so a second postgres
    or redis service cannot silently shift what is compared.
-   **One pair is NOT enforced:** `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
+   **Two pairs are NOT enforced — this list is what a maintainer checks by hand,
+   so keep it complete:**
+   (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
    `brainicism/bgutil-ytdlp-pot-provider` image tag in `docker-compose.yml`. The plugin
    and the sidecar are released in lockstep; drift breaks PO-token minting, which
-   surfaces as YouTube playback failures, not as a red build. Check it by hand.
+   surfaces as YouTube playback failures, not as a red build.
+   (b) `otel/opentelemetry-collector-contrib` (the `otelcol-metrics` service) ↔ the
+   otelcol-contrib build inside `grafana/otel-lgtm` (the `otel-lgtm` service), both in
+   `docker-compose.yml`. The comment above the collector's `image:` line states the rule
+   — bump either image and check the other by hand. Like (a), drift is invisible to
+   every build: the symptom lands on the metrics path, where a missing `docker_stats`
+   series leaves the dashboard's container panels empty, which is also exactly what
+   "the `metrics` profile is not running" looks like.
 7. **Do not create `pyrightconfig.json`.** `[tool.pyright]` in `pyproject.toml` is the
    single source of truth; a `pyrightconfig.json` would silently override it for editors
    only. Do not re-add `venvPath`/`venv` there either — `just types` passes
@@ -809,7 +818,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | both or neither; validated live at startup |
 | `REDIS_URL` | `redis://localhost:6379` | bot runs degraded (no persistence/recovery) without Redis |
 | `HISTORY_ARCHIVE_ENABLED` | `false` | **the consent gate for long-term storage** — `true` enables the Postgres archive tier (outbox writes, drainer, `POSTGRES_URL` requirement). Strict parse (`true/1/yes` / `false/0/no`, case-insensitive; unset/empty → false; garbage aborts startup, and `setup_hook` reads it FIRST so the ValueError cannot be swallowed by `@_guild_op`). Set together with `COMPOSE_PROFILES=archive` — the pair is documented in `.env.example` |
-| `COMPOSE_PROFILES` | — | read by Docker Compose from `.env`, not by the bot: `archive` deploys `postgres` + `db-migrate`. `just down` hardcodes `--profile archive` (a `down` with the profile inactive leaves postgres running); explicitly naming profiled services (`up -d redis postgres db-migrate`) auto-activates the profile. A second profile, `ops`, holds `db-backfill` — kept out of `up` entirely because it is run by hand (`docker compose run --rm db-backfill`) |
+| `COMPOSE_PROFILES` | — | read by Docker Compose from `.env`, not by the bot: `archive` deploys `postgres` + `db-migrate`. `just down` names every profile (`--profile archive --profile metrics`) — a `down` with a profile inactive leaves its containers running; explicitly naming profiled services (`up -d redis postgres db-migrate`) auto-activates the profile. Three profiles exist: `archive` (postgres + db-migrate), `ops` (`db-backfill`, kept out of `up` entirely because it is run by hand — `docker compose run --rm db-backfill`), and `metrics` (`otelcol-metrics`, the docker_stats → Prometheus sidecar behind the dashboard's per-container panels; it mounts the Docker socket, so it is opt-in) |
 | `POSTGRES_URL` | — | **required while the archive is enabled**; `setup_hook` raises without it. Ignored (with an INFO) when disabled — the flag, never URL presence, is what enables archiving. Compose supplies it; `just run` derives it from the parts below |
 | `POSTGRES_PASSWORD` | `password` | compose defaults it so a token-only archive-enabled `docker compose up` works; the bot warns loudly (startup ERROR + owner-only `-ping` row) while the default is in use AND the archive is enabled (`build_common.sh`'s preflight warns more widely: flag truthy OR the profile in `COMPOSE_PROFILES`, covering the profile-on/flag-off drift case where an idle default-credential postgres runs with the bot's warnings silenced), and `./setup_env.sh` generates a real one. Changing it after the volume is initialized needs `ALTER USER` — Postgres reads it on first init only. **`.env` is the only supported place it is set**; a per-install `POSTGRES_PASSWORD_FILE` was proposed and declined (see the comment above `DEFAULT_POSTGRES_PASSWORD` in config.py), and `using_default_postgres_password()` is scoped to the DSN shape that decision produces — do not re-add asyncpg's full resolution ladder |
 | `POSTGRES_USER` / `POSTGRES_DB` | `musicbot` / `musicbot` | compose only; also the parts `just run`/`db-*` build a host DSN from |
