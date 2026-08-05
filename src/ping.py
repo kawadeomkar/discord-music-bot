@@ -205,7 +205,14 @@ async def probe_otel() -> ProbeResult:
     # hostname=None and silently probes localhost. Prepend "//" so we hit the real one.
     raw = telemetry._OTLP_ENDPOINT
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
-    host, port = parsed.hostname or "localhost", parsed.port or 4317
+    # .port is a LAZY property: urlparse accepts "host:99999" and "host:4317 " and only
+    # raises on dereference. Reading it outside a guard let a stray character in .env
+    # raise out of the probe, through _settle, and out of the dashboard driver BEFORE
+    # the skeleton send — so a typo cost the whole board rather than one row.
+    try:
+        host, port = parsed.hostname or "localhost", parsed.port or 4317
+    except ValueError:
+        return ProbeResult("OTEL collector", ProbeState.FAILED)
 
     async def _do() -> None:
         # gRPC OTLP has no cheap app-level ping, so a TCP connect proves only that the

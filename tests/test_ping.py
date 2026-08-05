@@ -595,6 +595,26 @@ class TestProbeOtel:
         r = await ping.probe_otel()
         assert r.state is ProbeState.OFF
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "grpc://collector:4317 ",  # a trailing space in .env
+            "http://collector:99999",  # out of range
+        ],
+    )
+    async def test_an_unparseable_port_fails_the_row_not_the_board(
+        self, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ) -> None:
+        """urlparse().port is LAZY — it accepts these and raises on dereference. That
+        read sits outside _timed, so before the guard a stray character in .env raised
+        through _settle and out of the dashboard driver BEFORE the skeleton send, and
+        -ping answered with a bare error embed and no board at all.
+        """
+        monkeypatch.setattr(telemetry, "_tracer_provider", object())
+        monkeypatch.setattr(telemetry, "_OTLP_ENDPOINT", endpoint)
+        r = await ping.probe_otel()
+        assert r.state is ProbeState.FAILED
+
     async def test_reachable_is_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(telemetry, "_tracer_provider", object())
         monkeypatch.setattr(telemetry, "_OTLP_ENDPOINT", "http://collector:4317")
