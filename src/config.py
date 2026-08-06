@@ -1,3 +1,4 @@
+import math
 import os
 import subprocess
 import warnings
@@ -49,11 +50,54 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
+
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float knob from the environment, or raise a named error.
+
+    Same empty-reads-as-unset rule as _int_env below, and the same reason for raising
+    at import time. Non-finite is refused separately from the floor because `float()`
+    accepts "inf" and "nan" happily and both defeat the dashboard driver in ways a
+    minimum would not catch: `inf` makes the deadline never expire, so the command
+    holds its max_concurrency slot forever and every later run in that guild answers
+    "already running". A tick of 0 is the other half — it turns the driver's timed
+    wait into a hot spin, measured at 0.6 CPU-seconds per wall-second on the loop
+    that also carries voice heartbeats.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number; got {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number; got {raw!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    return value
+
+
+# Floor for every live-dashboard knob. Small enough to stay a tuning knob rather than
+# a policy, large enough that the driver's wait is always a real suspension.
+_MIN_DASHBOARD_SECS: Final[float] = 0.05
+
 # -ping's live-edit loop tunables. Constants, not call-time reads: the dashboard
 # reads them every tick. Here rather than in ping.py so this module stays the one
 # place that answers "what does the bot read from the environment?".
-PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
-PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
+PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+PING_DEADLINE_SECS: float = _float_env(
+    "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
+)
+
+# The same two knobs for -debug's live-edit loop (src/dashboard.py drives both).
+# A longer deadline than -ping's: these collectors do strictly more work per block
+# — a Postgres stats query and a Prometheus round trip, against -ping's single
+# reachability probe — and a block that misses the deadline renders "timed out"
+# rather than being retried, so cutting it short loses real data.
+DEBUG_TICK_SECS: float = _float_env("DEBUG_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+DEBUG_DEADLINE_SECS: float = _float_env(
+    "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
+)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
@@ -103,24 +147,14 @@ HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 POSTGRES_STATEMENT_CACHE: int = _int_env("POSTGRES_STATEMENT_CACHE", 100)
 
 
-def history_archive_enabled() -> bool:
-    """True when the operator has opted in to the Postgres history archive.
-
-    The consent gate for long-term storage. Enabled: POSTGRES_URL required at
-    startup, every play XADDed to history:outbox, the drainer moving it into
-    play_history forever. Disabled — the default — none of that exists; Redis
-    behavior is identical either way. Read at call time (once per song at most).
+def _parse_bool_env(name: str) -> bool:
+    """Parse a boolean knob, or raise naming it. Unset and empty read as False.
 
     Parsing is STRICT because of the failure direction: a lenient
-    anything-but-true-is-False rule turns a typo (`HISTORY_ARCHIVE_ENABLED=on`)
-    into an operator who believes they enabled archiving while every play goes
-    unrecorded. Unset and empty read as False — collection must be a choice.
-
-    setup_hook must call this before any other consumer: the next reader is
-    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
-    song instead of a startup abort.
+    anything-but-true-is-False rule turns a typo (`=on`) into an operator who
+    believes they flipped the switch while nothing changed.
     """
-    raw = os.environ.get("HISTORY_ARCHIVE_ENABLED")
+    raw = os.environ.get(name)
     value = (raw or "").strip().lower()
     if not value:
         return False
@@ -129,9 +163,65 @@ def history_archive_enabled() -> bool:
     if value in ("false", "0", "no"):
         return False
     raise ValueError(
-        f"HISTORY_ARCHIVE_ENABLED must be one of true/false, 1/0, or yes/no "
+        f"{name} must be one of true/false, 1/0, or yes/no "
         f"(case-insensitive); got {raw!r}"
     )
+
+
+def history_archive_enabled() -> bool:
+    """True when the operator has opted in to the Postgres history archive.
+
+    The consent gate for long-term storage. Enabled: POSTGRES_URL required at
+    startup, every play XADDed to history:outbox, the drainer moving it into
+    play_history forever. Disabled — the default — none of that exists; Redis
+    behavior is identical either way. Read at call time (once per song at most).
+
+    Parsing is STRICT (see _parse_bool_env) because of the failure direction: a
+    typo (`HISTORY_ARCHIVE_ENABLED=on`) would otherwise leave an operator
+    believing they enabled archiving while every play goes unrecorded. Unset and
+    empty read as False — collection must be a choice.
+
+    setup_hook must call this before any other consumer: the next reader is
+    @_guild_op-wrapped push_history, where a garbage value becomes one warning per
+    song instead of a startup abort.
+    """
+    return _parse_bool_env("HISTORY_ARCHIVE_ENABLED")
+
+
+def debug_mode_default() -> bool:
+    """The process-wide default for debug mode — what a guild gets before anyone
+    runs `-debug --enable`.
+
+    Debug mode is observation-only: it decorates responses with trace/timing
+    metadata and nothing else, so this is safe to leave on. Read ONCE, by
+    MusicBot.__init__, which is what makes a garbage value abort startup inside
+    load_extension.
+
+    This is the default for a guild that has never chosen, and only for as long as
+    it has not: `-debug --enable/--disable` persists to guild:{id}:config and WINS
+    over this value from then on, across restarts. Changing this env var moves every
+    guild that never chose and none that did.
+
+    Parsed by the same strict table as history_archive_enabled — unset and empty
+    are False, and a typo raises rather than silently reading as off — so there is
+    one boolean grammar in this file rather than two.
+    """
+    return _parse_bool_env("DEBUG_MODE")
+
+
+def debug_prometheus_url() -> Optional[str]:
+    """Base URL of a Prometheus that holds this deployment's container metrics, or
+    None (the default) to leave the feature off.
+
+    -debug's Postgres block reads container CPU/memory from here, because the bot
+    cannot see another container's cgroup and Postgres reports no OS metrics over
+    SQL. Compose supplies it once otel-lgtm's Prometheus port is published; unset,
+    the row degrades to `n/a (no metrics source)` and nothing else changes.
+
+    Read at call time, like postgres_url, and `or None` collapses unset and
+    exported-but-empty into one absent case.
+    """
+    return (os.environ.get("DEBUG_PROMETHEUS_URL") or "").strip() or None
 
 
 def postgres_url() -> Optional[str]:

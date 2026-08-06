@@ -423,8 +423,12 @@ jobs:
           # runs on main, where the resolved name and the Dockerfile's runtime
           # default are both "production" — but relying on two independent
           # defaults agreeing is not a property worth depending on.
+          # GIT_SHA is baked in as an ENV (and an OCI revision label) so the running
+          # bot can report its own commit. github.sha is the commit this job checked
+          # out — the same one metadata-action's `type=sha` tags the image with.
           build-args: |
             ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+            GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # Dead config removed: `cache-to` only ever wrote `type=gha`, so

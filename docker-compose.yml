@@ -5,6 +5,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into the image as an ENV so the running bot can report the commit
+        # it is on (-debug); the OCI label is invisible from inside a container.
+        # `unknown` rather than empty, exactly as build_common.sh's
+        # build_runtime_image defaults it — the TAG below falls back to `latest`
+        # instead, because a tag has to name something pullable.
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
     network_mode: host
@@ -20,6 +27,24 @@ services:
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      #
+      # Where `-debug` reads the postgres CONTAINER's cpu/memory from: the bot
+      # cannot see another container's cgroup, and Postgres reports no OS metrics
+      # over SQL. The series come from otelcol-metrics' docker_stats receiver,
+      # which this stack's otelcol-metrics sidecar collects. localhost because the
+      # bot uses host networking; unset it and the row degrades to `n/a (no metrics
+      # source)` with nothing else affected.
+      #
+      # Interpolated, not a bare literal: a valued `environment:` entry beats both
+      # env_file and the process environment, so hardcoding it here would silently
+      # override the .env setting that .env.example tells operators to use when the
+      # metrics stack lives on another host.
+      - DEBUG_PROMETHEUS_URL=${DEBUG_PROMETHEUS_URL:-http://localhost:${PROMETHEUS_HOST_PORT:-9090}}
+      # Off by default; `true` starts every server with debug mode on. This is the
+      # default for servers that have NEVER run `-debug --enable`/`--disable` —
+      # that choice is per server, persisted to guild:{id}:config, and wins over
+      # this value across restarts.
+      - DEBUG_MODE
       #
       # Built from the same POSTGRES_* vars as the postgres service below, so
       # the password lives in exactly one place (.env). Pointing at an EXTERNAL
@@ -83,8 +108,8 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and must
-    # never become eviction candidates:
+    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # and must never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
     #                       Evicting one loses that play silently — no error, no
@@ -99,6 +124,14 @@ services:
     #                       evicting one answers a guild with silence despite a
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
+    #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
+    #                       timezone. Evicting one silently reverts a setting the
+    #                       guild chose, with no log line and no error, which is
+    #                       exactly the failure moving these out of the 24h-TTL
+    #                       state hash was meant to fix. A handful of fields per
+    #                       guild (~160 B), written only by an explicit command
+    #                       and deleted on guild removal, so it scales with guild
+    #                       count and not with runtime.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.
@@ -189,6 +222,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Not optional here: this service shares the bot's `image:` name, so a
+        # build without the arg retags that image from a GIT_SHA-less build and
+        # -debug reports `unknown` for a commit it knows.
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: discord-postgres-migrate
     restart: "no"
     command: ["python", "-m", "src.db_migrate"]
@@ -245,6 +283,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Same image name as the bot and db-migrate, so the same arg — see the
+        # db-migrate build above.
+        GIT_SHA: ${GIT_SHA:-unknown}
     restart: "no"
     # No `container_name`: `docker compose run` generates its own, and a fixed
     # one makes a second invocation collide with the first's stopped container.
@@ -309,6 +351,15 @@ services:
       - "127.0.0.1:3014:3000"    # Grafana UI (localhost only)
       - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
       - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+      # Prometheus query API, for `-debug`'s Postgres container CPU/memory row. The
+      # bot runs with HOST networking, so a compose-internal address would not
+      # resolve for it — publishing here is what makes DEBUG_PROMETHEUS_URL reachable
+      # at all. Loopback-only like every other port here: this API is unauthenticated
+      # and exposes every metric the stack holds. The host side is a variable for the
+      # same reason POSTGRES_HOST_PORT is — 9090 is exactly the port an
+      # already-installed local Prometheus occupies, and a collision fails the whole
+      # `up`, not just this row. DEBUG_PROMETHEUS_URL above defaults to follow it.
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:
       - otel-grafana:/var/lib/grafana
       # /data, not /tmp: same class of trap as the postgres 18 volume note
