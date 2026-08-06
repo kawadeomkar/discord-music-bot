@@ -311,8 +311,14 @@ services:
       - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
     volumes:
       - otel-grafana:/var/lib/grafana
-      - otel-tempo:/tmp/tempo
-      - otel-loki:/tmp/loki
+      # /data, not /tmp: same class of trap as the postgres 18 volume note
+      # below. This image's Tempo and Loki write under /data/tempo and
+      # /data/loki (see its tempo-config.yaml / loki-config.yaml); the old
+      # /tmp/* mount points were stale, so every container recreate silently
+      # destroyed all trace and log history while the volumes stayed empty.
+      # Discovered when a recreate during dashboard verification wiped Loki.
+      - otel-tempo:/data/tempo
+      - otel-loki:/data/loki
       # Dashboard config-as-code. Both are SINGLE-FILE mounts on purpose:
       # bind-mounting a directory over provisioning/dashboards/ (or
       # datasources/) hides the image's own YAML there — Grafana comes up with
@@ -326,7 +332,11 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      # curl, not wget: the 0.30.0 image (ubi9-micro base) ships no wget, so
+      # the old wget probe failed on every tick and the container sat
+      # permanently "unhealthy". Nothing depends_on this service, so the only
+      # symptom was a misleading status column.
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 5

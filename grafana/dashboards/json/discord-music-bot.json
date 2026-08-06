@@ -385,7 +385,7 @@
       "id": 7,
       "type": "stat",
       "title": "Redis memory used",
-      "description": "redis-server used_memory (otelcol-metrics sidecar). Thresholds sit at 75% / 90% of the 256 MB compose maxmemory. history:outbox and guild:*:history are non-evictable \u2014 sustained growth here is the push_history ISSUE marker in redis_client.py. Enable the receiver's opt-in redis.maxmemory metric to graph the true ceiling alongside.",
+      "description": "redis-server used_memory as a share of maxmemory (256 MB in compose), from the otelcol-metrics sidecar \u2014 its redis receiver enables the opt-in redis.maxmemory metric, so this ratio tracks whatever cap the server actually runs with; no hardcoded threshold to drift. history:outbox and guild:*:history are non-evictable \u2014 sustained growth here is the push_history ISSUE marker in redis_client.py.",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -394,7 +394,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "percent",
           "color": {
             "mode": "thresholds"
           },
@@ -407,15 +407,15 @@
               },
               {
                 "color": "yellow",
-                "value": 201326592
+                "value": 70
               },
               {
                 "color": "red",
-                "value": 241172480
+                "value": 90
               }
             ]
           },
-          "decimals": 0
+          "decimals": 1
         },
         "overrides": []
       },
@@ -440,7 +440,7 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "redis_memory_used_bytes"
+          "expr": "100 * redis_memory_used_bytes / redis_maxmemory_bytes"
         }
       ]
     },
@@ -1475,7 +1475,7 @@
       "id": 26,
       "type": "timeseries",
       "title": "Redis memory",
-      "description": "From the otelcol-metrics sidecar's redis receiver. maxmemory is 256 MB in compose; the maxmemory series stays empty unless the receiver's opt-in redis.maxmemory metric is enabled. volatile-lru must never evict history:outbox or guild:*:history (they carry no TTL).",
+      "description": "From the otelcol-metrics sidecar's redis receiver (the opt-in redis.maxmemory metric is enabled in grafana/otelcol-metrics.yaml). maxmemory is 256 MB in compose; volatile-lru must never evict history:outbox or guild:*:history (they carry no TTL).",
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -2121,8 +2121,8 @@
     {
       "id": 37,
       "type": "logs",
-      "title": "Errors & warnings \u2014 live tail",
-      "description": "Every line carries environment + logger, and trace_id when inside a span \u2014 the trace_id derived-field links straight to the Tempo trace.",
+      "title": "Exceptions \u2014 live feed",
+      "description": "Errors plus any line that carried a traceback: structlog's ExceptionRenderer writes exc_info tracebacks to the `exception` field, so exc_info WARNINGs (e.g. \"Failed to update bot activity\") surface here too. Every line carries logger + environment, and trace_id when inside a span \u2014 the derived field links straight to the Tempo trace. Requires the JSON body, so guild_state's plain-stdlib lines are excluded (they never carry tracebacks).",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -2146,12 +2146,44 @@
             "uid": "loki"
           },
           "refId": "A",
-          "expr": "{service_name=\"discord-music-bot\", deployment_environment=~\"$environment\"} | detected_level=~\"error|warn.*\""
+          "expr": "{service_name=\"discord-music-bot\", deployment_environment=~\"$environment\"} | json | level=\"error\" or exception != \"\""
         }
       ]
     },
     {
       "id": 38,
+      "type": "logs",
+      "title": "Bot logs \u2014 live feed",
+      "description": "Everything the bot logs, all levels, newest first, updating at the dashboard refresh cadence (30s here). For true push-streaming tail of the same query use Explore \u2192 Live.",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 91
+      },
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "refId": "A",
+          "expr": "{service_name=\"discord-music-bot\", deployment_environment=~\"$environment\"}"
+        }
+      ]
+    },
+    {
+      "id": 39,
       "type": "row",
       "title": "Traces (Tempo)",
       "collapsed": false,
@@ -2159,11 +2191,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 101
       }
     },
     {
-      "id": 39,
+      "id": 40,
       "type": "table",
       "title": "Slow traces (> 2 s)",
       "description": "Command and pipeline traces above 2 s. player.loop.iteration spans intentionally live as long as the song they play \u2014 ignore those; look for slow command.play / ytdl.* chains.",
@@ -2171,7 +2203,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 92
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {},
@@ -2195,7 +2227,7 @@
       ]
     },
     {
-      "id": 40,
+      "id": 41,
       "type": "table",
       "title": "Errored traces",
       "description": "Traces containing an error-status span. Error embeds shown to users carry `trace: <id>` in the footer \u2014 paste it into Explore to join a report to its trace.",
@@ -2203,7 +2235,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 92
+        "y": 102
       },
       "fieldConfig": {
         "defaults": {},
@@ -2227,7 +2259,7 @@
       ]
     },
     {
-      "id": 41,
+      "id": 42,
       "type": "row",
       "title": "Telemetry pipeline health (otel-lgtm collector)",
       "collapsed": false,
@@ -2235,11 +2267,11 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 110
       }
     },
     {
-      "id": 42,
+      "id": 43,
       "type": "timeseries",
       "title": "Collector ingest",
       "description": "Spans / log records / metric points accepted by the otel-lgtm collector (its self-scrape). A flatline while the bot is up means telemetry is silently not arriving.",
@@ -2247,7 +2279,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 101
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
@@ -2295,7 +2327,7 @@
       ]
     },
     {
-      "id": 43,
+      "id": 44,
       "type": "timeseries",
       "title": "Collector refusals & export failures",
       "description": "Non-zero means telemetry is being dropped between the bot and Tempo/Loki/Prometheus \u2014 the dashboards lie while this is elevated.",
@@ -2303,7 +2335,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 101
+        "y": 111
       },
       "fieldConfig": {
         "defaults": {
