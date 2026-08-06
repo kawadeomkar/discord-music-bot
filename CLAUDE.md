@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.7.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.8.1, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -218,7 +218,8 @@ src/
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached)
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
-├── ping.py           # -ping live-editing health dashboard (probes, render, edit loop)
+├── dashboard.py      # optimistic-send + live-edit driver, extracted from -ping
+├── ping.py           # -ping health dashboard: probes + render (sequencing is dashboard.py)
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT detection (env var or git branch), SpotifyStatus, tunables
 └── util.py           # logger factory, embed helpers, fmt_duration, task helpers

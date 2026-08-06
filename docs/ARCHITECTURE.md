@@ -174,6 +174,8 @@ graph TD
     telemetry["src/telemetry.py\nOTel + structlog setup"]
     config["src/config.py\nENVIRONMENT + tunables"]
     help_cmd["src/help.py\nMusicHelpCommand"]
+    dashboard["src/dashboard.py\noptimistic-send + live-edit driver"]
+    ping["src/ping.py\n-ping probes + rendering"]
     util["src/util.py\nlogging + embed helpers"]
 
     main --> musicbot
@@ -184,6 +186,8 @@ graph TD
     main --> db
     main --> history_archive
     musicbot --> musicplayer
+    musicbot --> ping
+    ping --> dashboard
     musicbot --> sources
     musicbot --> spotify
     musicbot --> youtube
@@ -206,7 +210,7 @@ graph TD
 
 | Module | Responsibility |
 |---|---|
-| `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when `POSTGRES_URL` is set (`Database` → `PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`; unset → bit-identical pre-Postgres behavior), and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
+| `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
 | `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-playnow`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, the per-guild alone-disconnect timers, and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect) and crash recovery via `on_ready`. |
 | `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, and `-playnow` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns all three queue representations (asyncio queue, display deque, Redis mirror), the bulk-mutation mutex, the cleared-flag, and the in-flight-head carry logic. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. |
@@ -224,6 +228,8 @@ graph TD
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
 | `config.py` | `ENVIRONMENT` (from `$ENVIRONMENT`, else derived from the git branch: `main` → `production`) and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3.0). |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
+| `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver extracted from `-ping`. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. The caller replies through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
+| `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
 | `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`. |
 
 **Key types:**
@@ -364,7 +370,7 @@ sequenceDiagram
     Main->>Bot: bot.run(token) → connect WebSocket
     Discord-->>Bot: setup_hook (before READY)
     Bot->>Redis: create_redis_pool() + get_redis()
-    Bot->>Bot: POSTGRES_URL set? → Database → archive →<br/>HistoryOutboxDrainer.start() (lazy — no PG connection yet)
+    Bot->>Bot: HISTORY_ARCHIVE_ENABLED? → archive →<br/>HistoryOutboxDrainer.start() (lazy — no PG connection yet)
     Bot->>Bot: load_extension("src.musicbot")
     Discord-->>Bot: on_ready (all guilds cached)
     Bot->>Bot: presence = "Playing music"
@@ -738,7 +744,7 @@ sequenceDiagram
     MusicBot->>Redis: store.clear_connection() + refresh_ttl()
 ```
 
-`clear_connection()` distinguishes intentional stop from a crash (the Redis queue list is intentionally left intact — only the channel IDs and now-playing state are cleared). On process shutdown, `MusicBotApp.close()` tears down in order: drainer `stop()` (cancel, then one bounded final-drain attempt so a healthy Postgres receives whatever is buffered; never raises, even for an already-crashed task) → `Database.close()` → Redis pool drain → `shutdown_telemetry()` (a blocking force-flush, run in an executor). Anything left in the outbox simply drains on next start.
+`clear_connection()` distinguishes intentional stop from a crash (the Redis queue list is intentionally left intact — only the channel IDs and now-playing state are cleared). On process shutdown, `MusicBotApp.close()` tears down in order: drainer `stop()` (cancel, then one bounded final-drain attempt so a healthy Postgres receives whatever is buffered; never raises, even for an already-crashed task) → `PostgresHistoryArchive.close()` → Redis pool drain → `shutdown_telemetry()` (a blocking force-flush, run in an executor). Anything left in the outbox simply drains on next start.
 
 ---
 
@@ -865,7 +871,7 @@ flowchart TD
 | `Spotify._auth_lock: asyncio.Lock` | `Spotify` | Double-checked locking for token refresh |
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
-| `Database._init_lock: asyncio.Lock` | `Database` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
+| `PostgresHistoryArchive._init_lock: asyncio.Lock` | `PostgresHistoryArchive` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
 
 ---
 

@@ -1,3 +1,4 @@
+import math
 import os
 import subprocess
 import warnings
@@ -49,11 +50,44 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
+
+def _float_env(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float knob from the environment, or raise a named error.
+
+    Same empty-reads-as-unset rule as _int_env below, and the same reason for raising
+    at import time. Non-finite is refused separately from the floor because `float()`
+    accepts "inf" and "nan" happily and both defeat the dashboard driver in ways a
+    minimum would not catch: `inf` makes the deadline never expire, so the command
+    holds its max_concurrency slot forever and every later run in that guild answers
+    "already running". A tick of 0 is the other half — it turns the driver's timed
+    wait into a hot spin, measured at 0.6 CPU-seconds per wall-second on the loop
+    that also carries voice heartbeats.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number; got {raw!r}") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number; got {raw!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}; got {value}")
+    return value
+
+
+# Floor for every live-dashboard knob. Small enough to stay a tuning knob rather than
+# a policy, large enough that the driver's wait is always a real suspension.
+_MIN_DASHBOARD_SECS: Final[float] = 0.05
+
 # -ping's live-edit loop tunables. Constants, not call-time reads: the dashboard
 # reads them every tick. Here rather than in ping.py so this module stays the one
 # place that answers "what does the bot read from the environment?".
-PING_TICK_SECS: float = float(os.environ.get("PING_TICK_SECS", "1.0"))
-PING_DEADLINE_SECS: float = float(os.environ.get("PING_DEADLINE_SECS", "3.0"))
+PING_TICK_SECS: float = _float_env("PING_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
+PING_DEADLINE_SECS: float = _float_env(
+    "PING_DEADLINE_SECS", 3.0, minimum=_MIN_DASHBOARD_SECS
+)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
