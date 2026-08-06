@@ -19,6 +19,7 @@ from src.config import (
     SpotifyStatus,
     _float_env,
     _int_env,
+    debug_mode_default,
     history_archive_enabled,
     postgres_url,
     spotify_enabled,
@@ -167,6 +168,42 @@ class TestHistoryArchiveEnabled:
         assert history_archive_enabled() is False
         monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
         assert history_archive_enabled() is True
+
+
+class TestDebugModeDefault:
+    """The process-wide default behind debug mode. Shares history_archive_enabled's
+    strict grammar, so the failure direction is the same: a typo raises rather than
+    reading as off and leaving an operator waiting for footers that never come."""
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "  true  "])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_unset_or_empty_is_false(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DEBUG_MODE", raising=False)
+        assert debug_mode_default() is False
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "y", "2"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The message must name DEBUG_MODE: MusicBot.__init__ is the only reader,
+        so this surfaces as a load_extension failure at startup, where the variable
+        name is the whole diagnosis."""
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        with pytest.raises(ValueError, match="DEBUG_MODE"):
+            debug_mode_default()
 
 
 class TestIntEnv:

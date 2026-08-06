@@ -131,6 +131,54 @@ def _b_opt_int(raw: dict[bytes, bytes], key: str) -> int | None:
 # ── Value objects — immutable snapshots of Redis hash contents ───────────────
 
 
+class ConfigField:
+    """Wire field names for guild:{id}:config. Spelled out, like every other field
+    table here, so renaming a Python attribute can never silently rename a Redis
+    field and orphan every guild's stored setting."""
+
+    DEBUG_MODE: Final[str] = "debug_mode"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuildConfig:
+    """A guild's DURABLE preferences — what an operator chose, not what the bot is
+    doing right now.
+
+    Deliberately its own key rather than fields on guild:{id}:state. That hash is
+    runtime state (current song, pause epochs) and carries a 24h TTL, so a setting
+    stored there would silently revert on any guild that went a day without playing
+    anything — a worse failure than the in-memory version it replaces, because the
+    reset would be tied to nothing the user can see.
+
+    Every field is Optional and that is the whole point: absent means "follow the
+    host default", which is NOT the same as an explicitly chosen value. A guild that
+    turned debug off while the host default is on must stay off, and a guild that
+    never touched it must follow the host — a plain bool cannot express both.
+    """
+
+    debug_mode: bool | None = None
+
+    def to_redis(self) -> dict[str, str]:
+        """Only fields with a value. An unset field is ABSENT from the hash rather
+        than stored as a sentinel, so "never chose" stays distinguishable after a
+        round trip."""
+        mapping: dict[str, str] = {}
+        if self.debug_mode is not None:
+            mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
+        return mapping
+
+    @classmethod
+    def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
+        """Deserialize raw HGETALL output; an empty dict yields all-unset.
+
+        Anything that is neither "1" nor "0" reads as unset rather than raising:
+        this key outlives builds, and one unparseable field must not cost the guild
+        its whole config (the same rule the queue and history parsers follow).
+        """
+        stored = _b_str(raw, ConfigField.DEBUG_MODE)
+        return cls(debug_mode={"1": True, "0": False}.get(stored))
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildStateData:
     """Typed snapshot of guild:{id}:state deserialized from Redis.
@@ -851,6 +899,9 @@ class GuildPlaybackSnapshot:
     now_playing: NowPlayingData | None = None
     # Newest-first, as stored (GuildHistory.restore() handles the reversal).
     history: tuple[HistoryEntry, ...] = ()
+    # The guild's durable settings, read in the same round trip because restore is
+    # exactly when they are needed.
+    config: GuildConfig = GuildConfig()
 
     @property
     def pending_count(self) -> int:

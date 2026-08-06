@@ -21,6 +21,12 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
       #
+      # Off by default; `true` starts every server with debug mode on. This is the
+      # default for servers that have NEVER run `-debug --enable`/`--disable` —
+      # that choice is per server, persisted to guild:{id}:config, and wins over
+      # this value across restarts.
+      - DEBUG_MODE
+      #
       # Built from the same POSTGRES_* vars as the postgres service below, so
       # the password lives in exactly one place (.env). Pointing at an EXTERNAL
       # Postgres needs no edit here: POSTGRES_URL from .env (or the environment)
@@ -83,8 +89,8 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and must
-    # never become eviction candidates:
+    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # and must never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
     #                       Evicting one loses that play silently — no error, no
@@ -99,6 +105,13 @@ services:
     #                       evicting one answers a guild with silence despite a
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
+    #   guild:{id}:config   a guild's DURABLE choices. Evicting one silently
+    #                       reverts a setting the guild chose, with no log line
+    #                       and no error, which is exactly the failure moving
+    #                       these out of the 24h-TTL state hash was meant to fix.
+    #                       A handful of fields per guild (~160 B), written only
+    #                       by an explicit command and deleted on guild removal,
+    #                       so it scales with guild count and not with runtime.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.

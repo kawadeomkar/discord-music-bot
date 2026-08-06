@@ -4,7 +4,7 @@ import ast
 import inspect
 from pathlib import Path
 from typing import Any, Optional, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
 import pytest
@@ -18,6 +18,7 @@ from redis.exceptions import OutOfMemoryError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.guild_state import (
+    GuildConfig,
     GuildPlaybackSnapshot,
     GuildRecoveryGate,
     GuildStateData,
@@ -26,6 +27,7 @@ from src.guild_state import (
     SongQueueEntry,
 )
 from tests.helpers import mocked
+from src import redis_client
 from src.redis_client import (
     GUILD_TTL,
     HISTORY_CACHE_LIMIT,
@@ -2392,3 +2394,141 @@ class TestClearSongEndState:
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.clear_song_end_state()  # must not raise
+
+
+class TestGuildConfigStore:
+    """The durable half of the per-guild debug toggle."""
+
+    async def test_a_stored_choice_survives_a_round_trip(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        assert await store.set_debug_mode(True) is True
+        assert (await store.get_config()).debug_mode is True
+        assert await store.set_debug_mode(False) is True
+        assert (await store.get_config()).debug_mode is False
+
+    async def test_a_guild_that_never_chose_reads_unset(self, fake_redis: Any) -> None:
+        """Not False. Unset means "follow the host default", which is what lets
+        DEBUG_MODE still move a guild that has no opinion."""
+        assert (await GuildRedisStore(fake_redis, 7).get_config()).debug_mode is None
+
+    async def test_the_config_key_carries_no_ttl(self, fake_redis: Any) -> None:
+        """Under volatile-lru only TTL-bearing keys are eviction candidates, so an
+        expiring config is a setting that reverts with no log line and no error."""
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_a_ttl_refresh_does_not_reach_the_config_key(
+        self, fake_redis: Any
+    ) -> None:
+        """refresh_ttl sweeps the runtime keys. Config must not be swept in with
+        them — that is the whole reason it is not a field on guild:{id}:state."""
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        await store.refresh_ttl()
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_a_write_failure_is_reported_rather_than_swallowed(
+        self, fake_redis: Any
+    ) -> None:
+        """@_guild_op turns the raise into False, and the command turns that False
+        into "this applies until restart" instead of claiming a durable change."""
+        store = GuildRedisStore(fake_redis, 42)
+        with patch.object(
+            fake_redis, "pipeline", side_effect=RuntimeError("redis down")
+        ):
+            assert await store.set_debug_mode(True) is False
+
+    async def test_an_unreachable_redis_reads_as_unset(self, fake_redis: Any) -> None:
+        """Degrades to the host default rather than to an arbitrary one."""
+        store = GuildRedisStore(fake_redis, 42)
+        with patch.object(
+            fake_redis, "hgetall", side_effect=RuntimeError("redis down")
+        ):
+            assert (await store.get_config()).debug_mode is None
+
+    async def test_clearing_removes_the_key(self, fake_redis: Any) -> None:
+        store = GuildRedisStore(fake_redis, 42)
+        await store.set_debug_mode(True)
+        assert await store.clear_config() is True
+        assert await fake_redis.exists(store.config_key()) == 0
+
+
+class TestReadGuildConfigs:
+    """The multi-guild read hydration uses. Its contract is the return SHAPE: a
+    guild is present only if its read happened."""
+
+    async def test_reads_every_guild_across_batch_boundaries(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain per-guild fan-out silently failed every guild past the pool's
+        connection cap, so this batches. The batch loop's boundaries are the part
+        that can drop a guild."""
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        ids = list(range(1, 8))  # 7 guilds over batches of 2 — last batch partial
+        for guild_id in ids:
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
+
+        configs = await redis_client.read_guild_configs(fake_redis, ids)
+
+        assert sorted(configs) == ids
+        assert all(c.debug_mode is True for c in configs.values())
+
+    async def test_the_work_is_actually_batched(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """fakeredis has no connection cap, so the reason for batching is invisible
+        here — this pins the shape instead. One pipeline per batch, never one
+        awaited command per guild: the real pool RAISES rather than queueing once
+        its connections are in use, so a per-guild fan-out fails every guild past
+        the cap. tests/test_redis_integration.py proves that against a real server.
+        """
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        real = fake_redis.pipeline
+        with patch.object(fake_redis, "pipeline", side_effect=real) as pipe:
+            await redis_client.read_guild_configs(fake_redis, list(range(5)))
+        assert pipe.call_count == 3  # ceil(5 / 2)
+
+    async def test_a_guild_with_nothing_stored_is_present_and_all_unset(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """Present-but-unset is a real answer: "this guild never chose"."""
+        configs = await redis_client.read_guild_configs(fake_redis, [99])
+        assert configs[99] == GuildConfig()
+
+    async def test_a_failed_read_is_reported_by_OMISSION_not_a_zero_value(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        """The distinction the whole function exists for. Handing back an all-unset
+        GuildConfig would be indistinguishable from "never chose", and the caller
+        caches that — which is how a Redis blink came to DELETE stored settings."""
+        with patch.object(fake_redis, "pipeline", side_effect=RuntimeError("down")):
+            configs = await redis_client.read_guild_configs(fake_redis, [1, 2])
+        assert configs == {}
+
+    async def test_one_failed_batch_does_not_lose_the_others(
+        self, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(redis_client, "_CONFIG_READ_BATCH", 2)
+        for guild_id in (1, 2, 3, 4):
+            await GuildRedisStore(fake_redis, guild_id).set_debug_mode(True)
+        real = fake_redis.pipeline
+        calls = {"n": 0}
+
+        def flaky(*args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("down")
+            return real(*args, **kwargs)  # pyright: ignore[reportArgumentType]
+
+        with patch.object(fake_redis, "pipeline", side_effect=flaky):
+            configs = await redis_client.read_guild_configs(fake_redis, [1, 2, 3, 4])
+
+        assert sorted(configs) == [3, 4]
+
+    async def test_no_guilds_issues_no_commands(
+        self, fake_redis: aioredis.Redis
+    ) -> None:
+        with patch.object(fake_redis, "pipeline", side_effect=AssertionError) as pipe:
+            assert await redis_client.read_guild_configs(fake_redis, []) == {}
+        pipe.assert_not_called()
