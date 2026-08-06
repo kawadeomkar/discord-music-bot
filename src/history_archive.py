@@ -324,7 +324,10 @@ class ArchiveStats:
 # state='active', but pg_stat_database's sessions counters (active_time → the
 # `busy` rate) count client sessions alone, and the two halves of -debug's load
 # row must agree. pid <> pg_backend_pid() or the probe reads itself as
-# permanent load ≥ 1 active.
+# permanent load ≥ 1 active. pg_stat_activity masks OTHER roles' state (NULL),
+# so the FILTERs undercount rather than error; every connection today is the
+# bot's own role. If a second role ever appears: GRANT pg_read_all_stats — do
+# not pre-grant it, the bot's role is deliberately minimal.
 _STATS_SQL = """
 SELECT
     pg_database_size(current_database())                        AS database_bytes,

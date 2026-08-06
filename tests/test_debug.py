@@ -1883,6 +1883,58 @@ class TestPrometheusSession:
         assert debug._prometheus_session_cache is None
 
 
+class TestRateHumanizers:
+    """The formatting helpers behind the native rows, directly: the renderer
+    tests exercise only a handful of values, and the plan waived a temp-spill
+    integration test on the promise that these are unit-covered."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0"),
+            (0.44, "0.4"),
+            (9.94, "9.9"),
+            (9.99, "10"),  # decided off the rounded value — never "10.0"
+            (41.0, "41"),
+            (999.99, "1000"),
+        ],
+    )
+    def test_rate(self, value: float, expected: str) -> None:
+        assert debug._rate(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0"),
+            (500, "500"),
+            (999.94, "1000"),
+            (999.99, "1.0k"),  # rounded-mantissa promotion at the unit seam
+            (1_000, "1.0k"),
+            (12_400, "12.4k"),
+            (999_940, "999.9k"),
+            (999_960, "1.0M"),  # never "1000.0k"
+            (2_500_000, "2.5M"),
+        ],
+    )
+    def test_count_rate(self, value: float, expected: str) -> None:
+        assert debug._count_rate(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0 B/s"),
+            (512, "512 B/s"),
+            (1023.4, "1023 B/s"),
+            (1023.6, "1 KB/s"),  # rounds into the next unit — never "1024 B/s"
+            (2048, "2 KB/s"),
+            (1_048_575, "1.0 MB/s"),  # never "1024 KB/s"
+            (5_242_880, "5.0 MB/s"),
+        ],
+    )
+    def test_bytes_rate(self, value: float, expected: str) -> None:
+        assert debug._bytes_rate(value) == expected
+
+
 class TestPostgresBlockWithContainerMetrics:
     def test_container_rows_lead_the_block(self) -> None:
         container = debug.ContainerMetrics(
@@ -1937,15 +1989,15 @@ class TestPostgresProbeOrchestration:
         assert archive.stats.await_count == 2
         assert "41 tx/s" in lines
 
-    async def test_first_sample_failure_costs_only_the_rates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_first_sample_failure_costs_only_the_rates(self) -> None:
         """Asymmetric on purpose: `before` failing must not take down the instant
-        fields, which need only the second sample."""
-        monkeypatch.setattr(debug, "_PG_WINDOW_SECS", 0.0)
+        fields, which need only the second sample. Runs with the REAL window and a
+        1s timeout to prove the probe skips the sleep — nothing to rate over means
+        nothing to wait for."""
         archive = MagicMock()
         archive.stats = AsyncMock(side_effect=[RuntimeError("boom"), _pg_stats()])
-        lines = "\n".join(await debug._postgres_probe(self._inputs(archive)))
+        async with asyncio.timeout(1):
+            lines = "\n".join(await debug._postgres_probe(self._inputs(archive)))
         assert "busy unknown" in lines
         assert "throughput   unknown" in lines
         assert "db 128 MB" in lines

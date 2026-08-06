@@ -83,10 +83,11 @@ _REDIS_PROBE_TIMEOUT_SECS = _CPU_WINDOW_SECS + 3.0
 # backend's pending stats at transaction end and at most about once a second, so
 # a _CPU_WINDOW_SECS delta reads flush quantization rather than load.
 _PG_WINDOW_SECS = 2.0
-# Bounds the whole two-sample Postgres probe, like _REDIS_PROBE_TIMEOUT_SECS:
-# unbounded, two archive read-deadline SQL calls plus the window could hold the
-# archive's read slots ~32s for a card that stopped rendering at the ~8s default
-# deadline. Deliberately does NOT stretch with DEBUG_DEADLINE_SECS.
+# Bounds the whole two-sample Postgres probe, like _REDIS_PROBE_TIMEOUT_SECS.
+# Defense in depth, not the primary release: the dashboard cancels every pending
+# probe at its deadline, which already frees the archive's read slots. This cap
+# covers what that cannot — a raised DEBUG_DEADLINE_SECS, or the pre-loop send
+# blocking before any deadline exists. Deliberately does NOT stretch with either.
 _PG_PROBE_TIMEOUT_SECS = _PG_WINDOW_SECS + 6.0
 _git_sha_cache: Optional[str] = None
 
@@ -1245,26 +1246,30 @@ def _container_lines(metrics: Optional[ContainerMetrics]) -> list[str]:
 
 
 def _rate(value: float) -> str:
-    """One decimal below 10, integer above; an exact zero stays a bare 0."""
+    """One decimal below 10, integer above; an exact zero stays a bare 0.
+    The split is decided off the ROUNDED value: 9.99 renders "10", never "10.0"."""
     if value == 0:
         return "0"
-    return f"{value:.1f}" if value < 10 else f"{value:.0f}"
+    text = f"{value:.1f}"
+    return text if float(text) < 10 else f"{value:.0f}"
 
 
 def _count_rate(value: float) -> str:
-    if value >= 1_000_000:
+    # Units promote off the ROUNDED mantissa, so "1000.0k" can never render.
+    if round(value / 1_000, 1) >= 1_000:
         return f"{value / 1_000_000:.1f}M"
-    if value >= 1_000:
+    if round(value, 1) >= 1_000:
         return f"{value / 1_000:.1f}k"
     return _rate(value)
 
 
 def _bytes_rate(value: float) -> str:
-    if value < 1024:
-        return f"{value:.0f} B/s"
-    if value < 1_048_576:
+    # Same rounded-mantissa promotion as _count_rate ("1024 KB/s" never renders).
+    if round(value / 1024) >= 1024:
+        return f"{value / 1_048_576:.1f} MB/s"
+    if round(value) >= 1024:
         return f"{value / 1024:.0f} KB/s"
-    return f"{value / 1_048_576:.1f} MB/s"
+    return f"{value:.0f} B/s"
 
 
 def _wait_parenthetical(stats: "ArchiveStats") -> str:
@@ -1585,7 +1590,10 @@ async def _postgres_probe(inputs: DebugInputs) -> list[str]:
         except Exception as e:  # noqa: BLE001 — degrade rates, keep the block
             log.warning(f"first postgres sample failed: {type(e).__name__}: {e}")
             before = None
-        await asyncio.sleep(_PG_WINDOW_SECS)
+        # A dead first sample leaves nothing to rate over, so the window would
+        # buy no data — skip straight to the instant fields.
+        if before is not None:
+            await asyncio.sleep(_PG_WINDOW_SECS)
         # Concurrent, not sequential: these share no data, and awaiting Prometheus
         # first spent up to _PROMETHEUS_TIMEOUT_SECS of this probe's budget before
         # the query that carries the block's real content even started. A

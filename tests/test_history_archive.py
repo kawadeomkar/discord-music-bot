@@ -425,6 +425,52 @@ class TestStatsColumnContract:
         fields = {f.name for f in dataclasses.fields(ArchiveStats)}
         assert aliases == fields - {"monotonic"}
 
+    async def test_every_row_value_reaches_its_field(self) -> None:
+        """The other half of the contract: every counter field is DEFAULTED, so a
+        dropped row[...] mapping in stats() still constructs — and ships as
+        permanent zero rates with a green suite. Distinct values per column catch
+        omissions and transpositions alike."""
+        row = {
+            "database_bytes": 1,
+            "table_bytes": 2,
+            "rows_estimate": 3,
+            "rejected_estimate": 4,
+            "connections": 5,
+            "max_connections": 6,
+            "shared_buffers": "7MB",
+            "cache_hit_ratio": 0.8,
+            "active_backends": 9,
+            "active_io_wait": 10,
+            "active_lock_wait": 11,
+            "active_other_wait": 12,
+            "active_time_ms": 13.0,
+            "xacts_total": 14,
+            "tuples_total": 15,
+            "blks_hit": 16,
+            "blks_read": 17,
+            "temp_bytes": 18,
+            "deadlocks": 19,
+        }
+        # Keep the fixture itself honest against the alias test above.
+        assert set(row) == {f.name for f in dataclasses.fields(ArchiveStats)} - {
+            "monotonic"
+        }
+        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
+        conn = MagicMock()
+        conn.fetchrow = AsyncMock(return_value=_as_record(row))
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        # return_value=None, not a bare AsyncMock: a truthy __aexit__ would
+        # swallow any exception raised inside the block.
+        acquire_cm.__aexit__ = AsyncMock(return_value=None)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
+            stats = await archive.stats()
+        for name, expected in row.items():
+            assert getattr(stats, name) == expected, name
+        assert stats.monotonic > 0.0
+
 
 class TestPostgresArchiveWithoutServer:
     async def test_empty_insert_never_connects(self) -> None:
