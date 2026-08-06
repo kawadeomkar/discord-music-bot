@@ -105,7 +105,9 @@ services:
     #                       evicting one answers a guild with silence despite a
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
-    #   guild:{id}:config   a guild's DURABLE choices. Evicting one silently
+    #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
+    #                       timezone.
+    #                       Evicting one silently
     #                       reverts a setting the guild chose, with no log line
     #                       and no error, which is exactly the failure moving
     #                       these out of the 24h-TTL state hash was meant to fix.

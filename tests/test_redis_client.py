@@ -1522,22 +1522,46 @@ class TestGuildOpDefaults:
 
 
 class TestSetVolume:
-    async def test_writes_volume_to_hash(
+    async def test_writes_volume_to_the_config_key(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
+        assert await store.set_volume(0.75) is True
+        config = await fake_redis.hgetall(store.config_key())
+        assert config[b"volume"] == b"0.75"
+
+    async def test_the_volume_never_expires(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """It used to live in the 24h state hash, so a guild that went a day without
+        playing came back at 100% with nothing to explain why."""
+        await store.set_volume(1.0)
+        assert await fake_redis.ttl(store.config_key()) == -1
+        await store.refresh_ttl()
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_the_legacy_state_field_is_kept_fresh_not_deleted(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A rollback to a build that reads only :state must still find the current
+        value. Deleting the field made `just up <older-sha>` silently reset every
+        migrated guild to 100% — no log line, no user-visible cause."""
+        await fake_redis.hset(store.state_key(), "volume", "0.10")
         await store.set_volume(0.75)
         state = await fake_redis.hgetall(store.state_key())
         assert state[b"volume"] == b"0.75"
 
-    async def test_sets_ttl_on_state_key(
+    async def test_the_legacy_write_cannot_leave_the_state_key_immortal(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        await store.set_volume(1.0)
-        ttl = await fake_redis.ttl(store.state_key())
-        assert ttl > 0
+        """The legacy write can CREATE the state hash on a guild whose 24h TTL has
+        lapsed, and a state key created without an EXPIRE never expires again — a
+        permanently non-evictable key that golden rule 12 does not sanction."""
+        assert await fake_redis.exists(store.state_key()) == 0
+        await store.set_volume(0.5)
+        assert await fake_redis.ttl(store.state_key()) > 0
 
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.set_volume(0.5)  # must not raise
+        assert await broken_store.set_volume(0.5) is False
 
 
 class TestGetGuildState:
@@ -2532,3 +2556,60 @@ class TestReadGuildConfigs:
         with patch.object(fake_redis, "pipeline", side_effect=AssertionError) as pipe:
             assert await redis_client.read_guild_configs(fake_redis, []) == {}
         pipe.assert_not_called()
+
+
+class TestMigrateVolume:
+    """Seeding config from the legacy field, which must never overwrite."""
+
+    async def test_seeds_config_when_nothing_is_stored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        assert await store.migrate_volume(0.30) is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"volume"] == b"0.3"
+
+    async def test_never_overwrites_a_value_already_there(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The whole reason this is HSETNX. Restore reads its snapshot and writes it
+        back an arbitrary number of awaits later, so a -volume that landed in that
+        window would otherwise be destroyed by the older value — durably, while the
+        user is being told the new one took."""
+        await store.set_volume(0.50)
+        assert await store.migrate_volume(0.30) is True
+        assert (await fake_redis.hgetall(store.config_key()))[b"volume"] == b"0.5"
+
+    async def test_the_seeded_volume_never_expires(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.migrate_volume(0.30)
+        assert await fake_redis.ttl(store.config_key()) == -1
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        assert await broken_store.migrate_volume(0.5) is False  # must not raise
+
+
+class TestConfigWritesUseTheSchemaEncoder:
+    """Every config setter encodes through GuildConfig.to_redis rather than by
+    hand, so the wire format lives in one place and a setter cannot drift from what
+    from_redis expects. Asserted by round-tripping through the real parser."""
+
+    async def test_each_setter_round_trips_through_from_redis(
+        self, store: GuildRedisStore
+    ) -> None:
+        await store.set_debug_mode(False)
+        await store.set_volume(0.25)
+
+        config = await store.get_config()
+
+        # False, not None: an explicit opt-out must survive the round trip.
+        assert config.debug_mode is False
+        assert config.volume == 0.25
+
+    async def test_a_setter_writes_only_its_own_field(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """to_redis omits unset fields, which is what makes per-field setters safe:
+        a setter that wrote a whole config would clobber the other two with the
+        defaults of whatever it happened to construct."""
+        await store.set_debug_mode(True)
+        assert set(await fake_redis.hgetall(store.config_key())) == {b"debug_mode"}

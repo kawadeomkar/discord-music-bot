@@ -4,14 +4,17 @@ import dataclasses
 import logging
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import discord
 import orjson
 import pytest
 
+from src import guild_state
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
+    DEFAULT_TIMEZONE,
     ConfigField,
     GuildConfig,
     GuildPlaybackSnapshot,
@@ -24,6 +27,7 @@ from src.guild_state import (
     parse_history_entry,
     parse_queue_entry,
     serialize_history_entry,
+    valid_timezone,
 )
 
 
@@ -1272,3 +1276,141 @@ class TestGuildConfig:
         history parsers follow."""
         raw = {ConfigField.DEBUG_MODE.encode(): garbage}
         assert GuildConfig.from_redis(raw).debug_mode is None
+
+
+class TestStoredVolumeMigration:
+    """Volume moved from guild:{id}:state to guild:{id}:config. The fallback is a
+    one-release migration path, not a permanent dual-read: dropping the legacy field
+    outright would have silently reset every deployed guild to 100%."""
+
+    def test_config_wins_when_both_are_present(self) -> None:
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(volume=0.10),
+            config=GuildConfig(volume=0.75),
+        )
+        assert snapshot.stored_volume == 0.75
+
+    def test_a_legacy_value_is_still_honoured(self) -> None:
+        """The guild set 30% before the deploy; it must come back at 30%."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData(volume=0.30))
+        assert snapshot.stored_volume == 0.30
+
+    def test_nothing_stored_stays_none(self) -> None:
+        """Not 1.0 — restore has to skip the assignment rather than clobber a
+        concurrent -volume with a fabricated default."""
+        snapshot = GuildPlaybackSnapshot(state=GuildStateData())
+        assert snapshot.stored_volume is None
+
+    def test_an_explicit_zero_is_not_mistaken_for_unset(self) -> None:
+        """0.0 is falsy and a real choice — muted."""
+        snapshot = GuildPlaybackSnapshot(
+            state=GuildStateData(), config=GuildConfig(volume=0.0)
+        )
+        assert snapshot.stored_volume == 0.0
+
+
+class TestGuildConfigTimezone:
+    """The zone a guild renders ETAs in. Stored as an IANA name and resolved at
+    read time, because the tz database belongs to the host, not to the value."""
+
+    def test_unset_resolves_to_the_default(self) -> None:
+        assert GuildConfig().tzinfo() == ZoneInfo(DEFAULT_TIMEZONE)
+
+    def test_a_stored_name_round_trips(self) -> None:
+        config = GuildConfig(timezone="Europe/London")
+        assert config.to_redis() == {ConfigField.TIMEZONE: "Europe/London"}
+        assert config.tzinfo() == ZoneInfo("Europe/London")
+        raw = {ConfigField.TIMEZONE.encode(): b"Europe/London"}
+        assert GuildConfig.from_redis(raw).timezone == "Europe/London"
+
+    @pytest.mark.parametrize(
+        "name", ["Mars/Olympus", "not a zone", "PST", "../../etc/passwd", ""]
+    )
+    def test_an_unusable_name_falls_back_rather_than_raising(self, name: str) -> None:
+        """The eventual `-options timezone <name>` feeds this user input, and a
+        render path that raises would take the whole embed down. Includes a
+        traversal-shaped string: ZoneInfo resolves names against the tz database
+        by path, so it must not be handed one that escapes it.
+        """
+        assert GuildConfig(timezone=name).tzinfo() == ZoneInfo(DEFAULT_TIMEZONE)
+
+    def test_an_empty_stored_value_reads_as_unset(self) -> None:
+        raw = {ConfigField.TIMEZONE.encode(): b""}
+        assert GuildConfig.from_redis(raw).timezone is None
+
+
+class TestValidTimezone:
+    """The WRITE-boundary check. tzinfo()'s fallback covers a name that stopped
+    resolving; this stops an unusable one being stored in the first place, because
+    that failure is silent — the write succeeds and the guild keeps the default."""
+
+    @pytest.mark.parametrize(
+        "name", ["America/Los_Angeles", "Europe/London", "UTC", "Asia/Kolkata"]
+    )
+    def test_real_zones_are_accepted(self, name: str) -> None:
+        assert valid_timezone(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "Mars/Olympus",
+            "PST",
+            "not a zone",
+            "../../../etc/passwd",
+            "/etc/passwd",
+            "UTC\x00",
+            "x" * 65,
+        ],
+    )
+    def test_unusable_names_are_refused(self, name: str) -> None:
+        assert valid_timezone(name) is False
+
+    def test_an_oversized_name_is_rejected_before_the_zone_set_is_touched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Membership alone would reject it, so the length guard only earns its keep
+        by short-circuiting FIRST: `-options` will hand this arbitrary user text, and
+        hashing a megabyte string to look it up in a set is work an unauthenticated
+        command should not be able to ask for."""
+
+        def explode() -> frozenset[str]:
+            raise AssertionError("zone set consulted for an oversized name")
+
+        monkeypatch.setattr(guild_state, "_known_zones", explode)
+        assert valid_timezone("x" * 100_000) is False
+        assert valid_timezone("") is False
+
+    @pytest.mark.parametrize("name", ["zone.tab", "leapseconds", "iso3166.tab"])
+    def test_tz_database_files_that_are_not_zones_are_refused(self, name: str) -> None:
+        """ZoneInfo resolves BY PATH, so these construct without raising — they are
+        real files in the tz database. Membership in available_timezones() is what
+        separates a zone from a data file sitting next to one."""
+        assert valid_timezone(name) is False
+
+
+class TestUnusableZoneCache:
+    def test_a_bad_name_is_only_resolved_and_logged_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failed ZoneInfo lookup is a filesystem miss and it logs. Once -options
+        puts a stored name on a render path, an unresolvable one would pay both on
+        every single render."""
+        guild_state._UNUSABLE_ZONES.discard("Mars/Olympus")
+        config = GuildConfig(timezone="Mars/Olympus")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                assert config.tzinfo() == ZoneInfo(DEFAULT_TIMEZONE)
+        assert len([r for r in caplog.records if "Mars/Olympus" in r.message]) == 1
+        guild_state._UNUSABLE_ZONES.discard("Mars/Olympus")
+
+    def test_the_cache_is_bounded(self) -> None:
+        """Bounded rather than trusted: the write boundary validates, but this key
+        outlives builds and can be hand-edited."""
+        guild_state._UNUSABLE_ZONES.clear()
+        try:
+            for n in range(guild_state._MAX_UNUSABLE_ZONES + 50):
+                GuildConfig(timezone=f"Nowhere/Zone{n}").tzinfo()
+            assert len(guild_state._UNUSABLE_ZONES) == guild_state._MAX_UNUSABLE_ZONES
+        finally:
+            guild_state._UNUSABLE_ZONES.clear()

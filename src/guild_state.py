@@ -16,7 +16,9 @@ lives here so the type and the domain it promises cannot drift apart.
 import logging
 import math
 import re
+from zoneinfo import ZoneInfo, available_timezones
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Final, Self, Union
 
 import orjson
@@ -32,6 +34,13 @@ log = logging.getLogger(__name__)
 
 
 class StateField:
+    # LEGACY. Volume moved to guild:{id}:config (GuildConfig) because this hash
+    # expires in 24h and a setting must not. Config is the source of truth and is
+    # read first; this field is still both read AND written for one release, so a
+    # rollback to a build that only knows this one still finds a fresh value —
+    # deleting it outright reset every migrated guild to 100% on `just up
+    # <older-sha>`. Drop this, GuildStateData.volume and set_volume's second write
+    # together once every deployment understands :config.
     VOLUME: Final[str] = "volume"
     VOICE_CHANNEL_ID: Final[str] = "voice_channel_id"
     TEXT_CHANNEL_ID: Final[str] = "text_channel_id"
@@ -137,6 +146,52 @@ class ConfigField:
     field and orphan every guild's stored setting."""
 
     DEBUG_MODE: Final[str] = "debug_mode"
+    VOLUME: Final[str] = "volume"
+    TIMEZONE: Final[str] = "timezone"
+
+
+# The zone every guild renders ETAs in until it picks one. Named here rather than
+# in musicplayer so the schema layer can validate against the same default it
+# hands back, and so the eventual `-options timezone <name>` has one answer to
+# "what does unset mean?".
+DEFAULT_TIMEZONE: Final[str] = "America/Los_Angeles"
+
+# Zone names already proven unusable on this host. ZoneInfo caches SUCCESSFUL
+# lookups itself; a failed one is the expensive direction (a filesystem miss, ~155us
+# measured) and it also logs, so without this a stored name the host cannot resolve
+# would pay both on every render once -options lets a guild set one. Bounded by the
+# cap rather than by trust: the write boundary validates, but this key outlives
+# builds and can be hand-edited.
+_UNUSABLE_ZONES: Final[set[str]] = set()
+_MAX_UNUSABLE_ZONES: Final[int] = 256
+
+# The longest real IANA name is 32 chars ("America/Argentina/ComodRivadavia").
+_MAX_TIMEZONE_NAME: Final[int] = 64
+
+
+@lru_cache(maxsize=1)
+def _known_zones() -> frozenset[str]:
+    """Every zone this host can name. Cached: available_timezones() walks the whole
+    tz database, and the answer cannot change without a restart."""
+    return frozenset(available_timezones())
+
+
+def valid_timezone(name: str) -> bool:
+    """True if `name` is a zone this host can actually resolve.
+
+    The WRITE boundary's check. tzinfo()'s fallback is a backstop for a name that
+    stopped resolving (a base-image change), not a substitute for this: a bad name
+    stored unvalidated fails SILENTLY — the write succeeds, the command reports
+    success, and the guild's ETAs stay on the default forever with only a log line
+    nobody reads.
+
+    Membership, not `ZoneInfo(name)`: ZoneInfo resolves against the tz database BY
+    PATH, so `zone.tab` and `leapseconds` are real files that construct fine without
+    being zones.
+    """
+    if not name or len(name) > _MAX_TIMEZONE_NAME:
+        return False
+    return name in _known_zones()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -153,10 +208,18 @@ class GuildConfig:
     Every field is Optional and that is the whole point: absent means "follow the
     host default", which is NOT the same as an explicitly chosen value. A guild that
     turned debug off while the host default is on must stay off, and a guild that
-    never touched it must follow the host — a plain bool cannot express both.
+    never touched it must follow the host — a plain bool cannot express both. Volume
+    carries the same distinction for the same reason GuildStateData.volume did:
+    restore must skip the assignment rather than clobber a concurrent -volume with a
+    fabricated 1.0.
     """
 
     debug_mode: bool | None = None
+    volume: float | None = None
+    # An IANA name, not a ZoneInfo: the wire stays human-readable and the
+    # eventual -options command can write what the user typed. Resolved by
+    # tzinfo() below, which is also where an unusable name degrades.
+    timezone: str | None = None
 
     def to_redis(self) -> dict[str, str]:
         """Only fields with a value. An unset field is ABSENT from the hash rather
@@ -165,7 +228,33 @@ class GuildConfig:
         mapping: dict[str, str] = {}
         if self.debug_mode is not None:
             mapping[ConfigField.DEBUG_MODE] = "1" if self.debug_mode else "0"
+        if self.volume is not None:
+            mapping[ConfigField.VOLUME] = str(self.volume)
+        if self.timezone is not None:
+            mapping[ConfigField.TIMEZONE] = self.timezone
         return mapping
+
+    def tzinfo(self) -> ZoneInfo:
+        """The guild's zone, or the default when it has not chosen a usable one.
+
+        Resolution happens HERE rather than at write time because the tz database is
+        a property of the host, not of the stored value: a name that resolved when it
+        was set can stop resolving after a base-image change, and an ETA rendered in
+        the default beats a render path that raises.
+        """
+        # tzdata is a declared dependency, so the default always resolves and this
+        # cannot raise on a render path even where the host ships no tz database.
+        if self.timezone is None or self.timezone in _UNUSABLE_ZONES:
+            return ZoneInfo(DEFAULT_TIMEZONE)
+        try:
+            return ZoneInfo(self.timezone)
+        except Exception:  # noqa: BLE001 — any unusable name falls back
+            log.warning(
+                f"guild_state: unknown timezone {self.timezone!r}; using default"
+            )
+            if len(_UNUSABLE_ZONES) < _MAX_UNUSABLE_ZONES:
+                _UNUSABLE_ZONES.add(self.timezone)
+            return ZoneInfo(DEFAULT_TIMEZONE)
 
     @classmethod
     def from_redis(cls, raw: dict[bytes, bytes]) -> Self:
@@ -176,7 +265,14 @@ class GuildConfig:
         its whole config (the same rule the queue and history parsers follow).
         """
         stored = _b_str(raw, ConfigField.DEBUG_MODE)
-        return cls(debug_mode={"1": True, "0": False}.get(stored))
+        debug_mode = {"1": True, "0": False}.get(stored)
+        # _b_float already logs and returns None on a malformed value, which is the
+        # same "unset" this class wants.
+        return cls(
+            debug_mode=debug_mode,
+            volume=_b_float(raw, ConfigField.VOLUME),
+            timezone=_b_str(raw, ConfigField.TIMEZONE) or None,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -902,6 +998,22 @@ class GuildPlaybackSnapshot:
     # The guild's durable settings, read in the same round trip because restore is
     # exactly when they are needed.
     config: GuildConfig = GuildConfig()
+
+    @property
+    def stored_volume(self) -> float | None:
+        """The guild's volume, or None if it never set one.
+
+        Config first, then the legacy state field. The fallback is a one-release
+        migration path: volume used to live in guild:{id}:state, and dropping it
+        outright would silently reset every deployed guild to 100%. Restore SEEDS
+        config from whatever it finds here (migrate_volume, HSETNX — never an
+        overwrite), and set_volume keeps both copies fresh, so the two agree in
+        both directions and a rollback is a no-op. Delete this leg, StateField.VOLUME
+        and set_volume's legacy write together once every deployment has started once.
+        """
+        if self.config.volume is not None:
+            return self.config.volume
+        return self.state.volume
 
     @property
     def pending_count(self) -> int:

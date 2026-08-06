@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.9.0"
+version = "2.10.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -23,7 +23,7 @@ yt-dlp = { version = "2026.7.4", extras = ["default", "deno"] }
 bgutil-ytdlp-pot-provider = "1.3.1"
 async-timeout = "^5.0.1"
 discord-py = "2.7.1"
-redis = ">=8.1.0"
+redis = ">=5.0.0"
 orjson = ">=3.9.0"
 aiohttp = ">=3.14.3"
 opentelemetry-api = ">=1.27.0"
@@ -45,6 +45,7 @@ asyncpg = ">=0.30"
 #
 # `--only=` is unaffected by this flag — it selects groups explicitly — so the
 # Dockerfile stages and CI's composite action keep resolving exactly as before.
+tzdata = "^2026.3"
 [tool.poetry.group.test]
 optional = true
 
@@ -68,7 +69,7 @@ pytest-cov = "^7.1.0"
 pytest-timeout = "^2.3"
 # For the opt-in real-Postgres tier (marker `pg`), which arrives with the archive
 # code; needs Docker.
-testcontainers = ">=4.15.0"
+testcontainers = ">=4.8"
 
 [tool.poetry.group.lint]
 optional = true

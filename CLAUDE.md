@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.9.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.10.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -127,7 +127,7 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
     and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
     both archive modes, so evicting or expiring it answers a guild with silence.
-    `guild:{id}:config` holds a guild's DURABLE choices — evicting it silently
+    `guild:{id}:config` holds a guild's DURABLE choices (debug mode, volume, timezone) — evicting it silently
     reverts a setting the guild chose, with no log line and no error, which is
     exactly the failure the in-memory version had. It is a fixed handful of fields
     per guild, written only by an explicit command and deleted on guild removal, so
@@ -447,11 +447,11 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | volume, voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
-| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). One field today: `debug_mode` (`"1"`/`"0"`). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
@@ -848,7 +848,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |
-| musicplayer.py `_PST` | HACK | every guild's ETAs render in US/Pacific — `queue_embed`'s "Est. playing at" and the NP "Estimated finish" quote users elsewhere a clock time that is not theirs, with only the "PST" suffix stopping it from misleading. Fix: per-guild timezone, or Discord relative timestamps (`<t:epoch:R>`) |
+| musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but nothing WRITES it: `set_timezone` has no caller in `src/` and the `-options` command it was built for does not exist, so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a write path, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | musicbot.py `jump` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
@@ -867,6 +867,24 @@ on `GuildStateData` + `from_redis` → the write-path method on `GuildRedisStore
 `_now_playing_state_mapping` if it's per-song) → decide whether it belongs in
 `_TRANSIENT_SONG_FIELDS` / `clear_connection` → tests in test_guild_state.py and
 test_redis_client.py.
+
+**Add a per-guild SETTING** (a durable choice, not runtime state): constant in
+`ConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
+must keep meaning "follow the host default", or "never chose" collapses into "chose
+the default") → `to_redis` writes it only when set → `from_redis` reads an
+unrecognised value as unset → write method on `GuildRedisStore` that PERSISTs and
+**encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
+single-field config serializes to exactly that field, so the wire format has one
+definition and a setter cannot drift from what `from_redis` expects) → **validate at
+the write boundary if the value is user-typed** (see `valid_timezone`: a bad value
+stored here fails silently — the write succeeds, the command reports success, and the
+guild keeps the default forever) → if a hot path reads it, cache it in memory and
+hydrate in `_load_debug_overrides`'s shape rather than adding Redis IO to every send;
+a multi-guild hydration must read through `read_guild_configs`, whose omission-on-
+failure contract is what stops a Redis blink from deleting stored choices → tests in
+test_guild_state.py and test_redis_client.py. It goes in `guild:{id}:config`, NOT
+`guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
+any guild idle for a day.
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
