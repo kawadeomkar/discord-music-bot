@@ -176,6 +176,7 @@ graph TD
     help_cmd["src/help.py\nMusicHelpCommand"]
     dashboard["src/dashboard.py\noptimistic-send + live-edit driver"]
     ping["src/ping.py\n-ping probes + rendering"]
+    debug_mod["src/debug.py\n-debug snapshot + debug mode"]
     util["src/util.py\nlogging + embed helpers"]
 
     main --> musicbot
@@ -187,7 +188,11 @@ graph TD
     main --> history_archive
     musicbot --> musicplayer
     musicbot --> ping
+    musicbot --> debug_mod
     ping --> dashboard
+    debug_mod --> dashboard
+    debug_mod --> ping
+    main --> debug_mod
     musicbot --> sources
     musicbot --> spotify
     musicbot --> youtube
@@ -223,13 +228,14 @@ graph TD
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
 | `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
 | `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
-| `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history keys, pause epochs, recovery gate + lock, atomic start-song transaction). Module-level `cache_get`/`cache_set` and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
+| `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `read_guild_configs` (pipelined, chunked — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose") and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
-| `config.py` | `ENVIRONMENT` (from `$ENVIRONMENT`, else derived from the git branch: `main` → `production`) and `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3.0). |
+| `config.py` | The one module that answers "what does the bot read from the environment?". `ENVIRONMENT` (from `$ENVIRONMENT`, else derived from the git branch: `main` → `production`), `NOW_PLAYING_UPDATE_INTERVAL_SECS` (3.0), and the four live-dashboard knobs `PING_TICK_SECS`/`PING_DEADLINE_SECS` (1.0/3.0) and `DEBUG_TICK_SECS`/`DEBUG_DEADLINE_SECS` (1.0/8.0) — read through `_float_env`, which refuses non-finite values separately from its floor because `inf` makes a deadline never expire (the command holds its `max_concurrency` slot forever) and a tick of `0` turns the driver's timed wait into a hot spin. Plus the call-time accessors: `history_archive_enabled()`, `postgres_url()`, `using_default_postgres_password()`, `debug_mode_default()` (the host default for guilds that have never chosen — a stored `guild:{id}:config` choice wins over it) and `debug_prometheus_url()`. Every boolean goes through one strict parse table: unset and empty are False, a typo raises rather than silently reading as off. |
 | `help.py` | `MusicHelpCommand` — a `commands.HelpCommand` subclass rendering the command list and per-command help as man(1)-styled embeds (NAME / SYNOPSIS / DESCRIPTION / EXAMPLES / NOTES). Per-command copy (`brief`/`help`/`usage`/`extras`) lives on the command declarations in `musicbot.py`; categories/order come from `CATEGORY_COMMANDS`. `get_destination()` returns the `MusicContext` (not the bare channel) so help output routes through the NP-block attach path. |
-| `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver extracted from `-ping`. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. The caller replies through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
+| `dashboard.py` | `run_live_dashboard` — the optimistic-send + live-edit driver `-ping` and `-debug` share. Launch the probes concurrently, send what is already known immediately, edit that **one** message as results land, and stop at a deadline so a dead dependency cannot hold the reply open forever. Only the sequencing lives here: what a "result" *is* (a `ProbeResult` row, a block of rendered lines) stays with the caller, which supplies `settle`/`abandon`/`render` callbacks over its own state. Edits only when the render actually changed, so the common case is one edit rather than one per tick. Every probe's exception is retrieved wherever it settles — one cancelled at the deadline can still raise while unwinding, *after* the driver has returned. Both callers reply through `ctx.channel.send`, never `MusicContext.send`: a message an edit loop owns must not also be the NP host — see [Now Playing Host Model](#now-playing-host-model). |
 | `ping.py` | `-ping`'s probes and rows: Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, plus the bot / yt-dlp / FFmpeg version tuple (`collect_versions`, cached and executor-hopped). Sequencing is `dashboard.py`; `musicbot.py` holds only the command registration. The probes are deliberately **not** shared with a healthz endpoint — healthz must stay a dumb liveness probe, or a Redis blip becomes a pod restart loop. |
+| `debug.py` | `-debug`: the snapshot's collectors and rendering, plus `--enable`/`--disable` argument parsing. **Observation-only by rule** — nothing here changes playback, caching, queueing or persistence, which is what keeps "test with debug on, ship with debug off" a valid methodology. Every collector degrades to a labeled `unknown`/`n/a` rather than raising (`_safe_block`): a debug tool that crashes is worse than no debug tool. The host blocks are gated on bot ownership at **collection**, not at render, so a non-owner's `-debug` launches no probe at all — the public surface is versions plus this server's own player/voice state. The `Config` block renders a deny-by-default allowlist: `SECRET` variables show `set`/`unset` and never a value, `URL` variables lose userinfo, credential-bearing query params and the host itself. `musicbot.py` owns the command registration and the per-guild override cache. |
 | `util.py` | `get_logger` (structlog), `queue_message` (numbered list, capped at 10), `notice_embed`/`send_embed` (every command response is an embed — see design note), `cancel_task`, `latency_color`, `trace_footer`, `record_span_error`. |
 
 **Key types:**
@@ -271,14 +277,15 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-queue` | `q` | — | Display the next 10 songs with per-song ETA. |
 | `-history` | `h` | `[--limit N]` | Display the last N played songs (default 10, max 50). Served from the capped Redis list alone, in both archive modes — see [History read path](#history-read-path). |
 | `-leaderboard` | `lb`, `top` | `[--days N]` | Top 10 listeners and top 10 songs for this server, ranked by total listening time; `--days` scopes both boards to a rolling window. Aggregated from the Postgres archive (the first production reader of it) behind a 60 s Redis cache; replies with a notice when the archive is disabled. |
-| `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to `guild:{id}:config`, and the reply says whether the write actually landed. |
+| `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
+| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing footer to every reply) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
 | `-jump` | `j` | — | Stub; replies "currently in development". |
 | `-help` | `commands` | `[command]` | Man-page-styled embed help: the full command list, or detailed help for one command (`-help play`). Aliases resolve too (`-help np`). Rendered by `MusicHelpCommand` (`help.py`). |
 
 **Permission model:**
 
-Every command that touches playback is gated by `@commands.before_invoke(validate_commands)`. The read-only ones are not: `-ping` and `-leaderboard` answer without the author being in voice (and `-help` is a `HelpCommand`, not a cog command at all). `cog_before_invoke` runs first for all of them: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. `validate_commands` then checks:
+Every command that touches playback is gated by `@commands.before_invoke(validate_commands)`. The read-only ones are not: `-ping` and `-leaderboard` answer without the author being in voice (and `-help` is a `HelpCommand`, not a cog command at all). `cog_before_invoke` runs first for all of them: it binds structlog contextvars (`guild_id`, `user_id`, `command`), opens a `command.{name}` OTel span (closed in `cog_after_invoke`), creates the guild's `MusicPlayer` if needed, and refreshes the persisted `(voice_channel_id, text_channel_id)` pair when the command channel changed. A command carrying `extras={"observation_only": True}` — today only `-debug` — returns after the span and the contextvars and skips both the `get_mp()` and the channel-persistence steps: a command that reports on a guild's player must not manufacture one to look at, and creating it would also start a restore and a 300 s gate timeout on an idle guild. `validate_commands` then checks:
 1. The author is a `discord.Member` (not a `discord.User`)
 2. The author is in a voice channel
 3. For non-`play` commands: the bot is in the same voice channel as the author
@@ -1176,9 +1183,9 @@ logs, so persistence degrades silently rather than crashing.
 Only the **outbox** can reach that state by growing. The history lists are bounded
 at `HISTORY_CACHE_LIMIT` per guild, so their total scales with guild count
 (~24 KB each, ~24 MB across a thousand), not with runtime. The config hashes are
-bounded by the number of settings that exist — a handful of bytes per guild that has
-chosen one — so they scale with guild count even more weakly and cannot grow on their
-own at all. The outbox is near-empty
+bounded by the number of settings that exist — three fields, ~160 bytes measured,
+per guild that has chosen one — so they scale with guild count even more weakly
+(~1.5 MB across ten thousand) and cannot grow on their own at all. The outbox is near-empty
 whenever the drainer keeps up and grows for the whole duration of a Postgres
 outage, at ~487 bytes per play — so the bundled 256 MB budget holds roughly 525k
 un-archived plays. `HISTORY_OUTBOX_MAX` is the opt-in bound on it; it defaults to

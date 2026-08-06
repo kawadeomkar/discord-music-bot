@@ -20,6 +20,7 @@ from src.config import (
     _float_env,
     _int_env,
     debug_mode_default,
+    debug_prometheus_url,
     history_archive_enabled,
     postgres_url,
     spotify_enabled,
@@ -473,6 +474,23 @@ def _service_block(name: str) -> str:
     return match.group(1)
 
 
+def _building_services() -> dict[str, str]:
+    """name → block, for every top-level service that declares a `build:`. Named
+    rather than listed so a fourth build block has to satisfy the same contract
+    as the three that exist."""
+    # Scoped to the `services:` mapping: the top-level `volumes:` names sit at the
+    # same indent and would otherwise be looked up as services and not found.
+    section = re.search(
+        r"^services:\n(.*?)(?=^\S|\Z)", _compose_directives(), re.S | re.M
+    )
+    assert section is not None, "docker-compose.yml has no services: mapping"
+    blocks = {
+        name: _service_block(name)
+        for name in re.findall(r"^  (\S+):$", section.group(1), re.M)
+    }
+    return {n: b for n, b in blocks.items() if re.search(r"^    build:$", b, re.M)}
+
+
 class TestComposeArchiveProfile:
     """The deployment half of the opt-in archive: postgres and db-migrate exist in
     the model only while the `archive` profile is active, so a token-only
@@ -515,6 +533,76 @@ class TestComposeArchiveProfile:
         cannot-import-a-shell-script reasoning as the preflight test below."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
         assert "docker compose --profile archive down" in justfile
+
+
+class TestComposeBakesTheCommit:
+    """`-debug` reports the commit it is running by reading the GIT_SHA ENV baked
+    into the image — the OCI label the Dockerfile also stamps is invisible from
+    inside a container. compose's build blocks passed no `args:` at all, so
+    anything built through compose answered `unknown` while wearing a SHA tag."""
+
+    def test_every_service_that_builds_passes_the_commit(self) -> None:
+        """The three build blocks tag ONE image name, so `docker compose build`
+        builds that name three times and the last write wins: a block missing the
+        arg silently retags the bot's image from a GIT_SHA-less build."""
+        building = _building_services()
+        # Non-empty guard: a helper that matched nothing passes the loop.
+        assert len(building) >= 3, building
+        for name, block in building.items():
+            assert "image: discord-music-bot:" in block, name
+            assert "GIT_SHA: ${GIT_SHA:-unknown}" in block, name
+
+    def test_the_fallback_is_readable_rather_than_empty_or_mandatory(self) -> None:
+        """A bare `${GIT_SHA}` bakes an empty string, which -debug renders as a
+        blank commit; `:?` would fail `up` for everyone who builds outside the
+        deploy scripts. The image TAG's own `:-latest` is a different question —
+        a tag has to name something pullable."""
+        fallbacks = set(
+            re.findall(r"GIT_SHA: \$\{GIT_SHA([^}]*)\}", _compose_directives())
+        )
+        assert fallbacks == {":-unknown"}
+
+    def test_the_deploy_script_bakes_the_same_fallback(self) -> None:
+        """compose and build_common.sh are two independent paths onto one image
+        name, and neither can read the other's default. Drift means the same
+        unbuilt-from-a-deploy image reports two different things."""
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert 'GIT_SHA="${GIT_SHA:-unknown}"' in preflight
+
+
+class TestComposeDebugPrometheusUrl:
+    """A VALUED `environment:` entry beats env_file AND the process environment, so
+    a bare literal here would silently override the .env setting .env.example tells
+    operators to use. That is how the knob shipped inert."""
+
+    def test_the_url_is_interpolated_not_hardcoded(self) -> None:
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${DEBUG_PROMETHEUS_URL" in line, line
+
+    def test_it_defaults_rather_than_requiring_the_variable(self) -> None:
+        """`:-` not `:?`: unset must degrade that one -debug row to `n/a`, never
+        fail the whole `up`."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert ":-" in line and ":?" not in line
+
+    def test_the_published_port_is_a_variable_and_loopback_only(self) -> None:
+        """9090 is exactly the port an already-installed local Prometheus owns, and
+        a collision fails the entire `up` — same reasoning as POSTGRES_HOST_PORT."""
+        lgtm = _service_block("otel-lgtm")
+        line = next(ln for ln in lgtm.splitlines() if ":9090" in ln)
+        assert "127.0.0.1:" in line
+        assert "${PROMETHEUS_HOST_PORT" in line
+
+    def test_the_default_url_follows_the_published_port(self) -> None:
+        """Two knobs that must agree: moving the port without moving the URL points
+        the bot at a port nothing listens on."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${PROMETHEUS_HOST_PORT:-9090}" in line
 
 
 class TestComposeMatchesTheDefault:
@@ -904,3 +992,22 @@ class TestSetupEnvTightensTheEnvFile:
         # Narrowing only: go-rwx clears bits and never sets them, so an operator
         # who chose 400 keeps 400.
         assert self._run(0o400, tmp_path) == 0o400
+
+
+class TestDebugPrometheusUrl:
+    """The opt-in knob behind -debug's container-metrics row. Unset is the
+    feature being off, not a misconfiguration."""
+
+    def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DEBUG_PROMETHEUS_URL", raising=False)
+        assert debug_prometheus_url() is None
+
+    def test_empty_reads_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bare `KEY=` shape .env models elsewhere, and compose interpolates
+        an unset variable to exactly that."""
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", "   ")
+        assert debug_prometheus_url() is None
+
+    def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
+        assert debug_prometheus_url() == "http://localhost:9090"

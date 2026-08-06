@@ -1,8 +1,8 @@
-"""The optimistic-send + live-edit driver extracted from -ping.
+"""The optimistic-send + live-edit driver shared by -ping and -debug.
 
 These assert the SEQUENCING — send before the slow work finishes, edit only on a
-real change, give up at the deadline, never leak a task. What a command puts in
-those embeds is tested alongside that command, in test_ping.py.
+real change, give up at the deadline, never leak a task. What each command puts in
+those embeds is tested in test_ping.py and test_debug.py.
 """
 
 import asyncio
@@ -47,7 +47,7 @@ class TestEmbedsChanged:
 
     def test_a_added_or_removed_embed_counts(self) -> None:
         """The list, not just the last embed: -ping carries a static advisory
-        alongside its card, and a caller's block count can vary per invocation."""
+        alongside its card, and -debug's block count varies with the caller."""
         assert embeds_changed(_embed("a") + _embed("b"), _embed("a"))
 
 
@@ -539,8 +539,8 @@ class TestNothingToWaitFor:
     async def test_no_probes_sends_once_and_never_edits(
         self, dash_ctx: MagicMock
     ) -> None:
-        """A caller with nothing deferred: the driver degrades to a plain send,
-        with no loop and no deadline wait."""
+        """-debug's non-operator path: nothing deferred, so the driver degrades to
+        a plain send with no loop and no deadline wait."""
         returned: Optional[discord.Message] = await run_live_dashboard(
             dash_ctx,
             probes={},

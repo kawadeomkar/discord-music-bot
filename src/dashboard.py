@@ -1,16 +1,15 @@
-"""Optimistic-send + live-edit driver, extracted from `-ping`.
+"""Optimistic-send + live-edit driver, shared by `-ping` and `-debug`.
 
-A command that answers a question needing real IO across several services would
-otherwise leave the user watching nothing while it happens. The shape: launch the
-slow work concurrently, send what is already known immediately, edit that one
-message as results land, and stop at a deadline so a dead dependency cannot hold
-the reply open forever.
+Both commands answer a question that needs real IO across several services, and
+both would otherwise leave the user watching nothing while it happens. The shape
+is identical in each: launch the slow work concurrently, send what is already
+known immediately, edit that one message as results land, and stop at a deadline
+so a dead dependency cannot hold the reply open forever.
 
-What differs between callers is only what a "result" IS — a ProbeResult row for
--ping — so that stays with the caller. The sequencing, the edit-only-on-change
-rule and the never-leak-a-task guarantee live here, because those are the parts
-that are subtle and were worth getting right once. Generic over the result type
-for that reason: nothing here reads a probe's value, only whether it arrived.
+What differs is only what a "result" IS — a ProbeResult row for -ping, a block of
+rendered lines for -debug — so that stays with the callers. The sequencing, the
+edit-only-on-change rule and the never-leak-a-task guarantee live here, because
+those are the parts that are subtle and were worth getting right once.
 """
 
 import asyncio
@@ -155,8 +154,8 @@ async def run_live_dashboard(
         # seconds. Two costs, and the second is the bigger one — these replies carry
         # no NP block, AND the existing host is not retired, so it stays above this
         # card instead of staying glued to the bottom of the channel until the next
-        # ctx.send adopts a new host. A card that lives for the whole deadline makes
-        # that displacement visible.
+        # ctx.send adopts a new host. -debug's card is nine blocks tall and lives for
+        # the whole deadline, so the displacement is visible.
         # See docs/ARCHITECTURE.md#now-playing-host-model.
         message = await ctx.channel.send(embeds=last)
 
