@@ -8,6 +8,7 @@ without a server (early-outs, row mapping, close-before-connect).
 import asyncio
 import dataclasses
 import logging
+import re
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,6 +27,8 @@ from src.history_archive import (
     _POISON,
     _READ_CONCURRENCY,
     _RECENT_SQL,
+    _STATS_SQL,
+    ArchiveStats,
     HistoryArchive,
     HistoryOutboxDrainer,
     Leaderboard,
@@ -408,6 +411,19 @@ class TestRowMapping:
         )
         keys = _COLUMNS
         assert _row_to_entry(_as_record(dict(zip(keys, row)))).played_at == 0.0
+
+
+class TestStatsColumnContract:
+    def test_every_stats_alias_maps_to_a_field(self) -> None:
+        """A column aliased in _STATS_SQL but absent from ArchiveStats (or the
+        reverse) is a KeyError on the first real -debug — invisible to the unit
+        tier, which fakes the archive, exactly how a missing insert column once
+        shipped. `monotonic` is the one client-side field: stats() stamps it at
+        fetch time rather than reading it from the row."""
+        # act/db are relation aliases in the FROM clause, not output columns.
+        aliases = set(re.findall(r"AS (\w+)", _STATS_SQL)) - {"act", "db"}
+        fields = {f.name for f in dataclasses.fields(ArchiveStats)}
+        assert aliases == fields - {"monotonic"}
 
 
 class TestPostgresArchiveWithoutServer:
