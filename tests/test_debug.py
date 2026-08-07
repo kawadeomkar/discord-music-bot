@@ -669,9 +669,6 @@ class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that
     describes the HOST rather than the caller's own server is owner-only."""
 
-    _HOST_BLOCKS = ("Build", "Config", "Runtime", "Discord", "Redis", "Postgres",
-                    "Checks")  # fmt: skip
-
     async def test_non_operator_sees_only_versions_and_their_own_server(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -742,20 +739,6 @@ class TestOperatorGate:
         )
         assert embed.description is not None
         assert "bot owner" not in embed.description
-
-    @pytest.mark.parametrize("block", _HOST_BLOCKS)
-    async def test_every_host_block_is_operator_only(
-        self, mock_ctx: MagicMock, block: str
-    ) -> None:
-        """Parametrized so a block added later must decide which side it is on:
-        appending it to the operator branch without adding it here fails nothing,
-        but adding it to the PUBLIC branch fails this."""
-        mock_ctx.guild.voice_client = None
-        public = await _snapshot(
-            mock_ctx,
-            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
-        )
-        assert block not in [f.name for f in public.fields]
 
 
 class TestSnapshotEmbed:

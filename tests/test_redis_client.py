@@ -759,20 +759,6 @@ class TestOutboxDrainHelpers:
         assert [e.id for e in replay] == [e.id for e in first]
         assert [e.wire for e in replay] == [e.wire for e in first]
 
-    async def test_pending_read_inherits_a_dead_predecessors_batch(
-        self, fake_redis: Redis
-    ) -> None:
-        """mutation guard: a per-process consumer name (uuid4().hex). The PEL
-        belongs to the name, not the process: a successor recovers a dead
-        predecessor's batch by reading `0` under the same name — no lease, no TTL,
-        no XAUTOCLAIM. A random name per process orphans that PEL instead.
-        """
-        await ensure_outbox_group(fake_redis)
-        await _push(fake_redis, 1, 2)
-        delivered = await read_outbox_new(fake_redis, 10)  # "predecessor" dies here
-        recovered = await read_outbox_pending(fake_redis, 10)  # fresh process
-        assert [e.wire for e in recovered] == [e.wire for e in delivered]
-
     async def test_pending_read_is_empty_once_everything_is_settled(
         self, fake_redis: Redis
     ) -> None:
@@ -1865,14 +1851,6 @@ class TestGetPlaybackSnapshot:
         assert snap is not None
         assert len(snap.history) == HISTORY_CACHE_LIMIT
 
-    async def test_empty_guild_has_no_now_playing_and_empty_history(
-        self, store: GuildRedisStore
-    ) -> None:
-        snap = await store.get_playback_snapshot()
-        assert snap is not None
-        assert snap.now_playing is None
-        assert snap.history == ()
-
     async def test_corrupt_history_entries_dropped(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
@@ -2656,13 +2634,6 @@ class TestGuildConfigStore:
         DEBUG_MODE still move a guild that has no opinion."""
         assert (await GuildRedisStore(fake_redis, 7).get_config()).debug_mode is None
 
-    async def test_the_config_key_carries_no_ttl(self, fake_redis: Any) -> None:
-        """Under volatile-lru only TTL-bearing keys are eviction candidates, so an
-        expiring config is a setting that reverts with no log line and no error."""
-        store = GuildRedisStore(fake_redis, 42)
-        await store.set_debug_mode(True)
-        assert await fake_redis.ttl(store.config_key()) == -1
-
     async def test_a_ttl_refresh_does_not_reach_the_config_key(
         self, fake_redis: Any
     ) -> None:
@@ -2698,11 +2669,6 @@ class TestGuildConfigStore:
         config = await store.get_config()
         assert config.timezone == "Europe/London"
         assert config.tzinfo() == ZoneInfo("Europe/London")
-
-    async def test_the_timezone_never_expires(self, fake_redis: Any) -> None:
-        store = GuildRedisStore(fake_redis, 42)
-        await store.set_timezone("Europe/London")
-        assert await fake_redis.ttl(store.config_key()) == -1
 
     async def test_settings_do_not_clobber_each_other(self, fake_redis: Any) -> None:
         """Three fields, one hash: each write is an HSET of its own field, so

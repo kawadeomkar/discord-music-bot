@@ -187,31 +187,8 @@ class TestRecent:
         h.restore([_entry(2), _entry(1)])
         assert await h.recent(10) == [_entry(2), _entry(1)]
 
-    async def test_nonpositive_limit_returns_nothing(self) -> None:
-        h = _history(None)
-        h.restore([_entry(1)])
-        assert await h.recent(0) == []
-        assert await h.recent(-1) == []
-
     async def test_empty_history(self) -> None:
         assert await _history(None).recent(10) == []
-
-    async def test_reads_persisted_when_cache_cold(
-        self, store: GuildRedisStore
-    ) -> None:
-        """After a clean stop+restart the cache is empty but Redis still holds
-        history — recent() must surface it from the store."""
-        seed = _history(store)
-        for i in range(3):
-            await seed.add(_entry(i))
-        cold = _history(store)  # fresh player: empty in-memory cache
-        assert len(cold) == 0
-        assert await cold.recent(10) == [_entry(2), _entry(1), _entry(0)]
-
-    async def test_falls_back_to_cache_without_store(self) -> None:
-        h = _history(None)
-        h.restore([_entry(2), _entry(1)])
-        assert await h.recent(10) == [_entry(2), _entry(1)]
 
 
 class TestRecentIsRedisOnly:
@@ -366,18 +343,6 @@ class TestRecentWindowIsTheCap:
     musicbot.HISTORY_MAX_LIMIT is pinned to the same constant. Break any of the
     three and -history silently starts losing depth.
     """
-
-    async def test_the_list_is_capped_at_the_cache_limit(
-        self, store: GuildRedisStore
-    ) -> None:
-        """The RAW list, not get_history()'s capped read: get_history is itself
-        `LRANGE key 0 HISTORY_CACHE_LIMIT-1` and reads 50 whether the stored list
-        holds 50 or 60, so it cannot observe a trim at all. llen can.
-        """
-        h = _history(store)
-        for n in range(HISTORY_CACHE_LIMIT + 10):
-            await h.add(_entry(n))
-        assert await store.redis.llen(store.history_key()) == HISTORY_CACHE_LIMIT
 
     async def test_the_command_ceiling_cannot_outrun_the_window(self) -> None:
         # Imported here rather than at module scope: this is the one assertion

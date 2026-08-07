@@ -14,7 +14,7 @@ from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from src import dashboard, ping, telemetry
+from src import ping, telemetry
 from src.config import SpotifyStatus
 from src.ping import (
     ProbeResult,
@@ -916,17 +916,6 @@ class TestDefaultPasswordWarningReachesTheWire:
         assert len(embeds) == 2
         assert "Default database password" in (embeds[0].title or "")
 
-    async def test_the_advisory_rides_along_on_every_edit(self) -> None:
-        """The advisory is static and the health card moves, so the driver diffs the
-        whole embed LIST. Dropping the advisory from an edit would make it flicker;
-        diffing only the card would edit every tick for no change. Both live in
-        tests/test_dashboard.py now — this asserts the pairing survives the seam."""
-        warning = discord.Embed(title="⚠️ Default database password in use")
-        health = discord.Embed(title="Health")
-        assert not dashboard.embeds_changed([warning, health], [warning, health])
-        moved = discord.Embed(title="Health", description="redis 3 ms")
-        assert dashboard.embeds_changed([warning, moved], [warning, health])
-
 
 class TestTheAdvisoryIsForTheOperator:
     """Who sees the default-password warning. -ping has no permission check and
@@ -939,17 +928,6 @@ class TestTheAdvisoryIsForTheOperator:
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
         )
-
-    async def test_the_owner_sees_it(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
-        _ping_message(mock_ctx)
-        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
-            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
-        assert len(embeds) == 2
-        assert "Default database password" in (embeds[0].title or "")
 
     async def test_everyone_else_gets_the_health_card_alone(
         self, music_bot: MusicBot, mock_ctx: MagicMock

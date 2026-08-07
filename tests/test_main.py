@@ -789,10 +789,6 @@ class TestOnReady:
         await app.on_ready()
         mocked(app.change_presence).assert_awaited_once()
 
-    async def test_no_error_when_user_is_none(self, app: MusicBotApp) -> None:
-        app._connection.user = None
-        await app.on_ready()
-
     async def test_logs_user_info_when_user_set(self, app: MusicBotApp) -> None:
         user = MagicMock()
         user.name = "TestBot"

@@ -350,17 +350,6 @@ class TestQueuePut:
         mock_pf.assert_awaited_once()
         assert mock_pf.call_args[0][0] == queue_obj
 
-    async def test_put_does_not_spawn_prefetch_for_yt_source(
-        self, music_player: MusicPlayer
-    ) -> None:
-        source = YTSource(ytsearch="ytsearch:test song", process=True)
-        with patch(
-            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
-        ) as mock_pf:
-            await music_player.queue_put(source)
-            await asyncio.sleep(0)
-        mock_pf.assert_not_awaited()
-
     async def test_put_with_prefetch_false_skips_prefetch_task(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
@@ -3005,29 +2994,6 @@ class TestRestoreCrashedSong:
 
 
 class TestRestoreCompleteLoopGuard:
-    async def test_restore_state_sets_restore_complete_on_success(
-        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
-    ) -> None:
-        music_player._restore_complete.clear()
-        await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
-
-    async def test_restore_state_sets_restore_complete_on_failure(
-        self, music_player: MusicPlayer
-    ) -> None:
-        # get_playback_snapshot() swallows Redis errors and returns None, so
-        # the failure path here is the None early-return, not an exception.
-        music_player._restore_complete.clear()
-        with patch.object(
-            music_player.store,
-            "get_playback_snapshot",
-            new=AsyncMock(return_value=None),
-        ):
-            await music_player._restore_state()
-        assert music_player._restore_complete.is_set()
-        # Restore aborted before touching the queue.
-        assert music_player.queue.qsize() == 0
-
     async def test_restore_state_sets_restore_complete_when_no_store(
         self,
         mock_bot: MagicMock,

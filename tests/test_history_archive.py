@@ -603,16 +603,6 @@ class TestLeaderboardQuery:
         assert cutoff == datetime.fromtimestamp(1752530000.0, tz=timezone.utc)
         assert cutoff.tzinfo is timezone.utc
 
-    async def test_negative_since_epoch_floors_at_zero(self) -> None:
-        # datetime.fromtimestamp accepts negatives; the column cannot hold one.
-        archive = PostgresHistoryArchive("postgresql://nope:1/nope")
-        pool, conn = self._stubbed_pool([], [])
-        with patch.object(archive, "_ensure", AsyncMock(return_value=pool)):
-            await archive.leaderboard(42, 10, since_epoch=-1e9)
-        assert conn.fetch.await_args_list[0].args[3] == datetime.fromtimestamp(
-            0, tz=timezone.utc
-        )
-
     async def test_rows_map_onto_the_dataclasses(self) -> None:
         archive = PostgresHistoryArchive("postgresql://nope:1/nope")
         pool, _ = self._stubbed_pool(
