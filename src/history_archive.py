@@ -36,6 +36,7 @@ See docs/ARCHITECTURE.md#history-archive-tier.
 """
 
 import asyncio
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -286,6 +287,11 @@ class ArchiveStats:
     Row counts are planner ESTIMATES from pg_stat_user_tables, never COUNT(*):
     play_history is unbounded by design, so an exact count is a full scan on the
     largest table in the deployment for one line of a diagnostic embed.
+
+    The counter fields are cumulative since pg_stat_reset; -debug samples twice
+    and renders their deltas over `monotonic`. Defaulted (unlike the originals)
+    so every existing construction keeps compiling — this never crosses a wire,
+    so the defaults are constructor compatibility, not wire-format tolerance.
     """
 
     database_bytes: int
@@ -296,12 +302,32 @@ class ArchiveStats:
     max_connections: int
     shared_buffers: str
     cache_hit_ratio: float
+    active_backends: int = 0
+    active_io_wait: int = 0
+    active_lock_wait: int = 0
+    active_other_wait: int = 0
+    active_time_ms: float = 0.0
+    xacts_total: int = 0
+    tuples_total: int = 0
+    blks_hit: int = 0
+    blks_read: int = 0
+    temp_bytes: int = 0
+    deadlocks: int = 0
+    monotonic: float = 0.0
 
 
 # One row, deliberately: this feeds one embed field and a second round trip buys
 # nothing. to_regclass + COALESCE rather than a bare relation name so a database
 # migrated past the version that owns these tables degrades to zeros instead of
 # raising UndefinedTable at the one moment an operator is trying to diagnose it.
+# The active_* FILTERs take client backends only: autovacuum also shows
+# state='active', but pg_stat_database's sessions counters (active_time → the
+# `busy` rate) count client sessions alone, and the two halves of -debug's load
+# row must agree. pid <> pg_backend_pid() or the probe reads itself as
+# permanent load ≥ 1 active. pg_stat_activity masks OTHER roles' state (NULL),
+# so the FILTERs undercount rather than error; every connection today is the
+# bot's own role. If a second role ever appears: GRANT pg_read_all_stats — do
+# not pre-grant it, the bot's role is deliberately minimal.
 _STATS_SQL = """
 SELECT
     pg_database_size(current_database())                        AS database_bytes,
@@ -316,18 +342,54 @@ SELECT
         SELECT n_live_tup FROM pg_stat_user_tables
         WHERE relname = 'play_history_rejected'
     ), 0)                                                       AS rejected_estimate,
-    (
-        SELECT count(*) FROM pg_stat_activity
-        WHERE datname = current_database()
-    )                                                           AS connections,
+    act.connections                                             AS connections,
     current_setting('max_connections')::int                     AS max_connections,
     current_setting('shared_buffers')                           AS shared_buffers,
-    COALESCE((
-        SELECT CASE WHEN blks_hit + blks_read > 0
-                    THEN blks_hit::float8 / (blks_hit + blks_read)
-                    ELSE 0 END
-        FROM pg_stat_database WHERE datname = current_database()
-    ), 0)                                                       AS cache_hit_ratio
+    CASE WHEN COALESCE(db.blks_hit, 0) + COALESCE(db.blks_read, 0) > 0
+         THEN db.blks_hit::float8 / (db.blks_hit + db.blks_read)
+         ELSE 0 END                                             AS cache_hit_ratio,
+    act.active_backends                                         AS active_backends,
+    act.active_io_wait                                          AS active_io_wait,
+    act.active_lock_wait                                        AS active_lock_wait,
+    act.active_other_wait                                       AS active_other_wait,
+    COALESCE(db.active_time, 0)                                 AS active_time_ms,
+    COALESCE(db.xact_commit + db.xact_rollback, 0)              AS xacts_total,
+    COALESCE(db.tup_returned + db.tup_fetched, 0)               AS tuples_total,
+    COALESCE(db.blks_hit, 0)                                    AS blks_hit,
+    COALESCE(db.blks_read, 0)                                   AS blks_read,
+    COALESCE(db.temp_bytes, 0)                                  AS temp_bytes,
+    COALESCE(db.deadlocks, 0)                                   AS deadlocks
+FROM (
+    SELECT
+        count(*)                                                AS connections,
+        count(*) FILTER (
+            WHERE state = 'active'
+              AND backend_type = 'client backend'
+              AND pid <> pg_backend_pid()
+        )                                                       AS active_backends,
+        count(*) FILTER (
+            WHERE state = 'active'
+              AND backend_type = 'client backend'
+              AND pid <> pg_backend_pid()
+              AND wait_event_type = 'IO'
+        )                                                       AS active_io_wait,
+        count(*) FILTER (
+            WHERE state = 'active'
+              AND backend_type = 'client backend'
+              AND pid <> pg_backend_pid()
+              AND wait_event_type = 'Lock'
+        )                                                       AS active_lock_wait,
+        count(*) FILTER (
+            WHERE state = 'active'
+              AND backend_type = 'client backend'
+              AND pid <> pg_backend_pid()
+              AND wait_event_type IS NOT NULL
+              AND wait_event_type NOT IN ('IO', 'Lock')
+        )                                                       AS active_other_wait
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+) AS act
+LEFT JOIN pg_stat_database AS db ON db.datname = current_database()
 """
 
 
@@ -583,8 +645,10 @@ class PostgresHistoryArchive:
             )
 
     async def stats(self) -> ArchiveStats:
-        """Size, row estimates and connection/cache state, for -debug's Postgres
-        block. Raises on any failure — the caller renders the degraded row.
+        """Size, row estimates, connection/cache state and cumulative counters,
+        for -debug's Postgres block. Raises on any failure — the caller renders
+        the degraded row. -debug calls this TWICE per snapshot, bracketing its
+        sampling window, and rates the counter fields over `monotonic`.
 
         Bounded through _read_slots and the read deadline like leaderboard(): this
         is user-triggered and shares the pool the drainer writes through, and a
@@ -603,6 +667,18 @@ class PostgresHistoryArchive:
             max_connections=row["max_connections"],
             shared_buffers=row["shared_buffers"],
             cache_hit_ratio=row["cache_hit_ratio"],
+            active_backends=row["active_backends"],
+            active_io_wait=row["active_io_wait"],
+            active_lock_wait=row["active_lock_wait"],
+            active_other_wait=row["active_other_wait"],
+            active_time_ms=row["active_time_ms"],
+            xacts_total=row["xacts_total"],
+            tuples_total=row["tuples_total"],
+            blks_hit=row["blks_hit"],
+            blks_read=row["blks_read"],
+            temp_bytes=row["temp_bytes"],
+            deadlocks=row["deadlocks"],
+            monotonic=time.monotonic(),
         )
 
     async def health_check(self) -> None:

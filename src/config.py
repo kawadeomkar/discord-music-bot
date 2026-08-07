@@ -91,9 +91,11 @@ PING_DEADLINE_SECS: float = _float_env(
 
 # The same two knobs for -debug's live-edit loop (src/dashboard.py drives both).
 # A longer deadline than -ping's: these collectors do strictly more work per block
-# — a Postgres stats query and a Prometheus round trip, against -ping's single
-# reachability probe — and a block that misses the deadline renders "timed out"
-# rather than being retried, so cutting it short loses real data.
+# — the Postgres probe brackets a 2s sampling window between two stats queries,
+# plus a Prometheus round trip, against -ping's single reachability probe — and a
+# block that misses the deadline renders "timed out" rather than being retried,
+# so cutting it short loses real data. Keep the deadline comfortably above the
+# ~2.2s floor that window gives the Postgres block, or it times out every time.
 DEBUG_TICK_SECS: float = _float_env("DEBUG_TICK_SECS", 1.0, minimum=_MIN_DASHBOARD_SECS)
 DEBUG_DEADLINE_SECS: float = _float_env(
     "DEBUG_DEADLINE_SECS", 8.0, minimum=_MIN_DASHBOARD_SECS
