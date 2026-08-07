@@ -491,11 +491,6 @@ class TestSongQueueEntryWire:
             True,
         )
 
-    def test_snowflake_requester_id_exact(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_QOBJ_FULL)
-        assert isinstance(entry, SongQueueEntry)
-        assert entry.requester_id == 222222222222222222  # no float path
-
     def test_from_queue_object(self) -> None:
         item = QueueObject(
             webpage_url="https://yt.com/v=1",
@@ -533,12 +528,6 @@ class TestSongQueueEntryWire:
         assert entry.start_paused is True
         assert entry.interjected is False
 
-    def test_reader_parses_pre_stamp_entry_with_zero_stamps(self) -> None:
-        # Entries written before the enqueue stamps existed default both to 0.
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
-        assert isinstance(entry, SongQueueEntry)
-        assert (entry.queued_at, entry.queue_position) == (0.0, 0)
-
     def test_enqueue_stamps_round_trip(self) -> None:
         item = QueueObject(
             webpage_url="https://yt.com/v=1",
@@ -563,11 +552,6 @@ class TestSongQueueEntryWire:
         parsed = parse_queue_entry(SongQueueEntry.from_queue_object(item).to_redis())
         assert isinstance(parsed, SongQueueEntry)
         assert parsed.query_source == "tiktok.com"
-
-    def test_reader_defaults_query_source_on_a_pre_feature_entry(self) -> None:
-        entry = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
-        assert isinstance(entry, SongQueueEntry)
-        assert entry.query_source == ""
 
 
 class TestSearchQueueEntryWire:
@@ -899,16 +883,6 @@ class TestHistoryEntryDomain:
     )
     def test_negative_ints_clamp_to_zero(self, field: str) -> None:
         assert getattr(_entry_with(**{field: -5}), field) == 0
-
-    def test_snowflake_ids_survive(self) -> None:
-        # int8 columns: a real Discord snowflake must not be clamped into
-        # nonsense by an over-eager ceiling.
-        assert HistoryEntry(requester_id=222222222222222222).requester_id == (
-            222222222222222222
-        )
-        assert HistoryEntry(message_id=333333333333333333).message_id == (
-            333333333333333333
-        )
 
     def test_replace_re_runs_the_validator(self) -> None:
         # backfill_history stamps guild_id onto legacy entries

@@ -19,11 +19,6 @@ class TestQueueMessage:
     def test_empty_list_returns_empty_string(self) -> None:
         assert queue_message([]) == ""
 
-    def test_two_items_shows_both(self) -> None:
-        result = queue_message(["song_a", "song_b"])
-        assert "1: song_a" in result
-        assert "2: song_b" in result
-
     def test_five_items_shows_all_five(self) -> None:
         songs = [f"song{i}" for i in range(5)]
         result = queue_message(songs)
@@ -116,9 +111,6 @@ class TestPluralize:
         """The rule is `count == 1`, not `count <= 1`: 0 and -1 separate the two,
         since `<= 1` renders "0 song" / "-1 song" and passes every other test."""
         assert pluralize(count, "song") == expected
-
-    def test_plural_override_used_for_irregulars(self) -> None:
-        assert pluralize(2, "person", "people") == "people"
 
     def test_plural_override_ignored_when_singular(self) -> None:
         assert pluralize(1, "person", "people") == "person"

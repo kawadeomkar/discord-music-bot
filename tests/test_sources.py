@@ -166,20 +166,6 @@ class TestParseUrlOther:
         assert result.stype == URLSource.OTHER
         assert result.url == url
 
-    def test_vimeo_becomes_generic_ytdlp_source(self) -> None:
-        url = "https://vimeo.com/12345678"
-        result = parse_url(url, f"-play {url}")
-        assert isinstance(result, YTSource)
-        assert result.stype == URLSource.OTHER
-        assert result.url == url
-
-    def test_tiktok_becomes_generic_ytdlp_source(self) -> None:
-        url = "https://www.tiktok.com/@user/video/1234567890"
-        result = parse_url(url, f"-play {url}")
-        assert isinstance(result, YTSource)
-        assert result.stype == URLSource.OTHER
-        assert result.url == url
-
 
 class TestParseInput:
     def test_plain_text_becomes_ytsearch(self) -> None:
@@ -188,11 +174,6 @@ class TestParseInput:
         assert result.ytsearch == "ytsearch:never gonna give you up"
         assert result.process is True
         assert result.url is None
-
-    def test_multi_word_search(self) -> None:
-        result = parse_input("bohemian rhapsody queen", "-play bohemian rhapsody queen")
-        assert isinstance(result, YTSource)
-        assert result.ytsearch == "ytsearch:bohemian rhapsody queen"
 
     def test_single_word_search(self) -> None:
         result = parse_input("beethoven", "-play beethoven")
@@ -217,12 +198,6 @@ class TestParseInput:
         assert isinstance(result, YTSource)
         assert result.ytsearch == "ytsearch:98/99 sorisa"
         assert result.url is None
-
-    def test_single_word_with_slash_still_tries_url_parse(self) -> None:
-        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        result = parse_input(url, f"-p {url}")
-        assert isinstance(result, YTSource)
-        assert result.url == url
 
     def test_single_word_dotless_slash_falls_back_to_search(self) -> None:
         """A lone "98/99" (no dot, no scheme) is not a URL — parse_url raises

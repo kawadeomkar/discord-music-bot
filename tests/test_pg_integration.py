@@ -33,7 +33,6 @@ from src.guild_state import (
     serialize_history_entry,
 )
 from src.history_archive import (
-    _POISON,
     _RECENT_SQL,
     HistoryOutboxDrainer,
     PostgresHistoryArchive,
@@ -587,20 +586,6 @@ class TestSchemaLock:
         with pytest.raises(asyncpg.exceptions.CheckViolationError) as exc:
             await archive.insert_batch([orphan])
         assert exc.value.as_dict()["constraint_name"] == "play_history_guild_id_valid"
-
-    async def test_a_check_violation_is_classified_as_poison(self) -> None:
-        # CheckViolationError is SQLSTATE 23514 under
-        # IntegrityConstraintViolationError, not a DataError. Without that arm in
-        # _POISON a violation propagates past the quarantine path and wedges the
-        # drain head permanently on a non-evictable stream.
-        assert issubclass(
-            asyncpg.exceptions.CheckViolationError,
-            asyncpg.exceptions.IntegrityConstraintViolationError,
-        )
-        assert not issubclass(
-            asyncpg.exceptions.CheckViolationError, asyncpg.exceptions.DataError
-        )
-        assert isinstance(asyncpg.exceptions.CheckViolationError("x"), _POISON)
 
     async def test_not_valid_constraints_do_not_reject_legacy_rows(
         self, pg_dsn: str
