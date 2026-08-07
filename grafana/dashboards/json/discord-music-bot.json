@@ -2321,8 +2321,26 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum by (__name__) (rate({__name__=~\"otelcol_receiver_accepted_(spans|log_records|metric_points)(_total)?\"}[$__rate_interval]))",
-          "legendFormat": "{{__name__}}"
+          "expr": "sum(rate(otelcol_receiver_accepted_spans_total[$__rate_interval]))",
+          "legendFormat": "spans accepted/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_accepted_log_records_total[$__rate_interval]))",
+          "legendFormat": "log records accepted/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_accepted_metric_points_total[$__rate_interval]))",
+          "legendFormat": "metric points accepted/s"
         }
       ]
     },
@@ -2377,8 +2395,53 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum by (__name__) (rate({__name__=~\"otelcol_receiver_(refused|failed)_.+|otelcol_exporter_send_failed_.+\"}[$__rate_interval]))",
-          "legendFormat": "{{__name__}}"
+          "expr": "sum(rate(otelcol_receiver_refused_spans_total[$__rate_interval]))",
+          "legendFormat": "spans refused/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_refused_log_records_total[$__rate_interval]))",
+          "legendFormat": "log records refused/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_receiver_refused_metric_points_total[$__rate_interval]))",
+          "legendFormat": "metric points refused/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[$__rate_interval]))",
+          "legendFormat": "spans export-failed/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_exporter_send_failed_log_records_total[$__rate_interval]))",
+          "legendFormat": "log records export-failed/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(rate(otelcol_exporter_send_failed_metric_points_total[$__rate_interval]))",
+          "legendFormat": "metric points export-failed/s"
         }
       ]
     }
