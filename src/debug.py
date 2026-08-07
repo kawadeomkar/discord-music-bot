@@ -79,6 +79,16 @@ _GIT_PROBE_TIMEOUT_SECS = 2.0
 # so a server that accepts the socket and never answers would otherwise run to the
 # dashboard deadline and take its two blocks down at the very end.
 _REDIS_PROBE_TIMEOUT_SECS = _CPU_WINDOW_SECS + 3.0
+# Postgres samples over its own, longer window: pg_stat_database flushes a
+# backend's pending stats at transaction end and at most about once a second, so
+# a _CPU_WINDOW_SECS delta reads flush quantization rather than load.
+_PG_WINDOW_SECS = 2.0
+# Bounds the whole two-sample Postgres probe, like _REDIS_PROBE_TIMEOUT_SECS.
+# Defense in depth, not the primary release: the dashboard cancels every pending
+# probe at its deadline, which already frees the archive's read slots. This cap
+# covers what that cannot — a raised DEBUG_DEADLINE_SECS, or the pre-loop send
+# blocking before any deadline exists. Deliberately does NOT stretch with either.
+_PG_PROBE_TIMEOUT_SECS = _PG_WINDOW_SECS + 6.0
 _git_sha_cache: Optional[str] = None
 
 # Block order in the embed, and which probe fills each deferred one. The mapping is
@@ -1235,34 +1245,110 @@ def _container_lines(metrics: Optional[ContainerMetrics]) -> list[str]:
     ]
 
 
-async def postgres_lines(
-    archive: Optional[ArchiveStatsReader],
-    *,
-    archive_enabled: bool,
-    prometheus_url: Optional[str] = None,
+def _rate(value: float) -> str:
+    """One decimal below 10, integer above; an exact zero stays a bare 0.
+    The split is decided off the ROUNDED value: 9.99 renders "10", never "10.0"."""
+    if value == 0:
+        return "0"
+    text = f"{value:.1f}"
+    return text if float(text) < 10 else f"{value:.0f}"
+
+
+def _count_rate(value: float) -> str:
+    # Units promote off the ROUNDED mantissa, so "1000.0k" can never render.
+    if round(value / 1_000, 1) >= 1_000:
+        return f"{value / 1_000_000:.1f}M"
+    if round(value, 1) >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return _rate(value)
+
+
+def _bytes_rate(value: float) -> str:
+    # Same rounded-mantissa promotion as _count_rate ("1024 KB/s" never renders).
+    if round(value / 1024) >= 1024:
+        return f"{value / 1_048_576:.1f} MB/s"
+    if round(value) >= 1024:
+        return f"{value / 1024:.0f} KB/s"
+    return f"{value:.0f} B/s"
+
+
+def _wait_parenthetical(stats: "ArchiveStats") -> str:
+    """Only nonzero wait kinds; `(0 waiting)` when every active backend is on-CPU
+    (that IS information); nothing at 0 active — a parenthetical on zero is noise.
+    On-CPU is implied (active − waits), never printed."""
+    if stats.active_backends == 0:
+        return ""
+    nonzero = [
+        (count, kind)
+        for count, kind in (
+            (stats.active_io_wait, "io"),
+            (stats.active_lock_wait, "lock"),
+            (stats.active_other_wait, "other"),
+        )
+        if count > 0
+    ]
+    if not nonzero:
+        return " (0 waiting)"
+    if len(nonzero) == 1:
+        count, kind = nonzero[0]
+        return f" ({count} {kind}-wait)"
+    return " (" + " · ".join(f"{count} {kind}" for count, kind in nonzero) + ")"
+
+
+def postgres_lines(
+    container: Optional[ContainerMetrics],
+    before: Optional["ArchiveStats"],
+    after: "ArchiveStats",
 ) -> list[str]:
-    if archive is None:
-        # Mirrors -ping's OFF row: the default deployment made a choice, and a
-        # missing archive must read as that choice rather than as a fault.
-        return ["off (archive disabled)" if not archive_enabled else "n/a"]
-    # Concurrent, not sequential: these share no data, and awaiting Prometheus first
-    # spent up to _PROMETHEUS_TIMEOUT_SECS of this probe's budget before the query
-    # that carries the block's real content even started. A black-holed metrics
-    # endpoint plus a slow Postgres then lost the storage/rows/conns lines entirely.
-    container, stats = await asyncio.gather(
-        read_container_metrics(prometheus_url, _POSTGRES_CONTAINER),
-        archive.stats(),
-    )
+    """Pure renderer over the two-sample bracket _postgres_probe takes. Instant
+    fields come from `after` alone; the load/throughput/mem-signal rates are
+    windowed deltas, clamped at 0 so a pg_stat_reset() (or crash) between samples
+    cannot render negative. The native rows are NOT a fallback for the Prometheus
+    cpu/mem pair — they measure demand and pressure, not utilization, so they
+    render whenever the SQL answers, profile or no profile.
+    """
+    window = (after.monotonic - before.monotonic) if before is not None else 0.0
+    if before is not None and window > 0:
+        # busy averages when work was REPORTED, not when it happened — stats flush
+        # at transaction end, so a spike above the active count just means a long
+        # statement finished inside the window. Rendered honestly, uncapped.
+        busy = max(0.0, after.active_time_ms - before.active_time_ms) / 1000 / window
+        busy_text = f"busy {busy:.1f} bk-s/s"
+        xacts = max(0, after.xacts_total - before.xacts_total) / window
+        tuples = max(0, after.tuples_total - before.tuples_total) / window
+        throughput = f"{_rate(xacts)} tx/s · {_count_rate(tuples)} tuples/s"
+        delta_hit = max(0, after.blks_hit - before.blks_hit)
+        delta_read = max(0, after.blks_read - before.blks_read)
+        # A zero denominator is the common case, not a fault: an idle database
+        # touched no blocks at all during the window.
+        window_hit = (
+            f"window hit {delta_hit / (delta_hit + delta_read) * 100:.1f}%"
+            if delta_hit + delta_read > 0
+            else "window hit n/a (idle)"
+        )
+        spill = _bytes_rate(max(0, after.temp_bytes - before.temp_bytes) / window)
+        deadlocks = max(0, after.deadlocks - before.deadlocks)
+        mem_signal = f"{window_hit} · spill {spill} · deadlocks {deadlocks}"
+    else:
+        busy_text = "busy unknown"
+        throughput = "unknown"
+        mem_signal = "unknown"
     return _container_lines(container) + [
-        f"storage      db {_mb(stats.database_bytes)} · "
-        f"play_history {_mb(stats.table_bytes)}",
+        f"load         {after.active_backends} active"
+        f"{_wait_parenthetical(after)} · {busy_text}",
+        f"throughput   {throughput}",
+        f"mem signal   {mem_signal}",
+        f"storage      db {_mb(after.database_bytes)} · "
+        f"play_history {_mb(after.table_bytes)}",
         # Estimates, not COUNT(*): play_history is unbounded by design. A non-zero
         # rejected count means __post_init__'s clamp regressed — `just db-rejects`.
-        f"rows         ~{stats.rows_estimate} plays · "
-        f"{stats.rejected_estimate} rejected",
-        f"conns        {stats.connections} / {stats.max_connections}",
-        f"cache        buffers {stats.shared_buffers} · "
-        f"hit rate {stats.cache_hit_ratio * 100:.1f}%",
+        f"rows         ~{after.rows_estimate} plays · "
+        f"{after.rejected_estimate} rejected",
+        f"conns        {after.connections} / {after.max_connections}",
+        # (lifetime) since the window ratio landed above it: an unlabeled
+        # cumulative ratio next to a windowed one invites misreading.
+        f"cache        buffers {after.shared_buffers} · "
+        f"hit rate {after.cache_hit_ratio * 100:.1f}% (lifetime)",
     ]
 
 
@@ -1487,16 +1573,42 @@ async def _redis_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
     }
 
 
+async def _postgres_probe(inputs: DebugInputs) -> list[str]:
+    """Two stats() samples bracketing _PG_WINDOW_SECS, so the counter rows render
+    windowed rates. The failure paths are asymmetric ON PURPOSE: a failed first
+    sample costs only the rates (`unknown`), a failed second is the degraded row —
+    the second sample is the sole source of the instant fields.
+    """
+    archive = inputs.archive
+    if archive is None:
+        # Mirrors -ping's OFF row: the default deployment made a choice, and a
+        # missing archive must read as that choice rather than as a fault.
+        return ["off (archive disabled)" if not inputs.archive_enabled else "n/a"]
+    async with asyncio.timeout(_PG_PROBE_TIMEOUT_SECS):
+        try:
+            before = await archive.stats()
+        except Exception as e:  # noqa: BLE001 — degrade rates, keep the block
+            log.warning(f"first postgres sample failed: {type(e).__name__}: {e}")
+            before = None
+        # A dead first sample leaves nothing to rate over, so the window would
+        # buy no data — skip straight to the instant fields.
+        if before is not None:
+            await asyncio.sleep(_PG_WINDOW_SECS)
+        # Concurrent, not sequential: these share no data, and awaiting Prometheus
+        # first spent up to _PROMETHEUS_TIMEOUT_SECS of this probe's budget before
+        # the query that carries the block's real content even started. A
+        # black-holed metrics endpoint plus a slow Postgres then lost the
+        # storage/rows/conns lines entirely.
+        container, after = await asyncio.gather(
+            read_container_metrics(inputs.prometheus_url, _POSTGRES_CONTAINER),
+            archive.stats(),
+        )
+    return postgres_lines(container, before, after)
+
+
 async def _postgres_blocks(inputs: DebugInputs) -> dict[str, list[str]]:
     return {
-        "Postgres": await _safe_block_async(
-            "postgres",
-            lambda: postgres_lines(
-                inputs.archive,
-                archive_enabled=inputs.archive_enabled,
-                prometheus_url=inputs.prometheus_url,
-            ),
-        )
+        "Postgres": await _safe_block_async("postgres", lambda: _postgres_probe(inputs))
     }
 
 

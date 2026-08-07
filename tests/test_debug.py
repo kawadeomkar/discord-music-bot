@@ -78,6 +78,36 @@ def _archive_stats() -> ArchiveStats:
     )
 
 
+def _pg_stats(**overrides: Any) -> ArchiveStats:
+    """A realistic full sample for the renderer tests; override per case. The
+    counter values are the `before` baseline — pair with a second call carrying
+    deltas and a later `monotonic` to exercise the windowed rates."""
+    base: dict[str, Any] = dict(
+        database_bytes=134217728,
+        table_bytes=100663296,
+        rows_estimate=412083,
+        rejected_estimate=0,
+        connections=3,
+        max_connections=100,
+        shared_buffers="128MB",
+        cache_hit_ratio=0.994,
+        active_backends=0,
+        active_io_wait=0,
+        active_lock_wait=0,
+        active_other_wait=0,
+        active_time_ms=5_000.0,
+        xacts_total=1_000,
+        tuples_total=50_000,
+        blks_hit=9_000,
+        blks_read=1_000,
+        temp_bytes=0,
+        deadlocks=0,
+        monotonic=100.0,
+    )
+    base.update(overrides)
+    return ArchiveStats(**base)
+
+
 class TestParseDebugArg:
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -468,8 +498,10 @@ class TestTheSnapshotDoesNotWaitForItsIO:
         assert "collecting" not in rendered["Versions"]
 
     async def test_the_send_happens_before_a_slow_block_resolves(
-        self, mock_ctx: MagicMock
+        self, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The real window would add 2s of pure wall time after the gate opens.
+        monkeypatch.setattr(debug, "_PG_WINDOW_SECS", 0.0)
         mock_ctx.guild.voice_client = None
         gate = asyncio.Event()
         message = MagicMock(spec=discord.Message)
@@ -1216,36 +1248,133 @@ class TestRedisBlock:
 
 
 class TestPostgresBlock:
-    def _stats(self) -> ArchiveStats:
-        return ArchiveStats(
-            database_bytes=134217728,
-            table_bytes=100663296,
-            rows_estimate=412083,
-            rejected_estimate=0,
-            connections=3,
-            max_connections=100,
-            shared_buffers="128MB",
-            cache_hit_ratio=0.994,
-        )
+    """postgres_lines as a pure renderer: instant fields from `after`, rates from
+    the (before, after) bracket. The orchestration around it has its own class."""
 
-    async def test_renders_the_archive_stats(self) -> None:
-        archive = MagicMock()
-        archive.stats = AsyncMock(return_value=self._stats())
-        lines = "\n".join(await debug.postgres_lines(archive, archive_enabled=True))
+    def test_renders_the_archive_stats(self) -> None:
+        lines = "\n".join(debug.postgres_lines(None, None, _pg_stats()))
         assert "db 128 MB" in lines
         assert "play_history 96 MB" in lines
         assert "~412083 plays · 0 rejected" in lines
         assert "3 / 100" in lines
-        assert "hit rate 99.4%" in lines
+        assert "hit rate 99.4% (lifetime)" in lines
 
-    async def test_disabled_archive_reads_as_a_choice(self) -> None:
-        """Mirrors -ping's OFF row: the ship default made this choice, and it must
-        not read as a fault."""
-        lines = await debug.postgres_lines(None, archive_enabled=False)
-        assert lines == ["off (archive disabled)"]
+    def test_rates_come_from_the_window_deltas(self) -> None:
+        before = _pg_stats()
+        after = _pg_stats(
+            active_backends=2,
+            active_io_wait=1,
+            active_time_ms=5_800.0,  # +800ms over a 2s window → 0.4 bk-s/s
+            xacts_total=1_082,  # +82 → 41/s
+            tuples_total=74_800,  # +24800 → 12.4k/s
+            blks_hit=9_998,  # Δhit 998, Δread 2 → 99.8%
+            blks_read=1_002,
+            monotonic=102.0,
+        )
+        lines = "\n".join(debug.postgres_lines(None, before, after))
+        assert "load         2 active (1 io-wait) · busy 0.4 bk-s/s" in lines
+        assert "throughput   41 tx/s · 12.4k tuples/s" in lines
+        assert "mem signal   window hit 99.8% · spill 0 B/s · deadlocks 0" in lines
 
-    async def test_enabled_but_absent_archive_is_na(self) -> None:
-        assert await debug.postgres_lines(None, archive_enabled=True) == ["n/a"]
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            # 0 active drops the parenthetical entirely.
+            ({}, "load         0 active · busy"),
+            # All on-CPU is information, not absence.
+            ({"active_backends": 2}, "2 active (0 waiting) ·"),
+            # One nonzero kind carries the -wait suffix.
+            (
+                {"active_backends": 2, "active_io_wait": 1},
+                "2 active (1 io-wait) ·",
+            ),
+            (
+                {"active_backends": 1, "active_other_wait": 1},
+                "1 active (1 other-wait) ·",
+            ),
+            # Mixed kinds drop the suffix — the parenthetical is already
+            # wait-scoped.
+            (
+                {
+                    "active_backends": 3,
+                    "active_io_wait": 1,
+                    "active_lock_wait": 1,
+                },
+                "3 active (1 io · 1 lock) ·",
+            ),
+        ],
+    )
+    def test_wait_parenthetical_lists_only_nonzero_kinds(
+        self, overrides: dict[str, Any], expected: str
+    ) -> None:
+        lines = "\n".join(debug.postgres_lines(None, None, _pg_stats(**overrides)))
+        assert expected in lines
+
+    def test_missing_first_sample_costs_only_the_rates(self) -> None:
+        """The asymmetric failure contract: the instant half needs only `after`."""
+        lines = debug.postgres_lines(None, None, _pg_stats(active_backends=1))
+        joined = "\n".join(lines)
+        assert "busy unknown" in joined
+        assert "throughput   unknown" in joined
+        assert "mem signal   unknown" in joined
+        assert "1 active" in joined  # the instant half still renders
+        assert "db 128 MB" in joined
+
+    def test_zero_window_degrades_the_rates(self) -> None:
+        """Two samples at the same monotonic instant have no window to rate over —
+        `unknown`, never a ZeroDivisionError."""
+        lines = "\n".join(
+            debug.postgres_lines(None, _pg_stats(), _pg_stats(monotonic=100.0))
+        )
+        assert "busy unknown" in lines
+        assert "throughput   unknown" in lines
+
+    def test_idle_database_reads_as_idle_not_fault(self) -> None:
+        before = _pg_stats()
+        after = _pg_stats(monotonic=102.0)  # identical counters, real window
+        lines = "\n".join(debug.postgres_lines(None, before, after))
+        assert "load         0 active · busy 0.0 bk-s/s" in lines
+        assert "throughput   0 tx/s · 0 tuples/s" in lines
+        assert "mem signal   window hit n/a (idle) · spill 0 B/s · deadlocks 0" in lines
+
+    def test_a_counter_reset_clamps_rates_at_zero(self) -> None:
+        """pg_stat_reset() between samples makes every counter go backwards; the
+        deltas clamp at 0 rather than rendering negative rates."""
+        before = _pg_stats()
+        after = _pg_stats(
+            active_time_ms=100.0,
+            xacts_total=10,
+            tuples_total=500,
+            blks_hit=90,
+            blks_read=10,
+            temp_bytes=0,
+            monotonic=102.0,
+        )
+        lines = "\n".join(debug.postgres_lines(None, before, after))
+        assert "busy 0.0 bk-s/s" in lines
+        assert "throughput   0 tx/s · 0 tuples/s" in lines
+        assert "window hit n/a (idle)" in lines
+        assert "spill 0 B/s" in lines
+
+    def test_row_order_is_pinned(self) -> None:
+        container = debug.ContainerMetrics(
+            cpu_percent=3.1, used_bytes=1048576, limit_bytes=2097152
+        )
+        lines = debug.postgres_lines(container, _pg_stats(), _pg_stats(monotonic=102.0))
+        expected = (
+            "cpu",
+            "mem ",
+            "load",
+            "throughput",
+            "mem signal",
+            "storage",
+            "rows",
+            "conns",
+            "cache",
+        )
+        assert len(lines) == len(expected)
+        for line, prefix in zip(lines, expected, strict=True):
+            assert line.startswith(prefix), line
 
 
 class TestChecksBlock:
@@ -1754,68 +1883,176 @@ class TestPrometheusSession:
         assert debug._prometheus_session_cache is None
 
 
+class TestRateHumanizers:
+    """The formatting helpers behind the native rows, directly: the renderer
+    tests exercise only a handful of values, and the plan waived a temp-spill
+    integration test on the promise that these are unit-covered."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0"),
+            (0.44, "0.4"),
+            (9.94, "9.9"),
+            (9.99, "10"),  # decided off the rounded value — never "10.0"
+            (41.0, "41"),
+            (999.99, "1000"),
+        ],
+    )
+    def test_rate(self, value: float, expected: str) -> None:
+        assert debug._rate(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0"),
+            (500, "500"),
+            (999.94, "1000"),
+            (999.99, "1.0k"),  # rounded-mantissa promotion at the unit seam
+            (1_000, "1.0k"),
+            (12_400, "12.4k"),
+            (999_940, "999.9k"),
+            (999_960, "1.0M"),  # never "1000.0k"
+            (2_500_000, "2.5M"),
+        ],
+    )
+    def test_count_rate(self, value: float, expected: str) -> None:
+        assert debug._count_rate(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, "0 B/s"),
+            (512, "512 B/s"),
+            (1023.4, "1023 B/s"),
+            (1023.6, "1 KB/s"),  # rounds into the next unit — never "1024 B/s"
+            (2048, "2 KB/s"),
+            (1_048_575, "1.0 MB/s"),  # never "1024 KB/s"
+            (5_242_880, "5.0 MB/s"),
+        ],
+    )
+    def test_bytes_rate(self, value: float, expected: str) -> None:
+        assert debug._bytes_rate(value) == expected
+
+
 class TestPostgresBlockWithContainerMetrics:
-    async def test_container_rows_lead_the_block(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        archive = MagicMock()
-        archive.stats = AsyncMock(
-            return_value=ArchiveStats(
-                database_bytes=1,
-                table_bytes=1,
-                rows_estimate=0,
-                rejected_estimate=0,
-                connections=1,
-                max_connections=100,
-                shared_buffers="128MB",
-                cache_hit_ratio=1.0,
-            )
+    def test_container_rows_lead_the_block(self) -> None:
+        container = debug.ContainerMetrics(
+            cpu_percent=3.1, used_bytes=1048576, limit_bytes=2097152
         )
-        monkeypatch.setattr(
-            debug,
-            "read_container_metrics",
-            AsyncMock(
-                return_value=debug.ContainerMetrics(
-                    cpu_percent=3.1, used_bytes=1048576, limit_bytes=2097152
-                )
-            ),
-        )
-        lines = await debug.postgres_lines(
-            archive, archive_enabled=True, prometheus_url="http://localhost:9090"
-        )
+        lines = debug.postgres_lines(container, None, _pg_stats())
         assert lines[0].startswith("cpu")
         assert lines[1].startswith("mem")
-        assert lines[2].startswith("storage")
+        assert lines[2].startswith("load")
 
-    async def test_sql_still_answers_when_the_metrics_stack_is_down(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Why the block is hybrid rather than all-PromQL: an LGTM outage costs
-        one line, not the whole block."""
-        archive = MagicMock()
-        archive.stats = AsyncMock(
-            return_value=ArchiveStats(
-                database_bytes=134217728,
-                table_bytes=1,
-                rows_estimate=7,
-                rejected_estimate=0,
-                connections=1,
-                max_connections=100,
-                shared_buffers="128MB",
-                cache_hit_ratio=1.0,
-            )
-        )
-        monkeypatch.setattr(
-            debug, "read_container_metrics", AsyncMock(return_value=None)
-        )
-        lines = "\n".join(
-            await debug.postgres_lines(
-                archive, archive_enabled=True, prometheus_url=None
-            )
-        )
+    def test_sql_still_answers_when_the_metrics_stack_is_down(self) -> None:
+        """Why the block is hybrid rather than all-PromQL: an LGTM outage costs the
+        cpu/mem pair, not the whole block — and the native rows are exactly the
+        signal that stays live with the `metrics` profile off."""
+        before = _pg_stats()
+        after = _pg_stats(xacts_total=1_082, monotonic=102.0)
+        lines = "\n".join(debug.postgres_lines(None, before, after))
         assert "n/a (no metrics source)" in lines
         assert "db 128 MB" in lines
-        assert "~7 plays" in lines
+        assert "~412083 plays" in lines
+        assert "41 tx/s" in lines
+
+
+class TestPostgresProbeOrchestration:
+    """The two-sample bracket in _postgres_probe, mirroring the Redis probe's
+    shape: first sample → window sleep → second sample gathered with Prometheus,
+    all inside one outer timeout."""
+
+    def _inputs(self, archive: Any, **overrides: Any) -> DebugInputs:
+        kwargs: dict[str, Any] = dict(
+            debug_enabled=False,
+            debug_overridden=False,
+            players=0,
+            archive=archive,
+            archive_enabled=True,
+        )
+        kwargs.update(overrides)
+        return DebugInputs(**kwargs)
+
+    async def test_rates_render_from_both_samples(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(debug, "_PG_WINDOW_SECS", 0.0)
+        archive = MagicMock()
+        archive.stats = AsyncMock(
+            side_effect=[
+                _pg_stats(),
+                _pg_stats(xacts_total=1_082, monotonic=102.0),
+            ]
+        )
+        lines = "\n".join(await debug._postgres_probe(self._inputs(archive)))
+        assert archive.stats.await_count == 2
+        assert "41 tx/s" in lines
+
+    async def test_first_sample_failure_costs_only_the_rates(self) -> None:
+        """Asymmetric on purpose: `before` failing must not take down the instant
+        fields, which need only the second sample. Runs with the REAL window and a
+        1s timeout to prove the probe skips the sleep — nothing to rate over means
+        nothing to wait for."""
+        archive = MagicMock()
+        archive.stats = AsyncMock(side_effect=[RuntimeError("boom"), _pg_stats()])
+        async with asyncio.timeout(1):
+            lines = "\n".join(await debug._postgres_probe(self._inputs(archive)))
+        assert "busy unknown" in lines
+        assert "throughput   unknown" in lines
+        assert "db 128 MB" in lines
+        assert "unavailable" not in lines
+
+    async def test_second_sample_failure_degrades_the_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the asymmetry: `after` carries the instant fields, so
+        its failure leaves nothing to render — the block degrades whole."""
+        monkeypatch.setattr(debug, "_PG_WINDOW_SECS", 0.0)
+        archive = MagicMock()
+        archive.stats = AsyncMock(side_effect=[_pg_stats(), RuntimeError("boom")])
+        blocks = await debug._postgres_blocks(self._inputs(archive))
+        assert blocks["Postgres"] == ["unavailable (RuntimeError)"]
+
+    async def test_the_probe_timeout_degrades_the_block(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The outer bound exists to release the archive's read slots: a hung
+        Postgres must cost this block, not ~32s of held read capacity."""
+        monkeypatch.setattr(debug, "_PG_PROBE_TIMEOUT_SECS", 0.05)
+
+        async def never() -> Any:
+            await asyncio.Event().wait()
+
+        archive = MagicMock()
+        archive.stats = never
+        blocks = await debug._postgres_blocks(self._inputs(archive))
+        assert blocks["Postgres"] == ["unavailable (TimeoutError)"]
+
+    async def test_prometheus_rides_the_second_sample(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(debug, "_PG_WINDOW_SECS", 0.0)
+        fetch = AsyncMock(return_value=None)
+        monkeypatch.setattr(debug, "read_container_metrics", fetch)
+        archive = MagicMock()
+        archive.stats = AsyncMock(side_effect=[_pg_stats(), _pg_stats()])
+        await debug._postgres_probe(
+            self._inputs(archive, prometheus_url="http://localhost:9090")
+        )
+        fetch.assert_awaited_once_with(
+            "http://localhost:9090", debug._POSTGRES_CONTAINER
+        )
+
+    async def test_disabled_archive_reads_as_a_choice(self) -> None:
+        """Mirrors -ping's OFF row: the ship default made this choice, and it must
+        not read as a fault."""
+        blocks = await debug._postgres_blocks(self._inputs(None, archive_enabled=False))
+        assert blocks["Postgres"] == ["off (archive disabled)"]
+
+    async def test_enabled_but_absent_archive_is_na(self) -> None:
+        blocks = await debug._postgres_blocks(self._inputs(None))
+        assert blocks["Postgres"] == ["n/a"]
 
 
 class TestGuardsMutationTestingFound:
