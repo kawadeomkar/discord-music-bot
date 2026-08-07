@@ -526,13 +526,32 @@ class TestComposeArchiveProfile:
         assert 'profiles: ["ops"]' in backfill
         assert "archive" not in backfill
 
-    def test_just_down_activates_the_archive_profile(self) -> None:
-        """`docker compose down` with the profile inactive removes only un-profiled
-        containers and leaves a running postgres behind, so the justfile recipe
-        must pass --profile archive. Greps the justfile — the same
-        cannot-import-a-shell-script reasoning as the preflight test below."""
+    # `just down` must pass --profile archive or it leaves a running postgres
+    # behind; that is pinned by the exact-string assertion in
+    # TestComposeMetricsProfile::test_just_down_also_stops_it below, which covers
+    # both profiles of the one `down` recipe. A second, weaker copy lived here.
+
+
+class TestComposeMetricsProfile:
+    """The docker-socket sidecar is opt-in for the same reason the archive tier is:
+    `:ro` restricts the socket INODE, not the Docker API, so anything holding it can
+    create a privileged container. That is not a cost to add to every deploy."""
+
+    def test_otelcol_metrics_is_profiled(self) -> None:
+        assert 'profiles: ["metrics"]' in _service_block("otelcol-metrics")
+
+    def test_it_is_the_only_service_mounting_the_docker_socket(self) -> None:
+        """If a second service ever mounts it, this profile stops being the gate
+        and the reasoning above quietly becomes false."""
+        directives = _compose_directives()
+        mounts = [ln for ln in directives.splitlines() if "docker.sock" in ln]
+        assert len(mounts) == 1, mounts
+
+    def test_just_down_also_stops_it(self) -> None:
+        """A `down` that leaves the socket-mounted container running is the one
+        that matters most to get right."""
         justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
-        assert "docker compose --profile archive down" in justfile
+        assert "--profile archive --profile metrics down" in justfile
 
 
 class TestComposeBakesTheCommit:

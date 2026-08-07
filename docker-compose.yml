@@ -338,7 +338,13 @@ services:
       retries: 3
 
   otel-lgtm:
-    image: grafana/otel-lgtm:latest
+    # Pinned (was :latest): the two grafana/ bind mounts below reach into
+    # image-internal paths (/otel-lgtm/grafana/conf/provisioning/...), so an
+    # unwatched image bump could move them out from under us. On every bump,
+    # re-verify the provisioning root and the four datasource UIDs
+    # (loki/prometheus/tempo/pyroscope) — docs/GRAFANA_DASHBOARD_PLAN.md has
+    # the check commands.
+    image: grafana/otel-lgtm:0.30.0
     container_name: discord-otel-lgtm
     restart: unless-stopped
     ports:
@@ -356,16 +362,78 @@ services:
       - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:
       - otel-grafana:/var/lib/grafana
-      - otel-tempo:/tmp/tempo
-      - otel-loki:/tmp/loki
+      # /data, not /tmp: same class of trap as the postgres 18 volume note
+      # below. This image's Tempo and Loki write under /data/tempo and
+      # /data/loki (see its tempo-config.yaml / loki-config.yaml); the old
+      # /tmp/* mount points were stale, so every container recreate silently
+      # destroyed all trace and log history while the volumes stayed empty.
+      # Discovered when a recreate during dashboard verification wiped Loki.
+      - otel-tempo:/data/tempo
+      - otel-loki:/data/loki
+      # Prometheus too (run-prometheus.sh: --storage.tsdb.path=/data/prometheus).
+      # It was the one store left off when the /tmp/* mounts were fixed, so every
+      # recreate wiped ALL span-metrics history while trace/log history survived —
+      # a dashboard full of "No data" stat panels next to healthy Loki panels.
+      - otel-prometheus:/data/prometheus
+      # Dashboard config-as-code. Both are SINGLE-FILE mounts on purpose:
+      # bind-mounting a directory over provisioning/dashboards/ (or
+      # datasources/) hides the image's own YAML there — Grafana comes up with
+      # no datasources / no stock dashboards and nothing says why. The JSON
+      # directory mounts OUTSIDE the provisioning tree; the provider file
+      # points at it and file-watches, so dashboard edits land without a
+      # container restart. See docs/GRAFANA_CONFIG_AS_CODE_PLAN.md.
+      - ./grafana/dashboards/discord-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/discord-provider.yaml:ro
+      - ./grafana/dashboards/json:/var/lib/grafana/dashboards/discord:ro
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      # curl, not wget: the 0.30.0 image (ubi9-micro base) ships no wget, so
+      # the old wget probe failed on every tick and the container sat
+      # permanently "unhealthy". Nothing depends_on this service, so the only
+      # symptom was a misleading status column.
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  otelcol-metrics:
+    # Metrics sidecar: docker_stats (per-container CPU/mem/net/IO) + redis
+    # server metrics, pushed as OTLP into otel-lgtm's collector — the bot
+    # itself exports traces and logs only, and otel-lgtm's embedded collector
+    # is a pure pass-through, so without this service Prometheus holds nothing
+    # but Tempo's span-derived metrics. Config: grafana/otelcol-metrics.yaml.
+    #
+    # Version matches the otelcol-contrib build inside grafana/otel-lgtm:0.30.0
+    # — not one of `just pins`' enforced pairs; check by hand when bumping
+    # either image (like the bgutil sidecar pair).
+    #
+    # OPT-IN (`metrics` profile), for the same reason the archive tier is: this
+    # mounts the docker socket, and `:ro` restricts the INODE, not the API — any
+    # process that can talk to that socket can create a privileged container and
+    # own the host. That is not a cost to add to every deploy silently, so it is a
+    # choice the operator makes. Without it the stack still runs; the dashboard's
+    # container panels and `-debug`'s postgres cpu/mem row read `n/a`.
+    #
+    # The hardening below is defence in depth, NOT the mitigation — nothing the
+    # container drops takes away what the socket grants. Keep this collector free
+    # of receivers that listen on the network: a pull-based receiver added to
+    # grafana/otelcol-metrics.yaml would turn a config edit into host root.
+    #
+    # NOT in the bot's depends_on, same reasoning as otel-lgtm: the OTLP
+    # exporter retries until the stack is up.
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: discord-otelcol-metrics
+    profiles: ["metrics"]
+    restart: unless-stopped
+    user: "0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./grafana/otelcol-metrics.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
   redis-data:
@@ -374,3 +442,4 @@ volumes:
   otel-grafana:
   otel-tempo:
   otel-loki:
+  otel-prometheus:
