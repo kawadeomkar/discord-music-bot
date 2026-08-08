@@ -170,6 +170,12 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
 
+# How long `-resume` waits for the restore it needs before answering. Generous for
+# one pipelined read against a healthy Redis, and a bound rather than a deadline:
+# the pool sets no socket_timeout, so an unbounded wait here is a command that never
+# answers at all when the server accepts the connection and then stops responding.
+RESUME_RESTORE_WAIT_SECS = 5.0
+
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
@@ -1234,10 +1240,12 @@ class MusicBot(commands.Cog):
         aliases=["st"],
         brief="stop playback, drop the queue and disconnect",
         help=(
-            "Stops the current song, discards the queue, removes the Now Playing "
+            "Stops the current song, drops the queue, removes the Now Playing "
             "card and disconnects the bot from the voice channel.\n\n"
             "This is the full teardown — use `-pause` if you only want to take a "
-            "break, or `-clear` if you want to empty the queue but keep playing."
+            "break, or `-clear` if you want to empty the queue but keep playing.\n\n"
+            "The queue is kept on the server for 24 hours, so `-resume` (or the "
+            "next `-play`) can pick it back up. The song that was playing is not."
         ),
         extras={"category": "Playback", "examples": ["-stop", "-st"]},
     )
@@ -1289,29 +1297,162 @@ class MusicBot(commands.Cog):
         help=(
             "Resumes a paused song from the position it stopped at, and re-pins "
             "the Now Playing card — with its live progress bar — to the bottom "
-            "of the channel."
+            "of the channel.\n\n"
+            "If the bot is not in a voice channel it joins yours first and picks "
+            "the previous session's queue back up, the same auto-join `-play` does."
         ),
-        extras={"category": "Playback", "examples": ["-resume", "-r"]},
+        extras={
+            "category": "Playback",
+            "examples": ["-resume", "-r"],
+            "note": (
+                "A `-stop` or a disconnect keeps the queue for 24 hours, so "
+                "`-resume` brings it back. The song that was playing comes back "
+                "too — but only after a crash; an intentional `-stop` drops it."
+            ),
+        },
     )
     @commands.before_invoke(validate_commands)
+    # Two -resumes racing on a disconnected bot both read `voice_client is None`,
+    # so validate_commands' "already being used in channel X" check cannot fire for
+    # either: they both join, the second MOVES the bot to its own author's channel,
+    # and both announce a resume. One at a time per guild; the second gets
+    # cog_command_error's MaxConcurrencyReached notice.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.resume")
     async def resume(self, ctx: commands.Context) -> None:
         try:
             vc = ctx.voice_client
-            if (
-                isinstance(vc, discord.VoiceClient)
-                and not vc.is_playing()
-                and vc.is_paused()
-            ):
-                mp = self.get_mp(ctx)
-                await mp.resume(vc)
-                await ctx.message.add_reaction("⏭️")
-                # If the -pause confirmation hosts the block, re-host it so
-                # "⏸️ Paused at…" becomes history instead of sitting beneath a
-                # live, advancing bar for the rest of the song.
-                await mp.rehost_np_after_resume()
+            if not isinstance(vc, discord.VoiceClient):
+                # Not in voice: the paused song went with the voice client, but the
+                # queue outlives it in Redis. Join and pick that up instead.
+                await self._resume_disconnected(ctx)
+                return
+            if vc.is_playing():
+                await ctx.send(
+                    embed=notice_embed(
+                        "Already playing — nothing is paused.", discord.Color.orange()
+                    )
+                )
+                return
+            if not vc.is_paused():
+                # No queue advice here: this branch also covers the seconds
+                # between two songs, where the queue is not empty at all.
+                await ctx.send(
+                    embed=notice_embed("Nothing is paused.", discord.Color.orange())
+                )
+                return
+            mp = self.get_mp(ctx)
+            await mp.resume(vc)
+            await ctx.message.add_reaction("⏭️")
+            # If the -pause confirmation hosts the block, re-host it so
+            # "⏸️ Paused at…" becomes history instead of sitting beneath a
+            # live, advancing bar for the rest of the song.
+            await mp.rehost_np_after_resume()
         except Exception as e:
             await self._command_error(ctx, e)
+
+    async def _resume_disconnected(self, ctx: commands.Context) -> None:
+        """`-resume` with the bot out of voice: join the author's channel and let the
+        persisted queue play again.
+
+        A `-stop`, an eject and a crash all leave `guild:{id}:queue` intact, so there
+        is something to come back to; only a crash also leaves the song that was
+        playing, which restore re-queues at its position (cleanup() scrubs those
+        state fields on the other two).
+        """
+        assert ctx.guild is not None  # validate_commands rejects DMs before this
+        async with background_typing(ctx):
+            mp = self.get_mp(ctx)
+            if not mp.can_rejoin_cold():
+                # A player still holding a song, or already past its gate, with no
+                # voice client: the eject that killed its audio never reached
+                # on_voice_state_update, so cleanup never ran. Rejoining around it
+                # would announce a resume its wedged loop is not going to deliver.
+                await self.cleanup(ctx.guild)
+                mp = self.get_mp(ctx)
+            # Not -play's concurrent join: it overlaps a 1-4s extraction, while the
+            # only work here is the snapshot read cog_before_invoke already started,
+            # and joining first would park the bot in a channel for an empty queue.
+            if not await mp.wait_for_restore(timeout=RESUME_RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try `-resume` "
+                        "again in a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            # Built while the display head is still the restored one — once the gate
+            # opens the loop pops that head out from under this.
+            embed = mp.build_rejoin_resume_embed()
+            if embed is None:
+                # A restore that could not read reaches here too, with an empty queue
+                # it never filled. Claiming nothing was left would be asserting what
+                # it cannot know — the queue outlives this bot in Redis.
+                detail = (
+                    "Nothing to resume — no queue was left from a previous "
+                    "session. Use `-play` to start one."
+                    if mp.store is not None and not mp.restore_read_failed
+                    else "Can't reach the queue store, so there is nothing to "
+                    "resume from. Use `-play` to start a new queue."
+                )
+                await ctx.send(embed=notice_embed(detail, discord.Color.orange()))
+                return
+
+            # The same hold -play takes across its join: without it the head starts
+            # playing — and posts its own Now Playing card — before the response
+            # explaining why the bot just joined reaches the channel.
+            async with mp.defer_playback():
+                try:
+                    await ctx.invoke(self.join)
+                    # is_connected(), not just the type: discord.py registers the
+                    # voice client on the guild BEFORE the handshake, so a
+                    # concurrent cold -play can leave a still-connecting one here,
+                    # and vc.play() on it raises once per restored song.
+                    joined_vc = ctx.voice_client
+                    joined = (
+                        isinstance(joined_vc, discord.VoiceClient)
+                        and joined_vc.is_connected()
+                    )
+                except BaseException:
+                    # join swallows its own Exceptions, so an escape means its error
+                    # REPORTING failed (a Forbidden out of ctx.send) or the command
+                    # was cancelled. Both leave the same wreckage as a reported
+                    # failure, so both take the same exit.
+                    await self._abandon_rejoin(ctx, mp)
+                    raise
+                if not joined:
+                    # join already told the user why; nothing to add here.
+                    await self._abandon_rejoin(ctx, mp)
+                    return
+                await ctx.send(embed=embed)
+
+    async def _abandon_rejoin(self, ctx: commands.Context, mp: MusicPlayer) -> None:
+        """Drop the player `-resume` was about to hand a voice connection to.
+
+        defer_playback opens the gate as it unwinds whether or not the join worked,
+        and a loop that wakes with no voice client fails its `vc` assertion once per
+        restored song — draining the in-memory queue while Redis keeps every entry,
+        one red embed at a time. Tearing the player down first makes that gate-open
+        land on a cancelled loop, which is inert.
+
+        The re-park FOLLOWS cleanup(): a crash-recovered head lives only in this
+        player's memory (restore cleared its state fields the moment it re-queued
+        it), so dropping the player is what loses it — and cleanup()'s
+        clear_connection() HDELs the very fields the re-park writes.
+
+        All of it is skipped while another command holds the gate. That one is
+        mid-join on this same player, still expects to hand it a voice client, and
+        owns the teardown call; tearing down under it is the failure this method
+        exists to prevent, one caller up.
+        """
+        if mp.playback_holds > 1:  # this command's own hold, plus someone else's
+            return
+        if ctx.guild is not None:
+            with contextlib.suppress(Exception):
+                await self.cleanup(ctx.guild)
+        with contextlib.suppress(Exception):
+            await mp.repark_crashed_head()
 
     @commands.command(
         name="shuffle",
@@ -1344,7 +1485,7 @@ class MusicBot(commands.Cog):
         brief="connect the bot to your voice channel",
         help=(
             "Connects the bot to the voice channel you are in and reports its "
-            "latency. You rarely need this — `-play` joins for you.\n\n"
+            "latency. You rarely need this — `-play` and `-resume` join for you.\n\n"
             "If the bot is already playing in a different voice channel it stays "
             "there rather than abandoning that listener."
         ),

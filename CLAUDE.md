@@ -701,7 +701,7 @@ Per-guild synchronization primitives and what they protect:
 | Primitive | Protects |
 |---|---|
 | `GuildQueue._mutex` | all three queue legs during bulk mutations; dequeue commits |
-| `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves |
+| `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
