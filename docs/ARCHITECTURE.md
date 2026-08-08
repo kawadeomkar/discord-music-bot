@@ -304,7 +304,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
 | Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist_stream()` (sequential `next`-cursor pages) → N `YTSource` search items |
-| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album_stream()` (page 1 rides `GET /v1/albums/{id}`, later pages fan out concurrently) → N `YTSource` search items |
+| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album_stream()` (page 1 rides `GET /v1/albums/{id}`, later pages follow its embedded `next` cursor) → N `YTSource` search items. A leading locale segment (`/intl-de/…`, what Spotify's own share sheet emits for non-English clients) is dropped before the type is read |
 | Other Spotify link | `/artist/`, `/show/`, … | `UnsupportedSpotifyLinkError` — never a `ValueError`, which would fall back to a YouTube search for the raw URL |
 | SoundCloud URL | `https://soundcloud.com/...` | `SoundcloudSource` → yt-dlp directly |
 
@@ -803,8 +803,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist_tracks:{id}` | String | JSON array of track titles, written only on a full drain | 1 h (user-editable) |
-| `spotify:album_tracks:{id}` | String | JSON array of track titles, written only on a full drain | 24 h (albums are immutable) |
+| `spotify:playlist_tracks:{id}` | String | orjson object (`_collection_to_cache`: id/total/name/artists/thumbnail/release_date/titles), written only on a full drain | 1 h (user-editable) |
+| `spotify:album_tracks:{id}` | String | same object shape, written only on a full drain whose title count equals the album's `total` | 24 h (albums are immutable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -1400,26 +1400,45 @@ Two placement rules are load-bearing:
    a snapshot taken after the pop reads the post-teardown value and every page then
    matches and commits onto a dead guild's persisted mirror.
 
-**Drain bounds.** `_HTTP_TIMEOUT` bounds one request, not a stream, so both collection
-drains run under `_COLLECTION_DRAIN_TIMEOUT_SECS`. That ceiling sits below the two things
-the drains are nested inside: the 300s playback gate (the buffered front path holds it,
-and reaching the gate's own timeout tears the player down and refuses the finished
-`put_front`, losing the collection) and `_ENQUEUE_WAIT_SECS` (the streaming tail holds the
-per-guild enqueue lock, stalling `-shuffle` and YouTube-playlist enqueues behind Spotify
-I/O). Timing out keeps what already arrived and reports a partial enqueue.
+**Drain bounds.** `_HTTP_TIMEOUT` bounds one request, not a stream, so every drain leg —
+the page-1 fetch, the streaming tail, and the buffered front drain — runs under its own
+`_COLLECTION_DRAIN_TIMEOUT_SECS` budget. Per-leg budgets keep the whole enqueue-lock hold
+well under the 300s playback gate (the buffered front path holds the gate, and reaching
+the gate's own timeout tears the player down and refuses the finished `put_front`, losing
+the collection). They do **not** keep the hold under `_ENQUEUE_WAIT_SECS`: two legs plus
+notification sends can outlive 60s, so that constant is how long a *waiter* is willing to
+stand in line before being declined, not a promise that the line moves. The tail's
+deadline covers page **fetches** only — each `queue_put` runs outside it, because a put
+is a three-leg mutation whose Redis leg suspends inside the queue mutex, and a deadline
+expiring there would split memory from the mirror (the buffered path has always kept its
+`put_front` outside the timeout for the same reason). Timing out keeps what already
+arrived and reports a partial enqueue.
 
 ### Spotify collection paging
 
 Albums and playlists resolve through async-generator pagers (`album_stream`,
 `playlist_stream`) yielding `TrackPage`s of YouTube search titles, so `-play` can enqueue
-page 1 and start playback while the rest arrives.
+page 1 and start playback while the rest arrives. **One exception:** `-play` on a
+disconnected bot whose previous queue is still persisted (a `-stop` leaves it in Redis)
+takes the *buffered* front path — the whole collection is drained first and lands ahead
+of the restored backlog in a single `put_front`, because successive per-page front
+inserts would invert page order. On that path playback starts only after the drain
+(bounded by `_COLLECTION_DRAIN_TIMEOUT_SECS`; a timeout keeps what arrived).
 
-**Album vs playlist paging differ for a reason.** An album's page 1 rides the single
-`GET /v1/albums/{id}` that also returns its identity (name, artists, cover art, total),
-and later pages fan out concurrently by offset — safe *only* because albums are immutable
-once released. A playlist can be edited between requests, which shifts every offset and
-would silently duplicate or drop tracks, so `playlist_stream` follows the `next` cursor
-sequentially. Do not copy the fanout onto the playlist path.
+**Both pagers walk Spotify's own `next` cursor sequentially.** An album's page 1 rides
+the single `GET /v1/albums/{id}` that also returns its identity (name, artists, cover
+art, total); later pages follow the embedded paging object's cursor verbatim, exactly as
+playlists follow theirs. Sequential paging was chosen over an offset fanout even though
+album immutability would make one safe: the tail drains after playback has started, so
+the latency a fanout saves is invisible, while a cursor cannot skip or duplicate a run
+of tracks the way offset arithmetic against a lying `total`/`limit` could. Both walks
+are bounded by a page cap (`ceil(total/page_size)` + slack) so a cursor that stops
+advancing abandons the drain finite and uncached instead of spinning duplicates into
+the queue. A drained album is cached only when its title count equals the album's own
+`total` — albums never skip items, so short means truncated, and a truncation cached
+for 24h would be served as the whole album with no error anywhere. (Playlists carry no
+such equality: episode/null items are legitimately skipped, so their `total` is an
+upper bound.)
 
 **Cache discipline.** `spotify:{album,playlist}_tracks:{id}` is written only when the
 consumer iterates *past* the final page — i.e. the generator resumes after its last yield.

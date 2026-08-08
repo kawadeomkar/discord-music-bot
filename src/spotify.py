@@ -30,13 +30,11 @@ _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
 _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h — albums are immutable once released
 
-# Paging limits are Spotify's, not ours: 51 on an album-tracks request and 101
-# on a playlist request are both HTTP 400. _ALBUM_PAGE_LIMIT applies only to the
-# /albums/{id}/tracks?limit= requests we issue — page 1 arrives inside
-# GET /v1/albums/{id}, whose stride is read off the response, never assumed.
-_ALBUM_PAGE_LIMIT = 50
+# The paging limit is Spotify's, not ours: 101 on a playlist request is HTTP
+# 400. Albums send no explicit limit anywhere — page 1 arrives inside
+# GET /v1/albums/{id} and later pages follow its embedded `next` cursor
+# verbatim, so the album stride is always Spotify's own choice, never assumed.
 _PLAYLIST_PAGE_LIMIT = 100
-_ALBUM_PAGE_CONCURRENCY = 5  # measured safe: no Retry-After on a 20-page burst
 # `type` is in the mask so the unwrap can reject podcast episodes by name;
 # `next`/`total` are what the shipped mask omitted — the omission was the
 # entire >100-track truncation bug.
@@ -48,8 +46,12 @@ _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 # Pagination made one request per command into ceil(total/100), and the
 # collection lock is per guild, so only this semaphore bounds the app-wide rate
-# against one client-credentials app. Loop-agnostic since 3.10, so module scope
-# is safe.
+# against one client-credentials app. Module scope is safe for the PROCESS —
+# main() runs one asyncio.run for its lifetime — but the primitive is NOT
+# loop-agnostic: 3.10 removed the `loop` parameter, and _LoopBoundMixin still
+# pins it to the first loop that CONTENDS it (measured: a second loop raises
+# "bound to a different event loop"). The test suite gives every test a fresh
+# loop, so conftest rebinds this handle per test.
 _MAX_CONCURRENT_REQUESTS = 10
 _MAX_429_RETRIES = 3
 # Capped because Spotify's Retry-After can be minutes. _MAX_429_RETRIES * this
@@ -58,6 +60,18 @@ _MAX_429_RETRIES = 3
 # the drain bound instead. Keep that inequality if either moves.
 _MAX_RETRY_AFTER_SECS = 10.0
 _request_slots = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
+
+
+def _cursor_page_cap(total: int, page_size: int) -> int:
+    """Upper bound on pages a well-formed cursor walk can need.
+
+    The streams otherwise trust Spotify to terminate with `next: null`; a
+    cursor that stops advancing would spin duplicate pages into the consumer's
+    queue until its drain budget expires, growing the queue and its Redis
+    mirror the whole way. ceil(total/page_size) plus slack for a `total` that
+    under-reports. Hitting the cap abandons the drain — what arrived stays
+    yielded, nothing is cached."""
+    return -(-total // max(1, page_size)) + 2
 
 
 def _track_search_title(track: dict[str, Any]) -> str:
@@ -425,12 +439,12 @@ class Spotify:
 
         Page 1 rides GET /v1/albums/{id}: one call returns the album's
         identity (name, artists, cover art, total) AND its first tracks page,
-        so a ≤stride album costs a single HTTP round-trip. Later pages use a
-        concurrent offset fanout — safe only because albums are immutable
-        once released; a mutable collection paged by offset can silently
-        duplicate or drop tracks when an edit lands between requests, which
-        is why playlist_stream pages sequentially. Do not copy the fanout
-        onto the playlist path.
+        so a one-page album costs a single HTTP round-trip. Later pages follow
+        the embedded paging object's `next` cursor, exactly like
+        playlist_stream: sequential paging costs a few hundred ms per extra
+        page, all of it after playback has started (the tail drains once the
+        gate is open), and a cursor cannot skip or duplicate a run of tracks
+        the way offset arithmetic against a lying `total`/`limit` could.
         """
         span = trace.get_current_span()
         span.set_attribute("spotify.album_id", aid)
@@ -445,8 +459,8 @@ class Spotify:
             return
 
         resp = await self.http_call(self.spotify_endpoint + f"v1/albums/{aid}")
-        tracks = resp.get("tracks") or {}
-        total: int = tracks.get("total", 0)
+        page = resp.get("tracks") or {}
+        total: int = page.get("total", 0)
         images = resp.get("images") or []
         collection = SpotifyCollection(
             kind=SpotifyType.ALBUM,
@@ -457,79 +471,45 @@ class Spotify:
             thumbnail=images[0].get("url") if images else None,
             release_date=resp.get("release_date"),
         )
-        # Album items ARE the track (SimplifiedTrackObject) — no ["track"]
-        # wrapper, no episodes, so no unwrap guard.
-        page1 = [_track_search_title(t) for t in tracks.get("items") or []]
-        all_titles = list(page1)
-        if tracks.get("next") is None:
-            yield TrackPage(collection=collection, titles=page1, is_last=True)
-            # Reached only on a full drain. Empty is never cached: immutability
-            # makes a real empty album safe, but not a malformed or partial
-            # response, which would stick for 24h.
-            if all_titles:
-                await cache_set(
-                    self._redis,
-                    cache_key,
-                    _collection_to_cache(collection, all_titles),
-                    _ALBUM_TTL,
+        # Page size for the cap is page 1's own item count — the `next` cursor
+        # carries page 1's limit forward, so every later page has the same
+        # stride. 50 is only the fallback for a malformed empty-but-has-next
+        # page 1, where any finite cap serves.
+        page_cap = _cursor_page_cap(total, len(page.get("items") or []) or 50)
+        all_titles: list[str] = []
+        pages_seen = 0
+        while True:
+            # Album items ARE the track (SimplifiedTrackObject) — no ["track"]
+            # wrapper, no episodes, so no unwrap guard.
+            titles = [_track_search_title(t) for t in page.get("items") or []]
+            next_url = page.get("next")
+            all_titles.extend(titles)
+            pages_seen += 1
+            yield TrackPage(
+                collection=collection, titles=titles, is_last=next_url is None
+            )
+            if next_url is None:
+                break
+            if pages_seen >= page_cap:
+                log.warning(
+                    f"album {aid}: cursor still live after {pages_seen} pages "
+                    f"(total={total}); abandoning drain"
                 )
-            return
-
-        # The first page's stride is Spotify's choice on a limit-less endpoint
-        # (documented 20, measured 50) — starting the fanout at a hardcoded 50
-        # against a 20-item page 1 would silently drop tracks 21–49 of every
-        # album. Derive it; only the explicit ?limit= requests below use ours.
-        stride: int = tracks.get("limit") or len(page1)
-        yield TrackPage(collection=collection, titles=page1, is_last=False)
-
-        offsets = list(range(stride, total, _ALBUM_PAGE_LIMIT))
-        for wave_start in range(0, len(offsets), _ALBUM_PAGE_CONCURRENCY):
-            wave = offsets[wave_start : wave_start + _ALBUM_PAGE_CONCURRENCY]
-            try:
-                async with asyncio.TaskGroup() as tg:
-                    # TaskGroup, not gather: a failed page cancels its
-                    # siblings instead of leaving them hitting Spotify with
-                    # their results discarded. No yield happens inside the
-                    # group — every wave completes before its pages go out.
-                    tasks = [
-                        tg.create_task(self._album_page(aid, offset)) for offset in wave
-                    ]
-            except BaseExceptionGroup as eg:
-                # Callers speak single exceptions (SpotifyAuthError handling,
-                # _command_error). Siblings are already cancelled; surface the
-                # first real failure.
-                raise eg.exceptions[0]
-            for offset, task in zip(wave, tasks):
-                titles = task.result()
-                all_titles.extend(titles)
-                yield TrackPage(
-                    collection=collection,
-                    titles=titles,
-                    is_last=offset == offsets[-1],
-                )
-        await cache_set(
-            self._redis,
-            cache_key,
-            _collection_to_cache(collection, all_titles),
-            _ALBUM_TTL,
-        )
-
-    @_tracer.start_as_current_span("spotify.album_page")
-    async def _album_page(self, aid: str, offset: int) -> list[str]:
-        """One explicit album-tracks page — the fanout worker for album_stream.
-
-        Span-decorated (a coroutine, unlike the generators above — see the
-        section comment): each page of a fanout gets its own named span, so a
-        slow or failed page is attributable in the trace instead of being one
-        of N indistinguishable aiohttp client spans under the command."""
-        span = trace.get_current_span()
-        span.set_attribute("spotify.album_id", aid)
-        span.set_attribute("spotify.page_offset", offset)
-        resp = await self.http_call(
-            self.spotify_endpoint + f"v1/albums/{aid}/tracks",
-            params={"offset": offset, "limit": _ALBUM_PAGE_LIMIT},
-        )
-        return [_track_search_title(t) for t in resp.get("items") or []]
+                return
+            page = await self._collection_page(next_url)
+        # Reached only on a full drain, and guarded twice: an empty result is
+        # never cached (immutability makes a real empty album safe, but not a
+        # malformed response), and neither is a drain the cursor ended short
+        # of the album's own total — albums never skip items, so short means
+        # wrong, and an under-count cached here would serve the truncation for
+        # 24h with no error anywhere. A miss self-heals; a cache write sticks.
+        if all_titles and len(all_titles) == total:
+            await cache_set(
+                self._redis,
+                cache_key,
+                _collection_to_cache(collection, all_titles),
+                _ALBUM_TTL,
+            )
 
     async def playlist_stream(self, pid: str) -> AsyncGenerator[TrackPage]:
         """Yield a playlist's tracks as TrackPages of YouTube search titles.
@@ -569,7 +549,9 @@ class Spotify:
         collection = SpotifyCollection(
             kind=SpotifyType.PLAYLIST, id=pid, total=resp.get("total", 0)
         )
+        page_cap = _cursor_page_cap(collection.total, _PLAYLIST_PAGE_LIMIT)
         all_titles: list[str] = []
+        pages_seen = 0
         while True:
             titles: list[str] = []
             for item in resp.get("items") or []:
@@ -583,12 +565,19 @@ class Spotify:
                 titles.append(_track_search_title(track))
             next_url = resp.get("next")
             all_titles.extend(titles)
+            pages_seen += 1
             yield TrackPage(
                 collection=collection, titles=titles, is_last=next_url is None
             )
             if next_url is None:
                 break
-            resp = await self._playlist_page(next_url)
+            if pages_seen >= page_cap:
+                log.warning(
+                    f"playlist {pid}: cursor still live after {pages_seen} "
+                    f"pages (total={collection.total}); abandoning drain"
+                )
+                return
+            resp = await self._collection_page(next_url)
         if not all_titles:
             # Never cache "empty": _PLAYLIST_TTL is 1h because playlists are
             # user-editable, and the edit that follows this result is the user
@@ -601,11 +590,13 @@ class Spotify:
             _PLAYLIST_TTL,
         )
 
-    @_tracer.start_as_current_span("spotify.playlist_page")
-    async def _playlist_page(self, next_url: str) -> Any:
-        """One cursor-following playlist page — traced for the same reason as
-        _album_page: per-page drain time stays attributable in the trace. The
-        URL is Spotify's own `next` value, followed verbatim."""
+    @_tracer.start_as_current_span("spotify.collection_page")
+    async def _collection_page(self, next_url: str) -> Any:
+        """One cursor-following page, album or playlist — span-decorated (a
+        coroutine, unlike the generators above; see the section comment) so
+        per-page drain time stays attributable in the trace instead of being
+        one of N indistinguishable aiohttp client spans under the command.
+        The URL is Spotify's own `next` value, followed verbatim."""
         trace.get_current_span().set_attribute("spotify.page_url", next_url)
         return await self.http_call(next_url)
 

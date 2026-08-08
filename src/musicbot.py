@@ -45,6 +45,7 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSpotifyLinkError,
     YTSource,
     YTType,
     parse_input,
@@ -189,9 +190,12 @@ _ENQUEUE_WAIT_SECS = 60.0
 # waiters that all fire into the queue at once when the drain finishes.
 _ENQUEUE_MAX_WAITERS = 5
 # _HTTP_TIMEOUT bounds one request, so a 100-page playlist could otherwise run
-# 3000s. Sits under both bounds the drains are nested inside — the 300s playback
-# gate and _ENQUEUE_WAIT_SECS — so neither is reached by a slow drain. Timing
-# out keeps what arrived. See docs/ARCHITECTURE.md#queue-invariant.
+# 3000s. Bounds each drain leg SEPARATELY — the page-1 fetch, the tail, and the
+# buffered front drain each get one budget — keeping the whole enqueue-lock
+# hold well under the 300s playback gate. It does NOT keep the hold under
+# _ENQUEUE_WAIT_SECS: two legs plus sends can outlive 60s, so that bound is how
+# long a waiter is willing to stand in line, not a promise the line moves.
+# Timing out keeps what arrived. See docs/ARCHITECTURE.md#queue-invariant.
 _COLLECTION_DRAIN_TIMEOUT_SECS = 45.0
 
 
@@ -806,6 +810,7 @@ class MusicBot(commands.Cog):
                     PlaylistInputError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
+                    UnsupportedSpotifyLinkError,
                 ),
             ):
                 # Show the user-safe line, not the raw message: yt-dlp's carries
@@ -924,42 +929,33 @@ class MusicBot(commands.Cog):
         """
         assert ctx.guild is not None
         entry = self._enqueue_locks.setdefault(ctx.guild.id, _GuildEnqueueLock())
-        if not entry.lock.locked():
-            # No await between the locked() check and acquire(), so this cannot
-            # barge past a live waiter. It can still park during a release→wakeup
-            # handoff, when locked() reads False while waiters are queued, so the
-            # timeout keeps the bounded wait in that window.
-            try:
-                async with asyncio.timeout(_ENQUEUE_WAIT_SECS):
-                    await entry.lock.acquire()
-            except TimeoutError:
+        waiting = entry.lock.locked()
+        if waiting:
+            if entry.waiters >= _ENQUEUE_MAX_WAITERS:
                 await ctx.send(
                     embed=notice_embed(
-                        "Still queueing a large collection — try again in a moment.",
+                        "Too many albums/playlists are queueing right now — try "
+                        "again in a moment.",
                         discord.Color.orange(),
                     )
                 )
                 return None
-            return entry
-        if entry.waiters >= _ENQUEUE_MAX_WAITERS:
-            await ctx.send(
-                embed=notice_embed(
-                    "Too many albums/playlists are queueing right now — try "
-                    "again in a moment.",
-                    discord.Color.orange(),
-                )
-            )
-            return None
-        entry.waiters += 1
+            entry.waiters += 1
         try:
-            # A command sitting silently behind a 40s drain reads as a dead
-            # bot — acknowledge the wait before blocking.
-            await ctx.send(
-                embed=notice_embed(
-                    "Waiting for another album/playlist to finish queueing…",
-                    discord.Color.blue(),
+            if waiting:
+                # A command sitting silently behind a 40s drain reads as a dead
+                # bot — acknowledge the wait before blocking. Only real waiters
+                # get the ack (and the counter): the uncontended path below has
+                # no await between the locked() check above and acquire(), so
+                # it cannot barge past a live waiter. It can still park during
+                # a release→wakeup handoff, when locked() reads False while
+                # waiters are queued — the shared timeout bounds that window.
+                await ctx.send(
+                    embed=notice_embed(
+                        "Waiting for another album/playlist to finish queueing…",
+                        discord.Color.blue(),
+                    )
                 )
-            )
             try:
                 async with asyncio.timeout(_ENQUEUE_WAIT_SECS):
                     await entry.lock.acquire()
@@ -972,7 +968,8 @@ class MusicBot(commands.Cog):
                 )
                 return None
         finally:
-            entry.waiters -= 1
+            if waiting:
+                entry.waiters -= 1
         return entry
 
     @_tracer.start_as_current_span("bot.enqueue_collection")
@@ -995,7 +992,19 @@ class MusicBot(commands.Cog):
         is_album = resolved.kind is SpotifyType.ALBUM
         noun = "album" if is_album else "playlist"
         try:
-            page1 = await resolved.first_page
+            # Bounded like every other drain leg: unbounded, page 1 was the
+            # one fetch outside every deadline, and a rate-limited identity
+            # call could hold the enqueue lock (and, on the front path, the
+            # playback gate) for http_call's full retry ladder — ~150s against
+            # waiters that give up at 60. The timeout cancels only our await;
+            # the task itself is cancelled by pager.aclose() on the abandon
+            # path in _play_resolved's finally.
+            async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                page1 = await resolved.first_page
+        except TimeoutError:
+            raise ValueError(
+                f"Spotify took too long loading the {noun} — try again shortly"
+            ) from None
         except StopAsyncIteration:
             # The generators always yield at least one page; this is belt and
             # braces so a future edit can't turn it into an opaque crash.
@@ -1223,36 +1232,49 @@ class MusicBot(commands.Cog):
             async with contextlib.aclosing(drain.resolved.pages) as pages:
                 # Bounded because this drain holds the enqueue lock: unbounded, a
                 # slow collection stalls -shuffle and YouTube-playlist enqueues
-                # until they are declined. aclosing sits outside so aclose() runs
-                # after the cancellation is converted, not during it.
-                async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
-                    async for page in pages:
-                        ok = await mp.queue_put(
-                            spotify_titles_to_ytsearch(page.titles),
-                            prefetch=False,
-                            expected_generation=drain.generation,
-                        )
-                        if not ok:
-                            # A clear/teardown landed: the collection this page
-                            # belongs to was deleted. Abandon without refilling —
-                            # the regression this design exists to prevent.
-                            log.info("collection drain abandoned: queue invalidated")
-                            # Teardown-neutral copy: of the five doors that bump
-                            # the generation, only -clear empties the queue — the
-                            # others (-stop, kick, alone-timer, gate timeout)
-                            # deliberately leave pages 1..k persisted.
-                            with contextlib.suppress(Exception):
-                                await ctx.send(
-                                    embed=notice_embed(
-                                        f"Queueing stopped after {drain.enqueued} "
-                                        f"{pluralize(drain.enqueued, 'song')} — "
-                                        "the queue was cleared or playback was "
-                                        "stopped.",
-                                        discord.Color.orange(),
-                                    )
+                # until they are declined. One rolling deadline covers every
+                # page FETCH, but each queue_put runs OUTSIDE it — the same
+                # discipline as the buffered path. A put is a three-leg
+                # mutation whose Redis leg suspends inside the queue mutex;
+                # a deadline expiring there cancels between the in-memory legs
+                # and the mirror, leaving `-queue` showing songs a restart
+                # silently drops. aclosing sits outside so aclose() runs after
+                # the cancellation is converted, not during it.
+                deadline = (
+                    asyncio.get_running_loop().time() + _COLLECTION_DRAIN_TIMEOUT_SECS
+                )
+                while True:
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            page = await anext(pages)
+                    except StopAsyncIteration:
+                        break
+                    ok = await mp.queue_put(
+                        spotify_titles_to_ytsearch(page.titles),
+                        prefetch=False,
+                        expected_generation=drain.generation,
+                    )
+                    if not ok:
+                        # A clear/teardown landed: the collection this page
+                        # belongs to was deleted. Abandon without refilling —
+                        # the regression this design exists to prevent.
+                        log.info("collection drain abandoned: queue invalidated")
+                        # Teardown-neutral copy: of the five doors that bump
+                        # the generation, only -clear empties the queue — the
+                        # others (-stop, kick, alone-timer, gate timeout)
+                        # deliberately leave pages 1..k persisted.
+                        with contextlib.suppress(Exception):
+                            await ctx.send(
+                                embed=notice_embed(
+                                    f"Queueing stopped after {drain.enqueued} "
+                                    f"{pluralize(drain.enqueued, 'song')} — "
+                                    "the queue was cleared or playback was "
+                                    "stopped.",
+                                    discord.Color.orange(),
                                 )
-                            return
-                        drain.enqueued += len(page.titles)
+                            )
+                        return
+                    drain.enqueued += len(page.titles)
         except TimeoutError:
             # Budget spent. What is queued stays queued and the command ends
             # here rather than holding the enqueue lock any longer — every

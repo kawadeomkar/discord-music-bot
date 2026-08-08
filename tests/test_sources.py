@@ -188,13 +188,56 @@ class TestParseUrlSpotify:
         assert result.type == SpotifyType.ALBUM
         assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
 
+    @pytest.mark.parametrize(
+        ("locale", "kind", "expected_type"),
+        [
+            ("intl-de", "album", SpotifyType.ALBUM),
+            ("intl-pt", "track", SpotifyType.TRACK),
+            ("intl-ja", "playlist", SpotifyType.PLAYLIST),
+        ],
+    )
+    def test_intl_locale_prefix_is_dropped(
+        self, locale: str, kind: str, expected_type: SpotifyType
+    ) -> None:
+        """Spotify's own share sheet emits /intl-xx/ links for every
+        non-English client — rejecting them rejects the URL half the world
+        copies, with copy telling the user to paste what they just pasted."""
+        url = f"https://open.spotify.com/{locale}/{kind}/6WgSCcRfaXuBVfM2TpV0Kl"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, SpotifySource)
+        assert result.type is expected_type
+        assert result.id == "6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def test_intl_prefixed_unsupported_type_still_raises(self) -> None:
+        """The locale strip must expose the real type, not blindly accept."""
+        url = "https://open.spotify.com/intl-fr/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url, f"-play {url}")
+        assert "'artist'" in str(exc_info.value)
+
+    def test_spotify_link_without_id_raises_cleanly(self) -> None:
+        """A bare /album (type, no id) used to escape as a raw IndexError."""
+        url = "https://open.spotify.com/album"
+        with pytest.raises(UnsupportedSpotifyLinkError, match="has no id"):
+            parse_url(url, f"-play {url}")
+
     def test_unknown_spotify_type_raises(self) -> None:
         url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
         with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
             parse_url(url, f"-play {url}")
-        # The message names the supported types so the user can act on it.
+        # The message names the supported types so the user can act on it —
+        # as a sentence ("or"), not a bare comma join.
         assert "'artist'" in str(exc_info.value)
-        assert "track, playlist, album" in str(exc_info.value)
+        assert "track, playlist or album" in str(exc_info.value)
+
+    def test_user_message_is_the_message(self) -> None:
+        """_command_error renders `user_message` for allowlisted classes; the
+        property existing is what keeps the class-name prefix out of the
+        embed."""
+        url = "https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d"
+        with pytest.raises(UnsupportedSpotifyLinkError) as exc_info:
+            parse_url(url, f"-play {url}")
+        assert exc_info.value.user_message == str(exc_info.value)
 
     def test_unknown_spotify_type_is_not_a_value_error(self) -> None:
         """Regression guard: parse_input catches ValueError and falls back to a

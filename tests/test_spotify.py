@@ -12,7 +12,6 @@ from redis.asyncio import Redis
 
 from src.sources import SpotifyType
 from src.spotify import (
-    _ALBUM_PAGE_CONCURRENCY,
     _ALBUM_TTL,
     _HTTP_TIMEOUT,
     _MAX_429_RETRIES,
@@ -20,6 +19,7 @@ from src.spotify import (
     _MAX_RETRY_AFTER_SECS,
     _PLAYLIST_FIELDS,
     _collection_from_cache,
+    _cursor_page_cap,
     Spotify,
     SpotifyAuthError,
     SpotifyRateLimitError,
@@ -295,6 +295,35 @@ class TestRateLimitHandling:
         ):
             await spotify.http_call("https://api.spotify.com/v1/albums/a1")
 
+        assert excinfo.value.retry_after is None
+        assert [c.args[0] for c in sleep.await_args_list] == [1.0, 2.0, 4.0]
+        # The no-delay user_message arm is production-reachable (absent header,
+        # or Retry-After: 0) and renders straight into a channel embed from
+        # _drain_collection_tail — it must exist and must not leak the request.
+        assert "rate-limiting" in excinfo.value.user_message
+        assert "api.spotify.com" not in excinfo.value.user_message
+
+    async def test_http_date_retry_after_falls_back_to_backoff(
+        self, spotify: Spotify
+    ) -> None:
+        """The HTTP-date Retry-After form the docstring declines to parse:
+        malformed-header handling fell out of coverage when the old
+        `not-a-number` case was deleted, and without the except a date header
+        turns a 429 into an unhandled ValueError mid-drain — whose generic
+        notice tells the user to re-run, doubling the load that earned the
+        429."""
+        session = _make_mock_session(_resp_429("Wed, 21 Oct 2026 07:28:00 GMT"))
+        spotify._session_factory = lambda **kw: session
+        spotify.token_expiry = time.time() + 3600
+
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock()) as sleep,
+            pytest.raises(SpotifyRateLimitError) as excinfo,
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/albums/a1")
+
+        # Unparseable ⇒ treated exactly like absent: exponential backoff,
+        # never "zero seconds, hammer immediately".
         assert excinfo.value.retry_after is None
         assert [c.args[0] for c in sleep.await_args_list] == [1.0, 2.0, 4.0]
 
@@ -638,9 +667,18 @@ def _album_api(
     page1_limit: int,
     fail_at_offset: Optional[int] = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """An http_call side_effect emulating GET /v1/albums/{id} and its /tracks
-    pages. Returns (side_effect, calls) — calls records endpoint+params."""
+    """An http_call side_effect emulating GET /v1/albums/{id} and the `next`
+    cursor walk over its /tracks pages. Returns (side_effect, calls) — calls
+    records endpoint+params."""
     calls: list[dict[str, Any]] = []
+
+    def _next(offset: int) -> Optional[str]:
+        return (
+            None
+            if offset >= total
+            else f"https://api.spotify.com/v1/albums/{aid}/tracks"
+            f"?offset={offset}&limit={page1_limit}"
+        )
 
     async def call(
         endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
@@ -657,22 +695,26 @@ def _album_api(
                     "items": [_album_track(i) for i in range(page1_count)],
                     "limit": page1_limit,
                     "total": total,
-                    "next": (
-                        None
-                        if total <= page1_count
-                        else f"https://api.spotify.com/v1/albums/{aid}/tracks"
-                        f"?offset={page1_count}&limit=50"
-                    ),
+                    "next": _next(page1_count),
                 },
             }
-        assert params is not None, "tracks pages must be explicit ?offset= requests"
-        offset = params["offset"]
+        # A cursor page: Spotify's own `next` URL, followed verbatim.
+        assert params is None, "cursor pages carry their query in the URL"
+        offset = int(endpoint.split("offset=")[1].split("&")[0])
         if fail_at_offset is not None and offset == fail_at_offset:
-            raise SpotifyAuthError(401, "revoked mid-fanout")
-        end = min(offset + params["limit"], total)
-        return {"items": [_album_track(i) for i in range(offset, end)]}
+            raise SpotifyAuthError(401, "revoked mid-drain")
+        end = min(offset + page1_limit, total)
+        return {
+            "items": [_album_track(i) for i in range(offset, end)],
+            "next": _next(end),
+        }
 
     return call, calls
+
+
+def _cursor_offset(endpoint: str) -> int:
+    """The offset a recorded cursor-page URL names."""
+    return int(endpoint.split("offset=")[1].split("&")[0])
 
 
 def _playlist_track(i: int) -> dict[str, Any]:
@@ -769,72 +811,38 @@ class TestAlbumStream:
         assert c.release_date == "2017-11-17"
         assert c.total == 11
 
-    async def test_multi_page_album_offsets_and_order(self, spotify: Spotify) -> None:
+    async def test_multi_page_album_follows_cursor_in_order(
+        self, spotify: Spotify
+    ) -> None:
         api, calls = _album_api("alb976", total=976, page1_limit=50)
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
             pages = await _drain(spotify.album_stream("alb976"))
 
         assert len(calls) == 1 + 19
-        offsets = [c["params"]["offset"] for c in calls[1:]]
-        assert offsets == list(range(50, 976, 50))
+        assert [_cursor_offset(c["endpoint"]) for c in calls[1:]] == list(
+            range(50, 976, 50)
+        )
         titles = [t for p in pages for t in p.titles]
         assert titles == [f"Track {i} Artist" for i in range(976)]
         assert pages[-1].is_last and not pages[0].is_last
         # The frozen collection is shared, not rebuilt per page.
         assert all(p.collection is pages[0].collection for p in pages)
 
-    async def test_stride_derived_from_response(self, spotify: Spotify) -> None:
-        """H1 guard: a 20-item page 1 fans out from offset 20, not 50 — a
-        hardcoded 50 would silently drop tracks 21–49 of every album."""
+    async def test_cursor_honors_spotify_stride(self, spotify: Spotify) -> None:
+        """A 20-item page 1 (Spotify's documented default on the limit-less
+        embedded pager) walks the cursor at stride 20. The pages are
+        Spotify's own `next` URLs followed verbatim, so a stride mismatch
+        cannot skip or duplicate tracks by construction — the failure the
+        offset-arithmetic fanout this replaced had to derive its way around."""
         api, calls = _album_api("albstride", total=120, page1_limit=20)
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
             pages = await _drain(spotify.album_stream("albstride"))
 
-        offsets = [c["params"]["offset"] for c in calls[1:]]
-        assert offsets == [20, 70]
+        assert [_cursor_offset(c["endpoint"]) for c in calls[1:]] == list(
+            range(20, 120, 20)
+        )
         titles = [t for p in pages for t in p.titles]
         assert titles == [f"Track {i} Artist" for i in range(120)]
-
-    async def test_stride_falls_back_to_page1_length_when_limit_absent(
-        self, spotify: Spotify
-    ) -> None:
-        """The `or len(page1)` arm of the stride derivation: a response with
-        no `limit` field derives the stride from the page itself — a fallback
-        of 50 would skip every track between the real page-1 end and offset
-        50."""
-        calls: list[dict[str, Any]] = []
-
-        async def api(
-            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
-        ) -> dict[str, Any]:
-            calls.append({"endpoint": endpoint, "params": params})
-            if endpoint.endswith("v1/albums/albnolimit"):
-                return {
-                    "name": "N",
-                    "artists": [{"name": "A"}],
-                    "images": [{"url": "u"}],
-                    "release_date": "2020-01-01",
-                    "tracks": {
-                        # No "limit" key at all — 30 items speak for themselves.
-                        "items": [_album_track(i) for i in range(30)],
-                        "total": 90,
-                        "next": (
-                            "https://api.spotify.com/v1/albums/albnolimit"
-                            "/tracks?offset=30&limit=50"
-                        ),
-                    },
-                }
-            assert params is not None
-            end = min(params["offset"] + params["limit"], 90)
-            return {"items": [_album_track(i) for i in range(params["offset"], end)]}
-
-        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
-            pages = await _drain(spotify.album_stream("albnolimit"))
-
-        assert [c["params"]["offset"] for c in calls[1:]] == [30, 80]
-        assert [t for p in pages for t in p.titles] == [
-            f"Track {i} Artist" for i in range(90)
-        ]
 
     async def test_boundary_exact_page_no_second_call(self, spotify: Spotify) -> None:
         api, calls = _album_api("alb50", total=50, page1_limit=50)
@@ -850,7 +858,7 @@ class TestAlbumStream:
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
             pages = await _drain(spotify.album_stream("alb51"))
         assert len(calls) == 2
-        assert calls[1]["params"]["offset"] == 50
+        assert _cursor_offset(calls[1]["endpoint"]) == 50
         assert [t for p in pages for t in p.titles] == [
             f"Track {i} Artist" for i in range(51)
         ]
@@ -893,34 +901,63 @@ class TestAlbumStream:
         assert await fake_redis.ttl("spotify:album_tracks:alb1p") == _ALBUM_TTL
         assert len([t for p in pages for t in p.titles]) == 11
 
-    async def test_fanout_concurrency_capped(self, spotify: Spotify) -> None:
-        api, _ = _album_api("albcap", total=976, page1_limit=50)
-        active = 0
-        max_active = 0
-
-        async def tracking(
-            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
-        ) -> dict[str, Any]:
-            nonlocal active, max_active
-            if params is None or "offset" not in (params or {}):
-                return await api(endpoint, params, **kw)
-            active += 1
-            max_active = max(max_active, active)
-            try:
-                await asyncio.sleep(0.001)  # force wave members to overlap
-                return await api(endpoint, params, **kw)
-            finally:
-                active -= 1
-
-        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=tracking)):
-            await _drain(spotify.album_stream("albcap"))
-        assert 1 < max_active <= _ALBUM_PAGE_CONCURRENCY
-
-    async def test_auth_error_propagates_unwrapped_and_writes_no_cache(
+    async def test_short_cursor_drain_is_not_cached(
         self, spotify: Spotify, fake_redis: Redis
     ) -> None:
-        """A failed page must surface SpotifyAuthError itself (not TaskGroup's
-        ExceptionGroup) and must not cache the partial collection."""
+        """A cursor walk that ends short of the album's own total is a
+        truncation, not a drain — albums never skip items, so short means
+        wrong, and caching it would serve the short album for 24h with no
+        error anywhere (the embed already promised `total` songs). A miss
+        self-heals on the next -play; a cache write sticks."""
+        api, _ = _album_api("albshort", total=150, page1_limit=50)
+
+        async def short(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            resp = await api(endpoint, params, **kw)
+            if "offset=100" in endpoint:
+                resp["items"] = []  # partial degradation: page comes up empty
+            return resp
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=short)):
+            pages = await _drain(spotify.album_stream("albshort"))
+
+        assert len([t for p in pages for t in p.titles]) == 100  # yielded short
+        assert pages[-1].is_last  # the walk itself completed
+        assert await fake_redis.get("spotify:album_tracks:albshort") is None
+
+    async def test_stuck_cursor_abandons_at_cap_and_writes_no_cache(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """A `next` that stops advancing must not spin duplicate pages into
+        the consumer's queue until its 45s drain budget expires: the page cap
+        abandons the walk, keeps what was yielded, and skips the cache."""
+        api, _ = _album_api("albstuck", total=100, page1_limit=50)
+        frozen = "https://api.spotify.com/v1/albums/albstuck/tracks?offset=50&limit=50"
+
+        async def stuck(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            resp = await api(endpoint, params, **kw)
+            if "tracks" in resp:
+                resp["tracks"]["next"] = frozen  # page 1's embedded pager
+            else:
+                resp["next"] = frozen  # every cursor page points at itself
+            return resp
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=stuck)):
+            pages = await _drain(spotify.album_stream("albstuck"))
+
+        # cap = ceil(100/50) + 2 = 4 pages, then abandoned — finite, honest.
+        assert len(pages) == _cursor_page_cap(100, 50) == 4
+        assert not pages[-1].is_last
+        assert await fake_redis.get("spotify:album_tracks:albstuck") is None
+
+    async def test_failed_page_propagates_and_writes_no_cache(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """A failed page must surface its own error to the caller and must
+        not cache the partial collection."""
         api, _ = _album_api("albfail", total=976, page1_limit=50, fail_at_offset=150)
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=api)):
             with pytest.raises(SpotifyAuthError):
@@ -1004,6 +1041,34 @@ class TestPlaylistStream:
         assert titles == [f"T{i} A" for i in range(250)]
         assert pages[-1].is_last and not pages[0].is_last
         assert pages[0].collection.total == 250
+
+    async def test_stuck_cursor_abandons_at_cap(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """Termination is otherwise Spotify's promise alone: a `next` that
+        stops advancing would spin ~100 duplicates per iteration into the
+        consumer's queue (and its Redis mirror) until the 45s drain budget
+        expired. The cap abandons the walk finite and uncached."""
+        api, _ = _playlist_api("plstuck", total=100)
+        frozen = (
+            "https://api.spotify.com/v1/playlists/plstuck/tracks"
+            "?offset=0&limit=100&fields=next,total"
+        )
+
+        async def stuck(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            resp = await api(endpoint, params, **kw)
+            resp["next"] = frozen
+            return resp
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=stuck)):
+            pages = await _drain(spotify.playlist_stream("plstuck"))
+
+        # cap = ceil(100/100) + 2 = 3 pages, then abandoned; nothing cached.
+        assert len(pages) == _cursor_page_cap(100, 100) == 3
+        assert not pages[-1].is_last
+        assert await fake_redis.get("spotify:playlist_tracks:plstuck") is None
 
     async def test_first_request_targets_playlist_tracks_endpoint(
         self, spotify: Spotify
@@ -1217,6 +1282,15 @@ class TestHttpTimeout:
         spotify._session_factory = factory
         await spotify.http_call("https://api.spotify.com/v1/albums/x")
         assert captured["timeout"] is _HTTP_TIMEOUT
+
+    def test_http_timeout_value_is_pinned(self) -> None:
+        """Identity alone (`is _HTTP_TIMEOUT`) proves nothing about the VALUE.
+        At 60s a single hung page outlives _COLLECTION_DRAIN_TIMEOUT_SECS, so
+        the drain deadline fires inside an in-flight request rather than
+        between pages. The full nesting chain is asserted in
+        test_musicbot.py's timeout-chain test; the value itself is pinned
+        here, next to the constant's own module."""
+        assert _HTTP_TIMEOUT.total == 30
 
     async def test_refresh_token_passes_explicit_timeout(
         self, spotify: Spotify, mock_auth_response: dict[str, Any]

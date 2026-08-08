@@ -348,8 +348,10 @@ three separate phases so queueing is instant and songs start with near-zero late
   │ validate_commands: author must be in a usable voice channel
   ▼
 play():
-  ├─ voice client paused + song live? ──► _interject_flow (resume_paused=False):
-  │                                        "-play means play" — see interjection section
+  ├─ voice client paused + song live + NOT a collection? ──► _interject_flow
+  │        (resume_paused=False): "-play means play" — see interjection section.
+  │        Collections (Spotify album/playlist, YouTube playlist) are exempt:
+  │        they queue in full, then playback resumes (_resume_after_collection)
   ├─ parse_input (sources.py): single word → parse_url (youtube/spotify/soundcloud/
   │        any dotted domain → URLSource.OTHER, handed raw to yt-dlp); else ytsearch
   ├─ bot disconnected? front=True:
@@ -606,12 +608,15 @@ interrupted song back where it was":
    (`_skip_history_for` holds the song's identity, not a boolean — a stale flag would eat
    the next song's entry).
 
-`-play` while paused routes through the same flow with `resume_paused=False` (the
-interrupted song comes back PLAYING — "-play means play"); `-playnow` restores the exact
-paused state (`start_paused` re-pauses the player thread synchronously at `vc.play`,
-before any await, leaking at most a frame or two). Playlists collapse to their first
-track for `-playnow`; plain `-play` front-inserts a playlist in full (nothing is playing
-to keep waiting).
+`-play` while paused routes a SINGLE track through the same flow with
+`resume_paused=False` (the interrupted song comes back PLAYING — "-play means play").
+Collections are exempt: interjection resolves to exactly one song, so an album or
+playlist queues in full instead and playback resumes afterward
+(`_resume_after_collection`, which re-reads the paused state so a `-resume` that landed
+mid-drain is not doubled). `-playnow` restores the exact paused state (`start_paused`
+re-pauses the player thread synchronously at `vc.play`, before any await, leaking at
+most a frame or two). Playlists collapse to their first track for `-playnow`; plain
+`-play` front-inserts a playlist in full (nothing is playing to keep waiting).
 
 ### The Now Playing host system
 
@@ -686,10 +691,12 @@ the bearer token in Redis (TTL = expires_in − 30s, skipped if that margin woul
 the token's life) and track/collection lookups. Spotify content resolves to **YouTube
 searches** (`"<name> <artist1> <artist2>"`); collection tracks enqueue as lazy
 `SearchQueueEntry`s resolved per-song at dequeue. Albums and playlists stream page by
-page as `TrackPage`s (`album_stream`/`playlist_stream`): an album's page 1 rides the
-single `GET /v1/albums/{id}` that also returns its identity, and later pages fan out
-concurrently — safe ONLY because albums are immutable once released, which is why
-playlists follow the `next` cursor sequentially instead.
+page as `TrackPage`s (`album_stream`/`playlist_stream`), both following Spotify's own
+`next` cursor sequentially (bounded by a page cap so a cursor that stops advancing
+cannot loop); an album's page 1 rides the single `GET /v1/albums/{id}` that also
+returns its identity, and a drained album is cached only when its track count matches
+the album's own `total` — short means truncated, and a truncation cached for 24h would
+be served as the whole album with no error anywhere.
 
 ### Observability
 

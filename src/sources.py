@@ -159,6 +159,13 @@ class UnsupportedSpotifyLinkError(Exception):
     can act on.
     """
 
+    @property
+    def user_message(self) -> str:
+        """The message is already written for the user; exposing it under the
+        name _command_error's allowlist renders keeps the embed free of the
+        `**UnsupportedSpotifyLinkError:**` class-name prefix."""
+        return str(self)
+
 
 def parse_url(
     url: str, message: str
@@ -206,15 +213,29 @@ def parse_url(
         return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
+        # Spotify's web player and mobile share sheet prefix a locale segment
+        # (/intl-de/album/…) for every non-English client. It carries no
+        # routing information — drop it, or the share URL half the world copies
+        # is rejected while the hand-trimmed one works.
+        if path and path[0].startswith("intl-"):
+            path = path[1:]
+        kind = path[0] if path else ""
         try:
-            spotify_type = SpotifyType(path[0])
+            spotify_type = SpotifyType(kind)
         except ValueError:
-            supported = ", ".join(t.value for t in SpotifyType)
+            values = [t.value for t in SpotifyType]
+            supported = ", ".join(values[:-1]) + f" or {values[-1]}"
             # `from None`: the ValueError above is an implementation detail of
             # the enum lookup; chaining it turns the user-facing error into a
             # two-traceback log entry (the exact noise the incident log shows).
             raise UnsupportedSpotifyLinkError(
-                f"Spotify {path[0]!r} links aren't supported — try a {supported} link"
+                f"Spotify {kind!r} links aren't supported — try a {supported} link"
+            ) from None
+        if len(path) < 2 or not path[1]:
+            # A bare /album or /intl-de/track: the type without an id. The
+            # IndexError this used to raise rendered as a stack trace.
+            raise UnsupportedSpotifyLinkError(
+                f"That Spotify {kind} link has no id — copy the full link"
             ) from None
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
