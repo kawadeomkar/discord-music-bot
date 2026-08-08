@@ -170,11 +170,12 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
 
-# How long `-resume` waits for the restore it needs before answering. Generous for
-# one pipelined read against a healthy Redis, and a bound rather than a deadline:
-# the pool sets no socket_timeout, so an unbounded wait here is a command that never
-# answers at all when the server accepts the connection and then stops responding.
-RESUME_RESTORE_WAIT_SECS = 5.0
+# How long a cold-start command (-play, -resume) waits for the restore it needs
+# before answering. Generous for one pipelined read against a healthy Redis, and a
+# bound rather than a deadline: the pool sets no socket_timeout, so an unbounded wait
+# here is a command that never answers at all when the server accepts the connection
+# and then stops responding.
+RESTORE_WAIT_SECS = 5.0
 
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
@@ -915,14 +916,16 @@ class MusicBot(commands.Cog):
                     # -play on a disconnected bot means "play this", not "play
                     # the leftovers".
                     front = not ctx.voice_client
+                    # Bound before the join, not after: every failure path below
+                    # hands this exact player to _abandon_cold_start, and a get_mp()
+                    # issued after its cleanup() would build and start a fresh one.
+                    mp = self.get_mp(ctx)
                     if front:
                         # Hold the gate across the join below: join opens it the
                         # moment the handshake lands, which would start the
                         # restored head while queue_source is still extracting.
                         # Released on exiting the stack, after the front insertion.
-                        await stack.enter_async_context(
-                            self.get_mp(ctx).defer_playback()
-                        )
+                        await stack.enter_async_context(mp.defer_playback())
                         # Concurrent with queue_source: both are pure I/O (voice
                         # handshake vs yt-dlp extraction) with no data dependency.
                         # Awaiting join_task after queue_source guarantees the voice
@@ -943,22 +946,44 @@ class MusicBot(commands.Cog):
                             # zombie for up to 300s on queue.get() with
                             # clear_connection() never firing — spurious crash
                             # recovery on restart.
-                            if ctx.guild is not None:
-                                with contextlib.suppress(Exception):
-                                    await self.cleanup(ctx.guild)
+                            await self._abandon_cold_start(ctx, mp)
                             raise
+                        # join swallows its own failures, so a still-absent — or
+                        # merely still-connecting, since discord.py registers the
+                        # client before the handshake completes — voice client is
+                        # how one arrives here. Front-inserting anyway hands the
+                        # loop a song it can only raise on once the gate opens.
+                        joined_vc = ctx.voice_client
+                        if not (
+                            isinstance(joined_vc, discord.VoiceClient)
+                            and joined_vc.is_connected()
+                        ):
+                            await self._abandon_cold_start(ctx, mp)
+                            return
                     else:
                         qobj = await self.queue_source(ctx, source)
 
-                    mp = self.get_mp(ctx)
                     log.info(f"Voice client: {ctx.voice_client}")
 
                     if front:
                         # Order matters: put_front LPUSHes the mirror, while
                         # restore_entries replays already-listed entries in memory
                         # only, so inserting before restore reads its snapshot would
-                        # double-queue this song.
-                        await mp.wait_for_restore()
+                        # double-queue this song. A restore that never lands is
+                        # therefore a reason NOT to insert rather than one to insert
+                        # blindly — and waiting it out is a command that never
+                        # answers, since the pool sets no socket_timeout.
+                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                            await self._abandon_cold_start(ctx, mp)
+                            await ctx.send(
+                                embed=notice_embed(
+                                    "Couldn't reach this server's saved queue, so "
+                                    "your song wasn't queued — try again in a "
+                                    "moment.",
+                                    discord.Color.red(),
+                                )
+                            )
+                            return
 
                     if isinstance(qobj, QueueObject):
                         qobj.user_input = url
@@ -1373,7 +1398,7 @@ class MusicBot(commands.Cog):
             # Not -play's concurrent join: it overlaps a 1-4s extraction, while the
             # only work here is the snapshot read cog_before_invoke already started,
             # and joining first would park the bot in a channel for an empty queue.
-            if not await mp.wait_for_restore(timeout=RESUME_RESTORE_WAIT_SECS):
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
                     embed=notice_embed(
                         "Still loading this server's saved queue — try `-resume` "
@@ -1419,16 +1444,17 @@ class MusicBot(commands.Cog):
                     # REPORTING failed (a Forbidden out of ctx.send) or the command
                     # was cancelled. Both leave the same wreckage as a reported
                     # failure, so both take the same exit.
-                    await self._abandon_rejoin(ctx, mp)
+                    await self._abandon_cold_start(ctx, mp)
                     raise
                 if not joined:
                     # join already told the user why; nothing to add here.
-                    await self._abandon_rejoin(ctx, mp)
+                    await self._abandon_cold_start(ctx, mp)
                     return
                 await ctx.send(embed=embed)
 
-    async def _abandon_rejoin(self, ctx: commands.Context, mp: MusicPlayer) -> None:
-        """Drop the player `-resume` was about to hand a voice connection to.
+    async def _abandon_cold_start(self, ctx: commands.Context, mp: MusicPlayer) -> None:
+        """Drop the player a cold-start command (`-play`, `-resume`) was about to
+        hand a voice connection to.
 
         defer_playback opens the gate as it unwinds whether or not the join worked,
         and a loop that wakes with no voice client fails its `vc` assertion once per
