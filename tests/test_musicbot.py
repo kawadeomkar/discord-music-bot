@@ -5,7 +5,6 @@ import redis.asyncio as aioredis
 import asyncio
 import contextlib
 import orjson
-import structlog.testing
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
@@ -516,7 +515,8 @@ class TestQueueSource:
         assert isinstance(result, SpotifyCollectionPager)
         assert result.kind is SpotifyType.PLAYLIST
         music_bot.spotify.playlist_stream.assert_called_once_with("pid123")
-        page1 = await result.first_page
+        # Lazy: page 1 is fetched only when the enqueue path starts the pager.
+        page1 = await anext(result.pages)
         assert page1.titles == ["Song A", "Song B"]
         await result.aclose()
 
@@ -539,12 +539,14 @@ class TestQueueSource:
         # would KeyError on the missing ["track"] wrapper.
         await result.aclose()
 
-    async def test_pager_page1_fetch_starts_inside_queue_source(
+    async def test_pager_is_lazy_leaving_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The H7 guard: the page-1 HTTP call must already be running when
-        queue_source returns, so on the front path it overlaps the voice-join
-        handshake instead of serializing after it."""
+        """S2 inverted the old H7 guard: queue_source must return WITHOUT
+        starting the pager. No task exists to cancel or retrieve on abandon
+        paths, and every fetch — page 1 included — happens inside
+        _begin_collection_enqueue's bounded anext. An eager fetch sneaking
+        back in would resurrect the hand-managed lifecycle S2 removed."""
         source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
         assert music_bot.spotify is not None
         started = asyncio.Event()
@@ -558,8 +560,11 @@ class TestQueueSource:
 
         result = await music_bot.queue_source(mock_ctx, source)
         assert isinstance(result, SpotifyCollectionPager)
-        await asyncio.sleep(0)  # one tick — the task runs without anyone awaiting it
-        assert started.is_set()
+        await asyncio.sleep(0)  # a tick an eager task would have used to run
+        assert not started.is_set()
+        # The fetch happens exactly when the enqueue path asks for it.
+        page1 = await anext(result.pages)
+        assert started.is_set() and page1.titles == ["T"]
         await result.aclose()
 
     async def test_spotify_track_calls_yt_source(
@@ -4761,51 +4766,52 @@ class TestPlayAdmission:
 
 
 class TestSpotifyCollectionPagerAclose:
-    """aclose()'s already-settled arms. Both run on the mainline Spotify-outage
-    path (`-play <collection>` with page 1 failing), and both are guarded
-    against the *other* terminal state — a task is done for three different
-    reasons and .exception() is only legal for one of them."""
+    """The lazy pager's close contract (S2 removed the eager page-1 task and
+    with it the settled-task arms this class used to cover): construction
+    performs no work, a started generator is finalized by aclose(), and the
+    no-op arms — unstarted, already-finished, double-close — must not raise."""
 
-    async def test_failed_page1_exception_is_retrieved_and_logged(self) -> None:
-        """Left unretrieved, the page-1 failure surfaces only as an opaque
-        "exception was never retrieved" at GC, detached from the command that
-        caused it."""
+    async def test_construction_starts_nothing_and_aclose_is_a_noop(self) -> None:
+        """The S2 property itself: building a pager fires no I/O, so an
+        abandon path that never started it (a failed voice join) has nothing
+        to cancel, retrieve, or finalize — and wastes no Spotify request."""
+        entered: list[bool] = []
 
-        async def _boom() -> AsyncGenerator[TrackPage]:
-            raise SpotifyAuthError(401, "page 1 failed")
-            yield  # pragma: no cover - unreachable, makes this a generator
-
-        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _boom())
-        with contextlib.suppress(SpotifyAuthError):
-            await resolved.first_page
-        assert resolved.first_page.done() and not resolved.first_page.cancelled()
-
-        with structlog.testing.capture_logs() as logs:
-            await resolved.aclose()
-
-        assert any("abandoned page-1 fetch had failed" in str(e) for e in logs), logs
-
-    async def test_cancelled_page1_does_not_raise(self) -> None:
-        """The `not cancelled()` guard: .exception() on a CANCELLED task RAISES
-        CancelledError rather than returning it, so dropping the guard turns an
-        already-failing teardown into a second, unrelated error."""
-        started = asyncio.Event()
-
-        async def _slow() -> AsyncGenerator[TrackPage]:
-            started.set()
-            await asyncio.sleep(30)
+        async def _gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
             yield _spage(
                 _scollection(SpotifyType.ALBUM, total=1), ["T A"], is_last=True
             )
 
-        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _slow())
-        await started.wait()
-        resolved.first_page.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await resolved.first_page
-        assert resolved.first_page.cancelled()
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _gen())
+        assert entered == []  # lazy: nothing ran at construction
+        await resolved.aclose()  # unstarted: must not raise…
+        assert entered == []  # …and must not start it either
 
-        await resolved.aclose()  # must not raise
+    async def test_aclose_finalizes_a_started_generator(self) -> None:
+        """A pager suspended at a yield is the state every begin-then-bail
+        path leaves behind; aclose() must run its finally now rather than
+        deferring to asyncgen hooks (whose warning is a hard failure under
+        filterwarnings=["error"]). Double-close is a no-op."""
+        closed: list[bool] = []
+
+        async def _gen() -> AsyncGenerator[TrackPage]:
+            try:
+                yield _spage(
+                    _scollection(SpotifyType.ALBUM, total=2), ["T A"], is_last=False
+                )
+                yield _spage(
+                    _scollection(SpotifyType.ALBUM, total=2), ["U A"], is_last=True
+                )
+            finally:
+                closed.append(True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _gen())
+        await anext(resolved.pages)  # start it, park at the first yield
+        await resolved.aclose()
+        assert closed == [True]
+        await resolved.aclose()  # already finished: must not raise
+        assert closed == [True]
 
 
 class TestPlayCollectionIntegration:
@@ -4838,13 +4844,11 @@ class TestPlayCollectionIntegration:
     ) -> None:
         """Spotify down on the page-1 call — the mainline outage path.
 
-        queue_source returns the stream with its page-1 task already in flight,
-        so the raise happens at `await resolved.first_page`, drain stays None,
-        and _play_resolved's finally must aclose() the generator AND retrieve
-        the task's exception. It was uncovered: a regression there is swallowed
-        by the enclosing suppress, leaving the generator to asyncgen-hook
-        finalization — whose warning is a hard failure under
-        filterwarnings=["error"], which is what makes this test meaningful.
+        queue_source returns the lazy stream; _begin_collection_enqueue's
+        anext starts it, the raise happens there, drain stays None, and
+        _play_resolved's finally aclose()s a generator that already finished
+        raising — a no-op that must not mask the real error. The user must
+        still be told, and the enqueue lock released.
         """
 
         async def _boom() -> AsyncGenerator[TrackPage]:
@@ -4865,29 +4869,26 @@ class TestPlayCollectionIntegration:
         ]
         assert errors, "the user was told nothing"
 
-    async def test_join_failure_closes_the_pager(
+    async def test_join_failure_leaves_pager_unstarted_and_cleans_up(
         self,
         music_bot: MusicBot,
         music_player: MusicPlayer,
         mock_ctx: MagicMock,
     ) -> None:
-        """queue_source SUCCEEDS and the voice join then raises — the one
-        abandon path where a live pager exists with page 1 already in flight.
-        The capture at `pager = qobj` before `await join_task` is what lets
-        _play_resolved's finally aclose() it; every other join-failure test
-        fails inside queue_source, so no pager exists there and deleting that
-        capture stayed green. The leak recurs on every -play into a full or
-        permission-denied voice channel, and filterwarnings=error makes the
-        resulting asyncgen-hook warning a hard suite failure."""
+        """queue_source SUCCEEDS and the voice join then raises. Under the
+        lazy pager (S2) this path is inert by construction: page 1 has not
+        been fetched, so there is no in-flight task to cancel and no Spotify
+        request wasted — the property the eager design bought with a
+        hand-managed lifecycle. The generator must never be STARTED by the
+        abandon path either (aclose on an unstarted generator is a no-op),
+        and full cleanup must still run."""
         col = _scollection(SpotifyType.ALBUM, total=4)
-        closed: list[bool] = []
+        entered: list[bool] = []
 
         async def gen() -> AsyncGenerator[TrackPage]:
-            try:
-                yield _spage(col, ["T0 A", "T1 A"], is_last=False)
-                yield _spage(col, ["T2 A", "T3 A"], is_last=True)
-            finally:
-                closed.append(True)
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=False)
+            yield _spage(col, ["T2 A", "T3 A"], is_last=True)
 
         self._wire(music_bot, music_player, mock_ctx, gen())
         mock_ctx.voice_client = None  # front path: the join actually runs
@@ -4897,12 +4898,48 @@ class TestPlayCollectionIntegration:
 
         await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
 
-        assert closed == [True], "the pager's generator was never finalized"
+        assert entered == [], "a failed join must not cost a Spotify fetch"
         # The join failure ran full cleanup: player gone, nothing queued, and
         # the enqueue lock released for the next command.
         assert mock_ctx.guild.id not in music_bot.mps
         assert music_player.queue.qsize() == 0
         assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_begin_bailing_after_page1_finalizes_the_generator(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """The abandon path that still carries the leak risk under the lazy
+        pager: _begin_collection_enqueue consumed page 1 (the generator is
+        started, suspended at its yield) and then bailed — here, the
+        empty-collection raise. drain stays None, so _play_resolved's finally
+        must aclose() the suspended generator NOW; leaving it to asyncgen-hook
+        finalization is a hard suite failure under filterwarnings=["error"],
+        but only at GC time, which is why the finally needs its own test."""
+        col = _scollection(SpotifyType.ALBUM, total=0)
+        closed: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            try:
+                yield _spage(col, [], is_last=True)  # empty album → raise
+            finally:
+                closed.append(True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
+
+        assert closed == [True], "the suspended generator was never finalized"
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        errors = [
+            c.kwargs["embed"]
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert errors, "the user was told nothing"
 
     async def test_album_play_drains_all_pages_to_queue_and_mirror_in_order(
         self,
@@ -5702,10 +5739,9 @@ class TestDrainCollectionTail:
             yield _spage(col, ["tail A"], is_last=True)
 
         resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _pages())
-        # Production always consumes page 1 (_begin_collection_enqueue) before
-        # a drain exists; skipping it leaves the pager's eager first_page task
-        # racing the tail's anext for the generator.
-        await resolved.first_page
+        # Production always consumes page 1 (_begin_collection_enqueue's
+        # anext) before a drain exists; the tail starts from page 2.
+        await anext(resolved.pages)
         mp = _collection_mp(music_bot, mock_ctx)
         put_completed: list[int] = []
 

@@ -242,43 +242,28 @@ class _GuildEnqueueLock:
         self.waiters = 0
 
 
+@dataclass(frozen=True, slots=True)
 class SpotifyCollectionPager:
-    """A Spotify collection resolving page-by-page. Page 1 is ALREADY IN
-    FLIGHT: queue_source starts it as a task, so the first HTTP round-trip
-    runs concurrently with whatever the caller does next — for -play's
-    front path that is the voice-join handshake, keeping the Spotify call
-    inside the join overlap instead of serializing after it.
+    """A Spotify collection resolving page-by-page — LAZILY: constructing one
+    performs no I/O, and page 1 is fetched by _begin_collection_enqueue under
+    its own drain budget. (An eager page-1 task that overlapped the voice-join
+    handshake was removed as review simplification S2: it bought ~200ms on the
+    cold-cache front path only, and cost a hand-managed task lifecycle —
+    cancel-on-abandon, exception retrieval, capture-before-join.)
 
-    Not a dataclass: it owns a live task and a generator and must be closed
-    exactly once — aclose() or a full drain, never neither. Abandoning the
-    generator instead defers finalization to asyncio's asyncgen hooks, which
-    raise GeneratorExit at an arbitrary later point; under
-    filterwarnings=["error"] the resulting warning is a hard test failure.
+    A STARTED pager must still be closed exactly once — aclose() or a full
+    drain, never neither. Abandoning a started generator defers finalization
+    to asyncio's asyncgen hooks, which raise GeneratorExit at an arbitrary
+    later point; under filterwarnings=["error"] the resulting warning is a
+    hard test failure. An unstarted one is inert (aclose() is a no-op).
     """
 
-    def __init__(self, kind: SpotifyType, pages: AsyncGenerator[TrackPage]) -> None:
-        self.kind = kind
-        self.pages = pages
-        # __anext__() (not anext()) so the type checker sees a Coroutine, which
-        # create_task requires. This is what starts the page-1 HTTP call.
-        self.first_page: asyncio.Task[TrackPage] = asyncio.create_task(
-            pages.__anext__()
-        )
+    kind: SpotifyType
+    pages: AsyncGenerator[TrackPage]
 
     async def aclose(self) -> None:
-        """Cancel an unconsumed first page and finalize the generator now."""
-        if not self.first_page.done():
-            self.first_page.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.first_page
-        elif not self.first_page.cancelled() and self.first_page.exception():
-            # Retrieved but not re-raised: the abandon paths run because
-            # something else already failed. Left unretrieved, the task's
-            # exception surfaces only as an opaque "exception was never
-            # retrieved" at GC.
-            log.info(
-                f"abandoned page-1 fetch had failed: {self.first_page.exception()!r}"
-            )
+        """Finalize the generator now (no-op if never started or already
+        finished)."""
         await self.pages.aclose()
 
 
@@ -835,7 +820,8 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
     ) -> Union[QueueObject, SpotifyCollectionPager, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
-        SpotifyCollectionPager (its page-1 fetch is already in flight — no ordering
+        SpotifyCollectionPager (lazy — no I/O until _begin_collection_enqueue
+        starts it — no ordering
         decision is made here, so starting the HTTP call early is safe), a
         ResolvedYoutubePlaylist (already resolved in full), or a bare QueueObject."""
         if isinstance(source, SpotifySource) and source.type in (
@@ -992,15 +978,16 @@ class MusicBot(commands.Cog):
         is_album = resolved.kind is SpotifyType.ALBUM
         noun = "album" if is_album else "playlist"
         try:
-            # Bounded like every other drain leg: unbounded, page 1 was the
-            # one fetch outside every deadline, and a rate-limited identity
+            # This anext is what STARTS the pager (construction is lazy), and
+            # it is bounded like every other drain leg: unbounded, page 1 was
+            # the one fetch outside every deadline, and a rate-limited identity
             # call could hold the enqueue lock (and, on the front path, the
             # playback gate) for http_call's full retry ladder — ~150s against
-            # waiters that give up at 60. The timeout cancels only our await;
-            # the task itself is cancelled by pager.aclose() on the abandon
-            # path in _play_resolved's finally.
+            # waiters that give up at 60. On expiry the cancellation lands
+            # inside the generator's own await and finalizes it; the abandon
+            # path's aclose() is then a no-op.
             async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
-                page1 = await resolved.first_page
+                page1 = await anext(resolved.pages)
         except TimeoutError:
             raise ValueError(
                 f"Spotify took too long loading the {noun} — try again shortly"
@@ -1508,17 +1495,24 @@ class MusicBot(commands.Cog):
                     # head while queue_source is still extracting. Released on
                     # exiting the stack — never across the collection tail.
                     await stack.enter_async_context(self.get_mp(ctx).defer_playback())
-                    # Concurrent with queue_source: both are pure I/O with no data
-                    # dependency, and a Spotify collection's page-1 call rides the
-                    # same overlap. Awaiting join_task after queue_source guarantees
-                    # the voice client is ready before queue_put fires.
+                    # Concurrent with queue_source: both are pure I/O with no
+                    # data dependency. For single tracks and searches that
+                    # overlap covers the extraction; a Spotify collection's
+                    # queue_source is pure construction (the pager is lazy),
+                    # so its page 1 is fetched after the join instead — the
+                    # deliberate S2 trade: ~200ms of cold-cache front-path
+                    # latency for not managing an eager task's lifecycle.
+                    # Awaiting join_task after queue_source guarantees the
+                    # voice client is ready before queue_put fires.
                     join_task = asyncio.create_task(ctx.invoke(self.join))
                     try:
                         qobj = await self.queue_source(ctx, source)
-                        # Captured before awaiting the join: if the join (or a
-                        # cancellation delivered there) raises, the finally
-                        # below must still aclose() the pager — its page-1
-                        # task is already in flight.
+                        # Captured before awaiting the join so a join failure
+                        # still routes the pager through the finally below.
+                        # With a lazy pager this is belt-and-braces (an
+                        # unstarted generator is inert), kept so the invariant
+                        # stays one sentence: every pager that exists is
+                        # closed on every path.
                         if isinstance(qobj, SpotifyCollectionPager):
                             pager = qobj
                         await join_task
