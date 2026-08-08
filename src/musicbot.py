@@ -51,7 +51,12 @@ from src.sources import (
     query_source_of,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import (
+    Spotify,
+    SpotifyAuthError,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+)
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -661,10 +666,19 @@ class MusicBot(commands.Cog):
         # infrastructure would publish what the operator sees — a DSN host and
         # port, or a runbook naming a just recipe — to whoever ran it.
         if detail is None:
-            if isinstance(e, (ExtractionError, PlaylistInputError)):
+            if isinstance(
+                e,
+                (
+                    ExtractionError,
+                    PlaylistInputError,
+                    SpotifyRateLimitError,
+                    SpotifyRequestError,
+                ),
+            ):
                 # Show the user-safe line, not the raw message: yt-dlp's carries
-                # bug-report boilerplate, and a bad playlist link needs to name
-                # the numbers. See each class's user_message.
+                # bug-report boilerplate, a bad playlist link needs to name the
+                # numbers, and a rate-limit needs to say "wait" rather than name
+                # an endpoint. See each class's user_message.
                 detail = e.user_message
             else:
                 detail = f"**{type(e).__name__}:** {e}"
