@@ -24,7 +24,12 @@ from opentelemetry import trace
 from src import config
 from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
-from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
+from src.guild_state import (
+    DEFAULT_TIMEZONE,
+    HistoryEntry,
+    NowPlayingData,
+    SongQueueEntry,
+)
 from src.redis_client import GuildRedisStore, cache_get
 from src.sources import YTSource
 from src.telemetry import get_tracer
@@ -75,12 +80,17 @@ class EtaWalk:
         return replace(self, cumulative_secs=self.cumulative_secs + remaining)
 
 
-# HACK: Every guild's ETAs are hardcoded to Pacific time.
-# queue_embed()'s "Est. playing at" and the now-playing "Estimated finish" render in
-# US/Pacific for everyone, quoting users elsewhere a clock time that is not theirs;
-# the "PST" suffix is all that stops it misleading. Fix: a per-guild timezone, or
-# Discord relative timestamps (<t:epoch:R>), which render in each viewer's locale.
-_PST = ZoneInfo("America/Los_Angeles")
+# TODO: every guild's ETAs still render in DEFAULT_TIMEZONE, and in one zone per
+# guild rather than per viewer.
+# queue_embed()'s "Est. playing at" and the now-playing "Estimated finish" read
+# GuildConfig.timezone, but nothing WRITES it — set_timezone has no caller and the
+# `-options key value` command it exists for does not exist yet — so the field is
+# always absent and every guild is still quoted Pacific time. Two debts, not one:
+# a write path, and then the fact that a guild-wide zone still shows every member
+# the same clock. Discord relative timestamps (<t:epoch:R>) would render in each
+# VIEWER's locale and need no setting at all; they were not used here because the
+# surrounding text reads as a wall clock ("Est. playing at 4:15 PM"), which a
+# relative chip does not express.
 
 
 def _fmt_total_duration(secs: int) -> str:
@@ -97,9 +107,20 @@ def _fmt_total_duration(secs: int) -> str:
 
 
 def _fmt_clock_time(dt: datetime.datetime) -> str:
+    """A wall-clock time with the zone it is in.
+
+    The suffix comes from the datetime, not a literal. It used to be a hardcoded
+    "PST", which a configurable zone would turn into an outright lie — and which was
+    already wrong for the ~8 months a year US/Pacific spends in PDT.
+    """
     hour = dt.hour % 12 or 12
     ampm = "AM" if dt.hour < 12 else "PM"
-    return f"{hour}:{dt.strftime('%M')} {ampm} PST"
+    # tzname(), not strftime("%Z"): identical output, ~50x cheaper (strftime builds a
+    # whole timetuple and calls into the C library for one field). This runs on the
+    # NP progress tick and on every reply while a song is live. Zones with no
+    # abbreviation return a UTC offset, which is still unambiguous; None is possible
+    # for a naive datetime, hence the `or ""`.
+    return f"{hour}:{dt.minute:02d} {ampm} {dt.tzname() or ''}".rstrip()
 
 
 def _fmt_eta(est_dt: datetime.datetime, uncertain: bool) -> str:
@@ -234,12 +255,10 @@ def _build_progress_bar(
     return f"`{fmt_duration(int(elapsed_secs))}` {bar} `{fmt_duration(duration_secs)}`"
 
 
-def _fmt_finish_time(duration_secs: int) -> str:
+def _fmt_finish_time(duration_secs: int, tz: ZoneInfo) -> str:
     """Clock time `duration_secs` from now. No uncertainty prefix: a song's own
     remaining duration, unlike a queued song's ETA, is known once it's playing."""
-    finish_dt = datetime.datetime.now(tz=_PST) + datetime.timedelta(
-        seconds=duration_secs
-    )
+    finish_dt = datetime.datetime.now(tz=tz) + datetime.timedelta(seconds=duration_secs)
     return _fmt_clock_time(finish_dt)
 
 
@@ -313,6 +332,7 @@ class MusicPlayer:
         "play_message",
         "history",
         "volume",
+        "timezone",
         "_player",
         "_prefetch_task",
         "store",
@@ -387,6 +407,9 @@ class MusicPlayer:
 
         self.play_message = None
         self.volume = 1.0
+        # Replaced at restore from GuildConfig; the default is what a guild that
+        # has never set one renders in.
+        self.timezone = ZoneInfo(DEFAULT_TIMEZONE)
 
         self.store = (
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
@@ -531,7 +554,9 @@ class MusicPlayer:
                 cumulative_secs = secs
             else:
                 uncertain = True
-        return datetime.datetime.now(tz=_PST), EtaWalk(cumulative_secs, uncertain)
+        return datetime.datetime.now(tz=self.timezone), EtaWalk(
+            cumulative_secs, uncertain
+        )
 
     def _format_queue_line(
         self,
@@ -744,10 +769,24 @@ class MusicPlayer:
                         return
                     guild_state = snapshot.state
 
-                    # Only when a value was actually stored: an unconditional
-                    # assign would clobber a concurrent -volume with the default.
-                    if guild_state.volume is not None:
-                        self.volume = guild_state.volume
+                    # Unconditional is right here: tzinfo() already degrades to the
+                    # default for an unset or unusable name, so there is no "absent"
+                    # case for this assignment to skip.
+                    self.timezone = snapshot.config.tzinfo()
+
+                    stored_volume = snapshot.stored_volume
+                    # Only when a value was actually stored: an unconditional assign
+                    # would clobber a concurrent -volume with the default.
+                    if stored_volume is not None:
+                        self.volume = stored_volume
+                        # Seed a pre-move value forward, once. Volume lived in the
+                        # state hash, which expires in 24h, so leaving it there means
+                        # a guild quiet for a day loses the setting. migrate_volume,
+                        # NOT set_volume: this snapshot was read an arbitrary number
+                        # of awaits ago, and a -volume that landed since must not be
+                        # overwritten by the older value it is carrying.
+                        if snapshot.config.volume is None and self.store is not None:
+                            await self.store.migrate_volume(stored_volume)
 
                     # Display snapshot, so -now works if a song was playing.
                     if snapshot.now_playing is not None:
@@ -1005,7 +1044,9 @@ class MusicPlayer:
             # Remaining, not total: a song started mid-stream (?t=, crash
             # recovery, -playnow resume) finishes sooner than its full length.
             remaining = max(0, song.duration_secs - int(position))
-            requester_line += f"  ·  Estimated finish: {_fmt_finish_time(remaining)}"
+            requester_line += (
+                f"  ·  Estimated finish: {_fmt_finish_time(remaining, self.timezone)}"
+            )
         lines.append(requester_line)
         description = "\n".join(lines)
         fields = NowPlayingData.from_song(song)

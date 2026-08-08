@@ -96,6 +96,47 @@ class TestParseUrlYouTube:
         assert result.ts == 30
 
 
+class TestParseUrlPlaylistIndex:
+    """`index=` is YouTube's 1-based position of the video the link was copied
+    at. Parsed only on the playlist branch and never allowed to raise — a
+    ValueError out of parse_url means "not a URL" and searches for the link text.
+    """
+
+    def test_index_is_parsed_from_a_watch_url(self) -> None:
+        url = "https://www.youtube.com/watch?v=abc&list=PLtest&index=4"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.index == 4
+        assert result.video_id == "abc"
+
+    def test_index_is_none_when_absent(self) -> None:
+        url = "https://www.youtube.com/playlist?list=PLtest"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.index is None
+        assert result.video_id is None
+
+    def test_index_is_not_carried_by_a_bare_track(self) -> None:
+        """No list, no playlist — the index has nothing to index into."""
+        url = "https://www.youtube.com/watch?v=abc&index=4"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.TRACK
+        assert result.index is None
+
+    @pytest.mark.parametrize("raw", ["0", "-2", "abc", "4.5"])
+    def test_unusable_index_parses_as_none_not_an_error(self, raw: str) -> None:
+        """A malformed index degrades to "no index" instead of raising: the
+        alternative sends the whole link to ytsearch as plain text."""
+        url = f"https://www.youtube.com/watch?v=abc&list=PLtest&index={raw}"
+        result = parse_url(url, f"-play {url}")
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.list_id == "PLtest"
+        assert result.index is None
+
+
 class TestParseUrlSpotify:
     def test_spotify_track(self) -> None:
         url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"

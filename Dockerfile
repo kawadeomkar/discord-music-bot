@@ -107,8 +107,17 @@ COPY pyproject.toml ./
 COPY migrations/ ./migrations/
 
 ARG ENVIRONMENT=production
+# The commit this image was built from. GIT_SHA existed only as an image TAG, so a
+# running bot could not report its own commit — `just up <sha>` deploys by tag and
+# the process never saw it. Both forms are needed: the LABEL is the OCI-standard
+# annotation external tooling reads, but labels are invisible from inside the
+# container, so -debug reads the ENV. Dirty builds pass `<sha>-dirty.<digest>`
+# through unchanged, so the bot reports exactly the tag that was deployed.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
-    ENVIRONMENT="${ENVIRONMENT}"
+    ENVIRONMENT="${ENVIRONMENT}" \
+    GIT_SHA="${GIT_SHA}"
 
 CMD ["python", "-m", "src.main"]

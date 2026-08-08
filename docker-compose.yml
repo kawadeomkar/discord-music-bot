@@ -5,6 +5,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into the image as an ENV so the running bot can report the commit
+        # it is on (-debug); the OCI label is invisible from inside a container.
+        # `unknown` rather than empty, exactly as build_common.sh's
+        # build_runtime_image defaults it — the TAG below falls back to `latest`
+        # instead, because a tag has to name something pullable.
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
     network_mode: host
@@ -20,6 +27,24 @@ services:
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      #
+      # Where `-debug` reads the postgres CONTAINER's cpu/memory from: the bot
+      # cannot see another container's cgroup, and Postgres reports no OS metrics
+      # over SQL. The series come from otelcol-metrics' docker_stats receiver,
+      # which this stack's otelcol-metrics sidecar collects. localhost because the
+      # bot uses host networking; unset it and the row degrades to `n/a (no metrics
+      # source)` with nothing else affected.
+      #
+      # Interpolated, not a bare literal: a valued `environment:` entry beats both
+      # env_file and the process environment, so hardcoding it here would silently
+      # override the .env setting that .env.example tells operators to use when the
+      # metrics stack lives on another host.
+      - DEBUG_PROMETHEUS_URL=${DEBUG_PROMETHEUS_URL:-http://localhost:${PROMETHEUS_HOST_PORT:-9090}}
+      # Off by default; `true` starts every server with debug mode on. This is the
+      # default for servers that have NEVER run `-debug --enable`/`--disable` —
+      # that choice is per server, persisted to guild:{id}:config, and wins over
+      # this value across restarts.
+      - DEBUG_MODE
       #
       # Built from the same POSTGRES_* vars as the postgres service below, so
       # the password lives in exactly one place (.env). Pointing at an EXTERNAL
@@ -83,8 +108,8 @@ services:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru. Two keys deliberately carry NO TTL and must
-    # never become eviction candidates:
+    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # and must never become eviction candidates:
     #
     #   history:outbox      plays written but not yet durable in Postgres.
     #                       Evicting one loses that play silently — no error, no
@@ -99,6 +124,14 @@ services:
     #                       evicting one answers a guild with silence despite a
     #                       full archive behind it. Bounded by length, never by
     #                       time: ~24 KB per guild, permanently.
+    #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
+    #                       timezone. Evicting one silently reverts a setting the
+    #                       guild chose, with no log line and no error, which is
+    #                       exactly the failure moving these out of the 24h-TTL
+    #                       state hash was meant to fix. A handful of fields per
+    #                       guild (~160 B), written only by an explicit command
+    #                       and deleted on guild removal, so it scales with guild
+    #                       count and not with runtime.
     #
     # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
     # so volatile-lru preserves cache-eviction behavior for them.
@@ -189,6 +222,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Not optional here: this service shares the bot's `image:` name, so a
+        # build without the arg retags that image from a GIT_SHA-less build and
+        # -debug reports `unknown` for a commit it knows.
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: discord-postgres-migrate
     restart: "no"
     command: ["python", "-m", "src.db_migrate"]
@@ -245,6 +283,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Same image name as the bot and db-migrate, so the same arg — see the
+        # db-migrate build above.
+        GIT_SHA: ${GIT_SHA:-unknown}
     restart: "no"
     # No `container_name`: `docker compose run` generates its own, and a fixed
     # one makes a second invocation collide with the first's stopped container.
@@ -296,25 +338,102 @@ services:
       retries: 3
 
   otel-lgtm:
-    image: grafana/otel-lgtm:latest
+    # Pinned (was :latest): the two grafana/ bind mounts below reach into
+    # image-internal paths (/otel-lgtm/grafana/conf/provisioning/...), so an
+    # unwatched image bump could move them out from under us. On every bump,
+    # re-verify the provisioning root and the four datasource UIDs
+    # (loki/prometheus/tempo/pyroscope) — docs/GRAFANA_DASHBOARD_PLAN.md has
+    # the check commands.
+    image: grafana/otel-lgtm:0.30.0
     container_name: discord-otel-lgtm
     restart: unless-stopped
     ports:
       - "127.0.0.1:3014:3000"    # Grafana UI (localhost only)
       - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
       - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+      # Prometheus query API, for `-debug`'s Postgres container CPU/memory row. The
+      # bot runs with HOST networking, so a compose-internal address would not
+      # resolve for it — publishing here is what makes DEBUG_PROMETHEUS_URL reachable
+      # at all. Loopback-only like every other port here: this API is unauthenticated
+      # and exposes every metric the stack holds. The host side is a variable for the
+      # same reason POSTGRES_HOST_PORT is — 9090 is exactly the port an
+      # already-installed local Prometheus occupies, and a collision fails the whole
+      # `up`, not just this row. DEBUG_PROMETHEUS_URL above defaults to follow it.
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:
       - otel-grafana:/var/lib/grafana
-      - otel-tempo:/tmp/tempo
-      - otel-loki:/tmp/loki
+      # /data, not /tmp: same class of trap as the postgres 18 volume note
+      # below. This image's Tempo and Loki write under /data/tempo and
+      # /data/loki (see its tempo-config.yaml / loki-config.yaml); the old
+      # /tmp/* mount points were stale, so every container recreate silently
+      # destroyed all trace and log history while the volumes stayed empty.
+      # Discovered when a recreate during dashboard verification wiped Loki.
+      - otel-tempo:/data/tempo
+      - otel-loki:/data/loki
+      # Prometheus too (run-prometheus.sh: --storage.tsdb.path=/data/prometheus).
+      # It was the one store left off when the /tmp/* mounts were fixed, so every
+      # recreate wiped ALL span-metrics history while trace/log history survived —
+      # a dashboard full of "No data" stat panels next to healthy Loki panels.
+      - otel-prometheus:/data/prometheus
+      # Dashboard config-as-code. Both are SINGLE-FILE mounts on purpose:
+      # bind-mounting a directory over provisioning/dashboards/ (or
+      # datasources/) hides the image's own YAML there — Grafana comes up with
+      # no datasources / no stock dashboards and nothing says why. The JSON
+      # directory mounts OUTSIDE the provisioning tree; the provider file
+      # points at it and file-watches, so dashboard edits land without a
+      # container restart. See docs/GRAFANA_CONFIG_AS_CODE_PLAN.md.
+      - ./grafana/dashboards/discord-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/discord-provider.yaml:ro
+      - ./grafana/dashboards/json:/var/lib/grafana/dashboards/discord:ro
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      # curl, not wget: the 0.30.0 image (ubi9-micro base) ships no wget, so
+      # the old wget probe failed on every tick and the container sat
+      # permanently "unhealthy". Nothing depends_on this service, so the only
+      # symptom was a misleading status column.
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  otelcol-metrics:
+    # Metrics sidecar: docker_stats (per-container CPU/mem/net/IO) + redis
+    # server metrics, pushed as OTLP into otel-lgtm's collector — the bot
+    # itself exports traces and logs only, and otel-lgtm's embedded collector
+    # is a pure pass-through, so without this service Prometheus holds nothing
+    # but Tempo's span-derived metrics. Config: grafana/otelcol-metrics.yaml.
+    #
+    # Version matches the otelcol-contrib build inside grafana/otel-lgtm:0.30.0
+    # — not one of `just pins`' enforced pairs; check by hand when bumping
+    # either image (like the bgutil sidecar pair).
+    #
+    # OPT-IN (`metrics` profile), for the same reason the archive tier is: this
+    # mounts the docker socket, and `:ro` restricts the INODE, not the API — any
+    # process that can talk to that socket can create a privileged container and
+    # own the host. That is not a cost to add to every deploy silently, so it is a
+    # choice the operator makes. Without it the stack still runs; the dashboard's
+    # container panels and `-debug`'s postgres cpu/mem row read `n/a`.
+    #
+    # The hardening below is defence in depth, NOT the mitigation — nothing the
+    # container drops takes away what the socket grants. Keep this collector free
+    # of receivers that listen on the network: a pull-based receiver added to
+    # grafana/otelcol-metrics.yaml would turn a config edit into host root.
+    #
+    # NOT in the bot's depends_on, same reasoning as otel-lgtm: the OTLP
+    # exporter retries until the stack is up.
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: discord-otelcol-metrics
+    profiles: ["metrics"]
+    restart: unless-stopped
+    user: "0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./grafana/otelcol-metrics.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
 
 volumes:
   redis-data:
@@ -323,3 +442,4 @@ volumes:
   otel-grafana:
   otel-tempo:
   otel-loki:
+  otel-prometheus:

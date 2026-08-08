@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
@@ -10,6 +11,15 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
 from src.config import ENVIRONMENT, spotify_enabled
+
+# Reaches yt_dlp transitively (src.debug -> src.ping -> yt_dlp.version), and the
+# console script imports THIS module at module scope — so the yt-dlp pool's
+# spawn/forkserver bootstrap re-imports it too, measured at ~+500ms per bootstrap.
+# Kept because it is paid once at forkserver bootstrap on the deploy target (Linux),
+# happens inside the fire-and-forget prewarm() rather than on the loop, and is
+# arguably the point: prewarm()'s promise is that the first -play does not absorb
+# yt-dlp import latency, which was only half true before.
+from src.debug import decorate_embeds
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
@@ -25,6 +35,7 @@ from src.util import get_logger
 if TYPE_CHECKING:
     import redis.asyncio as aioredis
 
+    from src.musicbot import MusicBot
     from src.musicplayer import MusicPlayer
 
 log = get_logger(__name__)
@@ -38,11 +49,18 @@ class MusicContext(commands.Context):
     """Context whose send() keeps the Now Playing block at the bottom of the channel:
     responses lead with the NP block, then their own embeds, and the previous host is
     retired (deleted if dedicated, strip-edited otherwise). Attaching at send time
-    keeps the response and the block one atomic message."""
+    keeps the response and the block one atomic message.
+
+    It is also where debug mode's footer is applied — the one choke point through
+    which every command response passes."""
 
     async def send(
         self, content: Optional[str] = None, **kwargs: Any
     ) -> discord.Message:
+        # Ahead of the NP branch, so both send paths carry it. Decoration MUTATES
+        # the caller's embeds rather than reshaping kwargs, which is what lets the
+        # early return below stay a verbatim pass-through.
+        self._decorate_for_debug(kwargs)
         mp = self._np_player()
         if mp is None:
             return await super().send(content, **kwargs)
@@ -69,16 +87,51 @@ class MusicContext(commands.Context):
             mp._adopt_np_host_if_current(message, own, song)
         return message
 
+    def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
+        """Append the debug footer to this response's own embeds while the guild has
+        debug mode on. The NP block is deliberately not reachable from here: the
+        progress updater re-renders it every few seconds undecorated, and the flicker
+        would be worse than useless."""
+        cog = self._music_cog()
+        if cog is None:
+            return
+        guild_id = self.guild.id if self.guild else None
+        if not cog.debug_enabled(guild_id):
+            return
+        own = [
+            e
+            for e in (kwargs.get("embed"), *(kwargs.get("embeds") or ()))
+            if e is not None
+        ]
+        if not own:
+            return
+        # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
+        # command, which just means no elapsed time and no span to name.
+        active = cog._active_spans.get(id(self))
+        decorate_embeds(
+            own,
+            span=active.span if active is not None else None,
+            elapsed_ms=(time.monotonic() - active.started) * 1000
+            if active is not None
+            else None,
+            shard_id=self.guild.shard_id if self.guild else None,
+            runtime=cog.runtime_snapshot,
+        )
+
+    def _music_cog(self) -> Optional["MusicBot"]:
+        from src.musicbot import MusicBot
+
+        cog = self.bot.get_cog("MusicBot")
+        return cog if isinstance(cog, MusicBot) else None
+
     def _np_player(self) -> Optional["MusicPlayer"]:
         """The guild's MusicPlayer, only when attaching is appropriate: guild message,
         MusicBot cog loaded, player exists, a song is live, and this channel is the
         player's home channel (the host never leaves it)."""
-        from src.musicbot import MusicBot
-
         if self.guild is None:
             return None
-        cog = self.bot.get_cog("MusicBot")
-        if not isinstance(cog, MusicBot):
+        cog = self._music_cog()
+        if cog is None:
             return None
         mp = cog.mps.get(self.guild.id)
         if mp is None or mp.current_song is None:

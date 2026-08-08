@@ -20,6 +20,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable
+from dataclasses import dataclass
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -125,6 +126,18 @@ class PoolClosedError(RuntimeError):
     """
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PoolState:
+    """The pool's lifecycle as -debug reports it. `spawned` is False until the first
+    extraction — the executor is lazy — and `generation` counts executors BUILT, so
+    a value above 1 means a worker died abnormally and the pool was healed."""
+
+    max_workers: int
+    spawned: bool
+    generation: int
+    closed: bool
+
+
 class YtdlpPool:
     """The process's yt-dlp extraction pool: lazy creation, break-healing, shutdown.
     One instance per process, held by src.youtube. Deliberately not a singleton — tests
@@ -187,6 +200,19 @@ class YtdlpPool:
     def is_closed(self) -> bool:
         with self._lock:
             return self._closed
+
+    @property
+    def state(self) -> PoolState:
+        """A read-only lifecycle snapshot for -debug. Deliberately only what the
+        pool already tracks: an in-flight or completed-extraction counter would be
+        bookkeeping on the hot path for a diagnostic line."""
+        with self._lock:
+            return PoolState(
+                max_workers=self._max_workers,
+                spawned=self._executor is not None,
+                generation=self._generation,
+                closed=self._closed,
+            )
 
     def _acquire(self) -> Executor:
         """The live executor, building it on first use. Raises once shut down."""

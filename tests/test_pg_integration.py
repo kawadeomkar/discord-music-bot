@@ -1264,3 +1264,93 @@ class TestBackfillAgainstARealArchive:
         assert not report.ok
         # Guild 7 still landed — containment is real, not just counted.
         assert len(await archive.recent(7, 10)) == 1
+
+
+class TestArchiveStats:
+    """-debug's Postgres block, against a real server.
+
+    Its SQL never runs in the unit tier — those tests fake the archive — so a
+    misspelled column or a catalog view that does not answer the way it is
+    assumed to would ship silently and render the whole block "unavailable".
+    """
+
+    async def test_reports_sizes_connections_and_cache(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        await archive.insert_batch([_entry(i) for i in range(5)])
+        stats = await archive.stats()
+        assert stats.database_bytes > 0
+        assert stats.table_bytes > 0
+        # Own connection at minimum, and the setting is an int the row divides by.
+        assert 1 <= stats.connections <= stats.max_connections
+        assert stats.max_connections > 0
+        assert stats.shared_buffers  # a human string like "128MB"
+        assert 0.0 <= stats.cache_hit_ratio <= 1.0
+
+    async def test_row_counts_are_estimates_that_survive_never_analyzing(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """n_live_tup is NULL until autovacuum has visited the table, and a fresh
+        database is exactly that case. COALESCE keeps it 0 rather than crashing
+        the block on the deployment most likely to be running -debug."""
+        stats = await archive.stats()
+        assert stats.rows_estimate >= 0
+        # Expected to stay 0 forever: a row here means HistoryEntry's clamp
+        # regressed. -debug surfaces it, `just db-rejects` inspects it.
+        assert stats.rejected_estimate == 0
+
+    async def test_counter_columns_map_against_a_real_server(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Every extended column exists and lands with a sane value — a misspelled
+        column or a catalog shape assumed wrongly renders the whole block
+        `unavailable` and no unit test would notice (they fake the archive)."""
+        await archive.insert_batch([_entry(i) for i in range(3)])
+        stats = await archive.stats()
+        assert stats.active_backends >= 0
+        # The wait kinds partition a subset of the active count.
+        waits = stats.active_io_wait + stats.active_lock_wait + stats.active_other_wait
+        assert 0 <= waits <= stats.active_backends
+        assert stats.active_time_ms >= 0.0
+        assert stats.xacts_total > 0  # the insert above committed at least once
+        assert stats.tuples_total >= 0
+        assert stats.blks_hit > 0
+        assert stats.blks_read >= 0
+        assert stats.temp_bytes >= 0
+        assert stats.deadlocks == 0
+        assert stats.monotonic > 0.0
+
+    async def test_the_probe_does_not_count_itself_as_load(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """An otherwise-idle database must report 0 active: the querying backend is
+        excluded by pid, and autovacuum by the client-backend filter — without
+        both, `load` shows phantom demand on every -debug of a quiet bot (and
+        this assertion flakes whenever a worker wakes mid-test)."""
+        stats = await archive.stats()
+        assert stats.active_backends == 0
+        assert stats.active_io_wait == 0
+        assert stats.active_lock_wait == 0
+        assert stats.active_other_wait == 0
+
+    async def test_counters_are_monotone_under_traffic(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Two samples with real work between them: the deltas -debug rates over
+        must be non-negative and the window hit ratio computable. No exact `busy`
+        assertion on purpose — stats flush at transaction end with ~1s minimum
+        interval, so the delta's timing is inexact by design."""
+        first = await archive.stats()
+        await archive.insert_batch([_entry(100 + i) for i in range(20)])
+        await archive.leaderboard(_entry(100).guild_id, 5)
+        second = await archive.stats()
+        assert second.monotonic > first.monotonic
+        assert second.xacts_total >= first.xacts_total
+        assert second.tuples_total >= first.tuples_total
+        assert second.blks_hit >= first.blks_hit
+        assert second.blks_read >= first.blks_read
+        assert second.active_time_ms >= first.active_time_ms
+        assert second.deadlocks >= first.deadlocks
+        delta_hit = second.blks_hit - first.blks_hit
+        delta_read = second.blks_read - first.blks_read
+        assert delta_hit + delta_read >= 0

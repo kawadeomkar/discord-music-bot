@@ -353,10 +353,14 @@ _YTDL_STREAM_SEARCH_OPTS = {
 # Used by yt_playlist: entry metadata for every video in a playlist without
 # extracting each one's stream URL. noplaylist=False overrides the base option so
 # yt-dlp processes the full playlist, not just the first video.
+# extract_flat is "in_playlist", not True: a pasted watch?v=…&list=… URL resolves
+# to a url_result pointing at the playlist, and True stops there — yielding a
+# _type="url" with no entries, so the playlist queued nothing. "in_playlist"
+# resolves that one hop and still leaves the entries inside the playlist flat.
 _YTDL_PLAYLIST_OPTS = {
     **_YTDL_BASE_OPTS,
     "noplaylist": False,
-    "extract_flat": True,
+    "extract_flat": "in_playlist",
 }
 
 # Legacy alias kept so any external callers that imported YTDL_OPTS still work.
