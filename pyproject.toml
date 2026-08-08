@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.9.0"
+version = "2.15.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -45,6 +45,7 @@ asyncpg = ">=0.30"
 #
 # `--only=` is unaffected by this flag — it selects groups explicitly — so the
 # Dockerfile stages and CI's composite action keep resolving exactly as before.
+tzdata = "^2026.3"
 [tool.poetry.group.test]
 optional = true
 

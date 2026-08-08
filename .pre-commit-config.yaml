@@ -67,6 +67,10 @@ repos:
         stages: [pre-commit]
       - id: trailing-whitespace
         stages: [pre-commit]
+      # The Grafana dashboard is 2354 lines of machine-written JSON that nothing
+      # in src/ or tests/ ever parses — a truncated one first fails at Grafana's
+      # provisioning step, inside a container, long after the commit.
+      - id: check-json
       - id: check-toml
       - id: check-yaml
         # deploy/k8s/ manifests are multi-document

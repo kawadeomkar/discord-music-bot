@@ -33,7 +33,7 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "clear",
         "jump",
     ),
-    "Utility": ("help", "join", "ping"),
+    "Utility": ("help", "join", "ping", "debug"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"
@@ -51,7 +51,8 @@ _FENCE = "```"
 
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
-    "A `?t=` / `?ts=` timestamp starts the song at that offset.\n"
+    "A `?t=` / `?ts=` timestamp starts the song at that offset, and a playlist "
+    "link's `&index=` starts the queue at that position.\n"
     "**Spotify** — track, album and playlist links. Each title is matched to "
     "its YouTube audio; albums and playlists start playing after their first "
     "page loads and keep queueing in the background.\n"

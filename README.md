@@ -84,6 +84,7 @@ details, aliases, and examples.
 |---|---|---|
 | `-join` | `summon` | Connect the bot to your voice channel (`-play` does this automatically) |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | Live health check: Discord/Redis/Spotify/Postgres/OTEL latency + bot/yt-dlp/ffmpeg versions |
+| `-debug [--enable\|--disable]` | `dbg` | Diagnostic snapshot: what is running and how it is configured (where `-ping` answers "are my dependencies up?"). Everyone sees the versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` turn debug mode on or off for this server — a footer carrying the trace id and timing on every reply — and need **Manage Server** |
 | `-help [command]` | — | Full command manual |
 
 ### Supported inputs
@@ -93,6 +94,7 @@ https://www.youtube.com/watch?v=VIDEO_ID
 https://www.youtube.com/watch?v=VIDEO_ID&t=90    # start at timestamp
 https://youtu.be/VIDEO_ID?t=90
 https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
+https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/album/ALBUM_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
@@ -470,6 +472,11 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | | `3.0` | Progress-bar edit interval for the Now Playing card |
 | `PING_TICK_SECS` | | `1.0` | `-ping` health dashboard: how often the embed is re-edited as probes return |
 | `PING_DEADLINE_SECS` | | `3.0` | `-ping` health dashboard: how long a probe may run before the row is marked failed |
+| `DEBUG_MODE` | | `false` | Debug mode adds a footer carrying the trace id, elapsed time and live runtime metrics to every reply — observation-only, it never changes how the bot plays, queues or stores anything. This is the default **for servers that have never chosen**: a server's `-debug --enable`/`--disable` persists to Redis and wins over this value from then on, across restarts. So changing it moves every server that never ran the command and none that did — a server that opted out stays out when you turn this on. Strictly parsed like `HISTORY_ARCHIVE_ENABLED`; a typo refuses startup rather than silently reading as off |
+| `DEBUG_PROMETHEUS_URL` | | — (Compose sets `http://localhost:9090`) | Where `-debug` reads the Postgres container's CPU/memory from — the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL. The series come from the `otelcol-metrics` sidecar, which is **opt-in via the `metrics` Compose profile** because it mounts the Docker socket, so on a default `up` that one row reads `n/a (no metrics source)` even though this URL is set and Prometheus answers. Unset, the same row and nothing else changes |
+| `PROMETHEUS_HOST_PORT` | | `9090` | Host port the metrics stack's Prometheus publishes on (loopback only). Read by Compose, never by the bot; `DEBUG_PROMETHEUS_URL`'s default follows it. Change it when something on this machine already owns 9090 — a collision fails the whole `docker compose up`, not just the metrics row |
+| `DEBUG_TICK_SECS` | | `1.0` | `-debug` snapshot: a ceiling on how long the card can be stale, not a polling interval — the loop wakes as soon as a block is ready |
+| `DEBUG_DEADLINE_SECS` | | `8.0` | `-debug` snapshot: how long a block may collect before it renders `timed out`. Longer than `-ping`'s because each block does strictly more work (a Postgres stats query, a Prometheus round trip) and a straggler is not retried |
 | `OTEL_SERVICE_NAME` | | `discord-music-bot` | OpenTelemetry service name |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |

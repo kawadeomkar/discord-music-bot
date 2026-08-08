@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import dataclasses
 import re
+from zoneinfo import ZoneInfo
 import time
 from typing import Any, Never, cast
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -15,7 +16,12 @@ import orjson
 import pytest
 
 from src.guild_queue import QueueItem
-from src.guild_state import HistoryEntry, NowPlayingData, SongQueueEntry
+from src.guild_state import (
+    DEFAULT_TIMEZONE,
+    HistoryEntry,
+    NowPlayingData,
+    SongQueueEntry,
+)
 from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
@@ -218,12 +224,21 @@ class TestRequesterMention:
 
 class TestFmtFinishTime:
     def test_matches_clock_format(self) -> None:
-        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) PST$", _fmt_finish_time(90))
+        """PST or PDT: the suffix follows the zone's own abbreviation now, so half
+        the year US/Pacific is legitimately PDT."""
+        rendered = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) P[SD]T$", rendered)
+
+    def test_the_suffix_follows_the_configured_zone(self) -> None:
+        """A guild set to London must not be quoted London time labelled PST — the
+        suffix was a hardcoded literal before the zone became configurable."""
+        rendered = _fmt_finish_time(90, ZoneInfo("Europe/London"))
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
 
     def test_no_uncertainty_prefix(self) -> None:
         # Unlike _fmt_eta(), a song's own remaining duration is never
         # uncertain — no "~" prefix and no bold markdown wrapping.
-        result = _fmt_finish_time(90)
+        result = _fmt_finish_time(90, ZoneInfo(DEFAULT_TIMEZONE))
         assert not result.startswith("~")
         assert "**" not in result
 
@@ -1257,7 +1272,7 @@ class TestResumeNoticeEmbed:
 class TestEstimatedPlayingAt:
     def test_matches_clock_format(self, music_player: MusicPlayer) -> None:
         result = music_player.estimated_playing_at()
-        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*$", result)
+        assert re.match(r"^\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*$", result)
 
     def test_uncertain_when_current_song_has_no_duration_secs(
         self, music_player: MusicPlayer
@@ -1526,7 +1541,7 @@ class TestBuildNowPlayingEmbed:
         embed = music_player._build_now_playing_embed(mock_song)
         requester_line = described(embed).split("\n")[-1]
         assert re.search(
-            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) PST$",
+            r"Requester: \[.*\].*Estimated finish: \d{1,2}:\d{2} (AM|PM) P[SD]T$",
             requester_line,
         )
 
@@ -1973,8 +1988,8 @@ class TestRedisHelpers:
     ) -> None:
         assert music_player.store is not None
         await music_player.store.set_volume(0.75)
-        state = await fake_redis.hgetall(music_player.store.state_key())
-        assert state[b"volume"] == b"0.75"
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.75"
 
     async def test_redis_pop_queue_removes_first_item(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -4774,7 +4789,7 @@ class TestBuildNextUpEmbed:
         embed = music_player._build_next_up_embed()
         assert embed is not None
         assert "Est. playing at" in described(embed)
-        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) PST\*\*", described(embed))
+        assert re.search(r"\*\*\d{1,2}:\d{2} (AM|PM) P[SD]T\*\*", described(embed))
 
     def test_eta_matches_current_song_estimated_finish(
         self, music_player: MusicPlayer, mock_song: MagicMock
@@ -4963,7 +4978,12 @@ class TestRestoreStateTtlRefresh:
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
     ) -> None:
         assert music_player.store is not None
-        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.8")
+        # A realistic state hash: volume alone would be MIGRATED out of it by the
+        # restore below (see stored_volume), leaving an empty hash that Redis deletes
+        # — so the TTL this test is about would have nothing to sit on.
+        await fake_redis.hset(
+            music_player.store.state_key(), b"voice_channel_id", b"321"
+        )
         await fake_redis.expire(music_player.store.state_key(), 10)
 
         await music_player._restore_state()
@@ -6848,9 +6868,9 @@ class TestEstimatedFinishUsesRemaining:
         from src.musicplayer import _fmt_finish_time
 
         live_song.start_offset = 100  # 110s of the 210s song remain
-        before = _fmt_finish_time(110)
+        before = _fmt_finish_time(110, music_player.timezone)
         embed = music_player._build_now_playing_embed(live_song)
-        after = _fmt_finish_time(110)
+        after = _fmt_finish_time(110, music_player.timezone)
         assert (before in described(embed)) or (after in described(embed))
 
     def test_position_override_shrinks_remaining(
@@ -6858,11 +6878,11 @@ class TestEstimatedFinishUsesRemaining:
     ) -> None:
         from src.musicplayer import _fmt_finish_time
 
-        before = _fmt_finish_time(10)
+        before = _fmt_finish_time(10, music_player.timezone)
         embed = music_player._build_now_playing_embed(
             live_song, position_override=200.0
         )
-        after = _fmt_finish_time(10)
+        after = _fmt_finish_time(10, music_player.timezone)
         assert (before in described(embed)) or (after in described(embed))
 
 
@@ -7041,3 +7061,124 @@ class TestPlaynowLoopStart:
         self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
+
+
+class TestVolumeMigratesForwardOnRestore:
+    """The first restore after the deploy SEEDS a pre-move volume into config, so
+    no migration script is needed and the 24h state TTL stops being able to take the
+    setting with it. Seeds, never overwrites — the snapshot it is working from was
+    read an arbitrary number of awaits earlier."""
+
+    async def test_a_legacy_volume_is_restored_and_written_forward(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.30")
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.30
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.3"
+
+    async def test_a_muted_guild_is_restored_and_migrated(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """0.0 is a real choice, not an absence. A truthiness check here brings a
+        muted guild back at 100% AND never migrates it, so it is muted-then-loud on
+        every restart until the state hash expires and the setting is gone."""
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.0")
+
+        await music_player._restore_state()
+
+        assert music_player.volume == 0.0
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.0"
+
+    async def test_a_config_volume_is_not_rewritten(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Already migrated: restore reads it and leaves it alone rather than
+        spending a write on every recovery for the life of the deployment."""
+        assert music_player.store is not None
+        await music_player.store.set_volume(0.75)
+        with patch.object(
+            type(music_player.store), "migrate_volume", new=AsyncMock()
+        ) as write:
+            await music_player._restore_state()
+        assert music_player.volume == 0.75
+        write.assert_not_awaited()
+
+    async def test_the_forward_write_cannot_clobber_a_concurrent_volume(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        """Restore reads its snapshot, then writes it back after an arbitrary number
+        of awaits. A `-volume` landing in that window used to be overwritten by the
+        older stored value — durably, while the user was being told the new one took.
+        The seed is HSETNX, so the newer value wins.
+        """
+        assert music_player.store is not None
+        await fake_redis.hset(music_player.store.state_key(), b"volume", b"0.30")
+
+        real_snapshot = type(music_player.store).get_playback_snapshot
+
+        async def snapshot_then_user_sets_volume(store: object) -> object:
+            snapshot = await real_snapshot(store)  # pyright: ignore[reportArgumentType]
+            # The window: the snapshot is taken, and only then does -volume run.
+            assert music_player.store is not None
+            await music_player.store.set_volume(0.80)
+            return snapshot
+
+        with patch.object(
+            type(music_player.store),
+            "get_playback_snapshot",
+            new=snapshot_then_user_sets_volume,
+        ):
+            await music_player._restore_state()
+
+        config = await fake_redis.hgetall(music_player.store.config_key())
+        assert config[b"volume"] == b"0.8"
+
+    async def test_a_guild_that_never_set_one_keeps_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        before = music_player.volume
+        await music_player._restore_state()
+        assert music_player.volume == before
+
+
+class TestGuildTimezoneOnRestore:
+    """ETAs follow the guild's stored zone instead of a hardcoded Pacific."""
+
+    async def test_a_stored_zone_is_adopted(
+        self, music_player: MusicPlayer, fake_redis: aioredis.Redis
+    ) -> None:
+        assert music_player.store is not None
+        await music_player.store.set_timezone("Europe/London")
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo("Europe/London")
+
+    async def test_a_guild_with_no_zone_keeps_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo(DEFAULT_TIMEZONE)
+
+    async def test_an_unusable_stored_zone_degrades_to_the_default(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """Rendering must not raise on a name the host's tz database lost."""
+        assert music_player.store is not None
+        await music_player.store.set_timezone("Mars/Olympus")
+        await music_player._restore_state()
+        assert music_player.timezone == ZoneInfo(DEFAULT_TIMEZONE)
+
+    async def test_the_eta_renders_in_the_guilds_zone(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """End to end: the suffix is the zone's own abbreviation, so a London guild
+        is never quoted London time labelled PST."""
+        music_player.timezone = ZoneInfo("Europe/London")
+        rendered = _fmt_finish_time(90, music_player.timezone)
+        assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)

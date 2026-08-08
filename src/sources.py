@@ -67,7 +67,10 @@ class SpotifySource:
 class YTSource:
     """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
     `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
-    when type == YTType.PLAYLIST."""
+    when type == YTType.PLAYLIST; `index` is that playlist's 1-based start position,
+    set only on the playlist branch because it means nothing without a list.
+    `video_id` is the `v=` of a playlist link, kept only so the enqueue path can
+    tell whether `ts` belongs to the track it is about to queue first."""
 
     url: Optional[str] = None
     ytsearch: Optional[str] = None
@@ -76,6 +79,8 @@ class YTSource:
     stype: URLSource = URLSource.YOUTUBE
     type: YTType = YTType.TRACK
     list_id: Optional[str] = None
+    index: Optional[int] = None
+    video_id: Optional[str] = None
     # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
     # so MusicPlayer stamps by building a replace()d copy.
     queued_at: float = 0.0
@@ -132,6 +137,19 @@ def spotify_titles_to_ytsearch(titles: list[str]) -> list[YTSource]:
     ]
 
 
+def _playlist_index(raw: str) -> Optional[int]:
+    """YouTube's 1-based `index=` param, or None when it is unparseable or below 1.
+
+    Never raises: parse_url's ValueError means "not a URL at all" and sends
+    parse_input to search for the link's own text, which is the wrong answer for
+    a playlist whose index happens to be malformed."""
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 1 else None
+
+
 class UnsupportedSpotifyLinkError(Exception):
     """A Spotify URL naming a type this bot does not queue (/artist/, /show/, …).
 
@@ -163,11 +181,17 @@ def parse_url(
     if domain in ("youtube.com", "youtu.be"):
         ts: Optional[int] = None
         list_id: Optional[str] = None
+        index: Optional[int] = None
+        video_id: Optional[str] = None
         for _, k, v in args_match:
             if k == "ts" or k == "t":
                 ts = int(v)
             elif k == "list":
                 list_id = v
+            elif k == "index":
+                index = _playlist_index(v)
+            elif k == "v":
+                video_id = v
         if list_id is not None:
             return YTSource(
                 url,
@@ -175,6 +199,8 @@ def parse_url(
                 process=False,
                 type=YTType.PLAYLIST,
                 list_id=list_id,
+                index=index,
+                video_id=video_id,
                 query_source=QUERY_SOURCE_YOUTUBE,
             )
         return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)

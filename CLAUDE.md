@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.9.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.15.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,050 tests plus two opt-in integration tiers (testcontainers): a 72-test `pg` tier and a 35-test `redis` tier; coverage gate `fail_under = 80` (actual ~93%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,500 tests plus two opt-in integration tiers (testcontainers): a 77-test `pg` tier and a 41-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -88,20 +88,40 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    never creates the group, and a mis-shaped key is inert — downgraded to a startup
    warning by the leftover-outbox probe.)
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces six pairs — it is a dep of `check` and CI also runs it as its own step,
+   enforces seven pairs — it is a dep of `check` and CI also runs it as its own step,
    deliberately: Dependabot's `pip` and `pre-commit` ecosystems open SEPARATE PRs that
    each move one half, and those PRs are validated by CI and never by a local `check`.
-   The six: the ruff pin (pyproject) ↔ the ruff hook `rev` in
+   The seven: the ruff pin (pyproject) ↔ the ruff hook `rev` in
    `.pre-commit-config.yaml`; the image name (justfile `IMAGE` ↔ `build_common.sh`
    `IMAGE_NAME`); and `postgres:18-alpine` / `redis:7-alpine` each across three files —
    the integration tier's `_PG_IMAGE`/`_REDIS_IMAGE`, `ci.yml`'s service container, and
-   `docker-compose.yml` (compared tier↔ci and compose↔ci, so all three agree). The
-   compose legs are anchored to the named service, not `head -1`, so a second postgres
-   or redis service cannot silently shift what is compared.
-   **One pair is NOT enforced:** `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
+   `docker-compose.yml` (compared tier↔ci and compose↔ci, so all three agree); and
+   `_POSTGRES_CONTAINER` (`src/debug.py`) ↔ the postgres service's `container_name`,
+   which is a Prometheus label selector, so a rename there would otherwise leave
+   `-debug`'s cpu/mem row reading `n/a (no metrics source)` forever rather than
+   failing. The compose legs are anchored to the named service, not `head -1`, so a
+   second postgres or redis service cannot silently shift what is compared.
+   **Three pairs are NOT enforced — this list is what a maintainer checks by hand,
+   so keep it complete:**
+   (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
    `brainicism/bgutil-ytdlp-pot-provider` image tag in `docker-compose.yml`. The plugin
    and the sidecar are released in lockstep; drift breaks PO-token minting, which
-   surfaces as YouTube playback failures, not as a red build. Check it by hand.
+   surfaces as YouTube playback failures, not as a red build.
+   (b) The published Prometheus port `9090`, in **four** places that move together: the
+   `PROMETHEUS_HOST_PORT` defaults inside the bot service's `DEBUG_PROMETHEUS_URL` and
+   inside the otel-lgtm service's `ports:` entry (both `docker-compose.yml`), and the
+   commented-out `DEBUG_PROMETHEUS_URL` and `PROMETHEUS_HOST_PORT` assignments in
+   `.env.example`. Change one and `-debug` queries a port nothing publishes. A **fifth**
+   literal — the container side of that same `ports:` entry — is Prometheus's own listen
+   port inside `grafana/otel-lgtm` and must NOT move with them; both files also name the
+   number in prose, which drifts just as silently.
+   (c) `otel/opentelemetry-collector-contrib` (the `otelcol-metrics` service) ↔ the
+   otelcol-contrib build inside `grafana/otel-lgtm` (the `otel-lgtm` service), both in
+   `docker-compose.yml`. The comment above the collector's `image:` line states the rule
+   — bump either image and check the other by hand. Like (a), drift is invisible to
+   every build: the symptom lands on the metrics path, where a missing `docker_stats`
+   series leaves `-debug`'s cpu/mem row reading `n/a (no metrics source)`, which is also
+   exactly what "the `metrics` profile is not running" looks like.
 7. **Do not create `pyrightconfig.json`.** `[tool.pyright]` in `pyproject.toml` is the
    single source of truth; a `pyrightconfig.json` would silently override it for editors
    only. Do not re-add `venvPath`/`venv` there either — `just types` passes
@@ -119,16 +139,21 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 11. **`pytest` filterwarnings is `error`.** Any new `DeprecationWarning` fails the suite.
     Add a targeted `ignore:` entry in `[tool.pytest.ini_options]` only with a comment
     explaining what upstream fix removes it (see the existing audioop entry).
-12. **Redis eviction policy is `volatile-lru` on purpose.** Two keys carry no TTL
-    and neither may become an eviction candidate. `history:outbox` holds plays that
+12. **Redis eviction policy is `volatile-lru` on purpose.** Three keys carry no TTL
+    and none may become an eviction candidate. `history:outbox` holds plays that
     are not durable in Postgres yet (written only while the archive is enabled — when
     it is off the key is never created, but the policy must still protect a leftover
     from an earlier enabled run); evicting one loses that play with no error, no
     `play_history_rejected` row and no log line. `guild:{id}:history` is PERSISTed
     and capped at `HISTORY_CACHE_LIMIT` — it is the ONLY source `-history` reads, in
     both archive modes, so evicting or expiring it answers a guild with silence.
+    `guild:{id}:config` holds a guild's DURABLE choices (debug mode, volume, timezone) — evicting it silently reverts a setting the guild chose, with no log
+    line and no error, which is exactly the failure the in-memory version had. It is
+    a fixed handful of fields per guild, written only by an explicit command and
+    deleted on guild removal, so it scales with guild count and not with runtime.
     Never switch the compose Redis to `allkeys-lru`, and never put a TTL on the
-    history key: it is bounded by LENGTH, never by time.
+    history or config keys: history is bounded by LENGTH, and config is bounded by
+    the number of settings that exist.
 
 ## Commands
 
@@ -218,7 +243,10 @@ src/
 ├── sources.py        # Input parsing → YTSource / SpotifySource / SoundcloudSource; mints query_source
 ├── spotify.py        # Spotify Web API client (client-credentials, Redis-cached)
 ├── help.py           # man(1)-styled embed -help command (copy lives on the commands themselves)
-├── ping.py           # -ping live-editing health dashboard (probes, render, edit loop)
+├── dashboard.py      # optimistic-send + live-edit driver shared by -ping and -debug
+├── ping.py           # -ping health dashboard: probes + render (sequencing is dashboard.py)
+├── debug.py          # -debug snapshot + debug-mode toggle parsing; OBSERVATION-ONLY by rule
+│                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
 ├── config.py         # ENVIRONMENT detection (env var or git branch), SpotifyStatus, tunables
 └── util.py           # logger factory, embed helpers, fmt_duration, task helpers
@@ -450,11 +478,12 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | volume, voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
+| `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
 | `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
@@ -588,6 +617,11 @@ to keep waiting).
 
 The NP card (embed with a 10-segment live progress bar, edited every
 `NOW_PLAYING_UPDATE_INTERVAL_SECS` = 3.0s) stays glued to the bottom of the channel.
+**The two live dashboards are the documented exception**: `-ping` and `-debug` reply
+through `ctx.channel.send`, not `MusicContext.send`, because a message an edit loop
+owns must not also be the NP host — the progress updater would re-render it every
+3s. So those replies carry no NP block AND do not retire the current host, which
+stays above them until the next ordinary `ctx.send` adopts a new one.
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
 10-embed cap; worst case here is 3), then `_adopt_np_host_if_current` makes that message
@@ -818,6 +852,14 @@ about its commit. `just restart` restarts the existing container and does NOT pi
 new image. Compose runs the bot with **host networking**; a named `ytdlp-cache` volume
 persists yt-dlp's player-JS/challenge cache across restarts.
 
+`GIT_SHA` is both the deploy tag and a build-arg baked into the runtime image, as an
+`ENV` **and** an `org.opencontainers.image.revision` label — the ENV is the one the
+process can read (labels are invisible from inside the container), which is what lets
+`-debug` report the commit it is running. `build_runtime_image()` is the single
+`--build-arg` seam; every caller must **export** `GIT_SHA` before calling it, and CI
+passes `github.sha`. Not a seventh `just pins` pair: the value is derived, not
+duplicated.
+
 ## Configuration reference (all env vars; `.env` for compose)
 
 | Variable | Default | Notes |
@@ -826,7 +868,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` | — | both or neither; validated live at startup |
 | `REDIS_URL` | `redis://localhost:6379` | bot runs degraded (no persistence/recovery) without Redis |
 | `HISTORY_ARCHIVE_ENABLED` | `false` | **the consent gate for long-term storage** — `true` enables the Postgres archive tier (outbox writes, drainer, `POSTGRES_URL` requirement). Strict parse (`true/1/yes` / `false/0/no`, case-insensitive; unset/empty → false; garbage aborts startup, and `setup_hook` reads it FIRST so the ValueError cannot be swallowed by `@_guild_op`). Set together with `COMPOSE_PROFILES=archive` — the pair is documented in `.env.example` |
-| `COMPOSE_PROFILES` | — | read by Docker Compose from `.env`, not by the bot: `archive` deploys `postgres` + `db-migrate`. `just down` hardcodes `--profile archive` (a `down` with the profile inactive leaves postgres running); explicitly naming profiled services (`up -d redis postgres db-migrate`) auto-activates the profile. A second profile, `ops`, holds `db-backfill` — kept out of `up` entirely because it is run by hand (`docker compose run --rm db-backfill`) |
+| `COMPOSE_PROFILES` | — | read by Docker Compose from `.env`, not by the bot: `archive` deploys `postgres` + `db-migrate`. `just down` names every profile (`--profile archive --profile metrics`) — a `down` with a profile inactive leaves its containers running; explicitly naming profiled services (`up -d redis postgres db-migrate`) auto-activates the profile. Three profiles exist: `archive` (postgres + db-migrate), `ops` (`db-backfill`, kept out of `up` entirely because it is run by hand — `docker compose run --rm db-backfill`), and `metrics` (`otelcol-metrics`, the docker_stats → Prometheus sidecar `-debug`'s Postgres cpu/mem row reads; it mounts the Docker socket, so it is opt-in) |
 | `POSTGRES_URL` | — | **required while the archive is enabled**; `setup_hook` raises without it. Ignored (with an INFO) when disabled — the flag, never URL presence, is what enables archiving. Compose supplies it; `just run` derives it from the parts below |
 | `POSTGRES_PASSWORD` | `password` | compose defaults it so a token-only archive-enabled `docker compose up` works; the bot warns loudly (startup ERROR + owner-only `-ping` row) while the default is in use AND the archive is enabled (`build_common.sh`'s preflight warns more widely: flag truthy OR the profile in `COMPOSE_PROFILES`, covering the profile-on/flag-off drift case where an idle default-credential postgres runs with the bot's warnings silenced), and `./setup_env.sh` generates a real one. Changing it after the volume is initialized needs `ALTER USER` — Postgres reads it on first init only. **`.env` is the only supported place it is set**; a per-install `POSTGRES_PASSWORD_FILE` was proposed and declined (see the comment above `DEFAULT_POSTGRES_PASSWORD` in config.py), and `using_default_postgres_password()` is scoped to the DSN shape that decision produces — do not re-add asyncpg's full resolution ladder |
 | `POSTGRES_USER` / `POSTGRES_DB` | `musicbot` / `musicbot` | compose only; also the parts `just run`/`db-*` build a host DSN from |
@@ -835,10 +877,15 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | git branch (`main`→`production`) | set explicitly in CI/Docker/worktrees |
+| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every response with a trace/timing/runtime footer. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
+| `DEBUG_PROMETHEUS_URL` | — | Prometheus query API `-debug` reads the **postgres container's** CPU/memory from (the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL). Compose sets `http://localhost:9090`; the series come from the `otelcol-metrics` `docker_stats` receiver, selected by `container_name="discord-postgres"`. **That collector is behind the `metrics` compose profile**, so on a default `up` it does not run and the cpu/mem rows render `n/a (no metrics source)` even though the URL is set and Prometheus answers — set `COMPOSE_PROFILES=metrics` (or `docker compose --profile metrics up -d`) as well. Unset URL → the same `n/a`. Only those two rows depend on it: the block's load/throughput/mem-signal rows are native SQL over the archive's own pool and render regardless. The container name is a hand-checked cross-file pin (see golden rule 6) |
+| `PROMETHEUS_HOST_PORT` | `9090` | host-side published port for the metrics stack's Prometheus, loopback-bound. Also the port `DEBUG_PROMETHEUS_URL` defaults to — the two are written separately in compose (golden rule 6c) |
+| `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
+| `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (the Postgres probe brackets a 2s sampling window between two stats queries, plus a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried — keep the deadline comfortably above that ~2.2s floor. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
 | `OTEL_SDK_DISABLED` | `false` | `true` disables tracing/log export (stdout logs remain) |
 | `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` | `discord-music-bot` / `http://localhost:4317` | |
 
@@ -854,7 +901,7 @@ persists yt-dlp's player-JS/challenge cache across restarts.
 | config.py `_git_branch` | TODO | detached-worktree pytest runs die at collection (warning→error) |
 | youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
-| musicplayer.py `_PST` | HACK | every guild's ETAs render in US/Pacific — `queue_embed`'s "Est. playing at" and the NP "Estimated finish" quote users elsewhere a clock time that is not theirs, with only the "PST" suffix stopping it from misleading. Fix: per-guild timezone, or Discord relative timestamps (`<t:epoch:R>`) |
+| musicplayer.py ETA zone | TODO | **Only the plumbing landed — the user-visible defect is open.** `queue_embed`'s "Est. playing at" and the NP "Estimated finish" read `GuildConfig.timezone`, but nothing WRITES it: `set_timezone` has no caller in `src/` and the `-options` command it was built for does not exist, so `ConfigField.TIMEZONE` is always absent and every guild still renders `DEFAULT_TIMEZONE` (US/Pacific), quoting users elsewhere a clock time that is not theirs. The `%Z` suffix is real and fixed a *different* bug — a hardcoded "PST" that was wrong the ~8 months a year US/Pacific spends in PDT. Two things owed: a write path, and per-VIEWER rendering (a guild-wide zone is still one clock for everyone in the guild). Fix for the second: Discord relative timestamps (`<t:epoch:R>`) |
 | main.py `on_ready` | FIXME | "Bot commands:" log line actually logs an intent flag |
 | redis_client.py `clear_connection` | HACK | dead `last_author_id` field still scrubbed; safe to delete after one release |
 | musicbot.py `jump` | TODO | `-jump` is a stub ("in development") — implement or drop it from the command list |
@@ -873,6 +920,24 @@ on `GuildStateData` + `from_redis` → the write-path method on `GuildRedisStore
 `_now_playing_state_mapping` if it's per-song) → decide whether it belongs in
 `_TRANSIENT_SONG_FIELDS` / `clear_connection` → tests in test_guild_state.py and
 test_redis_client.py.
+
+**Add a per-guild SETTING** (a durable choice, not runtime state): constant in
+`ConfigField` → `Optional` field on `GuildConfig` (Optional is not optional — absent
+must keep meaning "follow the host default", or "never chose" collapses into "chose
+the default") → `to_redis` writes it only when set → `from_redis` reads an
+unrecognised value as unset → write method on `GuildRedisStore` that PERSISTs and
+**encodes through `GuildConfig(field=value).to_redis()` rather than by hand** (a
+single-field config serializes to exactly that field, so the wire format has one
+definition and a setter cannot drift from what `from_redis` expects) → **validate at
+the write boundary if the value is user-typed** (see `valid_timezone`: a bad value
+stored here fails silently — the write succeeds, the command reports success, and the
+guild keeps the default forever) → if a hot path reads it, cache it in memory and
+hydrate in `_load_debug_overrides`'s shape rather than adding Redis IO to every send;
+a multi-guild hydration must read through `read_guild_configs`, whose omission-on-
+failure contract is what stops a Redis blink from deleting stored choices → tests in
+test_guild_state.py and test_redis_client.py. It goes in `guild:{id}:config`, NOT
+`guild:{id}:state`: that hash carries a 24h TTL and a setting stored there reverts on
+any guild idle for a day.
 
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
