@@ -92,6 +92,7 @@ https://www.youtube.com/watch?v=VIDEO_ID
 https://www.youtube.com/watch?v=VIDEO_ID&t=90    # start at timestamp
 https://youtu.be/VIDEO_ID?t=90
 https://www.youtube.com/playlist?list=LIST_ID    # whole playlist
+https://www.youtube.com/watch?v=ID&list=LIST_ID&index=4  # playlist from #4 on
 https://open.spotify.com/track/TRACK_ID
 https://open.spotify.com/playlist/PLAYLIST_ID
 https://soundcloud.com/artist/track
