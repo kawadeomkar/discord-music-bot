@@ -22,6 +22,10 @@ SAFE-LOOKING direction — green unit tests, broken production:
        live entries alone, so a drained stream forgets its last ID and reissues
        one the group already delivered; real Redis keeps last_id independently
 
+A seventh divergence is not about streams at all and is asserted here too:
+fakeredis has no CONNECTION POOL, so a per-guild fan-out looks perfect against
+it and loses every guild past `max_connections` on a real server, silently.
+
 Rows 1, 3 and 4 are undetectable without a real server; rows 2 and 6 are
 asserted here so the unit tier's workarounds stay honest about what they work
 around. Row 6 is patched into the fake — see _patch_xadd_monotonic_ids in
@@ -36,6 +40,7 @@ Isolation: there is no throwaway-database-per-test equivalent to the pg tier's
 assumes it owns the server it is pointed at.
 """
 
+import asyncio
 import os
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -59,6 +64,7 @@ from src.redis_client import (
     outbox_depth,
     outbox_pending_below,
     outbox_pending_count,
+    read_guild_configs,
     read_outbox_new,
     read_outbox_pending,
     reclaim_outbox_stale,
@@ -626,6 +632,64 @@ class TestOutboxKeyIsNonEvictable:
         assert await redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
 
+class TestConfigReadsSurviveTheConnectionCap:
+    """The divergence this tier exists for. fakeredis has no connection pool, so a
+    per-guild fan-out looks perfect there and fails on a real server the moment a
+    bot passes `max_connections` guilds — silently, because @_guild_op turns the
+    pool's error into an all-unset config that reads as "this guild never chose"."""
+
+    @staticmethod
+    async def _client(redis_url: str) -> tuple[aioredis.Redis, Any]:
+        pool = aioredis.ConnectionPool.from_url(
+            redis_url, max_connections=20, decode_responses=False
+        )
+        return aioredis.Redis(connection_pool=pool), pool
+
+    async def test_the_naive_per_guild_fanout_really_does_lose_guilds(
+        self, redis_url: str
+    ) -> None:
+        """The bug, pinned. Not hypothetical and not a timing artefact: the pool
+        RAISES `MaxConnectionsError` rather than queueing (that is
+        BlockingConnectionPool), and the raise happens before `call_with_retry`, so
+        the configured retry never applies. Exactly `max_connections` survive."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            naive = await asyncio.gather(
+                *(GuildRedisStore(client, g).get_config() for g in ids)
+            )
+
+            assert sum(c.debug_mode is True for c in naive) == 20
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+    async def test_read_guild_configs_resolves_every_guild(
+        self, redis_url: str
+    ) -> None:
+        """And the fix, against the same server and the same cap."""
+        client, pool = await self._client(redis_url)
+        try:
+            await client.flushdb()
+            ids = list(range(1, 61))
+            for guild_id in ids:
+                await GuildRedisStore(client, guild_id).set_debug_mode(True)
+
+            configs = await read_guild_configs(client, ids)
+
+            assert sorted(configs) == ids
+            assert all(c.debug_mode is True for c in configs.values())
+        finally:
+            await client.flushdb()
+            await client.aclose()
+            await pool.disconnect()
+
+
 class TestHistoryWritePathAgainstARealServer:
     """Real-server coverage for the push path: LPUSH+LTRIM+PERSIST+conditional
     XADD, plus an OOM recovery. The unit tier's LTRIM assertions run against
@@ -714,3 +778,79 @@ class TestRefPolicyIsNotAvailableYet:
             await redis.execute_command(
                 "XTRIM", HISTORY_OUTBOX_KEY, "MINID", ids[1], "ACKED"
             )
+
+
+class TestDebugBlockFieldNames:
+    """The INFO fields -debug's Redis block and check rows read, against a real
+    server.
+
+    This is divergence 7 for the list above, and the worst-shaped one: fakeredis
+    does not implement INFO AT ALL — it raises ResponseError("unknown command") —
+    so the unit tier can only exercise the block against a dict this repo wrote
+    itself. A field renamed or misspelled renders "unknown"/"?" forever and every
+    unit test still passes, because they assert against our own fixture.
+    """
+
+    async def test_every_field_the_block_reads_exists(
+        self, redis: aioredis.Redis
+    ) -> None:
+        info = cast(dict[str, Any], await redis.info())
+        for field in (
+            "used_cpu_sys",
+            "used_cpu_user",
+            "used_memory",
+            "maxmemory",
+            "maxmemory_policy",
+            "mem_fragmentation_ratio",
+            "connected_clients",
+            "instantaneous_ops_per_sec",
+            "keyspace_hits",
+            "keyspace_misses",
+            "evicted_keys",
+            "rdb_last_bgsave_status",
+            # The AOF half of the persistence check. Absent here it defaults to
+            # "unknown", which the check treats as HEALTHY — so a rename makes the
+            # row permanently inert rather than red, and the compose Redis runs AOF.
+            "aof_last_write_status",
+        ):
+            assert field in info, f"INFO has no {field!r} — the debug row is dead"
+
+    async def test_keyspace_shape_is_a_per_db_mapping(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """`persistent = DBSIZE - expires` depends on this shape; a flat key would
+        silently make every key look persistent."""
+        await redis.set("persistent-key", b"1")
+        await redis.set("expiring-key", b"1", ex=60)
+        info = cast(dict[str, Any], await redis.info())
+        db = info["db0"]
+        assert isinstance(db, dict)
+        assert db["keys"] == 2
+        assert db["expires"] == 1
+        assert await redis.dbsize() - db["expires"] == 1
+
+    async def test_cpu_counters_are_cumulative_floats(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The block computes a RATE from two reads, which requires these to be
+        monotonically increasing seconds rather than an instantaneous gauge."""
+        first = cast(dict[str, Any], await redis.info())
+        for _ in range(500):
+            await redis.set("churn", b"1")
+        second = cast(dict[str, Any], await redis.info())
+        before = first["used_cpu_sys"] + first["used_cpu_user"]
+        after = second["used_cpu_sys"] + second["used_cpu_user"]
+        assert isinstance(after, float)
+        assert after >= before
+
+    async def test_history_ttl_reports_the_persist_invariant(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """-debug's check row asserts push_history's unconditional PERSIST. -1 is
+        no expiry, -2 is no such key — a guild that has played nothing."""
+        store = GuildRedisStore(redis, 424242)
+        assert await store.history_ttl() == -2
+        await redis.rpush(store.history_key(), b"{}")
+        assert await store.history_ttl() == -1
+        await redis.expire(store.history_key(), 3600)
+        assert 0 < cast(int, await store.history_ttl()) <= 3600

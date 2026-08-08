@@ -33,7 +33,7 @@ CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
         "clear",
         "jump",
     ),
-    "Utility": ("help", "join", "ping"),
+    "Utility": ("help", "join", "ping", "debug"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"

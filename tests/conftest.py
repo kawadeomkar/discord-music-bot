@@ -15,6 +15,7 @@ from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
+from src.debug import RuntimeSampler
 from src.musicbot import MusicBot
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
@@ -102,8 +103,13 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     drainer wiring) and hundreds of assertions encode it. Don't change this to
     the ship default — disabled-mode tests monkeypatch the flag per case and win
     over this fixture (same MonkeyPatch instance, later call).
+
+    DEBUG_MODE is scrubbed rather than pinned, because here the ship default is
+    the one hundreds of embed assertions encode: with it on, every response grows
+    a debug footer. Debug-on tests monkeypatch it (or set an override) per case.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
+    monkeypatch.delenv("DEBUG_MODE", raising=False)
     monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
 
 
@@ -161,6 +167,12 @@ def mock_author() -> MagicMock:
     member.mention = "<@222222222222222222>"
     member.voice = MagicMock()
     member.voice.channel = MagicMock(spec=discord.VoiceChannel)
+    # Set explicitly, not left to the spec. `spec=discord.Member` auto-mocks
+    # guild_permissions, so every attribute on it answers with a TRUTHY MagicMock —
+    # a permission check would pass here even if the code had deleted it. A test
+    # that means "denied" has to say so by setting this False.
+    member.guild_permissions = MagicMock(spec=discord.Permissions)
+    member.guild_permissions.manage_guild = True
     return member
 
 
@@ -203,6 +215,12 @@ def mock_ctx(
     # -ping's default-password advisory). AsyncMock is required — a bare
     # MagicMock attribute is unawaitable and every such command dies with TypeError.
     ctx.bot.is_owner = AsyncMock(return_value=True)
+    # Explicit, for the same reason mock_author pins guild_permissions: a bare
+    # MagicMock answers `.extras.get("anything")` with a truthy mock, so every
+    # command would look like it carried every flag. cog_before_invoke reads
+    # `extras["observation_only"]` to decide whether to skip get_mp(), and an
+    # auto-mock there silently exempts the whole suite.
+    ctx.command.extras = {}
     return ctx
 
 
@@ -357,4 +375,15 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._active_spans = {}
     cog._alone_timers = {}
     cog._restore_tasks = set()
+    # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
+    # mode on, every response grows a footer and the suite's embed assertions
+    # would be asserting against decorated output everywhere.
+    cog._debug_default = False
+    cog._debug_overrides = {}
+    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
+    # read before it cannot apply an older value on top.
+    cog._debug_toggle_seq = 0
+    cog._debug_toggled_at = {}
+    cog._debug_unpersisted = set()
+    cog._runtime_sampler = RuntimeSampler()
     return cog

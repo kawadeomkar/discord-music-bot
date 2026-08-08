@@ -1,0 +1,25 @@
+# Grafana dashboard provider for the bot's own dashboards. Mounted as a SINGLE
+# FILE into /otel-lgtm/grafana/conf/provisioning/dashboards/ next to the image's
+# grafana-dashboards.yaml — never bind-mount a directory over that path: it
+# hides the image's own provider YAML and silently drops the three stock
+# dashboards (and the same mistake on datasources/ wipes all four datasources).
+# See docs/GRAFANA_CONFIG_AS_CODE_PLAN.md.
+#
+# The JSON itself lives in grafana/dashboards/json/, mounted to the path below
+# (outside the provisioning tree, so Grafana file-watches it — edits to the JSON
+# appear within updateIntervalSeconds without a container restart).
+apiVersion: 1
+
+providers:
+  - name: "Discord Music Bot"
+    orgId: 1
+    folder: "Discord Music Bot"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    # Provisioned dashboards are read-only in the UI by design. Workflow:
+    # iterate in the UI on a manual copy -> export JSON -> commit here.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards/discord
+      foldersFromFilesStructure: false
