@@ -6932,6 +6932,36 @@ class TestAnnounceResume:
         await music_player._announce_resume(live_song)  # must not raise
 
 
+class TestStartOffsetAnnounce:
+    """The "Starting song at Xs" notice for a `?t=` link. It used to be sent by
+    YTDL.yt_stream at CONSTRUCTION, which prefetch performs while the previous song
+    is still playing — so it announced the wrong song's start."""
+
+    async def test_wording(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
+    ) -> None:
+        live_song.start_offset = 90
+        await music_player._announce_start_offset(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert "Starting song at 90 seconds" in embed.description
+
+    async def test_send_failure_swallowed(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
+    ) -> None:
+        live_song.start_offset = 90
+        mock_channel.send.side_effect = RuntimeError("channel gone")
+        await music_player._announce_start_offset(live_song)  # must not raise
+
+    async def test_it_is_decorated_in_debug_mode(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
+    ) -> None:
+        live_song.start_offset = 90
+        TestPlayerDebugDecoration._enable(music_player)
+        await music_player._announce_start_offset(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert "🐞" in (embed.footer.text or "")
+
+
 class TestRemainingSecs:
     def test_normal_item_full_duration(self, queue_obj: QueueObject) -> None:
         from src.musicplayer import _remaining_secs
@@ -7108,7 +7138,7 @@ class TestPlaynowLoopStart:
         queue_obj: QueueObject,
         mock_song: MagicMock,
         vc: discord.VoiceClient,
-    ) -> tuple[AsyncMock, AsyncMock]:
+    ) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -7136,9 +7166,12 @@ class TestPlaynowLoopStart:
             patch.object(
                 MusicPlayer, "_announce_resume", new=AsyncMock()
             ) as announce_mock,
+            patch.object(
+                MusicPlayer, "_announce_start_offset", new=AsyncMock()
+            ) as offset_mock,
         ):
             await music_player.loop()
-        return pause_mock, announce_mock
+        return pause_mock, announce_mock, offset_mock
 
     def _vc(self) -> discord.VoiceClient:
         """A VoiceClient whose play/pause are mocks, built without __init__.
@@ -7161,7 +7194,9 @@ class TestPlaynowLoopStart:
     ) -> None:
         mock_song.start_paused = True
         vc = self._vc()
-        pause_mock, _ = await self._run_one_song(music_player, queue_obj, mock_song, vc)
+        pause_mock, _, _ = await self._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
         # Synchronous park right after vc.play (frame-leak guard) …
         self._mock_call(vc, "pause").assert_called_once()
         # … plus the full pause() entry point (Redis epochs, debounced refresh).
@@ -7171,22 +7206,54 @@ class TestPlaynowLoopStart:
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
         mock_song.is_resume = True
+        mock_song.start_offset = 42  # a resume entry always carries one
         vc = self._vc()
-        _, announce_mock = await self._run_one_song(
+        _, announce_mock, offset_mock = await self._run_one_song(
             music_player, queue_obj, mock_song, vc
         )
         announce_mock.assert_awaited_once_with(mock_song)
+        # The two notices are exclusive: a resume already says where it resumed.
+        offset_mock.assert_not_awaited()
+
+    async def test_a_start_offset_entry_announces_from_the_start_path(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Relocated from YTDL.yt_stream, which ran at construction — prefetch builds
+        the next song while this one plays, so it announced the wrong song's start."""
+        mock_song.is_resume = False
+        mock_song.start_offset = 90
+        vc = self._vc()
+        _, announce_mock, offset_mock = await self._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
+        offset_mock.assert_awaited_once_with(mock_song)
+        announce_mock.assert_not_awaited()
+
+    async def test_a_zero_offset_announces_nothing(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A literal `?t=0` used to render "Starting song at 0 seconds" — the old
+        guard asked whether a ts was present, not whether it was nonzero."""
+        mock_song.is_resume = False
+        mock_song.start_offset = 0
+        vc = self._vc()
+        _, _, offset_mock = await self._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
+        offset_mock.assert_not_awaited()
 
     async def test_plain_song_neither_parks_nor_announces(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
+        mock_song.start_offset = 0
         vc = self._vc()
-        pause_mock, announce_mock = await self._run_one_song(
+        pause_mock, announce_mock, offset_mock = await self._run_one_song(
             music_player, queue_obj, mock_song, vc
         )
         self._mock_call(vc, "pause").assert_not_called()
         pause_mock.assert_not_awaited()
         announce_mock.assert_not_awaited()
+        offset_mock.assert_not_awaited()
 
 
 class TestVolumeMigratesForwardOnRestore:

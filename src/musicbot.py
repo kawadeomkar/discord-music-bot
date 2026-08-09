@@ -2292,14 +2292,22 @@ class MusicBot(commands.Cog):
                         deleted.append("text channel")
                     what = " and ".join(deleted)
                     verb = "was" if len(deleted) == 1 else "were"
-                    try:
-                        await notify_channel.send(
-                            embed=notice_embed(
-                                f"⚠️ I came back online but the {what} I was playing in "
-                                f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
-                                discord.Color.orange(),
-                            )
+                    notice = notice_embed(
+                        f"⚠️ I came back online but the {what} I was playing in "
+                        f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
+                        discord.Color.orange(),
+                    )
+                    # No player exists on this path (that is the point of the
+                    # notice), so the cog decorates it directly.
+                    if self.debug_enabled(guild.id):
+                        debug_mode.decorate_embeds(
+                            [notice],
+                            span=trace.get_current_span(),
+                            shard_id=guild.shard_id,
+                            runtime=self.runtime_snapshot,
                         )
+                    try:
+                        await notify_channel.send(embed=notice)
                     except Exception as notify_err:
                         log.warning(
                             f"Failed to send channel-deleted notification for "

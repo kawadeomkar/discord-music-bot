@@ -1563,12 +1563,35 @@ class MusicPlayer:
         self.queue.requeue_front(rebuilt)
         song.cleanup()
 
+    async def _announce_start_offset(self, song: YTDL) -> None:
+        """One-line notice for a song starting partway in (a `?t=` link). Sent from
+        the loop's start path, like _announce_resume and for the same reason: it used
+        to fire inside yt_stream, at YTDL *construction*, so a prefetched `?t=` song
+        announced itself while the previous song was still playing."""
+        try:
+            await self._channel.send(
+                embed=self._notice(
+                    f"Starting song at {song.start_offset} seconds",
+                    discord.Color.blue(),
+                )
+            )
+        except Exception as e:
+            log.warning(
+                f"Failed to send start-offset notice in guild {self._guild.id}: {e}"
+            )
+
+    def _notice(self, text: str, color: discord.Color) -> discord.Embed:
+        """A notice embed carrying debug mode's footer when the guild has it on."""
+        embed = notice_embed(text, color)
+        self._decorate_for_debug([embed], span=trace.get_current_span())
+        return embed
+
     async def _announce_resume(self, song: YTDL) -> None:
         """One-line notice when an interrupted song returns, sent from the loop's
-        start path because yt_stream suppresses its "Starting song at Xs" notice for
-        resume entries. Plain channel send, not send_with_np: this song's NP host is
-        not sent yet, so send_with_np would adopt the notice only for
-        _send_now_playing to immediately retire it."""
+        start path — the same path and the same reason as _announce_start_offset.
+        Plain channel send, not send_with_np: this song's NP host is not sent yet, so
+        send_with_np would adopt the notice only for _send_now_playing to immediately
+        retire it."""
         position = fmt_duration(int(song.position_secs))
         if song.start_paused:
             text = (
@@ -1577,10 +1600,8 @@ class MusicPlayer:
             )
         else:
             text = f"⏮ Resuming **{song.title}** at `{position}`"
-        embed = notice_embed(text, discord.Color.blue())
-        self._decorate_for_debug([embed], span=trace.get_current_span())
         try:
-            await self._channel.send(embed=embed)
+            await self._channel.send(embed=self._notice(text, discord.Color.blue()))
         except Exception as e:
             log.warning(f"Failed to send resume notice in guild {self._guild.id}: {e}")
 
@@ -1633,12 +1654,11 @@ class MusicPlayer:
         )
         if self.store is not None and song.webpage_url:
             await invalidate_stream_cache(self.store.redis, song.webpage_url)
-        embed = notice_embed(
+        embed = self._notice(
             f"Could not play **{song.title}** — YouTube refused the audio "
             "stream. Queue it again to retry.",
             discord.Color.red(),
         )
-        self._decorate_for_debug([embed], span=trace.get_current_span())
         try:
             await self._channel.send(embed=embed)
         except Exception as e:
@@ -2059,6 +2079,8 @@ class MusicPlayer:
                         await self.pause(vc)
                     if song.is_resume:
                         await self._announce_resume(song)
+                    elif song.start_offset > 0:
+                        await self._announce_start_offset(song)
 
                     await self.update_activity(song)
                     await self._send_now_playing(song)
