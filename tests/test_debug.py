@@ -23,6 +23,7 @@ from opentelemetry import trace as trace_api
 from src import debug
 from src.history_archive import ArchiveStats
 from src.musicbot import MusicBot as MusicBotCog
+from tests.helpers import command_callback
 from src.musicplayer import MusicPlayer
 from src.debug import (
     DebugAction,
@@ -968,6 +969,65 @@ class TestSnapshotEmbed:
             mock_ctx,
             DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
         )
+        assert "🐞" not in (embed.footer.text or "")
+
+
+class TestDebugCardCarriesTheSuffixEndToEnd:
+    """The cog→card wiring, driven through the real command.
+
+    TestSnapshotEmbed above hand-builds a DebugInputs, so it only pins the renderer's
+    concatenation; without these, deleting `debug_suffix=` from _debug_inputs left the
+    whole feature gone with a green suite.
+    """
+
+    @staticmethod
+    def _enable(cog: MusicBotCog, ctx: MagicMock) -> None:
+        cog._debug_overrides[ctx.guild.id] = True
+        cog._runtime_sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
+        )
+
+    @staticmethod
+    async def _run(cog: MusicBotCog, ctx: MagicMock) -> discord.Embed:
+        """Drive the real command and return the finished card."""
+        message = MagicMock(spec=discord.Message)
+        message.edit = AsyncMock()
+        ctx.channel.send = AsyncMock(return_value=message)
+        await command_callback(MusicBotCog.debug)(cog, ctx)
+        call = message.edit.await_args or ctx.channel.send.await_args
+        assert call is not None
+        return cast(discord.Embed, call.kwargs["embeds"][0])
+
+    async def test_the_owners_card_carries_the_footer(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        self._enable(music_bot, mock_ctx)
+        mock_ctx.guild.shard_id = 2
+        footer = (await self._run(music_bot, mock_ctx)).footer.text or ""
+        assert "🐞" in footer and "shard 2" in footer
+        assert "cpu 9%" in footer  # the owner does get the host metrics
+
+    async def test_a_non_owner_gets_the_footer_without_host_metrics(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """The card withholds its Runtime block from a non-owner and SAYS so in the
+        same embed. Printing cpu/mem/lag/tasks in that embed's footer would falsify
+        its own notice, so the suffix keeps only the shard."""
+        self._enable(music_bot, mock_ctx)
+        mock_ctx.guild.shard_id = 2
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        embed = await self._run(music_bot, mock_ctx)
+        footer = embed.footer.text or ""
+        assert "🐞" in footer and "shard 2" in footer
+        for withheld in ("cpu ", "mem ", "lag ", "tasks ", "pool "):
+            assert withheld not in footer
+        # The notice that makes this necessary is really on the card.
+        assert "bot owner only" in (embed.description or "")
+
+    async def test_no_footer_when_the_guild_has_debug_off(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        embed = await self._run(music_bot, mock_ctx)
         assert "🐞" not in (embed.footer.text or "")
 
 

@@ -1864,7 +1864,9 @@ class MusicBot(commands.Cog):
             return self._debug_default
         return self._debug_overrides.get(guild_id, self._debug_default)
 
-    def _debug_suffix(self, ctx: commands.Context) -> Optional[str]:
+    def _debug_suffix(
+        self, ctx: commands.Context, *, host_metrics: bool = True
+    ) -> Optional[str]:
         """Debug mode's footer for the two LIVE dashboards, rendered once per
         invocation. None while the guild has debug mode off.
 
@@ -1873,6 +1875,14 @@ class MusicBot(commands.Cog):
         that message on a tick. So the suffix is computed here and threaded in — and
         deliberately carries no elapsed-ms, because the driver only PATCHes when the
         render differs and a per-tick-varying footer would make that always true.
+
+        `host_metrics=False` drops the runtime segment and keeps the shard. `-debug`
+        passes the caller's operator status, because that card WITHHOLDS its Runtime
+        block from a non-owner and says so in the same embed ("Host details … are
+        shown to the bot owner only") — printing cpu/mem/lag/tasks into that embed's
+        footer would falsify its own notice. `-ping` withholds nothing and makes no
+        such promise, so it does not gate; the guild opted into debug mode, and its
+        ordinary command replies carry these numbers regardless.
         """
         guild = ctx.guild
         if not self.debug_enabled(guild.id if guild else None):
@@ -1880,9 +1890,10 @@ class MusicBot(commands.Cog):
         return (
             debug_mode.debug_footer(
                 shard_id=guild.shard_id if guild else None,
-                runtime=self.runtime_snapshot,
+                runtime=self.runtime_snapshot if host_metrics else None,
                 # Both cards already print `trace: <id>` in their own footer, and the
-                # same id twice reads as two different traces.
+                # same id twice reads as two different traces. Inert while no span is
+                # passed, and kept so adding one later cannot silently double it.
                 skip_trace=True,
             )
             or None
@@ -2055,7 +2066,9 @@ class MusicBot(commands.Cog):
             prometheus_url=debug_prometheus_url(),
             operator=operator,
             default_password=default_password,
-            debug_suffix=self._debug_suffix(ctx),
+            # Gated on `operator`: this card withholds its Runtime block from a
+            # non-owner and says so, so the footer must not print the same figures.
+            debug_suffix=self._debug_suffix(ctx, host_metrics=operator),
         )
 
     async def _is_owner(self, ctx: commands.Context) -> bool:

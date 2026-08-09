@@ -3770,6 +3770,58 @@ class TestPlayerDebugDecoration:
         embed = music_player._channel.send.call_args.kwargs["embed"]
         assert "🐞" in (embed.footer.text or "")
 
+    async def test_the_playback_error_embed_is_decorated(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """The loop's outer handler. This block was deliberately rewritten away from
+        send_embed() so the footer could be added before the send — so it is the one
+        site where a missing decoration would be silently undone by a refactor back."""
+        self._enable(music_player)
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        with patch.object(
+            MusicPlayer,
+            "_resolve_source",
+            new=AsyncMock(side_effect=Exception("yt-dlp lookup failed")),
+        ):
+            await music_player.loop()
+
+        embed = mocked(music_player._channel.send).call_args.kwargs["embed"]
+        assert embed.title == "Playback error — skipping song"
+        assert "🐞" in (embed.footer.text or "")
+
+    async def test_the_playback_error_embed_shows_one_trace_id(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """It carries its own `trace: <id>` from trace_footer(span); skip_trace must
+        dedup against it, or the footer names the same trace twice as if they were
+        two different requests."""
+        self._enable(music_player)
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        with (
+            _current_span(),
+            patch.object(
+                MusicPlayer,
+                "_resolve_source",
+                new=AsyncMock(side_effect=Exception("boom")),
+            ),
+        ):
+            await music_player.loop()
+
+        footer = (
+            mocked(music_player._channel.send).call_args.kwargs["embed"].footer.text
+        )
+        assert (footer or "").count("4bf92f3577b34da6a3ce929d0e0e4736") == 1
+
     async def test_a_one_shot_notice_keeps_its_trace_id(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
