@@ -20,7 +20,7 @@ from redis.asyncio import Redis
 from discord.ext import commands
 from opentelemetry import trace as trace_api
 
-from src import debug
+from src import config, debug
 from src.history_archive import ArchiveStats
 from src.musicbot import MusicBot as MusicBotCog
 from tests.helpers import command_callback
@@ -1042,8 +1042,11 @@ class TestDebugSuffixBuilder:
     def test_carries_shard_and_runtime_but_never_a_trace(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """skip_trace is deliberate: both cards already print `trace: <id>` in their
-        own footer, and the same id twice reads as two different traces."""
+        """No trace, for the plainer reason that no span is ever passed — the
+        `skip_trace=True` alongside it is belt-and-braces for a future caller that
+        passes one, not what produces this outcome. Asserted anyway: both cards
+        already print `trace: <id>` themselves, and the same id twice would read as
+        two different traces."""
         music_bot._debug_overrides[mock_ctx.guild.id] = True
         mock_ctx.guild.shard_id = 4
         music_bot._runtime_sampler._snapshot = debug.RuntimeSnapshot(
@@ -1777,6 +1780,54 @@ class TestRuntimeSampler:
             sampler.start()
             await asyncio.sleep(0.05)
             assert sampler.running
+        finally:
+            await sampler.aclose()
+
+    def test_the_interval_tracks_the_now_playing_tick(self) -> None:
+        """Sampling slower than the NP tick means most progress ticks re-push a
+        footer whose numbers did not move — which is exactly what "the metadata
+        updates every N seconds alongside the bar" is supposed to rule out."""
+        assert debug.RuntimeSampler.INTERVAL_SECS <= (
+            config.NOW_PLAYING_UPDATE_INTERVAL_SECS
+        )
+        assert debug.RuntimeSampler.INTERVAL_SECS >= 1.0  # /proc-read floor
+        assert debug.RuntimeSampler.INTERVAL_SECS <= 5.0  # command replies stay fresh
+
+    async def test_the_first_sample_does_not_wait_a_whole_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`-debug --enable` answering with a footer that has no runtime numbers,
+        and a first progress tick showing the same, reads as broken rather than
+        warming up. A full interval of dead air is what produced that."""
+        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 30.0)
+        monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
+        sampler = debug.RuntimeSampler()
+        try:
+            sampler.start()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if sampler.snapshot is not None:
+                    break
+            # Would still be None here if the loop slept INTERVAL_SECS first.
+            assert sampler.snapshot is not None
+        finally:
+            await sampler.aclose()
+
+    async def test_the_first_delay_never_exceeds_the_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The short first delay is a floor-breaker, not a floor: a deployment (or
+        a test) that shortens INTERVAL_SECS must not be slowed down by it."""
+        monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
+        monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 30.0)
+        sampler = debug.RuntimeSampler()
+        try:
+            sampler.start()
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if sampler.snapshot is not None:
+                    break
+            assert sampler.snapshot is not None
         finally:
             await sampler.aclose()
 

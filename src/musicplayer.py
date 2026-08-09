@@ -2237,16 +2237,19 @@ class MusicPlayer:
                     self.play_message = None
                     if self.store is not None:
                         await self.store.clear_song_end_state()
-                    # Built here rather than via send_embed so the debug footer can be
-                    # added before the send; skip_trace dedups against trace_footer's.
-                    error_embed = discord.Embed(
-                        title="Playback error — skipping song",
-                        description=f"**{type(e).__name__}:** {e}",
-                        color=discord.Color.red(),
-                    )
-                    error_embed.set_footer(text=trace_footer(span))
-                    self._decorate_for_debug([error_embed], span=span)
                     try:
+                        # Built inside the try, not above it: this is the loop's own
+                        # except block, so anything raising here escapes both handlers
+                        # and kills the playback task. Built by hand rather than via
+                        # send_embed so the debug footer can be added before the send;
+                        # skip_trace dedups against trace_footer's.
+                        error_embed = discord.Embed(
+                            title="Playback error — skipping song",
+                            description=f"**{type(e).__name__}:** {e}",
+                            color=discord.Color.red(),
+                        )
+                        error_embed.set_footer(text=trace_footer(span))
+                        self._decorate_for_debug([error_embed], span=span)
                         await self._channel.send(embed=error_embed)
                     except Exception as e:
                         log.warning(

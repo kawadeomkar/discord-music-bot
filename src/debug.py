@@ -890,8 +890,13 @@ class RuntimeSnapshot:
     pool_workers: int
 
 
+# How long the sampler waits before its FIRST sample — see RuntimeSampler._run.
+_FIRST_SAMPLE_SECS = 0.5
+
+
 class RuntimeSampler:
-    """A ~5s background sampler feeding the debug footer.
+    """A background sampler feeding the debug footer, on the Now Playing tick's
+    cadence (see INTERVAL_SECS).
 
     Sampled in the background rather than at send time because CPU% needs a
     wall-clock window and a response must never wait on one; a send reads the
@@ -902,7 +907,14 @@ class RuntimeSampler:
     outlives a cog reload and would leak the task.
     """
 
-    INTERVAL_SECS = 5.0
+    # Tied to the Now Playing tick, which is the fastest surface that renders a
+    # snapshot: sampling slower than it means most progress ticks re-push a footer
+    # whose numbers did not move, which is what "the metadata updates every N
+    # seconds" is supposed to rule out. Floored at 1s so a misconfigured tiny tick
+    # cannot spin /proc reads, and capped at the historical 5s so a long NP interval
+    # does not also stale the footers on ordinary command replies, which are not on
+    # that cadence at all.
+    INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task[None]] = None
@@ -954,13 +966,22 @@ class RuntimeSampler:
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
+        # The FIRST sample lands on a short delay, not a full interval. Waiting the
+        # whole interval means `-debug --enable` answers with a footer carrying no
+        # runtime numbers at all, and the next progress tick shows the same — which
+        # reads as the feature being broken rather than warming up. It cannot be
+        # instant: cpu% is a rate and needs a window, and start() has already taken
+        # the baseline this first sample rates against. Never longer than the
+        # interval itself, so a shortened INTERVAL_SECS still ticks promptly.
+        delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
         while True:
-            expected = loop.time() + self.INTERVAL_SECS
-            await asyncio.sleep(self.INTERVAL_SECS)
+            expected = loop.time() + delay
+            await asyncio.sleep(delay)
             try:
                 self._snapshot = self._sample(max(0.0, (loop.time() - expected) * 1000))
             except Exception as e:  # noqa: BLE001 — one bad tick must not end the loop
                 log.warning(f"runtime sample failed: {type(e).__name__}: {e}")
+            delay = self.INTERVAL_SECS
 
     def _sample(self, lag_ms: float) -> RuntimeSnapshot:
         previous, self._cpu = self._cpu, read_cpu_sample()

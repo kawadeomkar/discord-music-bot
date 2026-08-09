@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import time
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -331,11 +332,29 @@ class MusicBotApp(commands.AutoShardedBot):
         return await super().get_context(origin, cls=cls)
 
     async def invoke(self, ctx: commands.Context, /) -> None:
+        command = ctx.command
         # `--help` ANYWHERE in the raw message short-circuits to that command's help
         # embed, before checks, the cog's voice gate and argument parsing — so `-play
         # --help` answers from outside a voice channel instead of searching for it.
-        if ctx.command is not None and "--help" in ctx.message.content:
-            await ctx.send_help(ctx.command)
+        short_circuit = command is not None and "--help" in ctx.message.content
+        # Neither help path reaches cog_before_invoke: the short-circuit above skips
+        # dispatch, and `-help` itself is the one command discord.py owns rather than
+        # the cog. Both borrow the cog's span, or their embeds carry a debug footer
+        # with no trace id — see MusicBot.traced_help.
+        if short_circuit or (command is not None and command.cog is None):
+            from src.musicbot import MusicBot
+
+            cog = self.get_cog("MusicBot")
+            span = (
+                cog.traced_help(ctx)
+                if isinstance(cog, MusicBot)
+                else contextlib.nullcontext()
+            )
+            async with span:
+                if short_circuit and command is not None:
+                    await ctx.send_help(command)
+                else:
+                    await super().invoke(ctx)
             return
         await super().invoke(ctx)
 

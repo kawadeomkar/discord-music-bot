@@ -258,7 +258,7 @@ class TestDebugDecoration:
         # This layer decorates the response's OWN embeds only; the block arrives
         # already decorated from np_embed_block (stubbed here, so it arrives bare)
         # and passes through untouched. The real thing is asserted against a real
-        # player in test_musicplayer.py::TestNpBlockDebugDecoration.
+        # player in test_musicplayer.py::TestPlayerDebugDecoration.
         block = parent.call_args.kwargs["embeds"][:2]
         assert [e.footer.text for e in block] == [None, None]
 

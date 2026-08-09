@@ -595,6 +595,38 @@ class MusicBot(commands.Cog):
             active.span.end()
             otel_context.detach(active.token)
 
+    @contextlib.asynccontextmanager
+    async def traced_help(self, ctx: commands.Context) -> AsyncGenerator[None]:
+        """The span cog_before_invoke would have opened, for the help paths it does
+        not cover.
+
+        Help is the one command discord.py owns rather than this cog, and the
+        `--help` short-circuit in MusicBotApp.invoke bypasses dispatch entirely — so
+        neither reaches cog_before_invoke. Without a span here a help embed sent
+        under debug mode carries the runtime numbers but no trace id and no elapsed
+        time, which is exactly the half of that footer `-debug`'s own help copy tells
+        users to paste to the operator. Same bookkeeping as the cog hooks, so
+        MusicContext.send finds it under the same key.
+        """
+        span = _tracer.start_span(
+            "command.help",
+            attributes={
+                "discord.guild_id": str(ctx.guild.id) if ctx.guild else "",
+                "discord.user_id": str(ctx.author.id),
+            },
+        )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        self._active_spans[id(ctx)] = ActiveCommand(
+            span=span, token=token, started=time.monotonic()
+        )
+        try:
+            yield
+        finally:
+            active = self._active_spans.pop(id(ctx), None)
+            if active is not None:
+                active.span.end()
+                otel_context.detach(active.token)
+
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """discord.py hook run when a command raises: records the error on the
         active span and, for errors with no other user-visible output, notifies the user.
@@ -1982,9 +2014,13 @@ class MusicBot(commands.Cog):
             "Shows what this bot is running: versions, and Discord/voice state for "
             "this server. For the bot owner it also fills in host details — build, "
             "configuration, uptime, storage and health checks.\n\n"
-            "`--enable` turns debug mode on for this server, which adds a footer "
-            "carrying the trace id and timing to every reply — paste that id to the "
-            "operator and they can find the exact request in the logs. `--disable` "
+            "`--enable` turns debug mode on for this server, which adds a footer to "
+            "every embed the bot sends here — including the live Now Playing card, "
+            "which refreshes its numbers alongside the progress bar. A reply's "
+            "footer carries the trace id: paste it to the operator and they can find "
+            "the exact request in the logs. (The Now Playing card shows the runtime "
+            "numbers but no trace id — it is re-rendered under a different request "
+            "every few seconds, so any one id there would be misleading.) `--disable` "
             "turns it back off. The choice is saved for this server and survives "
             "restarts; a server that has never set it follows the host's default. "
             "Toggling needs the **Manage Server** permission.\n\n"
@@ -2111,7 +2147,7 @@ class MusicBot(commands.Cog):
         if not may_toggle:
             await ctx.send(
                 embed=notice_embed(
-                    "Debug mode changes what **every** reply in this server looks "
+                    "Debug mode changes what **every** embed in this server looks "
                     "like, so switching it needs the Manage Server permission. Run "
                     "`-debug` on its own to see the current state.",
                     discord.Color.red(),
@@ -2152,12 +2188,25 @@ class MusicBot(commands.Cog):
             else "⚠️ It could not be saved (Redis is unavailable), so it applies "
             "until the bot restarts."
         )
+        # Names what enabling actually publishes, at the moment the choice is made.
+        # The footer reports the whole PROCESS's load, so on a host serving several
+        # servers these numbers are not this server's alone — and the Now Playing
+        # card carries them passively, to everyone who can read the channel, for as
+        # long as music plays. Nobody reading "a debug footer" would infer that.
+        scope = (
+            " While it is on, every embed here — including the live Now Playing "
+            "card — shows the bot process's load to anyone who can read the channel."
+            if enabled
+            else ""
+        )
         await ctx.send(
             embed=notice_embed(
                 f"Debug mode is now **{'on' if enabled else 'off'}** for this "
-                "server. Replies "
+                "server. Embeds "
                 + ("carry" if enabled else "no longer carry")
-                + " a debug footer; nothing about playback changes either way. "
+                + " a debug footer; nothing about playback changes either way."
+                + scope
+                + " "
                 + durability,
                 discord.Color.blue(),
             )
