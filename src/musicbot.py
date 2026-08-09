@@ -1839,6 +1839,7 @@ class MusicBot(commands.Cog):
                 # unusable without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
                 archive=self.history_archive,
+                debug_suffix=self._debug_suffix(ctx),
             )
         except Exception as e:
             await self._command_error(ctx, e)
@@ -1862,6 +1863,30 @@ class MusicBot(commands.Cog):
         if guild_id is None:
             return self._debug_default
         return self._debug_overrides.get(guild_id, self._debug_default)
+
+    def _debug_suffix(self, ctx: commands.Context) -> Optional[str]:
+        """Debug mode's footer for the two LIVE dashboards, rendered once per
+        invocation. None while the guild has debug mode off.
+
+        They are the one pair of commands neither decoration seam reaches: they reply
+        through channel.send (an edit loop must not own the NP host) and then edit
+        that message on a tick. So the suffix is computed here and threaded in — and
+        deliberately carries no elapsed-ms, because the driver only PATCHes when the
+        render differs and a per-tick-varying footer would make that always true.
+        """
+        guild = ctx.guild
+        if not self.debug_enabled(guild.id if guild else None):
+            return None
+        return (
+            debug_mode.debug_footer(
+                shard_id=guild.shard_id if guild else None,
+                runtime=self.runtime_snapshot,
+                # Both cards already print `trace: <id>` in their own footer, and the
+                # same id twice reads as two different traces.
+                skip_trace=True,
+            )
+            or None
+        )
 
     async def _load_debug_overrides(self) -> None:
         """Hydrate the in-memory cache from each guild's stored config.
@@ -2030,6 +2055,7 @@ class MusicBot(commands.Cog):
             prometheus_url=debug_prometheus_url(),
             operator=operator,
             default_password=default_password,
+            debug_suffix=self._debug_suffix(ctx),
         )
 
     async def _is_owner(self, ctx: commands.Context) -> bool:

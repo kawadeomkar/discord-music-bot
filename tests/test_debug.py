@@ -22,6 +22,7 @@ from opentelemetry import trace as trace_api
 
 from src import debug
 from src.history_archive import ArchiveStats
+from src.musicbot import MusicBot as MusicBotCog
 from src.musicplayer import MusicPlayer
 from src.debug import (
     DebugAction,
@@ -941,6 +942,69 @@ class TestSnapshotEmbed:
         )
         assert embed.footer.text is not None
         assert embed.footer.text.startswith("environment: ")
+
+    async def test_footer_carries_the_debug_suffix_when_given_one(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """-debug is an edit loop replying through channel.send, so neither decoration
+        seam reaches it — the cog threads a pre-rendered suffix in instead."""
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(
+                debug_enabled=True,
+                debug_overridden=False,
+                players=0,
+                debug_suffix="🐞 shard 0 · cpu 9%",
+            ),
+        )
+        footer = embed.footer.text or ""
+        assert footer.startswith("environment: ")
+        assert footer.endswith("🐞 shard 0 · cpu 9%")
+
+    async def test_footer_has_no_suffix_by_default(self, mock_ctx: MagicMock) -> None:
+        mock_ctx.guild = None
+        embed = await _snapshot(
+            mock_ctx,
+            DebugInputs(debug_enabled=False, debug_overridden=False, players=0),
+        )
+        assert "🐞" not in (embed.footer.text or "")
+
+
+class TestDebugSuffixBuilder:
+    """The cog's half: what the two live dashboards are handed."""
+
+    def test_none_while_the_guild_has_debug_off(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        assert music_bot._debug_suffix(mock_ctx) is None
+
+    def test_carries_shard_and_runtime_but_never_a_trace(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """skip_trace is deliberate: both cards already print `trace: <id>` in their
+        own footer, and the same id twice reads as two different traces."""
+        music_bot._debug_overrides[mock_ctx.guild.id] = True
+        mock_ctx.guild.shard_id = 4
+        music_bot._runtime_sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
+        )
+        with trace_api.use_span(TestTraceIdInTheFooter._span(), end_on_exit=False):
+            suffix = music_bot._debug_suffix(mock_ctx)
+        assert suffix is not None
+        assert "shard 4" in suffix and "cpu 9%" in suffix
+        assert "trace" not in suffix
+
+    def test_the_first_segment_is_the_shard_not_an_elapsed_time(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """T3. The dashboards only PATCH when the render differs, and elapsed-ms —
+        which debug_footer puts first when given — would differ on every tick and
+        edit the board forever."""
+        music_bot._debug_overrides[mock_ctx.guild.id] = True
+        mock_ctx.guild.shard_id = 0
+        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        assert suffix.removeprefix("🐞 ").split(" · ")[0] == "shard 0"
 
 
 class TestCommandRegistration:

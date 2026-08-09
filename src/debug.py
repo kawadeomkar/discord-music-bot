@@ -178,10 +178,20 @@ def unknown_arg_message(arg: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 · FOOTER DECORATION
 # ════════════════════════════════════════════════════════════════════════════
-# What debug mode actually does to ordinary traffic: every command response grows
+# What debug mode actually does to ordinary traffic: every embed the bot sends grows
 # a footer identifying the request. The trace id is the point — it is already the
 # join key for every log line and span, so pasting one out of Discord finds the
-# exact request in Loki/Tempo. -ping is not decorated: it bypasses this seam.
+# exact request in Loki/Tempo.
+#
+# Three seams feed this, because "every embed" is sent from three places:
+#   • MusicContext.send — command responses (main.py)
+#   • MusicPlayer._decorate_for_debug — the NP block at every render site, and the
+#     player's own notices (musicplayer.py)
+#   • the live dashboards — -ping and -debug bypass both of the above (they reply
+#     through channel.send and then EDIT), so the cog pre-renders a suffix once per
+#     invocation and threads it in. Static across the loop on purpose: the driver
+#     only PATCHes when the render differs, so a varying footer would edit forever.
+#     That is why the dashboard suffix carries no elapsed-ms.
 
 _DEBUG_MARK = "🐞"
 
@@ -484,6 +494,11 @@ class DebugInputs:
     # `operator` rather than only when it is True: a row that appears for False and
     # vanishes for True would make its own absence the answer.
     default_password: Optional[bool] = None
+    # Debug mode's own footer, rendered once by the cog and constant for the whole
+    # live loop — see run_health_dashboard for why it must not vary per tick. None
+    # when the guild has debug mode off (which -debug's status card can still be
+    # asked for: reading the snapshot does not require the mode to be on).
+    debug_suffix: Optional[str] = None
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -1694,6 +1709,8 @@ def render_snapshot_embed(
     footer = f"environment: {ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
         footer += f" \u00b7 {tf}"
+    if inputs.debug_suffix:
+        footer += f" \u00b7 {inputs.debug_suffix}"
     embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
     return embed
 

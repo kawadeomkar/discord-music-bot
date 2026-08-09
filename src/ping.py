@@ -364,10 +364,15 @@ def render_ping_embed(
     versions: dict[str, str],
     discord_ms: float,
     span: Span,
+    *,
+    debug_suffix: Optional[str] = None,
 ) -> discord.Embed:
     """Build the live health embed from the current probe results + versions. Accent:
     any down/failed → red; else any still-pending → blurple; else the worst OK latency's
-    band colour (same bands as the dots)."""
+    band colour (same bands as the dots).
+
+    `debug_suffix` is debug mode's footer, pre-rendered by the cog and constant for
+    the whole invocation — see run_health_dashboard."""
     # nan latency means the gateway ws is reconnecting — show down (red) rather
     # than a bogus number.
     disc = (
@@ -404,11 +409,15 @@ def render_ping_embed(
         footer += " · probing…"
     if (tf := trace_footer(span)) is not None:
         footer += f" · {tf}"
+    if debug_suffix:
+        footer += f" · {debug_suffix}"
     embed.set_footer(text=footer)
     return embed
 
 
-def default_password_embed() -> Optional[discord.Embed]:
+def default_password_embed(
+    *, debug_suffix: Optional[str] = None
+) -> Optional[discord.Embed]:
     """A standing warning that the Postgres password is still the compose default, or
     None when it is not.
 
@@ -455,6 +464,8 @@ def default_password_embed() -> Optional[discord.Embed]:
         ),
         inline=False,
     )
+    if debug_suffix:
+        embed.set_footer(text=debug_suffix)
     return embed
 
 
@@ -487,6 +498,7 @@ async def run_health_dashboard(
     # for the same reason — a default of None would let a new caller silently render an
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
+    debug_suffix: Optional[str] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard: sends a skeleton embed immediately,
     then edits in place each tick as probes return, with a hard deadline failing any
@@ -495,6 +507,13 @@ async def run_health_dashboard(
 
     The sequencing lives in src/dashboard.py, shared with -debug; what stays here is
     what a row IS and how the board is drawn.
+
+    `debug_suffix` is debug mode's footer, rendered ONCE by the cog and held constant
+    for the whole loop. The driver only PATCHes when the rendered embeds differ, so a
+    suffix carrying elapsed-ms would differ on every tick and turn the change-check
+    into "always" — burning this channel's edit budget against the Now Playing bar.
+    Static is the design, which is also why the cog omits elapsed rather than
+    measuring it.
     """
     span = trace.get_current_span()
     discord_ms = bot_latency * 1000
@@ -538,7 +557,7 @@ async def run_health_dashboard(
         # exceptions propagating by design — so an unguarded call turns a transient
         # Discord API failure into "-ping produced no board at all". Suppressing the
         # advisory is the safe direction; the startup ERROR still names the problem.
-        warning = default_password_embed()
+        warning = default_password_embed(debug_suffix=debug_suffix)
         if warning is not None:
             try:
                 is_owner = await ctx.bot.is_owner(ctx.author)
@@ -549,7 +568,9 @@ async def run_health_dashboard(
                 warning = None
 
     def _render() -> list[discord.Embed]:
-        embed = render_ping_embed(results, versions, discord_ms, span)
+        embed = render_ping_embed(
+            results, versions, discord_ms, span, debug_suffix=debug_suffix
+        )
         return [e for e in (warning, embed) if e is not None]
 
     def _settle(label: str, outcome: "ProbeResult | Exception") -> None:
