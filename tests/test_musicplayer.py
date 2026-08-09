@@ -8,13 +8,15 @@ import re
 from zoneinfo import ZoneInfo
 import time
 from typing import Any, Never, cast
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
 import orjson
 import pytest
+from opentelemetry import trace as trace_api
 
+from src.debug import RuntimeSnapshot
 from src.guild_queue import QueueItem
 from src.guild_state import (
     DEFAULT_TIMEZONE,
@@ -3554,6 +3556,232 @@ class TestNpEmbedBlock:
         assert len(block) == 2
         assert block[0].colour == discord.Color.green()
         assert block[1].title == "Up next"
+
+
+@contextlib.contextmanager
+def _current_span() -> Generator[None]:
+    """Make a span with a valid, sampled context current. conftest installs no
+    TracerProvider, so trace.get_current_span() is otherwise the invalid span and
+    every trace assertion would pass vacuously."""
+    span = trace_api.NonRecordingSpan(
+        trace_api.SpanContext(
+            trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
+            span_id=0x00F067AA0BA902B7,
+            is_remote=False,
+            trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
+        )
+    )
+    with trace_api.use_span(span, end_on_exit=False):
+        yield
+
+
+class TestPlayerDebugDecoration:
+    """The player's half of debug mode's footer. MusicContext.send covers command
+    responses (test_context.py); everything here is sent or edited by the player
+    itself, where that seam is never reached.
+
+    The cog is a MagicMock pinned OFF in the mock_ctx fixture — enabling means
+    setting both halves, since a footer needs the runtime snapshot to be a real
+    RuntimeSnapshot rather than an auto-mock.
+    """
+
+    @staticmethod
+    def _enable(
+        music_player: MusicPlayer,
+        *,
+        cpu: float = 12.0,
+        mem: float = 34.0,
+        lag: float = 1.0,
+    ) -> None:
+        cog = mocked(music_player._cog)
+        cog.debug_enabled.return_value = True
+        cog.runtime_snapshot = RuntimeSnapshot(
+            cpu_percent=cpu, mem_percent=mem, lag_ms=lag, tasks=7, pool_workers=4
+        )
+
+    @staticmethod
+    def _footers(embeds: Sequence[discord.Embed]) -> list[str]:
+        return [e.footer.text or "" for e in embeds]
+
+    # ── The NP block: one chokepoint, every render site ───────────────────────
+
+    def test_block_is_decorated_when_enabled(
+        self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """Every embed of the block, not just the now-playing one — the requirement
+        is all embeds, and a multi-embed response decorates all of its own."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        music_player.queue._display.append(
+            QueueObject("https://yt.com/v=next", "Next Song", mock_author, duration=90)
+        )
+        block = music_player.np_embed_block()
+        assert len(block) == 2
+        assert all("🐞" in f for f in self._footers(block))
+
+    def test_block_is_clean_when_disabled(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        music_player.current_song = mock_song
+        block = music_player.np_embed_block()
+        # The NP embed keeps its own stream-metadata footer either way — "clean"
+        # means no debug suffix was added to it.
+        assert not any("🐞" in f for f in self._footers(block))
+        assert "Avg Bitrate" in self._footers(block)[0]
+
+    def test_the_suffix_appends_after_the_np_footer(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The NP embed already carries a stream-metadata footer (bitrate/sampling/
+        codec). Decoration must extend it, not overwrite it."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        footer = self._footers(music_player.np_embed_block())[0]
+        assert "Avg Bitrate" in footer
+        assert footer.index("Avg Bitrate") < footer.index("🐞")
+
+    def test_the_block_carries_no_trace_id(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Deliberate: the block re-renders under the command span at attach time and
+        the playback span on the next tick, so a trace id there would alternate on one
+        message. Runtime and shard are the same wherever it renders."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        with _current_span():
+            footer = self._footers(music_player.np_embed_block())[0]
+        assert "trace" not in footer
+        assert "cpu 12%" in footer and "shard" in footer
+
+    async def test_the_dedicated_host_send_is_decorated(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        sent = MagicMock(spec=discord.Message)
+        sent.id = 1
+        music_player._channel.send = AsyncMock(return_value=sent)
+        await music_player._send_np_host_message()
+        embeds = music_player._channel.send.call_args.kwargs["embeds"]
+        assert all("🐞" in f for f in self._footers(embeds))
+
+    # ── The periodic tick: the every-N-seconds half of the requirement ────────
+
+    async def test_the_tick_refreshes_the_metrics(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The footer must track the sampler, not freeze at song start — otherwise a
+        stale cpu/mem reading sits under a bar that is visibly still advancing."""
+        self._enable(music_player, cpu=12.0)
+        message = AsyncMock(spec=discord.Message)
+        await music_player._push_np_edit(mock_song, message, [])
+        first = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+
+        self._enable(music_player, cpu=91.0)
+        await music_player._push_np_edit(mock_song, message, [])
+        second = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+
+        assert "cpu 12%" in first
+        assert "cpu 91%" in second
+
+    async def test_the_tick_leaves_cached_own_embeds_alone(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """T2. The host's own embeds are the cached objects from send time, already
+        decorated by MusicContext.send; their elapsed-ms is a record of that request.
+        Re-decorating them every tick would rewrite history — and, before the
+        idempotency fix, would have grown the footer on every tick forever."""
+        self._enable(music_player)
+        own = discord.Embed(title="Queue")
+        own.set_footer(text="🐞 4 ms · shard 0")
+        message = AsyncMock(spec=discord.Message)
+        await music_player._push_np_edit(mock_song, message, [own])
+        await music_player._push_np_edit(mock_song, message, [own])
+        assert own.footer.text == "🐞 4 ms · shard 0"
+
+    async def test_disabling_mid_song_clears_the_footer_next_tick(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """T8. The block is rebuilt from scratch every tick, so a toggle takes effect
+        on the next one in both directions with nothing to clean up."""
+        self._enable(music_player)
+        message = AsyncMock(spec=discord.Message)
+        await music_player._push_np_edit(mock_song, message, [])
+        assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
+
+        mocked(music_player._cog).debug_enabled.return_value = False
+        await music_player._push_np_edit(mock_song, message, [])
+        after = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+        assert "🐞" not in after
+        assert "Avg Bitrate" in after  # the embed's own footer survives
+
+    async def test_enabling_mid_song_adds_the_footer_next_tick(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        message = AsyncMock(spec=discord.Message)
+        await music_player._push_np_edit(mock_song, message, [])
+        assert "🐞" not in (
+            message.edit.call_args.kwargs["embeds"][0].footer.text or ""
+        )
+
+        self._enable(music_player)
+        await music_player._push_np_edit(mock_song, message, [])
+        assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
+
+    async def test_the_finalize_edit_is_decorated(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        self._enable(music_player)
+        message = AsyncMock(spec=discord.Message)
+        await music_player._finalize_now_playing(mock_song, message, [])
+        assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
+
+    # ── Player-initiated one-shot sends ───────────────────────────────────────
+
+    async def test_send_with_np_decorates_its_own_embed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        sent = MagicMock(spec=discord.Message)
+        sent.id = 1
+        music_player._channel.send = AsyncMock(return_value=sent)
+        await music_player.send_with_np(embed=discord.Embed(title="Notice"))
+        embeds = music_player._channel.send.call_args.kwargs["embeds"]
+        assert all("🐞" in f for f in self._footers(embeds))
+
+    async def test_the_resume_notice_is_decorated(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        self._enable(music_player)
+        mock_song.start_paused = False
+        music_player._channel.send = AsyncMock()
+        await music_player._announce_resume(mock_song)
+        embed = music_player._channel.send.call_args.kwargs["embed"]
+        assert "🐞" in (embed.footer.text or "")
+
+    async def test_the_dead_stream_notice_is_decorated(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        self._enable(music_player)
+        music_player.store = None
+        music_player._channel.send = AsyncMock()
+        await music_player._handle_dead_stream(mock_song)
+        embed = music_player._channel.send.call_args.kwargs["embed"]
+        assert "🐞" in (embed.footer.text or "")
+
+    async def test_a_one_shot_notice_keeps_its_trace_id(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """The opposite of the block rule: nothing re-renders a notice, and the trace
+        id is what joins a user's report of it to Tempo."""
+        self._enable(music_player)
+        mock_song.start_paused = False
+        music_player._channel.send = AsyncMock()
+        with _current_span():
+            await music_player._announce_resume(mock_song)
+        embed = music_player._channel.send.call_args.kwargs["embed"]
+        assert "trace" in (embed.footer.text or "")
 
 
 class TestNpHostAdoptRetire:

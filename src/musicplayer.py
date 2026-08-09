@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 
 from src import config
+from src.debug import decorate_embeds
 from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import (
@@ -40,7 +41,6 @@ from src.util import (
     notice_embed,
     pluralize,
     record_span_error,
-    send_embed,
     trace_footer,
     truncate,
     truncate_embed_title,
@@ -1019,6 +1019,32 @@ class MusicPlayer:
 
     # ── Embed building ────────────────────────────────────────────────────────
 
+    def _decorate_for_debug(
+        self, embeds: Sequence[discord.Embed], *, span: Optional[trace.Span] = None
+    ) -> None:
+        """Add the debug footer to player-initiated embeds while the guild has debug
+        mode on. MusicContext.send covers command responses; this covers everything
+        the player sends or edits on its own, including the NP block at every render
+        site. No elapsed_ms: there is no command here to have taken any time.
+
+        Only ever call this on freshly built embeds — the cached _np_host_own_embeds
+        keep their send-time footer, whose elapsed-ms is a historical record.
+
+        `span` is left None by NP-block callers on purpose: the block re-renders
+        under whatever span is current (the command span when a response attaches it,
+        the playback span on the next tick), so a trace id there would visibly
+        alternate on one message. One-shot notices pass their span — joining the
+        notice to its trace is the point, and nothing re-renders them.
+        """
+        if not self._cog.debug_enabled(self._guild.id):
+            return
+        decorate_embeds(
+            embeds,
+            span=span,
+            shard_id=self._guild.shard_id,
+            runtime=self._cog.runtime_snapshot,
+        )
+
     def _build_now_playing_embed(
         self, song: YTDL, *, position_override: Optional[float] = None
     ) -> discord.Embed:
@@ -1135,7 +1161,13 @@ class MusicPlayer:
     ) -> list[discord.Embed]:
         """The [now_playing, next_up?] block, or [] when no song is live — the one
         place encoding its internal order. `now_playing` lets a caller that already
-        built this song's embed supply it instead of building an identical one."""
+        built this song's embed supply it instead of building an identical one.
+
+        Debug decoration happens here rather than at each caller, so every site that
+        attaches the block (command responses, the dedicated host, send_with_np) gets
+        it from one place. A supplied `now_playing` may be the cached play_message,
+        which is decorated more than once over its life — decorate_embeds replaces
+        rather than appends, which is what makes that safe."""
         song = self.current_song
         if song is None:
             return []
@@ -1149,6 +1181,7 @@ class MusicPlayer:
         next_up = self._build_next_up_embed()
         if next_up is not None:
             block.append(next_up)
+        self._decorate_for_debug(block)
         return block
 
     def _adopt_np_host(
@@ -1252,8 +1285,9 @@ class MusicPlayer:
         hook) but must still keep the NP block at the bottom — the same
         splice-send-adopt sequence as MusicContext.send."""
         own = [embed] if embed is not None else []
+        self._decorate_for_debug(own, span=trace.get_current_span())
         song = self.current_song  # the song the block below is built for
-        block = self.np_embed_block()
+        block = self.np_embed_block()  # decorates its own embeds
         embeds = block + own
         if embeds:
             message = await self._channel.send(content, embeds=embeds)
@@ -1543,8 +1577,10 @@ class MusicPlayer:
             )
         else:
             text = f"⏮ Resuming **{song.title}** at `{position}`"
+        embed = notice_embed(text, discord.Color.blue())
+        self._decorate_for_debug([embed], span=trace.get_current_span())
         try:
-            await self._channel.send(embed=notice_embed(text, discord.Color.blue()))
+            await self._channel.send(embed=embed)
         except Exception as e:
             log.warning(f"Failed to send resume notice in guild {self._guild.id}: {e}")
 
@@ -1597,14 +1633,14 @@ class MusicPlayer:
         )
         if self.store is not None and song.webpage_url:
             await invalidate_stream_cache(self.store.redis, song.webpage_url)
+        embed = notice_embed(
+            f"Could not play **{song.title}** — YouTube refused the audio "
+            "stream. Queue it again to retry.",
+            discord.Color.red(),
+        )
+        self._decorate_for_debug([embed], span=trace.get_current_span())
         try:
-            await self._channel.send(
-                embed=notice_embed(
-                    f"Could not play **{song.title}** — YouTube refused the audio "
-                    "stream. Queue it again to retry.",
-                    discord.Color.red(),
-                )
-            )
+            await self._channel.send(embed=embed)
         except Exception as e:
             log.warning(
                 f"Failed to send playback-failure notice in guild {self._guild.id}: {e}"
@@ -1669,13 +1705,19 @@ class MusicPlayer:
         """Rebuild the host's embeds — a fresh NP block, then its cached own embeds —
         and push one edit. Shared by the periodic tick, the debounced pause/resume
         refresh and the song-end finalize. False when the message no longer exists,
-        so callers can release the host; finalize ignores it."""
+        so callers can release the host; finalize ignores it.
+
+        This is what refreshes the debug footer alongside the bar: the block is
+        rebuilt and re-decorated every tick, so its metrics track the sampler.
+        `own_embeds` is excluded — those are cached and already decorated."""
         try:
             embed = self._build_now_playing_embed(
                 song, position_override=position_override
             )
             next_up = self._build_next_up_embed()
-            embeds = [embed] + ([next_up] if next_up else []) + own_embeds
+            block = [embed] + ([next_up] if next_up else [])
+            self._decorate_for_debug(block)
+            embeds = block + own_embeds
             # Discord's per-message cap: an attach accepted at the cap can overflow
             # here if a next-up embed appears later. Drop the own-embeds tail, never
             # the block (parity with MusicContext.send's guard; unreachable today).
@@ -2173,14 +2215,17 @@ class MusicPlayer:
                     self.play_message = None
                     if self.store is not None:
                         await self.store.clear_song_end_state()
+                    # Built here rather than via send_embed so the debug footer can be
+                    # added before the send; skip_trace dedups against trace_footer's.
+                    error_embed = discord.Embed(
+                        title="Playback error — skipping song",
+                        description=f"**{type(e).__name__}:** {e}",
+                        color=discord.Color.red(),
+                    )
+                    error_embed.set_footer(text=trace_footer(span))
+                    self._decorate_for_debug([error_embed], span=span)
                     try:
-                        await send_embed(
-                            self._channel,
-                            "Playback error — skipping song",
-                            f"**{type(e).__name__}:** {e}",
-                            discord.Color.red(),
-                            footer=trace_footer(span),
-                        )
+                        await self._channel.send(embed=error_embed)
                     except Exception as e:
                         log.warning(
                             f"Failed to send playback-error embed in guild {self._guild.id}: {e}"

@@ -88,10 +88,12 @@ class MusicContext(commands.Context):
         return message
 
     def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
-        """Append the debug footer to this response's own embeds while the guild has
-        debug mode on. The NP block is deliberately not reachable from here: the
-        progress updater re-renders it every few seconds undecorated, and the flicker
-        would be worse than useless."""
+        """Add the debug footer to this response's own embeds while the guild has debug
+        mode on. The NP block is decorated by the player instead, inside
+        np_embed_block(): it is re-rendered by the progress updater every few seconds,
+        so decorating it here would let the tick strip the footer straight back off.
+        Decorating at build time covers every render site — attach, dedicated host,
+        tick, debounce, finalize — and keeps the block's metrics fresh."""
         cog = self._music_cog()
         if cog is None:
             return
