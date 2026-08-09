@@ -220,6 +220,18 @@ def debug_footer(
     return f"{_DEBUG_MARK} " + " · ".join(parts)
 
 
+def _strip_debug_suffix(text: str) -> str:
+    """`text` with any previous debug suffix removed. The FIRST mark is the
+    boundary — no bot-authored footer contains it, so everything from there on is
+    ours, including a doubled suffix written by the pre-idempotency code."""
+    idx = text.find(f" · {_DEBUG_MARK} ")
+    if idx != -1:
+        return text[:idx]
+    if text.startswith(f"{_DEBUG_MARK} "):
+        return ""
+    return text
+
+
 def decorate_embeds(
     embeds: Sequence[discord.Embed],
     *,
@@ -228,28 +240,32 @@ def decorate_embeds(
     shard_id: Optional[int] = None,
     runtime: Optional["RuntimeSnapshot"] = None,
 ) -> None:
-    """Append the debug footer to each embed, IN PLACE.
-
-    Mutating is safe — embeds are freshly constructed per response everywhere in
-    this codebase — and it is what lets MusicContext.send decorate both of its send
-    paths without either of them reshaping its kwargs.
+    """Write the debug footer onto each embed, IN PLACE — replacing a previous
+    suffix rather than appending after it. Replacement is what keeps decoration
+    safe for a cached embed that is sent more than once (play_message, re-served
+    by -now during the crash-recovery window): each send refreshes the suffix
+    instead of growing the footer.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
+        base = _strip_debug_suffix(existing)
         suffix = debug_footer(
             span=span,
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
             runtime=runtime,
-            # Error embeds already carry one from _command_error. The same id twice
-            # in one footer reads as two different traces.
-            skip_trace="trace:" in existing or "trace " in existing,
+            # Decided from the PRE-suffix footer: error embeds carry their own
+            # trace from _command_error (the same id twice in one footer reads as
+            # two different traces), while a trace in our own previous suffix must
+            # not suppress the fresh one replacing it.
+            skip_trace="trace:" in base or "trace " in base,
         )
-        if not suffix:
-            continue
-        text = f"{existing} · {suffix}" if existing else suffix
+        if not suffix and base == existing:
+            continue  # nothing to add, nothing stale to replace
+        text = f"{base} · {suffix}" if base and suffix else (suffix or base)
         embed.set_footer(
-            text=truncate(text, FOOTER_LIMIT), icon_url=embed.footer.icon_url
+            text=truncate(text, FOOTER_LIMIT) if text else None,
+            icon_url=embed.footer.icon_url,
         )
 
 

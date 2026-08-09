@@ -697,6 +697,77 @@ class TestTraceIdInTheFooter:
         assert self.HEX in (embed.footer.text or "")
 
 
+class TestDecorationIsIdempotent:
+    """decorate_embeds REPLACES a previous debug suffix instead of appending after
+    it. The one cached embed sent more than once (play_message, re-served by -now
+    during the crash-recovery window) used to grow a fresh suffix on every send."""
+
+    def test_redecorating_replaces_the_suffix(self) -> None:
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed], elapsed_ms=5.0, shard_id=0)
+        debug.decorate_embeds([embed], elapsed_ms=9.0, shard_id=0)
+        text = embed.footer.text or ""
+        assert text.count(debug._DEBUG_MARK) == 1
+        assert "9 ms" in text
+        assert "5 ms" not in text
+
+    def test_an_original_footer_survives_redecoration(self) -> None:
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="Avg Bitrate: 128 kbps")
+        debug.decorate_embeds([embed], shard_id=1)
+        debug.decorate_embeds([embed], shard_id=2)
+        text = embed.footer.text or ""
+        assert text.startswith("Avg Bitrate: 128 kbps · ")
+        assert text.count("Avg Bitrate") == 1
+        assert text.count(debug._DEBUG_MARK) == 1
+        assert "shard 2" in text
+        assert "shard 1" not in text
+
+    def test_our_own_trace_does_not_suppress_the_fresh_one(self) -> None:
+        """The old skip_trace check read the WHOLE footer, so the trace segment of
+        our own previous suffix suppressed its replacement — the second decoration
+        of a traced embed silently lost the trace id."""
+        span = TestTraceIdInTheFooter._span()
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed], span=span, shard_id=0)
+        debug.decorate_embeds([embed], span=span, shard_id=0)
+        assert (embed.footer.text or "").count(TestTraceIdInTheFooter.HEX) == 1
+
+    def test_an_error_embeds_own_trace_still_wins(self) -> None:
+        """skip_trace is decided from the pre-suffix footer: _command_error's
+        `trace:` line keeps suppressing ours across any number of decorations."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text=f"trace: {TestTraceIdInTheFooter.HEX}")
+        span = TestTraceIdInTheFooter._span()
+        debug.decorate_embeds([embed], span=span, elapsed_ms=1.0)
+        debug.decorate_embeds([embed], span=span, elapsed_ms=2.0)
+        assert (embed.footer.text or "").count(TestTraceIdInTheFooter.HEX) == 1
+
+    def test_nothing_to_show_strips_a_stale_suffix(self) -> None:
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text is not None
+        debug.decorate_embeds([embed])
+        assert embed.footer.text is None
+
+    def test_nothing_to_show_restores_the_original_footer(self) -> None:
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="environment: test")
+        debug.decorate_embeds([embed], shard_id=0)
+        debug.decorate_embeds([embed])
+        assert embed.footer.text == "environment: test"
+
+    def test_a_doubled_legacy_suffix_is_fully_replaced(self) -> None:
+        """Footers written by the pre-idempotency code can carry two suffixes; the
+        first mark is the boundary, so one decoration heals the whole tail."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(
+            text=f"base · {debug._DEBUG_MARK} 3 ms · {debug._DEBUG_MARK} 4 ms"
+        )
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == f"base · {debug._DEBUG_MARK} shard 0"
+
+
 class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that
     describes the HOST rather than the caller's own server is owner-only."""

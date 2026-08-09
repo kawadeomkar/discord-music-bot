@@ -273,6 +273,20 @@ class TestDebugDecoration:
         assert parent.call_args.kwargs["embed"] is own  # kwargs shape untouched
         assert (own.footer.text or "").startswith("🐞")
 
+    async def test_resending_a_cached_embed_refreshes_rather_than_stacks(
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+    ) -> None:
+        """Decoration mutates in place, and play_message is cached on the player —
+        repeat -now during the crash-recovery window sends the SAME embed object
+        again. Each send must replace the previous suffix, not append another."""
+        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        live_mp.current_song = None
+        cached = discord.Embed(title="Now playing: x")  # stands in for play_message
+        with _parent_send(MagicMock(spec=discord.Message)):
+            await mctx.send(embed=cached)
+            await mctx.send(embed=cached)
+        assert (cached.footer.text or "").count("🐞") == 1
+
     async def test_decorates_every_embed_of_a_multi_embed_response(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
     ) -> None:
