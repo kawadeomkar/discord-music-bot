@@ -37,6 +37,7 @@ from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
 from src.util import (
+    FOOTER_LIMIT,
     cancel_task,
     fmt_duration,
     get_logger,
@@ -122,9 +123,9 @@ _OPERATOR_NOTICE = (
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard caps on an embed field value and its footer text.
+# Discord's hard cap on an embed field value; its footer sibling is FOOTER_LIMIT,
+# imported from util.py above (see the comment there for why it lives outside).
 _FIELD_LIMIT = 1024
-FOOTER_LIMIT = 2048
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
 
@@ -189,9 +190,8 @@ def unknown_arg_message(arg: str) -> str:
 #     player's own notices (musicplayer.py)
 #   • the live dashboards — -ping and -debug bypass both of the above (they reply
 #     through channel.send and then EDIT), so the cog pre-renders a suffix once per
-#     invocation and threads it in. Static across the loop on purpose: the driver
-#     only PATCHes when the render differs, so a varying footer would edit forever.
-#     That is why the dashboard suffix carries no elapsed-ms.
+#     invocation and threads it in (MusicBot._debug_suffix; see
+#     ping.run_health_dashboard for why it must stay constant across the loop).
 
 _DEBUG_MARK = "🐞"
 
@@ -242,6 +242,22 @@ def _strip_debug_suffix(text: str) -> str:
     return text
 
 
+def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
+    """Remove a previous debug suffix. What the seams call while debug mode is OFF.
+
+    Decoration is in place and some embeds outlive the toggle — `play_message` is
+    built once per song and re-sent by `-now` — so without this a guild that runs
+    `-debug --disable` keeps seeing the old footer on anything built before it. The
+    mark check keeps this off the hot path: with debug mode off, which is the ship
+    default, no embed carries one and this is one substring test per embed.
+    """
+    for embed in embeds:
+        existing = embed.footer.text or ""
+        if _DEBUG_MARK not in existing:
+            continue
+        _write_footer(embed, _strip_debug_suffix(existing), "")
+
+
 def decorate_embeds(
     embeds: Sequence[discord.Embed],
     *,
@@ -255,6 +271,10 @@ def decorate_embeds(
     safe for a cached embed that is sent more than once (play_message, re-served
     by -now during the crash-recovery window): each send refreshes the suffix
     instead of growing the footer.
+
+    With nothing worth showing this REMOVES a stale suffix rather than leaving it,
+    so a guild that turns debug mode off stops seeing one on an embed built while
+    it was on. An embed whose whole footer was the suffix ends up with no footer.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
@@ -272,11 +292,30 @@ def decorate_embeds(
         )
         if not suffix and base == existing:
             continue  # nothing to add, nothing stale to replace
-        text = f"{base} · {suffix}" if base and suffix else (suffix or base)
-        embed.set_footer(
-            text=truncate(text, FOOTER_LIMIT) if text else None,
-            icon_url=embed.footer.icon_url,
-        )
+        _write_footer(embed, base, suffix)
+
+
+def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
+    """Join `base` and `suffix` into the footer, clipping the BASE if the pair does
+    not fit.
+
+    Clipping the base rather than the joined string is what keeps decoration
+    idempotent at the limit: `truncate` applied to the join would cut the ` · 🐞 `
+    boundary off the end, and _strip_debug_suffix would then never find it again —
+    the embed would silently stop accepting a suffix for the rest of its life.
+    """
+    if base and suffix:
+        # 3 for the " · " separator.
+        text = f"{truncate(base, max(0, FOOTER_LIMIT - len(suffix) - 3))} · {suffix}"
+    else:
+        text = truncate(suffix or base, FOOTER_LIMIT)
+    embed.set_footer(
+        text=text or None,
+        # Discord rejects a footer carrying an icon with no text, so the icon goes
+        # with it. Unreachable today (nothing here sets one), but this is the
+        # general seam every embed the bot sends passes through.
+        icon_url=embed.footer.icon_url if text else None,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════

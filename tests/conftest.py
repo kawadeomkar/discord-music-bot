@@ -105,8 +105,9 @@ def scrub_config_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     over this fixture (same MonkeyPatch instance, later call).
 
     DEBUG_MODE is scrubbed rather than pinned, because here the ship default is
-    the one hundreds of embed assertions encode: with it on, every response grows
-    a debug footer. Debug-on tests monkeypatch it (or set an override) per case.
+    the one hundreds of embed assertions encode: with it on, every embed the bot
+    sends grows a debug footer — command responses, the Now Playing block at every
+    render, and the player's own notices. Debug-on tests monkeypatch it (or set an override) per case.
     """
     monkeypatch.delenv("POSTGRES_URL", raising=False)
     monkeypatch.delenv("DEBUG_MODE", raising=False)
@@ -383,8 +384,9 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._alone_timers = {}
     cog._restore_tasks = set()
     # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
-    # mode on, every response grows a footer and the suite's embed assertions
-    # would be asserting against decorated output everywhere.
+    # mode on, every embed grows a footer and the suite's embed assertions would be
+    # asserting against decorated output everywhere. The mock cog used by player
+    # tests is pinned separately, in mock_ctx — same hazard, different object.
     cog._debug_default = False
     cog._debug_overrides = {}
     # Same shape __init__ builds: the toggle stamps these so a hydration pass that

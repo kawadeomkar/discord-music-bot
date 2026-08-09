@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 
 from src import config
-from src.debug import decorate_embeds
+from src.debug import decorate_embeds, strip_debug_footers
 from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import (
@@ -1037,6 +1037,9 @@ class MusicPlayer:
         notice to its trace is the point, and nothing re-renders them.
         """
         if not self._cog.debug_enabled(self._guild.id):
+            # Not just a return: play_message is built once per song and outlives a
+            # mid-song --disable, so a stale suffix has to come back off.
+            strip_debug_footers(embeds)
             return
         decorate_embeds(
             embeds,

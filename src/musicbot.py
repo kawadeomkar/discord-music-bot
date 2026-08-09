@@ -1904,9 +1904,9 @@ class MusicBot(commands.Cog):
 
         They are the one pair of commands neither decoration seam reaches: they reply
         through channel.send (an edit loop must not own the NP host) and then edit
-        that message on a tick. So the suffix is computed here and threaded in — and
-        deliberately carries no elapsed-ms, because the driver only PATCHes when the
-        render differs and a per-tick-varying footer would make that always true.
+        that message on a tick. So the suffix is computed here, once, and threaded in.
+        No elapsed-ms, deliberately — see ping.run_health_dashboard for why every
+        segment of this has to be constant for the life of the loop.
 
         `host_metrics=False` drops the runtime segment and keeps the shard. `-debug`
         passes the caller's operator status, because that card WITHHOLDS its Runtime
@@ -2221,19 +2221,27 @@ class MusicBot(commands.Cog):
             mp = self.mps.get(guild.id)
 
             if mp is not None:
-                try:
-                    # send_with_np, not a bare channel send: this can fire mid-song
-                    # and a bare send would bury the NP host message.
-                    embed = discord.Embed(
-                        title="No users remaining in voice channel",
-                        description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                        color=discord.Color.orange(),
-                    )
-                    await mp.send_with_np(embed=embed)
-                except Exception as e:
-                    log.warning(
-                        f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
-                    )
+                # Its own short span rather than one stretched over the sleep (see
+                # below for why that is avoided): the notice is sent now, and with
+                # no span current its debug footer would carry no trace id to join
+                # it back to this decision.
+                with _tracer.start_as_current_span(
+                    "bot.alone_countdown.notice",
+                    attributes={"discord.guild_id": str(guild.id)},
+                ):
+                    try:
+                        # send_with_np, not a bare channel send: this can fire
+                        # mid-song and a bare send would bury the NP host message.
+                        embed = discord.Embed(
+                            title="No users remaining in voice channel",
+                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                            color=discord.Color.orange(),
+                        )
+                        await mp.send_with_np(embed=embed)
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
+                        )
 
             await asyncio.sleep(10)
 

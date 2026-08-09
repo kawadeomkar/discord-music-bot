@@ -20,6 +20,7 @@ from src.debug import RuntimeSnapshot
 from src.guild_queue import QueueItem
 from src.guild_state import (
     DEFAULT_TIMEZONE,
+    GuildStateData,
     HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
@@ -3728,6 +3729,25 @@ class TestPlayerDebugDecoration:
         await music_player._push_np_edit(mock_song, message, [])
         assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
 
+    def test_disabling_strips_a_suffix_from_a_cached_embed(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """play_message is built ONCE per song and decorated in place, so it outlives
+        a mid-song --disable — and -now re-sends that same object during the
+        crash-recovery window. Freshly built embeds self-heal (the tick rebuilds
+        them); this one cannot, so the disabled path has to strip rather than
+        early-return."""
+        self._enable(music_player)
+        music_player.current_song = mock_song
+        cached = music_player._build_now_playing_embed(mock_song)
+        music_player.np_embed_block(now_playing=cached)
+        assert "🐞" in (cached.footer.text or "")
+
+        mocked(music_player._cog).debug_enabled.return_value = False
+        music_player.np_embed_block(now_playing=cached)
+        assert "🐞" not in (cached.footer.text or "")
+        assert "Avg Bitrate" in (cached.footer.text or "")  # its own footer survives
+
     async def test_the_finalize_edit_is_decorated(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
@@ -7003,6 +7023,46 @@ class TestStartOffsetAnnounce:
         live_song.start_offset = 90
         mock_channel.send.side_effect = RuntimeError("channel gone")
         await music_player._announce_start_offset(live_song)  # must not raise
+
+    async def test_it_is_clean_with_debug_off(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
+    ) -> None:
+        live_song.start_offset = 90
+        await music_player._announce_start_offset(live_song)
+        embed = mock_channel.send.call_args.kwargs["embed"]
+        assert embed.footer.text is None
+
+    async def test_a_crash_recovered_song_takes_this_arm_not_the_resume_one(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """PRE-EXISTING and deliberately pinned as-is rather than fixed here.
+
+        from_crashed_state stamps `ts` = the crashed position and leaves is_resume
+        at its False default, so a song recovered at 2:17 announces "Starting song
+        at 137 seconds" instead of "⏮ Resuming … at 2:17". `main` does exactly the
+        same via the old yt_stream guard — the relocation neither caused nor cured
+        it. Changing it means setting is_resume on the crashed head, which also
+        moves _remaining_secs (resume entries count only their tail) and the queue
+        display, so it belongs in its own change. See the FIXME in guild_state.py.
+        """
+        entry = SongQueueEntry.from_crashed_state(
+            GuildStateData(
+                current_song_url="https://yt.com/v=crash",
+                current_song_title="Interrupted",
+                current_song_duration=210,
+            ),
+            position=137,
+        )
+        assert entry is not None
+        assert entry.is_resume is False  # the stamp that decides the arm
+        mock_song.is_resume = entry.is_resume
+        mock_song.start_offset = entry.ts
+        vc = TestPlaynowLoopStart()._vc()
+        _, announce_mock, offset_mock = await TestPlaynowLoopStart()._run_one_song(
+            music_player, queue_obj, mock_song, vc
+        )
+        offset_mock.assert_awaited_once_with(mock_song)
+        announce_mock.assert_not_awaited()
 
     async def test_it_is_decorated_in_debug_mode(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock

@@ -593,6 +593,16 @@ class SongQueueEntry:
         Redis list and the loop must not LPOP again for it. `position` is the
         caller-computed resume offset (crashed_position_at() plus its duration cap),
         passed in so this stays a pure field mapping.
+
+        FIXME: a recovered song is a resume in everything but the flag. `ts` is set
+        to where it was interrupted, but `is_resume` stays False, so the playback
+        loop announces "Starting song at 137 seconds" instead of "⏮ Resuming … at
+        2:17", and _remaining_secs bills the whole duration rather than the tail —
+        which skews every queue ETA behind it. Setting is_resume here fixes both,
+        but it also changes the queue display and the -playnow interjection
+        wording, so it wants its own change with its own tests. Pinned as-is by
+        test_musicplayer.py::TestStartOffsetAnnounce::
+        test_a_crash_recovered_song_takes_this_arm_not_the_resume_one.
         """
         if not state.has_crashed_song:
             return None

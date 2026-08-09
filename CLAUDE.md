@@ -755,7 +755,10 @@ read that header first.
 - Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
   exception — it has no test file; `test_leaderboard.py` also owns the cog command
   that drives it, since splitting the renderer's tests from the command's would make
-  a reader check two files to learn what one board looks like), plus `conftest.py` (shared fixtures/seams),
+  a reader check two files to learn what one board looks like; `test_debug.py`
+  likewise owns `MusicBot._debug_suffix` and the `-debug` card's end-to-end
+  assertions, for the same reason — what the footer says and what puts it there are
+  one behavior), plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
   `telemetry.py` are the two intentionally-least-covered modules.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs

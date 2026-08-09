@@ -50,7 +50,14 @@ from src.config import (
     using_default_postgres_password,
 )
 from src.spotify import Spotify
-from src.util import get_logger, latency_color, send_embed, trace_footer
+from src.util import (
+    FOOTER_LIMIT,
+    get_logger,
+    latency_color,
+    send_embed,
+    trace_footer,
+    truncate,
+)
 
 log = get_logger(__name__)
 
@@ -411,7 +418,7 @@ def render_ping_embed(
         footer += f" · {tf}"
     if debug_suffix:
         footer += f" · {debug_suffix}"
-    embed.set_footer(text=footer)
+    embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
     return embed
 
 
@@ -465,7 +472,7 @@ def default_password_embed(
         inline=False,
     )
     if debug_suffix:
-        embed.set_footer(text=debug_suffix)
+        embed.set_footer(text=truncate(debug_suffix, FOOTER_LIMIT))
     return embed
 
 
@@ -498,6 +505,10 @@ async def run_health_dashboard(
     # for the same reason — a default of None would let a new caller silently render an
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
+    # Defaulted, unlike `archive`, because None here is a REAL state rather than an
+    # unknown one — it is exactly what MusicBot._debug_suffix returns for a guild
+    # with debug mode off — and forgetting it costs a cosmetic footer, not a wrong
+    # health answer.
     debug_suffix: Optional[str] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard: sends a skeleton embed immediately,

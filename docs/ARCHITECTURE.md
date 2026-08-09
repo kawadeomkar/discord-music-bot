@@ -1391,7 +1391,9 @@ finalize — produces it, and the tick refreshes the metrics alongside the bar. 
 block's footer deliberately omits the trace id: the block re-renders under the command
 span when a response attaches it and under the playback span on the next tick, so a
 trace id there would alternate on a single message. The host's cached *own* embeds are
-never re-decorated — their elapsed-ms records the request that sent them.
+never re-decorated — their elapsed-ms records the request that sent them, so a command
+response that became the host before debug mode was toggled keeps whatever footer it
+was sent with until a new host replaces it.
 
 ## Design Decisions
 

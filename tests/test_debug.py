@@ -769,6 +769,69 @@ class TestDecorationIsIdempotent:
         debug.decorate_embeds([embed], shard_id=0)
         assert embed.footer.text == f"base · {debug._DEBUG_MARK} shard 0"
 
+    def test_an_undecorated_footer_is_left_exactly_alone(self) -> None:
+        """Nothing to add AND nothing stale to strip — the embed must not be
+        rewritten at all. Reachable in production: debug on, in a DM (no shard),
+        before the sampler's first tick, outside a command span."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="environment: test", icon_url="https://e/i.png")
+        debug.decorate_embeds([embed])
+        assert embed.footer.text == "environment: test"
+        assert embed.footer.icon_url == "https://e/i.png"
+
+    def test_an_empty_footer_stays_empty(self) -> None:
+        embed = discord.Embed(title="x")
+        debug.decorate_embeds([embed])
+        assert embed.footer.text is None
+
+    def test_a_footer_that_is_only_a_suffix_loses_its_icon_too(self) -> None:
+        """Discord rejects a footer carrying an icon with no text, so stripping the
+        text has to take the icon with it or the next send 400s the whole message."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(
+            text=f"{debug._DEBUG_MARK} shard 0", icon_url="https://e/i.png"
+        )
+        debug.decorate_embeds([embed])
+        assert embed.to_dict().get("footer") in (None, {})
+
+    def test_a_near_limit_footer_keeps_accepting_a_fresh_suffix(self) -> None:
+        """The clip has to fall on the BASE. Truncating the joined string instead
+        cuts the ` · 🐞 ` boundary off the end, after which _strip_debug_suffix can
+        never find it again and the embed silently stops taking a suffix for life."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text="B" * (debug.FOOTER_LIMIT - 4))
+        debug.decorate_embeds([embed], elapsed_ms=5.0, shard_id=0)
+        assert "5 ms" in (embed.footer.text or "")
+        debug.decorate_embeds([embed], elapsed_ms=9.0, shard_id=0)
+        text = embed.footer.text or ""
+        assert text.count(debug._DEBUG_MARK) == 1
+        assert "9 ms" in text and "5 ms" not in text
+        assert len(text) <= debug.FOOTER_LIMIT
+
+    def test_a_mark_that_is_not_a_suffix_takes_the_tail_with_it(self) -> None:
+        """Documents a real limitation rather than a wish: the FIRST mark is treated
+        as the boundary, so anything after it is discarded. Safe only because no
+        bot-authored footer contains the mark and no user text reaches a footer —
+        the two invariants asserted below. If either ever breaks, this is how."""
+        embed = discord.Embed(title="x")
+        embed.set_footer(text=f"a · {debug._DEBUG_MARK} b · c")
+        debug.decorate_embeds([embed], shard_id=0)
+        assert embed.footer.text == f"a · {debug._DEBUG_MARK} shard 0"
+
+    def test_no_footer_the_bot_writes_contains_the_mark(self) -> None:
+        """The invariant the test above depends on. `-debug`'s own mark is in its
+        TITLE, and that card never passes through decorate_embeds."""
+        import re
+
+        source = Path("src").rglob("*.py")
+        offenders: list[str] = []
+        for path in source:
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"set_footer\((.{0,200}?)\)", text, re.S):
+                if debug._DEBUG_MARK in match.group(1):
+                    offenders.append(f"{path}: {match.group(1)[:60]}")
+        assert not offenders, offenders
+
 
 class TestOperatorGate:
     """`-debug` is reachable by any user in any guild, and by DM. Everything that
@@ -1057,6 +1120,30 @@ class TestDebugSuffixBuilder:
         assert suffix is not None
         assert "shard 4" in suffix and "cpu 9%" in suffix
         assert "trace" not in suffix
+
+    def test_in_a_dm_it_falls_back_to_the_host_default_and_omits_the_shard(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """`guild.id if guild else None` and `shard_id=... if guild else None` are
+        conditional expressions, so coverage reports no partial branch and this gap
+        is invisible in the numbers. -debug is DM-reachable."""
+        mock_ctx.guild = None
+        music_bot._debug_default = True
+        music_bot._runtime_sampler._snapshot = debug.RuntimeSnapshot(
+            cpu_percent=9.0, mem_percent=8.0, lag_ms=1.5, tasks=3, pool_workers=4
+        )
+        suffix = music_bot._debug_suffix(mock_ctx) or ""
+        assert "cpu 9%" in suffix
+        assert "shard" not in suffix
+
+    def test_a_dm_with_nothing_to_report_yields_none_rather_than_a_bare_mark(
+        self, music_bot: MusicBotCog, mock_ctx: MagicMock
+    ) -> None:
+        """No guild (no shard) and no snapshot yet (sampler cold) leaves debug_footer
+        with nothing to say. `or None` is what stops a lone 🐞 reaching the card."""
+        mock_ctx.guild = None
+        music_bot._debug_default = True
+        assert music_bot._debug_suffix(mock_ctx) is None
 
     def test_the_first_segment_is_the_shard_not_an_elapsed_time(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock

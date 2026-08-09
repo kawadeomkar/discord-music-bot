@@ -20,7 +20,7 @@ from src.config import ENVIRONMENT, spotify_enabled
 # happens inside the fire-and-forget prewarm() rather than on the loop, and is
 # arguably the point: prewarm()'s promise is that the first -play does not absorb
 # yt-dlp import latency, which was only half true before.
-from src.debug import decorate_embeds
+from src.debug import decorate_embeds, strip_debug_footers
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
@@ -98,15 +98,18 @@ class MusicContext(commands.Context):
         cog = self._music_cog()
         if cog is None:
             return
-        guild_id = self.guild.id if self.guild else None
-        if not cog.debug_enabled(guild_id):
-            return
         own = [
             e
             for e in (kwargs.get("embed"), *(kwargs.get("embeds") or ()))
             if e is not None
         ]
         if not own:
+            return
+        guild_id = self.guild.id if self.guild else None
+        if not cog.debug_enabled(guild_id):
+            # Not just a return: a cached embed built while debug mode was on must
+            # lose its suffix once it is off (see strip_debug_footers).
+            strip_debug_footers(own)
             return
         # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
         # command, which just means no elapsed time and no span to name.
