@@ -478,7 +478,6 @@ class QueueEntryField:
     # "qobj" entries
     WEBPAGE_URL: Final[str] = "webpage_url"
     TITLE: Final[str] = "title"
-    REQUESTER_ID: Final[str] = "requester_id"
     TS: Final[str] = "ts"
     USER_INPUT: Final[str] = "user_input"
     DURATION: Final[str] = "duration"
@@ -495,6 +494,11 @@ class QueueEntryField:
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification, carried on both entry types (see sources.py).
     QUERY_SOURCE: Final[str] = "query_source"
+    # Who queued it, carried on both entry types. Required on a song (one has
+    # always been resolved by the time it is written); absent on a search queued
+    # before the field existed, which parses as None — a different fact from
+    # requester 0, and the one that routes it back to the fallback requester.
+    REQUESTER_ID: Final[str] = "requester_id"
     # "ytsource" entries
     YTSEARCH: Final[str] = "ytsearch"
     URL: Final[str] = "url"
@@ -655,6 +659,10 @@ class SearchQueueEntry:
     # Likewise for the classification — this is the leg that makes a Spotify
     # playlist track archive as Spotify and not as the YouTube URL it becomes.
     query_source: str = ""
+    # The requester, fixed at enqueue. Without it every lazily-resolved track was
+    # attributed at dequeue to whoever ran a command most recently. None on
+    # entries written before the field existed; those fall back at resolve time.
+    requester_id: int | None = None
 
     @classmethod
     def from_ytsource(cls, source: YTSource) -> Self:
@@ -666,6 +674,7 @@ class SearchQueueEntry:
             queued_at=source.queued_at,
             queue_position=source.queue_position,
             query_source=source.query_source,
+            requester_id=source.requester_id,
         )
 
     def to_redis(self) -> bytes:
@@ -679,6 +688,7 @@ class SearchQueueEntry:
                 QueueEntryField.QUEUED_AT: self.queued_at,
                 QueueEntryField.QUEUE_POSITION: self.queue_position,
                 QueueEntryField.QUERY_SOURCE: self.query_source,
+                QueueEntryField.REQUESTER_ID: self.requester_id,
             }
         )
 
@@ -706,6 +716,8 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
                 queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
                 query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+                # No default: absent must stay None (never recorded), not 0.
+                requester_id=d.get(QueueEntryField.REQUESTER_ID),
             )
         return SongQueueEntry(
             webpage_url=d[QueueEntryField.WEBPAGE_URL],

@@ -541,6 +541,24 @@ class MusicPlayer:
             )
         return self._last_author
 
+    def _resolve_requester(
+        self, requester_id: Optional[int]
+    ) -> Union[discord.User, discord.Member]:
+        """The requester a lazy search was queued by, else the fallback.
+
+        Entries written before YTSource carried an ID have None and must keep
+        landing on _last_author — that is what they have always resolved to. A
+        member who left the guild still resolves through the user cache, so
+        leaving mid-queue does not reassign their plays; the archived
+        requester_name is their global name rather than their nickname there."""
+        if requester_id is not None:
+            who = self._guild.get_member(requester_id) or self.bot.get_user(
+                requester_id
+            )
+            if who is not None:
+                return who
+        return self._require_requester()
+
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
         cumulative_secs starts at the current song's total duration as a proxy for
@@ -1580,7 +1598,7 @@ class MusicPlayer:
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
             qobj = await YTDL.yt_source(
-                self._require_requester(),
+                self._resolve_requester(source.requester_id),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
             )

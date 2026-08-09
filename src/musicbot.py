@@ -1042,7 +1042,7 @@ class MusicBot(commands.Cog):
             if not titles:
                 raise ValueError(f"The {noun} has no queueable tracks")
             ok = await mp.queue_put_front(
-                spotify_titles_to_ytsearch(titles),
+                spotify_titles_to_ytsearch(titles, ctx.author.id),
                 prefetch=False,
                 expected_generation=gen,
             )
@@ -1072,7 +1072,7 @@ class MusicBot(commands.Cog):
         # =False on every page — the default would RPUSH one entry per item
         # (a 100-item page = 100 round-trips) and spawn N prefetch tasks.
         ok = await mp.queue_put(
-            spotify_titles_to_ytsearch(page1.titles),
+            spotify_titles_to_ytsearch(page1.titles, ctx.author.id),
             prefetch=False,
             expected_generation=gen,
         )
@@ -1237,7 +1237,10 @@ class MusicBot(commands.Cog):
                     except StopAsyncIteration:
                         break
                     ok = await mp.queue_put(
-                        spotify_titles_to_ytsearch(page.titles),
+                        # ctx.author, not mp._last_author: this drain runs after
+                        # the gate opened, so other users' commands are landing
+                        # while it enqueues. The pages belong to whoever asked.
+                        spotify_titles_to_ytsearch(page.titles, ctx.author.id),
                         prefetch=False,
                         expected_generation=drain.generation,
                     )
@@ -1607,7 +1610,7 @@ class MusicBot(commands.Cog):
                     discord.Color.orange(),
                 )
             )
-            yts = spotify_titles_to_ytsearch(titles[:1])[0]
+            yts = spotify_titles_to_ytsearch(titles[:1], ctx.author.id)[0]
             # Both collection branches resolve directly rather than through
             # queue_source, so each stamps its own result.
             qobj = await YTDL.yt_source(

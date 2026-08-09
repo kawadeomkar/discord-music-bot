@@ -386,10 +386,15 @@ class TestParseInput:
         assert result.type == SpotifyType.ALBUM
 
 
+# A requester that could not be mistaken for a default, so an assertion that the
+# ID survived the queue cannot pass against a 0 or a None.
+_REQUESTER_ID = 424242424242424242
+
+
 class TestSpotifyTitlesToYTSearch:
     def test_converts_titles_to_ytsearch(self) -> None:
         titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
-        result = spotify_titles_to_ytsearch(titles)
+        result = spotify_titles_to_ytsearch(titles, _REQUESTER_ID)
 
         assert len(result) == 2
         assert all(isinstance(r, YTSource) for r in result)
@@ -398,20 +403,33 @@ class TestSpotifyTitlesToYTSearch:
 
     def test_all_results_have_process_true(self) -> None:
         titles = ["Song A", "Song B", "Song C"]
-        result = spotify_titles_to_ytsearch(titles)
+        result = spotify_titles_to_ytsearch(titles, _REQUESTER_ID)
         assert all(r.process is True for r in result)
 
     def test_empty_list_returns_empty(self) -> None:
-        assert spotify_titles_to_ytsearch([]) == []
+        assert spotify_titles_to_ytsearch([], _REQUESTER_ID) == []
 
     def test_single_title(self) -> None:
-        result = spotify_titles_to_ytsearch(["Only Song Artist"])
+        result = spotify_titles_to_ytsearch(["Only Song Artist"], _REQUESTER_ID)
         assert len(result) == 1
         assert result[0].ytsearch == "ytsearch:Only Song Artist"
 
     def test_url_field_is_none(self) -> None:
-        result = spotify_titles_to_ytsearch(["Song"])
+        result = spotify_titles_to_ytsearch(["Song"], _REQUESTER_ID)
         assert result[0].url is None
+
+    def test_stamps_requester_on_every_track(self) -> None:
+        """The whole point: a collection's tracks resolve minutes to an hour after
+        the command returned, so the requester has to travel with them."""
+        result = spotify_titles_to_ytsearch(["A", "B", "C"], _REQUESTER_ID)
+        assert [r.requester_id for r in result] == [_REQUESTER_ID] * 3
+
+    def test_requester_is_required(self) -> None:
+        """Guards the design decision, not the behaviour: defaulting this parameter
+        is what silently re-attributes a whole album to the last person who typed a
+        command. A new call site must be forced to supply one."""
+        with pytest.raises(TypeError):
+            spotify_titles_to_ytsearch(["Song"])  # pyright: ignore[reportCallIssue]
 
 
 class TestYTSourcePlaylistUrl:
@@ -550,7 +568,7 @@ class TestQuerySource:
     def test_spotify_collection_tracks_are_stamped_spotify(self) -> None:
         """The whole reason the token is captured at parse time: these resolve to
         YouTube URLs at dequeue, so nothing downstream could recover it."""
-        sources = spotify_titles_to_ytsearch(["song one", "song two"])
+        sources = spotify_titles_to_ytsearch(["song one", "song two"], _REQUESTER_ID)
         assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
 
     def test_uppercase_www_youtube_still_reports_youtube(self) -> None:

@@ -91,6 +91,12 @@ class YTSource:
     # (as SearchQueueEntry), so a lazily-resolved Spotify track still archives as
     # Spotify rather than as the YouTube URL it resolves into.
     query_source: str = ""
+    # Who asked for this track. An ID, not a Member: this module is discord-free,
+    # and a live member could not survive the Redis round-trip anyway. None on the
+    # parse-time sources, which resolve inside the command that built them, and on
+    # entries queued before this field existed — both fall back to _last_author,
+    # which is what they have always resolved to.
+    requester_id: Optional[int] = None
 
     @property
     def playlist_url(self) -> str:
@@ -123,15 +129,21 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_titles_to_ytsearch(titles: list[str]) -> list[YTSource]:
+def spotify_titles_to_ytsearch(titles: list[str], requester_id: int) -> list[YTSource]:
     """Spotify album or playlist tracks as lazy YouTube searches. The Spotify token
-    is stamped here because it is the last point that knows where these came from —
-    each resolves to a YouTube URL at dequeue."""
+    and the requester are stamped here because it is the last point that knows where
+    these came from — each resolves to a YouTube URL at dequeue, minutes to an hour
+    after the command that asked for it returned.
+
+    requester_id is required rather than defaulted on purpose: a caller that omits
+    it silently attributes every track to whoever ran a command most recently,
+    which is exactly the defect this parameter exists to close."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
+            requester_id=requester_id,
         )
         for title in titles
     ]

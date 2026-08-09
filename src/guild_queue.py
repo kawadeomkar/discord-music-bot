@@ -582,7 +582,10 @@ class GuildQueue:
         """At-rest entry → live queue item: the one construction path for
         everything coming back from Redis (pending entries and the crashed head).
         SongQueueEntry needs a requester resolved from the guild: the persisted
-        member ID, else requester_fallback (default guild.owner), else dropped."""
+        member ID, else requester_fallback (default guild.owner), else dropped.
+        A SearchQueueEntry carries its requester as an ID all the way to the
+        resolve at dequeue, which is the only place a member can be looked up
+        without this method's drop-on-failure contract losing the song."""
         if isinstance(entry, SearchQueueEntry):
             return YTSource(
                 ytsearch=entry.ytsearch,
@@ -592,6 +595,7 @@ class GuildQueue:
                 queued_at=entry.queued_at,
                 queue_position=entry.queue_position,
                 query_source=entry.query_source,
+                requester_id=entry.requester_id,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:

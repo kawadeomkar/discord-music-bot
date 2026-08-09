@@ -643,6 +643,29 @@ class TestRestoreEntries:
         assert isinstance(item, YTSource)
         assert item.ytsearch == "ytsearch:abc"
 
+    async def test_search_entries_carry_their_requester_through_restore(
+        self, gq: GuildQueue, mock_guild: MagicMock
+    ) -> None:
+        """A restart is exactly when the in-memory fallback is wrong: the player
+        that resolves these was built by whoever's command brought the bot back."""
+        entry = SearchQueueEntry(
+            ytsearch="ytsearch:abc", process=True, requester_id=424242424242424242
+        )
+        assert await gq.restore_entries([entry]) == 1
+        item = gq.display_items()[0]
+        assert isinstance(item, YTSource)
+        assert item.requester_id == 424242424242424242
+
+    async def test_search_entry_without_requester_rehydrates_as_none(
+        self, gq: GuildQueue, mock_guild: MagicMock
+    ) -> None:
+        """Unlike a song, a requesterless search is NOT dropped — it resolves to
+        the fallback at dequeue, which is what it has always done."""
+        assert await gq.restore_entries([SearchQueueEntry(ytsearch="y")]) == 1
+        item = gq.display_items()[0]
+        assert isinstance(item, YTSource)
+        assert item.requester_id is None
+
 
 class TestRestoreCrashed:
     def _crashed_entry(self, requester_id: int | None) -> SongQueueEntry:

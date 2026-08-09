@@ -5179,6 +5179,75 @@ class TestPlayCollectionIntegration:
         ]
 
 
+class TestCollectionRequesterAttribution:
+    """2026-08-07: a 22-track album queued by one user played and archived
+    entirely as someone else, because the lazy YTSource entries carried no
+    requester and the resolve at dequeue fell back to whoever had typed most
+    recently. Every path that mints one must stamp ctx.author."""
+
+    async def test_page1_stamps_the_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(mock_ctx, resolved, mp, front=False)
+
+        queued = mp.queue_put.call_args[0][0]
+        assert [y.requester_id for y in queued] == [mock_ctx.author.id] * 2
+        await resolved.aclose()
+
+    async def test_buffered_front_path_stamps_the_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mp.queue.has_restored_backlog.return_value = True
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(mock_ctx, resolved, mp, front=True)
+
+        queued = mp.queue_put_front.call_args[0][0]
+        assert [y.requester_id for y in queued] == [mock_ctx.author.id] * 2
+        await resolved.aclose()
+
+    async def test_tail_pages_stamp_the_original_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The exposed one: the tail drain runs after the playback gate opened,
+        so other users' commands are landing while it is still enqueueing. Every
+        page belongs to whoever ran the command, not to the newest typist."""
+        col = _scollection(SpotifyType.PLAYLIST, total=3)
+        pages = [
+            _spage(col, ["T0 A"], is_last=False),
+            _spage(col, ["T1 A"], is_last=False),
+            _spage(col, ["T2 A"], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        stamped = [
+            y.requester_id
+            for call in mp.queue_put.await_args_list
+            for y in call.args[0]
+        ]
+        assert stamped == [mock_ctx.author.id] * 3
+
+
 class TestBeginCollectionEnqueue:
     async def test_streaming_puts_page1_and_returns_drain_state(
         self, music_bot: MusicBot, mock_ctx: MagicMock
