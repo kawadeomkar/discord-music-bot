@@ -28,6 +28,17 @@ _PLAYLIST_TTL = 3600  # 1h  — playlists can be edited by users
 _ARTIST_TTL = 86400  # 24h
 _ALBUM_TTL = 86400  # 24h
 
+# aiohttp's default is ClientTimeout(total=300) — a hung Spotify request held a
+# command for five minutes, with the user's only signal being a typing indicator
+# that eventually stopped.
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+_MAX_429_RETRIES = 3
+# Capped because Spotify's Retry-After can be minutes, and a command holding for
+# that long is indistinguishable from a hung bot. Beyond the cap the caller is
+# told to wait rather than being made to.
+_MAX_RETRY_AFTER_SECS = 10.0
+
 
 def _track_search_title(track: dict[str, Any]) -> str:
     """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify track
@@ -48,6 +59,68 @@ class SpotifyAuthError(Exception):
             f"Spotify rejected the credentials (HTTP {status})"
             + (f": {detail}" if detail else "")
         )
+
+
+class SpotifyRequestError(Exception):
+    """A non-2xx Spotify response that says nothing about the credentials.
+
+    Separate from SpotifyAuthError because only that one may disable the source:
+    a 404 or a 5xx is about this request, not about the configuration. Carries a
+    user_message so the failure reaches the channel as a sentence rather than as
+    an endpoint and a status code."""
+
+    def __init__(self, status: int, endpoint: str, params: Any = None) -> None:
+        self.status = status
+        self.endpoint = endpoint
+        super().__init__(f"endpoint: {endpoint} stat: {status} params: {params}")
+
+    @property
+    def user_message(self) -> str:
+        if self.status == 404:
+            return (
+                "Spotify doesn't have that — the link may be private, "
+                "region-locked, or no longer exist."
+            )
+        return (
+            f"Spotify returned an error (HTTP {self.status}). "
+            "It may be having a moment — try again shortly."
+        )
+
+
+class SpotifyRateLimitError(Exception):
+    """Spotify rate-limited us and the retries were spent.
+
+    Its user_message says "wait", never "try again": a re-run re-issues every
+    request that earned the 429 in the first place."""
+
+    def __init__(self, retry_after: Optional[float] = None) -> None:
+        self.retry_after = retry_after
+        super().__init__(
+            "Spotify rate limit exceeded"
+            + (f" (retry after {retry_after}s)" if retry_after else "")
+        )
+
+    @property
+    def user_message(self) -> str:
+        wait = (
+            f" Try again in about {int(self.retry_after)}s."
+            if self.retry_after
+            else " Try again in a moment."
+        )
+        return "Spotify is rate-limiting this bot right now." + wait
+
+
+def _retry_after_secs(resp: aiohttp.ClientResponse) -> Optional[float]:
+    """Spotify's Retry-After header in seconds. None when absent or malformed —
+    the caller falls back to exponential backoff rather than treating a bad
+    header as zero and hammering."""
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 class Spotify:
@@ -130,19 +203,42 @@ class Spotify:
             headers = {}
         headers["Authorization"] = f"Bearer {self.auth_token}"
 
-        async with self._session_factory(json_serialize=ujson.dumps) as session:
-            resp = await session.request(
-                http_method, endpoint_route, headers=headers, data=data, params=params
+        retry_after: Optional[float] = None
+        for attempt in range(_MAX_429_RETRIES + 1):
+            async with self._session_factory(
+                json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
+            ) as session:
+                resp = await session.request(
+                    http_method,
+                    endpoint_route,
+                    headers=headers,
+                    data=data,
+                    params=params,
+                )
+                if resp.status in (200, 201):
+                    return await resp.json(content_type=None)
+                if resp.status in (401, 403):
+                    # Credential/token rejection — distinct from other non-2xx
+                    # codes so validate() can tell "bad credentials" from
+                    # "request failed".
+                    raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
+                if resp.status != 429:
+                    raise SpotifyRequestError(resp.status, endpoint_route, params)
+                retry_after = _retry_after_secs(resp)
+            # Session closed before sleeping: holding one open across the wait
+            # keeps a connection parked for nothing.
+            if attempt == _MAX_429_RETRIES:
+                break
+            delay = min(
+                retry_after if retry_after is not None else 2.0**attempt,
+                _MAX_RETRY_AFTER_SECS,
             )
-            if resp.status in (200, 201):
-                return await resp.json(content_type=None)
-            if resp.status in (401, 403):
-                # Credential/token rejection — distinct from other non-2xx codes
-                # so validate() can tell "bad credentials" from "request failed".
-                raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
-            raise Exception(
-                f"endpoint: {endpoint_route} stat: {resp.status} params: {params}"
+            log.warning(
+                f"spotify 429 on {endpoint_route}; retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{_MAX_429_RETRIES})"
             )
+            await asyncio.sleep(delay)
+        raise SpotifyRateLimitError(retry_after)
 
     async def validate(self, track_id: str) -> None:
         """Exercise the configured credentials against the live Spotify API: force a

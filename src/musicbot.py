@@ -51,7 +51,12 @@ from src.sources import (
     query_source_of,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import (
+    Spotify,
+    SpotifyAuthError,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+)
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -104,6 +109,58 @@ class SpotifyDisabledError(Exception):
         super().__init__(message)
 
 
+class PlaylistInputError(ValueError):
+    """A playlist link the user can fix by editing it, rather than a bot failure.
+
+    Subclasses ValueError so nothing that already catches one changes behaviour,
+    and carries user_message so _command_error renders actionable copy instead of
+    a "ValueError: …" line. One base class so _command_error's tuple names the
+    concept rather than growing an entry per case.
+    """
+
+    def __init__(self, log_message: str, user_message: str) -> None:
+        super().__init__(log_message)
+        self.user_message = user_message
+
+
+class PlaylistIndexError(PlaylistInputError):
+    """`index=` names a position past the end of the playlist. Both numbers are
+    in the message: the user cannot fix the link without knowing the real one."""
+
+    def __init__(self, index: int, total: int) -> None:
+        self.index = index
+        self.total = total
+        # A one-song playlist has no range to offer — "from 1 to 1" reads as a
+        # bug in the message rather than advice.
+        fix = (
+            "Drop the `&index=` from the link to queue it."
+            if total == 1
+            else (
+                f"Pick a position from 1 to {total}, or drop the `&index=` "
+                f"from the link to queue the whole playlist."
+            )
+        )
+        super().__init__(
+            f"playlist index {index} past end ({total} tracks)",
+            f"That link starts the playlist at **#{index}**, but the playlist "
+            f"only has **{total} {pluralize(total, 'song')}** — nothing was "
+            f"queued.\n\n{fix}",
+        )
+
+
+class EmptyPlaylistError(PlaylistInputError):
+    """A playlist that resolved to nothing queueable. Deliberately vague about
+    which cause: yt-dlp drops unavailable entries before this code sees them, so
+    "empty" and "every video is private" are indistinguishable here."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "playlist resolved to no tracks",
+            "That playlist has no songs I can queue — it may be empty, or every "
+            "video in it may be private or unavailable.",
+        )
+
+
 HISTORY_MIN_LIMIT = 1
 # Pinned to HISTORY_CACHE_LIMIT. recent() serves this command from the Redis list
 # alone, which holds exactly that many entries, so a larger ceiling here returns a
@@ -153,9 +210,54 @@ class ResolvedSpotifyPlaylist:
 
 @dataclass
 class ResolvedYoutubePlaylist:
-    """A YouTube playlist already resolved to playable QueueObjects."""
+    """A YouTube playlist already resolved to playable QueueObjects.
+
+    `skipped` is how many leading tracks the URL's `index=` dropped, carried for
+    the enqueue embed alone: tracks is already sliced, so nothing downstream has
+    to know the playlist started anywhere but its own first entry.
+    """
 
     tracks: list[QueueObject]
+    skipped: int = 0
+
+
+def _apply_playlist_index(
+    tracks: list[QueueObject], index: Optional[int]
+) -> tuple[list[QueueObject], int]:
+    """Drop the tracks ahead of YouTube's 1-based `index=`, returning what is left
+    and how many went. A share link copied mid-playlist carries the position it was
+    copied at, so playing it starts there rather than back at track 1.
+
+    An index past the end raises PlaylistIndexError rather than queueing nothing:
+    the user named a position this playlist does not have, and an empty enqueue
+    reports success. The empty-playlist guard lives here too, so both callers
+    get it.
+    """
+    if not tracks:
+        raise EmptyPlaylistError
+    if index is None or index <= 1:
+        return tracks, 0
+    if index > len(tracks):
+        raise PlaylistIndexError(index, len(tracks))
+    return tracks[index - 1 :], index - 1
+
+
+def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> None:
+    """Start the first queued track at the link's `t=` offset — but only when
+    that track is the video the link actually names.
+
+    A playlist link carries one offset and N tracks, so the offset belongs to the
+    `v=` video alone. Without a matching `index=` the queue starts at track 1,
+    which is usually a different song, and seeking that one would be wrong. The
+    offset was previously parsed and then dropped on this path.
+    """
+    if not source.ts or not source.video_id or not tracks:
+        return
+    # Substring, not equality: yt_playlist takes the entry's own `url` when it
+    # has one, so the shape it built is not guaranteed. An 11-char video id
+    # matching some other part of a YouTube URL is not a case that arises.
+    if source.video_id in tracks[0].webpage_url:
+        tracks[0].ts = source.ts
 
 
 def _check_voice_permissions(
@@ -564,9 +666,19 @@ class MusicBot(commands.Cog):
         # infrastructure would publish what the operator sees — a DSN host and
         # port, or a runbook naming a just recipe — to whoever ran it.
         if detail is None:
-            if isinstance(e, ExtractionError):
-                # Show the user-safe line, not the raw message, which can carry
-                # yt-dlp's bug-report boilerplate. See ExtractionError.user_message.
+            if isinstance(
+                e,
+                (
+                    ExtractionError,
+                    PlaylistInputError,
+                    SpotifyRateLimitError,
+                    SpotifyRequestError,
+                ),
+            ):
+                # Show the user-safe line, not the raw message: yt-dlp's carries
+                # bug-report boilerplate, a bad playlist link needs to name the
+                # numbers, and a rate-limit needs to say "wait" rather than name
+                # an endpoint. See each class's user_message.
                 detail = e.user_message
             else:
                 detail = f"**{type(e).__name__}:** {e}"
@@ -597,8 +709,10 @@ class MusicBot(commands.Cog):
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
             tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            tracks, skipped = _apply_playlist_index(tracks, source.index)
+            _apply_playlist_timestamp(tracks, source)
             _stamp_query_source(tracks, query_source_of(source))
-            return ResolvedYoutubePlaylist(tracks)
+            return ResolvedYoutubePlaylist(tracks, skipped=skipped)
         else:
             ts: Optional[int] = None
             search: str
@@ -659,11 +773,20 @@ class MusicBot(commands.Cog):
             tracks = qobj.tracks
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
+            # Stated, not silent: the user pasted a link and got fewer songs than
+            # the playlist holds, and only the `index=` in their own URL explains
+            # it.
+            skipped_line = (
+                f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
+                f"earlier {pluralize(qobj.skipped, 'song')}\n"
+                if qobj.skipped
+                else ""
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
                     f"Queued playlist — {count} {pluralize(count, 'song')}",
-                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n{skipped_line}\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -733,13 +856,17 @@ class MusicBot(commands.Cog):
             "If the bot is not connected yet it joins your voice channel first. "
             "If something is already playing, the song is appended to the queue "
             "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset."
+            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
+            "A YouTube playlist link copied from partway through — one carrying "
+            "an `&index=` — queues from that position, skipping the songs "
+            "before it. Drop the `&index=` to queue the whole playlist."
         ),
         extras={
             "category": "Playback",
             "examples": [
                 "-play never gonna give you up",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
+                "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
                 "-p https://soundcloud.com/artist/track",
             ],
@@ -864,9 +991,22 @@ class MusicBot(commands.Cog):
             return qobj
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
-            if not tracks:
-                raise ValueError("Playlist has no tracks")
-            await ctx.send(embed=playlist_notice)
+            # Indexed here too: -playnow on a link copied mid-playlist should
+            # interject the track the user was looking at, not the playlist's
+            # first. The slice makes tracks[0] that track.
+            tracks, skipped = _apply_playlist_index(tracks, source.index)
+            _apply_playlist_timestamp(tracks, source)
+            if skipped:
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Playlists can't be interjected — playing **#"
+                        f"{skipped + 1}** now. Use `-play` for the full "
+                        f"playlist.",
+                        discord.Color.orange(),
+                    )
+                )
+            else:
+                await ctx.send(embed=playlist_notice)
             _stamp_query_source(tracks[:1], query_source_of(source))
             return tracks[0]
         qobj = await self.queue_source(ctx, source)
