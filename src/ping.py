@@ -379,7 +379,7 @@ def render_ping_embed(
     band colour (same bands as the dots).
 
     `debug_suffix` is debug mode's footer, pre-rendered by the cog and constant for
-    the whole invocation — see run_health_dashboard."""
+    the invocation — see run_health_dashboard."""
     # nan latency means the gateway ws is reconnecting — show down (red) rather
     # than a bogus number.
     disc = (
@@ -505,10 +505,9 @@ async def run_health_dashboard(
     # for the same reason — a default of None would let a new caller silently render an
     # enabled archive's Postgres row as "n/a" by simply forgetting the argument.
     archive: Optional[ArchiveHealth],
-    # Defaulted, unlike `archive`, because None here is a REAL state rather than an
-    # unknown one — it is exactly what MusicBot._debug_suffix returns for a guild
-    # with debug mode off — and forgetting it costs a cosmetic footer, not a wrong
-    # health answer.
+    # Defaulted, unlike `archive`: None here is a real state (debug mode off, what
+    # MusicBot._debug_suffix returns) rather than an unknown, and forgetting it
+    # costs a footer, not a wrong health answer.
     debug_suffix: Optional[str] = None,
 ) -> None:
     """Optimistic-send + live-edit health dashboard: sends a skeleton embed immediately,
@@ -519,12 +518,10 @@ async def run_health_dashboard(
     The sequencing lives in src/dashboard.py, shared with -debug; what stays here is
     what a row IS and how the board is drawn.
 
-    `debug_suffix` is debug mode's footer, rendered ONCE by the cog and held constant
-    for the whole loop. The driver only PATCHes when the rendered embeds differ, so a
-    suffix carrying elapsed-ms would differ on every tick and turn the change-check
-    into "always" — burning this channel's edit budget against the Now Playing bar.
-    Static is the design, which is also why the cog omits elapsed rather than
-    measuring it.
+    `debug_suffix` is debug mode's footer, rendered once by the cog and constant for
+    the loop. The driver only edits when the render differs, so a suffix carrying
+    elapsed-ms would differ every tick and edit the board until the deadline — which
+    is why the cog omits elapsed rather than measuring it.
     """
     span = trace.get_current_span()
     discord_ms = bot_latency * 1000

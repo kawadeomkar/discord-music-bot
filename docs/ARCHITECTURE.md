@@ -43,6 +43,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Queue invariant](#queue-invariant)
     - [Now Playing host model](#now-playing-host-model)
+    - [Debug footer seams](#debug-footer-seams)
 16. [Design Decisions](#design-decisions)
 
 ---
@@ -1385,15 +1386,46 @@ that never produced audio has its block disposed of rather than finalized, since
 completed bar would be a false record.
 
 While a guild has debug mode on, the block carries the debug footer like every other
-embed. It is applied inside `np_embed_block()` rather than at the attach site, so
-every render — command attach, dedicated host, periodic tick, pause debounce, song-end
-finalize — produces it, and the tick refreshes the metrics alongside the bar. The
-block's footer deliberately omits the trace id: the block re-renders under the command
-span when a response attaches it and under the playback span on the next tick, so a
-trace id there would alternate on a single message. The host's cached *own* embeds are
-never re-decorated — their elapsed-ms records the request that sent them, so a command
-response that became the host before debug mode was toggled keeps whatever footer it
-was sent with until a new host replaces it.
+embed — see [Debug footer seams](#debug-footer-seams).
+
+### Debug footer seams
+
+With debug mode on, every embed the bot sends grows a `🐞 …` footer identifying the
+request (`debug_footer()`). The trace id is what makes it useful: it is already the
+join key for every log line and span, so pasting one out of Discord finds the exact
+request in Loki/Tempo.
+
+"Every embed" is sent from three places, so three seams apply it:
+
+| Seam | Covers |
+|---|---|
+| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
+| `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
+| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+
+Rules each seam encodes:
+
+- **The block decorates at build time, not at the attach site**, so every render —
+  command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
+  produces one, and the tick refreshes the metrics alongside the bar.
+- **The block carries no trace id.** It re-renders under the command span when a
+  response attaches it and under the playback span on the next tick, so a trace id
+  there would alternate on a single message. One-shot notices do carry theirs.
+- **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the
+  request that sent them, so a command response that became the host before a toggle
+  keeps the footer it was sent with until a new host replaces it.
+- **The dashboard suffix is constant for the life of the invocation**, and omits
+  elapsed-ms for that reason: the live-dashboard driver only edits when the render
+  differs, so a per-tick-varying footer would edit the board until its deadline.
+- **`-debug` gates the runtime segment on `operator`.** That card withholds its
+  Runtime block from a non-owner and says so in the same embed.
+- **Decoration replaces rather than appends**, and removes a stale suffix when there
+  is nothing to show. `play_message` is built once per song, decorated in place, and
+  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle.
+
+`RuntimeSampler` feeds the runtime segments on the NP tick's cadence
+(`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is
+effectively debug-enabled.
 
 ## Design Decisions
 

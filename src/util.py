@@ -116,9 +116,8 @@ def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
 # silently no-opping -history or failing the now-playing send/edit.
 EMBED_TITLE_LIMIT = 256
 
-# The same, for footer text. Lives here rather than in debug.py because both the
-# debug decoration and the -ping card write footers, and debug.py already imports
-# ping.py — putting it there and importing it back closes a hard cycle.
+# The same, for footer text. Lives here, not in debug.py: ping.py writes footers too
+# and debug.py already imports ping.py, so importing it back closes a hard cycle.
 FOOTER_LIMIT = 2048
 
 

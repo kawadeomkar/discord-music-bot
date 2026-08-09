@@ -447,8 +447,8 @@ class TestDebugFooterOnTheBoard:
     def test_the_password_advisory_carries_it_too(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """It has no footer of its own — the requirement is every embed, and this one
-        rides in front of the card on the same message."""
+        """It has no footer of its own, and rides in front of the card on the same
+        message."""
         monkeypatch.setenv(
             "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
         )
@@ -470,9 +470,8 @@ class TestDebugFooterOnTheBoard:
     async def test_the_suffix_never_changes_across_edits(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """T3. The driver only PATCHes when the render differs, so a suffix that
-        varied per tick would edit the board forever. Changing the snapshot mid-flight
-        must not reach the footer of an in-progress board."""
+        """The driver only edits when the render differs, so changing the snapshot
+        mid-flight must not reach an in-progress board's footer."""
         music_bot._debug_overrides[mocked(mock_ctx.guild).id] = True
         message = _ping_message(mock_ctx)
         gate: asyncio.Event = asyncio.Event()

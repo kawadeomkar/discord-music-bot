@@ -598,15 +598,10 @@ class MusicBot(commands.Cog):
     @contextlib.asynccontextmanager
     async def traced_help(self, ctx: commands.Context) -> AsyncGenerator[None]:
         """The span cog_before_invoke would have opened, for the help paths it does
-        not cover.
-
-        Help is the one command discord.py owns rather than this cog, and the
-        `--help` short-circuit in MusicBotApp.invoke bypasses dispatch entirely — so
-        neither reaches cog_before_invoke. Without a span here a help embed sent
-        under debug mode carries the runtime numbers but no trace id and no elapsed
-        time, which is exactly the half of that footer `-debug`'s own help copy tells
-        users to paste to the operator. Same bookkeeping as the cog hooks, so
-        MusicContext.send finds it under the same key.
+        not cover: discord.py owns the help command, and MusicBotApp.invoke's
+        `--help` short-circuit bypasses dispatch. Without it a help embed's debug
+        footer has no trace id and no elapsed time. Same key and bookkeeping as the
+        cog hooks, so MusicContext.send finds it.
         """
         span = _tracer.start_span(
             "command.help",
@@ -1899,22 +1894,12 @@ class MusicBot(commands.Cog):
     def _debug_suffix(
         self, ctx: commands.Context, *, host_metrics: bool = True
     ) -> Optional[str]:
-        """Debug mode's footer for the two LIVE dashboards, rendered once per
-        invocation. None while the guild has debug mode off.
-
-        They are the one pair of commands neither decoration seam reaches: they reply
-        through channel.send (an edit loop must not own the NP host) and then edit
-        that message on a tick. So the suffix is computed here, once, and threaded in.
-        No elapsed-ms, deliberately — see ping.run_health_dashboard for why every
-        segment of this has to be constant for the life of the loop.
-
-        `host_metrics=False` drops the runtime segment and keeps the shard. `-debug`
-        passes the caller's operator status, because that card WITHHOLDS its Runtime
-        block from a non-owner and says so in the same embed ("Host details … are
-        shown to the bot owner only") — printing cpu/mem/lag/tasks into that embed's
-        footer would falsify its own notice. `-ping` withholds nothing and makes no
-        such promise, so it does not gate; the guild opted into debug mode, and its
-        ordinary command replies carry these numbers regardless.
+        """Debug mode's footer for the two live dashboards, which neither decoration
+        seam reaches. Rendered once per invocation; no elapsed-ms, since every
+        segment must be constant across the loop (see run_health_dashboard).
+        `host_metrics=False` drops the runtime segment — -debug passes the caller's
+        operator status, matching the Runtime block it withholds from a non-owner.
+        None while the guild has debug mode off.
         """
         guild = ctx.guild
         if not self.debug_enabled(guild.id if guild else None):
@@ -1923,9 +1908,9 @@ class MusicBot(commands.Cog):
             debug_mode.debug_footer(
                 shard_id=guild.shard_id if guild else None,
                 runtime=self.runtime_snapshot if host_metrics else None,
-                # Both cards already print `trace: <id>` in their own footer, and the
-                # same id twice reads as two different traces. Inert while no span is
-                # passed, and kept so adding one later cannot silently double it.
+                # Both cards already print `trace: <id>` themselves, and the same id
+                # twice reads as two traces. Inert while no span is passed; kept so
+                # adding one later cannot silently double it.
                 skip_trace=True,
             )
             or None
@@ -2102,8 +2087,8 @@ class MusicBot(commands.Cog):
             prometheus_url=debug_prometheus_url(),
             operator=operator,
             default_password=default_password,
-            # Gated on `operator`: this card withholds its Runtime block from a
-            # non-owner and says so, so the footer must not print the same figures.
+            # Gated on `operator`: the card withholds its Runtime block from a
+            # non-owner and says so, so the footer must not print those figures.
             debug_suffix=self._debug_suffix(ctx, host_metrics=operator),
         )
 
@@ -2188,11 +2173,9 @@ class MusicBot(commands.Cog):
             else "⚠️ It could not be saved (Redis is unavailable), so it applies "
             "until the bot restarts."
         )
-        # Names what enabling actually publishes, at the moment the choice is made.
-        # The footer reports the whole PROCESS's load, so on a host serving several
-        # servers these numbers are not this server's alone — and the Now Playing
-        # card carries them passively, to everyone who can read the channel, for as
-        # long as music plays. Nobody reading "a debug footer" would infer that.
+        # Names what enabling publishes, at the moment the choice is made: the
+        # footer reports the whole process's load, and the Now Playing card carries
+        # it passively to everyone who can read the channel while music plays.
         scope = (
             " While it is on, every embed here — including the live Now Playing "
             "card — shows the bot process's load to anyone who can read the channel."
@@ -2222,9 +2205,8 @@ class MusicBot(commands.Cog):
 
             if mp is not None:
                 # Its own short span rather than one stretched over the sleep (see
-                # below for why that is avoided): the notice is sent now, and with
-                # no span current its debug footer would carry no trace id to join
-                # it back to this decision.
+                # below): without one current, this notice's debug footer carries no
+                # trace id.
                 with _tracer.start_as_current_span(
                     "bot.alone_countdown.notice",
                     attributes={"discord.guild_id": str(guild.id)},
@@ -2367,8 +2349,7 @@ class MusicBot(commands.Cog):
                         f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
                         discord.Color.orange(),
                     )
-                    # No player exists on this path (that is the point of the
-                    # notice), so the cog decorates it directly.
+                    # No player exists on this path, so the cog decorates directly.
                     if self.debug_enabled(guild.id):
                         debug_mode.decorate_embeds(
                             [notice],

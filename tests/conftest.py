@@ -207,11 +207,9 @@ def mock_ctx(
     ctx.channel = mock_channel
     ctx.message = mock_message
     ctx.cog = MagicMock()
-    # Explicit for the same reason as ctx.command.extras below: MusicPlayer is
-    # constructed with this mock as its cog, and a bare MagicMock's
-    # debug_enabled() is truthy, so every player-built embed in the suite would
-    # be decorated — with a MagicMock runtime, which renders garbage. Tests that
-    # want decoration set these two themselves.
+    # Explicit for the same reason as ctx.command.extras below: MusicPlayer takes
+    # this mock as its cog, and a bare MagicMock's debug_enabled() is truthy, so
+    # every player-built embed in the suite would decorate with a Mock runtime.
     ctx.cog.debug_enabled = MagicMock(return_value=False)
     ctx.cog.runtime_snapshot = None
     ctx.send = AsyncMock()

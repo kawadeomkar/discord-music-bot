@@ -1022,23 +1022,14 @@ class MusicPlayer:
     def _decorate_for_debug(
         self, embeds: Sequence[discord.Embed], *, span: Optional[trace.Span] = None
     ) -> None:
-        """Add the debug footer to player-initiated embeds while the guild has debug
-        mode on. MusicContext.send covers command responses; this covers everything
-        the player sends or edits on its own, including the NP block at every render
-        site. No elapsed_ms: there is no command here to have taken any time.
-
-        Only ever call this on freshly built embeds — the cached _np_host_own_embeds
-        keep their send-time footer, whose elapsed-ms is a historical record.
-
-        `span` is left None by NP-block callers on purpose: the block re-renders
-        under whatever span is current (the command span when a response attaches it,
-        the playback span on the next tick), so a trace id there would visibly
-        alternate on one message. One-shot notices pass their span — joining the
-        notice to its trace is the point, and nothing re-renders them.
+        """Add the debug footer to what the player sends or edits itself, which
+        MusicContext.send never sees. Freshly built embeds only: the cached
+        _np_host_own_embeds keep their send-time footer. No elapsed_ms — no command
+        here took any time. NP-block callers pass no span, so a re-rendered block
+        cannot alternate trace ids. See docs/ARCHITECTURE.md#debug-footer-seams.
         """
         if not self._cog.debug_enabled(self._guild.id):
-            # Not just a return: play_message is built once per song and outlives a
-            # mid-song --disable, so a stale suffix has to come back off.
+            # Strip rather than return: play_message outlives a mid-song --disable.
             strip_debug_footers(embeds)
             return
         decorate_embeds(
@@ -1166,11 +1157,10 @@ class MusicPlayer:
         place encoding its internal order. `now_playing` lets a caller that already
         built this song's embed supply it instead of building an identical one.
 
-        Debug decoration happens here rather than at each caller, so every site that
-        attaches the block (command responses, the dedicated host, send_with_np) gets
-        it from one place. A supplied `now_playing` may be the cached play_message,
-        which is decorated more than once over its life — decorate_embeds replaces
-        rather than appends, which is what makes that safe."""
+        Decoration happens here, not at each caller, so every attach site gets it
+        from one place. A supplied `now_playing` may be the cached play_message,
+        decorated more than once over its life; decorate_embeds replaces rather than
+        appends, which is what makes that safe."""
         song = self.current_song
         if song is None:
             return []
@@ -1568,9 +1558,9 @@ class MusicPlayer:
 
     async def _announce_start_offset(self, song: YTDL) -> None:
         """One-line notice for a song starting partway in (a `?t=` link). Sent from
-        the loop's start path, like _announce_resume and for the same reason: it used
-        to fire inside yt_stream, at YTDL *construction*, so a prefetched `?t=` song
-        announced itself while the previous song was still playing."""
+        the loop's start path, like _announce_resume and for the same reason: at
+        YTDL construction, where it used to live, a prefetched song announces itself
+        while the previous one is still playing."""
         try:
             await self._channel.send(
                 embed=self._notice(
@@ -1730,9 +1720,9 @@ class MusicPlayer:
         refresh and the song-end finalize. False when the message no longer exists,
         so callers can release the host; finalize ignores it.
 
-        This is what refreshes the debug footer alongside the bar: the block is
-        rebuilt and re-decorated every tick, so its metrics track the sampler.
-        `own_embeds` is excluded — those are cached and already decorated."""
+        Rebuilding and re-decorating the block each tick is what keeps the debug
+        footer's metrics moving with the bar. `own_embeds` is excluded: cached, and
+        already decorated at send time."""
         try:
             embed = self._build_now_playing_embed(
                 song, position_override=position_override
@@ -2241,11 +2231,10 @@ class MusicPlayer:
                     if self.store is not None:
                         await self.store.clear_song_end_state()
                     try:
-                        # Built inside the try, not above it: this is the loop's own
-                        # except block, so anything raising here escapes both handlers
-                        # and kills the playback task. Built by hand rather than via
-                        # send_embed so the debug footer can be added before the send;
-                        # skip_trace dedups against trace_footer's.
+                        # Inside the try: this is the loop's own except block, so a
+                        # raise here escapes both handlers and kills the playback
+                        # task. Hand-built rather than send_embed so the debug footer
+                        # lands before the send; skip_trace dedups the trace id.
                         error_embed = discord.Embed(
                             title="Playback error — skipping song",
                             description=f"**{type(e).__name__}:** {e}",

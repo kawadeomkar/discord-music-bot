@@ -123,8 +123,8 @@ _OPERATOR_NOTICE = (
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard cap on an embed field value; its footer sibling is FOOTER_LIMIT,
-# imported from util.py above (see the comment there for why it lives outside).
+# Discord's hard cap on an embed field value; FOOTER_LIMIT is its footer sibling,
+# imported from util.py above.
 _FIELD_LIMIT = 1024
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
@@ -179,19 +179,9 @@ def unknown_arg_message(arg: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 · FOOTER DECORATION
 # ════════════════════════════════════════════════════════════════════════════
-# What debug mode actually does to ordinary traffic: every embed the bot sends grows
-# a footer identifying the request. The trace id is the point — it is already the
-# join key for every log line and span, so pasting one out of Discord finds the
-# exact request in Loki/Tempo.
-#
-# Three seams feed this, because "every embed" is sent from three places:
-#   • MusicContext.send — command responses (main.py)
-#   • MusicPlayer._decorate_for_debug — the NP block at every render site, and the
-#     player's own notices (musicplayer.py)
-#   • the live dashboards — -ping and -debug bypass both of the above (they reply
-#     through channel.send and then EDIT), so the cog pre-renders a suffix once per
-#     invocation and threads it in (MusicBot._debug_suffix; see
-#     ping.run_health_dashboard for why it must stay constant across the loop).
+# With debug mode on, every embed the bot sends grows a footer identifying the
+# request. Three seams apply it, one per place embeds are sent from: this one, the
+# player, and the live dashboards. See docs/ARCHITECTURE.md#debug-footer-seams.
 
 _DEBUG_MARK = "🐞"
 
@@ -231,9 +221,9 @@ def debug_footer(
 
 
 def _strip_debug_suffix(text: str) -> str:
-    """`text` with any previous debug suffix removed. The FIRST mark is the
-    boundary — no bot-authored footer contains it, so everything from there on is
-    ours, including a doubled suffix written by the pre-idempotency code."""
+    """`text` with any previous debug suffix removed. The first mark is the boundary:
+    no bot-authored footer contains one, so everything from there on is ours —
+    including a doubled suffix written by the pre-idempotency code."""
     idx = text.find(f" · {_DEBUG_MARK} ")
     if idx != -1:
         return text[:idx]
@@ -243,13 +233,11 @@ def _strip_debug_suffix(text: str) -> str:
 
 
 def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
-    """Remove a previous debug suffix. What the seams call while debug mode is OFF.
+    """Remove a previous debug suffix; what the seams call while debug mode is off.
 
-    Decoration is in place and some embeds outlive the toggle — `play_message` is
-    built once per song and re-sent by `-now` — so without this a guild that runs
-    `-debug --disable` keeps seeing the old footer on anything built before it. The
-    mark check keeps this off the hot path: with debug mode off, which is the ship
-    default, no embed carries one and this is one substring test per embed.
+    Decoration is in place and `play_message` outlives the toggle, so a --disable
+    has to strip rather than skip. The mark check costs one substring test per embed
+    in the default configuration, where none carries a suffix.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
@@ -266,15 +254,10 @@ def decorate_embeds(
     shard_id: Optional[int] = None,
     runtime: Optional["RuntimeSnapshot"] = None,
 ) -> None:
-    """Write the debug footer onto each embed, IN PLACE — replacing a previous
-    suffix rather than appending after it. Replacement is what keeps decoration
-    safe for a cached embed that is sent more than once (play_message, re-served
-    by -now during the crash-recovery window): each send refreshes the suffix
-    instead of growing the footer.
-
-    With nothing worth showing this REMOVES a stale suffix rather than leaving it,
-    so a guild that turns debug mode off stops seeing one on an embed built while
-    it was on. An embed whose whole footer was the suffix ends up with no footer.
+    """Write the debug footer onto each embed, in place, replacing a previous suffix
+    rather than appending after it. That is what keeps a cached embed sent more than
+    once (`play_message`, re-served by -now) from growing a footer per send. With
+    nothing to show it removes a stale suffix instead of leaving it.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
@@ -284,10 +267,9 @@ def decorate_embeds(
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
             runtime=runtime,
-            # Decided from the PRE-suffix footer: error embeds carry their own
-            # trace from _command_error (the same id twice in one footer reads as
-            # two different traces), while a trace in our own previous suffix must
-            # not suppress the fresh one replacing it.
+            # Read from the pre-suffix footer: error embeds carry their own trace
+            # and the same id twice reads as two traces, but a trace in our own
+            # previous suffix must not suppress the fresh one replacing it.
             skip_trace="trace:" in base or "trace " in base,
         )
         if not suffix and base == existing:
@@ -296,13 +278,10 @@ def decorate_embeds(
 
 
 def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
-    """Join `base` and `suffix` into the footer, clipping the BASE if the pair does
-    not fit.
-
-    Clipping the base rather than the joined string is what keeps decoration
-    idempotent at the limit: `truncate` applied to the join would cut the ` · 🐞 `
-    boundary off the end, and _strip_debug_suffix would then never find it again —
-    the embed would silently stop accepting a suffix for the rest of its life.
+    """Join `base` and `suffix` into the footer, clipping the base if the pair does
+    not fit. Clipping the join instead would cut the ` · 🐞 ` boundary off the end,
+    after which _strip_debug_suffix never finds it again and the embed stops
+    accepting a suffix for good.
     """
     if base and suffix:
         # 3 for the " · " separator.
@@ -311,9 +290,8 @@ def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
         text = truncate(suffix or base, FOOTER_LIMIT)
     embed.set_footer(
         text=text or None,
-        # Discord rejects a footer carrying an icon with no text, so the icon goes
-        # with it. Unreachable today (nothing here sets one), but this is the
-        # general seam every embed the bot sends passes through.
+        # Discord rejects an icon with no text, so it goes with the text.
+        # Unreachable today — nothing in src/ sets a footer icon.
         icon_url=embed.footer.icon_url if text else None,
     )
 
@@ -533,10 +511,9 @@ class DebugInputs:
     # `operator` rather than only when it is True: a row that appears for False and
     # vanishes for True would make its own absence the answer.
     default_password: Optional[bool] = None
-    # Debug mode's own footer, rendered once by the cog and constant for the whole
-    # live loop — see run_health_dashboard for why it must not vary per tick. None
-    # when the guild has debug mode off (which -debug's status card can still be
-    # asked for: reading the snapshot does not require the mode to be on).
+    # Debug mode's footer, rendered once by the cog and constant for the whole live
+    # loop (see run_health_dashboard). None when the guild has debug mode off —
+    # reading this card does not require the mode to be on.
     debug_suffix: Optional[str] = None
 
 
@@ -929,7 +906,7 @@ class RuntimeSnapshot:
     pool_workers: int
 
 
-# How long the sampler waits before its FIRST sample — see RuntimeSampler._run.
+# Delay before the sampler's first sample — see RuntimeSampler._run.
 _FIRST_SAMPLE_SECS = 0.5
 
 
@@ -946,13 +923,9 @@ class RuntimeSampler:
     outlives a cog reload and would leak the task.
     """
 
-    # Tied to the Now Playing tick, which is the fastest surface that renders a
-    # snapshot: sampling slower than it means most progress ticks re-push a footer
-    # whose numbers did not move, which is what "the metadata updates every N
-    # seconds" is supposed to rule out. Floored at 1s so a misconfigured tiny tick
-    # cannot spin /proc reads, and capped at the historical 5s so a long NP interval
-    # does not also stale the footers on ordinary command replies, which are not on
-    # that cadence at all.
+    # Tied to the NP tick, the fastest surface that renders a snapshot: sampling
+    # slower re-pushes footers whose numbers have not moved. Floored so a tiny tick
+    # cannot spin /proc reads, capped so a long one cannot stale command replies.
     INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
@@ -1005,13 +978,9 @@ class RuntimeSampler:
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
-        # The FIRST sample lands on a short delay, not a full interval. Waiting the
-        # whole interval means `-debug --enable` answers with a footer carrying no
-        # runtime numbers at all, and the next progress tick shows the same — which
-        # reads as the feature being broken rather than warming up. It cannot be
-        # instant: cpu% is a rate and needs a window, and start() has already taken
-        # the baseline this first sample rates against. Never longer than the
-        # interval itself, so a shortened INTERVAL_SECS still ticks promptly.
+        # First sample on a short delay, so `-debug --enable` does not answer with
+        # a footer carrying no runtime numbers. Not instant: cpu% needs a window,
+        # and start() took the baseline. Never longer than the interval itself.
         delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
         while True:
             expected = loop.time() + delay

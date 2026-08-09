@@ -726,9 +726,8 @@ class TestDecorationIsIdempotent:
         assert "shard 1" not in text
 
     def test_our_own_trace_does_not_suppress_the_fresh_one(self) -> None:
-        """The old skip_trace check read the WHOLE footer, so the trace segment of
-        our own previous suffix suppressed its replacement — the second decoration
-        of a traced embed silently lost the trace id."""
+        """The old check read the whole footer, so our own previous suffix's trace
+        segment suppressed its replacement."""
         span = TestTraceIdInTheFooter._span()
         embed = discord.Embed(title="x")
         debug.decorate_embeds([embed], span=span, shard_id=0)
@@ -760,8 +759,8 @@ class TestDecorationIsIdempotent:
         assert embed.footer.text == "environment: test"
 
     def test_a_doubled_legacy_suffix_is_fully_replaced(self) -> None:
-        """Footers written by the pre-idempotency code can carry two suffixes; the
-        first mark is the boundary, so one decoration heals the whole tail."""
+        """Pre-idempotency footers can carry two suffixes; the first mark is the
+        boundary, so one decoration heals the whole tail."""
         embed = discord.Embed(title="x")
         embed.set_footer(
             text=f"base · {debug._DEBUG_MARK} 3 ms · {debug._DEBUG_MARK} 4 ms"
@@ -770,9 +769,8 @@ class TestDecorationIsIdempotent:
         assert embed.footer.text == f"base · {debug._DEBUG_MARK} shard 0"
 
     def test_an_undecorated_footer_is_left_exactly_alone(self) -> None:
-        """Nothing to add AND nothing stale to strip — the embed must not be
-        rewritten at all. Reachable in production: debug on, in a DM (no shard),
-        before the sampler's first tick, outside a command span."""
+        """Nothing to add and nothing stale to strip. Reachable: debug on, in a DM
+        (no shard), before the sampler's first tick, outside a command span."""
         embed = discord.Embed(title="x")
         embed.set_footer(text="environment: test", icon_url="https://e/i.png")
         debug.decorate_embeds([embed])
@@ -785,8 +783,7 @@ class TestDecorationIsIdempotent:
         assert embed.footer.text is None
 
     def test_a_footer_that_is_only_a_suffix_loses_its_icon_too(self) -> None:
-        """Discord rejects a footer carrying an icon with no text, so stripping the
-        text has to take the icon with it or the next send 400s the whole message."""
+        """Discord rejects an icon with no text, so stripping the text takes it."""
         embed = discord.Embed(title="x")
         embed.set_footer(
             text=f"{debug._DEBUG_MARK} shard 0", icon_url="https://e/i.png"
@@ -795,9 +792,8 @@ class TestDecorationIsIdempotent:
         assert embed.to_dict().get("footer") in (None, {})
 
     def test_a_near_limit_footer_keeps_accepting_a_fresh_suffix(self) -> None:
-        """The clip has to fall on the BASE. Truncating the joined string instead
-        cuts the ` · 🐞 ` boundary off the end, after which _strip_debug_suffix can
-        never find it again and the embed silently stops taking a suffix for life."""
+        """The clip falls on the base. Truncating the join cuts the ` · 🐞 `
+        boundary off, after which no suffix is ever accepted again."""
         embed = discord.Embed(title="x")
         embed.set_footer(text="B" * (debug.FOOTER_LIMIT - 4))
         debug.decorate_embeds([embed], elapsed_ms=5.0, shard_id=0)
@@ -809,10 +805,8 @@ class TestDecorationIsIdempotent:
         assert len(text) <= debug.FOOTER_LIMIT
 
     def test_a_mark_that_is_not_a_suffix_takes_the_tail_with_it(self) -> None:
-        """Documents a real limitation rather than a wish: the FIRST mark is treated
-        as the boundary, so anything after it is discarded. Safe only because no
-        bot-authored footer contains the mark and no user text reaches a footer —
-        the two invariants asserted below. If either ever breaks, this is how."""
+        """The first mark is the boundary, so anything after it is discarded. Safe
+        only while no bot-authored footer contains one — asserted below."""
         embed = discord.Embed(title="x")
         embed.set_footer(text=f"a · {debug._DEBUG_MARK} b · c")
         debug.decorate_embeds([embed], shard_id=0)
@@ -820,7 +814,7 @@ class TestDecorationIsIdempotent:
 
     def test_no_footer_the_bot_writes_contains_the_mark(self) -> None:
         """The invariant the test above depends on. `-debug`'s own mark is in its
-        TITLE, and that card never passes through decorate_embeds."""
+        title, and that card never passes through decorate_embeds."""
         import re
 
         source = Path("src").rglob("*.py")
@@ -1036,12 +1030,8 @@ class TestSnapshotEmbed:
 
 
 class TestDebugCardCarriesTheSuffixEndToEnd:
-    """The cog→card wiring, driven through the real command.
-
-    TestSnapshotEmbed above hand-builds a DebugInputs, so it only pins the renderer's
-    concatenation; without these, deleting `debug_suffix=` from _debug_inputs left the
-    whole feature gone with a green suite.
-    """
+    """The cog→card wiring, driven through the real command. TestSnapshotEmbed above
+    hand-builds a DebugInputs, so it pins only the renderer's concatenation."""
 
     @staticmethod
     def _enable(cog: MusicBotCog, ctx: MagicMock) -> None:
@@ -1073,9 +1063,8 @@ class TestDebugCardCarriesTheSuffixEndToEnd:
     async def test_a_non_owner_gets_the_footer_without_host_metrics(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """The card withholds its Runtime block from a non-owner and SAYS so in the
-        same embed. Printing cpu/mem/lag/tasks in that embed's footer would falsify
-        its own notice, so the suffix keeps only the shard."""
+        """The card withholds its Runtime block from a non-owner and says so in the
+        same embed, so the footer must not print those figures."""
         self._enable(music_bot, mock_ctx)
         mock_ctx.guild.shard_id = 2
         mock_ctx.bot.is_owner = AsyncMock(return_value=False)
@@ -1105,11 +1094,9 @@ class TestDebugSuffixBuilder:
     def test_carries_shard_and_runtime_but_never_a_trace(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """No trace, for the plainer reason that no span is ever passed — the
-        `skip_trace=True` alongside it is belt-and-braces for a future caller that
-        passes one, not what produces this outcome. Asserted anyway: both cards
-        already print `trace: <id>` themselves, and the same id twice would read as
-        two different traces."""
+        """No trace because no span is passed; the `skip_trace=True` alongside is
+        for a future caller that does. Asserted either way — both cards already
+        print `trace: <id>` themselves."""
         music_bot._debug_overrides[mock_ctx.guild.id] = True
         mock_ctx.guild.shard_id = 4
         music_bot._runtime_sampler._snapshot = debug.RuntimeSnapshot(
@@ -1124,9 +1111,8 @@ class TestDebugSuffixBuilder:
     def test_in_a_dm_it_falls_back_to_the_host_default_and_omits_the_shard(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """`guild.id if guild else None` and `shard_id=... if guild else None` are
-        conditional expressions, so coverage reports no partial branch and this gap
-        is invisible in the numbers. -debug is DM-reachable."""
+        """Both are conditional expressions, so coverage reports no partial branch
+        and this gap is invisible in the numbers. -debug is DM-reachable."""
         mock_ctx.guild = None
         music_bot._debug_default = True
         music_bot._runtime_sampler._snapshot = debug.RuntimeSnapshot(
@@ -1139,8 +1125,8 @@ class TestDebugSuffixBuilder:
     def test_a_dm_with_nothing_to_report_yields_none_rather_than_a_bare_mark(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """No guild (no shard) and no snapshot yet (sampler cold) leaves debug_footer
-        with nothing to say. `or None` is what stops a lone 🐞 reaching the card."""
+        """No guild and no snapshot leaves debug_footer with nothing to say; `or
+        None` stops a lone 🐞 reaching the card."""
         mock_ctx.guild = None
         music_bot._debug_default = True
         assert music_bot._debug_suffix(mock_ctx) is None
@@ -1148,9 +1134,8 @@ class TestDebugSuffixBuilder:
     def test_the_first_segment_is_the_shard_not_an_elapsed_time(
         self, music_bot: MusicBotCog, mock_ctx: MagicMock
     ) -> None:
-        """T3. The dashboards only PATCH when the render differs, and elapsed-ms —
-        which debug_footer puts first when given — would differ on every tick and
-        edit the board forever."""
+        """The dashboards only edit when the render differs, and elapsed-ms — which
+        debug_footer puts first — would differ every tick."""
         music_bot._debug_overrides[mock_ctx.guild.id] = True
         mock_ctx.guild.shard_id = 0
         suffix = music_bot._debug_suffix(mock_ctx) or ""
@@ -1871,9 +1856,8 @@ class TestRuntimeSampler:
             await sampler.aclose()
 
     def test_the_interval_tracks_the_now_playing_tick(self) -> None:
-        """Sampling slower than the NP tick means most progress ticks re-push a
-        footer whose numbers did not move — which is exactly what "the metadata
-        updates every N seconds alongside the bar" is supposed to rule out."""
+        """Sampling slower than the NP tick re-pushes footers whose numbers have
+        not moved."""
         assert debug.RuntimeSampler.INTERVAL_SECS <= (
             config.NOW_PLAYING_UPDATE_INTERVAL_SECS
         )
@@ -1883,9 +1867,8 @@ class TestRuntimeSampler:
     async def test_the_first_sample_does_not_wait_a_whole_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`-debug --enable` answering with a footer that has no runtime numbers,
-        and a first progress tick showing the same, reads as broken rather than
-        warming up. A full interval of dead air is what produced that."""
+        """A full interval of dead air means `-debug --enable` answers with a footer
+        carrying no runtime numbers."""
         monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 30.0)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 0.01)
         sampler = debug.RuntimeSampler()
@@ -1903,8 +1886,8 @@ class TestRuntimeSampler:
     async def test_the_first_delay_never_exceeds_the_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The short first delay is a floor-breaker, not a floor: a deployment (or
-        a test) that shortens INTERVAL_SECS must not be slowed down by it."""
+        """A deployment or test that shortens INTERVAL_SECS must not be slowed down
+        by the first delay."""
         monkeypatch.setattr(debug.RuntimeSampler, "INTERVAL_SECS", 0.01)
         monkeypatch.setattr(debug, "_FIRST_SAMPLE_SECS", 30.0)
         sampler = debug.RuntimeSampler()

@@ -3631,8 +3631,7 @@ class TestRestoreGuildChannelDeleted:
         mock_guild: MagicMock,
         fake_redis_bot: aioredis.Redis,
     ) -> None:
-        """No player exists on this path — that is what the notice is about — so the
-        cog decorates it directly rather than through either usual seam."""
+        """No player exists on this path, so the cog decorates directly."""
         from src.redis_client import GuildRedisStore
 
         store = GuildRedisStore(fake_redis_bot, mock_guild.id)

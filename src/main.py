@@ -89,12 +89,10 @@ class MusicContext(commands.Context):
         return message
 
     def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
-        """Add the debug footer to this response's own embeds while the guild has debug
-        mode on. The NP block is decorated by the player instead, inside
-        np_embed_block(): it is re-rendered by the progress updater every few seconds,
-        so decorating it here would let the tick strip the footer straight back off.
-        Decorating at build time covers every render site — attach, dedicated host,
-        tick, debounce, finalize — and keeps the block's metrics fresh."""
+        """Add the debug footer to this response's own embeds while the guild has
+        debug mode on. The NP block is decorated by the player instead, at build
+        time, so the progress tick cannot re-render it back to bare.
+        See docs/ARCHITECTURE.md#debug-footer-seams."""
         cog = self._music_cog()
         if cog is None:
             return
@@ -107,8 +105,8 @@ class MusicContext(commands.Context):
             return
         guild_id = self.guild.id if self.guild else None
         if not cog.debug_enabled(guild_id):
-            # Not just a return: a cached embed built while debug mode was on must
-            # lose its suffix once it is off (see strip_debug_footers).
+            # Strip rather than return: a cached embed built while debug mode was
+            # on must lose its suffix once it is off.
             strip_debug_footers(own)
             return
         # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
@@ -340,10 +338,9 @@ class MusicBotApp(commands.AutoShardedBot):
         # embed, before checks, the cog's voice gate and argument parsing — so `-play
         # --help` answers from outside a voice channel instead of searching for it.
         short_circuit = command is not None and "--help" in ctx.message.content
-        # Neither help path reaches cog_before_invoke: the short-circuit above skips
-        # dispatch, and `-help` itself is the one command discord.py owns rather than
-        # the cog. Both borrow the cog's span, or their embeds carry a debug footer
-        # with no trace id — see MusicBot.traced_help.
+        # Neither help path reaches cog_before_invoke — the short-circuit skips
+        # dispatch, and discord.py owns the help command — so both borrow a span
+        # from the cog. See MusicBot.traced_help.
         if short_circuit or (command is not None and command.cog is None):
             from src.musicbot import MusicBot
 

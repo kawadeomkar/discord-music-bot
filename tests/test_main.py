@@ -769,10 +769,8 @@ class TestHelpFlag:
         self, app: MusicBotApp, music_bot: MusicBot
     ) -> None:
         """MusicContext.send reads cog._active_spans[id(ctx)] for the trace id and
-        the elapsed time. This path skips dispatch, so cog_before_invoke never opens
-        one — without the borrowed span a help embed under debug mode shows the
-        runtime numbers and no trace id, which is the half users are told to paste.
-        """
+        elapsed time. This path skips dispatch, so cog_before_invoke never opens
+        one."""
         ctx = self._ctx("-play --help")
         seen: dict[str, object] = {}
 
@@ -789,8 +787,8 @@ class TestHelpFlag:
     async def test_the_bare_help_command_borrows_one_too(
         self, app: MusicBotApp, music_bot: MusicBot
     ) -> None:
-        """`-help` is dispatched normally, but discord.py owns it rather than the
-        cog, so its command carries no cog and the hooks never fire."""
+        """`-help` dispatches normally, but discord.py owns it rather than the cog,
+        so the hooks never fire."""
         ctx = self._ctx("-help")
         ctx.command.cog = None
         seen: dict[str, object] = {}

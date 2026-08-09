@@ -1282,16 +1282,11 @@ class TestYTStreamPlaynowFlags:
     async def test_no_notice_is_sent_from_construction_but_the_seek_remains(
         self, mock_ctx: MagicMock, is_resume: bool
     ) -> None:
-        """yt_stream sends NO user notice at all any more — it runs at construction,
-        which prefetch does while the previous song still plays, so every notice moved
-        to the loop's start path (test_musicplayer.py::TestStartOffsetAnnounce). The
-        -ss seek itself must still be applied here.
+        """yt_stream sends no user notice any more — every one moved to the loop's
+        start path (test_musicplayer.py::TestStartOffsetAnnounce). The -ss seek stays.
 
-        `is_resume=False` is the case that CHANGED and the one this must keep pinned:
-        resume entries were already silent here (the old guard was `if not
-        qo.is_resume`), so covering only those would pass verbatim against the old
-        code — and let a re-introduced send ship a DOUBLE notice, one from here and
-        one from the loop."""
+        `is_resume=False` is the case that changed: resume entries were already
+        silent here, so covering only those would pass against the old code too."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()

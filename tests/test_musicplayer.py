@@ -3562,8 +3562,7 @@ class TestNpEmbedBlock:
 @contextlib.contextmanager
 def _current_span() -> Generator[None]:
     """Make a span with a valid, sampled context current. conftest installs no
-    TracerProvider, so trace.get_current_span() is otherwise the invalid span and
-    every trace assertion would pass vacuously."""
+    TracerProvider, so otherwise every trace assertion passes vacuously."""
     span = trace_api.NonRecordingSpan(
         trace_api.SpanContext(
             trace_id=0x4BF92F3577B34DA6A3CE929D0E0E4736,
@@ -3577,13 +3576,10 @@ def _current_span() -> Generator[None]:
 
 
 class TestPlayerDebugDecoration:
-    """The player's half of debug mode's footer. MusicContext.send covers command
-    responses (test_context.py); everything here is sent or edited by the player
-    itself, where that seam is never reached.
+    """The player's half of debug mode's footer — what MusicContext.send never sees.
 
-    The cog is a MagicMock pinned OFF in the mock_ctx fixture — enabling means
-    setting both halves, since a footer needs the runtime snapshot to be a real
-    RuntimeSnapshot rather than an auto-mock.
+    The cog is a MagicMock pinned off in mock_ctx, so enabling means setting both
+    halves: an auto-mock runtime would render garbage.
     """
 
     @staticmethod
@@ -3609,8 +3605,7 @@ class TestPlayerDebugDecoration:
     def test_block_is_decorated_when_enabled(
         self, music_player: MusicPlayer, mock_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        """Every embed of the block, not just the now-playing one — the requirement
-        is all embeds, and a multi-embed response decorates all of its own."""
+        """Every embed of the block, not just the now-playing one."""
         self._enable(music_player)
         music_player.current_song = mock_song
         music_player.queue._display.append(
@@ -3644,9 +3639,8 @@ class TestPlayerDebugDecoration:
     def test_the_block_carries_no_trace_id(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """Deliberate: the block re-renders under the command span at attach time and
-        the playback span on the next tick, so a trace id there would alternate on one
-        message. Runtime and shard are the same wherever it renders."""
+        """The block re-renders under the command span at attach and the playback
+        span on the next tick, so a trace id there would alternate on one message."""
         self._enable(music_player)
         music_player.current_song = mock_song
         with _current_span():
@@ -3671,8 +3665,7 @@ class TestPlayerDebugDecoration:
     async def test_the_tick_refreshes_the_metrics(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The footer must track the sampler, not freeze at song start — otherwise a
-        stale cpu/mem reading sits under a bar that is visibly still advancing."""
+        """The footer tracks the sampler rather than freezing at song start."""
         self._enable(music_player, cpu=12.0)
         message = AsyncMock(spec=discord.Message)
         await music_player._push_np_edit(mock_song, message, [])
@@ -3688,10 +3681,8 @@ class TestPlayerDebugDecoration:
     async def test_the_tick_leaves_cached_own_embeds_alone(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """T2. The host's own embeds are the cached objects from send time, already
-        decorated by MusicContext.send; their elapsed-ms is a record of that request.
-        Re-decorating them every tick would rewrite history — and, before the
-        idempotency fix, would have grown the footer on every tick forever."""
+        """The host's own embeds are cached from send time and already decorated;
+        their elapsed-ms records that request, so the tick must leave them alone."""
         self._enable(music_player)
         own = discord.Embed(title="Queue")
         own.set_footer(text="🐞 4 ms · shard 0")
@@ -3703,8 +3694,8 @@ class TestPlayerDebugDecoration:
     async def test_disabling_mid_song_clears_the_footer_next_tick(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """T8. The block is rebuilt from scratch every tick, so a toggle takes effect
-        on the next one in both directions with nothing to clean up."""
+        """The block is rebuilt each tick, so a toggle takes effect on the next one
+        in both directions."""
         self._enable(music_player)
         message = AsyncMock(spec=discord.Message)
         await music_player._push_np_edit(mock_song, message, [])
@@ -3732,11 +3723,9 @@ class TestPlayerDebugDecoration:
     def test_disabling_strips_a_suffix_from_a_cached_embed(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """play_message is built ONCE per song and decorated in place, so it outlives
-        a mid-song --disable — and -now re-sends that same object during the
-        crash-recovery window. Freshly built embeds self-heal (the tick rebuilds
-        them); this one cannot, so the disabled path has to strip rather than
-        early-return."""
+        """play_message is built once per song and decorated in place, so it outlives
+        a mid-song --disable and -now re-sends that same object. Freshly built embeds
+        self-heal on the next tick; this one cannot."""
         self._enable(music_player)
         music_player.current_song = mock_song
         cached = music_player._build_now_playing_embed(mock_song)
@@ -3793,9 +3782,8 @@ class TestPlayerDebugDecoration:
     async def test_the_playback_error_embed_is_decorated(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
-        """The loop's outer handler. This block was deliberately rewritten away from
-        send_embed() so the footer could be added before the send — so it is the one
-        site where a missing decoration would be silently undone by a refactor back."""
+        """The loop's outer handler. This block was rewritten away from send_embed()
+        so the footer lands before the send, so a refactor back would undo it."""
         self._enable(music_player)
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -3817,9 +3805,8 @@ class TestPlayerDebugDecoration:
     async def test_the_playback_error_embed_shows_one_trace_id(
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
-        """It carries its own `trace: <id>` from trace_footer(span); skip_trace must
-        dedup against it, or the footer names the same trace twice as if they were
-        two different requests."""
+        """It carries its own `trace: <id>` from trace_footer(span), so skip_trace
+        must dedup against it rather than naming the same trace twice."""
         self._enable(music_player)
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -3845,8 +3832,8 @@ class TestPlayerDebugDecoration:
     async def test_a_one_shot_notice_keeps_its_trace_id(
         self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
-        """The opposite of the block rule: nothing re-renders a notice, and the trace
-        id is what joins a user's report of it to Tempo."""
+        """The opposite of the block rule: nothing re-renders a notice, so its trace
+        id stays valid."""
         self._enable(music_player)
         mock_song.start_paused = False
         music_player._channel.send = AsyncMock()
@@ -7005,9 +6992,8 @@ class TestAnnounceResume:
 
 
 class TestStartOffsetAnnounce:
-    """The "Starting song at Xs" notice for a `?t=` link. It used to be sent by
-    YTDL.yt_stream at CONSTRUCTION, which prefetch performs while the previous song
-    is still playing — so it announced the wrong song's start."""
+    """The "Starting song at Xs" notice for a `?t=` link. Sent by YTDL.yt_stream at
+    construction until this branch, which announced under the wrong song."""
 
     async def test_wording(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_channel: MagicMock
@@ -7035,15 +7021,11 @@ class TestStartOffsetAnnounce:
     async def test_a_crash_recovered_song_takes_this_arm_not_the_resume_one(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """PRE-EXISTING and deliberately pinned as-is rather than fixed here.
+        """Pre-existing, pinned as-is rather than fixed here.
 
-        from_crashed_state stamps `ts` = the crashed position and leaves is_resume
-        at its False default, so a song recovered at 2:17 announces "Starting song
-        at 137 seconds" instead of "⏮ Resuming … at 2:17". `main` does exactly the
-        same via the old yt_stream guard — the relocation neither caused nor cured
-        it. Changing it means setting is_resume on the crashed head, which also
-        moves _remaining_secs (resume entries count only their tail) and the queue
-        display, so it belongs in its own change. See the FIXME in guild_state.py.
+        from_crashed_state stamps `ts` and leaves is_resume False, so a song
+        recovered at 2:17 announces "Starting song at 137 seconds". main does the
+        same via the old yt_stream guard. See the FIXME in guild_state.py.
         """
         entry = SongQueueEntry.from_crashed_state(
             GuildStateData(
@@ -7331,7 +7313,7 @@ class TestPlaynowLoopStart:
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
         """Relocated from YTDL.yt_stream, which ran at construction — prefetch builds
-        the next song while this one plays, so it announced the wrong song's start."""
+        the next song while this one plays."""
         mock_song.is_resume = False
         mock_song.start_offset = 90
         vc = self._vc()
@@ -7344,8 +7326,8 @@ class TestPlaynowLoopStart:
     async def test_a_zero_offset_announces_nothing(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """A literal `?t=0` used to render "Starting song at 0 seconds" — the old
-        guard asked whether a ts was present, not whether it was nonzero."""
+        """The old guard asked whether a ts was present, not whether it was nonzero,
+        so `?t=0` rendered "Starting song at 0 seconds"."""
         mock_song.is_resume = False
         mock_song.start_offset = 0
         vc = self._vc()
