@@ -255,8 +255,10 @@ class TestDebugDecoration:
             await mctx.send(embed=own)
         assert own.footer.text is not None
         assert own.footer.text.startswith("🐞")
-        # The block leads the message and is NEVER decorated — the progress updater
-        # re-renders it every few seconds without a footer, and it would flicker.
+        # This layer decorates the response's OWN embeds only; the block arrives
+        # already decorated from np_embed_block (stubbed here, so it arrives bare)
+        # and passes through untouched. The real thing is asserted against a real
+        # player in test_musicplayer.py::TestPlayerDebugDecoration.
         block = parent.call_args.kwargs["embeds"][:2]
         assert [e.footer.text for e in block] == [None, None]
 
@@ -272,6 +274,19 @@ class TestDebugDecoration:
             await mctx.send(embed=own)
         assert parent.call_args.kwargs["embed"] is own  # kwargs shape untouched
         assert (own.footer.text or "").startswith("🐞")
+
+    async def test_resending_a_cached_embed_refreshes_rather_than_stacks(
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+    ) -> None:
+        """Decoration mutates in place and play_message is cached, so repeat -now
+        sends the same object again. Each send replaces the suffix."""
+        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        live_mp.current_song = None
+        cached = discord.Embed(title="Now playing: x")  # stands in for play_message
+        with _parent_send(MagicMock(spec=discord.Message)):
+            await mctx.send(embed=cached)
+            await mctx.send(embed=cached)
+        assert (cached.footer.text or "").count("🐞") == 1
 
     async def test_decorates_every_embed_of_a_multi_embed_response(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
@@ -305,8 +320,8 @@ class TestDebugDecoration:
     async def test_content_only_response_needs_no_embed(
         self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
     ) -> None:
-        """Nothing to decorate is not an error — and it must not decorate the NP
-        block standing in for the response."""
+        """Nothing to decorate is not an error — and this layer must not reach for
+        the NP block standing in for the response (the player owns that)."""
         self._enable(music_bot_cog, mocked(mctx.guild).id)
         with _parent_send(MagicMock(spec=discord.Message)) as parent:
             await mctx.send("shuffling...")

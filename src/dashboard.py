@@ -155,7 +155,9 @@ async def run_live_dashboard(
         # no NP block, AND the existing host is not retired, so it stays above this
         # card instead of staying glued to the bottom of the channel until the next
         # ctx.send adopts a new host. -debug's card is nine blocks tall and lives for
-        # the whole deadline, so the displacement is visible.
+        # the whole deadline, so the displacement is visible. A third, cheaper cost:
+        # this also bypasses debug-mode decoration, so callers pre-render a footer
+        # and thread it through `render`.
         # See docs/ARCHITECTURE.md#now-playing-host-model.
         message = await ctx.channel.send(embeds=last)
 

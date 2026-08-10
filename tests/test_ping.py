@@ -15,6 +15,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from src import dashboard, ping, telemetry
+from src.debug import RuntimeSnapshot
 from src.config import SpotifyStatus
 from src.ping import (
     ProbeResult,
@@ -412,6 +413,93 @@ class TestPingReportsPostgres:
         music_bot.history_archive = None
         row = await self._run(music_bot, mock_ctx)
         assert "off (archive disabled)" in row
+
+
+class TestDebugFooterOnTheBoard:
+    """-ping bypasses both decoration seams — it replies through channel.send and
+    then edits — so the cog pre-renders a suffix and threads it in."""
+
+    @staticmethod
+    def _versions() -> dict[str, str]:
+        return dict.fromkeys(["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x")
+
+    def test_the_suffix_lands_after_the_environment_line(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+            debug_suffix="🐞 shard 0 · cpu 9%",
+        )
+        footer = embed.footer.text or ""
+        assert footer.startswith("environment:")
+        assert footer.endswith("🐞 shard 0 · cpu 9%")
+
+    def test_no_suffix_leaves_the_footer_alone(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+        )
+        assert "🐞" not in (embed.footer.text or "")
+
+    def test_the_password_advisory_carries_it_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It has no footer of its own, and rides in front of the card on the same
+        message."""
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        embed = default_password_embed(debug_suffix="🐞 shard 0")
+        assert embed is not None
+        assert embed.footer.text == "🐞 shard 0"
+
+    async def test_the_command_decorates_when_the_guild_enabled_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._debug_overrides[mocked(mock_ctx.guild).id] = True
+        mocked(mock_ctx.guild).shard_id = 2
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        footer = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+        assert "🐞" in footer and "shard 2" in footer
+
+    async def test_the_suffix_never_changes_across_edits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The driver only edits when the render differs, so changing the snapshot
+        mid-flight must not reach an in-progress board's footer."""
+        music_bot._debug_overrides[mocked(mock_ctx.guild).id] = True
+        message = _ping_message(mock_ctx)
+        gate: asyncio.Event = asyncio.Event()
+
+        async def _slow() -> ProbeResult:
+            await gate.wait()
+            return _probe(ProbeState.OK, 5.0)
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 2.0)),
+            patch("src.ping.probe_otel", _slow),
+        ):
+            task = asyncio.create_task(
+                command_callback(MusicBot.ping)(music_bot, mock_ctx)
+            )
+            await _until(lambda: mock_ctx.channel.send.await_args is not None)
+            first = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+            # A live sampler tick between the skeleton and the final edit.
+            music_bot._runtime_sampler._snapshot = RuntimeSnapshot(
+                cpu_percent=99.0, mem_percent=1.0, lag_ms=1.0, tasks=1, pool_workers=1
+            )
+            gate.set()
+            await task
+
+        last = _health_embed(message.edit.await_args).footer.text or ""
+        assert "🐞" in first
+        assert last.split("🐞")[1] == first.split("🐞")[1]
+        assert "cpu 99%" not in last
 
 
 class TestDownReasonRendering:
