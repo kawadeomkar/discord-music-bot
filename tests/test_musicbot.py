@@ -3625,6 +3625,30 @@ class TestRestoreGuildChannelDeleted:
         assert "text channel" in msg
         assert "were deleted" in msg
 
+    async def test_the_notification_is_decorated_in_debug_mode(
+        self,
+        music_bot_with_redis: MusicBot,
+        mock_guild: MagicMock,
+        fake_redis_bot: aioredis.Redis,
+    ) -> None:
+        """No player exists on this path, so the cog decorates directly."""
+        from src.redis_client import GuildRedisStore
+
+        store = GuildRedisStore(fake_redis_bot, mock_guild.id)
+        await store.set_connection(888000000000000001, 888000000000000002)
+        music_bot_with_redis._debug_overrides[mock_guild.id] = True
+
+        mock_guild.get_channel.return_value = None
+        mock_guild.system_channel.send = AsyncMock()
+        mock_guild.system_channel.permissions_for.return_value = discord.Permissions(
+            send_messages=True
+        )
+
+        await music_bot_with_redis._restore_guild(mock_guild)
+
+        embed = mock_guild.system_channel.send.call_args.kwargs["embed"]
+        assert "🐞" in (embed.footer.text or "")
+
     async def test_falls_back_to_text_channels_when_system_channel_no_perms(
         self,
         music_bot_with_redis: MusicBot,

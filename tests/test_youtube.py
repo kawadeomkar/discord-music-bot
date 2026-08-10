@@ -1278,12 +1278,15 @@ class TestYTStreamPlaynowFlags:
         assert result.start_paused is True
         assert result.interjected is False
 
-    async def test_resume_entry_suppresses_ts_notice_but_keeps_seek(
-        self, mock_ctx: MagicMock
+    @pytest.mark.parametrize("is_resume", [False, True])
+    async def test_no_notice_is_sent_from_construction_but_the_seek_remains(
+        self, mock_ctx: MagicMock, is_resume: bool
     ) -> None:
-        """Prefetch constructs resume entries mid-interjection — the
-        construction-time notice would fire at the wrong moment, so the loop
-        announces the resume instead. The -ss seek itself must remain."""
+        """yt_stream sends no user notice any more — every one moved to the loop's
+        start path (test_musicplayer.py::TestStartOffsetAnnounce). The -ss seek stays.
+
+        `is_resume=False` is the case that changed: resume entries were already
+        silent here, so covering only those would pass against the old code too."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -1292,7 +1295,7 @@ class TestYTStreamPlaynowFlags:
             "Test Song",
             mock_ctx.author,
             ts=151,
-            is_resume=True,
+            is_resume=is_resume,
         )
 
         captured_options = {}
@@ -1316,22 +1319,6 @@ class TestYTStreamPlaynowFlags:
 
         channel.send.assert_not_awaited()
         assert "-ss 151" in captured_options["options"]
-
-    async def test_plain_ts_entry_still_sends_notice(self, mock_ctx: MagicMock) -> None:
-        fake_data = _fake_ytdl_data()
-        channel = AsyncMock(spec=discord.TextChannel)
-        channel.send = AsyncMock()
-        qobj = QueueObject(
-            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=90
-        )
-
-        with (
-            patch("src.youtube._ytdlp_extract", return_value=fake_data),
-            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
-        ):
-            await YTDL.yt_stream(qobj, channel)
-
-        channel.send.assert_awaited_once()
 
 
 class TestProcessBoundaryContract:

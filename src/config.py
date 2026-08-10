@@ -194,8 +194,9 @@ def debug_mode_default() -> bool:
     """The process-wide default for debug mode — what a guild gets before anyone
     runs `-debug --enable`.
 
-    Debug mode is observation-only: it decorates responses with trace/timing
-    metadata and nothing else, so this is safe to leave on. Read ONCE, by
+    Debug mode is observation-only: it decorates every embed the bot sends with
+    trace/timing/runtime metadata — the live Now Playing card included — and
+    nothing else, so this is safe to leave on. Read ONCE, by
     MusicBot.__init__, which is what makes a garbage value abort startup inside
     load_extension.
 

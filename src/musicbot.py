@@ -595,6 +595,33 @@ class MusicBot(commands.Cog):
             active.span.end()
             otel_context.detach(active.token)
 
+    @contextlib.asynccontextmanager
+    async def traced_help(self, ctx: commands.Context) -> AsyncGenerator[None]:
+        """The span cog_before_invoke would have opened, for the help paths it does
+        not cover: discord.py owns the help command, and MusicBotApp.invoke's
+        `--help` short-circuit bypasses dispatch. Without it a help embed's debug
+        footer has no trace id and no elapsed time. Same key and bookkeeping as the
+        cog hooks, so MusicContext.send finds it.
+        """
+        span = _tracer.start_span(
+            "command.help",
+            attributes={
+                "discord.guild_id": str(ctx.guild.id) if ctx.guild else "",
+                "discord.user_id": str(ctx.author.id),
+            },
+        )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        self._active_spans[id(ctx)] = ActiveCommand(
+            span=span, token=token, started=time.monotonic()
+        )
+        try:
+            yield
+        finally:
+            active = self._active_spans.pop(id(ctx), None)
+            if active is not None:
+                active.span.end()
+                otel_context.detach(active.token)
+
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """discord.py hook run when a command raises: records the error on the
         active span and, for errors with no other user-visible output, notifies the user.
@@ -1839,6 +1866,7 @@ class MusicBot(commands.Cog):
                 # unusable without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
                 archive=self.history_archive,
+                debug_suffix=self._debug_suffix(ctx),
             )
         except Exception as e:
             await self._command_error(ctx, e)
@@ -1862,6 +1890,31 @@ class MusicBot(commands.Cog):
         if guild_id is None:
             return self._debug_default
         return self._debug_overrides.get(guild_id, self._debug_default)
+
+    def _debug_suffix(
+        self, ctx: commands.Context, *, host_metrics: bool = True
+    ) -> Optional[str]:
+        """Debug mode's footer for the two live dashboards, which neither decoration
+        seam reaches. Rendered once per invocation; no elapsed-ms, since every
+        segment must be constant across the loop (see run_health_dashboard).
+        `host_metrics=False` drops the runtime segment — -debug passes the caller's
+        operator status, matching the Runtime block it withholds from a non-owner.
+        None while the guild has debug mode off.
+        """
+        guild = ctx.guild
+        if not self.debug_enabled(guild.id if guild else None):
+            return None
+        return (
+            debug_mode.debug_footer(
+                shard_id=guild.shard_id if guild else None,
+                runtime=self.runtime_snapshot if host_metrics else None,
+                # Both cards already print `trace: <id>` themselves, and the same id
+                # twice reads as two traces. Inert while no span is passed; kept so
+                # adding one later cannot silently double it.
+                skip_trace=True,
+            )
+            or None
+        )
 
     async def _load_debug_overrides(self) -> None:
         """Hydrate the in-memory cache from each guild's stored config.
@@ -1946,9 +1999,13 @@ class MusicBot(commands.Cog):
             "Shows what this bot is running: versions, and Discord/voice state for "
             "this server. For the bot owner it also fills in host details — build, "
             "configuration, uptime, storage and health checks.\n\n"
-            "`--enable` turns debug mode on for this server, which adds a footer "
-            "carrying the trace id and timing to every reply — paste that id to the "
-            "operator and they can find the exact request in the logs. `--disable` "
+            "`--enable` turns debug mode on for this server, which adds a footer to "
+            "every embed the bot sends here — including the live Now Playing card, "
+            "which refreshes its numbers alongside the progress bar. A reply's "
+            "footer carries the trace id: paste it to the operator and they can find "
+            "the exact request in the logs. (The Now Playing card shows the runtime "
+            "numbers but no trace id — it is re-rendered under a different request "
+            "every few seconds, so any one id there would be misleading.) `--disable` "
             "turns it back off. The choice is saved for this server and survives "
             "restarts; a server that has never set it follows the host's default. "
             "Toggling needs the **Manage Server** permission.\n\n"
@@ -2030,6 +2087,9 @@ class MusicBot(commands.Cog):
             prometheus_url=debug_prometheus_url(),
             operator=operator,
             default_password=default_password,
+            # Gated on `operator`: the card withholds its Runtime block from a
+            # non-owner and says so, so the footer must not print those figures.
+            debug_suffix=self._debug_suffix(ctx, host_metrics=operator),
         )
 
     async def _is_owner(self, ctx: commands.Context) -> bool:
@@ -2072,7 +2132,7 @@ class MusicBot(commands.Cog):
         if not may_toggle:
             await ctx.send(
                 embed=notice_embed(
-                    "Debug mode changes what **every** reply in this server looks "
+                    "Debug mode changes what **every** embed in this server looks "
                     "like, so switching it needs the Manage Server permission. Run "
                     "`-debug` on its own to see the current state.",
                     discord.Color.red(),
@@ -2113,12 +2173,23 @@ class MusicBot(commands.Cog):
             else "⚠️ It could not be saved (Redis is unavailable), so it applies "
             "until the bot restarts."
         )
+        # Names what enabling publishes, at the moment the choice is made: the
+        # footer reports the whole process's load, and the Now Playing card carries
+        # it passively to everyone who can read the channel while music plays.
+        scope = (
+            " While it is on, every embed here — including the live Now Playing "
+            "card — shows the bot process's load to anyone who can read the channel."
+            if enabled
+            else ""
+        )
         await ctx.send(
             embed=notice_embed(
                 f"Debug mode is now **{'on' if enabled else 'off'}** for this "
-                "server. Replies "
+                "server. Embeds "
                 + ("carry" if enabled else "no longer carry")
-                + " a debug footer; nothing about playback changes either way. "
+                + " a debug footer; nothing about playback changes either way."
+                + scope
+                + " "
                 + durability,
                 discord.Color.blue(),
             )
@@ -2133,19 +2204,26 @@ class MusicBot(commands.Cog):
             mp = self.mps.get(guild.id)
 
             if mp is not None:
-                try:
-                    # send_with_np, not a bare channel send: this can fire mid-song
-                    # and a bare send would bury the NP host message.
-                    embed = discord.Embed(
-                        title="No users remaining in voice channel",
-                        description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                        color=discord.Color.orange(),
-                    )
-                    await mp.send_with_np(embed=embed)
-                except Exception as e:
-                    log.warning(
-                        f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
-                    )
+                # Its own short span rather than one stretched over the sleep (see
+                # below): without one current, this notice's debug footer carries no
+                # trace id.
+                with _tracer.start_as_current_span(
+                    "bot.alone_countdown.notice",
+                    attributes={"discord.guild_id": str(guild.id)},
+                ):
+                    try:
+                        # send_with_np, not a bare channel send: this can fire
+                        # mid-song and a bare send would bury the NP host message.
+                        embed = discord.Embed(
+                            title="No users remaining in voice channel",
+                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
+                            color=discord.Color.orange(),
+                        )
+                        await mp.send_with_np(embed=embed)
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
+                        )
 
             await asyncio.sleep(10)
 
@@ -2266,14 +2344,21 @@ class MusicBot(commands.Cog):
                         deleted.append("text channel")
                     what = " and ".join(deleted)
                     verb = "was" if len(deleted) == 1 else "were"
-                    try:
-                        await notify_channel.send(
-                            embed=notice_embed(
-                                f"⚠️ I came back online but the {what} I was playing in "
-                                f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
-                                discord.Color.orange(),
-                            )
+                    notice = notice_embed(
+                        f"⚠️ I came back online but the {what} I was playing in "
+                        f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
+                        discord.Color.orange(),
+                    )
+                    # No player exists on this path, so the cog decorates directly.
+                    if self.debug_enabled(guild.id):
+                        debug_mode.decorate_embeds(
+                            [notice],
+                            span=trace.get_current_span(),
+                            shard_id=guild.shard_id,
+                            runtime=self.runtime_snapshot,
                         )
+                    try:
+                        await notify_channel.send(embed=notice)
                     except Exception as notify_err:
                         log.warning(
                             f"Failed to send channel-deleted notification for "

@@ -14,6 +14,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src.main import EXTENSIONS, MusicBotApp
+from src.musicbot import MusicBot
 from src.redis_client import HISTORY_OUTBOX_KEY
 from tests.helpers import mocked
 
@@ -763,6 +764,69 @@ class TestHelpFlag:
             await app.invoke(ctx)
         mock_super.assert_awaited_once_with(ctx)
         ctx.send_help.assert_not_awaited()
+
+    async def test_the_help_path_borrows_a_span(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """MusicContext.send reads cog._active_spans[id(ctx)] for the trace id and
+        elapsed time. This path skips dispatch, so cog_before_invoke never opens
+        one."""
+        ctx = self._ctx("-play --help")
+        seen: dict[str, object] = {}
+
+        async def _capture(_command: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        ctx.send_help = AsyncMock(side_effect=_capture)
+        with patch.object(app, "get_cog", return_value=music_bot):
+            await app.invoke(ctx)
+
+        assert seen["active"] is not None
+        assert music_bot._active_spans == {}  # and closed on the way out
+
+    async def test_the_bare_help_command_borrows_one_too(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """`-help` dispatches normally, but discord.py owns it rather than the cog,
+        so the hooks never fire."""
+        ctx = self._ctx("-help")
+        ctx.command.cog = None
+        seen: dict[str, object] = {}
+
+        async def _invoke(_ctx: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        with (
+            patch.object(app, "get_cog", return_value=music_bot),
+            patch.object(
+                commands.AutoShardedBot, "invoke", new=AsyncMock(side_effect=_invoke)
+            ),
+        ):
+            await app.invoke(ctx)
+
+        assert seen["active"] is not None
+        assert music_bot._active_spans == {}
+
+    async def test_an_ordinary_command_is_left_to_the_cog_hooks(
+        self, app: MusicBotApp, music_bot: MusicBot
+    ) -> None:
+        """Double-opening would leak: cog_before_invoke writes the same key and
+        cog_after_invoke pops it once."""
+        ctx = self._ctx("-play lofi")
+        seen: dict[str, object] = {}
+
+        async def _invoke(_ctx: object) -> None:
+            seen["active"] = music_bot._active_spans.get(id(ctx))
+
+        with (
+            patch.object(app, "get_cog", return_value=music_bot),
+            patch.object(
+                commands.AutoShardedBot, "invoke", new=AsyncMock(side_effect=_invoke)
+            ),
+        ):
+            await app.invoke(ctx)
+
+        assert seen["active"] is None
 
     async def test_unknown_command_falls_through(self, app: MusicBotApp) -> None:
         """`-bogus --help` must keep raising CommandNotFound downstream, not

@@ -17,7 +17,7 @@ from opentelemetry.trace import StatusCode
 
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
-from src.util import fmt_duration, get_logger, notice_embed
+from src.util import fmt_duration, get_logger
 from src.ytdlp_pool import YtdlpPool
 
 log = get_logger(__name__)
@@ -544,9 +544,9 @@ class QueueObject:
     # Queued via -playnow. A later -playnow REPLACES a playing interjection (no
     # resume entry is built for it) instead of stacking.
     interjected: bool = False
-    # The rebuilt tail of an interrupted song (ts = interrupt position). Drives
-    # notice wording and suppresses yt_stream's "Starting song at Xs" — the loop
-    # announces "Resuming…" when the entry actually starts.
+    # The rebuilt tail of an interrupted song (ts = interrupt position). Drives which
+    # notice the loop's start path sends: "Resuming…" for these, "Starting song at
+    # Xs" for an ordinary ?t= entry.
     is_resume: bool = False
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
@@ -805,15 +805,10 @@ class YTDL(discord.FFmpegOpusAudio):
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
             ffmpeg_opts["options"] += f" -ss {qo.ts}"
-            # Resume entries skip this construction-time notice: prefetch builds
-            # them while the interjected song still plays, so it would fire at the
-            # wrong moment — the loop announces "Resuming…" at actual start.
-            if not qo.is_resume:
-                await channel.send(
-                    embed=notice_embed(
-                        f"Starting song at {qo.ts} seconds", discord.Color.blue()
-                    )
-                )
+            # No user notice here. This runs at CONSTRUCTION, which prefetch does
+            # while the previous song is still playing, so announcing "Starting song
+            # at Xs" from here fired at the wrong moment. MusicPlayer's start path
+            # announces it — alongside "Resuming…", which was already moved there.
         if volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 

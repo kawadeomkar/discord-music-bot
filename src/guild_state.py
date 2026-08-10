@@ -593,6 +593,13 @@ class SongQueueEntry:
         Redis list and the loop must not LPOP again for it. `position` is the
         caller-computed resume offset (crashed_position_at() plus its duration cap),
         passed in so this stays a pure field mapping.
+
+        FIXME: A recovered song is a resume in everything but the flag.
+        `ts` holds the interrupt position but `is_resume` stays False, so the loop
+        announces "Starting song at 137 seconds" rather than resuming, and
+        _remaining_secs bills the whole duration instead of the tail, skewing every
+        ETA behind it. Setting the flag also moves the queue display and the -playnow
+        wording, so it wants its own change.
         """
         if not state.has_crashed_song:
             return None
