@@ -36,6 +36,7 @@ from src.musicbot import (
     _CollectionDrain,
     _check_voice_permissions,
     _is_collection,
+    _join_succeeded,
     _typing_keepalive,
     background_typing,
 )
@@ -236,6 +237,37 @@ class TestCommandErrorRendering:
 
         assert (call := send_embed.await_args) is not None
         assert call.args[2] == "**ValueError:** nope"
+
+
+class TestJoinSucceeded:
+    """The check both cold-start commands gate their insert on. Its whole reason to
+    exist is the still-connecting case: a type-only check passes there and hands the
+    loop a client vc.play() raises on, once per restored song."""
+
+    @staticmethod
+    def _ctx(voice_client: object) -> MagicMock:
+        ctx = MagicMock(spec=commands.Context)
+        ctx.voice_client = voice_client
+        return ctx
+
+    def test_connected_client_succeeds(self) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = True
+        assert _join_succeeded(self._ctx(vc)) is True
+
+    def test_still_connecting_client_fails(self) -> None:
+        # discord.py registers the client on the guild BEFORE the handshake, so this
+        # is a real state a concurrent cold -play leaves behind — not a mock artifact.
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = False
+        assert _join_succeeded(self._ctx(vc)) is False
+
+    def test_absent_client_fails(self) -> None:
+        # join swallows its own failures, so a failed join arrives as None.
+        assert _join_succeeded(self._ctx(None)) is False
+
+    def test_non_voice_client_fails(self) -> None:
+        assert _join_succeeded(self._ctx(MagicMock())) is False
 
 
 class TestCheckVoicePermissions:
@@ -2226,6 +2258,358 @@ class TestResumeCommand:
         await command_callback(MusicBot.resume)(music_bot, mock_ctx)
         mp.resume.assert_not_awaited()
 
+    async def test_notice_when_already_playing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Silence was the old answer on every no-op branch; a reply has to say
+        why nothing happened."""
+        mock_ctx.voice_client = _playing_vc()
+        mp = MagicMock()
+        mp.resume = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mp.resume.assert_not_awaited()
+        sent = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Already playing" in sent.description
+
+    async def test_nothing_paused_notice_gives_no_queue_advice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Exact match, not a substring: this branch also covers the seconds
+        between two songs, so any "use -play to queue a song" advice added here
+        would be telling a user with a full queue that it is empty."""
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = False
+        vc.is_paused.return_value = False
+        mock_ctx.voice_client = vc
+        mp = MagicMock()
+        mp.resume = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mp.resume.assert_not_awaited()
+        sent = mock_ctx.send.await_args.kwargs["embed"]
+        assert sent.description == "Nothing is paused."
+
+    @staticmethod
+    def _cold_mp(embed: Optional[discord.Embed]) -> MagicMock:
+        """MusicPlayer stand-in for -resume's disconnected path: the restore wait
+        and the playback-gate hold both have to be enterable/awaitable.
+
+        Every attribute the command BRANCHES on is set explicitly, for the reason
+        conftest.mock_bot spells out — an auto-vivified one answers both `is not
+        None` and `if x` with True, which would silently route every test down the
+        Redis-down wording and the wedged-player rebuild."""
+        mp = MagicMock()
+        mp.store = MagicMock()
+        mp.restore_read_failed = False
+        mp.can_rejoin_cold = MagicMock(return_value=True)
+        mp.playback_holds = 1  # the hold this command itself takes
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.defer_playback = MagicMock(return_value=contextlib.nullcontext())
+        mp.build_rejoin_resume_embed = MagicMock(return_value=embed)
+        # Explicitly awaitable: the teardown suppresses Exception, so a plain
+        # MagicMock would fail its await and be swallowed as a pass.
+        mp.repark_crashed_head = AsyncMock()
+        return mp
+
+    @staticmethod
+    def _recording_hold(calls: list[str]) -> MagicMock:
+        """defer_playback() stand-in that records its own entry and exit, so a
+        test can assert what ran *inside* the hold. Asserting the mock was called
+        proves only that the context manager was built — it stays green with the
+        join and the send moved outside it, which is the whole regression."""
+
+        class _Hold:
+            async def __aenter__(self) -> None:
+                calls.append("hold-enter")
+
+            async def __aexit__(self, *_a: object) -> None:
+                calls.append("hold-exit")
+
+        return MagicMock(side_effect=lambda: _Hold())
+
+    def _join_sets_voice_client(
+        self, mock_ctx: MagicMock, calls: Optional[list[str]] = None
+    ) -> AsyncMock:
+        """ctx.invoke stub standing in for a join that succeeds — the real one
+        leaves a voice client behind, which is what the command checks."""
+
+        async def fake_invoke(*_a: Any, **_kw: Any) -> None:
+            if calls is not None:
+                calls.append("join")
+            mock_ctx.voice_client = _paused_vc()
+
+        return AsyncMock(side_effect=fake_invoke)
+
+    async def test_joins_when_disconnected(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The gap this closes: a -stop or an eject leaves the queue in Redis, and
+        -resume used to answer a bot that was out of voice with silence."""
+        mock_ctx.voice_client = None
+        embed = discord.Embed(title="▶️ Resumed from queue")
+        mp = self._cold_mp(embed)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = self._join_sets_voice_client(mock_ctx)
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mock_ctx.invoke.assert_awaited_once_with(music_bot.join)
+        assert mock_ctx.send.await_args.kwargs["embed"] is embed
+
+    async def test_waits_for_restore_before_reading_the_queue(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The queue lives in Redis until restore replays it in memory, so a
+        build before that wait would find it empty and report nothing to resume."""
+        mock_ctx.voice_client = None
+        calls: list[str] = []
+
+        def build() -> discord.Embed:
+            calls.append("build")
+            return discord.Embed(title="▶️ Resumed from queue")
+
+        mp = self._cold_mp(None)
+
+        async def restored(**_kw: object) -> bool:
+            calls.append("restore")
+            return True
+
+        mp.wait_for_restore = AsyncMock(side_effect=restored)
+        mp.build_rejoin_resume_embed = MagicMock(side_effect=build)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = self._join_sets_voice_client(mock_ctx, calls)
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        # join last: the embed describes the display head, and the head is gone
+        # once the gate opens behind the join.
+        assert calls == ["restore", "build", "join"]
+
+    async def test_join_and_response_run_inside_the_playback_hold(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The hold is what stops the restored head from starting — and posting
+        its own Now Playing card — before the response explaining the join.
+        Asserting only that defer_playback() was called passes with both the join
+        and the send moved outside the hold, which is exactly the regression."""
+        mock_ctx.voice_client = None
+        calls: list[str] = []
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        mp.defer_playback = self._recording_hold(calls)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = self._join_sets_voice_client(mock_ctx, calls)
+        mock_ctx.send = AsyncMock(side_effect=lambda **_kw: calls.append("send"))
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        assert calls == ["hold-enter", "join", "send", "hold-exit"]
+
+    async def test_reports_nothing_to_resume_without_joining(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Nothing came back from Redis, so joining would park the bot in a
+        channel to sit silent until the 300s idle disconnect."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(None)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mock_ctx.invoke.assert_not_awaited()
+        sent = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Nothing to resume" in sent.description
+
+    async def test_names_the_outage_instead_of_claiming_the_queue_is_gone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """No store means restore never read anything, so the display is empty for
+        a reason that says nothing about the queue — which is intact under its 24h
+        TTL. "Nothing was left from a previous session" would assert what the bot
+        could not know."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(None)
+        mp.store = None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mock_ctx.invoke.assert_not_awaited()
+        sent = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Can't reach the queue store" in sent.description
+        assert "no queue was left" not in sent.description
+
+    async def test_cleans_up_when_the_join_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """join swallows its own Exceptions, so an escape means its error
+        REPORTING failed — a Forbidden out of ctx.send in a channel the bot cannot
+        post embeds to. defer_playback opens the gate as it unwinds either way, and
+        a loop woken with no voice client fails its vc assertion once per restored
+        song."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock(side_effect=RuntimeError("send failed"))
+        music_bot.cleanup = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mp.repark_crashed_head.assert_awaited_once()
+
+    async def test_cleans_up_when_the_join_fails(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """join swallows its own errors, so a failure shows up as a still-absent
+        voice client. cog_before_invoke already started loop(), which would park
+        on a gate nothing will open for 300s."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()  # leaves voice_client None
+        music_bot.cleanup = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_reparks_the_recovered_head_after_tearing_the_player_down(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A crash-recovered song lives only in the player restore built it in, so
+        the teardown above is what would lose it. The order is the fix: cleanup()'s
+        clear_connection() HDELs the fields the re-park writes, so a re-park that
+        ran first would be wiped by the teardown it exists to survive."""
+        mock_ctx.voice_client = None
+        calls: list[str] = []
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        mp.repark_crashed_head = AsyncMock(side_effect=lambda: calls.append("repark"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()  # leaves voice_client None
+        music_bot.cleanup = AsyncMock(side_effect=lambda _g: calls.append("cleanup"))
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        assert calls == ["cleanup", "repark"]
+
+    async def test_leaves_the_player_alone_when_another_command_holds_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A second hold is a concurrent cold -play mid-join on this same player.
+        Tearing it down pops the mps entry that command is still driving and drops
+        the queue it is about to front-insert into."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        mp.playback_holds = 2  # this command's, plus the other command's
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()  # leaves voice_client None
+        music_bot.cleanup = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        music_bot.cleanup.assert_not_awaited()
+        mp.repark_crashed_head.assert_not_awaited()
+
+    async def test_a_registered_but_unconnected_voice_client_is_a_failed_join(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """discord.py registers the voice client on the guild BEFORE the handshake,
+        so the type alone does not mean connected — and vc.play() on a half-open one
+        raises once per restored song."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        half_open = MagicMock(spec=discord.VoiceClient)
+        half_open.is_connected.return_value = False
+
+        async def fake_invoke(*_a: Any, **_kw: Any) -> None:
+            mock_ctx.voice_client = half_open
+
+        mock_ctx.invoke = AsyncMock(side_effect=fake_invoke)
+        music_bot.cleanup = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mock_ctx.send.assert_not_awaited()
+
+    async def test_rebuilds_a_wedged_player_before_rejoining(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A player still holding a song with no voice client kept running after an
+        eject that never reached on_voice_state_update. Rejoining around it would
+        announce a resume its wedged loop is never going to deliver."""
+        mock_ctx.voice_client = None
+        wedged = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        wedged.can_rejoin_cold = MagicMock(return_value=False)
+        rebuilt = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        music_bot.get_mp = MagicMock(side_effect=[wedged, rebuilt])
+        music_bot.cleanup = AsyncMock()
+        mock_ctx.invoke = self._join_sets_voice_client(mock_ctx)
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        # The rebuilt player is the one driven from there on, not the wedged one.
+        rebuilt.build_rejoin_resume_embed.assert_called_once()
+        wedged.build_rejoin_resume_embed.assert_not_called()
+
+    async def test_reports_a_restore_that_has_not_landed_yet(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The pool sets no socket_timeout, so a stalled Redis leaves the restore
+        pending forever. Waiting it out is a command that never answers at all."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(discord.Embed(title="▶️ Resumed from queue"))
+        mp.wait_for_restore = AsyncMock(return_value=False)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mock_ctx.invoke.assert_not_awaited()
+        assert "Still loading" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_names_the_outage_when_the_restore_could_not_read(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A store that exists but could not be read leaves the same empty display
+        as a guild with no saved queue. Reporting the second is telling a guild its
+        queue is gone on the strength of a failed pipeline."""
+        mock_ctx.voice_client = None
+        mp = self._cold_mp(None)
+        mp.restore_read_failed = True
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.invoke = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.resume)(music_bot, mock_ctx)
+
+        mock_ctx.invoke.assert_not_awaited()
+        sent = mock_ctx.send.await_args.kwargs["embed"]
+        assert "Can't reach the queue store" in sent.description
+        assert "no queue was left" not in sent.description
+
 
 class TestVolumeCommand:
     @staticmethod
@@ -2422,7 +2806,9 @@ class TestHistoryCommand:
         raises nothing — it silently starts returning short pages."""
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
-    @pytest.mark.parametrize("name", ["history", "ping", "leaderboard", "debug"])
+    @pytest.mark.parametrize(
+        "name", ["history", "ping", "leaderboard", "debug", "resume"]
+    )
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
         NP block), so unbounded concurrent renders rate-limit a guild out of its own
@@ -2431,7 +2817,10 @@ class TestHistoryCommand:
         every send, so they must be declined outright. `-leaderboard` carries it for
         a second reason: it draws on the same Postgres pool as the drainer, and
         `-debug` for a third: a Postgres stats query, a Prometheus round trip and
-        two Redis reads, live-editing under an 8s deadline.
+        two Redis reads, live-editing under an 8s deadline. `-resume` for a fourth:
+        two racing on a disconnected bot both read `voice_client is None`, so
+        validate_commands' "already being used in channel X" check cannot fire for
+        either — both join, and the second MOVES the bot to its own author's channel.
 
         command_callback() strips decorators everywhere else in this file, so this
         is the only place any of these guards is reachable at all."""
@@ -2645,6 +3034,17 @@ def _no_typing() -> AbstractContextManager[MagicMock]:
     )
 
 
+def _connected_vc() -> MagicMock:
+    """Connected voice client, nothing playing — what a successful cold join leaves
+    behind. is_connected is explicit: the cold path checks it, because discord.py
+    registers the client on the guild before the handshake completes."""
+    vc = MagicMock(spec=discord.VoiceClient)
+    vc.is_playing.return_value = False
+    vc.is_paused.return_value = False
+    vc.is_connected.return_value = True
+    return vc
+
+
 def _playing_vc() -> MagicMock:
     """Connected voice client, actively playing. Both flags must be set explicitly:
     an unstubbed is_paused() returns a truthy Mock, silently sending -play down the
@@ -2652,14 +3052,18 @@ def _playing_vc() -> MagicMock:
     vc = MagicMock(spec=discord.VoiceClient)
     vc.is_playing.return_value = True
     vc.is_paused.return_value = False
+    vc.is_connected.return_value = True
     return vc
 
 
 def _paused_vc() -> MagicMock:
-    """Connected voice client with a song parked paused."""
+    """Connected voice client with a song parked paused. is_connected is explicit:
+    -resume's rejoin checks it, and an auto-vivified one answers True by accident
+    rather than by choice."""
     vc = MagicMock(spec=discord.VoiceClient)
     vc.is_playing.return_value = False
     vc.is_paused.return_value = True
+    vc.is_connected.return_value = True
     return vc
 
 
@@ -2669,7 +3073,11 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
     and awaits wait_for_restore() before front-inserting."""
     mp = MagicMock()
     mp.defer_playback = MagicMock(return_value=contextlib.nullcontext())
-    mp.wait_for_restore = AsyncMock()
+    mp.wait_for_restore = AsyncMock(return_value=True)
+    # Numeric, not auto-vivified: _abandon_cold_start COMPARES this, and a Mock
+    # raises TypeError there rather than answering.
+    mp.playback_holds = 1  # the hold this command itself takes
+    mp.repark_crashed_head = AsyncMock()
     mp.queue_put_front = AsyncMock()
     mp.queue_put = AsyncMock()
     mp.queue.qsize = MagicMock(return_value=qsize)
@@ -2704,6 +3112,7 @@ class TestPlayCommand:
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
             coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
             return join_task
 
         with (
@@ -2748,7 +3157,7 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
@@ -2778,7 +3187,7 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
@@ -2805,7 +3214,7 @@ class TestPlayCommand:
         join_task.cancel = cancel_spy
 
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
-        music_bot.get_mp = MagicMock(return_value=MagicMock())
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
         music_bot.cleanup = AsyncMock()
 
         def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
@@ -3084,6 +3493,7 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
@@ -3092,6 +3502,99 @@ class TestPlayFrontInsertion:
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
         assert single_call.kwargs["front"] is True
+
+    async def test_cold_path_queues_nothing_when_the_join_never_connected(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """join swallows its own failures, so the cold path used to front-insert
+        onto a join that never landed — handing loop() a song it can only raise on
+        once the gate opens, once per restored entry, with the Redis mirror keeping
+        everything it drains."""
+        mock_ctx.voice_client = None  # the stub join leaves it that way
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        mp = _mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.cleanup = AsyncMock()
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        with (
+            _no_typing(),
+            patch(
+                "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
+            ),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        music_bot._enqueue_single.assert_not_awaited()
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        mp.repark_crashed_head.assert_awaited_once()
+
+    async def test_cold_path_queues_nothing_when_the_restore_never_lands(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """put_front LPUSHes the mirror while restore_entries replays already-listed
+        entries in memory only, so inserting against a restore that never read its
+        snapshot double-queues the song. Not landing is a reason not to insert."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        mp = _mock_mp()
+        mp.wait_for_restore = AsyncMock(return_value=False)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.cleanup = AsyncMock()
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
+            coro.close()
+            mock_ctx.voice_client = _connected_vc()
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        music_bot._enqueue_single.assert_not_awaited()
+        music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
+        assert "wasn't queued" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_cold_path_reparks_the_recovered_head_when_extraction_fails(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The cleanup this path already ran drops the player holding the only copy
+        of a crash-recovered song — restore cleared its state fields the moment it
+        re-queued it. Order matters: clear_connection() HDELs what the re-park
+        writes."""
+        mock_ctx.voice_client = None
+        calls: list[str] = []
+        mp = _mock_mp()
+        mp.repark_crashed_head = AsyncMock(side_effect=lambda: calls.append("repark"))
+        music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.cleanup = AsyncMock(side_effect=lambda _g: calls.append("cleanup"))
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        with (
+            _no_typing(),
+            patch(
+                "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
+            ),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        assert calls == ["cleanup", "repark"]
 
     async def test_warm_path_enqueues_at_back(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3125,7 +3628,12 @@ class TestPlayFrontInsertion:
 
         calls: list[str] = []
         mp = _mock_mp()
-        mp.wait_for_restore = AsyncMock(side_effect=lambda: calls.append("restore"))
+
+        async def restored(**_kw: object) -> bool:
+            calls.append("restore")
+            return True
+
+        mp.wait_for_restore = AsyncMock(side_effect=restored)
         music_bot.queue_source = AsyncMock(return_value=fake_qobj)
         music_bot._enqueue_single = AsyncMock(
             side_effect=lambda *a, **kw: calls.append("enqueue")
@@ -3138,6 +3646,7 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
@@ -3165,6 +3674,7 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
@@ -3256,6 +3766,7 @@ class TestPlayFrontInsertion:
 
         def fake_create_task(coro: Any) -> asyncio.Future[None]:
             coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
@@ -4860,6 +5371,17 @@ class TestPlayCollectionIntegration:
         music_bot.spotify.album_stream = MagicMock(return_value=pages)
         mock_ctx.message.content = f"-play {self._URL}"
 
+    @staticmethod
+    def _join_lands(mock_ctx: MagicMock) -> AsyncMock:
+        """ctx.invoke for a join that CONNECTS. A bare AsyncMock leaves
+        voice_client None, which _join_succeeded rejects — the cold path then
+        abandons and nothing reaches the queue."""
+
+        async def _invoke(*_args: object, **_kwargs: object) -> None:
+            mock_ctx.voice_client = _connected_vc()
+
+        return AsyncMock(side_effect=_invoke)
+
     async def test_page1_failure_reports_and_closes_the_generator(
         self,
         music_bot: MusicBot,
@@ -4928,6 +5450,73 @@ class TestPlayCollectionIntegration:
         assert mock_ctx.guild.id not in music_bot.mps
         assert music_player.queue.qsize() == 0
         assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_join_without_a_client_abandons_before_the_pager_starts(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """A join that returns WITHOUT connecting — _join_succeeded's case,
+        which leaves by `return` rather than by raising. The collection must
+        take the same exit as a raising join: nothing queued, the player torn
+        down, the lock released, and no Spotify fetch spent on a bot that is
+        not in voice."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        entered: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = AsyncMock()  # join reports its own failure, connects nothing
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
+
+        assert entered == [], "a join that connected nothing must not cost a fetch"
+        assert mock_ctx.guild.id not in music_bot.mps
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_unreadable_restore_abandons_the_collection_and_says_so(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The bounded restore wait timing out on the front path. Front-inserting
+        a collection against an unread snapshot double-queues every page, so the
+        whole collection is abandoned — and unlike the join paths, this one owes
+        the user a notice, because nothing else reported anything."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        entered: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = self._join_lands(mock_ctx)
+        # The real timeout, not a stubbed return: an event that is never set
+        # against a 10ms budget can only expire.
+        music_player._restore_complete.clear()
+        monkeypatch.setattr("src.musicbot.RESTORE_WAIT_SECS", 0.01)
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
+
+        assert entered == [], "an unread restore must not cost a Spotify fetch"
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        told = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("saved queue" in (d or "") for d in told), told
 
     async def test_begin_bailing_after_page1_finalizes_the_generator(
         self,
@@ -5020,7 +5609,7 @@ class TestPlayCollectionIntegration:
 
         self._wire(music_bot, music_player, mock_ctx, gen())
         mock_ctx.voice_client = None  # front path: the gate hold is live
-        mock_ctx.invoke = AsyncMock()
+        mock_ctx.invoke = self._join_lands(mock_ctx)
 
         await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
 
@@ -5049,7 +5638,7 @@ class TestPlayCollectionIntegration:
         ]
         self._wire(music_bot, music_player, mock_ctx, _sgen(pages))
         mock_ctx.voice_client = None
-        mock_ctx.invoke = AsyncMock()
+        mock_ctx.invoke = self._join_lands(mock_ctx)
 
         await command_callback(MusicBot.play)(music_bot, mock_ctx, self._URL)
 

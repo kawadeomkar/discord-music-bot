@@ -224,7 +224,7 @@ def _queue_runtime(items: list[QueueItem]) -> tuple[int, bool]:
     """Total remaining playtime of queued items, and whether any duration was
     unknown — an unresolved YTSource or a QueueObject with no duration makes the
     total a lower bound, which callers flag with "~". Shared by queue_embed() and
-    build_resume_notice_embed() so they can't disagree."""
+    the resume notices (via _add_resume_fields) so they can't disagree."""
     total_secs = 0
     partial = False
     for item in items:
@@ -338,6 +338,7 @@ class MusicPlayer:
         "store",
         "_restore_task",
         "_restore_complete",
+        "_restore_read_failed",
         "_playback_gate",
         "_playback_holds",
         "_background_tasks",
@@ -367,6 +368,7 @@ class MusicPlayer:
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
+    _restore_read_failed: bool
     _playback_gate: asyncio.Event
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
@@ -433,10 +435,14 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
+        # Set when the restore could not READ the store. Without it an empty queue is
+        # ambiguous — nothing saved vs nothing readable — and a command reporting the
+        # first when it means the second tells a guild its queue is gone.
+        self._restore_read_failed = False
         # Restore and *play* are separate concerns: the gate stays shut until a
         # command establishes a voice connection, so a player built by a command that
-        # never connects (cog_before_invoke runs before validate_commands, so even a
-        # rejected command builds one) cannot walk the queue and discard it.
+        # never connects — every command that reaches the cog hook builds one, and
+        # only the join opens this — cannot walk the queue and discard it.
         self._playback_gate = asyncio.Event()
         # >0 while an in-flight command owns the opening — -play holds the gate
         # across the join it triggers, so the restored head can't start before the
@@ -516,12 +522,43 @@ class MusicPlayer:
             if self._playback_holds == 0:
                 self.open_playback_gate()
 
-    async def wait_for_restore(self) -> None:
+    @property
+    def playback_holds(self) -> int:
+        """How many commands hold the gate shut. Nonzero means someone else is
+        driving this player toward playback and owns the teardown decision."""
+        return self._playback_holds
+
+    def can_rejoin_cold(self) -> bool:
+        """True in the parked state `-resume`'s rejoin path assumes. Failing it means
+        the player outlived its voice client (an eject on_voice_state_update never
+        saw), so its legs and gate are untrustworthy: rebuild, don't reuse."""
+        return self.current_song is None and not self._playback_gate.is_set()
+
+    @property
+    def restore_read_failed(self) -> bool:
+        """True when the last restore could not read the store: an empty queue then
+        means "unknown", not "nothing was left"."""
+        return self._restore_read_failed
+
+    async def wait_for_restore(self, timeout: Optional[float] = None) -> bool:
         """Block until _restore_state() has finished (or failed). Inserting before
         restore has read its snapshot double-queues: put_front() LPUSHes the mirror,
         while restore_entries() is in-memory only precisely because its entries are
-        already on that list."""
-        await self._restore_complete.wait()
+        already on that list.
+
+        False when `timeout` elapsed first. The pool sets no socket_timeout, so a
+        Redis that accepts the connection and then stalls hangs the read — and with
+        it any command that waits here — until the server answers.
+        """
+        if timeout is None:
+            await self._restore_complete.wait()
+            return True
+        try:
+            async with async_timeout.timeout(timeout):
+                await self._restore_complete.wait()
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def set_context(self, ctx: commands.Context) -> None:
         assert isinstance(ctx.channel, discord.TextChannel)
@@ -734,10 +771,46 @@ class MusicPlayer:
         if started.thumbnail:
             embed.set_thumbnail(url=started.thumbnail)
 
+        self._add_resume_fields(embed, items)
+        return embed
+
+    def build_rejoin_resume_embed(self) -> Optional[discord.Embed]:
+        """Heads-up that `-resume` on a disconnected bot rejoined voice and woke a
+        persisted queue. Build while the display head is still the restored one:
+        once the gate opens the loop would pop that head out from under this.
+
+        No song is named, unlike build_resume_notice_embed: nothing was inserted
+        here, so the head this describes IS the song the Now Playing card names
+        seconds later. None when the restore found nothing, which the caller
+        reports instead of joining a channel to sit silent in.
+        """
+        items = self.queue.display_items()
+        if not items:
+            return None
+
+        count = len(items)
+        songs = pluralize(count, "song")
+        verb = "resume" if count != 1 else "resumes"
+        embed = discord.Embed(
+            title="▶️ Resumed from queue",
+            description=(
+                f"Rejoined voice — **{count}** {songs} from the previous "
+                f"session {verb} now."
+            ),
+            color=discord.Color.green(),
+        )
+        self._add_resume_fields(embed, items)
+        return embed
+
+    def _add_resume_fields(self, embed: discord.Embed, items: list[QueueItem]) -> None:
+        """The "what the restore found" fields both resume notices carry: where the
+        previous session got to, how much queue came back, and how long it runs."""
         left_off = self._resume_left_off_field()
         if left_off is not None:
             embed.add_field(name=left_off[0], value=left_off[1], inline=True)
 
+        count = len(items)
+        songs = pluralize(count, "song")
         embed.add_field(name="Queued", value=f"**{count}** {songs}", inline=True)
         total_secs, partial = _queue_runtime(items)
         if total_secs > 0:
@@ -747,7 +820,6 @@ class MusicPlayer:
                 value=f"{prefix}{_fmt_total_duration(total_secs)}",
                 inline=True,
             )
-        return embed
 
     async def stop(self) -> None:
         await self._cog.cleanup(self._guild)
@@ -764,6 +836,7 @@ class MusicPlayer:
         queue list (it lives in current_song_url state), so the LPOP silently deletes
         an unrelated, still-queued song."""
         if self.store is None:
+            self._restore_read_failed = True
             self._restore_complete.set()
             return
         try:
@@ -780,6 +853,7 @@ class MusicPlayer:
                         # Read failed — abort rather than proceed with fabricated
                         # defaults. `finally` still sets _restore_complete, so
                         # loop() is never blocked.
+                        self._restore_read_failed = True
                         log.warning(
                             f"State restore aborted for guild {self._guild.id}: "
                             f"Redis unavailable"
@@ -884,6 +958,9 @@ class MusicPlayer:
                     )
 
                 except Exception as e:
+                    # Partial restore: what landed stands, but the queue is no longer
+                    # known complete, so an empty one is not "nothing was saved".
+                    self._restore_read_failed = True
                     record_span_error(span, e)
                     log.error(
                         f"State restore failed for guild {self._guild.id}: {e}",
@@ -896,6 +973,27 @@ class MusicPlayer:
         finally:
             # Always signal finished-or-failed so loop() never blocks forever.
             self._restore_complete.set()
+
+    async def repark_crashed_head(self) -> bool:
+        """Write a crash-recovered queue head back into the state hash it came from.
+        True when something was re-parked.
+
+        _restore_state clears current_song_* as soon as it re-queues that song, so
+        this player's memory is its only copy — dropping it loses the song silently.
+        Call AFTER cleanup(): its clear_connection() HDELs these same fields.
+        """
+        head = self.queue.peek_next()
+        if self.store is None or not isinstance(head, QueueObject):
+            return False
+        if is_persisted(head):
+            # Already on the Redis list: parking it would re-queue a second copy.
+            return False
+        # Backdated by the resume offset as the loop does at vc.play — the hash has no
+        # `ts`, and recovery reads position as now - play_start_epoch - pauses.
+        await self.store.set_current_song_state(
+            SongQueueEntry.from_queue_object(head), time.time() - (head.ts or 0)
+        )
+        return True
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
@@ -1941,16 +2039,26 @@ class MusicPlayer:
         # timeout is not optional: a player blocked here is not blocked in
         # queue_get(), so the 300s idle-disconnect below can never fire, and a player
         # that never connects would leak its mps entry and task forever.
-        try:
-            async with async_timeout.timeout(_PLAYBACK_GATE_TIMEOUT):
-                await self._playback_gate.wait()
-        except asyncio.TimeoutError:
-            log.info(
-                f"Playback gate timed out for guild {self._guild.id} "
-                f"(never connected to voice), tearing down player"
-            )
-            asyncio.create_task(self.stop())
-            return
+        while True:
+            try:
+                async with async_timeout.timeout(_PLAYBACK_GATE_TIMEOUT):
+                    await self._playback_gate.wait()
+                break
+            except asyncio.TimeoutError:
+                if self._playback_holds or self._playback_gate.is_set():
+                    # A hold means a command is mid-join: tearing down would pop this
+                    # player from mps while it still drives it. Every hold is released
+                    # by an `async with`, raise or not.
+                    # The gate check is NOT redundant — this handler runs a tick after
+                    # the timer fires, so a release can land in between and leave holds
+                    # 0 with the gate already open. Re-waiting is free.
+                    continue
+                log.info(
+                    f"Playback gate timed out for guild {self._guild.id} "
+                    f"(never connected to voice), tearing down player"
+                )
+                asyncio.create_task(self.stop())
+                return
         prefetched_song: Optional[YTDL] = None
 
         while not self.bot.is_closed():

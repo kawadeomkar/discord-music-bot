@@ -410,7 +410,22 @@ code in the repo. Its bookkeeping invariants:
   an error alone also describes a mid-song death that earned its history entry. A dead
   stream drops the cached URL (`_handle_dead_stream`) and notifies the channel.
 - Idle disconnect: `queue_get` times out at 300s; the playback gate itself times out at
-  300s (a player built by a command that never connects must not leak forever).
+  300s (a player built by a command that never connects must not leak forever) — unless
+  a `defer_playback` hold is outstanding, which means a command is mid-join.
+
+**`-resume` is the second cold-start path.** With the bot out of voice there is nothing
+to un-pause — the paused song went with the voice client — but the queue outlives it in
+Redis under a 24h TTL, so `-resume` joins the author's channel and lets that queue play.
+It differs from `-play`'s cold path in two ways that are not stylistic: it inserts
+**nothing** (so the `wait_for_restore`-before-`put_front` rule is moot, and the head it
+describes is the song that plays), and it restores **before** joining rather than
+concurrently, because there is no 1–4s extraction to hide the handshake behind and
+joining first would park the bot in a channel for an empty queue. It refuses to reuse a
+player failing `can_rejoin_cold()` (a song still held, or a gate already open, with no
+voice client — an eject that never reached `on_voice_state_update`), rebuilding instead.
+`max_concurrency(1, guild)` is load-bearing: two racing invocations both read
+`voice_client is None`, so `validate_commands`' "already being used in channel X" check
+cannot fire for either, and the second would move the bot to its own author's channel.
 
 ### Per-guild object graph
 
@@ -579,6 +594,37 @@ transaction) → crash → from_crashed_state → re-queue`. The `current_song_*
 ARE a parked queue entry; `_now_playing_state_mapping` is the single signature enforcing
 that identity.
 
+**Clearing that state hands the only copy to memory**, which is why
+`MusicPlayer.repark_crashed_head()` exists. `_restore_state` HDELs `current_song_*` the
+moment it re-queues the song (unconditionally — a re-queue that failed must not re-enter
+that block every restart), so from then until the song plays, the player's queue is the
+only place it exists. Any teardown before that loses it silently: no error, no log line,
+and nothing left for a later restore to find. `repark_crashed_head` writes a
+`persisted=False` display head back into the hash, backdating `play_start_epoch` by its
+resume offset because the hash carries no `ts`. It must run **after** `cleanup()`, whose
+`clear_connection()` HDELs exactly those fields. Its one caller is
+`MusicBot._abandon_cold_start`, the shared teardown for a cold-start command (`-play`,
+`-resume`) whose join never produced a connected voice client.
+
+That teardown is not optional in the other direction either: `defer_playback` opens the
+gate as it unwinds whether or not the join worked, and a `loop()` released with no voice
+client fails its `vc` assertion once per restored song — draining the in-memory legs
+while Redis keeps every entry (the LPOP lives past the assertion), so the queue
+resurrects on the next restore and does it again. Tearing the player down first makes
+that gate-open land on a cancelled loop, which is inert. `_abandon_cold_start` no-ops
+while `mp.playback_holds > 1`: the other holder is mid-join on the same player and owns
+the decision. Symmetrically, the 300s `_PLAYBACK_GATE_TIMEOUT` re-waits instead of
+tearing down while any hold is outstanding — every hold is released by an `async with`,
+raise or not, so it cannot park forever.
+
+Both cold-start commands wait on the restore before touching the queue, bounded by
+`RESTORE_WAIT_SECS` (musicbot.py): the pool sets `socket_connect_timeout` but no
+`socket_timeout`, so a Redis that accepts the connection and then stalls would hang the
+command outright. A restore that does not land is a reason **not** to insert — `-play`
+front-inserting against an unread snapshot double-queues the song — so both abandon and
+say so. `MusicPlayer.restore_read_failed` separates "nothing was saved" from "the store
+could not be read"; only the first may be reported to a guild as an empty queue.
+
 Known limitation (FIXME in guild_state.py): recovery counts **bot downtime** as playback
 position — a song 30s in that stays down 10min resumes near its end (duration−10s cap).
 The designed fix is a periodic position heartbeat, not yet implemented.
@@ -728,7 +774,7 @@ Per-guild synchronization primitives and what they protect:
 | Primitive | Protects |
 |---|---|
 | `GuildQueue._mutex` | all three queue legs during bulk mutations; dequeue commits |
-| `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves |
+| `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
 | `_np_edit_lock` | concurrent NP message edits |
