@@ -67,6 +67,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
 from src.ping import run_health_dashboard, send_latency_line
+from src.recovery import restore_guild
 from src.telemetry import get_tracer
 from src.util import (
     background_typing,
@@ -2231,149 +2232,7 @@ class MusicBot(commands.Cog):
         # reload and this one covers a cold start. Both are needed.
         spawn_background(self._load_debug_overrides(), self._restore_tasks)
         for guild in self.bot.guilds:
-            spawn_background(self._restore_guild(guild), self._restore_tasks)
-
-    @_tracer.start_as_current_span("guild.restore")
-    async def _restore_guild(self, guild: discord.Guild) -> None:
-        """Attempt to rejoin voice and restore queue for one guild after restart."""
-        if self.redis is None:
-            return
-        if guild.id in self.mps:
-            return
-
-        store = GuildRedisStore(self.redis, guild.id)
-
-        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
-        # Distributed lock so two bot instances can't race on the same guild.
-        # Acquired inside the span so the SET NX EX is a child span.
-        if not await store.acquire_recovery_lock():
-            trace.get_current_span().set_attribute("restore.skipped_lock", True)
-            log.info(
-                f"Recovery lock held by another instance for guild {guild.id}, skipping"
-            )
-            return
-        try:
-            # One pipelined read serves both gates below: connection (state hash) and
-            # anything-to-restore (queue length + crashed song). _restore_state
-            # re-reads the real payload after a successful connect, so a stopped
-            # guild's leftover queue never rides the wire on the nothing-to-do path.
-            gate = await store.get_recovery_gate()
-            if gate is None:
-                # Read failed — do not treat as "nothing to restore". Skip this
-                # attempt; the lock expires in 60s and the next on_ready retries.
-                log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
-                return
-            guild_state = gate.state
-            # Equivalent to `not has_active_connection`, spelled as explicit None
-            # checks so the channel IDs narrow to int below.
-            vc_id = guild_state.voice_channel_id
-            tc_id = guild_state.text_channel_id
-            if vc_id is None or tc_id is None:
-                return
-
-            voice_channel = guild.get_channel(vc_id)
-            text_channel = guild.get_channel(tc_id)
-            voice_ok = isinstance(voice_channel, discord.VoiceChannel)
-            text_ok = isinstance(text_channel, discord.TextChannel)
-
-            if not voice_ok or not text_ok:
-                # Clear stale IDs so this guild isn't re-attempted every reconnect.
-                await store.clear_connection()
-                trace.get_current_span().set_attribute("restore.channel_missing", True)
-                log.warning(
-                    f"Recovery skipped for guild {guild.id}: "
-                    f"voice_channel_id={vc_id} (resolved={voice_ok}) "
-                    f"text_channel_id={tc_id} (resolved={text_ok})"
-                )
-
-                notify_channel: Optional[discord.TextChannel] = None
-                if text_ok:
-                    notify_channel = text_channel
-                elif guild.me is not None:
-                    if (
-                        guild.system_channel is not None
-                        and guild.system_channel.permissions_for(guild.me).send_messages
-                    ):
-                        notify_channel = guild.system_channel
-                    else:
-                        notify_channel = next(
-                            (
-                                ch
-                                for ch in guild.text_channels
-                                if ch.permissions_for(guild.me).send_messages
-                            ),
-                            None,
-                        )
-
-                if notify_channel is not None:
-                    deleted: list[str] = []
-                    if not voice_ok:
-                        deleted.append("voice channel")
-                    if not text_ok:
-                        deleted.append("text channel")
-                    what = " and ".join(deleted)
-                    verb = "was" if len(deleted) == 1 else "were"
-                    notice = notice_embed(
-                        f"⚠️ I came back online but the {what} I was playing in "
-                        f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
-                        discord.Color.orange(),
-                    )
-                    # No player exists on this path, so the cog decorates directly.
-                    if self.debug_enabled(guild.id):
-                        debug_mode.decorate_embeds(
-                            [notice],
-                            span=trace.get_current_span(),
-                            shard_id=guild.shard_id,
-                            runtime=self.runtime_snapshot,
-                        )
-                    try:
-                        await notify_channel.send(embed=notice)
-                    except Exception as notify_err:
-                        log.warning(
-                            f"Failed to send channel-deleted notification for "
-                            f"guild {guild.id}: {notify_err}"
-                        )
-                return
-
-            # Check there is something to restore before connecting.
-            if not gate.has_restorable_playback:
-                return
-
-            trace.get_current_span().set_attribute(
-                "restore.queue_count", gate.pending_count
-            )
-            trace.get_current_span().set_attribute(
-                "restore.crashed_song", guild_state.has_crashed_song
-            )
-
-            try:
-                await voice_channel.connect(timeout=30.0, reconnect=True)
-                await guild.change_voice_state(
-                    channel=voice_channel, self_mute=False, self_deaf=True
-                )
-            except Exception as e:
-                trace.get_current_span().set_attribute(
-                    "restore.voice_connect_failed", True
-                )
-                trace.get_current_span().record_exception(e)
-                trace.get_current_span().set_status(
-                    StatusCode.ERROR, f"voice connect failed: {e}"
-                )
-                log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
-                return
-
-            mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
-            mp.start()
-            self.mps[guild.id] = mp
-
-            log.info(
-                f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
-            )
-        except Exception as e:
-            record_span_error(trace.get_current_span(), e)
-            log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
-        finally:
-            await store.release_recovery_lock()
+            spawn_background(restore_guild(self, guild), self._restore_tasks)
 
     @commands.Cog.listener()
     async def on_voice_state_update(

@@ -394,3 +394,46 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._debug_unpersisted = set()
     cog._runtime_sampler = RuntimeSampler()
     return cog
+
+
+# ── Cog fixtures with a live fakeredis ────────────────────────────────────────
+# In conftest rather than test_musicbot.py because test_recovery.py drives the same
+# cog: restore_guild takes it as a parameter, so both files need one built the same
+# way. Divergent copies would let a recovery test pass against a cog shape the
+# command tests no longer use.
+
+
+@pytest.fixture
+async def fake_redis_bot() -> AsyncIterator[Redis]:
+    server = fakeredis.FakeServer()
+    client = fakeredis.aioredis.FakeRedis(server=server, decode_responses=False)
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot:
+    cog = MusicBot.__new__(MusicBot)
+    cog.bot = mock_bot
+    cog.mps = {}
+    cog.spotify = MagicMock()
+    cog._spotify_status = SpotifyStatus.ENABLED
+    cog.redis = fake_redis_bot
+    # None, not a mock, and set explicitly: this fixture builds the cog without
+    # __init__, and _debug_inputs reads history_archive — left unset it would be an
+    # AttributeError, and left a MagicMock it would fake an archive that is absent.
+    cog.history_archive = None
+    cog._active_spans = {}
+    cog._alone_timers = {}
+    cog._restore_tasks = set()
+    # Debug state, same shape __init__ builds. The cog reads these on every send and
+    # now persists them, so a fixture without them tests a bot that cannot start.
+    cog._debug_default = False
+    cog._debug_overrides = {}
+    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
+    # read before it cannot apply an older value on top.
+    cog._debug_toggle_seq = 0
+    cog._debug_toggled_at = {}
+    cog._debug_unpersisted = set()
+    cog._runtime_sampler = RuntimeSampler()
+    return cog
