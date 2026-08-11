@@ -388,8 +388,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # asserting against decorated output everywhere. The mock cog used by player
     # tests is pinned separately, in mock_ctx — same hazard, different object.
     # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
-    # fixture that listed them would drift the moment one is added — which is
-    # exactly how the cog's old __slots__ fell three attributes behind.
+    # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
     return cog
@@ -428,8 +427,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     # Debug state, same shape __init__ builds. The cog reads these on every send and
     # now persists them, so a fixture without them tests a bot that cannot start.
     # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
-    # fixture that listed them would drift the moment one is added — which is
-    # exactly how the cog's old __slots__ fell three attributes behind.
+    # fixture that listed them would drift the moment one is added.
     cog.debug_settings = DebugSettings()
     cog.debug_settings._default = False
     return cog
