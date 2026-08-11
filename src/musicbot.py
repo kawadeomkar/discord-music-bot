@@ -29,6 +29,7 @@ from src.config import (
 )
 from src import debug as debug_mode
 from src import leaderboard
+from src.guild_history import history_embeds
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -70,7 +71,6 @@ from src.telemetry import get_tracer
 from src.util import (
     cancel_task,
     fmt_duration,
-    history_embeds,
     notice_embed,
     pluralize,
     queue_message,

@@ -7,8 +7,6 @@ import discord
 import structlog
 from opentelemetry.trace import Span, StatusCode
 
-from src.guild_state import HistoryEntry
-
 
 def queue_message(songs: list[str]) -> str:
     capped = songs[:10]
@@ -131,41 +129,6 @@ def truncate(text: str, limit: int) -> str:
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
     return truncate(title, EMBED_TITLE_LIMIT)
-
-
-def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
-    """One embed per played song, in the given (newest-first) order. Layout: numbered
-    title, raw webpage_url on its own line (Discord auto-links it), then played/duration,
-    requester, and — when known — the played-at timestamp as viewer-local <t:…:f>."""
-    embeds = []
-    for i, entry in enumerate(entries, start=1):
-        lines = []
-        if entry.webpage_url:
-            lines.append(entry.webpage_url)
-        requested_by = (
-            f"<@{entry.requester_id}>"
-            if entry.requester_id
-            else (entry.requester_name or "unknown")
-        )
-        meta = (
-            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
-            f" · requested by {requested_by}"
-        )
-        # played_at == 0 means unknown (absent on the wire); <t:0:f> would render
-        # "1 January 1970", so omit the timestamp instead.
-        if entry.played_at:
-            meta += f" · <t:{int(entry.played_at)}:f>"
-        lines.append(meta)
-        title = truncate_embed_title(f"{i}. {entry.title}")
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
-        if entry.thumbnail:
-            embed.set_thumbnail(url=entry.thumbnail)
-        embeds.append(embed)
-    return embeds
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
