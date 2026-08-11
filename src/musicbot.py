@@ -285,20 +285,12 @@ class MusicBot(commands.Cog):
     class for music bot
     """
 
-    __slots__ = (
-        "bot",
-        "mps",
-        "spotify",
-        "_spotify_status",
-        "redis",
-        "history_archive",
-        "_active_spans",
-        "_alone_timers",
-        "_restore_tasks",
-        "_debug_default",
-        "_debug_overrides",
-        "_runtime_sampler",
-    )
+    # No __slots__ here on purpose. commands.Cog declares none, so instances carry a
+    # __dict__ regardless and a tuple here binds nothing — the one this replaced had
+    # silently drifted three attributes out of date (_debug_toggle_seq,
+    # _debug_toggled_at, _debug_unpersisted), which under real slots is an
+    # AttributeError on the first -debug --enable. A declaration that enforces
+    # nothing is worse than none: it reads as a checked constraint.
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot

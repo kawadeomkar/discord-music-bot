@@ -744,8 +744,9 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
-    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
-    # AttributeError rather than returning None — and _debug_inputs reads it.
+    # None, not a mock, and set explicitly: this fixture builds the cog without
+    # __init__, and _debug_inputs reads history_archive — left unset it would be an
+    # AttributeError, and left a MagicMock it would fake an archive that is absent.
     cog.history_archive = None
     cog._active_spans = {}
     cog._alone_timers = {}
@@ -3099,9 +3100,10 @@ class TestOnReady:
         async def _noop() -> None:
             pass
 
-        # MusicBot uses __slots__, so we must patch at the class level.
-        # Capture happens synchronously in the spy (before stub_create_task
-        # closes the coroutine, which would prevent the body from running).
+        # Patched on the class, not the instance: on_ready calls self._restore_guild,
+        # which resolves through the type, so an instance attribute would be shadowed
+        # by the bound method. Capture happens synchronously in the spy (before
+        # stub_create_task closes the coroutine, which would prevent the body running).
         def _spy(self_inner: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
             passed_guilds.append(guild)
             return _noop()
