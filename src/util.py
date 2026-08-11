@@ -53,16 +53,6 @@ def record_span_error(span: Span, e: Exception) -> None:
     span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
 
 
-def latency_color(ms: float) -> discord.Color:
-    if ms <= 50:
-        return discord.Color(0x44FF44)
-    if ms <= 100:
-        return discord.Color(0xFFD000)
-    if ms <= 200:
-        return discord.Color(0xFF6600)
-    return discord.Color(0x990000)
-
-
 def notice_embed(
     message: str,
     color: Optional[discord.Color] = None,

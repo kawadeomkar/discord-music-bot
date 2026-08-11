@@ -21,6 +21,7 @@ from src.ping import (
     ProbeResult,
     ProbeState,
     default_password_embed,
+    latency_color,
     render_ping_embed,
 )
 from src.musicbot import MusicBot
@@ -1095,3 +1096,26 @@ class TestTheAdvisoryIsForTheOperator:
 
         mock_ctx.bot.is_owner.assert_not_awaited()
         assert len(mock_ctx.channel.send.await_args.kwargs["embeds"]) == 1
+
+
+class TestLatencyColor:
+    def test_excellent_latency_is_green(self) -> None:
+        assert latency_color(30).value == 0x44FF44
+
+    def test_boundary_50ms_is_green(self) -> None:
+        assert latency_color(50).value == 0x44FF44
+
+    def test_good_latency_is_yellow(self) -> None:
+        assert latency_color(75).value == 0xFFD000
+
+    def test_boundary_100ms_is_yellow(self) -> None:
+        assert latency_color(100).value == 0xFFD000
+
+    def test_acceptable_latency_is_orange(self) -> None:
+        assert latency_color(150).value == 0xFF6600
+
+    def test_boundary_200ms_is_orange(self) -> None:
+        assert latency_color(200).value == 0xFF6600
+
+    def test_poor_latency_is_red(self) -> None:
+        assert latency_color(300).value == 0x990000

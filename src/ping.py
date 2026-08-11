@@ -53,7 +53,6 @@ from src.spotify import Spotify
 from src.util import (
     FOOTER_LIMIT,
     get_logger,
-    latency_color,
     send_embed,
     trace_footer,
     truncate,
@@ -308,7 +307,7 @@ async def collect_versions() -> dict[str, str]:
 
 # One band table drives both the status dot and the embed accent, so a green dot can't
 # appear under a yellow accent. These bands (≤100/≤200) differ on purpose from
-# util.latency_color's (≤50/≤100/≤200), which backs send_latency_line — don't swap them.
+# latency_color's (≤50/≤100/≤200) below, which backs send_latency_line — don't swap them.
 _LATENCY_BANDS: tuple[tuple[float, str, int], ...] = (
     (100, "🟢", 0x44FF44),
     (200, "🟡", 0xFFD000),
@@ -479,6 +478,18 @@ def default_password_embed(
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3 · COMMAND BODIES — what src/musicbot.py's cog delegates to
 # ════════════════════════════════════════════════════════════════════════════
+
+
+def latency_color(ms: float) -> discord.Color:
+    """The accent for send_latency_line's one-line reply. Four bands, deliberately
+    NOT _LATENCY_BANDS' three — see the comment there before reconciling them."""
+    if ms <= 50:
+        return discord.Color(0x44FF44)
+    if ms <= 100:
+        return discord.Color(0xFFD000)
+    if ms <= 200:
+        return discord.Color(0xFF6600)
+    return discord.Color(0x990000)
 
 
 async def send_latency_line(ctx: commands.Context, bot_latency: float) -> None:

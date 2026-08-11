@@ -35,7 +35,7 @@ from src.musicbot import (
     background_typing,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.util import latency_color, spawn_background
+from src.util import spawn_background
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
@@ -343,29 +343,6 @@ class TestTypingKeepaliveCancellation:
         with contextlib.suppress(asyncio.CancelledError):
             await keepalive
         assert keepalive.cancelled()
-
-
-class TestLatencyColor:
-    def test_excellent_latency_is_green(self) -> None:
-        assert latency_color(30).value == 0x44FF44
-
-    def test_boundary_50ms_is_green(self) -> None:
-        assert latency_color(50).value == 0x44FF44
-
-    def test_good_latency_is_yellow(self) -> None:
-        assert latency_color(75).value == 0xFFD000
-
-    def test_boundary_100ms_is_yellow(self) -> None:
-        assert latency_color(100).value == 0xFFD000
-
-    def test_acceptable_latency_is_orange(self) -> None:
-        assert latency_color(150).value == 0xFF6600
-
-    def test_boundary_200ms_is_orange(self) -> None:
-        assert latency_color(200).value == 0xFF6600
-
-    def test_poor_latency_is_red(self) -> None:
-        assert latency_color(300).value == 0x990000
 
 
 class TestQueueSource:
