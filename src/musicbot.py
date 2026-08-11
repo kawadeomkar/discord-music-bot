@@ -29,6 +29,7 @@ from src.config import (
 )
 from src import debug as debug_mode
 from src import leaderboard
+from src.guild_history import history_embeds
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -68,9 +69,9 @@ from opentelemetry.trace import Span, StatusCode
 from src.ping import run_health_dashboard, send_latency_line
 from src.telemetry import get_tracer
 from src.util import (
+    background_typing,
     cancel_task,
     fmt_duration,
-    history_embeds,
     notice_embed,
     pluralize,
     queue_message,
@@ -298,49 +299,10 @@ def _check_voice_permissions(
     return None
 
 
-async def _typing_keepalive(ctx: commands.Context) -> None:
-    try:
-        async with ctx.typing():
-            await asyncio.sleep(3600)  # held open until cancelled
-    # Exception only, not CancelledError: background_typing() cancels this on the way
-    # out, and letting that propagate is what marks the task genuinely cancelled
-    # rather than completed. Swallowing it would stop a shutdown at this frame.
-    except Exception:
-        pass  # cosmetic — never let typing failures surface
-
-
-@contextlib.asynccontextmanager
-async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
-    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
-    the command body starts immediately, and the keepalive is cancelled when the body
-    finishes. The whole CM lives inside the task — never enter/exit Typing manually
-    across tasks."""
-    task = asyncio.create_task(_typing_keepalive(ctx))
-    try:
-        yield
-    finally:
-        task.cancel()
-
-
 class MusicBot(commands.Cog):
     """
     class for music bot
     """
-
-    __slots__ = (
-        "bot",
-        "mps",
-        "spotify",
-        "_spotify_status",
-        "redis",
-        "history_archive",
-        "_active_spans",
-        "_alone_timers",
-        "_restore_tasks",
-        "_debug_default",
-        "_debug_overrides",
-        "_runtime_sampler",
-    )
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot

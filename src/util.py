@@ -1,13 +1,12 @@
 import asyncio
 import contextlib
 from typing import Any, Optional
-from collections.abc import Coroutine
+from collections.abc import AsyncGenerator, Coroutine
 
 import discord
 import structlog
+from discord.ext import commands
 from opentelemetry.trace import Span, StatusCode
-
-from src.guild_state import HistoryEntry
 
 
 def queue_message(songs: list[str]) -> str:
@@ -49,20 +48,34 @@ def spawn_background(
     return task
 
 
+async def _typing_keepalive(ctx: commands.Context) -> None:
+    try:
+        async with ctx.typing():
+            await asyncio.sleep(3600)  # held open until cancelled
+    # Exception only, not CancelledError: background_typing() cancels this on the way
+    # out, and letting that propagate is what marks the task genuinely cancelled
+    # rather than completed. Swallowing it would stop a shutdown at this frame.
+    except Exception:
+        pass  # cosmetic — never let typing failures surface
+
+
+@contextlib.asynccontextmanager
+async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
+    the command body starts immediately, and the keepalive is cancelled when the body
+    finishes. The whole CM lives inside the task — never enter/exit Typing manually
+    across tasks."""
+    task = asyncio.create_task(_typing_keepalive(ctx))
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
 def record_span_error(span: Span, e: Exception) -> None:
     """Record an exception on a span and mark its status as ERROR."""
     span.record_exception(e)
     span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-
-
-def latency_color(ms: float) -> discord.Color:
-    if ms <= 50:
-        return discord.Color(0x44FF44)
-    if ms <= 100:
-        return discord.Color(0xFFD000)
-    if ms <= 200:
-        return discord.Color(0xFF6600)
-    return discord.Color(0x990000)
 
 
 def notice_embed(
@@ -131,41 +144,6 @@ def truncate(text: str, limit: int) -> str:
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
     return truncate(title, EMBED_TITLE_LIMIT)
-
-
-def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
-    """One embed per played song, in the given (newest-first) order. Layout: numbered
-    title, raw webpage_url on its own line (Discord auto-links it), then played/duration,
-    requester, and — when known — the played-at timestamp as viewer-local <t:…:f>."""
-    embeds = []
-    for i, entry in enumerate(entries, start=1):
-        lines = []
-        if entry.webpage_url:
-            lines.append(entry.webpage_url)
-        requested_by = (
-            f"<@{entry.requester_id}>"
-            if entry.requester_id
-            else (entry.requester_name or "unknown")
-        )
-        meta = (
-            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
-            f" · requested by {requested_by}"
-        )
-        # played_at == 0 means unknown (absent on the wire); <t:0:f> would render
-        # "1 January 1970", so omit the timestamp instead.
-        if entry.played_at:
-            meta += f" · <t:{int(entry.played_at)}:f>"
-        lines.append(meta)
-        title = truncate_embed_title(f"{i}. {entry.title}")
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
-        if entry.thumbnail:
-            embed.set_thumbnail(url=entry.thumbnail)
-        embeds.append(embed)
-    return embeds
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

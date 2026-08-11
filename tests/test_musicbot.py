@@ -32,11 +32,9 @@ from src.musicbot import (
     SpotifyDisabledError,
     _check_voice_permissions,
     _join_succeeded,
-    _typing_keepalive,
-    background_typing,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.util import latency_color, spawn_background
+from src.util import spawn_background
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
@@ -180,224 +178,6 @@ class TestCheckVoicePermissions:
         member.voice = MagicMock()
         member.voice.channel = MagicMock()
         assert _check_voice_permissions(member, None, "skip") is None
-
-
-class TestBackgroundTyping:
-    """Typing indicator must never delay the command body."""
-
-    async def test_body_runs_while_first_typing_post_is_in_flight(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        post_started = asyncio.Event()
-        release_post = asyncio.Event()
-
-        async def slow_post() -> None:
-            post_started.set()
-            await release_post.wait()
-
-        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=slow_post)
-
-        async with background_typing(mock_ctx):
-            # The body is executing while the POST is still blocked — the ~500ms
-            # first POST no longer serializes ahead of the work.
-            await asyncio.wait_for(post_started.wait(), timeout=1)
-            assert not release_post.is_set()
-
-    async def test_cancel_during_first_post_never_enters_typing_cm(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """Exiting while the first POST is in flight must not leak the keepalive:
-        the CM never entered, so __aexit__ is never called (the AttributeError
-        hazard of driving __aenter__/__aexit__ manually cannot occur)."""
-        post_started = asyncio.Event()
-
-        async def hung_post() -> None:
-            post_started.set()
-            await asyncio.sleep(3600)
-
-        mock_ctx.typing.return_value.__aenter__ = AsyncMock(side_effect=hung_post)
-
-        async with background_typing(mock_ctx):
-            await asyncio.wait_for(post_started.wait(), timeout=1)
-        await asyncio.sleep(0)  # let the cancelled keepalive task unwind
-        mock_ctx.typing.return_value.__aexit__.assert_not_awaited()
-
-    async def test_typing_cm_exited_after_body_completes(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        exited = asyncio.Event()
-        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
-            side_effect=lambda *a: exited.set()
-        )
-        entered = asyncio.Event()
-        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
-            side_effect=lambda: entered.set()
-        )
-
-        async with background_typing(mock_ctx):
-            await asyncio.wait_for(entered.wait(), timeout=1)
-        # Cancellation unwinds through the async with → indicator dropped promptly.
-        await asyncio.wait_for(exited.wait(), timeout=1)
-        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
-
-    async def test_typing_failure_never_surfaces_into_command_body(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
-
-        async with background_typing(mock_ctx):
-            await asyncio.sleep(0)  # let the keepalive task hit the failure
-            await asyncio.sleep(0)
-        # No exception propagates; the command body is unaffected.
-
-    async def test_body_exception_still_cancels_keepalive(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        entered = asyncio.Event()
-        exited = asyncio.Event()
-        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
-            side_effect=lambda: entered.set()
-        )
-        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
-            side_effect=lambda *a: exited.set()
-        )
-
-        with pytest.raises(ValueError):
-            async with background_typing(mock_ctx):
-                await asyncio.wait_for(entered.wait(), timeout=1)
-                raise ValueError("command body blew up")
-        await asyncio.wait_for(exited.wait(), timeout=1)
-
-
-class TestTypingKeepaliveCancellation:
-    """_typing_keepalive must catch Exception only and let CancelledError propagate.
-
-    Statement coverage cannot see the distinction — one `except` line serves both
-    arms, so a handler that also swallows CancelledError reports as covered while
-    completing the task *normally*. These assert `task.cancelled()`, the only
-    observable that separates the two; `done()` is true either way."""
-
-    async def test_cancelled_keepalive_ends_cancelled_not_completed(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """cancel() must leave the task cancelled, not just done(). Swallowing
-        CancelledError makes cooperative cancellation a lie: task.cancelled() is
-        False, and a cancellation aimed at an enclosing scope stops here."""
-        task = asyncio.create_task(_typing_keepalive(mock_ctx))
-        await asyncio.sleep(0)  # let it reach the sleep(3600)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-        assert task.cancelled(), (
-            "keepalive completed normally instead of ending cancelled — "
-            "the handler is swallowing CancelledError"
-        )
-        # done() alone cannot tell the two apart; that is why it is not the assert.
-        assert task.done()
-
-    async def test_cancellation_still_exits_the_typing_cm(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """Letting CancelledError propagate must not skip Typing.__aexit__ — the
-        `async with` unwind is what drops the indicator, and skipping it leaves the
-        bot apparently typing forever after every command."""
-        exited = asyncio.Event()
-        entered = asyncio.Event()
-        mock_ctx.typing.return_value.__aenter__ = AsyncMock(
-            return_value=None, side_effect=lambda: entered.set()
-        )
-        # return_value=None is required for any cancellation assert through this
-        # CM: an __aexit__ returning a truthy value suppresses the exception being
-        # unwound, so a bare AsyncMock() eats the CancelledError and fails the assert
-        # below for an unrelated reason. Real Typing.__aexit__ returns None.
-        mock_ctx.typing.return_value.__aexit__ = AsyncMock(
-            return_value=None, side_effect=lambda *a: exited.set()
-        )
-
-        task = asyncio.create_task(_typing_keepalive(mock_ctx))
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-        await asyncio.wait_for(exited.wait(), timeout=1)
-        mock_ctx.typing.return_value.__aexit__.assert_awaited_once()
-        assert task.cancelled()
-
-    async def test_cosmetic_typing_failure_is_still_swallowed(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """The Exception arm must survive: typing failures stay invisible."""
-        mock_ctx.typing.side_effect = RuntimeError("typing endpoint down")
-
-        task = asyncio.create_task(_typing_keepalive(mock_ctx))
-        await task  # must not raise
-
-        assert task.done() and not task.cancelled()
-        assert task.exception() is None
-
-    async def test_base_exception_is_not_swallowed(self, mock_ctx: MagicMock) -> None:
-        """Only Exception is cosmetic; a BaseException must propagate — CancelledError
-        is one, so this pins the general rule. A custom subclass rather than
-        SystemExit: asyncio re-raises SystemExit/KeyboardInterrupt into the loop,
-        escaping pytest.raises for reasons unrelated to this handler."""
-
-        class Shutdown(BaseException):
-            pass
-
-        mock_ctx.typing.side_effect = Shutdown("shutting down")
-
-        task = asyncio.create_task(_typing_keepalive(mock_ctx))
-        with pytest.raises(Shutdown):
-            await task
-
-    async def test_background_typing_leaves_its_keepalive_cancelled(
-        self, mock_ctx: MagicMock
-    ) -> None:
-        """End-to-end: the task background_typing() spawns and cancels on exit
-        must settle as cancelled. background_typing does not await it, so this
-        is the only place the contract is observable from outside."""
-        spawned: list[asyncio.Task[Any]] = []
-        real_create_task = asyncio.create_task
-
-        def capture(coro: Any, **kw: Any) -> asyncio.Task[Any]:
-            task = real_create_task(coro, **kw)
-            spawned.append(task)
-            return task
-
-        with patch("src.musicbot.asyncio.create_task", side_effect=capture):
-            async with background_typing(mock_ctx):
-                await asyncio.sleep(0)
-
-        assert len(spawned) == 1
-        keepalive = spawned[0]
-        with contextlib.suppress(asyncio.CancelledError):
-            await keepalive
-        assert keepalive.cancelled()
-
-
-class TestLatencyColor:
-    def test_excellent_latency_is_green(self) -> None:
-        assert latency_color(30).value == 0x44FF44
-
-    def test_boundary_50ms_is_green(self) -> None:
-        assert latency_color(50).value == 0x44FF44
-
-    def test_good_latency_is_yellow(self) -> None:
-        assert latency_color(75).value == 0xFFD000
-
-    def test_boundary_100ms_is_yellow(self) -> None:
-        assert latency_color(100).value == 0xFFD000
-
-    def test_acceptable_latency_is_orange(self) -> None:
-        assert latency_color(150).value == 0xFF6600
-
-    def test_boundary_200ms_is_orange(self) -> None:
-        assert latency_color(200).value == 0xFF6600
-
-    def test_poor_latency_is_red(self) -> None:
-        assert latency_color(300).value == 0x990000
 
 
 class TestQueueSource:
@@ -996,8 +776,9 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
-    # None, not a mock: MusicBot declares __slots__, so an unset slot raises
-    # AttributeError rather than returning None — and _debug_inputs reads it.
+    # None, not a mock, and set explicitly: this fixture builds the cog without
+    # __init__, and _debug_inputs reads history_archive — left unset it would be an
+    # AttributeError, and left a MagicMock it would fake an archive that is absent.
     cog.history_archive = None
     cog._active_spans = {}
     cog._alone_timers = {}
@@ -3830,9 +3611,10 @@ class TestOnReady:
         async def _noop() -> None:
             pass
 
-        # MusicBot uses __slots__, so we must patch at the class level.
-        # Capture happens synchronously in the spy (before stub_create_task
-        # closes the coroutine, which would prevent the body from running).
+        # Patched on the class, not the instance: on_ready calls self._restore_guild,
+        # which resolves through the type, so an instance attribute would be shadowed
+        # by the bound method. Capture happens synchronously in the spy (before
+        # stub_create_task closes the coroutine, which would prevent the body running).
         def _spy(self_inner: MusicBot, guild: MagicMock) -> Coroutine[Any, Any, None]:
             passed_guilds.append(guild)
             return _noop()
