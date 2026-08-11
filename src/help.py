@@ -66,7 +66,7 @@ TIPS = (
     "• The **Now Playing** card re-anchors itself to the bottom of the channel "
     "so its live progress bar is never buried by other messages.\n"
     "• Queue, history and volume are saved per server and restored if the bot "
-    "restarts mid-song.\n"
+    "restarts mid-song — or when `-resume` brings it back after a `-stop`.\n"
     "• A volume change applies from the **next** song onwards."
 )
 
