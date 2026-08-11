@@ -2416,6 +2416,37 @@ class TestPlaybackGate:
         music_player._cog.cleanup.assert_not_awaited()
         await cancel_task(loop_task)
 
+    async def test_a_timeout_landing_after_the_gate_opened_does_not_tear_down(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The hold check alone is not enough, and the gap is not theoretical.
+
+        defer_playback's exit drops the count and opens the gate in one synchronous
+        step, but this handler runs a tick AFTER the timer fired — async_timeout
+        cancels the inner wait and the except body reaches us later — so the release
+        can land in between. holds is then already 0 and the gate already open, and
+        a handler reading holds alone tears down a player whose join just succeeded.
+
+        Timing-free: the state the race produces is set up directly, and a wait that
+        never returns forces the handler to run in it. Under CPU contention the
+        sibling test above reproduces the same thing about once in 25 runs, which is
+        what CI saw.
+        """
+        music_player._cog.cleanup = AsyncMock()
+        music_player._playback_gate.set()
+        assert music_player.playback_holds == 0
+
+        never = asyncio.Event()  # never set, so every wait hits the timeout
+        with (
+            patch("src.musicplayer._PLAYBACK_GATE_TIMEOUT", 0.01),
+            patch.object(music_player._playback_gate, "wait", never.wait),
+        ):
+            loop_task = asyncio.create_task(music_player.loop())
+            await asyncio.sleep(0.05)  # several timeouts' worth
+            music_player._cog.cleanup.assert_not_awaited()
+            assert not loop_task.done()
+        await cancel_task(loop_task)
+
     def test_can_rejoin_cold_on_a_parked_player(
         self, music_player: MusicPlayer
     ) -> None:

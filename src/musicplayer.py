@@ -2011,12 +2011,22 @@ class MusicPlayer:
                     await self._playback_gate.wait()
                 break
             except asyncio.TimeoutError:
-                if self._playback_holds:
+                if self._playback_holds or self._playback_gate.is_set():
                     # A command is mid-join and owns the opening. Tearing down under
                     # it would pop this player from mps while it still holds the
                     # reference, leaving it to drive an orphan — and the join it is
                     # waiting on to hand a voice client to nobody. Wait again; every
                     # hold is released by an `async with`, raise or not.
+                    #
+                    # The gate check is not redundant with the hold check, and losing
+                    # it tears down a player that connected fine. defer_playback's
+                    # exit drops the count and opens the gate in one synchronous step,
+                    # but this handler runs a tick AFTER the timer fired: async_timeout
+                    # cancels the inner wait and the except body reaches us later, so
+                    # the release can land in between. Then holds is already 0 and the
+                    # gate is already open, and reading holds alone says "nobody is
+                    # coming back" about a join that just succeeded. Re-waiting is
+                    # free — an open gate returns immediately and breaks.
                     continue
                 log.info(
                     f"Playback gate timed out for guild {self._guild.id} "
