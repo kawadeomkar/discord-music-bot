@@ -31,6 +31,7 @@ from src.musicbot import (
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
+    _join_succeeded,
     _typing_keepalive,
     background_typing,
 )
@@ -104,6 +105,37 @@ class TestCommandErrorRendering:
 
         assert (call := send_embed.await_args) is not None
         assert call.args[2] == "**ValueError:** nope"
+
+
+class TestJoinSucceeded:
+    """The check both cold-start commands gate their insert on. Its whole reason to
+    exist is the still-connecting case: a type-only check passes there and hands the
+    loop a client vc.play() raises on, once per restored song."""
+
+    @staticmethod
+    def _ctx(voice_client: object) -> MagicMock:
+        ctx = MagicMock(spec=commands.Context)
+        ctx.voice_client = voice_client
+        return ctx
+
+    def test_connected_client_succeeds(self) -> None:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = True
+        assert _join_succeeded(self._ctx(vc)) is True
+
+    def test_still_connecting_client_fails(self) -> None:
+        # discord.py registers the client on the guild BEFORE the handshake, so this
+        # is a real state a concurrent cold -play leaves behind — not a mock artifact.
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_connected.return_value = False
+        assert _join_succeeded(self._ctx(vc)) is False
+
+    def test_absent_client_fails(self) -> None:
+        # join swallows its own failures, so a failed join arrives as None.
+        assert _join_succeeded(self._ctx(None)) is False
+
+    def test_non_voice_client_fails(self) -> None:
+        assert _join_succeeded(self._ctx(MagicMock())) is False
 
 
 class TestCheckVoicePermissions:

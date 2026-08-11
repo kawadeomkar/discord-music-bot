@@ -265,6 +265,20 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
         tracks[0].ts = source.ts
 
 
+def _join_succeeded(ctx: commands.Context) -> bool:
+    """Did the join a cold-start command just ran leave a USABLE voice client?
+
+    is_connected(), not just the type: discord.py registers the client on the guild
+    BEFORE the handshake completes, and vc.play() on a still-connecting one raises
+    once per restored song. join also swallows its own failures, so a failed one
+    arrives here as an absent client rather than an exception. Shared by -play and
+    -resume — the two checks must never diverge, since a type-only check is exactly
+    the bug this guards.
+    """
+    vc = ctx.voice_client
+    return isinstance(vc, discord.VoiceClient) and vc.is_connected()
+
+
 def _check_voice_permissions(
     author: Union[discord.Member, discord.User],
     voice_client: Optional[discord.VoiceClient],
@@ -973,14 +987,9 @@ class MusicBot(commands.Cog):
                             # recovery on restart.
                             await self._abandon_cold_start(ctx, mp)
                             raise
-                        # join swallows its own failures, so a failed one arrives as
-                        # an absent — or still-connecting — voice client. Inserting
-                        # anyway hands the loop a song it can only raise on.
-                        joined_vc = ctx.voice_client
-                        if not (
-                            isinstance(joined_vc, discord.VoiceClient)
-                            and joined_vc.is_connected()
-                        ):
+                        # Inserting onto a join that produced no usable client hands
+                        # the loop a song it can only raise on.
+                        if not _join_succeeded(ctx):
                             await self._abandon_cold_start(ctx, mp)
                             return
                     else:
@@ -1445,14 +1454,7 @@ class MusicBot(commands.Cog):
             async with mp.defer_playback():
                 try:
                     await ctx.invoke(self.join)
-                    # is_connected(), not just the type: discord.py registers the
-                    # client BEFORE the handshake, and vc.play() on a still-connecting
-                    # one raises once per restored song.
-                    joined_vc = ctx.voice_client
-                    joined = (
-                        isinstance(joined_vc, discord.VoiceClient)
-                        and joined_vc.is_connected()
-                    )
+                    joined = _join_succeeded(ctx)
                 except BaseException:
                     # join swallows Exceptions, so an escape means its error REPORTING
                     # failed, or the command was cancelled. Same wreckage, same exit.
