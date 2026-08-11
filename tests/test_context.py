@@ -16,6 +16,7 @@ from src.config import SpotifyStatus
 from src.debug import RuntimeSampler
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
+from src.recovery import VoiceWatchdog
 from tests.helpers import mocked
 
 
@@ -30,7 +31,7 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
-    cog._alone_timers = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
     # Off by default: send() asks the cog on every response, so a debug-on cog
     # here would decorate the embeds these attach tests compare.

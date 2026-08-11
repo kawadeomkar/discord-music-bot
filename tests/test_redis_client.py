@@ -1804,7 +1804,7 @@ class TestGetGuildState:
         self, broken_store: GuildRedisStore
     ) -> None:
         # None (read failed) must be distinguishable from GuildStateData()
-        # (nothing stored) — _restore_guild relies on this to avoid silently
+        # (nothing stored) — restore_guild() relies on this to avoid silently
         # skipping recovery during a Redis outage.
         result = await broken_store.get_guild_state()
         assert result is None

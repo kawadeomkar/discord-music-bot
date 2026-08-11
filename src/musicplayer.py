@@ -486,7 +486,7 @@ class MusicPlayer:
         loop() blocks on _restore_complete before consuming the queue (see
         _restore_state); with no store the event is set immediately. It then blocks on
         the playback gate, opened here when the guild already has a voice client —
-        _restore_guild connects before calling start(), so recovery resumes from the
+        restore_guild() connects before calling start(), so recovery resumes from the
         head with no extra call site. Otherwise -join / -play open it."""
         if self._guild.voice_client is not None:
             self.open_playback_gate()

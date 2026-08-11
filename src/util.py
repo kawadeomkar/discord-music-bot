@@ -110,6 +110,32 @@ async def send_embed(
     return await destination.send(embed=embed)
 
 
+def first_sendable_channel(
+    guild: discord.Guild,
+) -> Optional[discord.TextChannel]:
+    """A text channel in `guild` the bot may post in — the system channel when it
+    qualifies, else the first that does. For notices with no channel of their own,
+    e.g. telling a guild that the channels it was playing in were deleted.
+
+    None when the bot is not in the guild's member cache or can post nowhere; the
+    caller stays silent rather than raising, since these messages are advisory."""
+    if guild.me is None:
+        return None
+    if (
+        guild.system_channel is not None
+        and guild.system_channel.permissions_for(guild.me).send_messages
+    ):
+        return guild.system_channel
+    return next(
+        (
+            ch
+            for ch in guild.text_channels
+            if ch.permissions_for(guild.me).send_messages
+        ),
+        None,
+    )
+
+
 def fmt_duration(secs: int) -> str:
     """Compact clock rendering: 225 → "3:45", 3725 → "1:02:05"."""
     m, s = divmod(max(0, secs), 60)
