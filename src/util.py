@@ -1,10 +1,11 @@
 import asyncio
 import contextlib
 from typing import Any, Optional
-from collections.abc import Coroutine
+from collections.abc import AsyncGenerator, Coroutine
 
 import discord
 import structlog
+from discord.ext import commands
 from opentelemetry.trace import Span, StatusCode
 
 
@@ -45,6 +46,30 @@ def spawn_background(
     tasks.add(task)
     task.add_done_callback(tasks.discard)
     return task
+
+
+async def _typing_keepalive(ctx: commands.Context) -> None:
+    try:
+        async with ctx.typing():
+            await asyncio.sleep(3600)  # held open until cancelled
+    # Exception only, not CancelledError: background_typing() cancels this on the way
+    # out, and letting that propagate is what marks the task genuinely cancelled
+    # rather than completed. Swallowing it would stop a shutdown at this frame.
+    except Exception:
+        pass  # cosmetic — never let typing failures surface
+
+
+@contextlib.asynccontextmanager
+async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
+    the command body starts immediately, and the keepalive is cancelled when the body
+    finishes. The whole CM lives inside the task — never enter/exit Typing manually
+    across tasks."""
+    task = asyncio.create_task(_typing_keepalive(ctx))
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 def record_span_error(span: Span, e: Exception) -> None:
