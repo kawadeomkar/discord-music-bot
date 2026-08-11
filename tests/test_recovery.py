@@ -290,7 +290,7 @@ class TestRestoreGuildChannelDeleted:
 
         store = GuildRedisStore(fake_redis_bot, mock_guild.id)
         await store.set_connection(888000000000000001, 888000000000000002)
-        music_bot_with_redis._debug_overrides[mock_guild.id] = True
+        music_bot_with_redis.debug_settings._overrides[mock_guild.id] = True
 
         mock_guild.get_channel.return_value = None
         mock_guild.system_channel.send = AsyncMock()

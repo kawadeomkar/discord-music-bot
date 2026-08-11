@@ -3828,8 +3828,8 @@ class TestPlayerDebugDecoration:
         lag: float = 1.0,
     ) -> None:
         cog = mocked(music_player._cog)
-        cog.debug_enabled.return_value = True
-        cog.runtime_snapshot = RuntimeSnapshot(
+        cog.debug_settings.enabled.return_value = True
+        cog.debug_settings.snapshot = RuntimeSnapshot(
             cpu_percent=cpu, mem_percent=mem, lag_ms=lag, tasks=7, pool_workers=4
         )
 
@@ -3938,7 +3938,7 @@ class TestPlayerDebugDecoration:
         await music_player._push_np_edit(mock_song, message, [])
         assert "🐞" in (message.edit.call_args.kwargs["embeds"][0].footer.text or "")
 
-        mocked(music_player._cog).debug_enabled.return_value = False
+        mocked(music_player._cog).debug_settings.enabled.return_value = False
         await music_player._push_np_edit(mock_song, message, [])
         after = message.edit.call_args.kwargs["embeds"][0].footer.text or ""
         assert "🐞" not in after
@@ -3969,7 +3969,7 @@ class TestPlayerDebugDecoration:
         music_player.np_embed_block(now_playing=cached)
         assert "🐞" in (cached.footer.text or "")
 
-        mocked(music_player._cog).debug_enabled.return_value = False
+        mocked(music_player._cog).debug_settings.enabled.return_value = False
         music_player.np_embed_block(now_playing=cached)
         assert "🐞" not in (cached.footer.text or "")
         assert "Avg Bitrate" in (cached.footer.text or "")  # its own footer survives

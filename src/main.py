@@ -104,7 +104,7 @@ class MusicContext(commands.Context):
         if not own:
             return
         guild_id = self.guild.id if self.guild else None
-        if not cog.debug_enabled(guild_id):
+        if not cog.debug_settings.enabled(guild_id):
             # Strip rather than return: a cached embed built while debug mode was
             # on must lose its suffix once it is off.
             strip_debug_footers(own)
@@ -119,7 +119,7 @@ class MusicContext(commands.Context):
             if active is not None
             else None,
             shard_id=self.guild.shard_id if self.guild else None,
-            runtime=cog.runtime_snapshot,
+            runtime=cog.debug_settings.snapshot,
         )
 
     def _music_cog(self) -> Optional["MusicBot"]:

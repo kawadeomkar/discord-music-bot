@@ -15,7 +15,7 @@ from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
-from src.debug import RuntimeSampler
+from src.debug import DebugSettings
 from src.musicbot import MusicBot
 from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
@@ -209,10 +209,11 @@ def mock_ctx(
     ctx.message = mock_message
     ctx.cog = MagicMock()
     # Explicit for the same reason as ctx.command.extras below: MusicPlayer takes
-    # this mock as its cog, and a bare MagicMock's debug_enabled() is truthy, so
-    # every player-built embed in the suite would decorate with a Mock runtime.
-    ctx.cog.debug_enabled = MagicMock(return_value=False)
-    ctx.cog.runtime_snapshot = None
+    # this mock as its cog, and a bare MagicMock's debug_settings.enabled() is
+    # truthy, so every player-built embed in the suite would decorate with a Mock
+    # runtime.
+    ctx.cog.debug_settings.enabled = MagicMock(return_value=False)
+    ctx.cog.debug_settings.snapshot = None
     ctx.send = AsyncMock()
     ctx.typing = MagicMock()
     ctx.typing.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -386,14 +387,10 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # mode on, every embed grows a footer and the suite's embed assertions would be
     # asserting against decorated output everywhere. The mock cog used by player
     # tests is pinned separately, in mock_ctx — same hazard, different object.
-    cog._debug_default = False
-    cog._debug_overrides = {}
-    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
-    # read before it cannot apply an older value on top.
-    cog._debug_toggle_seq = 0
-    cog._debug_toggled_at = {}
-    cog._debug_unpersisted = set()
-    cog._runtime_sampler = RuntimeSampler()
+    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
+    # fixture that listed them would drift the moment one is added.
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
     return cog
 
 
@@ -429,12 +426,8 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog._restore_tasks = set()
     # Debug state, same shape __init__ builds. The cog reads these on every send and
     # now persists them, so a fixture without them tests a bot that cannot start.
-    cog._debug_default = False
-    cog._debug_overrides = {}
-    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
-    # read before it cannot apply an older value on top.
-    cog._debug_toggle_seq = 0
-    cog._debug_toggled_at = {}
-    cog._debug_unpersisted = set()
-    cog._runtime_sampler = RuntimeSampler()
+    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
+    # fixture that listed them would drift the moment one is added.
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
     return cog

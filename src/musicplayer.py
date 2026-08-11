@@ -1126,7 +1126,7 @@ class MusicPlayer:
         here took any time. NP-block callers pass no span, so a re-rendered block
         cannot alternate trace ids. See docs/ARCHITECTURE.md#debug-footer-seams.
         """
-        if not self._cog.debug_enabled(self._guild.id):
+        if not self._cog.debug_settings.enabled(self._guild.id):
             # Strip rather than return: play_message outlives a mid-song --disable.
             strip_debug_footers(embeds)
             return
@@ -1134,7 +1134,7 @@ class MusicPlayer:
             embeds,
             span=span,
             shard_id=self._guild.shard_id,
-            runtime=self._cog.runtime_snapshot,
+            runtime=self._cog.debug_settings.snapshot,
         )
 
     def _build_now_playing_embed(
