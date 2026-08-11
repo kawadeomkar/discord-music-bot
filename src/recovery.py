@@ -6,13 +6,9 @@ in docs/ARCHITECTURE.md#crash-recovery); VoiceWatchdog is the leave side (the
 10s alone-disconnect countdown). on_voice_state_update's bot-was-ejected arm is
 the third case and routes straight to cog.cleanup().
 
-These take the MusicBot cog as an explicit parameter rather than living on it.
-They are functions ABOUT the cog, not commands, and naming the dependency is
-what lets them out of a 2,400-line module. MusicPlayer already receives the cog
-the same way.
+Both take the MusicBot cog as an explicit parameter, the way MusicPlayer does.
 
-The `guild.restore` span keeps its name, so existing Tempo queries still match;
-what moved is the OTel instrumentation SCOPE, from src.musicbot to src.recovery.
+Do not rename the `guild.restore` span — Tempo queries match on it.
 """
 
 import asyncio
@@ -170,9 +166,9 @@ async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
 class VoiceWatchdog:
     """Disconnects the bot once it is alone in a voice channel.
 
-    Owns the per-guild timer tasks rather than leaving them a dict on the cog: the
-    cancel-before-pop ordering and the current-task guard below are the whole of
-    this feature's correctness, and they belong with the state they protect.
+    Owns the per-guild timer tasks: the cancel-before-pop ordering and the
+    current-task guard below are the whole of this feature's correctness, and
+    they belong with the state they protect.
 
     One instance per cog, built in MusicBot.__init__.
     """

@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.16.1"
+version = "2.16.4"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -59,7 +59,7 @@ pytest-asyncio = ">=0.25"
 # path the unit tier exists to cover. Below this floor the shape is wrong and the
 # guard tests pass against a fiction. The lock has resolved above it for a while;
 # the declared floor had not moved, so a fresh resolve could have gone under it.
-fakeredis = ">=2.36"
+fakeredis = ">=2.37.0"
 pytest-cov = "^7.1.0"
 # A per-test deadline (configured in [tool.pytest.ini_options]). Not a nicety:
 # several guards here are asyncio.timeout() calls, and a regression that removes

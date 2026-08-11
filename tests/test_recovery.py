@@ -728,7 +728,7 @@ class TestAloneCountdown:
     async def test_timer_removed_from_dict_on_completion(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
-        """_alone_timers entry is removed in the finally block regardless of outcome."""
+        """The timer entry is removed in the finally block regardless of outcome."""
         self._setup_mp(music_bot, mock_guild)
         music_bot.voice_watchdog._timers[mock_guild.id] = MagicMock()  # sentinel
 

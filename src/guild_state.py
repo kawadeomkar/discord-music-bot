@@ -1028,14 +1028,14 @@ class GuildPlaybackSnapshot:
 
     @property
     def has_restorable_playback(self) -> bool:
-        """The _restore_guild gate: True when a restart has anything to resume
+        """The restore_guild() gate: True when a restart has anything to resume
         — pending queue entries or a song that was mid-play at crash time."""
         return bool(self.queue) or self.state.has_crashed_song
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuildRecoveryGate:
-    """The minimal read `_restore_guild` needs to decide whether to reconnect: the
+    """The minimal read `restore_guild()` needs to decide whether to reconnect: the
     state hash plus the pending queue's *length* — never its contents.
 
     _restore_state re-reads the full GuildPlaybackSnapshot after a successful voice

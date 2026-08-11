@@ -37,7 +37,7 @@ from src.musicplayer import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
-from src.util import fmt_duration
+from src.util import cancel_task, fmt_duration
 from src.youtube import QueueObject, YTDL
 from tests.helpers import described, mocked, queue_object, stub_create_task
 
@@ -1269,6 +1269,155 @@ class TestResumeNoticeEmbed:
         assert len(_fields(embed)["Last played"]) <= 1024
 
 
+class TestRejoinResumeEmbed:
+    """build_rejoin_resume_embed() — the -resume-on-a-disconnected-bot heads-up."""
+
+    def test_returns_none_when_queue_empty(self, music_player: MusicPlayer) -> None:
+        """The gate: nothing came back, so -resume reports that instead of
+        joining a channel to sit silent in."""
+        assert music_player.build_rejoin_resume_embed() is None
+
+    def test_returns_none_when_queue_empty_even_with_history(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """History is a record of finished songs, not something to resume."""
+        music_player.history.restore([HistoryEntry(title="Old Song", played_at=1.0)])
+        assert music_player.build_rejoin_resume_embed() is None
+
+    def test_names_no_song(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Unlike the -play notice, nothing was inserted: the head this describes
+        is the song the Now Playing card names seconds later, so naming it here
+        would just be the same title twice."""
+        music_player.queue._display.append(queue_obj)
+
+        embed = music_player.build_rejoin_resume_embed()
+
+        assert embed is not None
+        assert "Playing now" not in described(embed)
+        assert embed.thumbnail.url is None
+
+    def test_reports_count_and_runtime(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        for i in range(3):
+            music_player.queue._display.append(
+                QueueObject(
+                    f"https://yt.com/v={i}", f"Song {i}", mock_author, duration=90
+                )
+            )
+
+        embed = music_player.build_rejoin_resume_embed()
+
+        assert embed is not None
+        assert "**3** songs" in described(embed)
+        fields = _fields(embed)
+        assert fields["Queued"] == "**3** songs"
+        assert fields["Runtime"] == "4m 30s"
+
+    def test_singular_wording_for_one_song(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        music_player.queue._display.append(queue_obj)
+
+        embed = music_player.build_rejoin_resume_embed()
+
+        assert embed is not None
+        assert "**1** song from the previous session resumes now." in described(embed)
+
+    def test_names_the_crash_recovered_head_it_left_off_on(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Shares _resume_left_off_field with the -play notice, so a crash's
+        mid-play song is named with the offset it will resume from."""
+        music_player.queue._display.append(_crashed(mock_author))
+
+        embed = music_player.build_rejoin_resume_embed()
+
+        assert embed is not None
+        assert _fields(embed)["Left off on"] == (
+            "**Interrupted Song**\n`0:45` / `3:20`"
+        )
+
+    def test_highlight_color_is_green(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """Green, not the -play notice's orange: that one interrupts a request
+        with news about unrelated restored state, while this IS the response to
+        what was asked for."""
+        music_player.queue._display.append(queue_obj)
+
+        embed = music_player.build_rejoin_resume_embed()
+
+        assert embed is not None
+        assert embed.colour == discord.Color.green()
+
+
+class TestReparkCrashedHead:
+    """repark_crashed_head() — putting back the recovered song that only memory
+    holds. _restore_state clears current_song_* as soon as it re-queues that song,
+    so from then until it plays, dropping the player loses it outright."""
+
+    async def test_writes_the_head_back_to_the_state_hash(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player.queue._display.append(_crashed(mock_author))
+
+        assert await music_player.repark_crashed_head() is True
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        assert state.has_crashed_song
+        assert state.current_song_title == "Interrupted Song"
+
+    async def test_position_survives_the_round_trip(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The state hash carries no `ts` field — a resume point exists there only
+        as a backdated play_start_epoch, which is what recovery reads it back out
+        of."""
+        music_player.queue._display.append(_crashed(mock_author, ts=45))
+
+        await music_player.repark_crashed_head()
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        assert state.crashed_position_at(time.time()) == pytest.approx(45, abs=2)
+
+    async def test_leaves_a_persisted_head_alone(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """An ordinary queued song is still on the Redis list. Parking it in
+        current_song_* would restore a second copy alongside that list entry."""
+        music_player.queue._display.append(queue_obj)
+
+        assert await music_player.repark_crashed_head() is False
+
+        assert music_player.store is not None
+        state = await music_player.store.get_guild_state()
+        assert state is not None
+        assert not state.has_crashed_song
+
+    async def test_no_head_writes_nothing(self, music_player: MusicPlayer) -> None:
+        assert await music_player.repark_crashed_head() is False
+
+    async def test_without_redis_writes_nothing(
+        self,
+        mock_bot: MagicMock,
+        mock_guild: MagicMock,
+        mock_channel: MagicMock,
+        mock_ctx: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        mp = MusicPlayer(mock_bot, mock_guild, mock_channel, mock_ctx.cog, redis=None)
+        mp.queue._display.append(_crashed(mock_author))
+
+        assert await mp.repark_crashed_head() is False
+
+
 # ── EstimatedPlayingAt ────────────────────────────────────────────────────────
 
 
@@ -2245,6 +2394,94 @@ class TestPlaybackGate:
 
         await asyncio.sleep(0.05)
         music_player._cog.cleanup.assert_awaited_once_with(music_player._guild)
+
+    async def test_gate_timeout_waits_out_an_in_flight_hold(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The timeout exists for a player nobody is coming back for. A hold means a
+        command is mid-join and still holds this player — tearing down under it pops
+        the mps entry it is driving and hands its join's voice client to nobody."""
+        music_player._playback_gate.clear()
+        music_player._cog.cleanup = AsyncMock()
+
+        with patch("src.musicplayer._PLAYBACK_GATE_TIMEOUT", 0.01):
+            async with music_player.defer_playback():
+                loop_task = asyncio.create_task(music_player.loop())
+                await asyncio.sleep(0.05)  # several timeouts' worth
+                music_player._cog.cleanup.assert_not_awaited()
+                assert not loop_task.done()
+            # Hold released: the gate opens and the loop proceeds normally.
+            await asyncio.sleep(0.05)
+
+        music_player._cog.cleanup.assert_not_awaited()
+        await cancel_task(loop_task)
+
+    async def test_a_timeout_landing_after_the_gate_opened_does_not_tear_down(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The hold check alone is not enough, and the gap is not theoretical.
+
+        defer_playback's exit drops the count and opens the gate in one synchronous
+        step, but this handler runs a tick AFTER the timer fired — async_timeout
+        cancels the inner wait and the except body reaches us later — so the release
+        can land in between. holds is then already 0 and the gate already open, and
+        a handler reading holds alone tears down a player whose join just succeeded.
+
+        Timing-free: the state the race produces is set up directly, and a wait that
+        never returns forces the handler to run in it. Under CPU contention the
+        sibling test above reproduces the same thing about once in 25 runs, which is
+        what CI saw.
+        """
+        music_player._cog.cleanup = AsyncMock()
+        music_player._playback_gate.set()
+        assert music_player.playback_holds == 0
+
+        never = asyncio.Event()  # never set, so every wait hits the timeout
+        with (
+            patch("src.musicplayer._PLAYBACK_GATE_TIMEOUT", 0.01),
+            patch.object(music_player._playback_gate, "wait", never.wait),
+        ):
+            loop_task = asyncio.create_task(music_player.loop())
+            await asyncio.sleep(0.05)  # several timeouts' worth
+            music_player._cog.cleanup.assert_not_awaited()
+            assert not loop_task.done()
+        await cancel_task(loop_task)
+
+    def test_can_rejoin_cold_on_a_parked_player(
+        self, music_player: MusicPlayer
+    ) -> None:
+        music_player._playback_gate.clear()
+        assert music_player.can_rejoin_cold() is True
+
+    def test_cannot_rejoin_cold_once_the_gate_is_open(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """An open gate with no voice client is a loop already walking the queue,
+        not a player waiting to be handed a connection."""
+        music_player._playback_gate.set()
+        assert music_player.can_rejoin_cold() is False
+
+    def test_cannot_rejoin_cold_while_a_song_is_held(
+        self, music_player: MusicPlayer
+    ) -> None:
+        music_player._playback_gate.clear()
+        music_player.current_song = MagicMock()
+        assert music_player.can_rejoin_cold() is False
+
+    async def test_wait_for_restore_gives_up_at_its_timeout(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The pool sets no socket_timeout, so a Redis that accepts the connection
+        and then stalls never finishes the restore — an unbounded wait here is a
+        command that never answers."""
+        music_player._restore_complete.clear()
+
+        assert await music_player.wait_for_restore(timeout=0.01) is False
+
+    async def test_wait_for_restore_reports_a_completed_restore(
+        self, music_player: MusicPlayer
+    ) -> None:
+        assert await music_player.wait_for_restore(timeout=1) is True
 
 
 class TestQueuePutFront:
