@@ -1077,7 +1077,7 @@ class GuildRedisStore:
 
         Zero-value GuildStateData when the hash is missing/empty, None when the read
         itself failed — so callers can tell "nothing stored" from "Redis
-        unavailable" (see _restore_guild). Pure read: does not refresh TTL;
+        unavailable" (see recovery.restore_guild). Pure read: does not refresh TTL;
         refresh_ttl() at the end of _restore_state() covers the recovery window.
         """
         # Same decode_responses=False invariant as get_now_playing() above.
@@ -1087,7 +1087,7 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
         """State hash + pending-queue *length* in one pipeline — the lightweight
-        connection/restorable gate for `_restore_guild`.
+        connection/restorable gate for `recovery.restore_guild`.
 
         Transfers no queue contents, now-playing or history: a -stopped guild keeps
         a possibly-long queue by design, and gating on LLEN keeps that payload off

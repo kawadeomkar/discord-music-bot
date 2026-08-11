@@ -2039,7 +2039,7 @@ class MusicBot(commands.Cog):
         "this guild never chose" must not be the same answer here — treating them
         alike made one failed read DELETE a correct stored choice and revert that
         guild to the host default for the rest of the process. This is the discipline
-        _restore_guild already applies to a failed get_recovery_gate.
+        restore_guild() already applies to a failed get_recovery_gate.
 
         A guild toggled while this pass was reading is skipped too. The read and the
         apply straddle an await, so a `-debug --enable` landing between them would
