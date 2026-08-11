@@ -435,10 +435,9 @@ class MusicPlayer:
         self._prefetch_task: Optional[asyncio.Task] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
-        # Set when the restore could not read the store. Without it an empty queue
-        # is ambiguous — nothing was saved, or nothing could be read — and a command
-        # reporting the first when it means the second tells the guild its queue is
-        # gone on the strength of a failed pipeline.
+        # Set when the restore could not READ the store. Without it an empty queue is
+        # ambiguous — nothing saved vs nothing readable — and a command reporting the
+        # first when it means the second tells a guild its queue is gone.
         self._restore_read_failed = False
         # Restore and *play* are separate concerns: the gate stays shut until a
         # command establishes a voice connection, so a player built by a command that
@@ -525,25 +524,20 @@ class MusicPlayer:
 
     @property
     def playback_holds(self) -> int:
-        """How many commands are currently holding the gate shut. A caller deciding
-        whether to tear this player down reads it to find out that someone else is
-        still driving it toward playback and owns that decision."""
+        """How many commands hold the gate shut. Nonzero means someone else is
+        driving this player toward playback and owns the teardown decision."""
         return self._playback_holds
 
     def can_rejoin_cold(self) -> bool:
-        """True when nothing is playing and the gate is still shut — the parked state
-        `-resume`'s rejoin path assumes. A player failing this kept running after its
-        voice client vanished (an eject that never reached on_voice_state_update), so
-        its in-memory legs and its gate are both untrustworthy: rebuild, don't reuse.
-        """
+        """True in the parked state `-resume`'s rejoin path assumes. Failing it means
+        the player outlived its voice client (an eject on_voice_state_update never
+        saw), so its legs and gate are untrustworthy: rebuild, don't reuse."""
         return self.current_song is None and not self._playback_gate.is_set()
 
     @property
     def restore_read_failed(self) -> bool:
-        """True when the last restore could not read the store, so an empty queue
-        here means "unknown", not "nothing was left". Distinguishing the two is the
-        difference between telling a guild its queue is gone and telling it the bot
-        cannot see the queue."""
+        """True when the last restore could not read the store: an empty queue then
+        means "unknown", not "nothing was left"."""
         return self._restore_read_failed
 
     async def wait_for_restore(self, timeout: Optional[float] = None) -> bool:
@@ -946,9 +940,8 @@ class MusicPlayer:
                     )
 
                 except Exception as e:
-                    # Partial restore: whatever landed before this stands, but the
-                    # queue is no longer known to be complete, so callers must not
-                    # read an empty one as "nothing was saved".
+                    # Partial restore: what landed stands, but the queue is no longer
+                    # known complete, so an empty one is not "nothing was saved".
                     self._restore_read_failed = True
                     record_span_error(span, e)
                     log.error(
@@ -968,21 +961,17 @@ class MusicPlayer:
         True when something was re-parked.
 
         _restore_state clears current_song_* as soon as it re-queues that song, so
-        this player's memory becomes its only copy — dropping the player before the
-        song plays loses it with no error and nothing left to recover from. A caller
-        tearing down without playing puts it back. Call AFTER cleanup(): its
-        clear_connection() HDELs these same fields.
+        this player's memory is its only copy — dropping it loses the song silently.
+        Call AFTER cleanup(): its clear_connection() HDELs these same fields.
         """
         head = self.queue.peek_next()
         if self.store is None or not isinstance(head, QueueObject):
             return False
         if is_persisted(head):
-            # Still on the Redis list, so it needs no parking — and writing it into
-            # current_song_* would re-queue a second copy at the next restore.
+            # Already on the Redis list: parking it would re-queue a second copy.
             return False
-        # Backdated by the resume offset exactly as the loop does at vc.play, since
-        # the state hash carries no `ts`: recovery reads position back as
-        # now - play_start_epoch - pauses.
+        # Backdated by the resume offset as the loop does at vc.play — the hash has no
+        # `ts`, and recovery reads position as now - play_start_epoch - pauses.
         await self.store.set_current_song_state(
             SongQueueEntry.from_queue_object(head), time.time() - (head.ts or 0)
         )
@@ -2012,21 +2001,12 @@ class MusicPlayer:
                 break
             except asyncio.TimeoutError:
                 if self._playback_holds or self._playback_gate.is_set():
-                    # A command is mid-join and owns the opening. Tearing down under
-                    # it would pop this player from mps while it still holds the
-                    # reference, leaving it to drive an orphan — and the join it is
-                    # waiting on to hand a voice client to nobody. Wait again; every
-                    # hold is released by an `async with`, raise or not.
-                    #
-                    # The gate check is not redundant with the hold check, and losing
-                    # it tears down a player that connected fine. defer_playback's
-                    # exit drops the count and opens the gate in one synchronous step,
-                    # but this handler runs a tick AFTER the timer fired: async_timeout
-                    # cancels the inner wait and the except body reaches us later, so
-                    # the release can land in between. Then holds is already 0 and the
-                    # gate is already open, and reading holds alone says "nobody is
-                    # coming back" about a join that just succeeded. Re-waiting is
-                    # free — an open gate returns immediately and breaks.
+                    # A hold means a command is mid-join: tearing down would pop this
+                    # player from mps while it still drives it. Every hold is released
+                    # by an `async with`, raise or not.
+                    # The gate check is NOT redundant — this handler runs a tick after
+                    # the timer fires, so a release can land in between and leave holds
+                    # 0 with the gate already open. Re-waiting is free.
                     continue
                 log.info(
                     f"Playback gate timed out for guild {self._guild.id} "
