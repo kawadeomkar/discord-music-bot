@@ -460,7 +460,7 @@ class TestDebugFooterOnTheBoard:
     async def test_the_command_decorates_when_the_guild_enabled_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        music_bot._debug_overrides[mocked(mock_ctx.guild).id] = True
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
         mocked(mock_ctx.guild).shard_id = 2
         _ping_message(mock_ctx)
         with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
@@ -473,7 +473,7 @@ class TestDebugFooterOnTheBoard:
     ) -> None:
         """The driver only edits when the render differs, so changing the snapshot
         mid-flight must not reach an in-progress board's footer."""
-        music_bot._debug_overrides[mocked(mock_ctx.guild).id] = True
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
         message = _ping_message(mock_ctx)
         gate: asyncio.Event = asyncio.Event()
 
@@ -491,7 +491,7 @@ class TestDebugFooterOnTheBoard:
             await _until(lambda: mock_ctx.channel.send.await_args is not None)
             first = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
             # A live sampler tick between the skeleton and the final edit.
-            music_bot._runtime_sampler._snapshot = RuntimeSnapshot(
+            music_bot.debug_settings._sampler._snapshot = RuntimeSnapshot(
                 cpu_percent=99.0, mem_percent=1.0, lag_ms=1.0, tasks=1, pool_workers=1
             )
             gate.set()

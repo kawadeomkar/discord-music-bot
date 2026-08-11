@@ -18,10 +18,8 @@ from discord.ext import commands
 import redis.asyncio as aioredis
 
 from src.config import (
-    ENVIRONMENT,
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
-    debug_mode_default,
     debug_prometheus_url,
     history_archive_enabled,
     spotify_enabled,
@@ -40,7 +38,6 @@ from src.redis_client import (
     GuildRedisStore,
     cache_get,
     cache_set,
-    read_guild_configs,
 )
 from src.sources import (
     SoundcloudSource,
@@ -333,41 +330,13 @@ class MusicBot(commands.Cog):
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
-        # Debug mode. The env var is read ONCE, here, which is what makes a garbage
-        # value abort startup inside load_extension rather than surfacing later from
-        # somewhere that swallows it. Overrides are per guild — an ungated toggle's
-        # blast radius must stay inside the guild that typed it — and DURABLE: the
-        # choice lives in guild:{id}:config and outlives restarts, so this dict is a
-        # read cache hydrated from Redis, not the record itself. A guild that never
-        # chose is absent from it and follows _debug_default, and keeps following it
-        # when the operator changes the env var.
-        self._debug_default: bool = debug_mode_default()
-        self._debug_overrides: dict[int, bool] = {}
-        # Monotonic stamp bumped by every explicit toggle, plus the value it had when
-        # each guild was last toggled. _load_debug_overrides reads Redis and applies
-        # the result across an await; these let it tell whether a guild changed under
-        # it in that window and leave the newer value alone. One int per guild that
-        # has ever toggled, pruned alongside the override on guild removal.
-        self._debug_toggle_seq: int = 0
-        self._debug_toggled_at: dict[int, int] = {}
-        # Guilds whose cached value did NOT reach Redis, so -debug can report
-        # "this session only" rather than the durability the toggle already warned
-        # did not happen. Cleared as soon as a write or a hydration proves the
-        # durable copy agrees.
-        self._debug_unpersisted: set[int] = set()
-        # One sampler per cog, never module state: a module global outlives a cog
-        # reload and would leak its task. cog_load is what starts it (see
-        # RuntimeSampler.apply for why load, not only toggles).
-        self._runtime_sampler = debug_mode.RuntimeSampler()
-        if self._debug_default and ENVIRONMENT == "production":
-            # Debug modes announce themselves in production; the convention is
-            # Flask's and Django's. Observation-only, so this is an advisory, not
-            # a refusal — but a production deployment should have chosen it.
-            log.warning(
-                "DEBUG_MODE is on in production: every command response will "
-                "carry a debug footer (trace id, timings, runtime metrics). "
-                "Nothing about playback changes. Unset DEBUG_MODE to turn it off."
-            )
+        # Debug mode: the durable per-guild choice, its read cache and the runtime
+        # sampler, all owned by DebugSettings (src/debug.py). Built here and never
+        # module state — a module global outlives a cog reload and leaks its task.
+        # MusicContext.send and MusicPlayer read this attribute directly. NOT named
+        # `debug`: MusicBot.debug is the -debug command, and an instance attribute of
+        # that name shadows it.
+        self.debug_settings = debug_mode.DebugSettings()
 
     async def cog_load(self) -> None:
         """Kick off Spotify credential validation without blocking startup.
@@ -375,9 +344,9 @@ class MusicBot(commands.Cog):
         anything awaited here delays it. The probe is a live network call, spawned
         fire-and-forget; _spotify_status stays optimistically enabled meanwhile."""
         # At load, not only on toggles — RuntimeSampler.apply's docstring has the
-        # reason. _load_debug_overrides re-syncs it once the stored choices land.
-        self._sync_runtime_sampler()
-        spawn_background(self._load_debug_overrides(), self._restore_tasks)
+        # reason. The hydration re-syncs it once the stored choices land.
+        self.debug_settings.sync_sampler()
+        spawn_background(self._hydrate_debug(), self._restore_tasks)
         if self.spotify is None:
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
@@ -387,12 +356,12 @@ class MusicBot(commands.Cog):
         would drip /proc reads for the life of the process. The shared Prometheus
         session goes with it, or a reload leaks a connector per load.
 
-        The background tasks go FIRST: _load_debug_overrides ends in
-        _sync_runtime_sampler, so one still in flight would restart the sampler
-        straight after aclose() and leak it, holding a dead cog alive.
+        The background tasks go FIRST: the hydration ends in sync_sampler, so one
+        still in flight would restart the sampler straight after aclose() and leak
+        it, holding a dead cog alive.
         """
         await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
-        await self._runtime_sampler.aclose()
+        await self.debug_settings.aclose()
         await debug_mode.close_prometheus_session()
 
     async def _validate_spotify_credentials(self) -> None:
@@ -1841,123 +1810,25 @@ class MusicBot(commands.Cog):
             await self._command_error(ctx, e)
 
     # ── Debug mode ────────────────────────────────────────────────────────────
-
-    def debug_enabled(self, guild_id: Optional[int]) -> bool:
-        """Whether debug mode is on for this guild — the one query surface for it.
-
-        DEBUG_MODE is the default every guild starts from: set it and all of them
-        are on unless they opted out; leave it false or unset and each guild turns
-        itself on with `-debug --enable`. A guild with no stored choice (and every
-        DM, which has no guild to scope one to) follows that default.
-
-        SYNCHRONOUS and in-memory on purpose: MusicContext.send calls this on every
-        reply, so a Redis round trip here would put the persistence layer on the hot
-        path of every command. Redis is the durable copy; `_debug_overrides` is the
-        read cache, hydrated at cog_load and on_ready and written through by the
-        toggle.
-        """
-        if guild_id is None:
-            return self._debug_default
-        return self._debug_overrides.get(guild_id, self._debug_default)
+    # The state machine is DebugSettings (src/debug.py); what stays here is the
+    # command surface and the permission policy around the toggle.
 
     def _debug_suffix(
         self, ctx: commands.Context, *, host_metrics: bool = True
     ) -> Optional[str]:
-        """Debug mode's footer for the two live dashboards, which neither decoration
-        seam reaches. Rendered once per invocation; no elapsed-ms, since every
-        segment must be constant across the loop (see run_health_dashboard).
-        `host_metrics=False` drops the runtime segment — -debug passes the caller's
-        operator status, matching the Runtime block it withholds from a non-owner.
-        None while the guild has debug mode off.
-        """
-        guild = ctx.guild
-        if not self.debug_enabled(guild.id if guild else None):
-            return None
-        return (
-            debug_mode.debug_footer(
-                shard_id=guild.shard_id if guild else None,
-                runtime=self.runtime_snapshot if host_metrics else None,
-                # Both cards already print `trace: <id>` themselves, and the same id
-                # twice reads as two traces. Inert while no span is passed; kept so
-                # adding one later cannot silently double it.
-                skip_trace=True,
-            )
-            or None
-        )
+        """The dashboards' debug footer, for a ctx rather than a guild."""
+        return self.debug_settings.footer(ctx.guild, host_metrics=host_metrics)
 
-    async def _load_debug_overrides(self) -> None:
-        """Hydrate the in-memory cache from each guild's stored config.
-
-        Runs at cog_load and again on every on_ready — reconnects included, and
-        on_ready re-fires on every session loss, not once per process. Two skip rules
-        make replaying it safe, and both are load-bearing:
-
-        A guild whose config could not be READ is skipped entirely. read_guild_configs
-        omits it rather than handing back a zero value, because "Redis blinked" and
-        "this guild never chose" must not be the same answer here — treating them
-        alike made one failed read DELETE a correct stored choice and revert that
-        guild to the host default for the rest of the process. This is the discipline
-        _restore_guild already applies to a failed get_recovery_gate.
-
-        A guild toggled while this pass was reading is skipped too. The read and the
-        apply straddle an await, so a `-debug --enable` landing between them would
-        otherwise be overwritten by the value that was true before the user ran it:
-        they are told "saved for this server", Redis agrees, and the footer never
-        appears until the next session loss.
-        """
-        if self.redis is None:
-            return
-        guilds = list(self.bot.guilds)
-        if not guilds:
-            return
-        started = self._debug_toggle_seq
-        configs = await read_guild_configs(self.redis, [g.id for g in guilds])
-        for guild in guilds:
-            config = configs.get(guild.id)
-            if config is None or self._debug_toggled_at.get(guild.id, 0) > started:
-                continue
-            if config.debug_mode is None:
-                # No stored choice: follow the host default, and do NOT cache that
-                # — caching it would freeze the guild against a later env change.
-                self._debug_overrides.pop(guild.id, None)
-            else:
-                self._debug_overrides[guild.id] = config.debug_mode
-                # Read back from Redis, so the durable copy is the source.
-                self._debug_unpersisted.discard(guild.id)
-        self._sync_runtime_sampler()
-
-    @property
-    def runtime_snapshot(self) -> Optional["debug_mode.RuntimeSnapshot"]:
-        """The rolling runtime metrics the debug footer prints, or None before the
-        sampler's first tick. Read by MusicContext.send."""
-        return self._runtime_sampler.snapshot
-
-    def _sync_runtime_sampler(self) -> None:
-        """Run the sampler exactly while some guild is effectively debug-enabled."""
-        self._runtime_sampler.apply(
-            wanted=self._debug_default or any(self._debug_overrides.values())
-        )
+    async def _hydrate_debug(self) -> None:
+        """Feed DebugSettings.hydrate this bot's redis handle and guild list. Both
+        cog_load and on_ready spawn it: bot.guilds is empty until READY, so
+        cog_load's pass covers an extension reload and on_ready's a cold start."""
+        await self.debug_settings.hydrate(self.redis, self.bot.guilds)
 
     @commands.Cog.listener()
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        """Forget a departed guild's debug override.
-
-        One bool per guild, so this is hygiene rather than a leak — but the override
-        is the only debug state that is NOT re-derived from the environment, so a
-        guild that removes the bot and re-adds it inside one process lifetime would
-        silently resume its old setting, which reads as the toggle ignoring them.
-        Re-syncing the sampler matters too: the last enabled guild leaving should
-        stop it, exactly as `--disable` would.
-        """
-        self._debug_toggled_at.pop(guild.id, None)
-        self._debug_unpersisted.discard(guild.id)
-        if self._debug_overrides.pop(guild.id, None) is not None:
-            self._sync_runtime_sampler()
-        # The durable copy goes too, or a guild that removes and re-adds the bot
-        # silently resumes a setting nobody there chose — and the key would sit in
-        # Redis forever, since config carries no TTL by design.
-        if self.redis is not None:
-            await GuildRedisStore(self.redis, guild.id).clear_config()
+        """Registration only — see DebugSettings.forget."""
+        await self.debug_settings.forget(self.redis, guild.id)
 
     @commands.command(
         name="debug",
@@ -2038,9 +1909,9 @@ class MusicBot(commands.Cog):
             else None
         )
         return debug_mode.DebugInputs(
-            debug_enabled=self.debug_enabled(guild_id),
-            debug_overridden=guild_id is not None and guild_id in self._debug_overrides,
-            debug_persisted=guild_id not in self._debug_unpersisted,
+            debug_enabled=self.debug_settings.enabled(guild_id),
+            debug_overridden=self.debug_settings.has_override(guild_id),
+            debug_persisted=self.debug_settings.is_persisted(guild_id),
             players=len(self.mps),
             player=self.mps.get(guild_id) if guild_id is not None else None,
             redis=self.redis,
@@ -2085,7 +1956,7 @@ class MusicBot(commands.Cog):
                 embed=notice_embed(
                     "Debug mode is set per server, so it can't be toggled from a "
                     f"direct message. It is currently "
-                    f"**{'on' if self._debug_default else 'off'}** here, following "
+                    f"**{'on' if self.debug_settings.default else 'off'}** here, following "
                     "the host's `DEBUG_MODE` default.",
                     discord.Color.orange(),
                 )
@@ -2109,30 +1980,7 @@ class MusicBot(commands.Cog):
             )
             return
         enabled = action is debug_mode.DebugAction.ENABLE
-        # Redis FIRST, cache second. The reverse would let a failed write leave the
-        # cache claiming a setting the durable copy never took, which the next
-        # on_ready would silently undo.
-        persisted = False
-        if self.redis is not None:
-            persisted = await GuildRedisStore(self.redis, ctx.guild.id).set_debug_mode(
-                enabled
-            )
-        self._debug_overrides[ctx.guild.id] = enabled
-        # Stamp this guild so a hydration pass that read BEFORE this write cannot
-        # apply its older value on top of it — see _load_debug_overrides.
-        self._debug_toggle_seq += 1
-        self._debug_toggled_at[ctx.guild.id] = self._debug_toggle_seq
-        if persisted:
-            self._debug_unpersisted.discard(ctx.guild.id)
-        else:
-            self._debug_unpersisted.add(ctx.guild.id)
-        # Re-evaluated on every toggle: the sampler runs only while some guild
-        # wants it, so the last --disable stops it.
-        self._sync_runtime_sampler()
-        log.info(
-            f"debug mode {'enabled' if enabled else 'disabled'} by command",
-            persisted=persisted,
-        )
+        persisted = await self.debug_settings.toggle(self.redis, ctx.guild.id, enabled)
         # Say which kind of change this was. A guild told "on" that quietly reverts
         # on the next restart reads as the bot ignoring them, so a degraded write is
         # named rather than rounded up to success.
@@ -2174,7 +2022,7 @@ class MusicBot(commands.Cog):
             return
         # bot.guilds is empty until READY, so cog_load's pass covers an extension
         # reload and this one covers a cold start. Both are needed.
-        spawn_background(self._load_debug_overrides(), self._restore_tasks)
+        spawn_background(self._hydrate_debug(), self._restore_tasks)
         for guild in self.bot.guilds:
             spawn_background(restore_guild(self, guild), self._restore_tasks)
 

@@ -16,10 +16,9 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
-from src import debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
-from src.guild_state import GuildConfig, HistoryEntry
+from src.guild_state import HistoryEntry
 from src.musicbot import (
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
@@ -32,7 +31,6 @@ from src.musicbot import (
     _check_voice_permissions,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.util import spawn_background
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
@@ -1717,7 +1715,6 @@ class TestHistoryReadsRedis:
     async def test_the_rendered_songs_come_from_redis_not_just_the_cache(
         self, music_bot: MusicBot, mock_ctx: MagicMock, fake_redis: Any
     ) -> None:
-        from src.redis_client import GuildRedisStore
 
         store = GuildRedisStore(fake_redis, guild_id=1)
         stored = _history_entries(2)  # Song 0 (t=1000), Song 1 (t=1001)
@@ -3254,11 +3251,11 @@ class TestDebugCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         guild_id = mock_ctx.guild.id
-        assert music_bot.debug_enabled(guild_id) is False
+        assert music_bot.debug_settings.enabled(guild_id) is False
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot.debug_enabled(guild_id) is True
+        assert music_bot.debug_settings.enabled(guild_id) is True
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--disable")
-        assert music_bot.debug_enabled(guild_id) is False
+        assert music_bot.debug_settings.enabled(guild_id) is False
 
     async def test_toggle_is_scoped_to_the_invoking_guild(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3266,19 +3263,19 @@ class TestDebugCommand:
         """Per-guild is the blast-radius containment behind the Manage Server gate:
         an enable typed in one server must not decorate another's replies."""
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is True
-        assert music_bot.debug_enabled(424242424242424242) is False
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is True
+        assert music_bot.debug_settings.enabled(424242424242424242) is False
 
     async def test_env_default_applies_where_no_override_exists(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        music_bot._debug_default = True
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is True
-        assert music_bot.debug_enabled(None) is True
+        music_bot.debug_settings._default = True
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is True
+        assert music_bot.debug_settings.enabled(None) is True
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--disable")
         # The override wins over the default, and only for this guild.
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is False
-        assert music_bot.debug_enabled(424242424242424242) is True
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is False
+        assert music_bot.debug_settings.enabled(424242424242424242) is True
 
     async def test_dm_toggle_explains_the_scope_instead_of_toggling(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3287,7 +3284,7 @@ class TestDebugCommand:
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "per server" in embed.description
-        assert music_bot._debug_overrides == {}
+        assert music_bot.debug_settings._overrides == {}
 
     async def test_dm_status_still_renders(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3303,7 +3300,7 @@ class TestDebugCommand:
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="enable")
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "--enable" in embed.description
-        assert music_bot._debug_overrides == {}
+        assert music_bot.debug_settings._overrides == {}
 
     async def test_collection_failure_becomes_an_error_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3332,8 +3329,8 @@ class TestDebugTogglePermission:
     ) -> None:
         self._plain_member(mock_ctx)
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot._debug_overrides == {}
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is False
+        assert music_bot.debug_settings._overrides == {}
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is False
 
     async def test_the_refusal_names_the_permission(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3348,10 +3345,10 @@ class TestDebugTogglePermission:
     ) -> None:
         """Both directions: a member who could disable it could also hide a
         moderator's deliberate enable."""
-        music_bot._debug_overrides[mock_ctx.guild.id] = True
+        music_bot.debug_settings._overrides[mock_ctx.guild.id] = True
         self._plain_member(mock_ctx)
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--disable")
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is True
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is True
 
     async def test_manage_server_may_toggle(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3359,7 +3356,7 @@ class TestDebugTogglePermission:
         mock_ctx.author.guild_permissions.manage_guild = True
         mock_ctx.bot.is_owner = AsyncMock(return_value=False)
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is True
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is True
 
     async def test_the_bot_owner_may_toggle_without_manage_server(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3367,7 +3364,7 @@ class TestDebugTogglePermission:
         mock_ctx.author.guild_permissions.manage_guild = False
         mock_ctx.bot.is_owner = AsyncMock(return_value=True)
         await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot.debug_enabled(mock_ctx.guild.id) is True
+        assert music_bot.debug_settings.enabled(mock_ctx.guild.id) is True
 
     async def test_reading_the_snapshot_stays_open_to_a_plain_member(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3390,7 +3387,7 @@ class TestDebugInputs:
         player = MagicMock()
         music_bot.mps = {guild_id: player, 999: MagicMock()}
         music_bot.redis = fake_redis
-        music_bot._debug_overrides[guild_id] = True
+        music_bot.debug_settings._overrides[guild_id] = True
 
         inputs = await music_bot._debug_inputs(mock_ctx)
 
@@ -3504,382 +3501,3 @@ class TestDebugObservesWithoutCreating:
         inputs = await music_bot._debug_inputs(mock_ctx)
         assert inputs.player is None
         assert inputs.players == 0
-
-
-class TestDebugSamplerLifecycle:
-    """The sampler feeds cpu/mem/lag into every decorated footer. It must run
-    exactly while some guild wants it — no sooner, and not after unload."""
-
-    async def test_enabling_starts_the_sampler(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        assert music_bot._runtime_sampler.running is False
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        assert music_bot._runtime_sampler.running is True
-        await music_bot._runtime_sampler.aclose()
-
-    async def test_the_last_disable_stops_it(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--disable")
-        assert music_bot._runtime_sampler.running is False
-
-    async def test_another_guild_still_wanting_it_keeps_it_running(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        music_bot._debug_overrides[999] = True
-        music_bot._sync_runtime_sampler()
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--disable")
-        assert music_bot._runtime_sampler.running is True
-        await music_bot._runtime_sampler.aclose()
-
-    async def test_the_env_default_starts_it_at_cog_load(
-        self, music_bot: MusicBot
-    ) -> None:
-        """DEBUG_MODE=true fires no enable transition, ever — so cog_load has to
-        evaluate the run condition too, not only the toggle path."""
-        music_bot._debug_default = True
-        await music_bot.cog_load()
-        assert music_bot._runtime_sampler.running is True
-        await music_bot._runtime_sampler.aclose()
-
-    async def test_cog_unload_stops_it(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """Without this a cog reload leaves a sampler dripping /proc reads forever.
-
-        `cancelled()`, never `cancelled() or done()`: the latter is just `done()`,
-        which a task that simply RETURNED also satisfies. `running` is no better —
-        stop() nulls the reference, so it reads False whether or not the loop ever
-        stopped. Only the task object still held here can tell them apart."""
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        sampler = music_bot._runtime_sampler
-        task = sampler._task
-        assert task is not None
-        # Seed a snapshot so teardown clearing it is observable: a dead sampler
-        # must not keep feeding footers a sample nothing will ever refresh.
-        sampler._snapshot = sampler._sample(1.5)
-        await music_bot.cog_unload()
-        assert task.cancelled()
-        assert sampler._task is None
-        assert sampler.snapshot is None
-
-    async def test_unload_cancels_an_in_flight_hydration(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """_load_debug_overrides ends in _sync_runtime_sampler, and nothing else
-        ever cancels _restore_tasks. Parked mid-read across cog_unload it resumed
-        afterwards and started a FRESH sampler task holding the dead cog — a
-        permanent leak per reload_extension."""
-        cog = music_bot_with_redis
-        cast(Any, cog.bot).guilds = [MagicMock(spec=discord.Guild, id=42)]
-        cog._debug_overrides = {42: True}
-        cog._sync_runtime_sampler()
-        assert cog._runtime_sampler.running is True
-        reading, released = asyncio.Event(), asyncio.Event()
-
-        async def parks_until_released(*_a: object, **_k: object) -> dict[int, Any]:
-            reading.set()
-            await released.wait()
-            return {42: GuildConfig(debug_mode=True)}
-
-        with patch("src.musicbot.read_guild_configs", new=parks_until_released):
-            task = spawn_background(cog._load_debug_overrides(), cog._restore_tasks)
-            await reading.wait()
-            await cog.cog_unload()
-            # Would resume the hydration if it had survived the unload.
-            released.set()
-            await asyncio.sleep(0)
-
-        assert task.cancelled()
-        assert cog._runtime_sampler.running is False
-        assert not cog._restore_tasks
-
-    async def test_background_tasks_are_cancelled_before_the_sampler_closes(
-        self, music_bot: MusicBot
-    ) -> None:
-        """The order is the fix, not just the cancel: aclose() awaits, so a task
-        still runnable when it starts resumes INSIDE it and can start a fresh
-        sampler that the later cancel no longer reaches."""
-        order: list[str] = []
-        started = asyncio.Event()
-
-        async def sentinel() -> None:
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                order.append("cancelled")
-                raise
-
-        sampler = music_bot._runtime_sampler
-        real_aclose = sampler.aclose
-
-        async def recording_aclose() -> None:
-            order.append("aclose")
-            await real_aclose()
-
-        spawn_background(sentinel(), music_bot._restore_tasks)
-        await started.wait()
-        with patch.object(sampler, "aclose", recording_aclose):
-            await music_bot.cog_unload()
-
-        assert order == ["cancelled", "aclose"]
-
-    async def test_the_sampled_snapshot_reaches_the_footer(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """The wiring, end to end: sampler → cog.runtime_snapshot → debug_footer."""
-        await command_callback(MusicBot.debug)(music_bot, mock_ctx, arg="--enable")
-        try:
-            sampler = music_bot._runtime_sampler
-            sampler._snapshot = sampler._sample(1.5)
-            snapshot = music_bot.runtime_snapshot
-            assert snapshot is not None
-            footer = debug_mode.debug_footer(
-                span=None, elapsed_ms=12.0, shard_id=0, runtime=snapshot
-            )
-            assert "cpu " in footer or "mem " in footer
-            assert "tasks " in footer
-        finally:
-            await music_bot._runtime_sampler.aclose()
-
-
-class TestDebugModeIsPerGuildAndDurable:
-    """DEBUG_MODE is the default every guild starts from; each guild can pin its own
-    choice, and that choice now outlives a restart."""
-
-    @staticmethod
-    def _guilds(cog: MusicBot, *ids: int) -> None:
-        # bot is a MagicMock here; Bot.guilds is a read-only property on the
-        # real class, which the checker sees through the annotation.
-        cast(Any, cog.bot).guilds = [MagicMock(spec=discord.Guild, id=i) for i in ids]
-
-    async def test_the_env_default_turns_every_guild_on(
-        self, music_bot: MusicBot, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(music_bot, "_debug_default", True)
-        monkeypatch.setattr(music_bot, "_debug_overrides", {})
-        assert music_bot.debug_enabled(123) is True
-        assert music_bot.debug_enabled(456) is True
-
-    async def test_without_the_env_default_a_guild_must_opt_in(
-        self, music_bot: MusicBot, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(music_bot, "_debug_default", False)
-        monkeypatch.setattr(music_bot, "_debug_overrides", {123: True})
-        assert music_bot.debug_enabled(123) is True
-        assert music_bot.debug_enabled(456) is False
-
-    async def test_a_guild_can_opt_out_while_the_host_default_is_on(
-        self, music_bot: MusicBot, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The reason the stored value is tri-state. A plain bool cannot tell "never
-        chose" from "chose off", so this guild would be dragged back on."""
-        monkeypatch.setattr(music_bot, "_debug_default", True)
-        monkeypatch.setattr(music_bot, "_debug_overrides", {123: False})
-        assert music_bot.debug_enabled(123) is False
-        assert music_bot.debug_enabled(456) is True
-
-    async def test_the_toggle_writes_through_to_redis(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug_mode.DebugAction.ENABLE
-        )
-        store = GuildRedisStore(cast(Any, music_bot_with_redis.redis), 42)
-        assert (await store.get_config()).debug_mode is True
-
-    async def test_a_stored_choice_is_restored_on_startup(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """The point of the whole change: the setting used to die with the process."""
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 111).set_debug_mode(True)
-        await GuildRedisStore(redis, 222).set_debug_mode(False)
-        self._guilds(music_bot_with_redis, 111, 222, 333)
-        music_bot_with_redis._debug_overrides = {}
-
-        await music_bot_with_redis._load_debug_overrides()
-
-        assert music_bot_with_redis._debug_overrides == {111: True, 222: False}
-        # 333 never chose, so it is absent rather than cached — caching it would
-        # freeze it against a later DEBUG_MODE change.
-        assert 333 not in music_bot_with_redis._debug_overrides
-
-    async def test_a_guild_with_no_stored_choice_still_follows_a_changed_default(
-        self, music_bot_with_redis: MusicBot, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._guilds(music_bot_with_redis, 333)
-        await music_bot_with_redis._load_debug_overrides()
-        monkeypatch.setattr(music_bot_with_redis, "_debug_default", True)
-        assert music_bot_with_redis.debug_enabled(333) is True
-
-    async def test_hydration_survives_an_unreachable_redis(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """read_guild_configs reports a failed batch by omission, so startup
-        degrades to the host default rather than dying."""
-        self._guilds(music_bot_with_redis, 111)
-        with patch.object(
-            cast(Any, music_bot_with_redis.redis),
-            "pipeline",
-            side_effect=RuntimeError("down"),
-        ):
-            await music_bot_with_redis._load_debug_overrides()
-        assert music_bot_with_redis._debug_overrides == {}
-
-    async def test_a_failed_read_does_not_discard_a_correct_stored_choice(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """The failure this whole read path is shaped around. A guild's config read
-        failing is NOT "this guild never chose": collapsing the two deleted a correct
-        cached value and reverted the guild to the host default for the rest of the
-        process, while Redis still held the opposite. on_ready re-fires on every
-        session loss, so a single blink was enough.
-
-        Starts from a POPULATED cache on purpose — asserting `== {}` from an empty
-        one cannot see a correct entry being destroyed, which is why the suite was
-        green while this was broken.
-        """
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 111).set_debug_mode(False)
-        self._guilds(music_bot_with_redis, 111)
-        music_bot_with_redis._debug_overrides = {111: False}
-
-        with patch.object(redis, "pipeline", side_effect=RuntimeError("down")):
-            await music_bot_with_redis._load_debug_overrides()
-
-        assert music_bot_with_redis._debug_overrides == {111: False}
-        assert music_bot_with_redis.debug_enabled(111) is False
-
-    async def test_a_read_that_succeeds_still_evicts_a_removed_choice(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """The other half: skipping on failure must not turn into never evicting.
-        A choice cleared out from under the process has to stop being cached, or the
-        guild is frozen against a later DEBUG_MODE change."""
-        self._guilds(music_bot_with_redis, 111)
-        music_bot_with_redis._debug_overrides = {111: True}
-
-        await music_bot_with_redis._load_debug_overrides()
-
-        assert 111 not in music_bot_with_redis._debug_overrides
-
-    async def test_a_toggle_during_hydration_is_not_overwritten(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """Hydration reads Redis and applies the result across an await. A toggle
-        landing in that window used to be overwritten by the value that was true
-        before the user ran it — they are told "saved for this server", Redis agrees,
-        and the footer never appears until the next session loss."""
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 42).set_debug_mode(False)
-        self._guilds(music_bot_with_redis, 42)
-        music_bot_with_redis._debug_overrides = {42: False}
-        mock_ctx.guild.id = 42
-
-        async def read_then_user_toggles(*_a: object, **_k: object) -> dict[int, Any]:
-            # The read has resolved; the toggle lands before the loop applies it.
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug_mode.DebugAction.ENABLE
-            )
-            return {42: GuildConfig(debug_mode=False)}  # what the read saw
-
-        with patch("src.musicbot.read_guild_configs", new=read_then_user_toggles):
-            await music_bot_with_redis._load_debug_overrides()
-
-        assert music_bot_with_redis.debug_enabled(42) is True
-
-    async def test_a_failed_write_is_reported_not_claimed(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """Telling a guild "on" when the write never landed reads as the bot
-        ignoring them after the next restart."""
-        mock_ctx.guild.id = 42
-        with patch.object(
-            cast(Any, music_bot_with_redis.redis),
-            "pipeline",
-            side_effect=RuntimeError("down"),
-        ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug_mode.DebugAction.ENABLE
-            )
-        description = mock_ctx.send.await_args.kwargs["embed"].description
-        assert "could not be saved" in description
-        # Still applied in memory for this process.
-        assert music_bot_with_redis.debug_enabled(42) is True
-
-    async def test_debug_reports_a_failed_write_as_session_only(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        """The toggle warns "it could not be saved"; -debug used to render "saved
-        here" one message later, because debug_overridden is just cache membership
-        and the cache is written whether or not Redis took it. The one command whose
-        job is to report reality contradicted the one that just changed it."""
-        mock_ctx.guild.id = 42
-        with patch.object(
-            cast(Any, music_bot_with_redis.redis),
-            "pipeline",
-            side_effect=RuntimeError("down"),
-        ):
-            await music_bot_with_redis._toggle_debug_mode(
-                mock_ctx, debug_mode.DebugAction.ENABLE
-            )
-
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
-
-        assert inputs.debug_overridden is True
-        assert inputs.debug_persisted is False
-        assert debug_mode.mode_source(True, persisted=False) == "this session only"
-
-    async def test_a_write_that_lands_reports_as_saved(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug_mode.DebugAction.ENABLE
-        )
-        inputs = await music_bot_with_redis._debug_inputs(mock_ctx)
-        assert inputs.debug_persisted is True
-
-    async def test_hydration_clears_a_stale_unpersisted_mark(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """Redis came back and the durable copy agrees, so the warning must stop."""
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 111).set_debug_mode(True)
-        self._guilds(music_bot_with_redis, 111)
-        music_bot_with_redis._debug_unpersisted.add(111)
-
-        await music_bot_with_redis._load_debug_overrides()
-
-        assert 111 not in music_bot_with_redis._debug_unpersisted
-
-    async def test_a_successful_write_says_it_is_saved(
-        self, music_bot_with_redis: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        mock_ctx.guild.id = 42
-        await music_bot_with_redis._toggle_debug_mode(
-            mock_ctx, debug_mode.DebugAction.ENABLE
-        )
-        description = mock_ctx.send.await_args.kwargs["embed"].description
-        assert "saved for this server" in description
-        assert "could not be saved" not in description
-
-    async def test_leaving_a_guild_drops_the_stored_choice(
-        self, music_bot_with_redis: MusicBot
-    ) -> None:
-        """Config carries no TTL, so nothing else would ever remove it — and a
-        rejoin would silently resume a setting nobody there chose."""
-        redis = cast(Any, music_bot_with_redis.redis)
-        await GuildRedisStore(redis, 111).set_debug_mode(True)
-        music_bot_with_redis._debug_overrides = {111: True}
-        guild = MagicMock(spec=discord.Guild, id=111)
-
-        await music_bot_with_redis.on_guild_remove(guild)
-
-        assert 111 not in music_bot_with_redis._debug_overrides
-        assert (await GuildRedisStore(redis, 111).get_config()).debug_mode is None

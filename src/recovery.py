@@ -112,12 +112,12 @@ async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
                     discord.Color.orange(),
                 )
                 # No player exists on this path, so the cog decorates directly.
-                if cog.debug_enabled(guild.id):
+                if cog.debug_settings.enabled(guild.id):
                     debug_mode.decorate_embeds(
                         [notice],
                         span=trace.get_current_span(),
                         shard_id=guild.shard_id,
-                        runtime=cog.runtime_snapshot,
+                        runtime=cog.debug_settings.snapshot,
                     )
                 try:
                     await notify_channel.send(embed=notice)
