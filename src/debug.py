@@ -1850,8 +1850,7 @@ class DebugSettings:
     DEBUG_MODE is the default every guild starts from: set it and all of them are
     on unless they opted out; leave it false or unset and each guild turns itself
     on with `-debug --enable`. The durable copy lives in guild:{id}:config; this
-    holds the read cache. One instance per cog, built in MusicBot.__init__ —
-    never module state, which would outlive a cog reload and leak the sampler.
+    holds the read cache. One instance per cog, built in MusicBot.__init__.
     """
 
     __slots__ = (

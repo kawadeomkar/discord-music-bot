@@ -331,11 +331,9 @@ class MusicBot(commands.Cog):
         self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
         # Debug mode: the durable per-guild choice, its read cache and the runtime
-        # sampler, all owned by DebugSettings (src/debug.py). Built here and never
-        # module state — a module global outlives a cog reload and leaks its task.
-        # MusicContext.send and MusicPlayer read this attribute directly. NOT named
-        # `debug`: MusicBot.debug is the -debug command, and an instance attribute of
-        # that name shadows it.
+        # sampler, all owned by DebugSettings (src/debug.py). MusicContext.send and
+        # MusicPlayer read this attribute directly. Named debug_settings, not debug:
+        # MusicBot.debug is the -debug command and an attribute would shadow it.
         self.debug_settings = debug_mode.DebugSettings()
 
     async def cog_load(self) -> None:
