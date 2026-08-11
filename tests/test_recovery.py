@@ -6,6 +6,7 @@ restore_guild reads; the split follows test_leaderboard.py, where the new file
 owns both the extracted module and the cog surface that reaches it.
 """
 
+import asyncio
 from typing import Any, Optional
 from collections.abc import Coroutine
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,7 +20,7 @@ from redis.asyncio import Redis
 from src.musicbot import MusicBot
 from src.recovery import restore_guild
 from src.redis_client import GuildRedisStore
-from tests.helpers import stub_create_task
+from tests.helpers import make_mock_task, mocked, stub_create_task
 
 
 class TestEagerRestore:
@@ -378,3 +379,365 @@ class TestRestoreGuildChannelDeleted:
         )
 
         await restore_guild(music_bot_with_redis, mock_guild)  # must not raise
+
+
+class TestVoiceStateConsistency:
+    @staticmethod
+    def _wire_bot_user(cog: MusicBot) -> None:
+        mock_user = MagicMock()
+        mock_user.id = 999999999999999999
+        mocked(cog.bot).user = mock_user
+
+    async def test_bot_disconnect_triggers_cleanup(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """on_voice_state_update cleans up when the bot itself leaves a channel."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        mp = MagicMock()
+        mp.store = None
+        mp._prefetch_task = None
+        mp._restore_task = None
+        mp._player = None
+        music_bot_with_redis.mps[mock_guild.id] = mp
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = MagicMock()  # was in a channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = None  # now disconnected
+
+        mock_guild.voice_client = None
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+        mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_bot_moved_cancels_stale_alone_timer(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Bot moved to a new channel (not ejected) cancels any running alone-timer."""
+        self._wire_bot_user(music_bot_with_redis)
+
+        timer = make_mock_task()
+        music_bot_with_redis.voice_watchdog._timers[mock_guild.id] = timer
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 999999999999999999
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = MagicMock()
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = MagicMock()  # moved to a new channel, not ejected
+
+        with patch.object(music_bot_with_redis, "cleanup", new=AsyncMock()):
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        timer.cancel.assert_called_once()
+        assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
+
+    async def test_member_in_inactive_guild_ignored(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Non-bot member event in a guild where the bot has no active player is a noop."""
+        self._wire_bot_user(music_bot_with_redis)
+        # mps is empty — guild is not active
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = MagicMock()
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = None
+
+        with patch.object(
+            music_bot_with_redis, "cleanup", new=AsyncMock()
+        ) as mock_cleanup:
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+        mock_cleanup.assert_not_called()
+
+    async def test_last_human_leaves_starts_alone_timer(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """When the last human leaves the bot's channel, an alone-timer is started."""
+        self._wire_bot_user(music_bot_with_redis)
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]  # only the bot remains
+        mock_guild.voice_client = vc
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.bot = False
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = vc.channel
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = None
+
+        task_created = []
+
+        def _capture_and_close(coro: Coroutine[Any, Any, Any]) -> MagicMock:
+            task_created.append(True)
+            coro.close()  # prevent "coroutine was never awaited" ResourceWarning
+            return MagicMock(spec=asyncio.Task)
+
+        with patch("asyncio.create_task", side_effect=_capture_and_close):
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        assert mock_guild.id in music_bot_with_redis.voice_watchdog._timers
+        assert len(task_created) == 1
+
+    async def test_human_rejoins_cancels_alone_timer(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """When a human joins the bot's channel while a timer is running, the timer is cancelled."""
+        self._wire_bot_user(music_bot_with_redis)
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        timer = make_mock_task()
+        music_bot_with_redis.voice_watchdog._timers[mock_guild.id] = timer
+
+        human = MagicMock(spec=discord.Member)
+        human.bot = False
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [human]  # a human is now present
+        mock_guild.voice_client = vc
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.bot = False
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = None
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = vc.channel  # user joined the bot's channel
+
+        await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        timer.cancel.assert_called_once()
+        assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
+
+    async def test_two_rapid_leaves_produce_one_timer(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Two members leaving in quick succession cancels the first timer and starts one new one."""
+        self._wire_bot_user(music_bot_with_redis)
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = [bot_member]
+        mock_guild.voice_client = vc
+
+        tasks_created = []
+        first_task = MagicMock(spec=asyncio.Task)
+        first_task.done.return_value = False
+        first_task.cancel = MagicMock()
+
+        def _capture_and_close(coro: Coroutine[Any, Any, Any]) -> MagicMock:
+            coro.close()
+            task = MagicMock(spec=asyncio.Task)
+            task.done.return_value = False
+            task.cancel = MagicMock()
+            tasks_created.append(task)
+            return task
+
+        def _make_member() -> tuple[MagicMock, MagicMock, MagicMock]:
+            m = MagicMock(spec=discord.Member)
+            m.id = 123456789
+            m.bot = False
+            m.guild = mock_guild
+            before = MagicMock(spec=discord.VoiceState)
+            before.channel = vc.channel
+            after = MagicMock(spec=discord.VoiceState)
+            after.channel = None
+            return m, before, after
+
+        with patch("asyncio.create_task", side_effect=_capture_and_close):
+            m1, b1, a1 = _make_member()
+            await music_bot_with_redis.on_voice_state_update(m1, b1, a1)
+            m2, b2, a2 = _make_member()
+            await music_bot_with_redis.on_voice_state_update(m2, b2, a2)
+
+        assert len(tasks_created) == 2
+        tasks_created[
+            0
+        ].cancel.assert_called_once()  # first timer cancelled by second event
+        assert (
+            music_bot_with_redis.voice_watchdog._timers[mock_guild.id]
+            is tasks_created[1]
+        )
+
+    async def test_member_change_in_unrelated_channel_ignored(
+        self, music_bot_with_redis: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Member moving between two channels that aren't the bot's channel → no timer action."""
+        self._wire_bot_user(music_bot_with_redis)
+        music_bot_with_redis.mps[mock_guild.id] = MagicMock()
+
+        bot_channel = MagicMock()
+        other_channel_a = MagicMock()
+        other_channel_b = MagicMock()
+
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = bot_channel
+        mock_guild.voice_client = vc
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 123456789
+        member.bot = False
+        member.guild = mock_guild
+        before = MagicMock(spec=discord.VoiceState)
+        before.channel = other_channel_a
+        after = MagicMock(spec=discord.VoiceState)
+        after.channel = other_channel_b
+
+        with patch("asyncio.create_task") as mock_create_task:
+            await music_bot_with_redis.on_voice_state_update(member, before, after)
+
+        mock_create_task.assert_not_called()
+        assert mock_guild.id not in music_bot_with_redis.voice_watchdog._timers
+
+
+class TestAloneCountdownNotice:
+    async def test_notice_routes_through_send_with_np(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The countdown notice can fire mid-song — it must go through
+        mp.send_with_np so it can't bury the NP host message."""
+        mp = MagicMock()
+        mp.send_with_np = AsyncMock()
+        music_bot.mps[mock_guild.id] = mp
+        mock_guild.voice_client = None  # post-sleep check: nothing to disconnect
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mp.send_with_np.assert_awaited_once()
+        embed = mp.send_with_np.call_args.kwargs["embed"]
+        assert "disconnect" in embed.description
+
+
+class TestAloneCountdown:
+    def _make_vc(self, members: list[MagicMock]) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()
+        vc.channel.members = members
+        return vc
+
+    def _setup_mp(self, music_bot: MusicBot, mock_guild: MagicMock) -> MagicMock:
+        text_channel = MagicMock(spec=discord.TextChannel)
+        text_channel.send = AsyncMock()
+        mp = MagicMock()
+        mp._channel = text_channel
+        music_bot.mps[mock_guild.id] = mp
+        return text_channel
+
+    async def test_calls_cleanup_when_still_alone(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """After the sleep, if no humans remain, cleanup is called."""
+        self._setup_mp(music_bot, mock_guild)
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_skips_cleanup_when_user_rejoined(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """After the sleep, if a human is present, cleanup is not called."""
+        self._setup_mp(music_bot, mock_guild)
+
+        human = MagicMock(spec=discord.Member)
+        human.bot = False
+        mock_guild.voice_client = self._make_vc([human])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mock_cleanup.assert_not_awaited()
+
+    async def test_cancelled_before_sleep_skips_cleanup(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """CancelledError raised at sleep does not call cleanup."""
+        self._setup_mp(music_bot, mock_guild)
+
+        with patch("asyncio.sleep", new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mock_cleanup.assert_not_awaited()
+
+    async def test_send_failure_does_not_abort_countdown(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """A failed text_channel.send is swallowed; the countdown still fires cleanup."""
+        text_channel = self._setup_mp(music_bot, mock_guild)
+        text_channel.send = AsyncMock(
+            side_effect=discord.HTTPException(MagicMock(), "forbidden")
+        )
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mock_cleanup.assert_awaited_once_with(mock_guild)
+
+    async def test_skips_cleanup_when_voice_client_gone(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """If the voice client is None when the countdown wakes, cleanup is not called."""
+        self._setup_mp(music_bot, mock_guild)
+
+        mock_guild.voice_client = None  # bot already disconnected mid-sleep
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()) as mock_cleanup:
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        mock_cleanup.assert_not_awaited()
+
+    async def test_timer_removed_from_dict_on_completion(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """_alone_timers entry is removed in the finally block regardless of outcome."""
+        self._setup_mp(music_bot, mock_guild)
+        music_bot.voice_watchdog._timers[mock_guild.id] = MagicMock()  # sentinel
+
+        bot_member = MagicMock(spec=discord.Member)
+        bot_member.bot = True
+        mock_guild.voice_client = self._make_vc([bot_member])
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            with patch.object(music_bot, "cleanup", new=AsyncMock()):
+                await music_bot.voice_watchdog._countdown(mock_guild)
+
+        assert mock_guild.id not in music_bot.voice_watchdog._timers

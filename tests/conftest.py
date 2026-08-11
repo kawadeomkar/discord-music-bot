@@ -17,6 +17,7 @@ from redis.asyncio import Redis
 from src.config import SpotifyStatus
 from src.debug import RuntimeSampler
 from src.musicbot import MusicBot
+from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
 from tests.helpers import noop_ffmpeg_init, tier_enabled
@@ -379,7 +380,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     # Postgres row set their own archive (see TestPingReportsPostgres).
     cog.history_archive = None
     cog._active_spans = {}
-    cog._alone_timers = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
     # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
     # mode on, every embed grows a footer and the suite's embed assertions would be
@@ -424,7 +425,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     # AttributeError, and left a MagicMock it would fake an archive that is absent.
     cog.history_archive = None
     cog._active_spans = {}
-    cog._alone_timers = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
     # Debug state, same shape __init__ builds. The cog reads these on every send and
     # now persists them, so a fixture without them tests a bot that cannot start.

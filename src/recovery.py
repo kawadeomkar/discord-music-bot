@@ -15,6 +15,7 @@ The `guild.restore` span keeps its name, so existing Tempo queries still match;
 what moved is the OTel instrumentation SCOPE, from src.musicbot to src.recovery.
 """
 
+import asyncio
 from typing import TYPE_CHECKING, Optional
 
 import discord
@@ -164,3 +165,151 @@ async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
         log.error(f"restore_guild failed for guild {guild.id}: {e}", exc_info=True)
     finally:
         await store.release_recovery_lock()
+
+
+class VoiceWatchdog:
+    """Disconnects the bot once it is alone in a voice channel.
+
+    Owns the per-guild timer tasks rather than leaving them a dict on the cog: the
+    cancel-before-pop ordering and the current-task guard below are the whole of
+    this feature's correctness, and they belong with the state they protect.
+
+    One instance per cog, built in MusicBot.__init__.
+    """
+
+    __slots__ = ("_cog", "_timers")
+
+    def __init__(self, cog: "MusicBot") -> None:
+        self._cog = cog
+        self._timers: dict[int, asyncio.Task] = {}
+
+    def cancel(self, guild_id: int) -> None:
+        """Drop a guild's pending countdown, if any.
+
+        Never cancels the CALLING task: _countdown ends in cog.cleanup(), which
+        calls straight back here, and cancelling yourself mid-teardown raises
+        CancelledError out of cleanup and abandons the rest of it.
+        """
+        existing = self._timers.pop(guild_id, None)
+        if existing and not existing.done() and existing is not asyncio.current_task():
+            existing.cancel()
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Two cases: the bot itself disconnected/moved (full cleanup or
+        stale-timer cancellation), and a human's channel change relative to the
+        bot's (starts/cancels the alone-disconnect countdown)."""
+        cog = self._cog
+        guild = member.guild
+
+        # ── Case A: bot itself was disconnected or moved ──────────────────────
+        if cog.bot.user is not None and member.id == cog.bot.user.id:
+            if before.channel is not None and after.channel is None:
+                # Bot ejected — full cleanup.
+                if guild.id in cog.mps:
+                    with _tracer.start_as_current_span(
+                        "bot.voice_state_update",
+                        attributes={"discord.guild_id": str(guild.id)},
+                    ):
+                        log.info(
+                            f"Bot disconnected from voice in guild {guild.id}, cleaning up"
+                        )
+                        await cog.cleanup(guild)
+            elif before.channel is not None and after.channel is not None:
+                # Bot moved — cancel any stale timer counting down the old channel.
+                self.cancel(guild.id)
+            return
+
+        # ── Case B: a human member's voice state changed ──────────────────────
+        if guild.id not in cog.mps:
+            return  # bot isn't active in this guild
+
+        vc = guild.voice_client
+        if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
+            return
+
+        # Skip mute/deafen/server-deafen events — channel is unchanged.
+        if before.channel == after.channel:
+            return
+
+        # Only care about events that affect the bot's current channel.
+        if before.channel != vc.channel and after.channel != vc.channel:
+            return
+
+        human_members = [m for m in vc.channel.members if not m.bot]
+
+        if len(human_members) == 0:
+            # Bot is now alone — start (or restart) the countdown.
+            self.cancel(guild.id)
+            log.info(
+                f"Bot is alone in guild {guild.id}, starting "
+                f"{ALONE_DISCONNECT_SECS}s disconnect timer"
+            )
+            self._timers[guild.id] = asyncio.create_task(self._countdown(guild))
+        else:
+            # A human is present — cancel any running alone-timer.
+            if guild.id in self._timers:
+                log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
+            self.cancel(guild.id)
+
+    async def _countdown(self, guild: discord.Guild) -> None:
+        """Warn the guild's text channel, wait, then disconnect if the bot is
+        still alone in its voice channel. Cancelled if a human rejoins."""
+        try:
+            mp = self._cog.mps.get(guild.id)
+
+            if mp is not None:
+                # Its own short span rather than one stretched over the sleep (see
+                # below): without one current, this notice's debug footer carries no
+                # trace id.
+                with _tracer.start_as_current_span(
+                    "bot.alone_countdown.notice",
+                    attributes={"discord.guild_id": str(guild.id)},
+                ):
+                    try:
+                        # send_with_np, not a bare channel send: this can fire
+                        # mid-song and a bare send would bury the NP host message.
+                        embed = discord.Embed(
+                            title="No users remaining in voice channel",
+                            description=(
+                                f"All users have disconnected. The bot will "
+                                f"disconnect in **{ALONE_DISCONNECT_SECS} seconds** "
+                                f"unless someone rejoins."
+                            ),
+                            color=discord.Color.orange(),
+                        )
+                        await mp.send_with_np(embed=embed)
+                    except Exception as e:
+                        log.warning(
+                            f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
+                        )
+
+            await asyncio.sleep(ALONE_DISCONNECT_SECS)
+
+            # Span covers only the post-sleep decision, so it isn't open for the
+            # full countdown (which confuses OTLP exporters and leaks OTel context).
+            with _tracer.start_as_current_span(
+                "bot.alone_countdown",
+                attributes={"discord.guild_id": str(guild.id)},
+            ):
+                vc = guild.voice_client
+                if (
+                    isinstance(vc, discord.VoiceClient)
+                    and vc.channel is not None
+                    and not any(not m.bot for m in vc.channel.members)
+                ):
+                    log.info(
+                        f"Bot still alone in guild {guild.id} after "
+                        f"{ALONE_DISCONNECT_SECS}s — disconnecting"
+                    )
+                    await self._cog.cleanup(guild)
+        except asyncio.CancelledError:
+            pass  # user rejoined or explicit stop; timer was cancelled
+        except Exception as e:
+            log.error(f"alone countdown error in guild {guild.id}: {e}", exc_info=True)
+        finally:
+            self._timers.pop(guild.id, None)

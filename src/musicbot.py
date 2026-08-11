@@ -67,7 +67,7 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
 from src.ping import run_health_dashboard, send_latency_line
-from src.recovery import restore_guild
+from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
     background_typing,
@@ -331,7 +331,7 @@ class MusicBot(commands.Cog):
         self.mps: dict[int, MusicPlayer] = {}
         # id(ctx) → the in-flight command's span, otel token and start time.
         self._active_spans: dict[int, ActiveCommand] = {}
-        self._alone_timers: dict[int, asyncio.Task] = {}
+        self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
         # Debug mode. The env var is read ONCE, here, which is what makes a garbage
         # value abort startup inside load_extension rather than surfacing later from
@@ -449,10 +449,9 @@ class MusicBot(commands.Cog):
         disconnect from voice, and clear persisted connection state. Safe to
         call concurrently — only the first caller for a given guild proceeds."""
         # Cancel any pending alone-disconnect timer before the atomic gate, so it
-        # cannot fire after cleanup completes and attempt a second one.
-        existing = self._alone_timers.pop(guild.id, None)
-        if existing and not existing.done() and existing is not asyncio.current_task():
-            existing.cancel()
+        # cannot fire after cleanup completes and attempt a second one. Never
+        # cancels the caller — _countdown reaches here from inside its own task.
+        self.voice_watchdog.cancel(guild.id)
 
         # Atomic pop: only the first caller proceeds. A concurrent call (e.g.
         # on_voice_state_update firing while stop's disconnect is in flight) gets
@@ -2165,61 +2164,6 @@ class MusicBot(commands.Cog):
             )
         )
 
-    # ── Alone-channel disconnect ──────────────────────────────────────────────
-
-    async def _alone_countdown(self, guild: discord.Guild) -> None:
-        """Warn the guild's text channel, wait 10s, then disconnect if the
-        bot is still alone in its voice channel. Cancelled if a human rejoins."""
-        try:
-            mp = self.mps.get(guild.id)
-
-            if mp is not None:
-                # Its own short span rather than one stretched over the sleep (see
-                # below): without one current, this notice's debug footer carries no
-                # trace id.
-                with _tracer.start_as_current_span(
-                    "bot.alone_countdown.notice",
-                    attributes={"discord.guild_id": str(guild.id)},
-                ):
-                    try:
-                        # send_with_np, not a bare channel send: this can fire
-                        # mid-song and a bare send would bury the NP host message.
-                        embed = discord.Embed(
-                            title="No users remaining in voice channel",
-                            description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                            color=discord.Color.orange(),
-                        )
-                        await mp.send_with_np(embed=embed)
-                    except Exception as e:
-                        log.warning(
-                            f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
-                        )
-
-            await asyncio.sleep(10)
-
-            # Span covers only the post-sleep decision, so it isn't open for the
-            # full 10s (which confuses OTLP exporters and leaks OTel context).
-            with _tracer.start_as_current_span(
-                "bot.alone_countdown",
-                attributes={"discord.guild_id": str(guild.id)},
-            ):
-                vc = guild.voice_client
-                if (
-                    isinstance(vc, discord.VoiceClient)
-                    and vc.channel is not None
-                    and not any(not m.bot for m in vc.channel.members)
-                ):
-                    log.info(
-                        f"Bot still alone in guild {guild.id} after 10s — disconnecting"
-                    )
-                    await self.cleanup(guild)
-        except asyncio.CancelledError:
-            pass  # user rejoined or explicit stop; timer was cancelled
-        except Exception as e:
-            log.error(f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True)
-        finally:
-            self._alone_timers.pop(guild.id, None)
-
     # ── Restart recovery listeners ────────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -2241,64 +2185,9 @@ class MusicBot(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Two cases: the bot itself disconnected/moved (full cleanup or
-        stale-timer cancellation), and a human's channel change relative to the
-        bot's (starts/cancels the 10s alone-disconnect countdown)."""
-        guild = member.guild
-
-        # ── Case A: bot itself was disconnected or moved ──────────────────────
-        if self.bot.user is not None and member.id == self.bot.user.id:
-            if before.channel is not None and after.channel is None:
-                # Bot ejected — full cleanup.
-                if guild.id in self.mps:
-                    with _tracer.start_as_current_span(
-                        "bot.voice_state_update",
-                        attributes={"discord.guild_id": str(guild.id)},
-                    ):
-                        log.info(
-                            f"Bot disconnected from voice in guild {guild.id}, cleaning up"
-                        )
-                        await self.cleanup(guild)
-            elif before.channel is not None and after.channel is not None:
-                # Bot moved — cancel any stale timer counting down the old channel.
-                existing = self._alone_timers.pop(guild.id, None)
-                if existing and not existing.done():
-                    existing.cancel()
-            return
-
-        # ── Case B: a human member's voice state changed ──────────────────────
-        if guild.id not in self.mps:
-            return  # bot isn't active in this guild
-
-        vc = guild.voice_client
-        if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
-            return
-
-        # Skip mute/deafen/server-deafen events — channel is unchanged.
-        if before.channel == after.channel:
-            return
-
-        # Only care about events that affect the bot's current channel.
-        if before.channel != vc.channel and after.channel != vc.channel:
-            return
-
-        human_members = [m for m in vc.channel.members if not m.bot]
-
-        if len(human_members) == 0:
-            # Bot is now alone — start (or restart) the 10-second countdown.
-            existing = self._alone_timers.pop(guild.id, None)
-            if existing and not existing.done():
-                existing.cancel()
-            log.info(f"Bot is alone in guild {guild.id}, starting 10s disconnect timer")
-            self._alone_timers[guild.id] = asyncio.create_task(
-                self._alone_countdown(guild)
-            )
-        else:
-            # A human is present — cancel any running alone-timer.
-            existing = self._alone_timers.pop(guild.id, None)
-            if existing and not existing.done():
-                log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
-                existing.cancel()
+        """Registration only — the alone-disconnect state machine is
+        VoiceWatchdog (src/recovery.py)."""
+        await self.voice_watchdog.on_voice_state_update(member, before, after)
 
 
 async def setup(bot: commands.Bot) -> None:
