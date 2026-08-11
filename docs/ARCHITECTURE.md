@@ -43,6 +43,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Queue invariant](#queue-invariant)
     - [Now Playing host model](#now-playing-host-model)
+    - [Debug footer seams](#debug-footer-seams)
 16. [Design Decisions](#design-decisions)
 
 ---
@@ -279,7 +280,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | `-leaderboard` | `lb`, `top` | `[--days N]` | Top 10 listeners and top 10 songs for this server, ranked by total listening time; `--days` scopes both boards to a rolling window. Aggregated from the Postgres archive (the first production reader of it) behind a 60 s Redis cache; replies with a notice when the archive is disabled. |
 | `-volume` | `v`, `vol`, `sound` | `0–100` | Set playback volume (takes effect on next song). Persisted to Redis. |
 | `-ping` | `latency`, `l`, `delay`, `health`, `status` | — | Live-editing service-health dashboard: probes Discord, Redis, Spotify, the Postgres archive and the OTLP endpoint, and reports the bot / yt-dlp / FFmpeg versions. One in flight per guild. |
-| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing footer to every reply) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
+| `-debug` | `dbg` | `[--enable \| --disable]` | Live-editing diagnostic snapshot: what is running and how it is configured, against `-ping`'s "are my dependencies up?". Public blocks are versions and this server's player/voice state; build, configuration, runtime, storage and health checks are **bot-owner only**. `--enable`/`--disable` toggle per-guild debug mode (adds a trace/timing/runtime footer to every embed the bot sends in that guild, the live Now Playing card included) and require **Manage Server**. The choice persists to `guild:{id}:config` and outlives restarts; a guild that has never set one follows the host's `DEBUG_MODE`. Observation-only, and exempt from `cog_before_invoke`'s `get_mp()` for that reason. One in flight per guild. |
 | `-jump` | `j` | — | Stub; replies "currently in development". |
 | `-help` | `commands` | `[command]` | Man-page-styled embed help: the full command list, or detailed help for one command (`-help play`). Aliases resolve too (`-help np`). Rendered by `MusicHelpCommand` (`help.py`). |
 
@@ -1383,6 +1384,48 @@ Song end *releases* the host, leaving a completed bar as truthful history. `-sto
 *retires* it, because a bar frozen mid-song on a stopped player is misleading. A stream
 that never produced audio has its block disposed of rather than finalized, since a
 completed bar would be a false record.
+
+While a guild has debug mode on, the block carries the debug footer like every other
+embed — see [Debug footer seams](#debug-footer-seams).
+
+### Debug footer seams
+
+With debug mode on, every embed the bot sends grows a `🐞 …` footer identifying the
+request (`debug_footer()`). The trace id is what makes it useful: it is already the
+join key for every log line and span, so pasting one out of Discord finds the exact
+request in Loki/Tempo.
+
+"Every embed" is sent from three places, so three seams apply it:
+
+| Seam | Covers |
+|---|---|
+| `MusicContext.send` (main.py) | command responses — their own `embed=`/`embeds=` kwargs |
+| `MusicPlayer._decorate_for_debug` (musicplayer.py) | the NP block, applied inside `np_embed_block()`, plus the player's own notices |
+| `MusicBot._debug_suffix` (musicbot.py) | `-ping` and `-debug`, which reply via `channel.send` and then edit, so neither seam above reaches them |
+
+Rules each seam encodes:
+
+- **The block decorates at build time, not at the attach site**, so every render —
+  command attach, dedicated host, periodic tick, pause debounce, song-end finalize —
+  produces one, and the tick refreshes the metrics alongside the bar.
+- **The block carries no trace id.** It re-renders under the command span when a
+  response attaches it and under the playback span on the next tick, so a trace id
+  there would alternate on a single message. One-shot notices do carry theirs.
+- **A host's cached own embeds are never re-decorated.** Their elapsed-ms records the
+  request that sent them, so a command response that became the host before a toggle
+  keeps the footer it was sent with until a new host replaces it.
+- **The dashboard suffix is constant for the life of the invocation**, and omits
+  elapsed-ms for that reason: the live-dashboard driver only edits when the render
+  differs, so a per-tick-varying footer would edit the board until its deadline.
+- **`-debug` gates the runtime segment on `operator`.** That card withholds its
+  Runtime block from a non-owner and says so in the same embed.
+- **Decoration replaces rather than appends**, and removes a stale suffix when there
+  is nothing to show. `play_message` is built once per song, decorated in place, and
+  re-sent by `-now`, so it outlives both a re-send and a mid-song toggle.
+
+`RuntimeSampler` feeds the runtime segments on the NP tick's cadence
+(`INTERVAL_SECS`, floored at 1 s and capped at 5 s), running only while some guild is
+effectively debug-enabled.
 
 ## Design Decisions
 

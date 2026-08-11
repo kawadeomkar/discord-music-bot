@@ -37,6 +37,7 @@ from src.dashboard import run_live_dashboard
 from src.ping import bot_version, collect_versions
 from src.redis_client import GuildRedisStore, outbox_depth
 from src.util import (
+    FOOTER_LIMIT,
     cancel_task,
     fmt_duration,
     get_logger,
@@ -122,9 +123,9 @@ _OPERATOR_NOTICE = (
     "only. Run `-ping` for dependency health."
 )
 
-# Discord's hard caps on an embed field value and its footer text.
+# Discord's hard cap on an embed field value; FOOTER_LIMIT is its footer sibling,
+# imported from util.py above.
 _FIELD_LIMIT = 1024
-FOOTER_LIMIT = 2048
 
 _DEBUG_COLOR = discord.Color(0xE67E22)  # amber: an operator surface, not an alert
 
@@ -178,10 +179,9 @@ def unknown_arg_message(arg: str) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 · FOOTER DECORATION
 # ════════════════════════════════════════════════════════════════════════════
-# What debug mode actually does to ordinary traffic: every command response grows
-# a footer identifying the request. The trace id is the point — it is already the
-# join key for every log line and span, so pasting one out of Discord finds the
-# exact request in Loki/Tempo. -ping is not decorated: it bypasses this seam.
+# With debug mode on, every embed the bot sends grows a footer identifying the
+# request. Three seams apply it, one per place embeds are sent from: this one, the
+# player, and the live dashboards. See docs/ARCHITECTURE.md#debug-footer-seams.
 
 _DEBUG_MARK = "🐞"
 
@@ -220,6 +220,32 @@ def debug_footer(
     return f"{_DEBUG_MARK} " + " · ".join(parts)
 
 
+def _strip_debug_suffix(text: str) -> str:
+    """`text` with any previous debug suffix removed. The first mark is the boundary:
+    no bot-authored footer contains one, so everything from there on is ours —
+    including a doubled suffix written by the pre-idempotency code."""
+    idx = text.find(f" · {_DEBUG_MARK} ")
+    if idx != -1:
+        return text[:idx]
+    if text.startswith(f"{_DEBUG_MARK} "):
+        return ""
+    return text
+
+
+def strip_debug_footers(embeds: Sequence[discord.Embed]) -> None:
+    """Remove a previous debug suffix; what the seams call while debug mode is off.
+
+    Decoration is in place and `play_message` outlives the toggle, so a --disable
+    has to strip rather than skip. The mark check costs one substring test per embed
+    in the default configuration, where none carries a suffix.
+    """
+    for embed in embeds:
+        existing = embed.footer.text or ""
+        if _DEBUG_MARK not in existing:
+            continue
+        _write_footer(embed, _strip_debug_suffix(existing), "")
+
+
 def decorate_embeds(
     embeds: Sequence[discord.Embed],
     *,
@@ -228,29 +254,46 @@ def decorate_embeds(
     shard_id: Optional[int] = None,
     runtime: Optional["RuntimeSnapshot"] = None,
 ) -> None:
-    """Append the debug footer to each embed, IN PLACE.
-
-    Mutating is safe — embeds are freshly constructed per response everywhere in
-    this codebase — and it is what lets MusicContext.send decorate both of its send
-    paths without either of them reshaping its kwargs.
+    """Write the debug footer onto each embed, in place, replacing a previous suffix
+    rather than appending after it. That is what keeps a cached embed sent more than
+    once (`play_message`, re-served by -now) from growing a footer per send. With
+    nothing to show it removes a stale suffix instead of leaving it.
     """
     for embed in embeds:
         existing = embed.footer.text or ""
+        base = _strip_debug_suffix(existing)
         suffix = debug_footer(
             span=span,
             elapsed_ms=elapsed_ms,
             shard_id=shard_id,
             runtime=runtime,
-            # Error embeds already carry one from _command_error. The same id twice
-            # in one footer reads as two different traces.
-            skip_trace="trace:" in existing or "trace " in existing,
+            # Read from the pre-suffix footer: error embeds carry their own trace
+            # and the same id twice reads as two traces, but a trace in our own
+            # previous suffix must not suppress the fresh one replacing it.
+            skip_trace="trace:" in base or "trace " in base,
         )
-        if not suffix:
-            continue
-        text = f"{existing} · {suffix}" if existing else suffix
-        embed.set_footer(
-            text=truncate(text, FOOTER_LIMIT), icon_url=embed.footer.icon_url
-        )
+        if not suffix and base == existing:
+            continue  # nothing to add, nothing stale to replace
+        _write_footer(embed, base, suffix)
+
+
+def _write_footer(embed: discord.Embed, base: str, suffix: str) -> None:
+    """Join `base` and `suffix` into the footer, clipping the base if the pair does
+    not fit. Clipping the join instead would cut the ` · 🐞 ` boundary off the end,
+    after which _strip_debug_suffix never finds it again and the embed stops
+    accepting a suffix for good.
+    """
+    if base and suffix:
+        # 3 for the " · " separator.
+        text = f"{truncate(base, max(0, FOOTER_LIMIT - len(suffix) - 3))} · {suffix}"
+    else:
+        text = truncate(suffix or base, FOOTER_LIMIT)
+    embed.set_footer(
+        text=text or None,
+        # Discord rejects an icon with no text, so it goes with the text.
+        # Unreachable today — nothing in src/ sets a footer icon.
+        icon_url=embed.footer.icon_url if text else None,
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -468,6 +511,10 @@ class DebugInputs:
     # `operator` rather than only when it is True: a row that appears for False and
     # vanishes for True would make its own absence the answer.
     default_password: Optional[bool] = None
+    # Debug mode's footer, rendered once by the cog and constant for the whole live
+    # loop (see run_health_dashboard). None when the guild has debug mode off —
+    # reading this card does not require the mode to be on.
+    debug_suffix: Optional[str] = None
 
 
 def _safe_block(label: str, fn: Callable[[], list[str]]) -> list[str]:
@@ -859,8 +906,13 @@ class RuntimeSnapshot:
     pool_workers: int
 
 
+# Delay before the sampler's first sample — see RuntimeSampler._run.
+_FIRST_SAMPLE_SECS = 0.5
+
+
 class RuntimeSampler:
-    """A ~5s background sampler feeding the debug footer.
+    """A background sampler feeding the debug footer, on the Now Playing tick's
+    cadence (see INTERVAL_SECS).
 
     Sampled in the background rather than at send time because CPU% needs a
     wall-clock window and a response must never wait on one; a send reads the
@@ -871,7 +923,10 @@ class RuntimeSampler:
     outlives a cog reload and would leak the task.
     """
 
-    INTERVAL_SECS = 5.0
+    # Tied to the NP tick, the fastest surface that renders a snapshot: sampling
+    # slower re-pushes footers whose numbers have not moved. Floored so a tiny tick
+    # cannot spin /proc reads, capped so a long one cannot stale command replies.
+    INTERVAL_SECS = max(1.0, min(5.0, config.NOW_PLAYING_UPDATE_INTERVAL_SECS))
 
     def __init__(self) -> None:
         self._task: Optional[asyncio.Task[None]] = None
@@ -923,13 +978,18 @@ class RuntimeSampler:
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
+        # First sample on a short delay, so `-debug --enable` does not answer with
+        # a footer carrying no runtime numbers. Not instant: cpu% needs a window,
+        # and start() took the baseline. Never longer than the interval itself.
+        delay = min(_FIRST_SAMPLE_SECS, self.INTERVAL_SECS)
         while True:
-            expected = loop.time() + self.INTERVAL_SECS
-            await asyncio.sleep(self.INTERVAL_SECS)
+            expected = loop.time() + delay
+            await asyncio.sleep(delay)
             try:
                 self._snapshot = self._sample(max(0.0, (loop.time() - expected) * 1000))
             except Exception as e:  # noqa: BLE001 — one bad tick must not end the loop
                 log.warning(f"runtime sample failed: {type(e).__name__}: {e}")
+            delay = self.INTERVAL_SECS
 
     def _sample(self, lag_ms: float) -> RuntimeSnapshot:
         previous, self._cpu = self._cpu, read_cpu_sample()
@@ -1678,6 +1738,8 @@ def render_snapshot_embed(
     footer = f"environment: {ENVIRONMENT}"
     if (tf := trace_footer(trace.get_current_span())) is not None:
         footer += f" \u00b7 {tf}"
+    if inputs.debug_suffix:
+        footer += f" \u00b7 {inputs.debug_suffix}"
     embed.set_footer(text=truncate(footer, FOOTER_LIMIT))
     return embed
 

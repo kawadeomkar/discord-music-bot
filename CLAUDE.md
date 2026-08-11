@@ -656,7 +656,12 @@ The NP card (embed with a 10-segment live progress bar, edited every
 through `ctx.channel.send`, not `MusicContext.send`, because a message an edit loop
 owns must not also be the NP host — the progress updater would re-render it every
 3s. So those replies carry no NP block AND do not retire the current host, which
-stays above them until the next ordinary `ctx.send` adopts a new one.
+stays above them until the next ordinary `ctx.send` adopts a new one. Bypassing
+`MusicContext.send` also bypasses debug-mode decoration, so the cog hands each
+dashboard a pre-rendered `debug_suffix` instead — computed ONCE per invocation and
+held constant, because the driver only edits when the render changes and a
+per-tick-varying footer would edit the board until its deadline (which is why that
+suffix omits elapsed-ms).
 Mechanism: `MusicContext.send` (main.py) asks the guild's player for `np_embed_block()`
 and **prepends it to every command response in the player's home channel** (≤ Discord's
 10-embed cap; worst case here is 3), then `_adopt_np_host_if_current` makes that message
@@ -796,7 +801,10 @@ read that header first.
 - Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
   exception — it has no test file; `test_leaderboard.py` also owns the cog command
   that drives it, since splitting the renderer's tests from the command's would make
-  a reader check two files to learn what one board looks like), plus `conftest.py` (shared fixtures/seams),
+  a reader check two files to learn what one board looks like; `test_debug.py`
+  likewise owns `MusicBot._debug_suffix` and the `-debug` card's end-to-end
+  assertions, for the same reason — what the footer says and what puts it there are
+  one behavior), plus `conftest.py` (shared fixtures/seams),
   `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
   `telemetry.py` are the two intentionally-least-covered modules.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs
@@ -906,7 +914,7 @@ duplicated.
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
 | `ENVIRONMENT` | git branch (`main`→`production`) | set explicitly in CI/Docker/worktrees |
-| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every response with a trace/timing/runtime footer. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
+| `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Three seams apply it, because "every embed" is sent from three places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), and a pre-rendered `debug_suffix` threaded into the two live dashboards. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
 | `DEBUG_PROMETHEUS_URL` | — | Prometheus query API `-debug` reads the **postgres container's** CPU/memory from (the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL). Compose sets `http://localhost:9090`; the series come from the `otelcol-metrics` `docker_stats` receiver, selected by `container_name="discord-postgres"`. **That collector is behind the `metrics` compose profile**, so on a default `up` it does not run and the cpu/mem rows render `n/a (no metrics source)` even though the URL is set and Prometheus answers — set `COMPOSE_PROFILES=metrics` (or `docker compose --profile metrics up -d`) as well. Unset URL → the same `n/a`. Only those two rows depend on it: the block's load/throughput/mem-signal rows are native SQL over the archive's own pool and render regardless. The container name is a hand-checked cross-file pin (see golden rule 6) |
 | `PROMETHEUS_HOST_PORT` | `9090` | host-side published port for the metrics stack's Prometheus, loopback-bound. Also the port `DEBUG_PROMETHEUS_URL` defaults to — the two are written separately in compose (golden rule 6c) |
 | `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |

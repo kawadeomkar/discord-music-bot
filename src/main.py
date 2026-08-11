@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import time
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -19,7 +20,7 @@ from src.config import ENVIRONMENT, spotify_enabled
 # happens inside the fire-and-forget prewarm() rather than on the loop, and is
 # arguably the point: prewarm()'s promise is that the first -play does not absorb
 # yt-dlp import latency, which was only half true before.
-from src.debug import decorate_embeds
+from src.debug import decorate_embeds, strip_debug_footers
 from src.help import MusicHelpCommand
 from src.history_archive import HistoryOutboxDrainer, PostgresHistoryArchive
 from src.redis_client import (
@@ -88,15 +89,12 @@ class MusicContext(commands.Context):
         return message
 
     def _decorate_for_debug(self, kwargs: dict[str, Any]) -> None:
-        """Append the debug footer to this response's own embeds while the guild has
-        debug mode on. The NP block is deliberately not reachable from here: the
-        progress updater re-renders it every few seconds undecorated, and the flicker
-        would be worse than useless."""
+        """Add the debug footer to this response's own embeds while the guild has
+        debug mode on. The NP block is decorated by the player instead, at build
+        time, so the progress tick cannot re-render it back to bare.
+        See docs/ARCHITECTURE.md#debug-footer-seams."""
         cog = self._music_cog()
         if cog is None:
-            return
-        guild_id = self.guild.id if self.guild else None
-        if not cog.debug_enabled(guild_id):
             return
         own = [
             e
@@ -104,6 +102,12 @@ class MusicContext(commands.Context):
             if e is not None
         ]
         if not own:
+            return
+        guild_id = self.guild.id if self.guild else None
+        if not cog.debug_enabled(guild_id):
+            # Strip rather than return: a cached embed built while debug mode was
+            # on must lose its suffix once it is off.
+            strip_debug_footers(own)
             return
         # Keyed by id(ctx), and this IS the ctx. Absent for a send outside any
         # command, which just means no elapsed time and no span to name.
@@ -329,11 +333,28 @@ class MusicBotApp(commands.AutoShardedBot):
         return await super().get_context(origin, cls=cls)
 
     async def invoke(self, ctx: commands.Context, /) -> None:
+        command = ctx.command
         # `--help` ANYWHERE in the raw message short-circuits to that command's help
         # embed, before checks, the cog's voice gate and argument parsing — so `-play
         # --help` answers from outside a voice channel instead of searching for it.
-        if ctx.command is not None and "--help" in ctx.message.content:
-            await ctx.send_help(ctx.command)
+        short_circuit = command is not None and "--help" in ctx.message.content
+        # Neither help path reaches cog_before_invoke — the short-circuit skips
+        # dispatch, and discord.py owns the help command — so both borrow a span
+        # from the cog. See MusicBot.traced_help.
+        if short_circuit or (command is not None and command.cog is None):
+            from src.musicbot import MusicBot
+
+            cog = self.get_cog("MusicBot")
+            span = (
+                cog.traced_help(ctx)
+                if isinstance(cog, MusicBot)
+                else contextlib.nullcontext()
+            )
+            async with span:
+                if short_circuit and command is not None:
+                    await ctx.send_help(command)
+                else:
+                    await super().invoke(ctx)
             return
         await super().invoke(ctx)
 
