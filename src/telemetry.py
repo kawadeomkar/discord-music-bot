@@ -137,15 +137,27 @@ def configure_worker_logging(log_queue: Optional[Queue] = None) -> None:
 # ── Internal setup ────────────────────────────────────────────────────────────
 
 
+def span_context_ids() -> dict[str, str]:
+    """The active span as W3C-width hex ids, or empty when no span is active.
+
+    The widths are the wire format Tempo and Loki join on, so they are fixed here
+    rather than at each site: a log line and the worker carrier that correlates
+    with it must render the same span identically or the join silently misses.
+    """
+    ctx = trace.get_current_span().get_span_context()
+    if not ctx.is_valid:
+        return {}
+    return {
+        "trace_id": format(ctx.trace_id, "032x"),
+        "span_id": format(ctx.span_id, "016x"),
+    }
+
+
 def _add_otel_context(
     logger: WrappedLogger, method: str, event_dict: EventDict
 ) -> EventDict:
     """Structlog processor: inject trace_id and span_id into every log event."""
-    span = trace.get_current_span()
-    ctx = span.get_span_context()
-    if ctx.is_valid:
-        event_dict["trace_id"] = format(ctx.trace_id, "032x")
-        event_dict["span_id"] = format(ctx.span_id, "016x")
+    event_dict.update(span_context_ids())
     return event_dict
 
 
