@@ -24,18 +24,12 @@ from src.redis_client import (
     OUTBOX_FIELD,
     GuildRedisStore,
 )
+from tests.helpers import history_entry
 
 
 def _entry(n: int, played_at: float | None = None) -> HistoryEntry:
-    return HistoryEntry(
-        title=f"Song {n}",
-        webpage_url=f"https://yt.com/v={n}",
-        duration_secs=200,
-        played_secs=200,
-        requester_id=n,
-        requester_name=f"user{n}",
-        played_at=1000.0 + n if played_at is None else played_at,
-    )
+    extra = {} if played_at is None else {"played_at": played_at}
+    return history_entry(n, **extra)
 
 
 @pytest.fixture

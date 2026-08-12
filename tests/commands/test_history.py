@@ -19,23 +19,13 @@ from src.musicbot import (
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from tests.helpers import (
     command_callback,
+    history_entry,
 )
 
 
 def _history_entries(n: int) -> list[HistoryEntry]:
     """n entries, oldest-first (the order GuildHistory stores them)."""
-    return [
-        HistoryEntry(
-            title=f"Song {i}",
-            webpage_url=f"https://yt.com/v={i}",
-            duration_secs=200,
-            played_secs=200,
-            requester_id=i + 1,
-            requester_name=f"user{i}",
-            played_at=1000.0 + i,
-        )
-        for i in range(n)
-    ]
+    return [history_entry(i, requester_id=i + 1) for i in range(n)]
 
 
 def _flags(limit: int = 10) -> SimpleNamespace:

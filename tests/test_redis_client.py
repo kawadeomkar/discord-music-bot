@@ -29,7 +29,7 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
-from tests.helpers import mocked
+from tests.helpers import history_entry, mocked
 from src.redis_client import (
     analytics_png_get,
     analytics_png_set,
@@ -470,15 +470,7 @@ class TestRemoveQueueEntries:
 
 
 def _hentry(n: int = 1) -> HistoryEntry:
-    return HistoryEntry(
-        title=f"Song {n}",
-        webpage_url=f"https://yt.com/v={n}",
-        duration_secs=200 + n,
-        played_secs=100 + n,
-        requester_id=n,
-        requester_name=f"user{n}",
-        played_at=1000.0 + n,
-    )
+    return history_entry(n, duration_secs=200 + n, played_secs=100 + n)
 
 
 class TestPushHistory:

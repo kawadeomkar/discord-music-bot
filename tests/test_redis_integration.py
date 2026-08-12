@@ -72,7 +72,7 @@ from src.redis_client import (
     trim_outbox_below,
 )
 
-from tests.helpers import bind_loopback_only, tier_enabled
+from tests.helpers import bind_loopback_only, history_entry, tier_enabled
 
 # REDIS_TEST_URL enables the tier on its own, for the same reason
 # POSTGRES_TEST_URL does in the pg tier: a CI job that supplied the server but
@@ -143,16 +143,9 @@ async def redis(redis_url: str) -> AsyncIterator[aioredis.Redis]:
 
 
 def _entry(n: int) -> HistoryEntry:
-    return HistoryEntry(
-        guild_id=42,
-        title=f"Song {n}",
-        webpage_url=f"https://yt.com/v={n}",
-        duration_secs=200,
-        played_secs=200,
-        requester_id=222222222222222222,
-        requester_name=f"user{n}",
-        played_at=1000.0 + n,
-    )
+    # Snowflake magnitude on the requester: a real id must survive the wire
+    # round trip without going through float.
+    return history_entry(n, guild_id=42, requester_id=222222222222222222)
 
 
 async def _push(redis: aioredis.Redis, *ns: int) -> None:

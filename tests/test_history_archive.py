@@ -59,19 +59,11 @@ from src.redis_client import (
     outbox_pending_count,
     read_outbox_new,
 )
+from tests.helpers import history_entry
 
 
 def _entry(n: int, guild_id: int = 42) -> HistoryEntry:
-    return HistoryEntry(
-        guild_id=guild_id,
-        title=f"Song {n}",
-        webpage_url=f"https://yt.com/v={n}",
-        duration_secs=200,
-        played_secs=200,
-        requester_id=n,
-        requester_name=f"user{n}",
-        played_at=1000.0 + n,
-    )
+    return history_entry(n, guild_id=guild_id)
 
 
 def _as_record(mapping: dict[str, Any]) -> asyncpg.Record:

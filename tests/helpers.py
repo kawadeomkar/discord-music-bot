@@ -17,6 +17,7 @@ from discord.utils import MISSING as _DISCORD_MISSING
 
 from src.guild_queue import GuildQueue, QueueItem
 from src.play_placement import PlayMode, PlayRequest
+from src.guild_state import HistoryEntry
 from src.youtube import QueueObject
 
 if TYPE_CHECKING:
@@ -265,3 +266,20 @@ def mock_mp(qsize: int = 0) -> MagicMock:
         return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
     )
     return mp
+
+
+def history_entry(n: int = 1, **overrides: Any) -> HistoryEntry:
+    """A played song whose every field varies with `n`, so entries built for one
+    test are distinguishable from each other. Callers override what their own
+    assertions read; everything else is filler."""
+    fields: dict[str, Any] = dict(
+        title=f"Song {n}",
+        webpage_url=f"https://yt.com/v={n}",
+        duration_secs=200,
+        played_secs=200,
+        requester_id=n,
+        requester_name=f"user{n}",
+        played_at=1000.0 + n,
+    )
+    fields.update(overrides)
+    return HistoryEntry(**fields)
