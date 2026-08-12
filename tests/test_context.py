@@ -13,35 +13,9 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src import config
-from src.config import SpotifyStatus
-from src.debug import DebugSettings
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
-from src.recovery import VoiceWatchdog
 from tests.helpers import mocked
-
-
-@pytest.fixture
-def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
-    """Minimal real MusicBot instance — _np_player's isinstance check needs the
-    actual class, not a MagicMock."""
-    cog = MusicBot.__new__(MusicBot)
-    cog.bot = mock_bot
-    cog.mps = {}
-    cog.spotify = MagicMock()
-    cog.spotify_status = SpotifyStatus.ENABLED
-    cog.redis = None
-    cog._active_spans = {}
-    cog.voice_watchdog = VoiceWatchdog(cog)
-    cog._restore_tasks = set()
-    # Off by default: send() asks the cog on every response, so a debug-on cog
-    # here would decorate the embeds these attach tests compare.
-    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
-    # fixture that listed them would drift the moment one is added — which is
-    # exactly how the cog's old __slots__ fell three attributes behind.
-    cog.debug_settings = DebugSettings()
-    cog.debug_settings._default = False
-    return cog
 
 
 @pytest.fixture
@@ -59,14 +33,14 @@ def mctx(
 
 @pytest.fixture
 def live_mp(
-    music_bot_cog: MusicBot,
+    music_bot: MusicBot,
     mock_bot: MagicMock,
     mock_guild: MagicMock,
     mock_channel: MagicMock,
 ) -> MagicMock:
     """A guild MusicPlayer (mocked) with a live song, wired into the cog lookup
     that MusicContext._np_player performs."""
-    mock_bot.get_cog = MagicMock(return_value=music_bot_cog)
+    mock_bot.get_cog = MagicMock(return_value=music_bot)
     mp = MagicMock()
     mp.current_song = MagicMock()
     mp.home_channel = mock_channel  # same channel object the ctx sends to
@@ -74,7 +48,7 @@ def live_mp(
         discord.Embed(title="NP"),
         discord.Embed(title="Up next"),
     ]
-    music_bot_cog.mps[mock_guild.id] = mp
+    music_bot.mps[mock_guild.id] = mp
     return mp
 
 
@@ -196,9 +170,9 @@ class TestMusicContextVanillaFallthrough:
         await self._assert_vanilla(mctx, live_mp)
 
     async def test_no_player_for_guild(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        music_bot_cog.mps.clear()
+        music_bot.mps.clear()
         await self._assert_vanilla(mctx, live_mp)
 
     async def test_no_live_song(self, mctx: MusicContext, live_mp: MagicMock) -> None:
@@ -246,9 +220,9 @@ class TestDebugDecoration:
         assert own.footer.text is None
 
     async def test_decorates_on_the_np_attach_path(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)) as parent:
             await mctx.send(embed=own)
@@ -262,11 +236,11 @@ class TestDebugDecoration:
         assert [e.footer.text for e in block] == [None, None]
 
     async def test_decorates_on_the_vanilla_path(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """The early return exists for every no-attach guard; a response that skips
         the NP block must still carry the footer."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         live_mp.current_song = None  # forces the vanilla fallthrough
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)) as parent:
@@ -275,11 +249,11 @@ class TestDebugDecoration:
         assert (own.footer.text or "").startswith("🐞")
 
     async def test_resending_a_cached_embed_refreshes_rather_than_stacks(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """Decoration mutates in place and play_message is cached, so repeat -now
         sends the same object again. Each send replaces the suffix."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         live_mp.current_song = None
         cached = discord.Embed(title="Now playing: x")  # stands in for play_message
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -288,18 +262,18 @@ class TestDebugDecoration:
         assert (cached.footer.text or "").count("🐞") == 1
 
     async def test_decorates_every_embed_of_a_multi_embed_response(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         own = [discord.Embed(title="A"), discord.Embed(title="B")]
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embeds=own)
         assert all((e.footer.text or "").startswith("🐞") for e in own)
 
     async def test_existing_footer_is_appended_to_not_replaced(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         own = discord.Embed(title="Board")
         own.set_footer(text="top 10 · last 30 days")
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -307,9 +281,9 @@ class TestDebugDecoration:
         assert (own.footer.text or "").startswith("top 10 · last 30 days\n🐞")
 
     async def test_shard_id_is_reported(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         mocked(mctx.guild).shard_id = 3
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -317,22 +291,22 @@ class TestDebugDecoration:
         assert "shard 3" in (own.footer.text or "")
 
     async def test_content_only_response_needs_no_embed(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """Nothing to decorate is not an error — and this layer must not reach for
         the NP block standing in for the response (the player owns that)."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         with _parent_send(MagicMock(spec=discord.Message)) as parent:
             await mctx.send("shuffling...")
         assert all(e.footer.text is None for e in parent.call_args.kwargs["embeds"])
 
     async def test_no_active_command_omits_elapsed_and_trace(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """A send outside any command has no _active_spans entry. It still gets a
         footer — the environment and the shard are knowable — but nothing is
         fabricated."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         mocked(mctx.guild).shard_id = 0
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -343,14 +317,14 @@ class TestDebugDecoration:
         self,
         mctx: MusicContext,
         live_mp: MagicMock,
-        music_bot_cog: MusicBot,
+        music_bot: MusicBot,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """It says which deployment everything after it describes, so it goes first.
         Read at send time, never captured: main() infers it from the git branch after
         this module is imported, so a module-level copy would say `development` on
         every card in production."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         monkeypatch.setattr(config, "ENVIRONMENT", "production")
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -358,15 +332,15 @@ class TestDebugDecoration:
         assert (own.footer.text or "").startswith("🐞 production ·")
 
     async def test_elapsed_is_measured_at_each_send(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """Two sends in one command show two increasing numbers: the footer times
         the phases of a command, not the command."""
         from src.musicbot import ActiveCommand
 
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         span = trace.INVALID_SPAN
-        music_bot_cog._active_spans[id(mctx)] = ActiveCommand(
+        music_bot._active_spans[id(mctx)] = ActiveCommand(
             span=span, token=cast(Any, None), started=time.monotonic() - 0.5
         )
         first, second = discord.Embed(title="A"), discord.Embed(title="B")
@@ -381,11 +355,11 @@ class TestDebugDecoration:
         assert 500 <= elapsed[0] <= elapsed[1]
 
     async def test_trace_id_is_never_printed_twice(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """Error embeds already carry one from _command_error. Two copies of the
         same id in one footer read as two different traces."""
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         own = discord.Embed(title="Command failed")
         own.set_footer(text="trace: 0af7651916cd43dd8448eb211c80319c")
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -393,9 +367,9 @@ class TestDebugDecoration:
         assert (own.footer.text or "").count("0af7651916cd43dd8448eb211c80319c") == 1
 
     async def test_footer_is_truncated_to_discord_s_limit(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
-        self._enable(music_bot_cog, mocked(mctx.guild).id)
+        self._enable(music_bot, mocked(mctx.guild).id)
         own = discord.Embed(title="Long")
         own.set_footer(text="x" * 2100)
         with _parent_send(MagicMock(spec=discord.Message)):
@@ -403,10 +377,10 @@ class TestDebugDecoration:
         assert len(own.footer.text or "") == 2048
 
     async def test_per_guild_scope_holds_at_the_send_seam(
-        self, mctx: MusicContext, live_mp: MagicMock, music_bot_cog: MusicBot
+        self, mctx: MusicContext, live_mp: MagicMock, music_bot: MusicBot
     ) -> None:
         """An enable in one server must not decorate another's replies."""
-        self._enable(music_bot_cog, 4242424242)
+        self._enable(music_bot, 4242424242)
         own = discord.Embed(title="Queue")
         with _parent_send(MagicMock(spec=discord.Message)):
             await mctx.send(embed=own)

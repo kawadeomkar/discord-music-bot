@@ -522,7 +522,9 @@ def ytdl_instance(
 def music_bot(mock_bot: MagicMock) -> MusicBot:
     """Minimal MusicBot instance bypassing __init__ Discord registration.
 
-    Shared by tests/test_musicbot.py (commands) and tests/test_ping.py (dashboard).
+    Shared by tests/test_musicbot.py (commands), tests/test_ping.py (dashboard)
+    and tests/test_context.py, whose _np_player isinstance check needs the real
+    class rather than a MagicMock.
     """
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
@@ -572,35 +574,10 @@ async def fake_redis_bot() -> AsyncIterator[Redis]:
 
 
 @pytest.fixture
-def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot:
-    cog = MusicBot.__new__(MusicBot)
-    cog.bot = mock_bot
-    cog.mps = {}
-    cog._plays = PlayRegistry()
-    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
-    # rejects an attribute Spotify does not have, which is how a renamed method
-    # gets caught here rather than passing against a mock that invents it. spec
-    # covers the class, so the credentials __init__ assigns are set by hand —
-    # -ping reads them to tell "unconfigured" from "configured and rejected".
-    cog.spotify = MagicMock(spec=Spotify)
-    cog.spotify.client_id = "cid"
-    cog.spotify.client_secret = "secret"
-    cog.spotify_status = SpotifyStatus.ENABLED
-    cog.redis = fake_redis_bot
-    # None, not a mock, and set explicitly: this fixture builds the cog without
-    # __init__, and _debug_inputs reads history_archive — left unset it would be an
-    # AttributeError, and left a MagicMock it would fake an archive that is absent.
-    cog.history_archive = None
-    cog._active_spans = {}
-    cog.voice_watchdog = VoiceWatchdog(cog)
-    cog._restore_tasks = set()
-    # Debug state, same shape __init__ builds. The cog reads these on every send and
-    # now persists them, so a fixture without them tests a bot that cannot start.
-    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
-    # fixture that listed them would drift the moment one is added.
-    cog.debug_settings = DebugSettings()
-    cog.debug_settings._default = False
-    return cog
+def music_bot_with_redis(music_bot: MusicBot, fake_redis_bot: Redis) -> MusicBot:
+    """`music_bot` with a live fakeredis, for the cog paths that persist."""
+    music_bot.redis = fake_redis_bot
+    return music_bot
 
 
 _PLAY_STAGES = (
