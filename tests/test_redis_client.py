@@ -29,7 +29,7 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
-from tests.helpers import history_entry, mocked
+from tests.helpers import history_entry, outbox_entries, mocked
 from src.redis_client import (
     analytics_png_get,
     analytics_png_set,
@@ -588,7 +588,7 @@ class TestPushHistoryOutbox:
         # reader. Asserting the payload by name rather than by "the only value
         # in the dict" is what makes a rename fail here instead of at runtime.
         await store.push_history(_hentry(1))
-        entries = await _stream_entries(fake_redis)
+        entries = await outbox_entries(fake_redis)
         assert [f[OUTBOX_FIELD] for _id, f in entries] == [_hentry(1).to_redis()]
 
     async def test_display_leg_unchanged_by_outbox_flag(
@@ -627,20 +627,8 @@ async def _push(fake_redis: Redis, *ns: int) -> None:
         await store.push_history(_hentry(n))
 
 
-async def _stream_entries(fake_redis: Redis) -> list[tuple[bytes, dict[bytes, bytes]]]:
-    """The outbox stream, oldest first, narrowed to the ordinary-entry shape.
-
-    redis-py types XRANGE's reply as a union wide enough for XAUTOCLAIM's 4-tuple
-    rows and RESP3 dicts, so every unpack would otherwise need its own ignore.
-    """
-    return cast(
-        list[tuple[bytes, dict[bytes, bytes]]],
-        await fake_redis.xrange(HISTORY_OUTBOX_KEY),
-    )
-
-
 async def _stream_ids(fake_redis: Redis) -> list[bytes]:
-    return [i for i, _ in await _stream_entries(fake_redis)]
+    return [i for i, _ in await outbox_entries(fake_redis)]
 
 
 class TestOperatorRecipeMatchesTheSchema:

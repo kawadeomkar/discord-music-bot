@@ -18,6 +18,7 @@ from discord.utils import MISSING as _DISCORD_MISSING
 from src.guild_queue import GuildQueue, QueueItem
 from src.play_placement import PlayMode, PlayRequest
 from src.guild_state import HistoryEntry
+from src.redis_client import HISTORY_OUTBOX_KEY
 from src.youtube import QueueObject
 
 if TYPE_CHECKING:
@@ -283,3 +284,14 @@ def history_entry(n: int = 1, **overrides: Any) -> HistoryEntry:
     )
     fields.update(overrides)
     return HistoryEntry(**fields)
+
+
+async def outbox_entries(redis: Any) -> list[tuple[bytes, dict[bytes, bytes]]]:
+    """The outbox stream, oldest first, narrowed to the ordinary-entry shape.
+
+    redis-py types XRANGE's reply wide enough to cover XAUTOCLAIM's 4-tuple rows
+    and RESP3 dict forms, so one cast here replaces a per-unpack ignore."""
+    return cast(
+        list[tuple[bytes, dict[bytes, bytes]]],
+        await redis.xrange(HISTORY_OUTBOX_KEY),
+    )

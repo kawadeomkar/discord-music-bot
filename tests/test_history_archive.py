@@ -59,7 +59,7 @@ from src.redis_client import (
     outbox_pending_count,
     read_outbox_new,
 )
-from tests.helpers import history_entry
+from tests.helpers import history_entry, outbox_entries
 
 
 def _entry(n: int, guild_id: int = 42) -> HistoryEntry:
@@ -160,17 +160,7 @@ async def _outbox_wires(fake_redis: Redis) -> list[bytes]:
     """Every payload still in the outbox, oldest first. XRANGE is oldest-first,
     unlike the LPUSHed list this replaced, so expectations that were reversed
     under the list read forward here."""
-    return [fields[OUTBOX_FIELD] for _id, fields in await _stream_entries(fake_redis)]
-
-
-async def _stream_entries(fake_redis: Redis) -> list[tuple[bytes, dict[bytes, bytes]]]:
-    """The outbox stream, oldest first, narrowed to the ordinary-entry shape.
-    redis-py types XRANGE's reply wide enough to cover XAUTOCLAIM's 4-tuple rows
-    and RESP3 dict forms, so one cast here replaces a per-unpack ignore."""
-    return cast(
-        list[tuple[bytes, dict[bytes, bytes]]],
-        await fake_redis.xrange(HISTORY_OUTBOX_KEY),
-    )
+    return [fields[OUTBOX_FIELD] for _id, fields in await outbox_entries(fake_redis)]
 
 
 async def _eventually(cond: Callable[[], bool], timeout: float = 2.0) -> None:
@@ -1517,7 +1507,7 @@ class TestTombstones:
         stuck = HistoryOutboxDrainer(fake_redis, archive)
         with pytest.raises(RuntimeError):
             await stuck._drain_once()  # deliver, do not ack
-        ids = [i for i, _ in await _stream_entries(fake_redis)]
+        ids = [i for i, _ in await outbox_entries(fake_redis)]
         await fake_redis.xdel(HISTORY_OUTBOX_KEY, ids[0])  # body gone, ID pending
 
     async def test_a_tombstone_is_acked_and_does_not_stall_the_drain(

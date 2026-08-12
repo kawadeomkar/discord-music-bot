@@ -72,7 +72,12 @@ from src.redis_client import (
     trim_outbox_below,
 )
 
-from tests.helpers import bind_loopback_only, history_entry, tier_enabled
+from tests.helpers import (
+    bind_loopback_only,
+    history_entry,
+    outbox_entries,
+    tier_enabled,
+)
 
 # REDIS_TEST_URL enables the tier on its own, for the same reason
 # POSTGRES_TEST_URL does in the pg tier: a CI job that supplied the server but
@@ -154,18 +159,14 @@ async def _push(redis: aioredis.Redis, *ns: int) -> None:
         await store.push_history(_entry(n))
 
 
+async def _ids(redis: aioredis.Redis) -> list[bytes]:
+    return [i for i, _ in await outbox_entries(redis)]
+
+
 def _id_parts(raw: bytes) -> tuple[int, int]:
     """`ms-seq` as integers — bytes compare lexicographically, not numerically."""
     ts, seq = raw.split(b"-")
     return int(ts), int(seq)
-
-
-async def _ids(redis: aioredis.Redis) -> list[bytes]:
-    entries = cast(
-        list[tuple[bytes, dict[bytes, bytes]]],
-        await redis.xrange(HISTORY_OUTBOX_KEY),
-    )
-    return [i for i, _ in entries]
 
 
 class TestServerFloor:
