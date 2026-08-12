@@ -27,6 +27,17 @@ from src.util import get_logger
 log = get_logger(__name__)
 
 
+def host_ids(message: Optional[discord.Message]) -> tuple[int, int]:
+    """A host message as the (message_id, channel_id) pair everything at rest
+    stores it as. Both come off one message or both are 0 — a card is only
+    resolvable as a pair, and a channel id from any other source would 404 for
+    exactly the host-migrated plays a pointer is wanted for. One function so that
+    stays true of every writer rather than of each one separately."""
+    if message is None:
+        return 0, 0
+    return message.id, message.channel.id
+
+
 @dataclass(frozen=True, slots=True)
 class NpHostRef:
     """The live host an interrupted fragment left behind, so the fragment's resume

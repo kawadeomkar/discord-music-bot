@@ -53,7 +53,7 @@ from src.util import (
     truncate_embed_title,
     get_logger,
 )
-from src.np_host import NpHost, NpHostRef
+from src.np_host import NpHost, NpHostRef, host_ids
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
 
 if TYPE_CHECKING:
@@ -865,12 +865,12 @@ class MusicPlayer:
             # ffmpeg exited without a frame: nobody heard it (see produced_audio).
             return None
         # Captured before cleanup()'s retire_np_host_on_stop() disposes of it.
-        host = self._np_host.message
+        message_id, channel_id = host_ids(self._np_host.message)
         entry = HistoryEntry.from_song(
             song,
             guild_id=self._guild.id,
-            message_id=host.id if host is not None else 0,
-            channel_id=host.channel.id if host is not None else 0,
+            message_id=message_id,
+            channel_id=channel_id,
         )
         self._skip_history_for = song
         return entry
@@ -1178,7 +1178,7 @@ class MusicPlayer:
         # a deep stack would pay the round trip per level before -clear can reply.
         await asyncio.gather(*(self.history.add(entry) for entry in entries))
 
-    async def _dispose_orphaned_cards(self, items: Sequence[QueueItem]) -> None:
+    def _dispose_orphaned_cards(self, items: Sequence[QueueItem]) -> None:
         """Retire the frozen NP card of every played tail leaving the queue.
 
         A tail disposes of the card its interrupted fragment left behind when it
@@ -1191,6 +1191,15 @@ class MusicPlayer:
         for item in items:
             if isinstance(item, QueueObject) and item.is_resume:
                 self._spawn_background(self._dispose_previous_np_card(item))
+
+    async def _retire_from_queue(self, items: Sequence[QueueItem]) -> None:
+        """Everything owed to queue items leaving the queue for good.
+
+        One method rather than two calls because the obligations share a trigger: a
+        resume tail leaving the queue is BOTH the only writer left for its play and
+        the only holder of the pointer to the card its fragment left frozen."""
+        await self._flush_played(items)
+        self._dispose_orphaned_cards(items)
 
     async def _retire_failed_dequeue(
         self, item: Optional[QueueItem], *, context: str
@@ -1213,8 +1222,7 @@ class MusicPlayer:
         cleared_items = await self.queue.clear()
         # Before the return: a flush failure must surface as a command error
         # rather than a "queue cleared" reply that silently dropped plays.
-        await self._flush_played(cleared_items)
-        await self._dispose_orphaned_cards(cleared_items)
+        await self._retire_from_queue(cleared_items)
         return [
             (
                 item.title
@@ -1244,8 +1252,7 @@ class MusicPlayer:
         outcome, since the command reports the positions and names the mode."""
         await self._cancel_prefetch()
         outcome = await self.queue.remove(remove_matcher(needle))
-        await self._flush_played(outcome.removed)
-        await self._dispose_orphaned_cards(outcome.removed)
+        await self._retire_from_queue(outcome.removed)
         return outcome
 
     # ── Embed building ────────────────────────────────────────────────────────
@@ -2700,12 +2707,10 @@ class MusicPlayer:
                             if finished_host is not None
                             else None
                         )
-                        pending_tail.np_message_id = (
-                            finished_host.id if finished_host is not None else 0
-                        )
-                        pending_tail.np_channel_id = (
-                            finished_host.channel.id if finished_host is not None else 0
-                        )
+                        (
+                            pending_tail.np_message_id,
+                            pending_tail.np_channel_id,
+                        ) = host_ids(finished_host)
                         pending_tail.np_dedicated = finished_dedicated
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
@@ -2714,23 +2719,15 @@ class MusicPlayer:
                     # start_offset-based, so it records what was actually heard.
                     heard_before = song.is_resume and song.start_offset > 0
                     if not skip_history and (not stream_failed or heard_before):
+                        # The host captured at song end, not the live one the
+                        # release above nulled. 0/0 = nothing hosted it.
+                        message_id, channel_id = host_ids(finished_host)
                         await self.history.add(
                             HistoryEntry.from_song(
                                 song,
                                 guild_id=self._guild.id,
-                                # The host captured at song end, not
-                                # the live host, which the release above nulled
-                                # above. Both ids come off that one message — never
-                                # the home channel, which commands reassign.
-                                # 0 = nothing hosted it.
-                                message_id=(
-                                    finished_host.id if finished_host is not None else 0
-                                ),
-                                channel_id=(
-                                    finished_host.channel.id
-                                    if finished_host is not None
-                                    else 0
-                                ),
+                                message_id=message_id,
+                                channel_id=channel_id,
                             )
                         )
 
