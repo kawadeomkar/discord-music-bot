@@ -169,6 +169,8 @@ graph TD
     guild_state["src/guild_state.py\nschema / value objects"]
     history_archive["src/history_archive.py\nPostgresHistoryArchive + drainer"]
     db["src/db_migrate.py\nSQL migration runner"]
+    np_host["src/np_host.py\nNpHost + NpHostRef"]
+    recovery["src/recovery.py\nrestore_guild + VoiceWatchdog"]
     youtube["src/youtube.py\nYTDL + QueueObject"]
     ytdlp_pool["src/ytdlp_pool.py\nYtdlpPool"]
     sources["src/sources.py\nparse_input + source types"]
@@ -193,6 +195,10 @@ graph TD
     main --> db
     main --> history_archive
     musicbot --> musicplayer
+    musicbot --> recovery
+    recovery --> musicplayer
+    musicplayer --> np_host
+    youtube --> np_host
     musicbot --> ping
     musicbot --> debug_mod
     ping --> dashboard
@@ -230,7 +236,9 @@ graph TD
 |---|---|
 | `main.py` | Entry point. `MusicBotApp` (extends `AutoShardedBot`): `setup_hook` creates the Redis pool, wires the durable tier when **`HISTORY_ARCHIVE_ENABLED` is true** (`PostgresHistoryArchive` → `HistoryOutboxDrainer.start()`) — the flag is the consent gate, never URL presence: enabled without `POSTGRES_URL` **raises**, and disabled ignores a set one with an INFO, leaving bit-identical pre-Postgres behavior, and loads extensions; `close()` tears down drainer → database → Redis pool and flushes telemetry off-loop; `invoke()` is overridden so that `--help` anywhere in a command message short-circuits to that command's help embed *before* any check or argument parsing runs; `help_command=MusicHelpCommand()` replaces discord.py's plaintext default. `MusicContext` (custom `commands.Context`, installed via `get_context` override): its `send()` glues the Now Playing embed block to the bottom of the player's channel (see [Now Playing Host Model](#now-playing-host-model)). `main()` calls `setup_telemetry()` before anything else. |
 | `musicbot.py` | `MusicBot` Cog. All Discord commands (including `-playnow`, which resolves a source and calls `MusicPlayer.interject()`). Owns `mps: dict[guild_id → MusicPlayer]`, the per-guild alone-disconnect timers, and per-command OTel spans + structlog contextvars (`cog_before_invoke`/`cog_after_invoke`). Handles voice-state events (auto-disconnect) and crash recovery via `on_ready`. |
-| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing host management, embeds/ETA, presence updates, pause/resume accounting, and `-playnow` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
+| `musicplayer.py` | Per-guild playback orchestration: `loop()` task, prefetch task, progress-bar task, Now-Playing rendering (the host POINTER is `np_host.py`), embeds/ETA, presence updates, pause/resume accounting, and `-playnow` interjection (`interject()` → `InterjectOutcome`, resume-entry bookkeeping via `_skip_history_for`). Delegates every queue operation to `self.queue: GuildQueue` and history to `self.history: GuildHistory`. |
+| `np_host.py` | `NpHost` — which message currently carries the Now Playing block, for one guild. Owns the host pointer and its companion fields, the edit lock every write against it takes, the pointer-first swap protocol (`adopt`/`shed`/`release`/`release_if`), the strip-vs-delete asymmetry in `retire`, and `dispose_previous` — the guarded by-id cleanup of the card a `-playnow`-interrupted fragment left frozen. Also home to `NpHostRef`, the live-Message form a resume tail carries; `youtube.py` imports it for that field. Depends on nothing but `util.py`, so the adopt GATE (is the block still current?) stays on `MusicPlayer`, which is the only thing that knows what a song is. |
+| `recovery.py` | Voice-session lifecycle: `restore_guild()` (the crash-recovery rejoin — distributed lock, pipelined recovery gate, player construction) and `VoiceWatchdog` (the alone-disconnect countdown). Both take the `MusicBot` cog explicitly, the way `MusicPlayer` does. |
 | `guild_queue.py` | `GuildQueue` — the queue domain class. Privately owns **one deque plus a cursor into it** (`_items[:_cursor]` claimed, `_items[_cursor:]` pending) and the Redis mirror, along with the bulk-mutation mutex, the generation counter, and the `_wake` Event whose sole writer is `_sync_wake()`. Every queue operation (put/clear/shuffle/remove/restore/dequeue bookkeeping) lives here. This replaced an `asyncio.Queue` plus a parallel display `deque` whose agreement had to be maintained by hand — see [Queue invariant](#queue-invariant). |
 | `guild_history.py` | `GuildHistory` — played-song history domain class. Two legs, both bounded at `HISTORY_CACHE_LIMIT` (50): the PERSISTed `guild:{id}:history` Redis list and an in-memory deque of the same window. `recent()` merges those two and **never reads Postgres** — see [History read path](#history-read-path). Writes additionally XADD the outbox while the archive is enabled. |
 | `guild_state.py` | Schema module: **every byte persisted to Redis is defined here**. Field-name constants (`StateField`, `NowPlayingField`, `QueueEntryField`, `ConfigField`) + frozen value objects (`GuildStateData`, `NowPlayingData`, `SongQueueEntry`/`SearchQueueEntry`, `GuildPlaybackSnapshot`, `HistoryEntry`, `GuildConfig`) with `from_redis`/`to_redis` converters. `GuildConfig` is the durable-settings object behind `guild:{id}:config`, and every one of its fields is `Optional` on purpose: absent means "follow the host default", which an explicit `False`/`0.0` does not (`tzinfo()` resolves the stored IANA name at read time, falling back to `DEFAULT_TIMEZONE` rather than raising on a render path). Pure data — no domain logic, no project runtime imports. Wire formats are pinned by golden-fixture tests. |
@@ -688,8 +696,8 @@ Mechanics:
 
 - **`MusicContext.send()`** (installed bot-wide via `get_context`): every command response in the player's channel, while a song is live, is sent as `NP block + response's own embeds` in **one message** (atomic — the bar is never even momentarily buried). After the send, `_adopt_np_host_if_current(message, own, song)` makes that message the new host and retires the old one. The adopt is gated on the song still being current — the send's `await` can cross a song boundary, and adopting a stale block would delete the next song's fresh host (the gate sheds the stale block from the just-sent message instead).
 - **A `-play` whose song lands at the queue head answers with the block alone.** The block's `next_up` card and the `-play` confirmation share one renderer (`_queue_entry_description`), so for that entry they are the same card — the command re-hosts the live block via `repin_now_playing()` instead of sending a second copy. Dedicated, not a response host: a response host with no own embeds strip-edits to a blank message when it retires.
-- **Retiring the old host**: a *dedicated* NP message (sent by `_send_now_playing` with nothing else) is deleted; a *command-response* host is strip-edited back to its own embeds. All mutations of an old host (progress-tick edits, retires) go through `_np_edit_lock` so a strip/delete is always the final write.
-- **Pointer-first, synchronous adoption** (`_adopt_np_host`): the host pointer swap happens atomically on the event loop before any awaits, so no progress tick can edit a message that is about to be retired.
+- **Retiring the old host**: a *dedicated* NP message (sent by `_send_now_playing` with nothing else) is deleted; a *command-response* host is strip-edited back to its own embeds. All mutations of an old host (progress-tick edits, retires) go through `NpHost.edit_lock` so a strip/delete is always the final write.
+- **Pointer-first, synchronous adoption** (`NpHost.adopt`): the host pointer swap happens atomically on the event loop before any awaits, so no progress tick can edit a message that is about to be retired.
 - **`send_with_np()`**: for bot-initiated messages (loop errors, alone-countdown notice) — same attach behavior outside a command context. **Never** send to the player's channel with a bare `channel.send()` while a song is live.
 - **Song end**: the loop releases the host (the finished bar stays behind as a historical record) and fires one final edit so the bar renders fully complete instead of frozen at the last tick.
 - **Stop/cleanup**: `retire_np_host_on_stop()` disposes of the host after all tasks are cancelled.
@@ -839,8 +847,7 @@ sequenceDiagram
 | `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery; started only when a store exists |
 | `_pause_debounce_task` | `Optional[asyncio.Task]` | Debounced pause/resume embed+presence refresh |
 | `_skip_history_for` | `Optional[YTDL]` | Set by `interject()` to the parked song whose history add is deferred to its resume tail (holds identity, not a flag — the song can end during interject's awaits) |
-| `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` | host pointer + its own embeds + kind | The one message currently carrying the NP block |
-| `_np_edit_lock` | `asyncio.Lock` | Serializes old-host mutations (ticks vs retire) |
+| `_np_host` | `NpHost` (`src/np_host.py`) | The host pointer, its own embeds and kind, plus the edit lock — the one message currently carrying the NP block |
 | `_background_tasks` | `set` | Keeps fire-and-forget tasks alive (GC guard) |
 
 ### Redis Schema
@@ -948,7 +955,7 @@ flowchart TD
 | `_restore_complete: asyncio.Event` | `MusicPlayer` | `loop()` must not dequeue before restore populates the queue |
 | `GuildQueue._mutex: asyncio.Lock` | `GuildQueue` (private) | Bulk queue mutations + the loop's dequeue commit (`commit_dequeue()` holds it across the start transaction's dispatch) |
 | `GuildQueue._wake: asyncio.Event` | `GuildQueue` (private) | The pending-item signal a parked `get()` waits on. Set iff `_cursor < len(_items)`; `_sync_wake()` is its ONLY writer, because a stale set leaves the wait loop with no suspension point and stalls the whole event loop (I3) |
-| `_np_edit_lock: asyncio.Lock` | `MusicPlayer` | Old-host edits vs retire (strip/delete is always the final write) |
+| `NpHost.edit_lock: asyncio.Lock` | `np_host.py` | Old-host edits vs retire (strip/delete is always the final write) |
 | `Spotify._auth_lock: asyncio.Lock` | `Spotify` | Double-checked locking for token refresh |
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
@@ -1516,8 +1523,9 @@ eats the new head.
 
 ### Now Playing host invariants
 
-The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
-pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.
+The NP block lives in exactly one host message, owned by `NpHost` (`src/np_host.py`).
+`adopt` is pointer-first: the swap is synchronous, retirement is fire-and-forget under
+the host's edit lock.
 Overlapping sends can complete out of order — channel position is send-*start* order
 while adopts run in send-*return* order — so an adopt for an older message id sheds its
 own block instead of becoming host.
@@ -1534,7 +1542,7 @@ inherits a pointer to that card (`np_message_id` / `np_channel_id` / `np_dedicat
 the wire, plus a runtime-only `np_host_ref`) and disposes of it when the tail starts,
 strictly *after* its own card is up. Three constraints shape this:
 
-- **Never a re-adopt.** `_adopt_np_host` refuses a message older than the current host
+- **Never a re-adopt.** `NpHost.adopt` refuses a message older than the current host
   by design — the live bar belongs at the channel bottom. The stored ids exist to
   *dispose* of the old card, never to move back to it.
 - **The channel id comes from the host message**, not from the persisted text-channel id,

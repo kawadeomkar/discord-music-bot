@@ -1255,7 +1255,7 @@ class MusicPlayer:
     ) -> None:
         """Add the debug footer to what the player sends or edits itself, which
         MusicContext.send never sees. Freshly built embeds only: the cached
-        _np_host_own_embeds keep their send-time footer. No elapsed_ms — no command
+        the host's own embeds keep their send-time footer. No elapsed_ms — no command
         here took any time. NP-block callers pass no span, so a re-rendered block
         cannot alternate trace ids. See docs/ARCHITECTURE.md#debug-footer-seams.
         """
@@ -2117,7 +2117,7 @@ class MusicPlayer:
         runs. loop() released the host before this fires, so no tick or retire can
         START against the message — but a debounce-spawned _edit_now_playing_once
         that captured the host before the release can still have a PATCH in flight.
-        It holds _np_edit_lock across its edit, so taking the lock here orders this
+        It holds the host's edit lock across its edit, so taking it here orders this
         write after it (last write wins).
         """
         if song.duration_secs <= 0:
@@ -2719,7 +2719,7 @@ class MusicPlayer:
                                 song,
                                 guild_id=self._guild.id,
                                 # The host captured at song end, not
-                                # _np_host_message, which _release_np_host() nulled
+                                # the live host, which the release above nulled
                                 # above. Both ids come off that one message — never
                                 # the home channel, which commands reassign.
                                 # 0 = nothing hosted it.
