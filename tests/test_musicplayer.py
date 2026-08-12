@@ -138,14 +138,6 @@ def queue_obj_no_meta(mock_author: MagicMock) -> QueueObject:
     )
 
 
-@pytest.fixture()
-def _stub_queue_put_tasks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prevent prefetch_stream tasks in queue_put from doing real yt-dlp work."""
-    from src import youtube
-
-    monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
-
 # ── Archive wiring ────────────────────────────────────────────────────────────
 
 
@@ -565,10 +557,6 @@ class TestQueuePutNext:
 
 
 class TestQueueClear:
-    @pytest.fixture(autouse=True)
-    def _setup(self, _stub_queue_put_tasks: None) -> None:
-        pass
-
     async def test_clear_empties_queue(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
@@ -635,10 +623,6 @@ class TestQueueClearFlushesPlayedSongs:
     good. An interjection's resume tail cleared before it finishes has already been
     heard and will never reach the loop's write site, so -clear is its only
     chance at a history row."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self, _stub_queue_put_tasks: None) -> None:
-        pass
 
     async def test_played_tail_is_recorded_once(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -999,10 +983,6 @@ class TestQueueClearFlushesPlayedSongs:
 
 
 class TestQueueShuffle:
-    @pytest.fixture(autouse=True)
-    def _setup(self, _stub_queue_put_tasks: None) -> None:
-        pass
-
     async def test_shuffle_requires_minimum_four_items(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
@@ -1155,12 +1135,6 @@ class TestQueueShuffle:
 
 
 class TestQueueRemove:
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
     async def test_remove_by_webpage_url(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
@@ -3343,12 +3317,6 @@ class TestQueuePutFront:
     """MusicPlayer.queue_put_front — the -play-on-a-disconnected-bot path
     . The list branch is the playlist case,
         which front-inserts in full rather than collapsing to one track."""
-
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from src import youtube
-
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
     async def test_single_item_goes_to_the_head(
         self, music_player: MusicPlayer, mock_author: MagicMock
