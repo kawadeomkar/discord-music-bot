@@ -79,7 +79,7 @@ GUILD_TTL = 86400
 # the equality leaves no headroom, so anything that costs a slot without yielding a
 # renderable play shortens the answer by one — a corrupt entry (get_history drops
 # it) or a duplicate (recent() dedups it; retry_on_error re-sends a non-idempotent
-# LPUSH after the server applied EXEC). Raising it costs ~487 B per entry per guild
+# LPUSH after the server applied EXEC). Raising it costs ~625 B per entry per guild
 # in all three roles at once, permanently, since nothing expires it.
 # See docs/ARCHITECTURE.md#history-read-path.
 HISTORY_CACHE_LIMIT = 50
@@ -87,6 +87,16 @@ HISTORY_CACHE_LIMIT = 50
 # Transient per-song fields and the playback-position fields, cleared together on
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
+# Scrubbed together when a song ends or a connection is torn down. ROLLBACK NOTE:
+# an older image's copy of this tuple does not name the fields added since, so
+# `just up <older-sha>` leaves current_song_played_at / _is_resume / _start_paused
+# in the hash while it clears the rest, and its own song starts never rewrite them.
+# Roll forward, crash mid-song, and from_crashed_state reads a value belonging to a
+# song that finished under the old build. Same shape as the `volume` incident, and
+# bounded the same way: this build rewrites all three on EVERY song start
+# (_now_playing_state_mapping is unconditional), so the stale value survives only
+# until the next song plays under a build that knows the field. Delete this note
+# once no supported rollback target predates them.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -865,8 +875,8 @@ class GuildRedisStore:
     # with guild count (~24 KB each), not with runtime. Config is the same shape and far
     # smaller — a fixed handful of fields per guild, tens of bytes, written only by an
     # explicit command and deleted on guild removal. The outbox is near-empty whenever
-    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~547
-    # resident bytes per play — 256mb holds ~491k. That figure is a step, not the wire
+    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~625
+    # resident bytes per play — 256mb holds ~429k. That figure is a step, not the wire
     # size: see HistoryOutboxDrainer.CAP_PAGE for the listpack-node cliff behind it, which
     # a field of 18 bytes can move. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
     # real data loss, since a capped list leaves no second copy. A Redis memory/eviction

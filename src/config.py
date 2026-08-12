@@ -137,8 +137,8 @@ def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
 # entries a drainer is holding, ACKing them first (see _enforce_cap) — so size it
 # well above BATCH_SIZE x peak burst, not just above steady-state depth.
 #
-# Sizing: ~420 bytes on the wire, ~487 stored (MEMORY USAGE against
-# redis:7-alpine at 100k stream entries), so 256mb holds roughly 525k un-archived
+# Sizing: ~520 bytes on the wire, ~625 stored (MEMORY USAGE against
+# redis:7-alpine at 50k stream entries), so 256mb holds roughly 429k un-archived
 # plays. Redis 8 stores the same payload in ~424 bytes; measure on your major.
 HISTORY_OUTBOX_MAX: int = _int_env("HISTORY_OUTBOX_MAX", 0)
 

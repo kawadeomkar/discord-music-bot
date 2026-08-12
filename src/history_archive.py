@@ -835,8 +835,10 @@ class HistoryOutboxDrainer:
     # Resident cost is a STEP, not that wire size: entries pack into listpack
     # nodes bounded by stream-node-max-bytes (4096), so per-entry memory jumps
     # whenever a node loses one entry. Measured on redis:7-alpine over 50k
-    # entries, the cliff is at ~440 B of payload — 486.8 B/entry below it, 547.4
-    # above. Adding query_source crossed it, so 256 MB now holds ~491k entries
+    # entries the step is the ALLOCATOR BIN the listpack node lands in, not the
+    # node cap: 486.8 B/entry, then 547.4 after query_source, then 625.3 after
+    # channel_id. Not monotonic — an UNSTAMPED 499 B entry is worst at 678.3. So
+    # 256 MB now holds ~429k entries (~412k for a guild that stamps nothing)
     # rather than ~552k (11% less outage runway) for 18 wire bytes. The empty
     # token pays the same as a full one: the key is on the wire either way.
     CAP_PAGE: int = 10_000
