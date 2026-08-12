@@ -803,19 +803,7 @@ class GuildRedisStore:
         the same transaction, so a crash can never leave state pointing at song B
         while the snapshot still shows song A.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
-        pipe = self.redis.pipeline(transaction=True)
-        pipe.lpop(self.queue_key())
-        pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
-        pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
-        pipe.expire(self.state_key(), GUILD_TTL)
-        if now_playing is not None:
-            pipe.hset(
-                self.now_playing_key(),
-                mapping=_hset_mapping(now_playing.to_redis_mapping()),
-            )
-            pipe.expire(self.now_playing_key(), GUILD_TTL)
-        await pipe.execute()
+        await self._start_song(current, play_start_epoch, now_playing, pop_queue=True)
 
     @_guild_op(default=None)
     async def set_current_song_state(
@@ -828,8 +816,28 @@ class GuildRedisStore:
         restarting a crash-recovered "current song" that was never RPUSHed to the
         queue list.
         """
+        await self._start_song(current, play_start_epoch, now_playing, pop_queue=False)
+
+    async def _start_song(
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        now_playing: Optional[NowPlayingData],
+        *,
+        pop_queue: bool,
+    ) -> None:
+        """The start transaction both public writers issue, differing only in whether
+        the song's queue entry is LPOPed in the same MULTI.
+
+        One definition because the two are one invariant: whatever the state hash
+        gets on a normal start it must also get on a crash-recovered one, or the
+        recovered song plays with a field the next restore cannot read back. The
+        callers own the @_guild_op and the docstrings that explain when each applies.
+        """
         mapping = self._now_playing_state_mapping(current, play_start_epoch)
         pipe = self.redis.pipeline(transaction=True)
+        if pop_queue:
+            pipe.lpop(self.queue_key())
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
         pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
         pipe.expire(self.state_key(), GUILD_TTL)

@@ -21,12 +21,16 @@ from logging.handlers import QueueListener
 from unittest.mock import MagicMock, patch
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
 
+from src.telemetry import span_context_ids
 from src.ytdlp_pool import (
     PoolClosedError,
     RemoteCallError,
     YtdlpPool,
     _picklable_call,
+    _trace_carrier,
     _warmup_noop,
     _worker_init,
 )
@@ -794,3 +798,39 @@ class TestDefaults:
         pool = YtdlpPool()
         assert not pool.is_closed
         assert pool._executor is None
+
+
+class TestTraceCarrier:
+    """The worker carrier and the structlog processor render the SAME span, and
+    Tempo/Loki join on the rendered strings — so the W3C widths are the contract,
+    not a formatting preference. Both read span_context_ids()."""
+
+    def test_no_active_span_carries_nothing(self) -> None:
+        # Prewarm and most tests run outside a span; an invalid context must not
+        # be forwarded as a zero trace id a worker would then bind.
+        assert _trace_carrier() == {}
+
+    def test_an_active_span_round_trips_through_the_carrier(self) -> None:
+        # A local SDK provider, not the global one: the suite runs with tracing
+        # disabled, so trace.get_tracer() yields non-recording spans whose context
+        # is invalid and nothing below would be asserted.
+        tracer = TracerProvider().get_tracer(__name__)
+        with tracer.start_as_current_span("carrier-test"):
+            carrier = _trace_carrier()
+            ctx = trace.get_current_span().get_span_context()
+            assert ctx.is_valid
+            assert carrier == span_context_ids()
+            assert int(carrier["trace_id"], 16) == ctx.trace_id
+            assert int(carrier["span_id"], 16) == ctx.span_id
+
+    def test_a_low_numbered_id_is_zero_padded_to_the_w3c_widths(self) -> None:
+        """The widths are a MINIMUM, so a random 128-bit id renders 32 chars either
+        way and proves nothing. A small id is where the padding shows — and where
+        losing it costs a join: Tempo matches the rendered string, so an id written
+        short matches no span at all."""
+        ctx = trace.SpanContext(trace_id=1, span_id=1, is_remote=False)
+        with trace.use_span(trace.NonRecordingSpan(ctx), end_on_exit=False):
+            assert _trace_carrier() == {
+                "trace_id": "0" * 31 + "1",
+                "span_id": "0" * 15 + "1",
+            }

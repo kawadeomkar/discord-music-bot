@@ -336,6 +336,22 @@ class TestQueuePut:
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(items) == 1
 
+    async def test_no_prefetch_without_a_store(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """prefetch_stream needs a Redis handle to cache into, and it is read off
+        the store — so a degraded player must enqueue and warm nothing rather than
+        spawn tasks that reach through a None."""
+        music_player.store = None
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            await music_player.queue_put(queue_obj)
+            await music_player.queue_put_front(queue_obj)
+            await asyncio.sleep(0)
+        mock_pf.assert_not_awaited()
+        assert len(music_player.queue.display_items()) == 2
+
     async def test_put_sets_ttl_on_redis_key(
         self,
         music_player: MusicPlayer,

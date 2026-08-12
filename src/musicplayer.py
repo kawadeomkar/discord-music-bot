@@ -736,13 +736,10 @@ class MusicPlayer:
         which song the previous session left off on, and how much queue waits behind
         the one starting now.
         """
-        items = self.queue.display_items()
-        if not items:
+        restored = self._restored_queue()
+        if restored is None:
             return None
-
-        count = len(items)
-        songs = pluralize(count, "song")
-        verb = "resume" if count != 1 else "resumes"
+        items, count, songs, verb = restored
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
@@ -770,13 +767,10 @@ class MusicPlayer:
         seconds later. None when the restore found nothing, which the caller
         reports instead of joining a channel to sit silent in.
         """
-        items = self.queue.display_items()
-        if not items:
+        restored = self._restored_queue()
+        if restored is None:
             return None
-
-        count = len(items)
-        songs = pluralize(count, "song")
-        verb = "resume" if count != 1 else "resumes"
+        items, count, songs, verb = restored
         embed = discord.Embed(
             title="▶️ Resumed from queue",
             description=(
@@ -788,6 +782,17 @@ class MusicPlayer:
         self._add_resume_fields(embed, items)
         return embed
 
+    def _restored_queue(self) -> Optional[tuple[list[QueueItem], int, str, str]]:
+        """What both resume notices open with: the restored display, its size, and
+        the two words that have to agree with it. None when nothing came back, which
+        is the shared "say nothing" case rather than an empty embed."""
+        items = self.queue.display_items()
+        if not items:
+            return None
+        count = len(items)
+        verb = "resume" if count != 1 else "resumes"
+        return items, count, pluralize(count, "song"), verb
+
     def _add_resume_fields(self, embed: discord.Embed, items: list[QueueItem]) -> None:
         """The "what the restore found" fields both resume notices carry: where the
         previous session got to, how much queue came back, and how long it runs."""
@@ -796,8 +801,11 @@ class MusicPlayer:
             embed.add_field(name=left_off[0], value=left_off[1], inline=True)
 
         count = len(items)
-        songs = pluralize(count, "song")
-        embed.add_field(name="Queued", value=f"**{count}** {songs}", inline=True)
+        embed.add_field(
+            name="Queued",
+            value=f"**{count}** {pluralize(count, 'song')}",
+            inline=True,
+        )
         total_secs, partial = _queue_runtime(items)
         if total_secs > 0:
             prefix = "~" if partial else ""
@@ -1074,20 +1082,7 @@ class MusicPlayer:
         per-item tasks spawn, since N concurrent prefetches saturate the pool and
         mint stream URLs that expire before playback reaches them.
         _prefetch_next_song covers one-ahead prefetch as songs play."""
-        items: list[QueueItem]
-        if isinstance(obj, (QueueObject, YTSource)):
-            items = [obj]
-        else:
-            items = list(obj)
-        items = await self.queue.put(
-            items, batch=not prefetch, stamp=self._stamp_at_depth
-        )
-        if prefetch and self.store is not None:
-            for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+        await self._enqueue(obj, prefetch=prefetch, front=False)
 
     async def queue_put_front(
         self,
@@ -1100,23 +1095,43 @@ class MusicPlayer:
         queue: the requested song plays now, the persisted entries resume behind it.
         Playlists insert in full and in order, with prefetch=False for the same
         reason as queue_put()."""
-        items: list[QueueItem]
-        if isinstance(obj, (QueueObject, YTSource)):
-            items = [obj]
-        else:
-            items = list(obj)
-        # Front insertion waits only on the live song and an in-flight head — the
-        # persisted entries it jumps ahead of are behind it, not in front.
-        items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
-        if prefetch and self.store is not None:
-            for item in items:
-                if isinstance(item, QueueObject):
-                    self._spawn_background(
-                        YTDL.prefetch_stream(item, redis=self.store.redis)
-                    )
+        await self._enqueue(obj, prefetch=prefetch, front=True)
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()
+
+    async def _enqueue(
+        self,
+        obj: Union[QueueItem, Sequence[QueueItem]],
+        *,
+        prefetch: bool,
+        front: bool,
+    ) -> None:
+        """The body queue_put and queue_put_front share: normalize to a list, insert
+        under the queue's stamping mutex, then warm each item's stream.
+
+        The prefetch rule is the part worth having once — it is skipped for bulk
+        playlists (N concurrent extractions mint URLs that expire before playback
+        reaches them), and a copy that dropped the store guard would spawn tasks
+        reaching through a None."""
+        items: list[QueueItem] = (
+            [obj] if isinstance(obj, (QueueObject, YTSource)) else list(obj)
+        )
+        if front:
+            # Front insertion waits only on the live song and an in-flight head —
+            # the persisted entries it jumps ahead of are behind it, not in front.
+            items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
+        else:
+            items = await self.queue.put(
+                items, batch=not prefetch, stamp=self._stamp_at_depth
+            )
+        if not prefetch or self.store is None:
+            return
+        for item in items:
+            if isinstance(item, QueueObject):
+                self._spawn_background(
+                    YTDL.prefetch_stream(item, redis=self.store.redis)
+                )
 
     async def _cancel_prefetch(self) -> None:
         """Cancel any in-flight prefetch task and wait for it to finish. Must run

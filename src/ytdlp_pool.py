@@ -29,9 +29,8 @@ from logging.handlers import QueueListener
 from typing import Any, Optional, TypeVar
 
 import structlog
-from opentelemetry import trace
 
-from src.telemetry import configure_worker_logging
+from src.telemetry import configure_worker_logging, span_context_ids
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -68,13 +67,7 @@ def _trace_carrier() -> dict[str, str]:
     """The parent's trace context as picklable strings for a worker to rebind. Workers
     have no TracerProvider, so get_current_span() is always invalid there and correlation
     must be carried explicitly. Empty when no span is active (prewarm, tests)."""
-    ctx = trace.get_current_span().get_span_context()
-    if not ctx.is_valid:
-        return {}
-    return {
-        "trace_id": format(ctx.trace_id, "032x"),
-        "span_id": format(ctx.span_id, "016x"),
-    }
+    return span_context_ids()
 
 
 def _call_with_context(carrier: dict[str, str], fn: Callable[..., T], *args: Any) -> T:
