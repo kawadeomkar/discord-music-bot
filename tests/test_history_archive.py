@@ -1026,6 +1026,33 @@ class TestRejectionIsolation:
         assert isinstance(error, asyncpg.exceptions.CheckViolationError)
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
+    async def test_schema_drift_drains_instead_of_wedging_the_outbox(
+        self, fake_redis: Redis
+    ) -> None:
+        # UndefinedColumnError is the DATABASE being older than this build, not a
+        # bad row — which is exactly why leaving it transient was catastrophic: it
+        # fails EVERY insert, and the redelivery lands on history:outbox, a key
+        # with no TTL that eviction is not allowed to touch. Unbounded, silent,
+        # and it ends by rejecting every Redis write in the process.
+        archive = PoisonArchive(
+            {"Song 1", "Song 2", "Song 3"},
+            exc=asyncpg.exceptions.UndefinedColumnError("channel_id"),
+        )
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await _push(fake_redis, 1, 2, 3)
+
+        assert await drainer._drain_once() == 3
+
+        assert archive.inserted == []
+        assert {e.title for e, _ in archive.rejections} == {
+            "Song 1",
+            "Song 2",
+            "Song 3",
+        }
+        # The invariant: nothing is left to redeliver. The plays are recoverable
+        # from play_history_rejected.payload, and visible to `just db-rejects`.
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
     async def test_the_recorded_entry_is_the_whole_play(
         self, fake_redis: Redis
     ) -> None:
@@ -1108,9 +1135,11 @@ class TestRejectionIsolation:
     ) -> None:
         """An unforeseen error type must keep redelivering rather than drop the
         batch: with the schema lock a data-caused refusal is a CHECK or a
-        DataError, both named in _POISON, so anything else genuinely is transient
-        and dropping would be data loss. The growing outbox is the symptom, and
-        HISTORY_OUTBOX_MAX plus the depth gauge are what page on it."""
+        DataError, and the one schema-caused refusal the build can name is an
+        UndefinedColumnError — all three are in _POISON, so anything else
+        genuinely is transient and dropping would be data loss. The growing
+        outbox is the symptom, and HISTORY_OUTBOX_MAX plus the depth gauge are
+        what page on it."""
 
         class AlwaysFails(RecordsRejections):
             async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None:

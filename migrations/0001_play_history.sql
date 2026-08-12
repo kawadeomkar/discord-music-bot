@@ -182,6 +182,16 @@ ALTER TABLE play_history ADD COLUMN IF NOT EXISTS inserted_at    timestamptz NOT
 -- entries imported by backfill_history, or values the validator clamped).
 -- Accepted: a silent merge of indistinguishable pre-archive rows beats a wider
 -- key that stops deduping the redeliveries this index exists for.
+--
+-- Second edge, and it cuts the other way: every fragment of one interrupted play
+-- INHERITS played_at (see the column comment), so this key also collapses a
+-- genuine bug into silence. If two writers ever record one play, Postgres keeps
+-- one row while the Redis list keeps both — so -history shows the duplicate and
+-- -leaderboard does not, with no rejected row and no log line. That made the
+-- archive the only place the exactly-once defects found in review did NOT show.
+-- The writers were fixed rather than the key widened (widening it would stop
+-- deduping the outbox redeliveries this index exists for), but nothing here
+-- reports a masked duplicate: an inserted-vs-sent count on the drain is owed.
 CREATE UNIQUE INDEX IF NOT EXISTS play_history_dedup
     ON play_history (guild_id, played_at, webpage_url);
 

@@ -747,8 +747,25 @@ class PostgresHistoryArchive:
 #   CheckViolationError   23514, and not a DataError — both inherit from
 #   NotNullViolationError IntegrityConstraintViolationError; without both arms a
 #                         CHECK violation wedges the drain head permanently
+#   UndefinedColumnError  42703, the schema-drift arm. NOT data the server
+#                         refused — the DATABASE is older than this build, which
+#                         migrate() cannot see: it skips a version already in the
+#                         ledger without reading the file, so an edited migration
+#                         reaches fresh databases only and the deployed one still
+#                         passes the version check. Left transient it fails EVERY
+#                         insert, and the redelivery lands on history:outbox,
+#                         which has no TTL and is exempt from eviction — an
+#                         unbounded silent stall ending in a Redis OOM that
+#                         rejects all writes, not just the archive's. Dead-
+#                         lettering instead costs a manual replay (the raw wire
+#                         bytes are preserved in payload) and buys a bounded
+#                         failure that `just db-rejects` can actually see.
 #
 # Deliberately not here — each would break the drain:
+#   - UndefinedTableError: the isolation path writes to play_history_rejected, so
+#     a build that cannot see play_history usually cannot see that table either —
+#     the rejection insert raises and nothing settles. It stays transient because
+#     there is no way to record it, not because retrying is right.
 #   - UniqueViolationError: play_history_dedup is the ON CONFLICT target, so it
 #     cannot surface; catching it hides a genuine index bug.
 #   - bare ValueError / TypeError: asyncpg raises them for whole-statement
@@ -761,6 +778,7 @@ _POISON = (
     asyncpg.exceptions.DataError,
     asyncpg.exceptions.CheckViolationError,
     asyncpg.exceptions.NotNullViolationError,
+    asyncpg.exceptions.UndefinedColumnError,
 )
 
 

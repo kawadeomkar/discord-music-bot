@@ -291,6 +291,40 @@ class TestMigrations:
             await conn.close()
         assert await migrate(raw_pg_dsn) == EXPECTED_SCHEMA_VERSION
 
+        # And the version number is NOT the assertion that matters. This test
+        # constructs exactly the shape a schema-drifted database has — ledger
+        # says migrated, table is missing columns — and asserting only the
+        # version passes in precisely that state, which is the state that wedges
+        # the drainer. Inserting is what distinguishes "migrated" from
+        # "recorded as migrated".
+        archive = PostgresHistoryArchive(raw_pg_dsn)
+        try:
+            await archive.insert_batch([_entry(1)])
+            [row] = await archive.recent(42, limit=10)
+            assert row.webpage_url == _entry(1).webpage_url
+        finally:
+            await archive.close()
+
+    async def test_the_dedup_key_collapses_fragments_of_one_play(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Every fragment of one interrupted play INHERITS played_at, so two
+        writers recording the same play land exactly on
+        (guild_id, played_at, webpage_url). Postgres keeps one row while the Redis
+        list keeps both — which is what made the archive the only place this
+        review's exactly-once defects did NOT show. Pinned so the asymmetry is a
+        known property rather than a surprise during an investigation."""
+        first = _entry(1, played_at=1752530000.0)
+        second = replace(first, played_secs=first.played_secs + 60)
+
+        await archive.insert_batch([first])
+        await archive.insert_batch([second])
+
+        rows = await archive.recent(42, limit=10)
+        assert len(rows) == 1
+        # First writer wins: ON CONFLICT DO NOTHING keeps the row already there.
+        assert rows[0].played_secs == first.played_secs
+
     async def test_archive_refuses_an_unmigrated_database(
         self, raw_pg_dsn: str
     ) -> None:
