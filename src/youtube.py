@@ -17,6 +17,7 @@ from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
+from src.np_host import NpHostRef
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
 from src.util import fmt_duration, get_logger
@@ -674,20 +675,6 @@ async def invalidate_stream_cache(
     """Drop a song's cached stream URL so the next play re-extracts a fresh one.
     Returns whether an entry existed to drop."""
     return await cache_del(redis, _stream_cache_key(webpage_url))
-
-
-@dataclass(frozen=True, slots=True)
-class NpHostRef:
-    """The live Now Playing host an interrupted fragment left behind, so the
-    fragment's resume tail can dispose of that frozen card when it starts.
-
-    Runtime only — a live Message cannot be serialized, and own_embeds cannot be
-    reconstructed from ids, so the wire fields alone can never strip-edit a
-    retirement (see MusicPlayer._retire_np_host)."""
-
-    message: discord.Message
-    own_embeds: list[discord.Embed]
-    dedicated: bool
 
 
 @dataclass

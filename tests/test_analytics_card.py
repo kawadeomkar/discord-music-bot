@@ -929,11 +929,11 @@ class TestNowPlayingEditSites:
     leaves the analytics PNG attached. One added kwarg silently destroys the image
     three seconds after posting, and no other test covers it."""
 
-    def _edit_kwargs(self, name: str) -> set[str]:
+    def _edit_kwargs(self, module: str, name: str) -> set[str]:
         import ast
         import pathlib
 
-        source = pathlib.Path("src/musicplayer.py").read_text()
+        source = pathlib.Path(module).read_text()
         tree = ast.parse(source)
         target = next(
             node
@@ -950,9 +950,17 @@ class TestNowPlayingEditSites:
                 kwargs |= {kw.arg for kw in node.keywords if kw.arg}
         return kwargs
 
-    @pytest.mark.parametrize("site", ["_push_np_edit", "_retire_np_host"])
-    def test_neither_edit_site_passes_attachments_or_files(self, site: str) -> None:
-        kwargs = self._edit_kwargs(site)
+    @pytest.mark.parametrize(
+        ("module", "site"),
+        [
+            ("src/musicplayer.py", "_push_np_edit"),
+            ("src/np_host.py", "retire"),
+        ],
+    )
+    def test_neither_edit_site_passes_attachments_or_files(
+        self, module: str, site: str
+    ) -> None:
+        kwargs = self._edit_kwargs(module, site)
         assert kwargs, f"no message.edit() call found in {site} — the walk is broken"
         assert kwargs == {"embeds"}, (
             f"{site} now passes {sorted(kwargs)} to Message.edit — anything beyond "
