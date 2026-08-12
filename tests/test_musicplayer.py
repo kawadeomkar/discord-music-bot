@@ -730,6 +730,35 @@ class TestQueueClearFlushesPlayedSongs:
             ("https://yt.com/v=heard", 95)
         ]
 
+    async def test_a_failed_tail_dequeue_also_disposes_its_frozen_card(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The tail holds the ONLY pointer to the card its fragment left frozen,
+        and disposal normally fires when the tail starts — so a tail that never
+        starts strands that card exactly as -clear would. This exit owes the same
+        pair of obligations as the other two."""
+        tail = QueueObject(
+            "https://yt.com/v=heard",
+            "Heard",
+            mock_author,
+            ts=95,
+            duration=240,
+            is_resume=True,
+            played_at=1752530001.0,
+        )
+        await music_player.queue_put(tail)
+        assert music_player.queue.get_nowait() is tail
+        disposed: list[str] = []
+
+        async def track(_self: Any, song: Any) -> None:
+            disposed.append(song.webpage_url)
+
+        with patch.object(MusicPlayer, "_dispose_previous_np_card", new=track):
+            await music_player._retire_failed_dequeue(tail, context="prefetch failure")
+            await asyncio.sleep(0)  # let the fire-and-forget task run
+
+        assert disposed == ["https://yt.com/v=heard"]
+
     async def test_a_failed_fresh_dequeue_records_nothing(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:

@@ -285,11 +285,7 @@ class GuildQueue:
             if self._store is None:
                 return new_items
             if in_flight:
-                entries = [_to_entry(s) for s in self._display if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
+                await self._write_mirror(self._display)
             else:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
@@ -349,10 +345,8 @@ class GuildQueue:
             # so a concurrent put()'s pushes can't be wiped by a rebuild that
             # predates them. persisted=False items were never RPUSHed — never
             # write them in.
-            if self._store is not None and kept:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
+            if kept:
+                await self._write_mirror(in_flight + kept)
 
         return ShuffleOutcome.SHUFFLED
 
@@ -388,12 +382,8 @@ class GuildQueue:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + kept)
 
-            if removed_positions and self._store is not None:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
+            if removed_positions:
+                await self._write_mirror(in_flight + kept)
 
         return RemoveOutcome(removed=removed_items, positions=removed_positions)
 
@@ -533,6 +523,20 @@ class GuildQueue:
             await self._store.pop_queue()
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    async def _write_mirror(self, items: Sequence[QueueItem]) -> None:
+        """Rewrite the Redis leg to exactly `items` — atomic DELETE+RPUSH, or a
+        DELETE when nothing persisted survives. Every caller that rebuilds rather
+        than appends goes through here, so the persisted= filter and the
+        empty-result branch have one definition. No-ops without a store; must hold
+        _mutex, like the mutations that call it."""
+        if self._store is None:
+            return
+        entries = [_to_entry(s) for s in items if is_persisted(s)]
+        if entries:
+            await self._store.rebuild_queue(entries)
+        else:
+            await self._store.delete_queue()
 
     def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
         """The dequeued-but-uncommitted items at the display head.

@@ -971,26 +971,13 @@ class HistoryEntry:
         resume tail, whose position spans the full listened range; a ?t= song
         includes the skip.
         """
-        played = round(song.position_secs)
-        duration = song.duration_secs or 0
-        if duration:
-            played = min(played, duration)
-        return cls(
+        return cls._from_play(
+            song,
             guild_id=guild_id,
-            title=song.title or "",
-            webpage_url=song.webpage_url or "",
-            duration_secs=duration,
-            played_secs=played,
-            requester_id=song.requester.id if song.requester else 0,
-            requester_name=song.requester.display_name if song.requester else "",
-            thumbnail=song.thumbnail or "",
-            uploader=song.uploader or "",
-            played_at=song.played_at,
+            played=round(song.position_secs),
+            duration=song.duration_secs or 0,
             message_id=message_id,
             channel_id=channel_id,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
-            query_source=song.query_source,
         )
 
     @classmethod
@@ -1010,26 +997,49 @@ class HistoryEntry:
         deletes that card fires only when a tail STARTS, and a flushed tail never
         does. 0/0 when the tail was never stamped.
         """
-        played = item.ts or 0
-        duration = item.duration or 0
+        return cls._from_play(
+            item,
+            guild_id=guild_id,
+            played=item.ts or 0,
+            duration=item.duration or 0,
+            message_id=item.np_message_id,
+            channel_id=item.np_channel_id,
+        )
+
+    @classmethod
+    def _from_play(
+        cls,
+        src: "YTDL | QueueObject",
+        *,
+        guild_id: int,
+        played: int,
+        duration: int,
+        message_id: int,
+        channel_id: int,
+    ) -> Self:
+        """The field table both constructors share — one definition, so a new column
+        cannot reach the archive from a finished song and not from a flushed queue
+        object. `played` and `duration` are read differently on either side
+        (position_secs/duration_secs vs ts/duration) and arrive resolved; the cap is
+        applied here so both agree on what "capped at duration" means."""
         if duration:
             played = min(played, duration)
         return cls(
             guild_id=guild_id,
-            title=item.title,
-            webpage_url=item.webpage_url,
+            title=src.title or "",
+            webpage_url=src.webpage_url or "",
             duration_secs=duration,
             played_secs=played,
-            requester_id=item.requester.id if item.requester else 0,
-            requester_name=item.requester.display_name if item.requester else "",
-            thumbnail=item.thumbnail or "",
-            uploader=item.uploader or "",
-            played_at=item.played_at,
-            message_id=item.np_message_id,
-            channel_id=item.np_channel_id,
-            queued_at=item.queued_at,
-            queue_position=item.queue_position,
-            query_source=item.query_source,
+            requester_id=src.requester.id if src.requester else 0,
+            requester_name=src.requester.display_name if src.requester else "",
+            thumbnail=src.thumbnail or "",
+            uploader=src.uploader or "",
+            played_at=src.played_at,
+            message_id=message_id,
+            channel_id=channel_id,
+            queued_at=src.queued_at,
+            queue_position=src.queue_position,
+            query_source=src.query_source,
         )
 
     def to_redis(self) -> bytes:
