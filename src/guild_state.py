@@ -49,9 +49,14 @@ class StateField:
     CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
-    # "1" when the playing song was queued via -playnow — preserves replace
-    # semantics across a crash mid-interjection.
+    # "1" when the playing song was queued via -playnow — attribution that would
+    # otherwise be lost across a crash mid-interjection.
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
+    # "1" when the playing song is a -playnow resume tail, and when it was parked
+    # paused. Both are BEHAVIOUR, not attribution: is_resume drives the resume
+    # announcement, _remaining_secs' billing, and the tail's NP-card cleanup.
+    CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
+    CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
     # Stamped at enqueue and carried, never restamped, so a crash-recovered song
     # still archives the position it was originally queued at.
     CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
@@ -59,6 +64,10 @@ class StateField:
     # Same reason: without it a song recovered after a crash archives as unknown,
     # silently and only for crashed plays.
     CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
+    # When the audio started. Not derivable from PLAY_START_EPOCH below, which is
+    # backdated by the -ss offset — and a resume tail's value is inherited from an
+    # earlier fragment, so no derivation from this run's clock can reconstruct it.
+    CURRENT_SONG_PLAYED_AT: Final[str] = "current_song_played_at"
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
@@ -294,9 +303,12 @@ class GuildStateData:
     current_song_uploader: str | None = None
     current_song_requester_id: int | None = None
     current_song_interjected: bool = False
+    current_song_is_resume: bool = False
+    current_song_start_paused: bool = False
     current_song_queued_at: float = 0.0
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
+    current_song_played_at: float = 0.0
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
@@ -365,6 +377,12 @@ class GuildStateData:
             current_song_interjected=(
                 _b_str(raw, StateField.CURRENT_SONG_INTERJECTED) == "1"
             ),
+            current_song_is_resume=(
+                _b_str(raw, StateField.CURRENT_SONG_IS_RESUME) == "1"
+            ),
+            current_song_start_paused=(
+                _b_str(raw, StateField.CURRENT_SONG_START_PAUSED) == "1"
+            ),
             # `or` coalescing is safe on these two: the zero value IS the default,
             # unlike total_pause_seconds below.
             current_song_queued_at=(
@@ -374,6 +392,9 @@ class GuildStateData:
                 _b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0
             ),
             current_song_query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
+            current_song_played_at=(
+                _b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0
+            ),
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),
@@ -495,6 +516,14 @@ class QueueEntryField:
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification, carried on both entry types (see sources.py).
     QUERY_SOURCE: Final[str] = "query_source"
+    # When the audio started. Only "qobj" entries carry it — a search has not
+    # played by definition. Absent on pre-feature entries, parsed as 0.0.
+    PLAYED_AT: Final[str] = "played_at"
+    # The frozen Now Playing card a resume tail is responsible for disposing of.
+    # Absent on pre-feature entries, parsed as 0 / 0 / False = "nothing to clean".
+    NP_MESSAGE_ID: Final[str] = "np_message_id"
+    NP_CHANNEL_ID: Final[str] = "np_channel_id"
+    NP_DEDICATED: Final[str] = "np_dedicated"
     # "ytsource" entries
     YTSEARCH: Final[str] = "ytsearch"
     URL: Final[str] = "url"
@@ -539,6 +568,16 @@ class SongQueueEntry:
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
     query_source: str = ""
+    # When the audio started (0.0 = not played yet), see QueueObject. Carried so a
+    # song interrupted by -playnow, or recovered from a crash, still records the
+    # start of the play rather than the start of its last fragment.
+    played_at: float = 0.0
+    # The interrupted fragment's frozen NP card, see QueueObject. The live
+    # np_host_ref beside them cannot be serialized, so a rehydrated tail can only
+    # DELETE a dedicated card, never strip-edit a command response.
+    np_message_id: int = 0
+    np_channel_id: int = 0
+    np_dedicated: bool = False
 
     @classmethod
     def from_queue_object(cls, item: QueueObject) -> Self:
@@ -559,6 +598,10 @@ class SongQueueEntry:
             queued_at=item.queued_at,
             queue_position=item.queue_position,
             query_source=item.query_source,
+            played_at=item.played_at,
+            np_message_id=item.np_message_id,
+            np_channel_id=item.np_channel_id,
+            np_dedicated=item.np_dedicated,
         )
 
     @classmethod
@@ -579,6 +622,7 @@ class SongQueueEntry:
             queued_at=song.queued_at,
             queue_position=song.queue_position,
             query_source=song.query_source,
+            played_at=song.played_at,
         )
 
     @classmethod
@@ -594,12 +638,17 @@ class SongQueueEntry:
         caller-computed resume offset (crashed_position_at() plus its duration cap),
         passed in so this stays a pure field mapping.
 
-        FIXME: A recovered song is a resume in everything but the flag.
-        `ts` holds the interrupt position but `is_resume` stays False, so the loop
-        announces "Starting song at 137 seconds" rather than resuming, and
-        _remaining_secs bills the whole duration instead of the tail, skewing every
-        ETA behind it. Setting the flag also moves the queue display and the -playnow
-        wording, so it wants its own change.
+        A song that WAS a -playnow resume tail round-trips its is_resume and
+        start_paused through the state hash, so recovery no longer downgrades it
+        to a fresh song.
+
+        FIXME: A crash-recovered FRESH song is still a resume in everything but
+        the flag. `ts` holds the interrupt position but nothing ever set
+        is_resume, so the loop announces "Starting song at 137 seconds" rather
+        than resuming, and _remaining_secs bills the whole duration instead of the
+        tail, skewing every ETA behind it. Synthesizing the flag from `ts > 0`
+        would also move the queue display and the -playnow wording, so it wants
+        its own change — this one only stops a real flag being LOST.
         """
         if not state.has_crashed_song:
             return None
@@ -611,13 +660,24 @@ class SongQueueEntry:
             duration=state.current_song_duration,
             uploader=state.current_song_uploader,
             persisted=False,
-            # A crash mid-interjection must not demote the recovered song: a
-            # -playnow after recovery still replaces it (no resume entry) rather
-            # than stacking one.
+            # Attribution only, carried so a crash mid-interjection does not
+            # silently reclassify how the song was queued.
             interjected=state.current_song_interjected,
+            # Behaviour, not attribution — losing these reclassified a resume tail
+            # as a fresh song on every restart: no resume announcement,
+            # _remaining_secs billing the whole duration instead of the tail (so
+            # every ETA behind it skewed), the tail's NP-card cleanup silently
+            # disabled, and a stack parked while paused coming back playing.
+            is_resume=state.current_song_is_resume,
+            start_paused=state.current_song_start_paused,
             queued_at=state.current_song_queued_at,
             queue_position=state.current_song_queue_position,
             query_source=state.current_song_query_source,
+            # The parked entry is the only at-rest copy of a playing song's start
+            # (its queue-list entry was LPOPed when it started), so recovery reads
+            # it back rather than restamping to the recovery wall clock. An
+            # old-build hash carries no field and recovers as 0.0 = unknown.
+            played_at=state.current_song_played_at,
         )
 
     def to_redis(self) -> bytes:
@@ -641,6 +701,10 @@ class SongQueueEntry:
                 QueueEntryField.QUEUED_AT: self.queued_at,
                 QueueEntryField.QUEUE_POSITION: self.queue_position,
                 QueueEntryField.QUERY_SOURCE: self.query_source,
+                QueueEntryField.PLAYED_AT: self.played_at,
+                QueueEntryField.NP_MESSAGE_ID: self.np_message_id,
+                QueueEntryField.NP_CHANNEL_ID: self.np_channel_id,
+                QueueEntryField.NP_DEDICATED: self.np_dedicated,
             }
         )
 
@@ -730,6 +794,10 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
             queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
             queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
             query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),
+            played_at=d.get(QueueEntryField.PLAYED_AT, 0.0),
+            np_message_id=d.get(QueueEntryField.NP_MESSAGE_ID, 0),
+            np_channel_id=d.get(QueueEntryField.NP_CHANNEL_ID, 0),
+            np_dedicated=d.get(QueueEntryField.NP_DEDICATED, False),
         )
     except Exception as e:
         log.warning(f"guild_state: corrupt queue entry dropped: {e}")
@@ -737,7 +805,8 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
 
 
 # ── guild:{id}:history list — wire format ────────────────────────────────────
-# One JSON object of HistoryEntryField keys per entry, newest-first.
+# One JSON object of HistoryEntryField keys per entry, most-recently-recorded
+# first (song-end order — see GuildHistory.recent, which sorts on played_at).
 
 
 class HistoryEntryField:
@@ -752,6 +821,7 @@ class HistoryEntryField:
     UPLOADER: Final[str] = "uploader"
     PLAYED_AT: Final[str] = "played_at"
     MESSAGE_ID: Final[str] = "message_id"
+    CHANNEL_ID: Final[str] = "channel_id"
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
     QUERY_SOURCE: Final[str] = "query_source"
@@ -773,7 +843,12 @@ _INT4_FIELDS: Final[tuple[str, ...]] = (
     "played_secs",
     "queue_position",
 )
-_INT8_FIELDS: Final[tuple[str, ...]] = ("guild_id", "requester_id", "message_id")
+_INT8_FIELDS: Final[tuple[str, ...]] = (
+    "guild_id",
+    "requester_id",
+    "message_id",
+    "channel_id",
+)
 # Machine-generated tokens (src.sources.query_source_of), never raw user text: a
 # lowercase host, or the literal "search". Anything else is a producer defect, so
 # it clamps to the unknown sentinel rather than being stored — which is what lets
@@ -803,10 +878,13 @@ class HistoryEntry:
     the drainer maps each entry to a Postgres row. Entries written before the field
     existed parse as guild_id=0.
 
-    message_id is a WEAK reference — the NP host migrates across messages during
-    one song and a dedicated host is deleted when retired, so it records which
-    message hosted the block at song end, not one guaranteed to still exist. Hence
-    neither a foreign key nor part of play_history_dedup.
+    message_id and channel_id are a WEAK reference — the NP host migrates across
+    messages (and channels) during one song and a dedicated host is deleted when
+    retired, so they record which message hosted the block at song end, not one
+    guaranteed to still exist. Hence neither a foreign key nor part of
+    play_history_dedup. Both are captured from the same message at the same
+    moment, so the pair is either both real or both 0; a channel id taken from
+    anywhere else would not resolve the message it claims to locate.
     """
 
     guild_id: int = 0
@@ -818,8 +896,12 @@ class HistoryEntry:
     requester_name: str = ""  # display_name at play time; survives member departure
     thumbnail: str = ""
     uploader: str = ""
-    played_at: float = 0.0  # unix epoch at song end; drives <t:…:f>
+    # Unix epoch when the audio started; drives <t:…:f>. One value per play, not
+    # per fragment: a -playnow resume tail inherits the interrupted song's stamp,
+    # so an interrupted play files under when the listener first heard it.
+    played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
+    channel_id: int = 0  # the channel that host was in; 0 = unknown, always paired
     queued_at: float = 0.0  # unix epoch when first enqueued; 0 = unknown
     # Songs ahead of it at that moment, counting the one playing. 0 means it
     # played immediately — and is also what a pre-feature entry parses as.
@@ -882,15 +964,20 @@ class HistoryEntry:
 
     @classmethod
     def from_song(
-        cls, song: YTDL, *, guild_id: int, played_at: float, message_id: int
+        cls, song: YTDL, *, guild_id: int, message_id: int, channel_id: int
     ) -> Self:
-        """Canonical extraction from a finished song. played_at is a
-        caller-supplied clock (as in crashed_position_at) so this stays a pure field
-        mapping. guild_id is keyword-required because the song object doesn't carry
-        it and a forgotten stamp would silently write unattributable outbox entries.
-        message_id more strictly still: play_history's CHECK is `>= 0`, so a missed
-        stamp inserts cleanly as 0 and is permanently indistinguishable from a song
-        that genuinely had no host — pass 0 explicitly for that case.
+        """Canonical extraction from a finished song. guild_id is keyword-required
+        because the song object doesn't carry it and a forgotten stamp would
+        silently write unattributable outbox entries. message_id and channel_id
+        more strictly still: play_history's CHECKs are `>= 0`, so a missed stamp
+        inserts cleanly as 0 and is permanently indistinguishable from a song that
+        genuinely had no host — pass 0 explicitly for that case, and take both from
+        the same message so the pair resolves.
+
+        played_at rides the song itself rather than a caller clock: the loop stamps
+        it at vc.play() and every later fragment of the same play inherits it, so
+        reading it here is what makes an interrupted song file once, under the
+        moment it actually started.
 
         played_secs is the position reached (start_offset + audio delivered), capped
         at duration when known. A -playnow-interrupted song is recorded once at its
@@ -911,11 +998,55 @@ class HistoryEntry:
             requester_name=song.requester.display_name if song.requester else "",
             thumbnail=song.thumbnail or "",
             uploader=song.uploader or "",
-            played_at=played_at,
+            played_at=song.played_at,
             message_id=message_id,
+            channel_id=channel_id,
             queued_at=song.queued_at,
             queue_position=song.queue_position,
             query_source=song.query_source,
+        )
+
+    @classmethod
+    def from_queue_object(cls, item: QueueObject, *, guild_id: int) -> Self:
+        """A played song recorded as it LEAVES the queue, rather than as it ends.
+
+        The -clear/-remove counterpart to from_song, and here beside it for the
+        same reason: construction lives next to the schema lock, so no consumer
+        re-proves the column domain. There is no YTDL to hand from_song — this
+        entry was interrupted by a -playnow and destroyed at the front of the
+        queue before its tail could play, so the queue object is all that is left
+        of it.
+
+        played_secs comes from `ts`, the resume offset, which is ABSOLUTE (see
+        YTDL.position_secs = start_offset + elapsed): it already spans everything
+        heard across every earlier fragment. Capped at duration like from_song's.
+
+        The host ids come off the tail's np_* fields, which name the card its
+        interrupted fragment left frozen — the last message that hosted this play,
+        which is exactly what the column means. Still resolvable when this runs:
+        the cleanup that deletes that card fires only when a tail STARTS, and a
+        flushed tail never does. 0/0 when the tail was never stamped.
+        """
+        played = item.ts or 0
+        duration = item.duration or 0
+        if duration:
+            played = min(played, duration)
+        return cls(
+            guild_id=guild_id,
+            title=item.title,
+            webpage_url=item.webpage_url,
+            duration_secs=duration,
+            played_secs=played,
+            requester_id=item.requester.id if item.requester else 0,
+            requester_name=item.requester.display_name if item.requester else "",
+            thumbnail=item.thumbnail or "",
+            uploader=item.uploader or "",
+            played_at=item.played_at,
+            message_id=item.np_message_id,
+            channel_id=item.np_channel_id,
+            queued_at=item.queued_at,
+            queue_position=item.queue_position,
+            query_source=item.query_source,
         )
 
     def to_redis(self) -> bytes:
@@ -934,6 +1065,7 @@ class HistoryEntry:
                 HistoryEntryField.UPLOADER: self.uploader,
                 HistoryEntryField.PLAYED_AT: self.played_at,
                 HistoryEntryField.MESSAGE_ID: self.message_id,
+                HistoryEntryField.CHANNEL_ID: self.channel_id,
                 HistoryEntryField.QUEUED_AT: self.queued_at,
                 HistoryEntryField.QUEUE_POSITION: self.queue_position,
                 HistoryEntryField.QUERY_SOURCE: self.query_source,
@@ -973,6 +1105,7 @@ def parse_history_entry(data: bytes | str) -> HistoryEntry | None:
             uploader=str(entry.get(HistoryEntryField.UPLOADER) or ""),
             played_at=float(entry.get(HistoryEntryField.PLAYED_AT) or 0.0),
             message_id=int(entry.get(HistoryEntryField.MESSAGE_ID) or 0),
+            channel_id=int(entry.get(HistoryEntryField.CHANNEL_ID) or 0),
             queued_at=float(entry.get(HistoryEntryField.QUEUED_AT) or 0.0),
             queue_position=int(entry.get(HistoryEntryField.QUEUE_POSITION) or 0),
             query_source=str(entry.get(HistoryEntryField.QUERY_SOURCE) or ""),

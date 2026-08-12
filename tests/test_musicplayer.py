@@ -88,6 +88,9 @@ def mock_song() -> MagicMock:
     song.queued_at = 0.0
     song.queue_position = 0
     song.query_source = ""
+    # Unstamped, like a song the loop has not started yet: the loop's or-stamp
+    # writes the real clock here, and the epoch clamp raises on a MagicMock.
+    song.played_at = 0.0
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
@@ -5475,6 +5478,9 @@ class TestLoop:
         song.queued_at = 0.0
         song.queue_position = 0
         song.query_source = ""
+        # Unstamped: the loop's or-stamp writes the real clock here, and the
+        # epoch clamp in HistoryEntry raises on a MagicMock.
+        song.played_at = 0.0
         return song
 
     async def test_exits_immediately_when_bot_closed(
@@ -5688,7 +5694,7 @@ class TestLoop:
         # the play_history "unknown" sentinel, not a forgotten stamp.
         assert music_player.history[0].message_id == 0
 
-    async def test_history_entry_records_the_np_host_message_id(
+    async def test_history_entry_records_the_np_host_message_and_channel(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
         """The history row carries the host of this song, as of song END: not the
@@ -5696,20 +5702,28 @@ class TestLoop:
         this song adopted its own — a hoisted capture yields the PREVIOUS song's id,
         undetectable downstream since every id is a plausible snowflake. The side
         effect on _send_now_playing is what makes the two distinguishable; a bare
-        AsyncMock would leave the decoy standing all iteration."""
+        AsyncMock would leave the decoy standing all iteration.
+
+        Both ids come off that ONE message. The hosts here sit in different
+        channels, which is what a mid-song host migration looks like: a channel
+        read from anywhere else pairs a real message id with a channel that never
+        held it, and `channel.get_partial_message(message_id)` then 404s."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
-        # Decoy: the host left over from the PREVIOUS song. Stamping this is the
-        # off-by-one-song failure, so it must not be what lands in history.
+        # Decoy: the host left over from the PREVIOUS song, in another channel.
+        # Stamping this is the off-by-one-song failure, so neither of its ids may
+        # land in history.
         stale_host = AsyncMock(spec=discord.Message)
         stale_host.id = 555555555555555555
+        stale_host.channel.id = 111111111111111111
         music_player._np_host_message = stale_host
 
         this_songs_host = AsyncMock(spec=discord.Message)
         this_songs_host.id = 777777777777777777
+        this_songs_host.channel.id = 888888888888888888
 
         async def adopt_this_songs_host(_song: object) -> None:
             music_player._np_host_message = this_songs_host
@@ -6006,6 +6020,96 @@ class TestLoop:
         assert current.duration == 240
         assert current.uploader == "Test Channel"
         assert current.requester_id == mock_author.id
+
+    async def _run_one_song(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        pop_spy: AsyncMock,
+    ) -> None:
+        """One full loop iteration with the start transaction spied on."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        assert music_player.store is not None
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(music_player.store, "pop_queue_and_start_song", pop_spy),
+        ):
+            await music_player.loop()
+
+    async def test_played_at_is_stamped_before_the_start_transaction(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The parked entry must carry the start, not 0.0.
+
+        A playing song has no queue entry anywhere persistent — this transaction's
+        own LPOP destroyed it — so the hash is its only at-rest copy. Stamping
+        after from_song() persists 0.0 while the in-memory song says otherwise,
+        and the crash path then recovers a song with no start at all."""
+        assert music_player.store is not None
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
+        before = time.time()
+
+        await self._run_one_song(music_player, queue_obj, mock_song, pop_spy)
+
+        current = pop_spy.call_args.args[0]
+        assert isinstance(current, SongQueueEntry)
+        assert before <= current.played_at <= time.time()
+        assert current.played_at == mock_song.played_at  # one value, not two clocks
+
+    async def test_played_at_is_the_wall_clock_not_the_backdated_epoch(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """play_start_epoch is deliberately pulled back by the FFmpeg -ss offset so
+        recovery math yields true audio position. Reusing it here would claim a
+        `?t=60` song started a minute before anyone pressed play."""
+        assert music_player.store is not None
+        mock_song.start_offset = 60
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
+
+        await self._run_one_song(music_player, queue_obj, mock_song, pop_spy)
+
+        current, backdated_start = pop_spy.call_args.args[:2]
+        assert current.played_at == pytest.approx(backdated_start + 60)
+
+    async def test_inherited_played_at_is_not_restamped(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A -playnow resume tail arrives already carrying the interrupted song's
+        start, and the or-stamp must leave it alone: restamping files the two
+        fragments of one play as two plays, minutes apart."""
+        assert music_player.store is not None
+        mock_song.played_at = 1752530000.5
+        mock_song.is_resume = True
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
+
+        with patch.object(MusicPlayer, "_announce_resume", new=AsyncMock()):
+            await self._run_one_song(music_player, queue_obj, mock_song, pop_spy)
+
+        assert pop_spy.call_args.args[0].played_at == 1752530000.5
+        assert music_player.history[0].played_at == 1752530000.5
 
     async def test_loop_clears_play_message_on_song_end(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -6486,6 +6590,9 @@ class TestLoopAdditional:
         song.queued_at = 0.0
         song.queue_position = 0
         song.query_source = ""
+        # Unstamped: the loop's or-stamp writes the real clock here, and the
+        # epoch clamp in HistoryEntry raises on a MagicMock.
+        song.played_at = 0.0
         return song
 
     async def test_update_activity_called_at_song_start_and_end(

@@ -349,6 +349,7 @@ _COLUMNS = (
     "uploader",
     "played_at",
     "message_id",
+    "channel_id",
     "queued_at",
     "queue_position",
     "query_source",
@@ -367,14 +368,23 @@ class TestRowMapping:
             assert column in _INSERT_SQL
             assert column in _RECENT_SQL
 
-    def test_message_id_round_trips(self) -> None:
-        # The NP host id is a snowflake; it must survive as a native int, and
-        # it must actually reach the row rather than defaulting to 0.
-        entry = HistoryEntry(guild_id=1, title="x", message_id=1234567890123456789)
+    def test_host_ids_round_trip(self) -> None:
+        # Both NP host ids are snowflakes; they must survive as native ints, and
+        # they must actually reach the row rather than defaulting to 0. Distinct
+        # values so a transposition of the adjacent columns is visible.
+        entry = HistoryEntry(
+            guild_id=1,
+            title="x",
+            message_id=1234567890123456789,
+            channel_id=987654321098765432,
+        )
         row = _entry_to_row(entry)
         assert row[_COLUMNS.index("message_id")] == 1234567890123456789
-        assert _row_to_entry(_as_record(dict(zip(_COLUMNS, row)))).message_id == (
-            1234567890123456789
+        assert row[_COLUMNS.index("channel_id")] == 987654321098765432
+        restored = _row_to_entry(_as_record(dict(zip(_COLUMNS, row))))
+        assert (restored.message_id, restored.channel_id) == (
+            1234567890123456789,
+            987654321098765432,
         )
 
     def test_round_trip(self) -> None:

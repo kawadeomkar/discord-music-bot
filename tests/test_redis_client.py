@@ -2358,6 +2358,22 @@ class TestPopQueueAndStartSong:
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_query_source == "spotify.com"
 
+    async def test_parks_the_played_at(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The LPOP in this very transaction destroys the song's queue-list entry,
+        # so from here until song end the hash holds the only copy of when the
+        # play started. It rides the same MULTI, leaving no window where the song
+        # is playing and its start is unrecorded — and it is NOT play_start_epoch,
+        # which is backdated by the -ss offset.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(played_at=1752530000.5), 990.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_played_at"] == b"1752530000.5"
+        assert state[b"play_start_epoch"] == b"990.0"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_played_at == 1752530000.5
+
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:

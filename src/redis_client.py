@@ -94,9 +94,12 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
     StateField.CURRENT_SONG_INTERJECTED,
+    StateField.CURRENT_SONG_IS_RESUME,
+    StateField.CURRENT_SONG_START_PAUSED,
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
+    StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
@@ -770,9 +773,12 @@ class GuildRedisStore:
                 str(current.requester_id) if current.requester_id else ""
             ),
             StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
+            StateField.CURRENT_SONG_IS_RESUME: ("1" if current.is_resume else ""),
+            StateField.CURRENT_SONG_START_PAUSED: ("1" if current.start_paused else ""),
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
+            StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }
@@ -987,7 +993,10 @@ class GuildRedisStore:
 
     @_guild_op(default_factory=list)
     async def get_history(self) -> list[HistoryEntry]:
-        """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
+        """Return up to HISTORY_CACHE_LIMIT history entries, most recently
+        RECORDED first — which is song-end order, not played_at order, since
+        played_at is when a song started and an interrupted one is recorded after
+        everything that cut in front of it. GuildHistory.recent sorts.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         raw = await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
         return [e for e in map(parse_history_entry, raw) if e is not None]

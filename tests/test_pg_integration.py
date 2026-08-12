@@ -537,6 +537,7 @@ class TestSchemaLock:
             ("played_secs", -1, "play_history_played_secs_valid"),
             ("duration_secs", -1, "play_history_duration_valid"),
             ("message_id", -1, "play_history_message_id_valid"),
+            ("channel_id", -1, "play_history_channel_id_valid"),
             ("queue_position", -1, "play_history_queue_position_valid"),
             # The epoch floor -leaderboard's all-time cutoff relies on. Without
             # these CHECKs it is asserted only by the validator, so a pre-epoch
@@ -739,9 +740,9 @@ class TestRejectsTable:
 
 
 class TestMessageIdColumn:
-    """message_id reaches Postgres. The column is `default 0` with a
-    `message_id >= 0` CHECK, so a value dropped between the wire and the INSERT
-    lands cleanly and is indistinguishable from a song that genuinely had no Now
+    """message_id and channel_id reach Postgres. Both are `default 0` with a
+    `>= 0` CHECK, so a value dropped between the wire and the INSERT lands
+    cleanly and is indistinguishable from a song that genuinely had no Now
     Playing host. Only a real round trip catches that; the drainer tests never
     touch SQL."""
 
@@ -761,6 +762,32 @@ class TestMessageIdColumn:
         await archive.insert_batch([_entry(2)])
         (got,) = await archive.recent(42, 10)
         assert got.message_id == 0
+
+    async def test_the_host_pair_survives_the_round_trip_undisturbed(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Distinct snowflakes: the two columns are adjacent in _INSERT_SQL and in
+        # _entry_to_row's positional tuple, so a transposition would round-trip
+        # perfectly with equal values and produce a pointer into the wrong
+        # channel forever.
+        stamped = replace(
+            _entry(1), message_id=1418765432109876543, channel_id=1330000000000000001
+        )
+        await archive.insert_batch([stamped])
+        (got,) = await archive.recent(42, 10)
+        assert (got.message_id, got.channel_id) == (
+            1418765432109876543,
+            1330000000000000001,
+        )
+
+    async def test_an_unstamped_channel_reads_back_as_zero(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # A row written by a build older than the column: unresolvable, which is
+        # what those rows are — never a pointer into some arbitrary channel.
+        await archive.insert_batch([_entry(3)])
+        (got,) = await archive.recent(42, 10)
+        assert got.channel_id == 0
 
 
 class TestEnqueueStampColumns:

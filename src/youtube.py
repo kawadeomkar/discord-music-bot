@@ -2,7 +2,7 @@ import copy
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -199,14 +199,14 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
-    for field in _UNUSED_INFO_COLLECTIONS:
-        info.pop(field, None)
+    for key in _UNUSED_INFO_COLLECTIONS:
+        info.pop(key, None)
     entries = info.get("entries")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
-                for field in _UNUSED_INFO_COLLECTIONS:
-                    entry.pop(field, None)
+                for key in _UNUSED_INFO_COLLECTIONS:
+                    entry.pop(key, None)
     # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
     # conforms, and `grep cast(` is how those assertions are audited.
     return cast(YTDLExtractResult, info)
@@ -524,6 +524,20 @@ async def invalidate_stream_cache(
     await cache_del(redis, _stream_cache_key(webpage_url))
 
 
+@dataclass(frozen=True, slots=True)
+class NpHostRef:
+    """The live Now Playing host an interrupted fragment left behind, so the
+    fragment's resume tail can dispose of that frozen card when it starts.
+
+    Runtime only — a live Message cannot be serialized, and own_embeds cannot be
+    reconstructed from ids, which is why the wire fields alone can never perform a
+    strip-edit retirement (see MusicPlayer._retire_np_host)."""
+
+    message: discord.Message
+    own_embeds: list[discord.Embed]
+    dedicated: bool
+
+
 @dataclass
 class QueueObject:
     """Song metadata in a queue before it's processed by YTDL"""
@@ -541,8 +555,9 @@ class QueueObject:
     # so the loop must skip its redis_pop_for(). Read via guild_queue.is_persisted().
     persisted: bool = True
     # ── -playnow interjection flags ──
-    # Queued via -playnow. A later -playnow REPLACES a playing interjection (no
-    # resume entry is built for it) instead of stacking.
+    # Queued via -playnow. Attribution only — interjections stack, so this changes
+    # nothing about how the song is treated; it rides spans as "did this cut in
+    # front of another -playnow song".
     interjected: bool = False
     # The rebuilt tail of an interrupted song (ts = interrupt position). Drives which
     # notice the loop's start path sends: "Resuming…" for these, "Starting song at
@@ -560,6 +575,21 @@ class QueueObject:
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
     query_source: str = ""
+    # Unix epoch when this song's audio actually started, stamped by the playback
+    # loop at vc.play() and carried from there — a -playnow resume tail INHERITS it,
+    # so every fragment of one play records the same start. 0.0 = not played yet,
+    # which is what makes the stamp idempotent across fragments.
+    played_at: float = 0.0
+    # ── The Now Playing card the interrupted fragment left frozen ──
+    # Set on a resume tail at the fragment's iteration end (not at interjection
+    # time — see MusicPlayer's _pending_resume_tail), and consumed when the tail
+    # starts, so a stack does not pile up one dead card per interjection.
+    # The ids survive a restart; the ref does not, and only the ref can strip-edit
+    # a card hosted by a command response. 0/0/False = nothing to clean up.
+    np_message_id: int = 0
+    np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
+    np_dedicated: bool = False  # a pure NP message (deletable) vs a response
+    np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
@@ -599,6 +629,11 @@ class YTDL(discord.FFmpegOpusAudio):
         queued_at: float = 0.0,
         queue_position: int = 0,
         query_source: str = "",
+        played_at: float = 0.0,
+        np_message_id: int = 0,
+        np_channel_id: int = 0,
+        np_dedicated: bool = False,
+        np_host_ref: Optional[NpHostRef] = None,
     ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -617,6 +652,15 @@ class YTDL(discord.FFmpegOpusAudio):
         self.queued_at: float = queued_at
         self.queue_position: int = queue_position
         self.query_source: str = query_source
+        # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
+        # which inherits the interrupted song's start (see QueueObject.played_at).
+        self.played_at: float = played_at
+        # The previous fragment's frozen NP card, carried so the loop can dispose
+        # of it once this one is up (see QueueObject's fields).
+        self.np_message_id: int = np_message_id
+        self.np_channel_id: int = np_channel_id
+        self.np_dedicated: bool = np_dedicated
+        self.np_host_ref: Optional[NpHostRef] = np_host_ref
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -826,6 +870,11 @@ class YTDL(discord.FFmpegOpusAudio):
             queued_at=qo.queued_at,
             queue_position=qo.queue_position,
             query_source=qo.query_source,
+            played_at=qo.played_at,
+            np_message_id=qo.np_message_id,
+            np_channel_id=qo.np_channel_id,
+            np_dedicated=qo.np_dedicated,
+            np_host_ref=qo.np_host_ref,
         )
 
     @classmethod

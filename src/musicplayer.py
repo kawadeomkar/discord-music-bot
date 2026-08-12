@@ -2149,6 +2149,12 @@ class MusicPlayer:
                         # pause_start_epoch survives that transaction's HDEL.
                         vc.pause()
                     play_start = time.time()  # capture immediately before any awaits
+                    # The play's start, stamped once and inherited by every later
+                    # fragment (a -playnow resume tail arrives carrying it), which
+                    # is what makes an interrupted song file under when it actually
+                    # began. Before from_song() below, or the parked entry persists
+                    # 0.0 and a crash recovers the song with no start.
+                    song.played_at = song.played_at or play_start
 
                     # Mirror the now-playing song to Redis. should_pop_queue=True →
                     # one MULTI/EXEC atomically LPOPs the queue and writes every state
@@ -2286,14 +2292,21 @@ class MusicPlayer:
                             HistoryEntry.from_song(
                                 song,
                                 guild_id=self._guild.id,
-                                played_at=time.time(),
                                 # The host captured at song end, not
                                 # _np_host_message, which _release_np_host() nulled
                                 # above. Clearing current_song before the prefetch
                                 # await makes this complete: nothing can adopt a
                                 # later host for this song. 0 = nothing hosted it.
+                                # Both ids come off that one message: the channel
+                                # is read from the host it locates, never from the
+                                # home channel, which every command reassigns.
                                 message_id=(
                                     finished_host.id if finished_host is not None else 0
+                                ),
+                                channel_id=(
+                                    finished_host.channel.id
+                                    if finished_host is not None
+                                    else 0
                                 ),
                             )
                         )
