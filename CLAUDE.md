@@ -1042,7 +1042,10 @@ forgetting fails the suite rather than shipping) → check where the added bytes
 against the outbox's allocator-bin cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
 18 bytes once cost 11% of the OOM runway and the next 32 cost another 14%, and the
 curve is NOT monotonic — an unstamped entry measured worse than a larger stamped
-one, so measure every shape a field takes and never just the populated one) → `to_redis`/`parse_history_entry`
+one, so measure every shape a field takes and never just the populated one) → the field
+table in `HistoryEntry._from_play`, which `from_song` and `from_queue_object` both build
+through, so a column reaching the archive from a finished song but not from a flushed
+queue object is not a shape this can take → `to_redis`/`parse_history_entry`
 (`.get(..., default)`, so pre-migration wire entries still parse) → the column in
 `migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
 table definition pre-release (free to validate on an empty table); a separate `NOT VALID`
