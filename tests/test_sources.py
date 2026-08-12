@@ -250,22 +250,15 @@ class TestParseUrlErrors:
 class TestParseUrlOther:
     """Domains we don't special-case are handed to yt-dlp rather than rejected."""
 
-    def test_unknown_domain_becomes_generic_ytdlp_source(self) -> None:
-        url = "https://example.com/video/123"
-        result = parse_url(url)
-        assert isinstance(result, YTSource)
-        assert result.stype == URLSource.OTHER
-        assert result.url == url
-
-    def test_vimeo_becomes_generic_ytdlp_source(self) -> None:
-        url = "https://vimeo.com/12345678"
-        result = parse_url(url)
-        assert isinstance(result, YTSource)
-        assert result.stype == URLSource.OTHER
-        assert result.url == url
-
-    def test_tiktok_becomes_generic_ytdlp_source(self) -> None:
-        url = "https://www.tiktok.com/@user/video/1234567890"
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/video/123",
+            "https://vimeo.com/12345678",
+            "https://www.tiktok.com/@user/video/1234567890",
+        ],
+    )
+    def test_any_dotted_domain_becomes_a_generic_ytdlp_source(self, url: str) -> None:
         result = parse_url(url)
         assert isinstance(result, YTSource)
         assert result.stype == URLSource.OTHER
@@ -569,17 +562,15 @@ class TestQuerySource:
         assert result.stype == URLSource.SEARCH
         assert query_source_of(result) == QUERY_SOURCE_SEARCH
 
-    def test_youtube_watch_url(self) -> None:
-        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
-
-    def test_youtu_be_collapses_onto_the_service(self) -> None:
-        """A shortener is not a different service."""
-        url = "https://youtu.be/dQw4w9WgXcQ"
-        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
-
-    def test_youtube_playlist(self) -> None:
-        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp"
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",  # a shortener is not a different service
+            "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp",
+        ],
+    )
+    def test_every_youtube_form_reports_the_service(self, url: str) -> None:
         assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
 
     def test_spotify_track_link(self) -> None:
