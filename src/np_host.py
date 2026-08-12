@@ -18,7 +18,7 @@ See docs/ARCHITECTURE.md#now-playing-host-model.
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional, Protocol
 
 import discord
 
@@ -36,6 +36,38 @@ def host_ids(message: Optional[discord.Message]) -> tuple[int, int]:
     if message is None:
         return 0, 0
     return message.id, message.channel.id
+
+
+class NpCard(Protocol):
+    """What carries a pointer to one Now Playing card: the live ref while the
+    process that made it is alive, the wire ids always.
+
+    A Protocol rather than a type, so this module states the SHAPE it needs and
+    imports nothing to get it — QueueObject and YTDL satisfy it structurally, and
+    a card is not a yt-dlp concept in either direction. The four fields move
+    together at every site that touches them, which is why they are one parameter
+    rather than four."""
+
+    np_host_ref: Optional["NpHostRef"]
+    np_message_id: int
+    np_channel_id: int
+    np_dedicated: bool
+
+
+def stamp_card(
+    target: NpCard,
+    message: Optional[discord.Message],
+    own_embeds: list[discord.Embed],
+    dedicated: bool,
+) -> None:
+    """Record the host that was live when a fragment ended onto the tail that will
+    dispose of it. The inverse of what NpHost.dispose_previous reads back, so the
+    ref-or-ids pairing has one definition on the write side too."""
+    target.np_host_ref = (
+        NpHostRef(message, own_embeds, dedicated) if message is not None else None
+    )
+    target.np_message_id, target.np_channel_id = host_ids(message)
+    target.np_dedicated = dedicated
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,19 +165,20 @@ class NpHost:
             # send-START order, adopts run in send-RETURN order. Adopting the older
             # message would pull the block up from the true bottom — keep the newer
             # host and shed the older message's block instead.
-            self._spawn(self.retire(message, own_embeds, dedicated))
+            self.shed(message, own_embeds, dedicated)
             return
         self._message = message
         self._own_embeds = own_embeds
         self._dedicated = dedicated
         if old_msg is not None and old_msg.id != message.id:
-            self._spawn(self.retire(old_msg, old_own, old_dedicated))
+            self.shed(old_msg, old_own, old_dedicated)
 
     def shed(
         self, message: discord.Message, own_embeds: list[discord.Embed], dedicated: bool
     ) -> None:
-        """Retire a message that was never adopted, without waiting. The caller's
-        adopt gate declined it, so its block has no host to keep it current."""
+        """Retire a message that is not (or is no longer) the host, without
+        waiting: the block it carries has nothing left to keep it current. Both of
+        adopt's exits and the player's declined adopt gate all end here."""
         self._spawn(self.retire(message, own_embeds, dedicated))
 
     def release(self) -> None:
@@ -201,19 +234,12 @@ class NpHost:
         self.release()
         await self.retire(host, own, dedicated)
 
-    async def dispose_previous(
-        self,
-        *,
-        ref: Optional[NpHostRef],
-        message_id: int,
-        channel_id: int,
-        dedicated: bool,
-    ) -> None:
+    async def dispose_previous(self, card: NpCard) -> None:
         """Remove the frozen card a previous fragment of one play left behind.
 
-        The caller unpacks these off whichever form of the tail it holds — the YTDL
-        about to play, or the QueueObject a bulk mutation is destroying. Without
-        this a -playnow stack accumulates one dead partial bar per interjection.
+        Takes either form of the tail — the YTDL about to play, or the QueueObject a
+        bulk mutation is destroying — since both satisfy NpCard. Without this a
+        -playnow stack accumulates one dead partial bar per interjection.
 
         With the live ref this is retire() verbatim, so a card hosted by a command
         response is strip-edited back to its own embeds. After a restart only the
@@ -221,9 +247,12 @@ class NpHost:
         delete is gated to DEDICATED cards. Never a re-adopt: the live bar belongs
         at the channel bottom.
         """
+        ref = card.np_host_ref
         if ref is not None:
             await self.retire(ref.message, ref.own_embeds, ref.dedicated)
             return
+        message_id, channel_id = card.np_message_id, card.np_channel_id
+        dedicated = card.np_dedicated
         # parse_queue_entry coerces nothing, so three wire values reach this
         # DESTRUCTIVE call unchecked. `dedicated` is the authorization between
         # "delete this message" and "leave a user's reply alone", so `is True` and

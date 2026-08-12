@@ -46,7 +46,7 @@ from src.util import (
     truncate_embed_title,
     get_logger,
 )
-from src.np_host import NpHost, NpHostRef, host_ids
+from src.np_host import NpHost, host_ids, stamp_card
 from src.youtube import YTDL, QueueObject, invalidate_stream_cache
 
 if TYPE_CHECKING:
@@ -1188,7 +1188,7 @@ class MusicPlayer:
         must not wait on, and a failure is cosmetic."""
         for item in items:
             if isinstance(item, QueueObject) and item.is_resume:
-                self._spawn_background(self._dispose_previous_np_card(item))
+                self._spawn_background(self._np_host.dispose_previous(item))
 
     async def _retire_from_queue(self, items: Sequence[QueueItem]) -> None:
         """Everything owed to queue items leaving the queue for good.
@@ -1431,20 +1431,6 @@ class MusicPlayer:
             return True
         self._np_host.shed(message, own_embeds, dedicated)
         return False
-
-    async def _dispose_previous_np_card(self, song: YTDL | QueueObject) -> None:
-        """Dispose of the card the previous fragment of this song left frozen.
-
-        Takes either form of the same tail — the YTDL the loop is about to play, or
-        the QueueObject a bulk mutation is destroying — since both carry the np_*
-        fields and the card outlives whichever goes away. Unpacking them here is
-        what keeps NpHost from needing to know what a song is."""
-        await self._np_host.dispose_previous(
-            ref=song.np_host_ref,
-            message_id=song.np_message_id,
-            channel_id=song.np_channel_id,
-            dedicated=song.np_dedicated,
-        )
 
     async def retire_np_host_on_stop(self) -> None:
         """-stop / alone-disconnect teardown, called by cog.cleanup() once the
@@ -2310,7 +2296,7 @@ class MusicPlayer:
                     # swallows every failure, so a 403 leaves no card and disposing
                     # would delete the only bar in the channel.
                     if song.is_resume and self._np_host.message is not None:
-                        self._spawn_background(self._dispose_previous_np_card(song))
+                        self._spawn_background(self._np_host.dispose_previous(song))
 
                     self._prefetch_task = asyncio.create_task(
                         self._prefetch_next_song()
@@ -2422,21 +2408,17 @@ class MusicPlayer:
                     # zero: any later rebuild_queue re-serializes this object
                     # through SongQueueEntry.from_queue_object, so -shuffle, a
                     # matching -remove or an in-flight-head put_front persist the
-                    # live ids — which is why _dispose_previous_np_card guards them
+                    # live ids — which is why NpHost.dispose_previous guards them
                     # as hostile input.
                     pending_tail = self._pending_resume_tail
                     self._pending_resume_tail = None
                     if skip_history and pending_tail is not None:
-                        pending_tail.np_host_ref = (
-                            NpHostRef(finished_host, finished_own, finished_dedicated)
-                            if finished_host is not None
-                            else None
+                        stamp_card(
+                            pending_tail,
+                            finished_host,
+                            finished_own,
+                            finished_dedicated,
                         )
-                        (
-                            pending_tail.np_message_id,
-                            pending_tail.np_channel_id,
-                        ) = host_ids(finished_host)
-                        pending_tail.np_dedicated = finished_dedicated
                     # stream_failed means THIS fragment never opened a stream —
                     # "nobody heard it" for a fresh song, but not for a resume tail,
                     # whose offset is audio heard under the fragment that parked it
