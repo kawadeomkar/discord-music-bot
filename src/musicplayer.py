@@ -1113,7 +1113,8 @@ class MusicPlayer:
         YTSource). Returns the 1-indexed queue positions removed.
         """
         await self._cancel_prefetch()
-        return await self.queue.remove(url)
+        outcome = await self.queue.remove(url)
+        return outcome.positions
 
     # ── Embed building ────────────────────────────────────────────────────────
 
@@ -2041,6 +2042,10 @@ class MusicPlayer:
                         self.queue.task_done()
                         prefetched_song.cleanup()
                         prefetched_song = None
+                    # Captured where each path takes its item, and handed back to
+                    # try_commit_dequeue() below: a clear() in between voids this
+                    # dequeue even if a put() has since refilled the display.
+                    commit_generation = self.queue.generation
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
@@ -2056,6 +2061,10 @@ class MusicPlayer:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
                                 dequeue_owed = True
+                                # Re-read: queue_get() can block, and a clear()
+                                # during that wait belongs to the queue this item
+                                # came from, not to the one we sampled above.
+                                commit_generation = self.queue.generation
                                 source = await self._resolve_source(source)
                         except asyncio.TimeoutError:
                             log.warning("Queue timed out, disconnecting")
@@ -2101,7 +2110,7 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    if not await self.queue.try_commit_dequeue():
+                    if not await self.queue.try_commit_dequeue(commit_generation):
                         # Cleared while this song resolved (e.g. Inside yt_stream).
                         # Discard without playing: task_done() balances the get()
                         # above, and cleanup() terminates the FFmpeg subprocess

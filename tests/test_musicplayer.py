@@ -5612,7 +5612,7 @@ class TestLoop:
         remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(remaining) == 0
         assert (
-            music_player.queue._pending._unfinished_tasks == 0  # pyright: ignore[reportAttributeAccessIssue]
+            music_player.queue._pending._unfinished_tasks == 0
         )  # task_done() balanced get()
         sent_embed = mocked(music_player._channel.send).call_args.kwargs["embed"]
         assert sent_embed.title == "Playback error — skipping song"
