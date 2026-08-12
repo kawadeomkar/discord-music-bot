@@ -1598,6 +1598,56 @@ class TestGetQueue:
 # ── Resume notice embed ───────────────────────────────────────────────────────
 
 
+def _loop_song(
+    url: str = "https://yt.com/v=loop1", title: str = "Loop Test Song"
+) -> MagicMock:
+    """A song shaped for loop(): real (str/int/None) values for every field
+    NowPlayingData.from_song() reads, since the loop serializes it into the Redis
+    start transaction and MagicMock attribute values are not HSET-able. spec'd, so
+    a field the loop reads that YTDL does not carry raises here instead of reading
+    truthy. Parameterized because a test needing a SECOND song (a prefetch result)
+    must not reach for a bare MagicMock: its attributes read truthy, so start_paused
+    trips and vc.pause() kills the iteration before it reaches the commit — with the
+    assertions already satisfied, so the test still passes."""
+    song = MagicMock(spec=YTDL)
+    song.title = title
+    song.webpage_url = url
+    song.duration_secs = 210
+    song.duration = "0:03:30"
+    song.uploader = "Loop Channel"
+    song.thumbnail = ""
+    song.views = None
+    song.likes = None
+    song.abr = None
+    song.asr = None
+    song.acodec = ""
+    song.requester = None
+    song.start_offset = 0
+    # Real number: loop()'s history step feeds this through
+    # HistoryEntry.from_song, and round(MagicMock) raises.
+    song.position_secs = 195.0
+    # Interjection flags a real YTDL always carries — truthy MagicMock
+    # attributes would trip the loop's start_paused/is_resume gates.
+    song.interjected = False
+    song.is_resume = False
+    song.start_paused = False
+    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+    # clamps its fields into the play_history column domain — query_source
+    # too, which the slug clamp regex-matches.
+    song.analytics = ANALYTICS_ZERO
+    song.user_input = None
+    song.query_source = ""
+    # Unstamped: the loop's or-stamp writes the real clock here, and the
+    # epoch clamp in HistoryEntry raises on a MagicMock.
+    song.played_at = 0.0
+    song.persisted = True
+    # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the
+    # loop reads `traceparent` off it to link this song's trace to the
+    # extraction that minted its URL, and that value is parsed as a string.
+    song.data = {}
+    return song
+
+
 def _fields(embed: discord.Embed) -> dict[str, str]:
     """An embed's fields as a name → value mapping, both asserted non-empty. Same
     reasoning as described(): name and value are `Optional[str]`, so failing that
@@ -7068,41 +7118,7 @@ class TestRestoreStateTtlRefresh:
 class TestLoop:
     @pytest.fixture
     def mock_song(self) -> MagicMock:
-        # Real (str/int/None) values for every field NowPlayingData.from_song()
-        # reads — loop() now serializes the song into the Redis start
-        # transaction, and MagicMock attribute values are not HSET-able.
-        song = MagicMock()
-        song.title = "Loop Test Song"
-        song.webpage_url = "https://yt.com/v=loop1"
-        song.duration_secs = 210
-        song.duration = "0:03:30"
-        song.uploader = "Loop Channel"
-        song.thumbnail = ""
-        song.views = None
-        song.likes = None
-        song.abr = None
-        song.asr = None
-        song.acodec = ""
-        song.requester = None
-        song.start_offset = 0
-        # Real number: loop()'s history step feeds this through
-        # HistoryEntry.from_song, and round(MagicMock) raises.
-        song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        return song
+        return _loop_song()
 
     async def test_exits_immediately_when_bot_closed(
         self, music_player: MusicPlayer
@@ -8680,46 +8696,7 @@ class TestLoopAdditional:
 
     @staticmethod
     def _song(url: str, title: str) -> MagicMock:
-        # See TestLoop.mock_song — real values so the Redis start transaction
-        # in loop() can serialize the song. spec'd, so a field the loop reads
-        # that YTDL does not carry raises here instead of reading truthy.
-        song = MagicMock(spec=YTDL)
-        song.title = title
-        song.webpage_url = url
-        song.duration_secs = 210
-        song.duration = "0:03:30"
-        song.uploader = "Loop Channel"
-        song.thumbnail = ""
-        song.views = None
-        song.likes = None
-        song.abr = None
-        song.asr = None
-        song.acodec = ""
-        song.requester = None
-        song.start_offset = 0
-        # Real number: loop()'s history step feeds this through
-        # HistoryEntry.from_song, and round(MagicMock) raises.
-        song.position_secs = 195.0
-        # Interjection flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.user_input = None
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        song.persisted = True
-        # The cached info-dict a real YTDL keeps. A real dict, not a MagicMock: the
-        # loop reads `traceparent` off it to link this song's trace to the
-        # extraction that minted its URL, and that value is parsed as a string.
-        song.data = {}
-        return song
+        return _loop_song(url, title)
 
     async def test_update_activity_called_at_song_start_and_end(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
