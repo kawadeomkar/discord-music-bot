@@ -440,10 +440,9 @@ class MusicBot(commands.Cog):
         if mp is None:
             return
         log.info("going to cleanup/disconnect")
-        # Before any await, so the loop cannot slip its own iteration end into the
-        # window: claim the song being abandoned mid-play. Nothing else records it
-        # — it is not in the queue, clear_connection() drops the parked copy, and
-        # the loop is cancelled below while parked in play_next.wait().
+        # Claim the song being abandoned mid-play, before any await so the loop
+        # cannot slip its iteration end into the window. Nothing else records it: it
+        # left the queue at start, and clear_connection() drops the parked copy.
         pending_history = mp.claim_current_song_for_history()
         try:
             # Cancel tasks before disconnecting so the loop cannot wake and start
@@ -465,12 +464,9 @@ class MusicBot(commands.Cog):
             if pending_history is not None:
                 # After the disconnect, never inside the teardown gather: gather
                 # completes on its SLOWEST member, so Redis IO there delays the
-                # silence the user asked for — measured at 20s against an
-                # unreachable host (connect timeout x the pool's retry ladder),
-                # and unbounded against one that accepts and then stalls, since
-                # the pool sets no socket_timeout. Nothing below reads this, and
-                # the entry was claimed synchronously above, so the only thing
-                # ordering buys is that audio stops first.
+                # silence -stop asked for — measured at 20s against an unreachable
+                # host, and unbounded against one that accepts and then stalls,
+                # since the pool sets no socket_timeout.
                 await mp.history.add(pending_history)
             # The loop's CancelledError handler already resets presence, but only
             # if it was parked inside the block that handles it. Repeated here —
@@ -867,11 +863,10 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # Serialized per guild, like -resume. Two concurrent invocations both read a
-    # live current_song, both park a resume tail for it, and that one play then
-    # comes back twice — with one played_at, so play_history_dedup silently keeps
-    # a single row while -history shows two. wait=False: the second caller is told
-    # to wait rather than queued behind a 1-4s extraction.
+    # Serialized per guild, like -resume: two concurrent invocations both read a
+    # live current_song and both park a resume tail for it, so one play comes back
+    # twice. wait=False — the second caller is told to wait rather than queued
+    # behind a 1-4s extraction.
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
@@ -1128,9 +1123,8 @@ class MusicBot(commands.Cog):
             # re-resolve and (for a playlist) enqueue all tracks right after the
             # first-track-only notice above. Front, not append: the user asked for
             # "now", and this window can be seconds long with songs queued behind.
-            # It interrupted nothing, so it is an ordinary front-queued song —
-            # keeping the marker would attribute an interjection that never
-            # happened (the flag is telemetry now, not behaviour).
+            # It interrupted nothing, so keeping the marker would attribute an
+            # interjection that never happened.
             qobj.interjected = False
             # The player's wrapper, not queue.put_front directly: it stamps the
             # enqueue under the queue mutex like every other user-facing insert.
@@ -1534,13 +1528,10 @@ class MusicBot(commands.Cog):
     async def clear(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
-            # Both bulk mutations destroy the Redis mirror while reading the
-            # IN-MEMORY display, so running one against an unrestored player
-            # deletes a saved queue it cannot see. A -playnow stack is the case
-            # that bites: those tails are played songs, and _flush_played records
-            # them from the display — empty display, no rows, and the list they
-            # lived on is gone. validate_commands only requires the AUTHOR in
-            # voice, so a cold player is reachable here.
+            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
+            # unrestored player deletes a saved queue it cannot see — including the
+            # -playnow tails _flush_played would have recorded. validate_commands
+            # only requires the AUTHOR in voice, so a cold player reaches here.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
                     embed=notice_embed(
@@ -1602,13 +1593,10 @@ class MusicBot(commands.Cog):
                 )
                 return
             mp = self.get_mp(ctx)
-            # Both bulk mutations destroy the Redis mirror while reading the
-            # IN-MEMORY display, so running one against an unrestored player
-            # deletes a saved queue it cannot see. A -playnow stack is the case
-            # that bites: those tails are played songs, and _flush_played records
-            # them from the display — empty display, no rows, and the list they
-            # lived on is gone. validate_commands only requires the AUTHOR in
-            # voice, so a cold player is reachable here.
+            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
+            # unrestored player deletes a saved queue it cannot see — including the
+            # -playnow tails _flush_played would have recorded. validate_commands
+            # only requires the AUTHOR in voice, so a cold player reaches here.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
                     embed=notice_embed(

@@ -1165,11 +1165,10 @@ class TestHistoryEntryFromSong:
         )
 
     def test_guild_id_message_id_and_channel_id_are_required_keywords(self) -> None:
-        # Requiredness is the whole protection for the host ids: play_history's
-        # CHECKs are `>= 0` with default 0, so a forgotten stamp inserts cleanly
-        # and reads as a song that genuinely had no host. pyright catches a
-        # missing argument only while no default exists — adding one silently
-        # retires the guarantee, and this is what notices.
+        # play_history's CHECKs are `>= 0` with default 0, so a forgotten host
+        # stamp inserts cleanly and reads as a song that had no host. Requiredness
+        # is what catches it, and pyright only enforces that while no default
+        # exists — adding one would silently retire the guarantee.
         song = _history_song_stub()
         with pytest.raises(TypeError):
             HistoryEntry.from_song(song, guild_id=111, message_id=0)  # pyright: ignore[reportCallIssue]

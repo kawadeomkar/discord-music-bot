@@ -60,13 +60,10 @@ class _FrontQueue(asyncio.Queue[QueueItem]):
     """asyncio.Queue plus head insertion.
 
     _queue is already a collections.deque, so this is put_nowait's bookkeeping
-    (cpython asyncio/queues.py:156) run against appendleft instead of append. Its
-    full/shutdown checks are dropped deliberately: _pending is unbounded and never
-    shut down, so both branches are unreachable.
-
-    Only _init/_get/_put are sanctioned subclass hooks; the private names below
-    are plain internals, so a CPython rename breaks here — loudly, at first use —
-    and nowhere else.
+    (cpython asyncio/queues.py:156) run against appendleft. The full/shutdown
+    checks are dropped: _pending is unbounded and never shut down. Only
+    _init/_get/_put are sanctioned subclass hooks, so a CPython rename of the
+    private names below breaks here, at first use.
     """
 
     def put_front_nowait(self, item: QueueItem) -> None:
@@ -159,19 +156,17 @@ class GuildQueue:
         also call task_done().
 
         `item` may be the RESOLVED form of what was dequeued (YTSource →
-        QueueObject). The display head is realigned onto it, which matters beyond
-        tidiness: a later put_front taking its in-flight-head branch rebuilds the
-        Redis mirror FROM the display, so leaving the unresolved YTSource there
-        persisted a search entry over an entry that had already resolved. A crash
-        then re-ran the ytsearch, paying the extraction again and free to rank a
-        different video than the one the queue had settled on."""
+        QueueObject), so the display head is realigned onto it: put_front's
+        in-flight-head branch rebuilds the Redis mirror FROM the display, and a
+        stale YTSource there would persist a search over an entry that had already
+        resolved — re-running the ytsearch after a crash, free to rank a different
+        video."""
         # Balance the abandoned get(); the head insert below re-increments the
         # task counter, transferring the slot to the future consumer.
         self._pending.task_done()
         self._pending.put_front_nowait(item)
-        # Same slot on the display leg. Positional, not by identity: this item IS
-        # the head's resolved form, and the head is where the abandoned get() took
-        # it from.
+        # Positional: this item is the head's resolved form, and the head is where
+        # the abandoned get() took it from.
         if self._display:
             self._display[0] = item
 
@@ -280,10 +275,9 @@ class GuildQueue:
 
             for item in reversed(new_items):
                 self._pending.put_front_nowait(item)
-            # Lift the in-flight head off, insert behind it, put it back. The
-            # display tail is carried over rather than recomputed from _pending,
-            # so the triad invariant is assumed here, not re-established: a
-            # pre-existing drift survives this insert instead of being healed.
+            # Lift the in-flight head off, insert behind it, put it back. The tail
+            # is carried over rather than recomputed from _pending, so a
+            # pre-existing triad drift survives this insert rather than being healed.
             for _ in in_flight:
                 self._display.popleft()
             self._display.extendleft(reversed(in_flight + new_items))
@@ -459,26 +453,15 @@ class GuildQueue:
         )
 
     def resume_tail_depth(self) -> int:
-        """How many parked plays are waiting behind the song that just cut the
-        line — the run of consecutive resume tails after it. 1 is a plain
-        -playnow, 2+ is a stack.
+        """How many parked plays are waiting behind the song that just cut the line
+        — the run of consecutive resume tails after it. 1 is a plain -playnow, 2+ a
+        stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
+        gone by the time this runs and only its tail is queued.
 
-        Counts PLAYS, not fragments: an interrupted song's live fragment is gone by
-        the time this runs and only its tail is queued, which is the same reason
-        has_resume_tail exists. Stops at the first non-tail — anything past that
-        was queued normally and was never interrupted.
-
-        The interjected song is not always at index 0. put_front's in-flight-head
-        branch keeps a dequeued-but-uncommitted item ahead of what it inserts, and
-        that branch is reachable — the loop awaiting a still-running prefetch while
-        interject() runs inside that await. Skipping a fixed index 1 then started
-        the run ON the interjected song, which is not a tail, so the count came
-        back 0 for a real interjection: the only observability on stack depth,
-        reading zero in the interleaving most worth observing."""
+        The interjected song is not always at index 0 — put_front's in-flight-head
+        branch keeps a dequeued-but-uncommitted item ahead of what it inserts — so
+        the run starts after whatever _pending does not account for."""
         items = list(self._display)
-        # Everything _pending does not account for is in flight and belongs to a
-        # consumer, not to this insert. The interjected song is the first item
-        # after it; the tails follow.
         head = len(items) - self._pending.qsize()
         start = (head if head > 0 else 0) + 1
         depth = 0
@@ -529,19 +512,12 @@ class GuildQueue:
         means the queue was cleared during the resolve and the caller discards
         the song — its task_done() and FFmpeg cleanup stay caller-side.
 
-        `generation` is what the queue read when this dequeue took its item.
-        Emptiness alone is NOT the question, though it looks like it: clear()
-        empties the display, but any put() landing before this commit refills it,
-        and the head then belongs to the NEW song. Committing there pops that
-        entry, plays the cleared song anyway, and — since -clear already flushed
-        it to history — records the play a second time. `-clear` immediately
-        followed by `-play` is a common pair and the resolve window is a whole
-        yt-dlp round, so this is reachable, not theoretical.
-
-        Identity would not answer it either: _resolve_source() replaces a
-        YTSource with the QueueObject it resolved to, so the display head and the
-        item in hand are legitimately different objects for one queue slot.
-        The generation is the only thing a refill cannot forge."""
+        `generation` is what the queue read when this dequeue took its item, and
+        neither emptiness nor identity can stand in for it. A put() landing before
+        the commit refills the display, so the head belongs to the NEW song and
+        committing pops that entry while playing (and re-recording) the cleared one.
+        And _resolve_source() replaces a YTSource with the QueueObject it resolved
+        to, so head and item are legitimately different objects for one slot."""
         async with self._mutex:
             if generation != self._generation:
                 return False
@@ -625,7 +601,7 @@ class GuildQueue:
             query_source=entry.query_source,
             played_at=entry.played_at,
             # No np_host_ref: a live Message cannot survive a restart, so a
-            # rehydrated tail can only delete a dedicated card by id (§ consume).
+            # rehydrated tail can only delete a dedicated card by id.
             np_message_id=entry.np_message_id,
             np_channel_id=entry.np_channel_id,
             np_dedicated=entry.np_dedicated,

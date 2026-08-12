@@ -513,8 +513,8 @@ class TestQueueClearFlushesPlayedSongs:
     async def test_unplayed_entries_are_not_recorded(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        # played_at == 0.0 is the whole test. An ordinary queued song was never
-        # heard, and recording it would invent a play out of a cancelled one.
+        # played_at stays 0.0: an ordinary queued song was never heard, and
+        # recording it would invent a play out of a cancelled one.
         await music_player.queue_put(
             QueueObject("https://yt.com/v=never", "Never Played", mock_author)
         )
@@ -7821,10 +7821,9 @@ class TestInterject:
             await music_player.interject(playnow_obj, mock_vc)
 
         mock_vc.stop.assert_not_called()
-        # The marker IS taken, and that is the fix rather than a regression: the
-        # tail is on the queue whatever the loop did, so it will record this play.
-        # Leaving the marker unset here — as this test used to assert — let the
-        # loop's own iteration end record it too, one play as two rows.
+        # The marker is taken even though the song moved on: the tail is on the
+        # queue whatever the loop did, so it records this play. Leaving it unset
+        # would let the loop's own iteration end record it too.
         assert music_player._skip_history_for is live_song
 
     async def test_depth_and_over_interjection_reach_the_span(
@@ -9050,8 +9049,8 @@ class TestPlaynowLoopStart:
     async def test_a_resume_disposes_of_the_previous_card_after_its_own_is_up(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """Ordering is the point: the new bar must be in the channel before the old
-        one goes, or the channel is momentarily without a Now Playing card."""
+        """The new bar must be in the channel before the old one goes, or the
+        channel is momentarily without a Now Playing card."""
         order: list[str] = []
         mock_song.is_resume = True
         mock_song.start_offset = 42

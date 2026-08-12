@@ -48,19 +48,11 @@ CREATE TABLE IF NOT EXISTS play_history (
     requester_name text        NOT NULL DEFAULT '',
     thumbnail      text        NOT NULL DEFAULT '',
     uploader       text        NOT NULL DEFAULT '',
-    -- When the audio STARTED, not when the row was recorded, and it is one value
-    -- per PLAY rather than per fragment: every -playnow resume tail inherits the
-    -- played_at of the fragment it continues, so an interrupted song files under
-    -- the moment a listener first heard it.
-    --
-    -- Two consequences worth knowing before querying this column. Rows are NOT
-    -- in recording order, so `ORDER BY played_at` and the order the Redis list
-    -- was written diverge whenever anything cut the line. And an interrupted
-    -- play's [played_at, played_at + played_secs] interval OVERLAPS the songs
-    -- that interrupted it, for a bot that plays exactly one song at a time — so
-    -- "what was playing at time T" has more than one answer, by construction.
-    -- Crash recovery widens the same seam: played_at survives the restart while
-    -- played_secs absorbs the downtime (see crashed_position_at's FIXME).
+    -- When the audio STARTED, one value per PLAY rather than per fragment: every
+    -- -playnow resume tail inherits the played_at of the fragment it continues.
+    -- So rows are not in recording order, and an interrupted play's [played_at,
+    -- played_at + played_secs] interval overlaps the songs that interrupted it —
+    -- "what was playing at time T" has more than one answer here.
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
 
     -- When the song was first added to the queue (epoch 0 = unknown, the same
@@ -91,35 +83,19 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- default fills it, and HistoryEntry stays exactly the wire schema.
     inserted_at    timestamptz NOT NULL DEFAULT now(),
 
-    -- The Now Playing embed that hosted this song: the message, and the channel
-    -- it was posted in.
+    -- The Now Playing embed that hosted this song, resolvable only as a PAIR:
+    -- discord.py has no guild.fetch_message(id), so resolve via
+    -- `channel.get_partial_message(message_id)`. The persisted text-channel id
+    -- cannot stand in, which is why channel_id exists — set_context reassigns the
+    -- home channel on every command, so it records where the last command ran
+    -- rather than where any card was posted. Both are read off the same message at
+    -- song end, so they are both real or both 0. 0 also covers a failed NP send, a
+    -- host deleted mid-song, and rows predating the columns.
     --
-    -- A RESOLVABLE PAIR, and only as a pair. discord.py has no
-    -- guild.fetch_message(id), so a message id alone locates nothing — resolve
-    -- via the channel: `channel.get_partial_message(message_id)`. The persisted
-    -- text-channel id would NOT have worked as a stand-in, which is why this
-    -- column exists: MusicPlayer.set_context reassigns the home channel on every
-    -- command, so the NP host migrates across text channels within one guild and
-    -- that id only records wherever the last command ran. Both values are read
-    -- off the same message at the same instant (musicplayer's loop, at song end),
-    -- so they are both real or both 0 — a channel id from any other source would
-    -- 404 for precisely the host-migrated plays a pointer is wanted for.
-    --
-    -- Populated by the archive: _INSERT_SQL / _RECENT_SQL / _entry_to_row /
-    -- _row_to_entry in history_archive.py all carry these columns. HistoryEntry
-    -- carries them on the Redis wire — HistoryEntry.from_song stamps them from
-    -- the host the playback loop captured at song end — and the drainer writes
-    -- them through unchanged. 0 is a real recorded value, but an ambiguous one:
-    -- it covers a song whose NP send failed, a host a listener deleted mid-song
-    -- (released on discord.NotFound), and any entry written by a build older
-    -- than the field.
-    --
-    -- Kept out of play_history_dedup, and not foreign keys, for the same reason:
-    -- the NP host is not stable or permanent. It migrates across messages during
-    -- one song (MusicContext.send re-hosts the block on every command response in
-    -- the home channel), and a dedicated NP message is DELETED when retired. So
-    -- two deliveries of one play can disagree on them — in the key that would
-    -- land them as two rows — and the message they point at may no longer exist.
+    -- Kept out of play_history_dedup, and not foreign keys: the host migrates
+    -- across messages during one song and a dedicated NP message is DELETED when
+    -- retired, so two deliveries of one play can disagree on them and the message
+    -- they point at may no longer exist.
     message_id     bigint      NOT NULL DEFAULT 0,
     channel_id     bigint      NOT NULL DEFAULT 0,
 
@@ -154,18 +130,13 @@ CREATE TABLE IF NOT EXISTS play_history (
     )
 );
 
--- CREATE TABLE IF NOT EXISTS is a no-op against a table that already exists, so
--- on its own it records this migration as applied over WHATEVER shape it found.
--- That is the failure mode the whole schema-version machinery cannot see: the
--- ledger says migrated, verify_schema() agrees, and every insert then raises
--- UndefinedColumnError. These make the CREATE genuinely idempotent for the
--- columns added after the table's first shape, so "recorded as applied" and
--- "actually has the columns" cannot diverge. Each is a no-op on a correct table.
---
--- Column-level only. The CHECK constraints are inline in the CREATE above and
--- are NOT retrofitted here: Postgres has no ADD CONSTRAINT IF NOT EXISTS, and
--- the only shape that reaches this path is a pre-release DDL that never shipped.
--- Anything added from here needs its line here as well as in the CREATE.
+-- CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so on its own
+-- it records this migration as applied over whatever shape it found — a drift the
+-- schema-version machinery cannot see: the ledger says migrated, verify_schema()
+-- agrees, and every insert raises UndefinedColumnError. These make the CREATE
+-- idempotent per column and are no-ops on a correct table, so a new column needs a
+-- line here as well as above. Columns only — Postgres has no ADD CONSTRAINT IF
+-- NOT EXISTS, and the CHECKs are inline in the CREATE.
 ALTER TABLE play_history ADD COLUMN IF NOT EXISTS message_id     bigint      NOT NULL DEFAULT 0;
 ALTER TABLE play_history ADD COLUMN IF NOT EXISTS channel_id     bigint      NOT NULL DEFAULT 0;
 ALTER TABLE play_history ADD COLUMN IF NOT EXISTS queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0);
@@ -183,15 +154,11 @@ ALTER TABLE play_history ADD COLUMN IF NOT EXISTS inserted_at    timestamptz NOT
 -- Accepted: a silent merge of indistinguishable pre-archive rows beats a wider
 -- key that stops deduping the redeliveries this index exists for.
 --
--- Second edge, and it cuts the other way: every fragment of one interrupted play
--- INHERITS played_at (see the column comment), so this key also collapses a
--- genuine bug into silence. If two writers ever record one play, Postgres keeps
--- one row while the Redis list keeps both — so -history shows the duplicate and
--- -leaderboard does not, with no rejected row and no log line. That made the
--- archive the only place the exactly-once defects found in review did NOT show.
--- The writers were fixed rather than the key widened (widening it would stop
--- deduping the outbox redeliveries this index exists for), but nothing here
--- reports a masked duplicate: an inserted-vs-sent count on the drain is owed.
+-- Second edge, cutting the other way: every fragment of one interrupted play
+-- INHERITS played_at (see the column comment), so the key also masks a genuine
+-- double-record. Two writers recording one play land as one row here while the
+-- Redis list keeps both — -history shows the duplicate, the archive does not, and
+-- nothing rejects or logs it.
 CREATE UNIQUE INDEX IF NOT EXISTS play_history_dedup
     ON play_history (guild_id, played_at, webpage_url);
 

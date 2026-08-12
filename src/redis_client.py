@@ -87,16 +87,11 @@ HISTORY_CACHE_LIMIT = 50
 # Transient per-song fields and the playback-position fields, cleared together on
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
-# Scrubbed together when a song ends or a connection is torn down. ROLLBACK NOTE:
-# an older image's copy of this tuple does not name the fields added since, so
-# `just up <older-sha>` leaves current_song_played_at / _is_resume / _start_paused
-# in the hash while it clears the rest, and its own song starts never rewrite them.
-# Roll forward, crash mid-song, and from_crashed_state reads a value belonging to a
-# song that finished under the old build. Same shape as the `volume` incident, and
-# bounded the same way: this build rewrites all three on EVERY song start
-# (_now_playing_state_mapping is unconditional), so the stale value survives only
-# until the next song plays under a build that knows the field. Delete this note
-# once no supported rollback target predates them.
+# ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
+# since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
+# _start_paused in the hash and from_crashed_state can later read a value belonging
+# to a song that finished under the old build. Bounded: this build rewrites all
+# three on every song start. Delete once no rollback target predates them.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,

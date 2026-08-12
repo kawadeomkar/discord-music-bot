@@ -1030,10 +1030,8 @@ class TestRejectionIsolation:
         self, fake_redis: Redis
     ) -> None:
         # UndefinedColumnError is the DATABASE being older than this build, not a
-        # bad row — which is exactly why leaving it transient was catastrophic: it
-        # fails EVERY insert, and the redelivery lands on history:outbox, a key
-        # with no TTL that eviction is not allowed to touch. Unbounded, silent,
-        # and it ends by rejecting every Redis write in the process.
+        # bad row, so left transient it fails EVERY insert and redelivers onto
+        # history:outbox — a key with no TTL that eviction may not touch.
         archive = PoisonArchive(
             {"Song 1", "Song 2", "Song 3"},
             exc=asyncpg.exceptions.UndefinedColumnError("channel_id"),

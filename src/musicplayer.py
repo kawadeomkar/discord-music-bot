@@ -818,48 +818,29 @@ class MusicPlayer:
     def claim_current_song_for_history(self) -> Optional[HistoryEntry]:
         """Take the playing song's history entry so a teardown can record it.
 
-        A teardown abandons a song mid-play, and nothing else will ever record it:
-        it is not in the queue (its entry was LPOPed when it started),
-        clear_connection() drops the parked state copy, and the loop's own write
-        site never runs — it is cancelled while parked in play_next.wait(). Before
-        this, -stop and the alone-disconnect simply lost the song a listener was
-        hearing.
+        A teardown abandons a song mid-play and nothing else records it: its queue
+        entry was LPOPed when it started, clear_connection() drops the parked state
+        copy, and the loop is cancelled while parked in play_next.wait().
 
-        SYNCHRONOUS by design: it reads the song, decides, and takes the
-        _skip_history_for marker with no await in between, so the loop cannot
-        record the same song from its iteration end through a window this opened.
-        The marker is the same exactly-once primitive interject() uses, pointed at
-        the same problem from the other side.
+        SYNCHRONOUS by design — it reads the song, decides, and takes the
+        _skip_history_for marker with no await between, and the loop reads that
+        marker after its prefetch await, so exactly one of the two writes.
 
-        Falls back to _ended_song, and that is not belt-and-braces. The loop nulls
-        current_song BEFORE `await prefetch_task`, which its own comment notes can
-        sit for seconds on a cold extraction, and only writes history after it — so
-        current_song alone is blind for exactly as long as an extraction takes, and
-        a teardown landing there cancels the loop straight past its write site. A
-        song ending is also when the last listener tends to leave, so the
-        alone-disconnect aims at this window rather than away from it.
-
-        Exclusivity across that window is the marker's, not a second flag's: the
-        loop reads _skip_history_for AFTER the prefetch await, so a claim that
-        lands inside it is already seen and suppresses the loop's own write.
-
-        None when there is nothing to record.
+        The _ended_song fallback covers that await: current_song is nulled before it
+        and history written after, so current_song alone is blind for as long as a
+        cold extraction takes. None when there is nothing to record.
         """
         song = self.current_song or self._ended_song
         if song is None:
             return None
         if self._skip_history_for is song:
-            # An interjection already parked this song's tail, and a teardown
-            # leaves guild:{id}:queue intact under its 24h TTL — so the play comes
-            # back on -resume and is recorded there. Recording here as well would
-            # file one play as two.
+            # An interjection parked this song's tail, and a teardown leaves the
+            # queue intact under its 24h TTL — so -resume plays it and records it.
             return None
         if not song.produced_audio:
             # ffmpeg exited without a frame: nobody heard it (see produced_audio).
             return None
-        # The host as of right now, captured before cleanup()'s
-        # retire_np_host_on_stop() disposes of it — the id still identifies which
-        # message carried the block, which is what the column is for.
+        # Captured before cleanup()'s retire_np_host_on_stop() disposes of it.
         host = self._np_host_message
         entry = HistoryEntry.from_song(
             song,
@@ -1160,26 +1141,18 @@ class MusicPlayer:
         its queue object exits the queue".
 
         These are -playnow resume tails: songs a listener heard part of, whose
-        remaining tail is being discarded, so nothing else will ever record them
-        (the loop's single write site only fires for a song it played to its end).
-        `played_at > 0.0` is the whole test — the loop stamps it at vc.play() and
-        the tail inherits it. The isinstance is not decorative: a YTSource has no
-        such field, and a search that played has by definition already resolved.
+        remaining tail is discarded, so nothing else records them (the loop's single
+        write site only fires for a song it played to its end). `played_at > 0.0` is
+        the whole test — the loop stamps it at vc.play() and the tail inherits it;
+        the isinstance guard is real, since a YTSource has no such field.
 
-        Not covered, deliberately: -stop and the idle disconnect leave the queue
-        intact under its 24h TTL, so those tails have not exited and a later
-        -resume still plays them.
+        -stop and the idle disconnect are deliberately not covered: they leave the
+        queue intact under its 24h TTL, so a later -resume still plays those tails.
 
-        The third exit is _retire_failed_dequeue(), which calls this — a tail
-        that never gets to play has left the queue just as permanently as one
-        -clear destroyed.
-
-        Accepted crash window: GuildQueue.clear()/remove() destroy the Redis
-        mirror inside the bulk mutex and this runs after it, so a crash in
-        between loses these records with no row and no log line. Same
-        at-most-once posture as the dequeue LPOP (see redis_client.pop_queue);
-        the alternative is history IO under the queue mutex, which would couple
-        every bulk mutation to outbox latency.
+        Accepted crash window: clear()/remove() destroy the Redis mirror inside the
+        bulk mutex and this runs after it, so a crash in between loses these records
+        with no row and no log line — the same at-most-once posture as the dequeue
+        LPOP (see redis_client.pop_queue).
         """
         played = [
             item
@@ -1191,10 +1164,6 @@ class MusicPlayer:
         ]
         if not played:
             return
-        # Concurrently, not one await at a time: each write is an independent
-        # Redis MULTI plus an outbox push, and a deep stack pays the round trip
-        # per level before -clear can reply. They are idempotent under
-        # play_history_dedup, so ordering between them buys nothing.
         entries = []
         for item in played:
             try:
@@ -1202,33 +1171,29 @@ class MusicPlayer:
                     HistoryEntry.from_queue_object(item, guild_id=self._guild.id)
                 )
             except Exception as e:
-                # parse_queue_entry coerces nothing, and HistoryEntry.__post_init__
-                # deliberately raises rather than coercing — so one non-conforming
-                # wire value used to abort the whole batch out of queue_clear(),
-                # after clear() had already destroyed the mirror. The user got
-                # "Failed" on a queue that WAS cleared and every play in the batch
-                # was dropped. One bad entry now costs only itself.
+                # __post_init__ raises rather than coercing, and clear() has already
+                # destroyed the mirror by now — so one malformed wire value must not
+                # abort the batch and drop every other play with it.
                 log.warning(
                     f"history flush skipped a malformed entry in guild "
                     f"{self._guild.id}: {type(e).__name__}: {e}"
                 )
         if not entries:
             return
+        # Concurrently: each write is an independent MULTI plus an outbox push, and
+        # a deep stack would pay the round trip per level before -clear can reply.
         await asyncio.gather(*(self.history.add(entry) for entry in entries))
 
     async def _dispose_orphaned_cards(self, items: Sequence[QueueItem]) -> None:
         """Retire the frozen NP card of every played tail leaving the queue.
 
-        A tail carries a pointer to the card its interrupted fragment left behind
-        and disposes of it when the tail STARTS — so a tail destroyed before it
-        ever plays takes the only pointer with it, and the dead partial bar stays
-        in the channel forever. That is exactly the accumulation the feature
-        exists to stop, reached through the most-used escape hatch: -clear on a
-        3-deep stack strands three of them.
+        A tail disposes of the card its interrupted fragment left behind when it
+        STARTS, so a tail destroyed before it ever plays takes the only pointer with
+        it and the dead partial bar stays in the channel — -clear on a 3-deep stack
+        strands three.
 
-        Fire-and-forget per item. These are rate-limited Discord calls and the
-        command must not wait on them, and a failure is cosmetic — the disposal
-        itself swallows NotFound/Forbidden."""
+        Fire-and-forget per item: these are rate-limited Discord calls the command
+        must not wait on, and a failure is cosmetic."""
         for item in items:
             if isinstance(item, QueueObject) and item.is_resume:
                 self._spawn_background(self._dispose_previous_np_card(item))
@@ -1239,16 +1204,12 @@ class MusicPlayer:
         """Retire a dequeue that will never play, and record it if a listener
         already heard part of it.
 
-        For an ordinary song the flush is a no-op and dropping it is right —
-        nobody heard it. For a -playnow resume TAIL it is the difference between
-        one record and none: the interrupted fragment declined to record itself
-        (_skip_history_for, set when the interjection parked this tail), so the
-        tail is the only writer left for a play that may have run for minutes.
-
-        This is the likely failure, not an exotic one. A tail behind a deep stack
-        waits minutes while ytdl:stream:* caps at 30, and re-extraction failure
-        is the most common runtime error this bot has — so every level of a
-        stack is an independent chance to lose a play."""
+        For an ordinary song the flush is a no-op — nobody heard it. For a -playnow
+        resume TAIL it is the difference between one record and none: the
+        interrupted fragment declined to record itself (_skip_history_for), so the
+        tail is the only writer left for a play that may have run for minutes. A
+        tail behind a deep stack waits minutes while ytdl:stream:* caps at 30, so
+        every level of a stack is an independent chance to lose one."""
         await self.queue.finish_failed_dequeue(item, context=context)
         if item is not None:
             await self._flush_played([item])
@@ -1506,15 +1467,11 @@ class MusicPlayer:
 
         The STRIP takes the edit lock so an in-flight tick edit finishes first:
         concurrent PATCHes resolve last-write-wins server-side, and a tick landing
-        after the strip would resurrect the block on the retired host with nothing
-        to clean it up.
+        after the strip would resurrect the block on the retired host.
 
-        The DELETE does not, and the asymmetry is the point. Nothing can
-        resurrect a deleted message — a late tick edit 404s and is swallowed —
-        while message deletion is its own, stricter ratelimit bucket. Held across
-        it, one 429 stalled every NP edit for the NEW song for the retry-after,
-        so a burst of -playnow serialized the live progress bar behind a queue of
-        deletes."""
+        The DELETE does not. Nothing can resurrect a deleted message, while message
+        deletion is its own stricter ratelimit bucket — held across it, one 429
+        stalled every NP edit for the NEW song for the retry-after."""
         try:
             if dedicated:
                 await message.delete()  # pure NP message → remove entirely
@@ -1530,59 +1487,44 @@ class MusicPlayer:
     async def _dispose_previous_np_card(self, song: YTDL | QueueObject) -> None:
         """Remove the frozen card the previous fragment of this song left behind.
 
-        Takes either form of the same tail: the YTDL the loop is about to play, or
-        the QueueObject a bulk mutation is destroying before it ever plays. Both
-        carry the four np_* fields, and both reach here for the same reason — the
-        card outlives whichever one goes away.
+        Takes either form of the same tail — the YTDL the loop is about to play, or
+        the QueueObject a bulk mutation is destroying — since both carry the np_*
+        fields and the card outlives whichever goes away. Without it a -playnow
+        stack accumulates one dead partial bar per interjection.
 
-        Without it a -playnow stack accumulates one dead partial bar per
-        interjection: song end RELEASES the host rather than retiring it (a
-        completed bar is a truthful record), and an interrupted fragment's bar is
-        finalized at its true position and then simply left in the channel.
-
-        Never a re-adopt: _adopt_np_host refuses a message older than the current
-        host by design, because the live bar belongs at the CHANNEL BOTTOM. The
-        stored ids exist to dispose of the old card, not to move back to it.
-
-        Two paths, and the difference is not cosmetic. With the live ref (the
-        no-crash case) this is _retire_np_host verbatim, so a card hosted by a
+        With the live ref this is _retire_np_host verbatim, so a card hosted by a
         command response is strip-edited back to its own embeds. After a restart
-        only the ids survive, and own_embeds cannot be reconstructed from them —
-        so a by-id delete is gated to DEDICATED cards, or it would destroy a
-        user's command reply. A frozen block left on a response after a crash is
-        accepted noise.
+        only the ids survive and own_embeds cannot be reconstructed from them, so
+        the by-id delete is gated to DEDICATED cards. Never a re-adopt: the live bar
+        belongs at the channel bottom. See
+        docs/ARCHITECTURE.md#now-playing-host-model.
         """
         ref = song.np_host_ref
         if ref is not None:
             await self._retire_np_host(ref.message, ref.own_embeds, ref.dedicated)
             return
         mid, cid = song.np_message_id, song.np_channel_id
-        # parse_queue_entry coerces nothing — a malformed cosmetic field must not
-        # cost the queue a whole song — so THREE wire values reach this
-        # DESTRUCTIVE call and each is checked here rather than in the parser.
-        # np_dedicated is the authorization, not a target: it is the only thing
-        # between "delete this message" and "leave a user's reply alone", so it
-        # gets `is True` and not truthiness — a wire "false" is a truthy string.
+        # parse_queue_entry coerces nothing, so three wire values reach this
+        # DESTRUCTIVE call unchecked. np_dedicated is the authorization between
+        # "delete this message" and "leave a user's reply alone", so `is True` and
+        # not truthiness — a wire "false" is a truthy string.
         if song.np_dedicated is not True:
             return
-        # `is True` above, and bool excluded here: isinstance(True, int) is True
-        # in Python, so a wire `true` would render "True" into the REST route.
+        # bool excluded: isinstance(True, int) is True, so a wire `true` would
+        # render "True" into the REST route.
         if isinstance(mid, bool) or isinstance(cid, bool):
             return
         if not (isinstance(mid, int) and isinstance(cid, int)):
             return
         if not (mid > 0 and cid > 0):
             return
-        # Scoped to THIS guild before anything is issued. The ids are wire values
-        # up to the queue key's 24h TTL old, and a PartialMessageable validates
-        # nothing — without this, a corrupted or stale channel id deletes a
-        # message wherever it happens to resolve, including another guild or a DM.
+        # Scoped to THIS guild first: a PartialMessageable validates nothing, so a
+        # stale or corrupted channel id would delete a message wherever it happens
+        # to resolve, including another guild or a DM.
         if self._guild.get_channel_or_thread(cid) is None:
             return
-        # get_partial_messageable, not get_channel: the pair is all a DELETE needs,
-        # and this issues it without the channel being cached — which it may not be
-        # on the restart path that is the only way to reach this branch. guild_id
-        # is passed so the route can never be built against another guild.
+        # get_partial_messageable: issues the DELETE without the channel being
+        # cached, which it may not be on the restart path that reaches this branch.
         channel = self.bot.get_partial_messageable(cid, guild_id=self._guild.id)
         try:
             await channel.get_partial_message(mid).delete()
@@ -1593,11 +1535,9 @@ class MusicPlayer:
         except discord.HTTPException as e:
             log.warning(f"NP card cleanup failed for guild {self._guild.id}: {e}")
         except Exception as e:
-            # discord.py's HTTP layer surfaces aiohttp.ClientError and
-            # asyncio.TimeoutError once its own retries are spent, and this runs
-            # fire-and-forget — without this arm those land as asyncio's "Task
-            # exception was never retrieved", outside structlog and outside the
-            # span, so a systematically failing cleanup is invisible.
+            # discord.py surfaces aiohttp.ClientError and asyncio.TimeoutError once
+            # its retries are spent, and this runs fire-and-forget — unhandled they
+            # land outside structlog as "Task exception was never retrieved".
             log.warning(
                 f"NP card cleanup errored for guild {self._guild.id}: "
                 f"{type(e).__name__}: {e}"
@@ -1765,12 +1705,10 @@ class MusicPlayer:
         loop's ordinary dequeue → -ss → play cycle does the rest. Both entries are
         persisted, so crash recovery mid-interjection works unchanged.
 
-        Interjections STACK: interrupting a song that is itself an interjection
-        parks it like any other, in front of the tails already waiting, so the
-        queue unwinds LIFO and every parked song eventually returns. Depth is
-        unbounded — each -playnow pays a 1–4 s resolve first, so cadence is the
-        only limit that matters — and `ts` is absolute at every level, so a tail
-        of a tail resumes at the position actually reached, not at its fragment's.
+        Interjections STACK: interrupting an interjection parks it in front of the
+        tails already waiting, so the queue unwinds LIFO. Depth is unbounded, and
+        `ts` is absolute at every level, so a tail of a tail resumes at the position
+        actually reached rather than at its own fragment's start.
 
         resume_paused decides whether a song interrupted while PAUSED comes back
         paused: True (-playnow) restores what it interrupted, False (-play) brings it
@@ -1828,18 +1766,15 @@ class MusicPlayer:
                     thumbnail=current.thumbnail,
                     is_resume=True,
                     start_paused=was_paused and resume_paused,
-                    # The tail is the same play, so it keeps the interrupted
-                    # song's stamps rather than earning new ones here — played_at
-                    # included, which is what files the whole play under the
-                    # moment its first fragment started.
+                    # The tail is the same play, so it keeps the interrupted song's
+                    # stamps — played_at included, which files the whole play under
+                    # the moment its first fragment started.
                     queued_at=current.queued_at,
                     queue_position=current.queue_position,
                     played_at=current.played_at,
-                    # _skip_history_for means the tail writes the ONLY row for
-                    # this play, and the classification is not recoverable from
-                    # webpage_url — a Spotify link, a search and a pasted YouTube
-                    # link all archive as youtube.com. Same reason
-                    # _neutralize_prefetch's rebuild carries it.
+                    # The tail writes the ONLY row for this play, and the
+                    # classification is not recoverable from webpage_url — a Spotify
+                    # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
                 )
 
@@ -1848,29 +1783,19 @@ class MusicPlayer:
         items = self._stamp_enqueue([qobj], base=0)
         if resume is not None:
             items.append(resume)
-            # The song returns — record it in history once, when its tail
-            # finishes. A song with no resume entry (nearly over) keeps its own
-            # entry, matching -skip. One marker is enough at any depth: each
-            # interjection stops exactly one song, and that song's iteration
-            # consumes the marker before the next -playnow can finish resolving.
+            # The song returns, so it is recorded once — when its tail finishes. A
+            # song with no resume entry (nearly over) keeps its own entry, matching
+            # -skip. One marker is enough at any depth: each interjection stops
+            # exactly one song, and that song's iteration consumes the marker before
+            # the next -playnow can finish resolving.
             #
-            # Taken BEFORE the put_front await, and unconditionally. It used to be
-            # taken after, under a `current_song is current` re-check, which left
-            # the tail queued and the marker unset for the length of a Redis round
-            # trip. Two writers then recorded one play: a teardown claiming the
-            # song mid-window (the marker is what makes that claim decline), or
-            # the loop's own iteration end if the song finished inside the await.
-            # Everything from the `current_song is not current` guard above to
-            # here is synchronous, so taking it now closes the window rather than
-            # narrowing it — and if the song does end inside the await, the loop
-            # reads the marker at its iteration end, skips, and the tail is still
-            # the one writer.
+            # Taken BEFORE the put_front await and unconditionally: everything from
+            # the guard above to here is synchronous, so there is no window in which
+            # a teardown or the loop's own iteration end could record the play too.
             self._skip_history_for = current
-            # Set together with it, and consumed in the same block: the tail
-            # inherits this fragment's NP card so it can dispose of it, but which
-            # message that is is only settled at the fragment's iteration end —
-            # the confirmation this command is about to send can still adopt (and
-            # retire) a different host before then.
+            # The tail inherits this fragment's NP card, but which message that is
+            # is only settled at the fragment's iteration end — the confirmation
+            # this command is about to send can still adopt a different host.
             self._pending_resume_tail = resume
         await self.queue.put_front(items)
 
@@ -1879,13 +1804,9 @@ class MusicPlayer:
         if self.current_song is current:
             vc.stop()
 
-        # Measured after the insert, so the tail just built is counted. The
-        # interrupted song itself is not counted twice — its live fragment is
-        # gone and only this tail represents it (see resume_tail_depth).
+        # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
-        # The one behavioural read of `interjected` is gone with replace
-        # semantics; this keeps it an attribution signal rather than a field
-        # nothing consumes — "did this cut in front of another -playnow song".
+        # Attribution only: did this cut in front of another -playnow song.
         span.set_attribute("interject.over_interjection", current.interjected)
         span.set_attribute("interject.resume_position", position if resume else -1)
         return InterjectOutcome(
@@ -1928,11 +1849,11 @@ class MusicPlayer:
             song = None
         if song is None:
             return
-        # Carry the -ss offset, every -playnow flag and both stamps through the
-        # rebuild: dropping them makes a neutralized resume entry restart from
-        # 0:00 (unpaused, unannounced), loses an ordinary prefetched song's ?t=
-        # offset, would let the rebuild be restamped as freshly queued, and — on a
-        # resume tail, the only prefetch that carries one — loses the play's start.
+        # Carry the -ss offset, every -playnow flag and every stamp through the
+        # rebuild: dropping them makes a neutralized resume entry restart from 0:00
+        # (unpaused, unannounced), loses an ordinary prefetched song's ?t= offset,
+        # and lets the rebuild be restamped as freshly queued or lose the play's
+        # start.
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",
@@ -2459,11 +2380,9 @@ class MusicPlayer:
                         # pause_start_epoch survives that transaction's HDEL.
                         vc.pause()
                     play_start = time.time()  # capture immediately before any awaits
-                    # The play's start, stamped once and inherited by every later
-                    # fragment (a -playnow resume tail arrives carrying it), which
-                    # is what makes an interrupted song file under when it actually
-                    # began. Before from_song() below, or the parked entry persists
-                    # 0.0 and a crash recovers the song with no start.
+                    # Stamped once and inherited by every later fragment (a resume
+                    # tail arrives carrying it). Before the state write below, or
+                    # the parked entry persists 0.0 and a crash recovers no start.
                     song.played_at = song.played_at or play_start
 
                     # Mirror the now-playing song to Redis. should_pop_queue=True →
@@ -2501,16 +2420,11 @@ class MusicPlayer:
 
                     await self.update_activity(song)
                     await self._send_now_playing(song)
-                    # Strictly after the new card is up, so the bar is never
-                    # momentarily absent from the channel. Fire-and-forget: a
-                    # cosmetic cleanup must not delay playback.
-                    #
-                    # The host check is what makes "after" true. _send_now_playing
-                    # RELEASES the host before it sends and swallows every failure
-                    # (and returns quietly when the adopt declines), so a 403 or a
-                    # rate-limit leaves no card at all — and disposing there would
-                    # delete the only bar in the channel for a song that is
-                    # playing, inverting the invariant this ordering exists for.
+                    # Strictly after the new card is up, so the bar is never absent
+                    # from the channel. The host check is what makes that true:
+                    # _send_now_playing releases the host before sending and
+                    # swallows every failure, so a 403 leaves no card and disposing
+                    # would delete the only bar in the channel.
                     if song.is_resume and self._np_host_message is not None:
                         self._spawn_background(self._dispose_previous_np_card(song))
 
@@ -2588,10 +2502,9 @@ class MusicPlayer:
                     # copy, and what the history entry below is built from.
                     self.current_song = None
                     self.play_message = None  # -now must not serve a finished song
-                    # Handed over in the same synchronous breath: the play is no
-                    # longer current but its row is not written yet, and the
-                    # prefetch await below is long enough for a teardown to land
-                    # in between. Cleared once this iteration has settled it.
+                    # The play is no longer current but its row is not written yet,
+                    # and the prefetch await below is long enough for a teardown to
+                    # land in between. Cleared once this iteration settles it.
                     self._ended_song = song
 
                     # Claim-then-await: interject() may have neutralized (and nulled)
@@ -2616,24 +2529,17 @@ class MusicPlayer:
                     self._skip_history_for = None
                     # Same identity, same clear-either-way rule: hand the tail the
                     # card this fragment is leaving frozen. Late-bound because THIS
-                    # is where the host is settled — an id taken at interjection
-                    # time can name a message already retired by the confirmation's
-                    # adopt. Mutating the queued object is safe: single event loop,
-                    # and the queue legs hold this very reference.
+                    # is where the host settles — an id taken at interjection time
+                    # can name a message the confirmation's own adopt already
+                    # retired. Mutating the queued object is safe: single event
+                    # loop, and the queue legs hold this reference.
                     #
-                    # Not mirrored to Redis HERE. An LSET by index would have to
-                    # compute the entry's position inside exactly the
-                    # commit-vs-LPOP window the guild_queue.py ISSUE header
-                    # documents as racy, to buy a cosmetic cleanup.
-                    #
-                    # But do NOT read that as "the wire fields stay zero". Any
-                    # later rebuild_queue re-serializes this very object through
-                    # SongQueueEntry.from_queue_object, which writes all three np
-                    # fields — so -shuffle, a matching -remove, or a put_front
-                    # that takes its in-flight-head branch persists the live ids,
-                    # and the by-id delete becomes the routine path rather than
-                    # the post-crash fallback its docstring describes. That is why
-                    # the guard there is written for hostile input.
+                    # Not mirrored to Redis here, but the wire fields do not stay
+                    # zero: any later rebuild_queue re-serializes this object
+                    # through SongQueueEntry.from_queue_object, so -shuffle, a
+                    # matching -remove or an in-flight-head put_front persist the
+                    # live ids — which is why _dispose_previous_np_card guards them
+                    # as hostile input.
                     pending_tail = self._pending_resume_tail
                     self._pending_resume_tail = None
                     if skip_history and pending_tail is not None:
@@ -2649,14 +2555,11 @@ class MusicPlayer:
                             finished_host.channel.id if finished_host is not None else 0
                         )
                         pending_tail.np_dedicated = finished_dedicated
-                    # stream_failed means THIS fragment never opened a stream. For
-                    # a fresh song that is "nobody heard it" and dropping is
-                    # right. For a resume tail it is not: the offset it carries is
-                    # audio a listener already heard under the fragment that
-                    # parked it, and that fragment declined to record itself. So
-                    # the tail is still the only writer, and from_song's
-                    # played_secs is start_offset-based — the recorded position is
-                    # what was actually heard, not the zero this fragment played.
+                    # stream_failed means THIS fragment never opened a stream —
+                    # "nobody heard it" for a fresh song, but not for a resume tail,
+                    # whose offset is audio heard under the fragment that parked it
+                    # and declined to record. from_song's played_secs is
+                    # start_offset-based, so it records what was actually heard.
                     heard_before = song.is_resume and song.start_offset > 0
                     if not skip_history and (not stream_failed or heard_before):
                         await self.history.add(
@@ -2665,12 +2568,9 @@ class MusicPlayer:
                                 guild_id=self._guild.id,
                                 # The host captured at song end, not
                                 # _np_host_message, which _release_np_host() nulled
-                                # above. Clearing current_song before the prefetch
-                                # await makes this complete: nothing can adopt a
-                                # later host for this song. 0 = nothing hosted it.
-                                # Both ids come off that one message: the channel
-                                # is read from the host it locates, never from the
-                                # home channel, which every command reassigns.
+                                # above. Both ids come off that one message — never
+                                # the home channel, which commands reassign.
+                                # 0 = nothing hosted it.
                                 message_id=(
                                     finished_host.id if finished_host is not None else 0
                                 ),
@@ -2682,8 +2582,8 @@ class MusicPlayer:
                             )
                         )
 
-                    # Settled: written, or deliberately not. Either way a teardown
-                    # from here on has nothing left to claim for this song.
+                    # Written, or deliberately not — either way a teardown from here
+                    # has nothing left to claim.
                     self._ended_song = None
 
                     if self.store is not None:
@@ -2722,9 +2622,8 @@ class MusicPlayer:
                     self._release_np_host()
                     prefetched_song = None
                     self._skip_history_for = None
-                    # Cleared with its companion — a tail left holding this slot
-                    # would receive a LATER fragment's card ids and delete the
-                    # wrong message.
+                    # A tail left holding this slot would receive a LATER fragment's
+                    # card ids and delete the wrong message.
                     self._pending_resume_tail = None
                     self._ended_song = None
                     self.current_song = None

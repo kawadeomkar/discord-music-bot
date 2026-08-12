@@ -291,12 +291,11 @@ class TestMigrations:
             await conn.close()
         assert await migrate(raw_pg_dsn) == EXPECTED_SCHEMA_VERSION
 
-        # And the version number is NOT the assertion that matters. This test
-        # constructs exactly the shape a schema-drifted database has — ledger
-        # says migrated, table is missing columns — and asserting only the
-        # version passes in precisely that state, which is the state that wedges
-        # the drainer. Inserting is what distinguishes "migrated" from
-        # "recorded as migrated".
+        # The version alone proves nothing here: this is exactly the shape a
+        # schema-drifted database has (ledger says migrated, table is missing
+        # columns), and that shape passes the version check while wedging the
+        # drainer. Inserting is what separates "migrated" from "recorded as
+        # migrated".
         archive = PostgresHistoryArchive(raw_pg_dsn)
         try:
             await archive.insert_batch([_entry(1)])

@@ -747,25 +747,17 @@ class PostgresHistoryArchive:
 #   CheckViolationError   23514, and not a DataError — both inherit from
 #   NotNullViolationError IntegrityConstraintViolationError; without both arms a
 #                         CHECK violation wedges the drain head permanently
-#   UndefinedColumnError  42703, the schema-drift arm. NOT data the server
-#                         refused — the DATABASE is older than this build, which
-#                         migrate() cannot see: it skips a version already in the
-#                         ledger without reading the file, so an edited migration
-#                         reaches fresh databases only and the deployed one still
-#                         passes the version check. Left transient it fails EVERY
-#                         insert, and the redelivery lands on history:outbox,
-#                         which has no TTL and is exempt from eviction — an
-#                         unbounded silent stall ending in a Redis OOM that
-#                         rejects all writes, not just the archive's. Dead-
-#                         lettering instead costs a manual replay (the raw wire
-#                         bytes are preserved in payload) and buys a bounded
-#                         failure that `just db-rejects` can actually see.
+#   UndefinedColumnError  42703, schema drift — the DATABASE is older than this
+#                         build, which migrate() cannot see (it skips a version
+#                         already in the ledger without reading the file). Left
+#                         transient it fails EVERY insert and redelivers forever
+#                         onto history:outbox, which has no TTL and is exempt from
+#                         eviction, ending in a Redis OOM that rejects all writes
 #
 # Deliberately not here — each would break the drain:
-#   - UndefinedTableError: the isolation path writes to play_history_rejected, so
-#     a build that cannot see play_history usually cannot see that table either —
-#     the rejection insert raises and nothing settles. It stays transient because
-#     there is no way to record it, not because retrying is right.
+#   - UndefinedTableError: the isolation path writes to play_history_rejected,
+#     which a build that cannot see play_history usually cannot see either — the
+#     rejection insert raises and nothing settles.
 #   - UniqueViolationError: play_history_dedup is the ON CONFLICT target, so it
 #     cannot surface; catching it hides a genuine index bug.
 #   - bare ValueError / TypeError: asyncpg raises them for whole-statement
@@ -832,15 +824,13 @@ class HistoryOutboxDrainer:
     # YouTube entry serializes to ~455-470 B, of which 49 B is the
     # queued_at/queue_position pair and 18-32 B is query_source.
     #
-    # Resident cost is a STEP, not that wire size: entries pack into listpack
-    # nodes bounded by stream-node-max-bytes (4096), so per-entry memory jumps
-    # whenever a node loses one entry. Measured on redis:7-alpine over 50k
-    # entries the step is the ALLOCATOR BIN the listpack node lands in, not the
-    # node cap: 486.8 B/entry, then 547.4 after query_source, then 625.3 after
-    # channel_id. Not monotonic — an UNSTAMPED 499 B entry is worst at 678.3. So
-    # 256 MB now holds ~429k entries (~412k for a guild that stamps nothing)
-    # rather than ~552k (11% less outage runway) for 18 wire bytes. The empty
-    # token pays the same as a full one: the key is on the wire either way.
+    # Resident cost is a STEP, not that wire size: entries pack into listpack nodes
+    # bounded by stream-node-max-bytes (4096), and the step is the ALLOCATOR BIN the
+    # node lands in. Measured on redis:7-alpine over 50k entries: 486.8 B/entry,
+    # 547.4 after query_source, 625.3 after channel_id — and NOT monotonic, an
+    # unstamped 499 B entry being worst at 678.3. So 256 MB holds ~429k entries
+    # (~412k unstamped). See
+    # docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0
