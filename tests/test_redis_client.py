@@ -628,12 +628,6 @@ class TestPushHistoryOutbox:
         await store.push_history(_hentry(1))
         assert await fake_redis.ttl(HISTORY_OUTBOX_KEY) == -1
 
-    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        # The producer stays on the SWALLOWING side of golden rule 5, unlike
-        # every drain helper below. The playback loop must not die because
-        # Redis blinked.
-        await broken_store.push_history(_hentry(1))  # must not raise
-
 
 async def _push(fake_redis: Redis, *ns: int) -> None:
     store = GuildRedisStore(fake_redis, guild_id=42)

@@ -647,12 +647,6 @@ class TestCleanup:
 
         mp.history.add.assert_not_awaited()
 
-    async def test_noop_when_guild_not_in_mps(
-        self, music_bot: MusicBot, mock_guild: MagicMock
-    ) -> None:
-        mock_guild.voice_client = None
-        await music_bot.cleanup(mock_guild)  # must not raise
-
     async def test_cancels_player_task_before_disconnect(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:

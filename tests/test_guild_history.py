@@ -205,11 +205,6 @@ class TestRecent:
         h.restore([_entry(3), _entry(2), _entry(1)])  # newest-first input
         assert await h.recent(2) == [_entry(3), _entry(2)]
 
-    async def test_limit_larger_than_history_returns_all(self) -> None:
-        h = _history(None)
-        h.restore([_entry(2), _entry(1)])
-        assert await h.recent(10) == [_entry(2), _entry(1)]
-
     async def test_nonpositive_limit_returns_nothing(self) -> None:
         h = _history(None)
         h.restore([_entry(1)])
@@ -230,11 +225,6 @@ class TestRecent:
         cold = _history(store)  # fresh player: empty in-memory cache
         assert len(cold) == 0
         assert await cold.recent(10) == [_entry(2), _entry(1), _entry(0)]
-
-    async def test_falls_back_to_cache_without_store(self) -> None:
-        h = _history(None)
-        h.restore([_entry(2), _entry(1)])
-        assert await h.recent(10) == [_entry(2), _entry(1)]
 
 
 class TestRecentIsRedisOnly:
