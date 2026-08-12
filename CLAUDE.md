@@ -227,7 +227,10 @@ Compose requires `.env`.
 src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
 ├── musicbot.py       # MusicBot cog — every command, per-guild player registry (mps), crash-recovery entry
-├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
+├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP rendering, ETA, interject
+├── np_host.py        # NpHost — the Now Playing host pointer, swap protocol, edit lock, card disposal
+│                     # (NpHostRef lives here; youtube.py imports it back)
+├── recovery.py       # restore_guild (crash-recovery join) + VoiceWatchdog (alone-disconnect)
 ├── guild_queue.py    # GuildQueue — the three synchronized queue representations + bulk-mutation mutex
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
@@ -436,8 +439,7 @@ concurrent callers no-op). Each player owns:
   `spawn_background`)
 - events: `play_next`, `_restore_complete`, `_playback_gate` (+ `_playback_holds`
   refcount for `defer_playback()`)
-- NP host state: `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` /
-  `_np_edit_lock`
+- NP host: `_np_host` (an `NpHost` — pointer, own embeds, kind, edit lock)
 
 `cleanup(guild)` cancels all five tasks BEFORE disconnecting (so the loop can't start
 the next song mid-teardown), retires the NP host, disconnects voice, resets presence,
@@ -688,7 +690,7 @@ An interjected fragment's frozen bar is the one case release-don't-retire leaves
 and a stack leaves one per interjection — so its resume tail carries a pointer to that
 card (`np_message_id`/`np_channel_id`/`np_dedicated` on the wire, plus a runtime-only
 `np_host_ref`) and disposes of it when the tail starts, **after** its own card is up.
-Never a re-adopt (`_adopt_np_host` refuses older ids by design — the bar belongs at the
+Never a re-adopt (`NpHost.adopt` refuses older ids by design — the bar belongs at the
 channel bottom); the channel id comes from `message.channel.id`, never the persisted
 home channel; and capture is late-bound to the fragment's iteration end, because an id
 read inside `interject()` can name a message the confirmation's own adopt already
@@ -777,7 +779,7 @@ Per-guild synchronization primitives and what they protect:
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
-| `_np_edit_lock` | concurrent NP message edits |
+| `NpHost.edit_lock` | concurrent NP message edits |
 | `Spotify._auth_lock` | token refresh double-fire |
 | `lock:guild:{id}:recovery` (Redis) | two instances recovering the same guild |
 | `history:outbox` consumer group (Redis) | replaced the `history:drainer` lease. Not mutual exclusion — `XREADGROUP >` gives two drainers **disjoint** entries and `XACK` settles by ID, so a second drainer duplicates work instead of destroying plays it never inserted |
