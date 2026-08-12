@@ -128,10 +128,14 @@ class GuildHistory:
             # embed instead of degrading to the cache.
             take(await self._read_tier("redis", lambda: store.get_history()))
         take(list(reversed(self._entries)))
-        # Both legs are newest-first over the same window, so the concatenation is
-        # nearly ordered — but only nearly: the deque can hold an entry the Redis
-        # read missed. A 0.0 (unknown) timestamp sorting last is CORRECT — the only
-        # way to hold one is to predate played_at. list.sort is stable, so ties keep
+        # Load-bearing, not a tidy-up. Both legs are ordered by when a song was
+        # RECORDED, which is when it ended — and played_at is when it started, so
+        # an interrupted song sorts far from where it sits: -playnow parks it, and
+        # it is recorded after everything that cut in front of it. Measured on a
+        # 3-deep stack, the leg's own head held the EARLIEST played_at. Deleting
+        # this sort would render -history in end order under a "newest first"
+        # promise. A 0.0 (unknown) timestamp sorting last is CORRECT — the only way
+        # to hold one is to predate played_at. list.sort is stable, so ties keep
         # leg order.
         merged.sort(key=lambda e: e.played_at, reverse=True)
         return merged[:limit]

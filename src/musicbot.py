@@ -440,22 +440,38 @@ class MusicBot(commands.Cog):
         if mp is None:
             return
         log.info("going to cleanup/disconnect")
+        # Before any await, so the loop cannot slip its own iteration end into the
+        # window: claim the song being abandoned mid-play. Nothing else records it
+        # — it is not in the queue, clear_connection() drops the parked copy, and
+        # the loop is cancelled below while parked in play_next.wait().
+        pending_history = mp.claim_current_song_for_history()
         try:
             # Cancel tasks before disconnecting so the loop cannot wake and start
             # the next song between voice_client.stop() and cancellation.
             # disconnect() calls stop() internally, silencing audio below.
-            await asyncio.gather(
+            teardown = [
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
                 cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),
-            )
+            ]
+            await asyncio.gather(*teardown)
             # Tasks are down, so no tick can race this. Dispose of the NP host so
             # no message keeps a bar frozen mid-song by the stop.
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
+            if pending_history is not None:
+                # After the disconnect, never inside the teardown gather: gather
+                # completes on its SLOWEST member, so Redis IO there delays the
+                # silence the user asked for — measured at 20s against an
+                # unreachable host (connect timeout x the pool's retry ladder),
+                # and unbounded against one that accepts and then stalls, since
+                # the pool sets no socket_timeout. Nothing below reads this, and
+                # the entry was claimed synchronously above, so the only thing
+                # ordering buys is that audio stops first.
+                await mp.history.add(pending_history)
             # The loop's CancelledError handler already resets presence, but only
             # if it was parked inside the block that handles it. Repeated here —
             # after the disconnect, so this guild's client no longer registers as
@@ -851,6 +867,12 @@ class MusicBot(commands.Cog):
             ),
         },
     )
+    # Serialized per guild, like -resume. Two concurrent invocations both read a
+    # live current_song, both park a resume tail for it, and that one play then
+    # comes back twice — with one played_at, so play_history_dedup silently keeps
+    # a single row while -history shows two. wait=False: the second caller is told
+    # to wait rather than queued behind a 1-4s extraction.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, url: str) -> None:
@@ -1027,11 +1049,15 @@ class MusicBot(commands.Cog):
             "note": (
                 "`-play` adds to the back of the queue; `-playnow` cuts the line and "
                 "hands the current song back afterwards. A song that was nearly over "
-                "will not return, and interjecting on top of another `-playnow` song "
-                "replaces it rather than stacking."
+                "will not return. Otherwise they stack: run it again and the song "
+                "you just interrupted waits its turn too, each one resuming from "
+                "where it left off, most recent first."
             ),
         },
     )
+    # See -play: interject() re-checks current_song, but current_song outlives
+    # the check by a whole song, so the re-check cannot serialize two callers.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, url: str) -> None:
@@ -1102,7 +1128,9 @@ class MusicBot(commands.Cog):
             # re-resolve and (for a playlist) enqueue all tracks right after the
             # first-track-only notice above. Front, not append: the user asked for
             # "now", and this window can be seconds long with songs queued behind.
-            # Reset the marker or a normally queued song triggers replace semantics.
+            # It interrupted nothing, so it is an ordinary front-queued song —
+            # keeping the marker would attribute an interjection that never
+            # happened (the flag is telemetry now, not behaviour).
             qobj.interjected = False
             # The player's wrapper, not queue.put_front directly: it stamps the
             # enqueue under the queue mutex like every other user-facing insert.
@@ -1122,12 +1150,7 @@ class MusicBot(commands.Cog):
             )
             return
 
-        if outcome.replaced:
-            desc = (
-                f"Replaced **{outcome.interrupted_title}** (also played "
-                f"via `-playnow` — it will not return)."
-            )
-        elif outcome.resume_position is None:
+        if outcome.resume_position is None:
             desc = (
                 f"**{outcome.interrupted_title}** was nearly finished "
                 f"and will not resume."
@@ -1222,14 +1245,15 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="stop",
         aliases=["st"],
-        brief="stop playback, drop the queue and disconnect",
+        brief="stop playback and disconnect, keeping the queue",
         help=(
-            "Stops the current song, drops the queue, removes the Now Playing "
-            "card and disconnects the bot from the voice channel.\n\n"
+            "Stops the current song, removes the Now Playing card and "
+            "disconnects the bot from the voice channel.\n\n"
             "This is the full teardown — use `-pause` if you only want to take a "
             "break, or `-clear` if you want to empty the queue but keep playing.\n\n"
-            "The queue is kept on the server for 24 hours, so `-resume` (or the "
-            "next `-play`) can pick it back up. The song that was playing is not."
+            "The queue is **kept** on the server for 24 hours, so `-resume` (or "
+            "the next `-play`) picks it back up where it left off. The song that "
+            "was playing does not come back, but it is recorded in `-history`."
         ),
         extras={"category": "Playback", "examples": ["-stop", "-st"]},
     )
@@ -1510,6 +1534,22 @@ class MusicBot(commands.Cog):
     async def clear(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
+            # Both bulk mutations destroy the Redis mirror while reading the
+            # IN-MEMORY display, so running one against an unrestored player
+            # deletes a saved queue it cannot see. A -playnow stack is the case
+            # that bites: those tails are played songs, and _flush_played records
+            # them from the display — empty display, no rows, and the list they
+            # lived on is gone. validate_commands only requires the AUTHOR in
+            # voice, so a cold player is reachable here.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
             cleared = await mp.queue_clear()
             if not cleared:
                 await ctx.send(
@@ -1549,39 +1589,62 @@ class MusicBot(commands.Cog):
         },
     )
     @commands.before_invoke(validate_commands)
+    @_tracer.start_as_current_span("bot.remove")
     async def remove(self, ctx: commands.Context, url: Optional[str] = None) -> None:
-        if url is None:
-            await ctx.send(
-                embed=notice_embed(
-                    "`-remove <url>` — removes all songs matching the given URL from the queue. "
-                    "The URL must match the YouTube link shown in the **Now Playing** embed.",
-                    discord.Color.blue(),
+        try:
+            if url is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "`-remove <url>` — removes all songs matching the given URL from the queue. "
+                        "The URL must match the YouTube link shown in the **Now Playing** embed.",
+                        discord.Color.blue(),
+                    )
                 )
-            )
-            return
-        mp = self.get_mp(ctx)
-        positions = await mp.queue_remove(url)
-        if not positions:
+                return
+            mp = self.get_mp(ctx)
+            # Both bulk mutations destroy the Redis mirror while reading the
+            # IN-MEMORY display, so running one against an unrestored player
+            # deletes a saved queue it cannot see. A -playnow stack is the case
+            # that bites: those tails are played songs, and _flush_played records
+            # them from the display — empty display, no rows, and the list they
+            # lived on is gone. validate_commands only requires the AUTHOR in
+            # voice, so a cold player is reachable here.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            positions = await mp.queue_remove(url)
+            if not positions:
+                await send_embed(
+                    ctx,
+                    "",
+                    f"No queued songs found matching: <{url}>",
+                    discord.Color.red(),
+                )
+                return
+            count = len(positions)
+            noun = pluralize(count, "song")
+            pos_label = pluralize(count, "Position")
+            pos_str = ", ".join(str(p) for p in positions)
             await send_embed(
-                ctx, "", f"No queued songs found matching: <{url}>", discord.Color.red()
+                ctx,
+                f"Removed {count} {noun} from the queue",
+                "",
+                discord.Color.orange(),
+                fields=[
+                    ("URL", f"<{url}>", False),
+                    (f"{pos_label} removed", pos_str, False),
+                ],
             )
-            return
-        count = len(positions)
-        noun = pluralize(count, "song")
-        pos_label = pluralize(count, "Position")
-        pos_str = ", ".join(str(p) for p in positions)
-        await send_embed(
-            ctx,
-            f"Removed {count} {noun} from the queue",
-            "",
-            discord.Color.orange(),
-            fields=[
-                ("URL", f"<{url}>", False),
-                (f"{pos_label} removed", pos_str, False),
-            ],
-        )
-        await ctx.send(embed=mp.queue_embed())
-        await ctx.message.add_reaction("🗑️")
+            await ctx.send(embed=mp.queue_embed())
+            await ctx.message.add_reaction("🗑️")
+        except Exception as e:
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="now",
