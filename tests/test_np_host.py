@@ -36,17 +36,6 @@ def np_host(mock_bot: MagicMock, mock_guild: MagicMock, spawned: set) -> NpHost:
     return NpHost(mock_bot, mock_guild, _spawn)
 
 
-async def _dispose(host: NpHost, song: MagicMock) -> None:
-    """The unpack MusicPlayer._dispose_previous_np_card does, so these tests keep
-    exercising the shape a real caller passes."""
-    await host.dispose_previous(
-        ref=song.np_host_ref,
-        message_id=song.np_message_id,
-        channel_id=song.np_channel_id,
-        dedicated=song.np_dedicated,
-    )
-
-
 class TestNpHostAdoptRetire:
     def test_adopt_updates_state_synchronously(
         self, np_host: NpHost, spawned: set
@@ -255,7 +244,7 @@ class TestDisposePreviousNpCard:
         message = AsyncMock(spec=discord.Message)
         song = self._song(np_host_ref=NpHostRef(message, [], True))
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         message.delete.assert_awaited_once()
         message.edit.assert_not_awaited()
@@ -275,7 +264,7 @@ class TestDisposePreviousNpCard:
             np_channel_id=888888888888888888,
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         np_host._bot.get_partial_messageable.assert_not_called()
 
@@ -289,7 +278,7 @@ class TestDisposePreviousNpCard:
             np_dedicated=True, np_message_id=True, np_channel_id=888888888888888888
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         np_host._bot.get_partial_messageable.assert_not_called()
 
@@ -303,7 +292,7 @@ class TestDisposePreviousNpCard:
             np_dedicated=True, np_message_id=777777777777777777, np_channel_id=0
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         np_host._bot.get_partial_messageable.assert_not_called()
 
@@ -328,7 +317,7 @@ class TestDisposePreviousNpCard:
                 )
             )
 
-            await _dispose(np_host, song)  # must not raise
+            await np_host.dispose_previous(song)  # must not raise
 
     async def test_a_truthy_non_bool_dedicated_flag_never_authorizes_a_delete(
         self, np_host: NpHost, spawned: set
@@ -344,7 +333,7 @@ class TestDisposePreviousNpCard:
             np_channel_id=888888888888888888,
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         np_host._bot.get_partial_messageable.assert_not_called()
 
@@ -358,7 +347,7 @@ class TestDisposePreviousNpCard:
         own = [discord.Embed(title="the reply's own embed")]
         song = self._song(np_host_ref=NpHostRef(message, own, False))
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         message.edit.assert_awaited_once_with(embeds=own)
         message.delete.assert_not_awaited()
@@ -379,7 +368,7 @@ class TestDisposePreviousNpCard:
             np_dedicated=True,
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         # guild_id scopes the route: the ids are wire values up to 24h stale and
         # a PartialMessageable validates nothing on its own.
@@ -401,7 +390,7 @@ class TestDisposePreviousNpCard:
         np_host._bot.get_partial_messageable = MagicMock(return_value=messageable)
         song = self._song(np_message_id=7, np_channel_id=8, np_dedicated=True)
 
-        await _dispose(np_host, song)  # must not raise
+        await np_host.dispose_previous(song)  # must not raise
 
         partial.delete.assert_awaited_once()
 
@@ -414,7 +403,7 @@ class TestDisposePreviousNpCard:
         np_host._bot.get_partial_messageable = MagicMock()
         song = self._song(np_message_id=7, np_channel_id=8, np_dedicated=False)
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         mocked(np_host._bot.get_partial_messageable).assert_not_called()
 
@@ -422,7 +411,7 @@ class TestDisposePreviousNpCard:
         self, np_host: NpHost, spawned: set
     ) -> None:
         np_host._bot.get_partial_messageable = MagicMock()
-        await _dispose(np_host, self._song())
+        await np_host.dispose_previous(self._song())
         mocked(np_host._bot.get_partial_messageable).assert_not_called()
 
     async def test_a_non_integer_id_never_reaches_the_delete(
@@ -436,7 +425,7 @@ class TestDisposePreviousNpCard:
             np_message_id={"nested": "object"}, np_channel_id=8, np_dedicated=True
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         mocked(np_host._bot.get_partial_messageable).assert_not_called()
 
@@ -454,7 +443,7 @@ class TestDisposePreviousNpCard:
             np_dedicated=True,
         )
 
-        await _dispose(np_host, song)
+        await np_host.dispose_previous(song)
 
         message.delete.assert_awaited_once()
         mocked(np_host._bot.get_partial_messageable).assert_not_called()

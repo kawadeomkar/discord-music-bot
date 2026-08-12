@@ -46,7 +46,7 @@ from src.musicplayer import (
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource
 from src.util import cancel_task, fmt_duration
-from src.np_host import NpHostRef
+from src.np_host import NpHost, NpHostRef
 from src.youtube import QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
 
@@ -615,7 +615,7 @@ class TestQueueClearFlushesPlayedSongs:
     ) -> None:
         """The three legs each had a test — the wire round trip and the by-id
         delete — but nothing connected them, so the whole restart branch of
-        _dispose_previous_np_card could go dead without a failure. Reachable in
+        NpHost.dispose_previous could go dead without a failure. Reachable in
         production: the loop stamps a tail in memory, -shuffle or a matching
         -remove re-serializes the stamped object, and the restart path is then the
         only thing holding those ids."""
@@ -672,7 +672,7 @@ class TestQueueClearFlushesPlayedSongs:
         async def track(_self: Any, song: Any) -> None:
             disposed.append(song.webpage_url)
 
-        with patch.object(MusicPlayer, "_dispose_previous_np_card", new=track):
+        with patch.object(NpHost, "dispose_previous", new=track):
             await music_player.queue_clear()
             await asyncio.sleep(0)  # let the fire-and-forget tasks run
 
@@ -10484,7 +10484,7 @@ class TestPlaynowLoopStart:
                 MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
             ),
             patch.object(MusicPlayer, "_send_now_playing", new=track_send),
-            patch.object(MusicPlayer, "_dispose_previous_np_card", new=track_dispose),
+            patch.object(NpHost, "dispose_previous", new=track_dispose),
             patch.object(
                 MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
             ),
@@ -10511,7 +10511,7 @@ class TestPlaynowLoopStart:
             self_inner._np_host._message = None  # released, send raised, swallowed
 
         with (
-            patch.object(MusicPlayer, "_dispose_previous_np_card", new=dispose),
+            patch.object(NpHost, "dispose_previous", new=dispose),
             patch.object(MusicPlayer, "_send_now_playing", new=failed_send),
             patch.object(MusicPlayer, "_announce_resume", new=AsyncMock()),
         ):
@@ -10528,7 +10528,7 @@ class TestPlaynowLoopStart:
         mock_song.start_offset = 0
         dispose = AsyncMock()
         vc = self._vc()
-        with patch.object(MusicPlayer, "_dispose_previous_np_card", new=dispose):
+        with patch.object(NpHost, "dispose_previous", new=dispose):
             await self._run_one_song(music_player, queue_obj, mock_song, vc)
         dispose.assert_not_awaited()
 

@@ -737,7 +737,7 @@ class TestParseQueueEntryCorrupt:
 
         np_message_id is the field where that tolerance has teeth, since it feeds a
         message delete(); the guard for it lives at that call
-        (MusicPlayer._dispose_previous_np_card), not here."""
+        (NpHost.dispose_previous), not here."""
         entry = parse_queue_entry(
             b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
             b'"requester_id":42,"np_message_id":{"nested":"object"}}'
