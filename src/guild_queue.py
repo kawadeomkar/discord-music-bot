@@ -6,8 +6,16 @@ Domain layer between the schema (src/guild_state.py) and playback orchestration
 never desync:
 
   _pending: asyncio.Queue   consumed by the playback loop
-  _display: deque           ordered view for embeds / ETA math
+  _display: deque           every queued item in order — NOT a view (see below)
   Redis guild:{id}:queue    persisted mirror (via GuildRedisStore)
+
+_display does three jobs that are not display, and the name hides all three. It
+is the only leg that holds a dequeued-but-uncommitted item, so _in_flight_head
+derives that set from its length; it is what put_front rebuilds the mirror from;
+and it is what clear() returns, while the _drain_pending() result is discarded.
+That return feeds _flush_played, so a parked -playnow tail earns its
+play_history row only because display carried it. A refactor treating this leg
+as presentation loses that row with no error and no log line.
 
 All three legs are private, so no caller can mutate one without the others, and
 every mirror-touching mutation (put, put_front, clear, shuffle, remove,
@@ -353,8 +361,13 @@ class GuildQueue:
     # stranded. A COMPLETED prefetch is fine — its item is an in-flight head.
 
     async def clear(self) -> list[QueueItem]:
-        """Drain all three legs, returning the drained items in display order. Sets
-        the cleared-flag under the mutex before draining, so a loop iteration
+        """Drain all three legs, returning what was queued — read off the DISPLAY
+        leg, with _drain_pending()'s result deliberately discarded: display carries
+        the in-flight head and _pending does not. The caller records these
+        (MusicPlayer._flush_played), so returning the drain instead would drop a
+        parked -playnow tail's play_history row with no error.
+
+        Sets the cleared-flag under the mutex before draining, so a loop iteration
         holding a prefetched song discards it. The DEL is inside the mutex too:
         released early, a concurrent put()'s mirror writes would land between the
         drain and the DEL and be wiped."""

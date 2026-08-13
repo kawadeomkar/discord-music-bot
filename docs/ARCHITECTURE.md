@@ -621,8 +621,10 @@ All queue state lives behind `GuildQueue` (`guild_queue.py`). Three representati
 | Leg | Type | Purpose |
 |---|---|---|
 | `_pending` | `asyncio.Queue[QueueItem]` | Consumed by the playback loop (via `get`/`get_nowait`/`task_done` pass-throughs) |
-| `_display` | `deque[QueueItem]` | Ordered view for embeds/ETA (`display_items()`, `peek_next()`) |
+| `_display` | `deque[QueueItem]` | Every queued item in order. **Not a view**, despite the name — see below |
 | Redis `guild:{id}:queue` | JSON `SongQueueEntry`/`SearchQueueEntry` | Persistence across restarts |
+
+**`_display` does three jobs that are not display**, and the name hides all three. It is the only leg that holds a dequeued-but-uncommitted item, so `_in_flight_head()` *defines* that set as `len(_display) − pending_count`. It is what `put_front` rebuilds the mirror from. And it is what `clear()` returns, while `_drain_pending()`'s result is discarded — that return feeds `MusicPlayer._flush_played`, so a parked `-playnow` resume tail earns its `play_history` row only because display carried the in-flight head. A refactor treating this leg as presentation-only loses that row silently: one missing row, no error, no log line. Embeds and ETA are the fourth job, and the only one the name describes.
 
 Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `finish_failed_dequeue`) runs under one bulk-mutation mutex. Bulk mutations carry a dequeued-but-uncommitted head through untouched (`_in_flight_head`), so a shuffle/remove during a multi-second resolve can't retire the wrong entry.
 
@@ -1362,6 +1364,14 @@ Four things cross into the worker processes, each with its own contract:
   which bricks the pool permanently.
 
 ### Queue invariant
+
+**`_display` is not a view.** The name says presentation and three of its four jobs are not:
+it is the only leg that holds a dequeued-but-uncommitted item (`_in_flight_head()` *defines*
+that set as `len(_display) − pending_count`), it is what `put_front` rebuilds the mirror from,
+and it is what `clear()` returns while `_drain_pending()`'s result is discarded — feeding
+`MusicPlayer._flush_played`, so a parked `-playnow` tail earns its `play_history` row only
+because display carried it. Treat this leg as presentation and that row goes with no error and
+no log line. See [Queue Operations](#queue-operations) for the legs table.
 
 **Why `put_front`'s in-flight branch is not dead code.** `MusicPlayer.interject()`
 neutralizes the prefetch before calling `GuildQueue.put_front()`, which normally means
