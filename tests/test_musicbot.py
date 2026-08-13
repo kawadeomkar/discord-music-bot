@@ -18,7 +18,7 @@ from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
-from src.guild_state import HistoryEntry
+from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
@@ -42,6 +42,10 @@ from tests.helpers import (
     mocked,
     queue_object,
 )
+
+# Ask-time analytics for direct queue_source/_enqueue_playlist calls — the real
+# command paths mint this at dispatch from ctx.message.created_at + enqueue_depth.
+_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=0)
 
 
 class TestCommandErrorRendering:
@@ -183,7 +187,7 @@ class TestQueueSource:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
-        result = await music_bot.queue_source(mock_ctx, source)
+        result = await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
         assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
 
     async def test_spotify_track_calls_yt_source(
@@ -196,7 +200,9 @@ class TestQueueSource:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, QueueObject)
 
     async def test_youtube_url_calls_yt_source(
@@ -209,14 +215,22 @@ class TestQueueSource:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, QueueObject)
 
 
-class TestQuerySourceStamping:
-    """Every path from parsed input to an enqueueable object stamps the token.
-    yt_source cannot: it is handed a search string, and for Spotify that string
-    is a YouTube title query indistinguishable from a plaintext search."""
+class TestQuerySourceClassification:
+    """Every path from parsed input to an enqueueable object hands the token to
+    the extraction call, which REQUIRES it. yt_source cannot derive it: it is
+    given a search string, and for Spotify that string is a YouTube title query
+    indistinguishable from a plaintext search."""
+
+    @staticmethod
+    def _passed_query_source(spy: AsyncMock) -> str:
+        assert spy.await_args is not None
+        return spy.await_args.kwargs["query_source"]
 
     async def test_spotify_track(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -225,24 +239,20 @@ class TestQuerySourceStamping:
         fake_qobj = QueueObject("https://yt.com/v=1", "My Track", mock_ctx.author)
         assert music_bot.spotify is not None
         music_bot.spotify.track = AsyncMock(return_value="My Track Artist")
-        with patch(
-            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
-        ):
-            result = await music_bot.queue_source(mock_ctx, source)
-        assert isinstance(result, QueueObject)
-        assert result.query_source == "spotify.com"
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
+        assert self._passed_query_source(spy) == "spotify.com"
 
     async def test_plaintext_search(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = parse_input("never gonna give you up", "-play never gonna give you up")
         fake_qobj = QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
-        with patch(
-            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
-        ):
-            result = await music_bot.queue_source(mock_ctx, source)
-        assert isinstance(result, QueueObject)
-        assert result.query_source == "search"
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
+        assert self._passed_query_source(spy) == "search"
 
     async def test_generic_host_link(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -250,26 +260,29 @@ class TestQuerySourceStamping:
         url = "https://www.tiktok.com/@user/video/1234567890"
         source = parse_input(url, f"-play {url}")
         fake_qobj = QueueObject(url, "Clip", mock_ctx.author)
-        with patch(
-            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
-        ):
-            result = await music_bot.queue_source(mock_ctx, source)
-        assert isinstance(result, QueueObject)
-        assert result.query_source == "tiktok.com"
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
+        assert self._passed_query_source(spy) == "tiktok.com"
 
-    async def test_youtube_playlist_stamps_every_track(
+    async def test_youtube_playlist_classifies_every_track(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
+        # One token for the whole playlist: yt_playlist stamps it onto each
+        # QueueObject it builds, so the call carries it once.
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url, f"-play {url}")
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"T{i}", mock_ctx.author)
             for i in range(3)
         ]
-        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot.queue_source(mock_ctx, source)
+        spy = AsyncMock(return_value=tracks)
+        with patch("src.musicbot.YTDL.yt_playlist", new=spy):
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, ResolvedYoutubePlaylist)
-        assert [t.query_source for t in result.tracks] == ["youtube.com"] * 3
+        assert self._passed_query_source(spy) == "youtube.com"
 
     @staticmethod
     def _yt_tracks(author: MagicMock, count: int) -> list[QueueObject]:
@@ -286,10 +299,62 @@ class TestQuerySourceStamping:
         source = parse_input(url, f"-play {url}")
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.title for t in result.tracks] == ["T3", "T4", "T5"]
         assert result.skipped == 3
+
+    async def test_playlist_index_rebases_the_kept_positions(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Positions are assigned at construction, BEFORE the index slice, so the
+        slice must rebase what it keeps. Without that, an &index=4 link archives
+        every kept track three deeper than it actually waited — invisible unless
+        a test carries an index."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
+        source = parse_input(url, f"-play {url}")
+        tracks = [
+            QueueObject(
+                f"https://yt.com/watch?v=v{i}",
+                f"T{i}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+            )
+            for i in range(6)
+        ]
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
+        # The ask time is untouched by the slice — one instant for the command.
+        assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
+
+    async def test_playlist_index_rebase_preserves_a_nonzero_base(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The rebase subtracts the dropped count, it does not zero the field: a
+        playlist queued behind two songs still waits behind them."""
+        url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
+        source = parse_input(url, f"-play {url}")
+        tracks = [
+            QueueObject(
+                f"https://yt.com/watch?v=v{i}",
+                f"T{i}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1752530000.5, queue_position=2 + i),
+            )
+            for i in range(5)
+        ]
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
+        assert isinstance(result, ResolvedYoutubePlaylist)
+        assert [t.analytics.queue_position for t in result.tracks] == [2, 3, 4]
 
     async def test_playlist_index_1_queues_everything(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -300,7 +365,9 @@ class TestQuerySourceStamping:
         source = parse_input(url, f"-play {url}")
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert len(result.tracks) == 3
         assert result.skipped == 0
@@ -317,7 +384,7 @@ class TestQuerySourceStamping:
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
             pytest.raises(PlaylistIndexError) as excinfo,
         ):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
         assert (excinfo.value.index, excinfo.value.total) == (9, 3)
 
     async def test_empty_playlist_raises_instead_of_queueing_nothing(
@@ -331,7 +398,7 @@ class TestQuerySourceStamping:
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[])),
             pytest.raises(EmptyPlaylistError),
         ):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
 
     async def test_playlist_timestamp_applies_to_the_linked_video(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -342,7 +409,9 @@ class TestQuerySourceStamping:
         source = parse_input(url, f"-play {url}")
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert result.tracks[0].title == "T3"
         assert result.tracks[0].ts == 90
@@ -357,7 +426,9 @@ class TestQuerySourceStamping:
         source = parse_input(url, f"-play {url}")
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert all(t.ts is None for t in result.tracks)
 
@@ -438,16 +509,15 @@ class TestQuerySourceStamping:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # _resolve_playnow_source resolves both playlist shapes directly, so a
-        # stamp only in queue_source would leave these two unclassified.
+        # token passed only from queue_source would leave these two unclassified.
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None
         music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
         fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
-        with patch(
-            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
-        ):
-            result = await music_bot._resolve_playnow_source(mock_ctx, source)
-        assert result.query_source == "spotify.com"
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert self._passed_query_source(spy) == "spotify.com"
 
     async def test_playnow_youtube_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -455,9 +525,26 @@ class TestQuerySourceStamping:
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url, f"-play {url}")
         tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
-        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot._resolve_playnow_source(mock_ctx, source)
-        assert result.query_source == "youtube.com"
+        spy = AsyncMock(return_value=tracks)
+        with patch("src.musicbot.YTDL.yt_playlist", new=spy):
+            await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert self._passed_query_source(spy) == "youtube.com"
+
+    async def test_playnow_analytics_is_depth_zero(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # An interjection plays immediately by definition, so -playnow reads no
+        # queue depth at all — and its queued_at is still the ask time.
+        url = "https://www.youtube.com/watch?v=abc"
+        source = parse_input(url, f"-playnow {url}")
+        fake_qobj = QueueObject(url, "Song", mock_ctx.author)
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            await music_bot._resolve_playnow_source(mock_ctx, source)
+        assert spy.await_args is not None
+        analytics = spy.await_args.kwargs["analytics"]
+        assert analytics.queue_position == 0
+        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
 
 
 class TestSpotifyDisabled:
@@ -497,7 +584,7 @@ class TestSpotifyDisabled:
         music_bot._spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         with pytest.raises(SpotifyDisabledError):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
 
     async def test_spotify_track_raises_when_disabled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -506,7 +593,7 @@ class TestSpotifyDisabled:
         music_bot._spotify_status = SpotifyStatus.DISABLED
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
 
     async def test_spotify_track_raises_when_credentials_invalid(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -516,7 +603,7 @@ class TestSpotifyDisabled:
         music_bot._spotify_status = SpotifyStatus.INVALID
         source = SpotifySource(type=SpotifyType.TRACK, id="tid123")
         with pytest.raises(SpotifyDisabledError):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
 
     async def test_non_spotify_source_unaffected_when_disabled(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -531,7 +618,9 @@ class TestSpotifyDisabled:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ):
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         assert isinstance(result, QueueObject)
 
     def test_disabled_error_message_is_actionable(self) -> None:
@@ -553,7 +642,7 @@ class TestSpotifyDisabled:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=fake_qobj)
         ) as mock_yt:
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
         call_args = mock_yt.call_args
         assert call_args[0][1] == "ytsearch:test song"
 
@@ -573,9 +662,16 @@ class TestSpotifyDisabled:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
         ) as mock_playlist:
-            result = await music_bot.queue_source(mock_ctx, source)
+            result = await music_bot.queue_source(
+                mock_ctx, source, analytics=_ANALYTICS
+            )
         mock_playlist.assert_awaited_once_with(
-            "https://www.youtube.com/playlist?list=PLtest123", mock_ctx.author
+            "https://www.youtube.com/playlist?list=PLtest123",
+            mock_ctx.author,
+            # "" because this YTSource is built directly rather than by
+            # parse_input, which is what classifies. See TestQuerySourceClassification.
+            query_source="",
+            analytics=_ANALYTICS,
         )
         assert result == ResolvedYoutubePlaylist(tracks=fake_qobjs)
 
@@ -590,7 +686,7 @@ class TestSpotifyDisabled:
             list_id=None,
         )
         with pytest.raises(ValueError, match="list_id"):
-            await music_bot.queue_source(mock_ctx, source)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
 
     async def test_youtube_playlist_preserves_full_url(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -608,8 +704,13 @@ class TestSpotifyDisabled:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=fake_qobjs)
         ) as mock_playlist:
-            await music_bot.queue_source(mock_ctx, source)
-        mock_playlist.assert_awaited_once_with(full_url, mock_ctx.author)
+            await music_bot.queue_source(mock_ctx, source, analytics=_ANALYTICS)
+        mock_playlist.assert_awaited_once_with(
+            full_url,
+            mock_ctx.author,
+            query_source="",
+            analytics=_ANALYTICS,
+        )
 
 
 class TestEnqueuePlaylist:
@@ -637,7 +738,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks=qobjs),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -660,7 +765,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs, skipped=3), mp
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks=qobjs, skipped=3),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -679,7 +788,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks=qobjs),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -697,7 +810,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks=qobjs),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -716,7 +833,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks=qobjs), mp
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks=qobjs),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         mp.queue_put.assert_awaited_once()
@@ -733,7 +854,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedSpotifyPlaylist(titles=titles), mp
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=titles),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -748,7 +873,11 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedSpotifyPlaylist(titles=titles), mp
+            mock_ctx,
+            source,
+            ResolvedSpotifyPlaylist(titles=titles),
+            mp,
+            analytics=_ANALYTICS,
         )
 
         mp.queue_put.assert_awaited_once()
@@ -3063,7 +3192,12 @@ class TestPlayFrontInsertion:
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_playlist(
-            mock_ctx, source, ResolvedYoutubePlaylist(tracks), mp, front=True
+            mock_ctx,
+            source,
+            ResolvedYoutubePlaylist(tracks),
+            mp,
+            front=True,
+            analytics=_ANALYTICS,
         )
 
         mp.queue_put_front.assert_awaited_once_with(tracks, prefetch=False)

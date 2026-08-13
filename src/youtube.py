@@ -2,7 +2,7 @@ import copy
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -566,10 +566,11 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # ── Enqueue analytics, written once by MusicPlayer and carried thereafter ──
+    # ── Ask-time analytics, set at construction and carried thereafter ──
     # queued_at + queue_position in one frozen container (guild_state.Analytics).
-    # ANALYTICS_ZERO doubles as "not yet stamped", which is what makes stamping
-    # idempotent across re-queues.
+    # yt_source/yt_playlist REQUIRE it, so a QueueObject leaves them complete;
+    # the default exists for rehydration and the carry sites, which always pass
+    # a real value explicitly.
     analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
@@ -643,7 +644,7 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
-        # Enqueue analytics carried from the QueueObject so the history entry
+        # Ask-time analytics carried from the QueueObject so the history entry
         # this song produces records where it started, not when it played.
         self.analytics: Analytics = analytics
         self.query_source: str = query_source
@@ -878,12 +879,18 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         search: str,
         *,
+        query_source: str,
+        analytics: Analytics,
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
-        Redis source cache if present."""
+        Redis source cache if present.
+
+        query_source and analytics are REQUIRED so the QueueObject leaves here
+        complete — a default would let a new call site forget them and write a
+        plausible zero, permanently indistinguishable from a real value."""
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
         # per-request playback offset, not part of the video identity.
@@ -905,6 +912,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
                     thumbnail=cached.get("thumbnail"),
+                    query_source=query_source,
+                    analytics=analytics,
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -1004,6 +1013,8 @@ class YTDL(discord.FFmpegOpusAudio):
             duration=duration,
             uploader=uploader,
             thumbnail=thumbnail,
+            query_source=query_source,
+            analytics=analytics,
         )
 
     @staticmethod
@@ -1011,8 +1022,14 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
+        *,
+        query_source: str,
+        analytics: Analytics,
     ) -> list[QueueObject]:
-        """Fetch flat entry metadata for every video in a YouTube playlist."""
+        """Fetch flat entry metadata for every video in a YouTube playlist.
+
+        query_source and analytics are REQUIRED (see yt_source). `analytics` is
+        the head's — track positions are derived per kept track below."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -1040,5 +1057,18 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
-            qobjs.append(QueueObject(video_url, title, requester))
+            # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
+            # skipped null entries above must not leave gaps in queue_position.
+            qobjs.append(
+                QueueObject(
+                    video_url,
+                    title,
+                    requester,
+                    query_source=query_source,
+                    analytics=replace(
+                        analytics,
+                        queue_position=analytics.queue_position + len(qobjs),
+                    ),
+                )
+            )
         return qobjs

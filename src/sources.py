@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, Optional, Union
 
@@ -81,8 +81,10 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
-    # Enqueue analytics (guild_state.Analytics), carried onto the QueueObject
-    # this resolves into. Frozen, so MusicPlayer stamps a replace()d copy.
+    # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
+    # this resolves into. Parse-layer minting leaves the zero value — the real
+    # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
+    # yt_source/yt_playlist call for sources resolved directly.
     analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
@@ -122,17 +124,21 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches. The Spotify token is
-    stamped here because it is the last point that knows where these came from —
-    each resolves to a YouTube URL at dequeue."""
+def spotify_playlist_to_ytsearch(
+    titles: list[str], *, analytics: Analytics
+) -> list[YTSource]:
+    """Spotify playlist tracks as lazy YouTube searches. The Spotify token and the
+    ask-time analytics are set here because it is the last point that knows where
+    these came from — each resolves to a YouTube URL at dequeue. `analytics` is
+    the head's; per-track positions are derived from it, as in yt_playlist."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
+            analytics=replace(analytics, queue_position=analytics.queue_position + i),
         )
-        for title in titles
+        for i, title in enumerate(titles)
     ]
 
 

@@ -3,6 +3,7 @@
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
@@ -192,6 +193,10 @@ def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message.channel = mock_channel
     message.content = "-play test song"
     message.add_reaction = AsyncMock()
+    # A real tz-aware datetime, as discord.py derives from the message snowflake:
+    # the enqueue paths take queued_at from here, and it lands in a timestamptz
+    # column via HistoryEntry's epoch clamp, which raises on a MagicMock.
+    message.created_at = datetime(2026, 7, 14, 20, 33, 20, tzinfo=timezone.utc)
     return message
 
 

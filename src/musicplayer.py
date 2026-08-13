@@ -27,7 +27,6 @@ from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import (
     DEFAULT_TIMEZONE,
-    Analytics,
     HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
@@ -1028,48 +1027,22 @@ class MusicPlayer:
 
     # ── Queue operations ──────────────────────────────────────────────────────
 
-    def _stamp_enqueue(self, items: list[QueueItem], *, base: int) -> list[QueueItem]:
-        """Stamp queued_at/queue_position on items entering a queue for the first
-        time, `base` songs behind the front.
+    def enqueue_depth(self) -> int:
+        """Songs a new arrival waits behind: the display leg, plus the one playing.
 
-        Stamp-once: a non-zero queued_at is left alone. No path re-enqueues an
-        already-stamped item through here today — requeue_front, restore and the
-        neutralized prefetch all bypass it — so the guard is what keeps a future
-        one from silently renumbering a song against a depth it never waited.
-
-        QueueObject is mutated in place, as prefetch already does; YTSource is
-        frozen, so it is replaced — callers must use the returned list.
-        """
-        now = time.time()
-        stamped: list[QueueItem] = []
-        for offset, item in enumerate(items):
-            if item.analytics.queued_at:
-                stamped.append(item)
-            else:
-                stamp = Analytics(queued_at=now, queue_position=base + offset)
-                if isinstance(item, YTSource):
-                    stamped.append(replace(item, analytics=stamp))
-                else:
-                    item.analytics = stamp
-                    stamped.append(item)
-        return stamped
-
-    def _stamp_at_depth(
-        self, items: Sequence[QueueItem], queued_ahead: int
-    ) -> list[QueueItem]:
-        """GuildQueue stamp hook: songs a new arrival waits behind are the entries
-        already ahead of the insert point plus the one playing. `queued_ahead`
-        comes from the queue under its bulk-mutation mutex, so a concurrent
-        enqueue cannot shift the depth between reading it and the insert landing.
+        Read once at command dispatch — queue_position is depth at ASK, and
+        approximate against insert by design: the loop dequeues continuously, so
+        the two differ routinely with no user involvement, and wait duration is
+        measured exactly as played_at - queued_at beside it.
 
         The live song is NOT counted when its resume tail is already queued: after
         an interjection that entry is the same play as current_song, and counting
         both puts a new arrival one song too deep."""
-        base = queued_ahead
+        depth = self.queue.display_size()
         current = self.current_song
         if current is not None and not self.queue.has_resume_tail(current.webpage_url):
-            base += 1
-        return self._stamp_enqueue(list(items), base=base)
+            depth += 1
+        return depth
 
     async def queue_put(
         self,
@@ -1087,9 +1060,7 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put(
-            items, batch=not prefetch, stamp=self._stamp_at_depth
-        )
+        items = await self.queue.put(items, batch=not prefetch)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -1113,9 +1084,7 @@ class MusicPlayer:
             items = [obj]
         else:
             items = list(obj)
-        # Front insertion waits only on the live song and an in-flight head — the
-        # persisted entries it jumps ahead of are behind it, not in front.
-        items = await self.queue.put_front(items, stamp=self._stamp_at_depth)
+        items = await self.queue.put_front(items)
         if prefetch and self.store is not None:
             for item in items:
                 if isinstance(item, QueueObject):
@@ -1777,9 +1746,10 @@ class MusicPlayer:
                     query_source=current.query_source,
                 )
 
-        # Stamped alone, at position 0: it plays immediately by definition, while
-        # the tail keeps the interrupted song's stamps — unknown ones included.
-        items = self._stamp_enqueue([qobj], base=0)
+        # The interjection arrives carrying depth 0 from its own command dispatch
+        # — it plays immediately by definition — while the tail keeps the
+        # interrupted song's analytics, unknown ones included.
+        items: list[QueueItem] = [qobj]
         if resume is not None:
             items.append(resume)
             # The song returns, so it is recorded once — when its tail finishes. A
@@ -1921,16 +1891,13 @@ class MusicPlayer:
 
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
-            qobj = await YTDL.yt_source(
+            return await YTDL.yt_source(
                 self._require_requester(),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
+                query_source=source.query_source,
+                analytics=source.analytics,
             )
-            # yt_source builds the QueueObject, so the search's enqueue stamps are
-            # copied onto it here rather than threaded through its signature.
-            qobj.analytics = source.analytics
-            qobj.query_source = source.query_source
-            return qobj
         return source
 
     async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:

@@ -1,7 +1,7 @@
 import asyncio
 import contextlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import (
     Any,
@@ -10,7 +10,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Coroutine, Sequence
+from collections.abc import AsyncGenerator, Coroutine
 
 import discord
 from discord.ext import commands
@@ -28,6 +28,7 @@ from src.config import (
 from src import debug as debug_mode
 from src import leaderboard
 from src.guild_history import history_embeds
+from src.guild_state import Analytics
 from src.leaderboard import LeaderboardFlags
 from src.history_archive import (
     ArchiveReader,
@@ -179,16 +180,6 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
-def _stamp_query_source(qobjs: Sequence[QueueObject], token: str) -> None:
-    """Write the parse-time classification onto resolved songs.
-
-    Applied after resolution rather than threaded through yt_source/yt_playlist:
-    those are the extraction API, and this is the same seam MusicPlayer uses to
-    copy the enqueue stamps onto what yt_source builds."""
-    for qobj in qobjs:
-        qobj.query_source = token
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ActiveCommand:
     """The bookkeeping cog_before_invoke opens and cog_after_invoke closes.
@@ -243,7 +234,18 @@ def _apply_playlist_index(
         return tracks, 0
     if index > len(tracks):
         raise PlaylistIndexError(index, len(tracks))
-    return tracks[index - 1 :], index - 1
+    kept = tracks[index - 1 :]
+    dropped = index - 1
+    # Positions were assigned at construction, before this slice — rebase, or an
+    # &index=N link stamps every kept track N-1 too deep (and -playnow's single
+    # track lands at N-1 instead of 0). Kept-relative is the true depth: the
+    # dropped tracks never enqueue.
+    for track in kept:
+        track.analytics = replace(
+            track.analytics,
+            queue_position=track.analytics.queue_position - dropped,
+        )
+    return kept, dropped
 
 
 def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> None:
@@ -682,23 +684,32 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        analytics: Analytics,
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
-        a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject."""
+        a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject.
+
+        `analytics` is the command's ask-time head value, minted at dispatch;
+        playlist tracks derive their per-track positions from it."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            # Titles, not QueueObjects — spotify_playlist_to_ytsearch stamps the
-            # YTSources they become.
+            # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
+            # they become, carrying this command's analytics.
             return ResolvedSpotifyPlaylist(
                 await self._require_spotify().playlist(source.id)
             )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            tracks = await YTDL.yt_playlist(
+                source.playlist_url,
+                ctx.author,
+                query_source=query_source_of(source),
+                analytics=analytics,
+            )
             tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
-            _stamp_query_source(tracks, query_source_of(source))
             return ResolvedYoutubePlaylist(tracks, skipped=skipped)
         else:
             ts: Optional[int] = None
@@ -712,9 +723,14 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            qobj = await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
-            _stamp_query_source([qobj], query_source_of(source))
-            return qobj
+            return await YTDL.yt_source(
+                ctx.author,
+                search,
+                ts=ts,
+                redis=self.redis,
+                query_source=query_source_of(source),
+                analytics=analytics,
+            )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -724,6 +740,7 @@ class MusicBot(commands.Cog):
         qobj: Union[ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
         mp: MusicPlayer,
         *,
+        analytics: Analytics,
         front: bool = False,
     ) -> None:
         """Queue a resolved playlist and notify the channel — branches on the
@@ -735,7 +752,7 @@ class MusicBot(commands.Cog):
         enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(titles)
+            qobjs_yt = spotify_playlist_to_ytsearch(titles, analytics=analytics)
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
                 send_embed(
@@ -905,6 +922,16 @@ class MusicBot(commands.Cog):
                     # hands this exact player to _abandon_cold_start, and a get_mp()
                     # issued after its cleanup() would build and start a fresh one.
                     mp = self.get_mp(ctx)
+                    # Ask-time analytics, read ONCE at dispatch. queued_at is the
+                    # command message's snowflake time, not time.time() — gateway
+                    # delivery lag is real time the user waited (cross-clock with
+                    # played_at; a small negative wait in the archive reads as
+                    # host drift). front ⇒ depth 0: a cold-start song jumps the
+                    # restored queue and plays first.
+                    analytics = Analytics(
+                        queued_at=ctx.message.created_at.timestamp(),
+                        queue_position=0 if front else mp.enqueue_depth(),
+                    )
                     if front:
                         # Hold the gate across the join below: join opens it the
                         # moment the handshake lands, which would start the
@@ -917,7 +944,9 @@ class MusicBot(commands.Cog):
                         # client is ready before queue_put fires.
                         join_task = asyncio.create_task(ctx.invoke(self.join))
                         try:
-                            qobj = await self.queue_source(ctx, source)
+                            qobj = await self.queue_source(
+                                ctx, source, analytics=analytics
+                            )
                             await join_task
                         except BaseException:
                             if not join_task.done():
@@ -939,7 +968,7 @@ class MusicBot(commands.Cog):
                             await self._abandon_cold_start(ctx, mp)
                             return
                     else:
-                        qobj = await self.queue_source(ctx, source)
+                        qobj = await self.queue_source(ctx, source, analytics=analytics)
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
@@ -965,7 +994,9 @@ class MusicBot(commands.Cog):
                         qobj.user_input = url
                         await self._enqueue_single(ctx, qobj, mp, front=front)
                     else:
-                        await self._enqueue_playlist(ctx, source, qobj, mp, front=front)
+                        await self._enqueue_playlist(
+                            ctx, source, qobj, mp, front=front, analytics=analytics
+                        )
 
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
@@ -983,21 +1014,33 @@ class MusicBot(commands.Cog):
             "Use `-play` for the full playlist.",
             discord.Color.orange(),
         )
+        # Ask-time analytics: the message's snowflake time, and depth 0 — an
+        # interjection plays immediately by definition, so no queue read at all.
+        analytics = Analytics(
+            queued_at=ctx.message.created_at.timestamp(), queue_position=0
+        )
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1])[0]
+            yts = spotify_playlist_to_ytsearch(titles[:1], analytics=analytics)[0]
             # Both playlist branches resolve directly rather than through
-            # queue_source, so each stamps its own result.
-            qobj = await YTDL.yt_source(
-                ctx.author, yts.ytsearch or "", redis=self.redis
+            # queue_source, so each passes its own metadata.
+            return await YTDL.yt_source(
+                ctx.author,
+                yts.ytsearch or "",
+                redis=self.redis,
+                query_source=query_source_of(yts),
+                analytics=analytics,
             )
-            _stamp_query_source([qobj], query_source_of(yts))
-            return qobj
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            tracks = await YTDL.yt_playlist(
+                source.playlist_url,
+                ctx.author,
+                query_source=query_source_of(source),
+                analytics=analytics,
+            )
             # Indexed here too: -playnow on a link copied mid-playlist should
             # interject the track the user was looking at, not the playlist's
             # first. The slice makes tracks[0] that track.
@@ -1014,9 +1057,8 @@ class MusicBot(commands.Cog):
                 )
             else:
                 await ctx.send(embed=playlist_notice)
-            _stamp_query_source(tracks[:1], query_source_of(source))
             return tracks[0]
-        qobj = await self.queue_source(ctx, source)
+        qobj = await self.queue_source(ctx, source, analytics=analytics)
         assert isinstance(qobj, QueueObject)
         return qobj
 
@@ -1126,8 +1168,8 @@ class MusicBot(commands.Cog):
             # It interrupted nothing, so keeping the marker would attribute an
             # interjection that never happened.
             qobj.interjected = False
-            # The player's wrapper, not queue.put_front directly: it stamps the
-            # enqueue under the queue mutex like every other user-facing insert.
+            # The player's wrapper, not queue.put_front directly — the same
+            # item-vs-list plumbing as every other user-facing insert.
             # prefetch=False — the stream URL was warmed above.
             await mp.queue_put_front(qobj, prefetch=False)
             await asyncio.gather(

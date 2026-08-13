@@ -45,14 +45,19 @@ class Analytics:
     Frozen on purpose: carry sites alias one instance across a resume tail and
     its source (analytics=current.analytics), which is only safe immutable."""
 
-    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
-    # stamped", which is what makes stamping idempotent across re-queues.
+    # Unix epoch when the user ASKED for the song — the command message's
+    # snowflake time, not time.time(), so played_at - queued_at is cross-clock:
+    # under host drift a slightly negative wait is skew, not corruption.
+    # 0.0 = unknown (pre-feature wire entries).
     queued_at: float
-    # Songs ahead of it then, counting the one playing (0 = played immediately).
+    # Songs ahead at ask time, counting the one playing (0 = played immediately).
+    # Read once at command dispatch (MusicPlayer.enqueue_depth) and approximate
+    # against insert by design — the loop dequeues continuously, and the exact
+    # wait sits beside it as played_at - queued_at.
     queue_position: int
 
 
-# The unstamped value: what a pre-feature wire entry rehydrates as, and the
+# The unknown value: what a pre-feature wire entry rehydrates as, and the
 # default on live objects whose construction site cannot know the values yet.
 ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
 
@@ -84,8 +89,8 @@ class StateField:
     # the tail's NP-card cleanup, so losing it across a crash changes behaviour.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
     CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
-    # Stamped at enqueue and carried, never restamped, so a crash-recovered song
-    # still archives the position it was originally queued at.
+    # Set once at ask time and carried, never rewritten, so a crash-recovered
+    # song still archives the position it was originally queued at.
     CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
     CURRENT_SONG_QUEUE_POSITION: Final[str] = "current_song_queue_position"
     # Same reason: without it a song recovered after a crash archives as unknown,
@@ -590,7 +595,7 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # Enqueue stamps (0 = unknown / played immediately), see QueueObject.
+    # Ask-time analytics (0 = unknown / played immediately), see Analytics.
     queued_at: float = 0.0
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
@@ -739,8 +744,8 @@ class SearchQueueEntry:
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
-    # Enqueue stamps: searches are stamped like resolved songs, so a Spotify
-    # playlist track keeps its position through the resolve at dequeue.
+    # Ask-time analytics, carried so a Spotify playlist track keeps its position
+    # through the resolve at dequeue.
     queued_at: float = 0.0
     queue_position: int = 0
     # Likewise for the classification — this is the leg that makes a Spotify
@@ -919,8 +924,8 @@ class HistoryEntry:
     played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
     channel_id: int = 0  # the channel that host was in; 0 = unknown, always paired
-    queued_at: float = 0.0  # unix epoch when first enqueued; 0 = unknown
-    # Songs ahead of it at that moment, counting the one playing. 0 means it
+    queued_at: float = 0.0  # unix epoch when the user ASKED; 0 = unknown
+    # Songs ahead of it at ask time, counting the one playing. 0 means it
     # played immediately — and is also what a pre-feature entry parses as.
     queue_position: int = 0
     # How the song was asked for: "search", or the host of the link that was
