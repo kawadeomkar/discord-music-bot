@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
+    _LREM_MAX_ENTRIES,
     GuildQueue,
     RemoveMode,
     ShuffleOutcome,
@@ -1239,6 +1240,82 @@ class TestShuffleWithInFlightDequeue:
         assert len(gq.display_items()) == 5
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 4  # the crashed head is never persisted
+
+
+class TestMirrorWriteChoice:
+    """Which Redis write a mutation picks. A rebuild costs the same whether it
+    drops one entry or fifty, so a small -remove takes the LREM path instead —
+    but only a removal may, because LREM says the survivors kept their order."""
+
+    def _spy(self, store: GuildRedisStore) -> list[str]:
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            original = getattr(store, name)
+
+            def spy(*args: Any, _n: str = name, _o: Any = original, **kw: Any) -> Any:
+                calls.append(_n)
+                return _o(*args, **kw)
+
+            setattr(store, name, spy)
+        return calls
+
+    async def test_a_small_removal_lrems(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(n, mock_author) for n in range(1, 6)])
+        calls = self._spy(store)
+
+        await gq.remove(remove_matcher("https://yt.com/v=3"))
+
+        assert calls == ["remove_queue_entries"]
+
+    async def test_a_large_removal_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Past the threshold the per-LREM scans overtake one rewrite."""
+        album = "https://open.spotify.com/album/big"
+        await gq.put(
+            [
+                QueueObject(
+                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                )
+                for n in range(_LREM_MAX_ENTRIES + 1)
+            ]
+            # A survivor, or the queue empties and DELETE wins before the
+            # threshold is ever consulted.
+            + [_qobj(999, mock_author)]
+        )
+        calls = self._spy(store)
+
+        outcome = await gq.remove(remove_matcher(album))
+
+        assert len(outcome.positions) == _LREM_MAX_ENTRIES + 1
+        assert calls == ["rebuild_queue"]
+
+    async def test_removing_everything_deletes_the_key(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Not an LREM of each: an empty list must not be left behind for the next
+        restore to find, and DELETE is one round trip rather than n."""
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        calls = self._spy(store)
+
+        await gq.remove(lambda _item: RemoveMode.RESOLVED)
+
+        assert calls == ["delete_queue"]
+
+    async def test_shuffle_always_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """LREM cannot express a reorder — it removes, and shuffle removes nothing.
+        Passing it a `removed` set here would silently leave Redis in the old
+        order while memory held the new one."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 6)])
+        calls = self._spy(store)
+
+        await gq.shuffle()
+
+        assert calls == ["rebuild_queue"]
 
 
 class TestRemoveWithInFlightDequeue:

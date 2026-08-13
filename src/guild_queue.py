@@ -55,6 +55,18 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
+# Above this many removed entries, the pipelined LREMs cost more than rewriting
+# the whole list. Measured on redis:7-alpine at depth 1000 — a rebuild is a flat
+# ~5.7ms whatever it drops, while LREM runs 0.96ms for one entry, 3.4ms for 100
+# and 5.8ms for 250, crossing over near 270. Set below that: the margin absorbs
+# the depth the crossover moves with, and every realistic collection removal
+# (an album, a playlist page) sits far under it.
+#
+# NOT the ~40 an earlier estimate gave. That came from fakeredis, where a
+# pipeline costs what its commands cost; against a real server the whole batch
+# is one round trip, so LREM stays ahead roughly six times longer.
+_LREM_MAX_ENTRIES = 200
+
 
 class _FrontQueue(asyncio.Queue[QueueItem]):
     """asyncio.Queue plus head insertion.
@@ -425,7 +437,7 @@ class GuildQueue:
             self._display = deque(in_flight + kept)
 
             if removed_positions:
-                await self._write_mirror(in_flight + kept)
+                await self._write_mirror(in_flight + kept, removed=removed_items)
 
         return RemoveOutcome(
             removed=removed_items,
@@ -587,8 +599,11 @@ class GuildQueue:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _write_mirror(self, items: Sequence[QueueItem]) -> None:
-        """Replace the Redis mirror with the persisted subset of `items`, in order.
+    async def _write_mirror(
+        self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
+    ) -> None:
+        """Bring the Redis mirror in line with `items` — the persisted subset, in
+        order — by whichever of three writes is right.
 
         Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
         where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation
@@ -597,14 +612,24 @@ class GuildQueue:
 
         Empty means DELETE, not skip: a queue whose every persisted entry just went
         would otherwise leave the old list behind for the next restore to find.
+
+        `removed` is the LREM shortcut, and only a removal may pass it: it says the
+        survivors kept their order, which is false for shuffle and for any insert.
+        Worth it because a rebuild costs the same whether it drops one entry or two
+        hundred — ~5.7ms at depth 1000, against ~0.96ms to LREM a single entry —
+        and one song is what -remove does nearly every time.
         """
         if self._store is None:
             return
         entries = [_to_entry(s) for s in items if is_persisted(s)]
-        if entries:
-            await self._store.rebuild_queue(entries)
-        else:
+        if not entries:
             await self._store.delete_queue()
+            return
+        dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+        if dropped and len(dropped) <= _LREM_MAX_ENTRIES:
+            await self._store.remove_queue_entries(dropped)
+            return
+        await self._store.rebuild_queue(entries)
 
     def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
         """The dequeued-but-uncommitted items at the display head.

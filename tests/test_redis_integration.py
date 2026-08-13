@@ -51,7 +51,7 @@ import redis.asyncio as aioredis
 
 from redis.exceptions import OutOfMemoryError
 
-from src.guild_state import HistoryEntry
+from src.guild_state import HistoryEntry, SongQueueEntry
 from src.redis_client import (
     HISTORY_CACHE_LIMIT,
     HISTORY_OUTBOX_CONSUMER,
@@ -854,3 +854,88 @@ class TestDebugBlockFieldNames:
         assert await store.history_ttl() == -1
         await redis.expire(store.history_key(), 3600)
         assert 0 < cast(int, await store.history_ttl()) <= 3600
+
+
+class TestLremRemovalPath:
+    """`remove_queue_entries` — the write a small `-remove` takes instead of
+    rewriting the whole list. fakeredis answers LREM, so the unit tier covers the
+    shape; what it cannot vouch for is the semantics this depends on against a
+    real server, and getting either wrong corrupts a persisted queue silently."""
+
+    @staticmethod
+    def _entry(n: int) -> SongQueueEntry:
+        return SongQueueEntry(
+            webpage_url=f"https://yt.com/v={n}", title=f"Song {n}", requester_id=n
+        )
+
+    async def test_a_positive_count_removes_from_the_head_only(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """LREM's count sign picks a direction, and the queue is head-ordered: a
+        negative count would take the LAST copy of a duplicate, leaving the one
+        the user is about to hear and dropping the one further back."""
+        store = GuildRedisStore(redis, guild_id=1)
+        await store.rebuild_queue(
+            [self._entry(1), self._entry(2), self._entry(1), self._entry(3)]
+        )
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [
+            self._entry(2).to_redis(),
+            self._entry(1).to_redis(),
+            self._entry(3).to_redis(),
+        ]
+
+    async def test_bytes_values_match_what_rpush_wrote(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The pool is decode_responses=False, so entries go in as bytes and LREM
+        must compare against the same bytes. redis-py's stub types `value` as str
+        — the one place this file's suppression is checked against a real server."""
+        store = GuildRedisStore(redis, guild_id=2)
+        await store.rebuild_queue([self._entry(n) for n in range(1, 4)])
+
+        await store.remove_queue_entries([self._entry(2)])
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [self._entry(1).to_redis(), self._entry(3).to_redis()]
+
+    async def test_a_missing_entry_is_a_no_op_not_an_error(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """The in-flight head is on the list but never removed, and a
+        crash-recovered item is on neither. Both make "remove this" reach an entry
+        that is not there, which must leave the rest alone rather than raise."""
+        store = GuildRedisStore(redis, guild_id=3)
+        await store.rebuild_queue([self._entry(1), self._entry(2)])
+
+        await store.remove_queue_entries([self._entry(99)])
+
+        items = await redis.lrange(store.queue_key(), 0, -1)
+        assert items == [self._entry(1).to_redis(), self._entry(2).to_redis()]
+
+    async def test_the_ttl_is_refreshed_like_every_other_queue_write(
+        self, redis: aioredis.Redis
+    ) -> None:
+        store = GuildRedisStore(redis, guild_id=4)
+        await store.rebuild_queue([self._entry(1), self._entry(2)])
+        await redis.persist(store.queue_key())
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        assert cast(int, await redis.ttl(store.queue_key())) > 0
+
+    async def test_emptying_the_list_by_lrem_leaves_no_key(
+        self, redis: aioredis.Redis
+    ) -> None:
+        """Redis drops a list key when its last element goes, so the EXPIRE that
+        follows lands on nothing. GuildQueue takes the DELETE path here instead —
+        this pins what the store would do if it ever did not."""
+        store = GuildRedisStore(redis, guild_id=5)
+        await store.rebuild_queue([self._entry(1)])
+
+        await store.remove_queue_entries([self._entry(1)])
+
+        assert await redis.exists(store.queue_key()) == 0
