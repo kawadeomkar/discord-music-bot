@@ -36,9 +36,9 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum, StrEnum, auto
 from typing import Optional, Union
 
 import discord
@@ -78,6 +78,56 @@ class ShuffleOutcome(Enum):
     TOO_FEW_SONGS = auto()  # fewer than 4 queued items — nothing was mutated
 
 
+class RemoveMode(StrEnum):
+    """How a removal matched, for the reply to explain itself with."""
+
+    RESOLVED = "resolved"  # the yt-dlp URL, as the Now Playing card shows it
+    ORIGIN = "origin"  # what the user typed: a search term, or a source link
+
+
+# One queue item → the mode it matched under, or None. Built by remove_matcher();
+# remove() only applies it, so the policy stays testable without a queue.
+RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
+
+
+def _normalize(s: str) -> str:
+    """Fold a needle for comparison: collapse whitespace, and casefold anything
+    that is not a URL. Links keep their case because IDs inside them are
+    case-sensitive — a casefolded Spotify base62 id would let ".../album/AbC"
+    match a different album's ".../album/abc"."""
+    s = " ".join(s.split())
+    return s if s[:8].lower().startswith(("http://", "https:/")) else s.casefold()
+
+
+def remove_matcher(needle: str) -> RemoveMatcher:
+    """Match a queue item against one `-remove` argument, by resolved URL or by
+    what the user typed, whichever hits.
+
+    The union rather than a mode flag: the two are disjoint in practice — a
+    resolved yt-dlp URL is not something anyone types to queue with — so
+    `-remove <anything>` does the right thing with no syntax to learn. RESOLVED is
+    tried first, which keeps every removal that worked before working the same way.
+
+    Matching an origin removes every item sharing it, which is the point: one
+    album link takes back out exactly the tracks it put in. Links are compared
+    literally, so youtu.be/x will not match an entry stored as
+    youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
+    folded = _normalize(needle)
+
+    def match(item: QueueItem) -> Optional[RemoveMode]:
+        resolved = (
+            item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
+        )
+        if resolved == needle:
+            return RemoveMode.RESOLVED
+        origin = item.user_input
+        if origin is not None and _normalize(origin) == folded:
+            return RemoveMode.ORIGIN
+        return None
+
+    return match
+
+
 @dataclass(frozen=True)
 class RemoveOutcome:
     """What remove() took out. The positions are what the command reports; the
@@ -86,6 +136,10 @@ class RemoveOutcome:
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
+    # ORIGIN when anything matched on what the user typed rather than the resolved
+    # URL — the case where one argument removes many songs, so the reply says so.
+    # None when nothing matched.
+    mode: Optional[RemoveMode] = None
 
 
 def _to_entry(item: QueueItem) -> QueueEntry:
@@ -343,17 +397,20 @@ class GuildQueue:
 
         return ShuffleOutcome.SHUFFLED
 
-    async def remove(self, url: str) -> RemoveOutcome:
-        """Remove every queued item whose webpage_url (QueueObject) or url
-        (YTSource) matches. Returns the removed items with their 1-indexed
-        positions as the queue embed shows them — the items because a removed
-        entry can be the last record of a song that already played. An in-flight
-        dequeue is never removed even on a URL match (it is committed to play;
+    async def remove(self, match: RemoveMatcher) -> RemoveOutcome:
+        """Remove every queued item `match` accepts. Returns the removed items with
+        their 1-indexed positions as the queue embed shows them — the items because
+        a removed entry can be the last record of a song that already played. An
+        in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset."""
+        the numbering offset.
+
+        A predicate rather than a URL: the matching policy is remove_matcher's, and
+        keeping it out here is what lets it be tested without a queue."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
+        modes: list[RemoveMode] = []
 
         async with self._mutex:
             # Drain everything first so positions are numbered before partitioning.
@@ -361,13 +418,11 @@ class GuildQueue:
             in_flight = self._in_flight_head(pending_count=len(drained))
 
             for pos, item in enumerate(drained, start=1 + len(in_flight)):
-                if isinstance(item, QueueObject):
-                    match = item.webpage_url == url
-                else:
-                    match = (item.url or "") == url
-                if match:
+                mode = match(item)
+                if mode is not None:
                     removed_positions.append(pos)
                     removed_items.append(item)
+                    modes.append(mode)
                 else:
                     kept.append(item)
 
@@ -382,7 +437,16 @@ class GuildQueue:
                 else:
                     await self._store.delete_queue()
 
-        return RemoveOutcome(removed=removed_items, positions=removed_positions)
+        return RemoveOutcome(
+            removed=removed_items,
+            positions=removed_positions,
+            # ORIGIN if it is anywhere in the run: a mixed match means the argument
+            # reached items the resolved URL alone would not have, which is the
+            # thing the reply has to explain.
+            mode=RemoveMode.ORIGIN
+            if RemoveMode.ORIGIN in modes
+            else (RemoveMode.RESOLVED if modes else None),
+        )
 
     # ── Crash recovery ────────────────────────────────────────────────────────
 

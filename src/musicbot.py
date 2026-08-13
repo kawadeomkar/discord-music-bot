@@ -40,7 +40,9 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
+from src.guild_queue import RemoveMode, RemoveOutcome
 from src.sources import (
+    QUERY_SOURCE_SEARCH,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -186,6 +188,24 @@ DEPTH_RESTORE_WAIT_SECS = 1.0
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
+    """How the removal matched, for the reply's "Matched" field.
+
+    An origin match is the one that needs explaining: one argument can take out a
+    whole album, so the reply names which of the user's own inputs did it. The
+    resolved-URL case reads as it always has.
+    """
+    if outcome.mode is not RemoveMode.ORIGIN:
+        return f"<{needle}>"
+    kinds = {item.query_source for item in outcome.removed if item.query_source}
+    # Only when every removed item agrees — a mixed set has no one kind to name.
+    kind = kinds.pop() if len(kinds) == 1 else ""
+    them = "them" if len(outcome.removed) > 1 else "it"
+    if kind == QUERY_SOURCE_SEARCH:
+        return f"`{needle}` — the search you queued {them} with"
+    return f"<{needle}> — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1678,29 +1698,45 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="remove",
         aliases=["rm"],
-        brief="remove queued songs matching a URL",
-        usage="<url>",
+        brief="remove queued songs by link or by what you typed",
+        usage="<link or search text>",
         help=(
-            "Removes every queued song matching a YouTube URL and reports the "
+            "Removes every queued song matching what you give it and reports the "
             "queue positions that were dropped, followed by the updated queue.\n\n"
-            "The URL must match the YouTube link shown in the **Now Playing** "
-            "card — not the Spotify or search text you originally queued with. "
-            "Run it with no URL for a reminder of the format."
+            "Three things match: the YouTube link shown in the **Now Playing** "
+            "card, the search text you queued with, and the link you queued with "
+            "— so removing an album or playlist link takes back out every track "
+            "it added. Run it with no argument for a reminder.\n\n"
+            "Links are matched as typed, so a `youtu.be` short link will not "
+            "match a song queued from a full `youtube.com` one."
         ),
         extras={
             "category": "Queue",
-            "examples": ["-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+            "examples": [
+                "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "-remove never gonna give you up",
+                "-remove https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+            ],
+            "note": (
+                "A search term removes what that exact search queued, not "
+                "anything that merely looks similar."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.remove")
-    async def remove(self, ctx: commands.Context, url: Optional[str] = None) -> None:
+    async def remove(
+        self, ctx: commands.Context, *, needle: Optional[str] = None
+    ) -> None:
         try:
-            if url is None:
+            if needle is None:
                 await ctx.send(
                     embed=notice_embed(
-                        "`-remove <url>` — removes all songs matching the given URL from the queue. "
-                        "The URL must match the YouTube link shown in the **Now Playing** embed.",
+                        "`-remove <link or search text>` — removes every queued "
+                        "song that matches. Give it the YouTube link from the "
+                        "**Now Playing** card, or the search text or link you "
+                        "queued with; a collection link removes every track it "
+                        "added.",
                         discord.Color.blue(),
                     )
                 )
@@ -1719,12 +1755,13 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            positions = await mp.queue_remove(url)
+            outcome = await mp.queue_remove(needle)
+            positions = outcome.positions
             if not positions:
                 await send_embed(
                     ctx,
                     "",
-                    f"No queued songs found matching: <{url}>",
+                    f"No queued songs found matching: {needle}",
                     discord.Color.red(),
                 )
                 return
@@ -1738,7 +1775,7 @@ class MusicBot(commands.Cog):
                 "",
                 discord.Color.orange(),
                 fields=[
-                    ("URL", f"<{url}>", False),
+                    ("Matched", _matched_label(outcome, needle), False),
                     (f"{pos_label} removed", pos_str, False),
                 ],
             )

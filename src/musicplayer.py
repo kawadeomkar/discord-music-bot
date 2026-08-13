@@ -24,7 +24,13 @@ from opentelemetry import trace
 from src import config
 from src.debug import decorate_embeds, strip_debug_footers
 from src.guild_history import GuildHistory
-from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
+from src.guild_queue import (
+    GuildQueue,
+    RemoveOutcome,
+    ShuffleOutcome,
+    is_persisted,
+    remove_matcher,
+)
 from src.guild_state import (
     DEFAULT_TIMEZONE,
     HistoryEntry,
@@ -1221,15 +1227,17 @@ class MusicPlayer:
             return "There must be at least 3 songs to shuffle the queue"
         return "Shuffled!"
 
-    async def queue_remove(self, url: str) -> list[int]:
-        """Remove all queued items matching url (webpage_url for QueueObject, url for
-        YTSource). Returns the 1-indexed queue positions removed.
+    async def queue_remove(self, needle: str) -> RemoveOutcome:
+        """Remove every queued item matching `needle` — the resolved yt-dlp URL, or
+        what the user originally typed (see remove_matcher). Returns the whole
+        outcome: the command reports the positions AND names the mode, because an
+        origin match is the case where one argument removes many songs.
         """
         await self._cancel_prefetch()
-        outcome = await self.queue.remove(url)
+        outcome = await self.queue.remove(remove_matcher(needle))
         await self._flush_played(outcome.removed)
         await self._dispose_orphaned_cards(outcome.removed)
-        return outcome.positions
+        return outcome
 
     # ── Embed building ────────────────────────────────────────────────────────
 

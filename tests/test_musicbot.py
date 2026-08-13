@@ -18,6 +18,7 @@ from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
     DEPTH_RESTORE_WAIT_SECS,
@@ -3755,6 +3756,14 @@ class TestQueueCommand:
 # ── Remove command ────────────────────────────────────────────────────────────
 
 
+def _removed_song(n: int, query_source: str = "") -> QueueObject:
+    """A stand-in for what queue_remove hands back — the reply reads query_source
+    off these to name how it matched."""
+    return QueueObject(
+        f"https://yt.com/v={n}", f"Song {n}", MagicMock(), query_source=query_source
+    )
+
+
 class TestRemoveCommand:
     async def test_a_failure_becomes_a_command_error(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3770,7 +3779,7 @@ class TestRemoveCommand:
         music_bot._command_error = AsyncMock()
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         music_bot._command_error.assert_awaited_once()
@@ -3783,7 +3792,7 @@ class TestRemoveCommand:
     async def test_no_url_sends_usage_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        await command_callback(MusicBot.remove)(music_bot, mock_ctx, None)
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=None)
 
         mock_ctx.send.assert_awaited_once()
         msg = mock_ctx.send.call_args.kwargs["embed"].description
@@ -3793,12 +3802,14 @@ class TestRemoveCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(removed=[], positions=[])
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=notfound"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=notfound"
         )
 
         mock_ctx.send.assert_awaited_once()
@@ -3809,13 +3820,19 @@ class TestRemoveCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[2])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(1)],
+                positions=[2],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         calls = mock_ctx.send.await_args_list
@@ -3830,13 +3847,19 @@ class TestRemoveCommand:
     ) -> None:
         queue_embed = discord.Embed(title="Queue")
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(1)],
+                positions=[1],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=queue_embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         calls = mock_ctx.send.await_args_list
@@ -3849,44 +3872,119 @@ class TestRemoveCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(1)],
+                positions=[1],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         mock_ctx.message.add_reaction.assert_awaited_once_with("🗑️")
 
-    async def test_removal_embed_contains_url_field(
+    async def test_an_origin_match_explains_itself(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """One argument removing eight songs needs a reason on screen, or it reads
+        as the bot having removed more than it was asked to."""
+        album = "https://open.spotify.com/album/abc123"
+        removed: list[QueueItem] = [_removed_song(i, "spotify.com") for i in range(8)]
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=removed,
+                positions=list(range(1, 9)),
+                mode=RemoveMode.ORIGIN,
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=album)
+
+        fields = {
+            f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+        }
+        assert (
+            fields["Matched"]
+            == f"<{album}> — the spotify.com link you queued them with"
+        )
+
+    async def test_a_search_match_is_quoted_not_linked(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Search text is not a URL — angle-bracketing it would render as a broken
+        link, and "them" would be wrong for the single song it took."""
+        song = _removed_song(1, "search")
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[song], positions=[2], mode=RemoveMode.ORIGIN
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="never gonna give you up"
+        )
+
+        fields = {
+            f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+        }
+        assert fields["Matched"] == (
+            "`never gonna give you up` — the search you queued it with"
+        )
+
+    async def test_removal_embed_names_what_it_matched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[3])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(1)],
+                positions=[3],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
         url = "https://yt.com/watch?v=abc"
 
-        await command_callback(MusicBot.remove)(music_bot, mock_ctx, url)
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=url)
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
-        field_names = [f.name for f in removal_embed.fields]
-        assert "URL" in field_names
+        fields = {f.name: f.value for f in removal_embed.fields}
+        # A resolved-URL match reads as it always has: the link, nothing more.
+        assert fields["Matched"] == f"<{url}>"
 
     async def test_removal_embed_shows_positions(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[1, 4])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(2)],
+                positions=[1, 4],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
@@ -3897,13 +3995,19 @@ class TestRemoveCommand:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         mp = MagicMock()
-        mp.queue_remove = AsyncMock(return_value=[1])
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[_removed_song(i) for i in range(1)],
+                positions=[1],
+                mode=RemoveMode.RESOLVED,
+            )
+        )
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
-            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
         )
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]

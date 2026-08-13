@@ -12,7 +12,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
+from src.guild_queue import (
+    GuildQueue,
+    RemoveMode,
+    ShuffleOutcome,
+    is_persisted,
+    remove_matcher,
+)
 from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
@@ -584,6 +590,56 @@ class TestShuffle:
 # ── remove ────────────────────────────────────────────────────────────────────
 
 
+class TestRemoveMatcher:
+    """`remove_matcher` — the union policy, tested without a queue. RESOLVED is
+    tried first so every removal that worked before works identically."""
+
+    def _song(self, url: str, origin: str | None) -> QueueObject:
+        return QueueObject(url, "Song", MagicMock(), user_input=origin)
+
+    def test_resolved_url_still_matches(self) -> None:
+        item = self._song("https://yt.com/v=1", "some search")
+        assert remove_matcher("https://yt.com/v=1")(item) is RemoveMode.RESOLVED
+
+    def test_the_search_text_matches(self) -> None:
+        item = self._song("https://yt.com/v=1", "never gonna give you up")
+        match = remove_matcher("never gonna give you up")
+        assert match(item) is RemoveMode.ORIGIN
+
+    def test_search_text_is_case_and_space_insensitive(self) -> None:
+        """Retyping a search rather than pasting it is the normal way to use this,
+        so folding is what makes it usable at all."""
+        item = self._song("https://yt.com/v=1", "Never  Gonna Give You Up")
+        assert remove_matcher(" never gonna give you up ")(item) is RemoveMode.ORIGIN
+
+    def test_links_keep_their_case(self) -> None:
+        """A Spotify id is case-sensitive base62, so folding a link would let one
+        album's id match another's. Text still folds; links must not."""
+        item = self._song("https://yt.com/v=1", "https://open.spotify.com/album/AbC")
+        assert remove_matcher("https://open.spotify.com/album/abc")(item) is None
+        assert (
+            remove_matcher("https://open.spotify.com/album/AbC")(item)
+            is RemoveMode.ORIGIN
+        )
+
+    def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
+        """A Spotify-playlist track has no resolved URL yet — the origin is the
+        only thing it can be matched by, and the only place the album link is."""
+        album = "https://open.spotify.com/album/xyz"
+        item = YTSource(ytsearch="ytsearch:Track One", user_input=album)
+        assert remove_matcher(album)(item) is RemoveMode.ORIGIN
+
+    def test_no_origin_recorded_never_matches_by_origin(self) -> None:
+        """A pre-feature queue entry rehydrates with user_input=None, which must
+        not collide with anything — least of all an empty argument."""
+        item = self._song("https://yt.com/v=1", None)
+        assert remove_matcher("")(item) is None
+
+    def test_unrelated_needle_matches_nothing(self) -> None:
+        item = self._song("https://yt.com/v=1", "some search")
+        assert remove_matcher("something else")(item) is None
+
+
 class TestRemove:
     async def test_removes_matching_and_returns_positions(
         self,
@@ -597,7 +653,7 @@ class TestRemove:
         duplicate = QueueObject("https://yt.com/v=2", "Song 2 again", mock_author)
         await gq.put([other, target, duplicate])
 
-        outcome = await gq.remove("https://yt.com/v=2")
+        outcome = await gq.remove(remove_matcher("https://yt.com/v=2"))
 
         assert outcome.positions == [2, 3]
         assert outcome.removed == [target, duplicate]  # the items, not just where
@@ -613,7 +669,7 @@ class TestRemove:
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
         before = await fake_redis.lrange(store.queue_key(), 0, -1)
-        outcome = await gq.remove("https://yt.com/v=none")
+        outcome = await gq.remove(remove_matcher("https://yt.com/v=none"))
         assert (outcome.positions, outcome.removed) == ([], [])
         assert len(gq.display_items()) == 1
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == before
@@ -626,7 +682,7 @@ class TestRemove:
         mock_author: MagicMock,
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
-        outcome = await gq.remove("https://yt.com/v=1")
+        outcome = await gq.remove(remove_matcher("https://yt.com/v=1"))
         assert outcome.positions == [1]
         assert await fake_redis.exists(store.queue_key()) == 0
 
@@ -639,7 +695,7 @@ class TestRemove:
     ) -> None:
         src = YTSource(url="https://yt.com/v=7", process=False)
         await gq.put([src, _qobj(1, mock_author)])
-        outcome = await gq.remove("https://yt.com/v=7")
+        outcome = await gq.remove(remove_matcher("https://yt.com/v=7"))
         assert outcome.positions == [1]
         assert outcome.removed == [src]  # YTSources come back too; the caller filters
         assert len(gq.display_items()) == 1
@@ -1197,7 +1253,7 @@ class TestRemoveWithInFlightDequeue:
         await gq.put(items)
         in_flight = await gq.get()  # items[0]
 
-        outcome = await gq.remove(items[2].webpage_url)
+        outcome = await gq.remove(remove_matcher(items[2].webpage_url))
 
         # The queue embed numbers display items from 1 with the in-flight
         # head included, so items[2] shows as #3.
@@ -1233,7 +1289,7 @@ class TestRemoveWithInFlightDequeue:
         in_flight = await gq.get()
         assert in_flight is a1
 
-        outcome = await gq.remove(a1.webpage_url)
+        outcome = await gq.remove(remove_matcher(a1.webpage_url))
 
         assert outcome.positions == [2]  # only the pending duplicate
         # The head is committed to play, so it is not among the removed items

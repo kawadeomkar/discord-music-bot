@@ -17,6 +17,7 @@ import pytest
 from opentelemetry import trace as trace_api
 
 from src.debug import RuntimeSnapshot
+from src.guild_queue import RemoveMode
 from src.guild_state import (
     ANALYTICS_ZERO,
     Analytics,
@@ -897,25 +898,63 @@ class TestQueueRemove:
         qobj = QueueObject("https://yt.com/v=abc", "Song", mock_author)
         await music_player.queue_put(qobj)
 
-        positions = await music_player.queue_remove("https://yt.com/v=abc")
+        positions = (await music_player.queue_remove("https://yt.com/v=abc")).positions
 
         assert positions == [1]
         assert music_player.queue.qsize() == 0
         assert len(music_player.queue._display) == 0
 
-    async def test_remove_by_user_input_not_supported(
+    async def test_remove_by_the_search_text_that_queued_it(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        # user_input is not a match key — only webpage_url is used.
+        """The resolved yt-dlp URL is not what a user who typed a search has in
+        front of them — before this, the only way to remove that song was to read
+        the link off the Now Playing card."""
         qobj = QueueObject(
             "https://yt.com/v=abc", "Song", mock_author, user_input="my search query"
         )
         await music_player.queue_put(qobj)
 
-        positions = await music_player.queue_remove("my search query")
+        outcome = await music_player.queue_remove("my search query")
 
-        assert positions == []
-        assert music_player.queue.qsize() == 1
+        assert outcome.positions == [1]
+        assert outcome.mode is RemoveMode.ORIGIN
+        assert music_player.queue.qsize() == 0
+
+    async def test_one_collection_link_removes_every_track_it_queued(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The point of matching on origin: an album expands to N songs sharing
+        one link, and removing them one resolved URL at a time is the workflow
+        this replaces. The song queued separately stays."""
+        album = "https://open.spotify.com/album/abc123"
+        await music_player.queue_put(
+            [
+                QueueObject(
+                    f"https://yt.com/v={n}",
+                    f"Track {n}",
+                    mock_author,
+                    user_input=album,
+                    query_source="spotify.com",
+                )
+                for n in range(1, 4)
+            ]
+            + [
+                QueueObject(
+                    "https://yt.com/v=other",
+                    "Other",
+                    mock_author,
+                    user_input="unrelated search",
+                )
+            ]
+        )
+
+        outcome = await music_player.queue_remove(album)
+
+        assert outcome.positions == [1, 2, 3]
+        assert outcome.mode is RemoveMode.ORIGIN
+        survivors = music_player.queue.display_items()
+        assert [getattr(i, "title", None) for i in survivors] == ["Other"]
 
     async def test_no_match_returns_empty_list(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -923,7 +962,7 @@ class TestQueueRemove:
         qobj = QueueObject("https://yt.com/v=abc", "Song", mock_author)
         await music_player.queue_put(qobj)
 
-        positions = await music_player.queue_remove("https://yt.com/v=xyz")
+        positions = (await music_player.queue_remove("https://yt.com/v=xyz")).positions
 
         assert positions == []
         assert music_player.queue.qsize() == 1
@@ -932,7 +971,7 @@ class TestQueueRemove:
     async def test_remove_empty_queue_returns_empty(
         self, music_player: MusicPlayer
     ) -> None:
-        positions = await music_player.queue_remove("https://yt.com/v=x")
+        positions = (await music_player.queue_remove("https://yt.com/v=x")).positions
         assert positions == []
 
     async def test_remove_returns_correct_1indexed_positions(
@@ -942,7 +981,7 @@ class TestQueueRemove:
             qobj = QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
             await music_player.queue_put(qobj)
 
-        positions = await music_player.queue_remove("https://yt.com/v=2")
+        positions = (await music_player.queue_remove("https://yt.com/v=2")).positions
         assert positions == [3]
 
     async def test_removed_played_tail_is_recorded(
@@ -965,7 +1004,9 @@ class TestQueueRemove:
             QueueObject("https://yt.com/v=other", "Other", mock_author)
         )
 
-        positions = await music_player.queue_remove("https://yt.com/v=heard")
+        positions = (
+            await music_player.queue_remove("https://yt.com/v=heard")
+        ).positions
 
         assert positions == [1]
         assert len(music_player.history) == 1
@@ -978,7 +1019,9 @@ class TestQueueRemove:
             QueueObject("https://yt.com/v=abc", "Song", mock_author)
         )
 
-        assert await music_player.queue_remove("https://yt.com/v=abc") == [1]
+        assert (await music_player.queue_remove("https://yt.com/v=abc")).positions == [
+            1
+        ]
         assert len(music_player.history) == 0
 
     async def test_remove_multiple_matches_returns_all_positions(
@@ -988,7 +1031,7 @@ class TestQueueRemove:
         for url in urls:
             await music_player.queue_put(QueueObject(url, f"Song {url}", mock_author))
 
-        positions = await music_player.queue_remove("https://yt.com/v=a")
+        positions = (await music_player.queue_remove("https://yt.com/v=a")).positions
         assert positions == [1, 3]
 
     async def test_remove_keeps_non_matching_songs(
@@ -1048,7 +1091,7 @@ class TestQueueRemove:
             QueueObject("https://yt.com/v=b", "Song B", mock_author)
         )
 
-        positions = await music_player.queue_remove("https://yt.com/v=a")
+        positions = (await music_player.queue_remove("https://yt.com/v=a")).positions
 
         assert positions == [2]  # crashed(1), a(2), b(3) — 1-indexed
         items = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
