@@ -63,7 +63,13 @@ class SpotifySource:
     stype: URLSource = URLSource.SPOTIFY
 
 
-@dataclass(frozen=True)
+# slots: one of these is retained per unresolved Spotify-playlist track, so a
+# 1000-track playlist holds 1000 of them until each is dequeued and resolved.
+# Dropping the per-instance __dict__ measures 344 B -> 120 B, so ~224 B each
+# (~224 KB for that playlist) — five times what Analytics costs. Safe here
+# because the class is frozen, has no __dict__ reader (no asdict/vars), and is
+# never pickled — it crosses to Redis as SearchQueueEntry JSON, not as an object.
+@dataclass(frozen=True, slots=True)
 class YTSource:
     """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
     `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
@@ -85,6 +91,13 @@ class YTSource:
     # this resolves into. Parse-layer minting leaves the zero value — the real
     # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
     # yt_source/yt_playlist call for sources resolved directly.
+    #
+    # CONTRACT: the default is for the PARSE layer, which runs before the mint
+    # and has nothing truthful to put here. Anything that hands a YTSource on to
+    # be queued must pass a real value. Nothing re-mints downstream — the stamp
+    # hook that used to backfill a zero is gone — so an omission here persists
+    # 0.0/0 to Redis and to play_history with no error and no log line, and
+    # "unknown / played immediately" is indistinguishable from the real thing.
     analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and

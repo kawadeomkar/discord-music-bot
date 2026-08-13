@@ -20,6 +20,7 @@ from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
+    DEPTH_RESTORE_WAIT_SECS,
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
     HistoryFlags,
@@ -330,6 +331,8 @@ class TestQuerySourceClassification:
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
+        # keep_first_only is -playnow's; -play enqueues the whole tail.
+        assert len(result.tracks) == 3
         # The ask time is untouched by the slice — one instant for the command.
         assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
 
@@ -529,6 +532,32 @@ class TestQuerySourceClassification:
         with patch("src.musicbot.YTDL.yt_playlist", new=spy):
             await music_bot._resolve_playnow_source(mock_ctx, source)
         assert self._passed_query_source(spy) == "youtube.com"
+
+    async def test_playnow_indexed_playlist_rebases_only_the_track_it_keeps(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-playnow interjects exactly one track. Rebasing the rest is work whose
+        only consumer throws it away, so keep_first_only trims first — and the
+        one survivor still lands at 0, the depth an interjection actually has."""
+        url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
+        source = parse_input(url, f"-playnow {url}")
+        tracks = [
+            QueueObject(
+                f"https://yt.com/watch?v=v{i}",
+                f"T{i}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1752530000.5, queue_position=i),
+            )
+            for i in range(6)
+        ]
+        with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
+            kept = await music_bot._resolve_playnow_source(mock_ctx, source)
+
+        assert kept is tracks[3]
+        assert kept.analytics.queue_position == 0
+        # The discarded tail keeps its construction-time positions — untouched,
+        # which is the whole point of trimming before the rebase.
+        assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
 
     async def test_playnow_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -2595,6 +2624,10 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
     mp.queue_put_front = AsyncMock()
     mp.queue_put = AsyncMock()
     mp.queue.qsize = MagicMock(return_value=qsize)
+    # Numeric for the same reason as playback_holds: this lands in
+    # Analytics.queue_position and rides to Postgres through HistoryEntry's
+    # integer clamp, which a Mock raises on rather than answering.
+    mp.enqueue_depth = MagicMock(return_value=qsize)
     # Mirrors the real builder's contract: a notice only when the restore
     # actually left something in the queue (see build_resume_notice_embed).
     mp.build_resume_notice_embed = MagicMock(
@@ -2743,6 +2776,101 @@ class TestPlayCommand:
         mock_ctx.send.assert_awaited()
 
 
+class TestPlayAnalytics:
+    """The ask-time Analytics -play mints and hands to queue_source.
+
+    Asserted on the call rather than on a returned object: queue_source is what
+    carries the value into every construction site, and nothing downstream
+    restamps it, so the hand-off IS the behavior."""
+
+    async def test_warm_path_carries_the_ask_time_and_the_player_depth(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = _playing_vc()
+        mp = _mock_mp()
+        mp.enqueue_depth = MagicMock(return_value=7)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        spy = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot.queue_source = spy
+        music_bot._enqueue_single = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        assert spy.await_args is not None
+        analytics = spy.await_args.kwargs["analytics"]
+        # The message snowflake, NOT time.time(): gateway delivery lag is real
+        # time the user waited, and so is the 1-4s resolve that follows.
+        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
+        assert analytics.queue_position == 7
+
+    async def test_cold_path_is_depth_zero_without_reading_the_queue(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A cold-start song front-inserts ahead of the restored queue and plays
+        first, so its depth is 0 by construction — the queue is never asked."""
+        mock_ctx.voice_client = None
+        mp = _mock_mp()
+        mp.enqueue_depth = MagicMock(return_value=7)  # would be wrong if read
+        music_bot.get_mp = MagicMock(return_value=mp)
+        spy = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot.queue_source = spy
+        music_bot._enqueue_single = AsyncMock()
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
+            coro.close()
+            mock_ctx.voice_client = _connected_vc()
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        assert spy.await_args is not None
+        analytics = spy.await_args.kwargs["analytics"]
+        assert analytics.queued_at == mock_ctx.message.created_at.timestamp()
+        assert analytics.queue_position == 0
+        mp.enqueue_depth.assert_not_called()
+
+    async def test_warm_path_reads_the_depth_after_the_restore_lands(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Crash recovery reconnects voice BEFORE restore_entries() replays the
+        queue into _display. Reading the depth in that window records 0 behind a
+        queue about to reappear, so the read waits the restore out."""
+        mock_ctx.voice_client = _playing_vc()
+        mp = _mock_mp()
+        restored = False
+
+        async def _land_the_restore(**_kw: Any) -> bool:
+            nonlocal restored
+            restored = True
+            return True
+
+        mp.wait_for_restore = AsyncMock(side_effect=_land_the_restore)
+        # What the real display leg answers on either side of the restore.
+        mp.enqueue_depth = MagicMock(side_effect=lambda: 12 if restored else 0)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        spy = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot.queue_source = spy
+        music_bot._enqueue_single = AsyncMock()
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["analytics"].queue_position == 12
+
+
 class TestPlayWhilePaused:
     """-play on a paused song interjects instead of appending
     . Appending would leave the bot silent
@@ -2850,6 +2978,7 @@ class TestPlayWhilePaused:
         vc = _paused_vc()
         mock_ctx.voice_client = vc
         mp = self._paused_mp()
+        mp.enqueue_depth = MagicMock(return_value=9)
         music_bot.get_mp = MagicMock(return_value=mp)
         qobj = QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
@@ -2870,6 +2999,9 @@ class TestPlayWhilePaused:
         mp.interject.assert_not_awaited()
         music_bot._enqueue_single.assert_awaited_once()
         assert qobj.interjected is False  # must not trigger replace semantics later
+        # Re-minted for the append: the 0 minted for an interjection would claim
+        # this song played immediately when it waited behind the whole queue.
+        assert qobj.analytics.queue_position == 9
 
     async def test_resolution_failure_leaves_paused_song_untouched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3078,8 +3210,15 @@ class TestPlayFrontInsertion:
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
         assert single_call.kwargs["front"] is False
-        # No hold and no restore wait on the warm path — the gate is already open.
-        mp.wait_for_restore.assert_not_awaited()
+        # No playback hold on the warm path — the gate is already open. (It DOES
+        # wait on the restore, but only to read a meaningful queue depth, and on
+        # the short bound; see test_warm_path_reads_the_depth_after_the_restore.)
+        mp.defer_playback.assert_not_called()
+        assert (
+            mp.wait_for_restore.await_args is not None
+            and mp.wait_for_restore.await_args.kwargs["timeout"]
+            == DEPTH_RESTORE_WAIT_SECS
+        )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3925,9 +4064,13 @@ class TestPlaynow:
         await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         mock_ctx.invoke.assert_not_awaited()
-        # The player's wrapper, so the insert is stamped under the queue mutex;
-        # the stream was already warmed, so it must not prefetch again.
+        # The player's wrapper, not queue.put_front directly — same plumbing as
+        # every other insert; the stream was warmed, so it must not prefetch again.
         live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
+        # interject() also returns None when the loop moved on to a DIFFERENT
+        # song, which this insert waits behind: one, not the 0 an interjection
+        # would have had, and not the queue depth — it goes to the front.
+        assert qobj.analytics.queue_position == 1
         # The interjection marker must not leak onto a normally queued song —
         # a later -playnow would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False
