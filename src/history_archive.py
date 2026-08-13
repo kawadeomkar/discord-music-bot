@@ -821,16 +821,17 @@ class HistoryOutboxDrainer:
     # (page+1)-th oldest entry and XRANGE has no ID-only form, so the reply
     # carries bodies: uncapped, a 500k backlog would haul the entire overage over
     # the socket in one reply hundreds of MB wide. 10k entries ≈ 5 MB — a typical
-    # YouTube entry serializes to ~455-470 B, of which 49 B is the
+    # YouTube entry serializes to ~455-470 B, of which 45 B is the
     # queued_at/queue_position pair and 18-32 B is query_source.
     #
     # Resident cost is a STEP, not that wire size: entries pack into listpack nodes
     # bounded by stream-node-max-bytes (4096), and the step is the ALLOCATOR BIN the
-    # node lands in. Measured on redis:7-alpine over 50k entries: 486.8 B/entry,
-    # 547.4 after query_source, 625.3 after channel_id — and NOT monotonic, an
-    # unstamped 499 B entry being worst at 678.3. So 256 MB holds ~429k entries
-    # (~412k unstamped). See
-    # docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
+    # node lands in. Measured on redis:7-alpine at 1-byte resolution: ~548 B/entry
+    # up to 497 B of wire, a SPIKE to ~676 at 498-499 B exactly, then ~626 from
+    # 500 B on. The spike is a function of WIRE SIZE ALONE — it is what an earlier
+    # unstamped 499 B entry measured at 678.3, which is not a property of being
+    # unstamped. So 256 MB holds ~429k entries, ~397k for a shape on the spike.
+    # See docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0

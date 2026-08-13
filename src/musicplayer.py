@@ -1037,7 +1037,20 @@ class MusicPlayer:
 
         The live song is NOT counted when its resume tail is already queued: after
         an interjection that entry is the same play as current_song, and counting
-        both puts a new arrival one song too deep."""
+        both puts a new arrival one song too deep.
+
+        Two known ±1 windows, both pre-dating the ask-time switch and both left
+        as-is — they are narrow, and the field is documented approximate:
+
+        - OVER by one while the loop resolves a stream. current_song is assigned
+          before try_commit_dequeue() pops the display head, so for the length of
+          a probe (100ms-seconds) the same play is in both legs. Not fixable from
+          here: current_song is a YTDL and the display holds QueueObjects, so
+          there is no identity test, and reordering the loop for an analytics
+          field is not a trade worth making.
+        - UNDER by one when the live song has a parked tail from an EARLIER play
+          of the same URL (-play X, -playnow Y, -playnow X). has_resume_tail
+          matches on URL, so it cannot tell the two plays apart."""
         depth = self.queue.display_size()
         current = self.current_song
         if current is not None and not self.queue.has_resume_tail(current.webpage_url):
@@ -1818,11 +1831,11 @@ class MusicPlayer:
             song = None
         if song is None:
             return
-        # Carry the -ss offset, every -playnow flag and every stamp through the
+        # Carry the -ss offset, every -playnow flag and the analytics through the
         # rebuild: dropping them makes a neutralized resume entry restart from 0:00
         # (unpaused, unannounced), loses an ordinary prefetched song's ?t= offset,
-        # and lets the rebuild be restamped as freshly queued or lose the play's
-        # start.
+        # and zeroes the ask this play was queued against — nothing re-mints it,
+        # so the archive would read "queued at unknown, played immediately".
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",

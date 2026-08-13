@@ -1059,6 +1059,12 @@ class YTDL(discord.FFmpegOpusAudio):
             )
             # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
             # skipped null entries above must not leave gaps in queue_position.
+            #
+            # replace(), though it measures ~1.8x an explicit Analytics(...) here
+            # (+1.8ms per 1000 tracks, behind a 1-4s extraction). Spelling the
+            # fields out would silently drop any field added to Analytics later
+            # with a default — the exact silent-zero failure this container was
+            # built to end. Not worth 0.1% of one command.
             qobjs.append(
                 QueueObject(
                     video_url,

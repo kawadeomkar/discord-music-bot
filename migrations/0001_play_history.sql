@@ -55,10 +55,29 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- "what was playing at time T" has more than one answer here.
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
 
-    -- When the song was first added to the queue (epoch 0 = unknown, the same
-    -- sentinel as played_at) and how many songs were ahead of it then, counting
-    -- the one playing. 0 = played immediately, which is also what an entry
-    -- written before these fields existed parses as.
+    -- When the user ASKED for the song, and how many songs were ahead of it at
+    -- that moment, counting the one playing. Epoch 0 = unknown (the same
+    -- sentinel as played_at), and 0 = played immediately; both are also what an
+    -- entry written before these fields existed parses as.
+    --
+    -- Two things a reader will otherwise assume and be wrong about:
+    --
+    -- queued_at is the COMMAND MESSAGE's snowflake time, taken before the 1-4s
+    -- yt-dlp resolve, so it is on DISCORD's clock while played_at is on the
+    -- host's. played_at - queued_at is therefore a cross-clock interval and can
+    -- come out slightly negative under host drift. That is skew, not corruption
+    -- — do not filter it out with `WHERE played_at >= queued_at`, which would
+    -- silently drop real plays.
+    --
+    -- queue_position is depth at ASK, read once at command dispatch, and is
+    -- approximate against where the song actually landed: the playback loop
+    -- dequeues continuously, so the two differ routinely with no user
+    -- involvement. Do not join it against played_at ordering and expect
+    -- agreement. The exact wait is the interval above, not this column.
+    --
+    -- Rows imported by `just db-backfill` from a Redis history list predate the
+    -- switch and carry the OLD meaning of both columns: insert time on the
+    -- host's clock, and position at insert. Nothing distinguishes them.
     queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
     queue_position integer     NOT NULL DEFAULT 0,
 
