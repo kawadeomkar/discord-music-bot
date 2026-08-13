@@ -746,6 +746,10 @@ class SearchQueueEntry:
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
+    # What the user typed, carried so -remove can match on it. A Spotify-playlist
+    # track's origin is the album link, which nothing downstream can reconstruct:
+    # the ytsearch here is a title the expansion generated.
+    user_input: str | None = None
     # Ask-time analytics, carried so a Spotify playlist track keeps its position
     # through the resolve at dequeue.
     queued_at: float = 0.0
@@ -761,6 +765,7 @@ class SearchQueueEntry:
             url=source.url,
             process=source.process,
             ts=source.ts,
+            user_input=source.user_input,
             queued_at=source.analytics.queued_at,
             queue_position=source.analytics.queue_position,
             query_source=source.query_source,
@@ -774,6 +779,7 @@ class SearchQueueEntry:
                 QueueEntryField.URL: self.url,
                 QueueEntryField.PROCESS: self.process,
                 QueueEntryField.TS: self.ts,
+                QueueEntryField.USER_INPUT: self.user_input,
                 QueueEntryField.QUEUED_AT: self.queued_at,
                 QueueEntryField.QUEUE_POSITION: self.queue_position,
                 QueueEntryField.QUERY_SOURCE: self.query_source,
@@ -801,6 +807,7 @@ def parse_queue_entry(data: bytes | str) -> QueueEntry | None:
                 url=d.get(QueueEntryField.URL),
                 process=d.get(QueueEntryField.PROCESS),
                 ts=d.get(QueueEntryField.TS),
+                user_input=d.get(QueueEntryField.USER_INPUT),
                 queued_at=d.get(QueueEntryField.QUEUED_AT, 0.0),
                 queue_position=d.get(QueueEntryField.QUEUE_POSITION, 0),
                 query_source=d.get(QueueEntryField.QUERY_SOURCE, ""),

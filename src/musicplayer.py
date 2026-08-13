@@ -1910,6 +1910,7 @@ class MusicPlayer:
                 redis=self.store.redis if self.store is not None else None,
                 query_source=source.query_source,
                 analytics=source.analytics,
+                user_input=source.user_input,
             )
         return source
 

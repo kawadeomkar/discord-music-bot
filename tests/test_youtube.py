@@ -417,6 +417,7 @@ class TestYTSource:
                 "ytsearch:test song",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert isinstance(result, QueueObject)
@@ -439,6 +440,7 @@ class TestYTSource:
                 "ytsearch:test song",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
 
@@ -451,6 +453,7 @@ class TestYTSource:
                     "ytsearch:nothing",
                     query_source="youtube.com",
                     analytics=_ANALYTICS,
+                    user_input=None,
                 )
 
     async def test_yt_source_unsupported_url_gives_friendly_error(
@@ -477,6 +480,7 @@ class TestYTSource:
                     url,
                     query_source="youtube.com",
                     analytics=_ANALYTICS,
+                    user_input=None,
                 )
 
     async def test_yt_source_reraises_non_unsupported_extraction_error(
@@ -498,6 +502,7 @@ class TestYTSource:
                     "ytsearch:test",
                     query_source="youtube.com",
                     analytics=_ANALYTICS,
+                    user_input=None,
                 )
         assert caught.value.unsupported is False
         assert "unable to download webpage" in caught.value.message
@@ -527,6 +532,7 @@ class TestYTSource:
                 "ytsearch:test",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert result.title == "Entry One"
@@ -556,6 +562,7 @@ class TestYTSource:
                 "ytsearch:test",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert result.title == "Real Video"
@@ -575,6 +582,7 @@ class TestYTSource:
                 "my search query",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         assert result.user_input == "my search query"
 
@@ -599,6 +607,7 @@ class TestYTSource:
             redis=fake_redis,
             query_source="youtube.com",
             analytics=_ANALYTICS,
+            user_input=None,
         )
         assert result.user_input == "cached search"
 
@@ -624,6 +633,7 @@ class TestYTSource:
             redis=fake_redis,
             query_source="youtube.com",
             analytics=_ANALYTICS,
+            user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
 
@@ -644,6 +654,7 @@ class TestYTSource:
                 redis=fake_redis,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         result = await YTDL.yt_source(
@@ -652,6 +663,7 @@ class TestYTSource:
             redis=fake_redis,
             query_source="youtube.com",
             analytics=_ANALYTICS,
+            user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
 
@@ -668,6 +680,7 @@ class TestYTSource:
                 ts=45,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert result.ts == 45
@@ -686,6 +699,7 @@ class TestYTSource:
                 download=True,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         # download rides on the request object, not a positional bool
         req = mock_extract.call_args[0][0]
@@ -721,6 +735,7 @@ class TestYTPlaylistAnalytics:
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=Analytics(queued_at=1752529000.5, queue_position=2),
+                user_input="https://yt.com/playlist?list=PL1",
             )
         assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
         assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
@@ -742,6 +757,7 @@ class TestYTPlaylistAnalytics:
                 mock_ctx.author,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input="https://yt.com/playlist?list=PL1",
             )
         assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
@@ -767,6 +783,7 @@ class TestYTSourceUnifiedExtraction:
                 "https://yt.com/watch?v=direct",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         req = mock_extract.call_args[0][0]
         assert req.opts is _YTDL_STREAM_SEARCH_OPTS
@@ -786,6 +803,7 @@ class TestYTSourceUnifiedExtraction:
                 redis=fake_redis,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         source_entry = await fake_redis.get("ytdl:source:unified search")
@@ -809,6 +827,7 @@ class TestYTSourceUnifiedExtraction:
                 redis=fake_redis,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
@@ -829,6 +848,7 @@ class TestYTSourceUnifiedExtraction:
                 redis=fake_redis,
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert isinstance(result, QueueObject)
@@ -854,6 +874,7 @@ class TestYTSourceUnifiedExtraction:
                 redis=fake_redis,
                 query_source="soundcloud.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         assert isinstance(result, QueueObject)
         assert (
@@ -874,6 +895,7 @@ class TestYTSourceUnifiedExtraction:
                 "no redis search",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         playable_urls.assert_not_awaited()
 
@@ -889,6 +911,7 @@ class TestYTSourceUnifiedExtraction:
                 "metadata search",
                 query_source="youtube.com",
                 analytics=_ANALYTICS,
+                user_input=None,
             )
         assert result.duration == 180
         assert result.uploader == "Test Channel"

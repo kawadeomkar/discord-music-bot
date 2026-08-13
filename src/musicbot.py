@@ -704,13 +704,17 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
         analytics: Analytics,
+        origin: str,
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
         a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject.
 
         `analytics` is the command's ask-time head value, minted at dispatch;
-        playlist tracks derive their per-track positions from it."""
+        playlist tracks derive their per-track positions from it. `origin` is the
+        raw command argument, carried onto every resulting item so -remove can
+        match what the user typed — for a collection that is the link, never the
+        per-track search its expansion generated."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
             # they become, carrying this command's analytics.
@@ -725,6 +729,7 @@ class MusicBot(commands.Cog):
                 ctx.author,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
             tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
@@ -748,6 +753,7 @@ class MusicBot(commands.Cog):
                 redis=self.redis,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
@@ -759,6 +765,7 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         analytics: Analytics,
+        origin: str,
         front: bool = False,
     ) -> None:
         """Queue a resolved playlist and notify the channel — branches on the
@@ -770,7 +777,9 @@ class MusicBot(commands.Cog):
         enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(titles, analytics=analytics)
+            qobjs_yt = spotify_playlist_to_ytsearch(
+                titles, analytics=analytics, origin=origin
+            )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
                 send_embed(
@@ -975,7 +984,7 @@ class MusicBot(commands.Cog):
                         join_task = asyncio.create_task(ctx.invoke(self.join))
                         try:
                             qobj = await self.queue_source(
-                                ctx, source, analytics=analytics
+                                ctx, source, analytics=analytics, origin=url
                             )
                             await join_task
                         except BaseException:
@@ -998,7 +1007,9 @@ class MusicBot(commands.Cog):
                             await self._abandon_cold_start(ctx, mp)
                             return
                     else:
-                        qobj = await self.queue_source(ctx, source, analytics=analytics)
+                        qobj = await self.queue_source(
+                            ctx, source, analytics=analytics, origin=url
+                        )
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
@@ -1021,11 +1032,16 @@ class MusicBot(commands.Cog):
                             return
 
                     if isinstance(qobj, QueueObject):
-                        qobj.user_input = url
                         await self._enqueue_single(ctx, qobj, mp, front=front)
                     else:
                         await self._enqueue_playlist(
-                            ctx, source, qobj, mp, front=front, analytics=analytics
+                            ctx,
+                            source,
+                            qobj,
+                            mp,
+                            front=front,
+                            analytics=analytics,
+                            origin=url,
                         )
 
             except Exception as e:
@@ -1035,10 +1051,16 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        origin: str,
     ) -> QueueObject:
         """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
         their first track — interjecting a whole one would delay the interrupted
-        song's return indefinitely (use -play)."""
+        song's return indefinitely (use -play).
+
+        `origin` is the raw command argument; every branch passes it down rather
+        than letting yt_source fall back to the search it was handed, which for a
+        collapsed playlist is a title this code generated."""
         playlist_notice = notice_embed(
             "Playlists can't be interjected — playing the **first track** now. "
             "Use `-play` for the full playlist.",
@@ -1056,7 +1078,9 @@ class MusicBot(commands.Cog):
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1], analytics=analytics)[0]
+            yts = spotify_playlist_to_ytsearch(
+                titles[:1], analytics=analytics, origin=origin
+            )[0]
             # Both playlist branches resolve directly rather than through
             # queue_source, so each passes its own metadata.
             return await YTDL.yt_source(
@@ -1065,6 +1089,7 @@ class MusicBot(commands.Cog):
                 redis=self.redis,
                 query_source=query_source_of(yts),
                 analytics=analytics,
+                user_input=origin,
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(
@@ -1072,6 +1097,7 @@ class MusicBot(commands.Cog):
                 ctx.author,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
             # Indexed here too: -playnow on a link copied mid-playlist should
             # interject the track the user was looking at, not the playlist's
@@ -1092,7 +1118,7 @@ class MusicBot(commands.Cog):
             else:
                 await ctx.send(embed=playlist_notice)
             return tracks[0]
-        qobj = await self.queue_source(ctx, source, analytics=analytics)
+        qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
         return qobj
 
@@ -1173,8 +1199,7 @@ class MusicBot(commands.Cog):
         a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url, ctx.message.content)
-        qobj = await self._resolve_playnow_source(ctx, source)
-        qobj.user_input = url
+        qobj = await self._resolve_playnow_source(ctx, source, origin=url)
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts

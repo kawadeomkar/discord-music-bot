@@ -804,6 +804,24 @@ class TestRestoreEntries:
         assert item.interjected is False
         assert item.ts == 151
 
+    async def test_origin_rehydrates_on_the_search_branch(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The song branch already carried user_input; the search branch is the new
+        leg, and it is the one that matters — a Spotify-album track holds the album
+        link nowhere else, so losing it here breaks -remove after a restart."""
+        mock_guild.get_member.return_value = mock_author
+        album = "https://open.spotify.com/album/abc123"
+        assert (
+            await gq.restore_entries(
+                [SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)]
+            )
+            == 1
+        )
+        (restored,) = gq.display_items()
+        assert isinstance(restored, YTSource)
+        assert restored.user_input == album
+
     async def test_enqueue_stamps_rehydrate_on_both_entry_types(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:

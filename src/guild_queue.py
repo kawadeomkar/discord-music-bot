@@ -571,6 +571,7 @@ class GuildQueue:
                     queued_at=entry.queued_at,
                     queue_position=entry.queue_position,
                 ),
+                user_input=entry.user_input,
                 query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
