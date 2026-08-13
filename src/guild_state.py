@@ -542,8 +542,10 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Enqueue stamps, carried on both entry types — absent on pre-feature
-    # entries, parsed as the 0 defaults.
+    # Ask-time analytics, carried on both entry types. FLAT on the wire even
+    # though they group as Analytics in memory — nesting would break these
+    # parsers, the clamp-domain coverage and the positional row mapping. Absent
+    # on pre-feature entries, parsed as the 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification, carried on both entry types (see sources.py).
