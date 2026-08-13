@@ -15,6 +15,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
 from src.util import fmt_duration, get_logger
@@ -565,12 +566,11 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # ── Enqueue stamps, written once by MusicPlayer and carried thereafter ──
-    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
-    # stamped", which is what makes stamping idempotent across re-queues.
-    queued_at: float = 0.0
-    # Songs ahead of it then, counting the one playing (0 = played immediately).
-    queue_position: int = 0
+    # ── Enqueue analytics, written once by MusicPlayer and carried thereafter ──
+    # queued_at + queue_position in one frozen container (guild_state.Analytics).
+    # ANALYTICS_ZERO doubles as "not yet stamped", which is what makes stamping
+    # idempotent across re-queues.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
     query_source: str = ""
@@ -623,8 +623,7 @@ class YTDL(discord.FFmpegOpusAudio):
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
-        queued_at: float = 0.0,
-        queue_position: int = 0,
+        analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
         played_at: float = 0.0,
         np_message_id: int = 0,
@@ -644,10 +643,9 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
-        # Enqueue stamps carried from the QueueObject so the history entry this
-        # song produces records where it started, not when it played.
-        self.queued_at: float = queued_at
-        self.queue_position: int = queue_position
+        # Enqueue analytics carried from the QueueObject so the history entry
+        # this song produces records where it started, not when it played.
+        self.analytics: Analytics = analytics
         self.query_source: str = query_source
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).
@@ -864,8 +862,7 @@ class YTDL(discord.FFmpegOpusAudio):
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
-            queued_at=qo.queued_at,
-            queue_position=qo.queue_position,
+            analytics=qo.analytics,
             query_source=qo.query_source,
             played_at=qo.played_at,
             np_message_id=qo.np_message_id,

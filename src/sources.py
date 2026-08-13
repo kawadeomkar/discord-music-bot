@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Final, Optional, Union
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -80,10 +81,9 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
-    # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
-    # so MusicPlayer stamps by building a replace()d copy.
-    queued_at: float = 0.0
-    queue_position: int = 0
+    # Enqueue analytics (guild_state.Analytics), carried onto the QueueObject
+    # this resolves into. Frozen, so MusicPlayer stamps a replace()d copy.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
     # Spotify-playlist tracks alike, and it is the only one that survives into Redis

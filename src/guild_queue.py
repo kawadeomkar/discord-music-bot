@@ -43,7 +43,7 @@ from typing import Optional, Union
 
 import discord
 
-from src.guild_state import QueueEntry, SearchQueueEntry, SongQueueEntry
+from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.util import get_logger
@@ -568,8 +568,10 @@ class GuildQueue:
                 url=entry.url,
                 process=entry.process,
                 ts=entry.ts,
-                queued_at=entry.queued_at,
-                queue_position=entry.queue_position,
+                analytics=Analytics(
+                    queued_at=entry.queued_at,
+                    queue_position=entry.queue_position,
+                ),
                 query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
@@ -596,8 +598,10 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            queued_at=entry.queued_at,
-            queue_position=entry.queue_position,
+            analytics=Analytics(
+                queued_at=entry.queued_at,
+                queue_position=entry.queue_position,
+            ),
             query_source=entry.query_source,
             played_at=entry.played_at,
             # No np_host_ref: a live Message cannot survive a restart, so a

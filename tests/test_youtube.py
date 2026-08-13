@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
+from src.guild_state import Analytics
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -880,8 +881,7 @@ class TestYTStream:
             "https://www.youtube.com/watch?v=test",
             "Test Song",
             mock_ctx.author,
-            queued_at=1752529000.5,
-            queue_position=4,
+            analytics=Analytics(queued_at=1752529000.5, queue_position=4),
         )
 
         with (
@@ -890,8 +890,8 @@ class TestYTStream:
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
-        assert result.queued_at == 1752529000.5
-        assert result.queue_position == 4
+        assert result.analytics.queued_at == 1752529000.5
+        assert result.analytics.queue_position == 4
 
 
 class TestStreamUrlTtl:

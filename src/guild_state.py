@@ -30,6 +30,33 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# ── Pure-analytics values, grouped ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Analytics:
+    """Pure-analytics values carried on live queue objects (QueueObject, YTSource,
+    YTDL): zero reads outside serialize/carry. Admission rule — a field ANYTHING
+    branches on or renders does NOT belong here (query_source is rendered by
+    -leaderboard, played_at is branched on, np_* drive card disposal). The wire
+    entries and the play_history columns stay FLAT: this container is an
+    in-memory shape only, exploded at the serialization boundary in this module.
+
+    Frozen on purpose: carry sites alias one instance across a resume tail and
+    its source (analytics=current.analytics), which is only safe immutable."""
+
+    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
+    # stamped", which is what makes stamping idempotent across re-queues.
+    queued_at: float
+    # Songs ahead of it then, counting the one playing (0 = played immediately).
+    queue_position: int
+
+
+# The unstamped value: what a pre-feature wire entry rehydrates as, and the
+# default on live objects whose construction site cannot know the values yet.
+ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
+
+
 # ── guild:{id}:state hash — field name constants ─────────────────────────────
 
 
@@ -595,8 +622,8 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
-            queued_at=item.queued_at,
-            queue_position=item.queue_position,
+            queued_at=item.analytics.queued_at,
+            queue_position=item.analytics.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
             np_message_id=item.np_message_id,
@@ -619,8 +646,8 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             interjected=song.interjected,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
+            queued_at=song.analytics.queued_at,
+            queue_position=song.analytics.queue_position,
             query_source=song.query_source,
             played_at=song.played_at,
         )
@@ -727,8 +754,8 @@ class SearchQueueEntry:
             url=source.url,
             process=source.process,
             ts=source.ts,
-            queued_at=source.queued_at,
-            queue_position=source.queue_position,
+            queued_at=source.analytics.queued_at,
+            queue_position=source.analytics.queue_position,
             query_source=source.query_source,
         )
 
@@ -988,8 +1015,8 @@ class HistoryEntry:
             played_at=song.played_at,
             message_id=message_id,
             channel_id=channel_id,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
+            queued_at=song.analytics.queued_at,
+            queue_position=song.analytics.queue_position,
             query_source=song.query_source,
         )
 
@@ -1027,8 +1054,8 @@ class HistoryEntry:
             played_at=item.played_at,
             message_id=item.np_message_id,
             channel_id=item.np_channel_id,
-            queued_at=item.queued_at,
-            queue_position=item.queue_position,
+            queued_at=item.analytics.queued_at,
+            queue_position=item.analytics.queue_position,
             query_source=item.query_source,
         )
 

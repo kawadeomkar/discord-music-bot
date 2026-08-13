@@ -27,6 +27,7 @@ from src.guild_history import GuildHistory
 from src.guild_queue import GuildQueue, ShuffleOutcome, is_persisted
 from src.guild_state import (
     DEFAULT_TIMEZONE,
+    Analytics,
     HistoryEntry,
     NowPlayingData,
     SongQueueEntry,
@@ -1042,16 +1043,15 @@ class MusicPlayer:
         now = time.time()
         stamped: list[QueueItem] = []
         for offset, item in enumerate(items):
-            if item.queued_at:
+            if item.analytics.queued_at:
                 stamped.append(item)
-            elif isinstance(item, YTSource):
-                stamped.append(
-                    replace(item, queued_at=now, queue_position=base + offset)
-                )
             else:
-                item.queued_at = now
-                item.queue_position = base + offset
-                stamped.append(item)
+                stamp = Analytics(queued_at=now, queue_position=base + offset)
+                if isinstance(item, YTSource):
+                    stamped.append(replace(item, analytics=stamp))
+                else:
+                    item.analytics = stamp
+                    stamped.append(item)
         return stamped
 
     def _stamp_at_depth(
@@ -1769,8 +1769,7 @@ class MusicPlayer:
                     # The tail is the same play, so it keeps the interrupted song's
                     # stamps — played_at included, which files the whole play under
                     # the moment its first fragment started.
-                    queued_at=current.queued_at,
-                    queue_position=current.queue_position,
+                    analytics=current.analytics,
                     played_at=current.played_at,
                     # The tail writes the ONLY row for this play, and the
                     # classification is not recoverable from webpage_url — a Spotify
@@ -1865,8 +1864,7 @@ class MusicPlayer:
             interjected=song.interjected,
             is_resume=song.is_resume,
             start_paused=song.start_paused,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
+            analytics=song.analytics,
             query_source=song.query_source,
             played_at=song.played_at,
             np_message_id=song.np_message_id,
@@ -1930,8 +1928,7 @@ class MusicPlayer:
             )
             # yt_source builds the QueueObject, so the search's enqueue stamps are
             # copied onto it here rather than threaded through its signature.
-            qobj.queued_at = source.queued_at
-            qobj.queue_position = source.queue_position
+            qobj.analytics = source.analytics
             qobj.query_source = source.query_source
             return qobj
         return source
