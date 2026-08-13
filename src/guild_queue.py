@@ -37,6 +37,7 @@ import asyncio
 import random
 from collections import deque
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Union
 
@@ -55,9 +56,36 @@ log = get_logger(__name__)
 QueueItem = Union[QueueObject, YTSource]
 
 
+class _FrontQueue(asyncio.Queue[QueueItem]):
+    """asyncio.Queue plus head insertion.
+
+    _queue is already a collections.deque, so this is put_nowait's bookkeeping
+    (cpython asyncio/queues.py:156) run against appendleft. The full/shutdown
+    checks are dropped: _pending is unbounded and never shut down. Only
+    _init/_get/_put are sanctioned subclass hooks, so a CPython rename of the
+    private names below breaks here, at first use.
+    """
+
+    def put_front_nowait(self, item: QueueItem) -> None:
+        self._queue.appendleft(item)  # pyright: ignore[reportAttributeAccessIssue]
+        self._unfinished_tasks += 1
+        self._finished.clear()  # pyright: ignore[reportAttributeAccessIssue]
+        self._wakeup_next(self._getters)  # pyright: ignore[reportAttributeAccessIssue]
+
+
 class ShuffleOutcome(Enum):
     SHUFFLED = auto()
     TOO_FEW_SONGS = auto()  # fewer than 4 queued items — nothing was mutated
+
+
+@dataclass(frozen=True)
+class RemoveOutcome:
+    """What remove() took out. The positions are what the command reports; the
+    items exist because a removed entry may be a played song whose only remaining
+    record is the queue object itself (see MusicPlayer._flush_played)."""
+
+    removed: list[QueueItem]
+    positions: list[int]  # 1-indexed, as the queue embed numbers them
 
 
 def _to_entry(item: QueueItem) -> QueueEntry:
@@ -92,15 +120,24 @@ class GuildQueue:
     (GuildRedisStore logs and never raises) — the in-memory queue keeps working.
     """
 
-    __slots__ = ("_guild", "_store", "_pending", "_display", "_mutex", "_cleared")
+    __slots__ = (
+        "_guild",
+        "_store",
+        "_pending",
+        "_display",
+        "_mutex",
+        "_cleared",
+        "_generation",
+    )
 
     def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
         self._guild = guild
         self._store = store
-        self._pending: asyncio.Queue = asyncio.Queue()
+        self._pending: _FrontQueue = _FrontQueue()
         self._display: deque = deque()
         self._mutex = asyncio.Lock()
         self._cleared = False
+        self._generation = 0
 
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
@@ -116,22 +153,22 @@ class GuildQueue:
         playing it (prefetch cancellation). The display and Redis legs never moved,
         so undoing the pending leg realigns all three and leaves no in-flight head.
         The abandoned get()'s task slot transfers to the re-put: callers must not
-        also call task_done(). `item` may be the RESOLVED form of what was dequeued
-        (YTSource → QueueObject); the other legs still hold the original — counts
-        stay aligned and they converge at the next dequeue."""
-        # Balance the abandoned get(); the put_nowait below re-increments the task
-        # counter, transferring the slot to the future consumer.
+        also call task_done().
+
+        `item` may be the RESOLVED form of what was dequeued (YTSource →
+        QueueObject), so the display head is realigned onto it: put_front's
+        in-flight-head branch rebuilds the Redis mirror FROM the display, and a
+        stale YTSource there would persist a search over an entry that had already
+        resolved — re-running the ytsearch after a crash, free to rank a different
+        video."""
+        # Balance the abandoned get(); the head insert below re-increments the
+        # task counter, transferring the slot to the future consumer.
         self._pending.task_done()
-        rest: list[QueueItem] = []
-        while True:
-            try:
-                rest.append(self._pending.get_nowait())
-                self._pending.task_done()
-            except asyncio.QueueEmpty:
-                break
-        self._pending.put_nowait(item)
-        for r in rest:
-            self._pending.put_nowait(r)
+        self._pending.put_front_nowait(item)
+        # Positional: this item is the head's resolved form, and the head is where
+        # the abandoned get() took it from.
+        if self._display:
+            self._display[0] = item
 
     def task_done(self) -> None:
         self._pending.task_done()
@@ -144,8 +181,9 @@ class GuildQueue:
 
     def _drain_pending(self) -> list[QueueItem]:
         """Remove and return every item in _pending, in queue order, each balanced
-        with task_done(). Shared first step of put_front()/clear()/shuffle()/
-        remove(). Must hold _mutex — the drain must not race a consumer."""
+        with task_done(). Shared first step of clear()/shuffle()/remove(), which
+        all inspect or reorder every item. Must hold _mutex — the drain must not
+        race a consumer."""
         drained: list[QueueItem] = []
         for _ in range(self._pending.qsize()):
             try:
@@ -162,6 +200,13 @@ class GuildQueue:
         was_cleared = self._cleared
         self._cleared = False
         return was_cleared
+
+    @property
+    def generation(self) -> int:
+        """Bumped by clear(). A dequeue captures this when it takes its item and
+        hands it back to try_commit_dequeue(), which refuses to commit across a
+        bump — see that method for why emptiness alone cannot answer this."""
+        return self._generation
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
@@ -223,23 +268,24 @@ class GuildQueue:
         if not items:
             return []
         async with self._mutex:
-            drained = self._drain_pending()
-            in_flight = self._in_flight_head(drained_count=len(drained))
+            in_flight = self._in_flight_head(pending_count=self._pending.qsize())
             if stamp is not None:
                 items = stamp(items, len(in_flight))
             new_items = list(items)
-            for item in new_items + drained:
-                self._pending.put_nowait(item)
-            self._display = deque(in_flight + new_items + drained)
+
+            for item in reversed(new_items):
+                self._pending.put_front_nowait(item)
+            # Lift the in-flight head off, insert behind it, put it back. The tail
+            # is carried over rather than recomputed from _pending, so a
+            # pre-existing triad drift survives this insert rather than being healed.
+            for _ in in_flight:
+                self._display.popleft()
+            self._display.extendleft(reversed(in_flight + new_items))
 
             if self._store is None:
                 return new_items
             if in_flight:
-                entries = [
-                    _to_entry(s)
-                    for s in in_flight + new_items + drained
-                    if is_persisted(s)
-                ]
+                entries = [_to_entry(s) for s in self._display if is_persisted(s)]
                 if entries:
                     await self._store.rebuild_queue(entries)
                 else:
@@ -264,6 +310,7 @@ class GuildQueue:
         drain and the DEL and be wiped."""
         async with self._mutex:
             self._cleared = True
+            self._generation += 1
             self._drain_pending()
             cleared_items = list(self._display)
             self._display.clear()
@@ -286,7 +333,7 @@ class GuildQueue:
 
         async with self._mutex:
             shuffled = self._drain_pending()
-            in_flight = self._in_flight_head(drained_count=len(shuffled))
+            in_flight = self._in_flight_head(pending_count=len(shuffled))
             random.shuffle(shuffled)
             kept: list[QueueItem] = []
             for song in shuffled:
@@ -309,19 +356,22 @@ class GuildQueue:
 
         return ShuffleOutcome.SHUFFLED
 
-    async def remove(self, url: str) -> list[int]:
+    async def remove(self, url: str) -> RemoveOutcome:
         """Remove every queued item whose webpage_url (QueueObject) or url
-        (YTSource) matches. Returns 1-indexed positions as the queue embed shows
-        them. An in-flight dequeue is never removed even on a URL match (it is
-        committed to play; stopping it is -skip's job) but still occupies a display
-        position — hence the numbering offset."""
+        (YTSource) matches. Returns the removed items with their 1-indexed
+        positions as the queue embed shows them — the items because a removed
+        entry can be the last record of a song that already played. An in-flight
+        dequeue is never removed even on a URL match (it is committed to play;
+        stopping it is -skip's job) but still occupies a display position — hence
+        the numbering offset."""
         removed_positions: list[int] = []
+        removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
 
         async with self._mutex:
             # Drain everything first so positions are numbered before partitioning.
             drained = self._drain_pending()
-            in_flight = self._in_flight_head(drained_count=len(drained))
+            in_flight = self._in_flight_head(pending_count=len(drained))
 
             for pos, item in enumerate(drained, start=1 + len(in_flight)):
                 if isinstance(item, QueueObject):
@@ -330,6 +380,7 @@ class GuildQueue:
                     match = (item.url or "") == url
                 if match:
                     removed_positions.append(pos)
+                    removed_items.append(item)
                 else:
                     kept.append(item)
 
@@ -344,7 +395,7 @@ class GuildQueue:
                 else:
                     await self._store.delete_queue()
 
-        return removed_positions
+        return RemoveOutcome(removed=removed_items, positions=removed_positions)
 
     # ── Crash recovery ────────────────────────────────────────────────────────
 
@@ -401,6 +452,25 @@ class GuildQueue:
             for item in self._display
         )
 
+    def resume_tail_depth(self) -> int:
+        """How many parked plays are waiting behind the song that just cut the line
+        — the run of consecutive resume tails after it. 1 is a plain -playnow, 2+ a
+        stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
+        gone by the time this runs and only its tail is queued.
+
+        The interjected song is not always at index 0 — put_front's in-flight-head
+        branch keeps a dequeued-but-uncommitted item ahead of what it inserts — so
+        the run starts after whatever _pending does not account for."""
+        items = list(self._display)
+        head = len(items) - self._pending.qsize()
+        start = (head if head > 0 else 0) + 1
+        depth = 0
+        for item in items[start:]:
+            if not (isinstance(item, QueueObject) and item.is_resume):
+                break
+            depth += 1
+        return depth
+
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
     def pop_display_head(self, context: str = "dequeue") -> None:
@@ -436,12 +506,21 @@ class GuildQueue:
             await self.redis_pop_for(item)
         self._pending.task_done()
 
-    async def try_commit_dequeue(self) -> bool:
+    async def try_commit_dequeue(self, generation: int) -> bool:
         """Commit the display-side dequeue for a song about to play, under the
-        bulk-mutation lock so the emptiness check can't race a clear()/shuffle().
-        False means the queue was cleared during the resolve and the caller
-        discards the song — its task_done() and FFmpeg cleanup stay caller-side."""
+        bulk-mutation lock so the check can't race a clear()/shuffle(). False
+        means the queue was cleared during the resolve and the caller discards
+        the song — its task_done() and FFmpeg cleanup stay caller-side.
+
+        `generation` is what the queue read when this dequeue took its item, and
+        neither emptiness nor identity can stand in for it. A put() landing before
+        the commit refills the display, so the head belongs to the NEW song and
+        committing pops that entry while playing (and re-recording) the cleared one.
+        And _resolve_source() replaces a YTSource with the QueueObject it resolved
+        to, so head and item are legitimately different objects for one slot."""
         async with self._mutex:
+            if generation != self._generation:
+                return False
             return self.try_pop_display_head()
 
     async def redis_pop_for(self, item: Optional[QueueItem]) -> None:
@@ -455,20 +534,22 @@ class GuildQueue:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _in_flight_head(self, *, drained_count: int) -> list[QueueItem]:
+    def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
         """The dequeued-but-uncommitted items at the display head.
 
         A consumer (the loop mid-resolve, or a completed prefetch committing next
         iteration) pops _pending on get() but leaves its display entry until
         try_commit_dequeue()/finish_failed_dequeue(); in that window the display
         leads _pending by exactly those items — at most one in practice, at the
-        head since dequeues come off the front. Called under the mutex after
-        draining _pending, so anything beyond drained_count is in-flight.
+        head since dequeues come off the front. Called under the mutex with
+        however many items _pending accounts for — just drained out of it
+        (clear/shuffle/remove) or still sitting in it (put_front) — so anything
+        the display holds beyond that count is in-flight.
 
         Bulk mutations must carry these through untouched on both legs, or the
         consumer's eventual display-pop and LPOP retire someone else's entry —
         permanent triad desync, and a queued song's persisted entry lost."""
-        extra = len(self._display) - drained_count
+        extra = len(self._display) - pending_count
         return list(self._display)[:extra] if extra > 0 else []
 
     def _rehydrate(
@@ -518,4 +599,10 @@ class GuildQueue:
             queued_at=entry.queued_at,
             queue_position=entry.queue_position,
             query_source=entry.query_source,
+            played_at=entry.played_at,
+            # No np_host_ref: a live Message cannot survive a restart, so a
+            # rehydrated tail can only delete a dedicated card by id.
+            np_message_id=entry.np_message_id,
+            np_channel_id=entry.np_channel_id,
+            np_dedicated=entry.np_dedicated,
         )

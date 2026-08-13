@@ -184,6 +184,15 @@ class TestGuildStateDataFromRedis:
         )
         assert data.current_song_query_source == "soundcloud.com"
 
+    def test_played_at_parses(self) -> None:
+        data = GuildStateData.from_redis({b"current_song_played_at": b"1752530000.5"})
+        assert data.current_song_played_at == 1752530000.5
+
+    def test_played_at_missing_is_zero(self) -> None:
+        # Pre-feature state hashes carry no such field; 0.0 is the wire's
+        # "unknown", never a stand-in clock.
+        assert GuildStateData.from_redis({}).current_song_played_at == 0.0
+
     def test_query_source_missing_is_unknown(self) -> None:
         assert GuildStateData.from_redis({}).current_song_query_source == ""
 
@@ -391,6 +400,10 @@ class TestNowPlayingDataImmutability:
 _PLAYNOW_FLAGS_FALSE = b'"interjected":false,"is_resume":false,"start_paused":false'
 _ENQUEUE_STAMPS_ZERO = b'"queued_at":0.0,"queue_position":0'
 _QUERY_SOURCE_UNKNOWN = b'"query_source":""'
+# "qobj" only — a search has not played, so SearchQueueEntry carries no such field.
+_PLAYED_AT_UNPLAYED = b'"played_at":0.0'
+# Likewise "qobj" only: the frozen NP card a resume tail is responsible for.
+_NP_HOST_NONE = b'"np_message_id":0,"np_channel_id":0,"np_dedicated":false'
 _GOLDEN_QOBJ_FULL = (
     b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true,'
     + _PLAYNOW_FLAGS_FALSE
@@ -398,6 +411,10 @@ _GOLDEN_QOBJ_FULL = (
     + _ENQUEUE_STAMPS_ZERO
     + b","
     + _QUERY_SOURCE_UNKNOWN
+    + b","
+    + _PLAYED_AT_UNPLAYED
+    + b","
+    + _NP_HOST_NONE
     + b"}"
 )
 _GOLDEN_QOBJ_BARE = (
@@ -407,6 +424,10 @@ _GOLDEN_QOBJ_BARE = (
     + _ENQUEUE_STAMPS_ZERO
     + b","
     + _QUERY_SOURCE_UNKNOWN
+    + b","
+    + _PLAYED_AT_UNPLAYED
+    + b","
+    + _NP_HOST_NONE
     + b"}"
 )
 _GOLDEN_QOBJ_UNPERSISTED = (
@@ -416,6 +437,10 @@ _GOLDEN_QOBJ_UNPERSISTED = (
     + _ENQUEUE_STAMPS_ZERO
     + b","
     + _QUERY_SOURCE_UNKNOWN
+    + b","
+    + _PLAYED_AT_UNPLAYED
+    + b","
+    + _NP_HOST_NONE
     + b"}"
 )
 _GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
@@ -490,6 +515,55 @@ class TestSongQueueEntryWire:
             True,
             True,
         )
+
+    def test_np_host_fields_round_trip(self) -> None:
+        # Only a resume tail carries these, and they are snowflakes: a float route
+        # would come back off by a digit and delete nothing (or, worse, something).
+        entry = dataclasses.replace(
+            _FULL_ENTRY,
+            is_resume=True,
+            np_message_id=999999999999999999,
+            np_channel_id=888888888888888888,
+            np_dedicated=True,
+        )
+        parsed = parse_queue_entry(entry.to_redis())
+        assert parsed == entry
+        assert isinstance(parsed, SongQueueEntry)
+        assert (parsed.np_message_id, parsed.np_channel_id, parsed.np_dedicated) == (
+            999999999999999999,
+            888888888888888888,
+            True,
+        )
+
+    def test_reader_defaults_np_host_fields_on_pre_feature_entry(self) -> None:
+        # An entry written before the fields existed has no card to dispose of,
+        # which is what 0/0/False means — never "delete message 0".
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        assert isinstance(pre_feature, SongQueueEntry)
+        assert (
+            pre_feature.np_message_id,
+            pre_feature.np_channel_id,
+            pre_feature.np_dedicated,
+        ) == (0, 0, False)
+
+    def test_played_at_round_trips(self) -> None:
+        # A queued entry carries a nonzero start only when it is a -playnow resume
+        # tail, which inherits the interrupted song's — so this is the leg that
+        # keeps one play from being filed twice under two different moments after
+        # a restart.
+        entry = dataclasses.replace(_FULL_ENTRY, played_at=1752530000.5)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert parsed == entry
+        assert isinstance(parsed, SongQueueEntry)
+        assert parsed.played_at == 1752530000.5
+
+    def test_reader_defaults_played_at_on_pre_feature_entry(self) -> None:
+        # Entries written before the field existed must parse as unplayed rather
+        # than dropping as corrupt.
+        assert _FULL_ENTRY.played_at == 0.0
+        pre_feature = parse_queue_entry(_GOLDEN_QOBJ_PRE_PLAYNOW)
+        assert isinstance(pre_feature, SongQueueEntry)
+        assert pre_feature.played_at == 0.0
 
     def test_snowflake_requester_id_exact(self) -> None:
         entry = parse_queue_entry(_GOLDEN_QOBJ_FULL)
@@ -634,6 +708,21 @@ class TestParseQueueEntryCorrupt:
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
 
+    def test_a_malformed_optional_field_keeps_the_song(self) -> None:
+        """Only the REQUIRED keys drop an entry. The optional ones are read with a
+        default and no coercion, so garbage in one survives the parse — deliberate:
+        losing a queued song over a cosmetic field would be the worse failure.
+
+        np_message_id is the field where that tolerance has teeth, since it feeds a
+        message delete(); the guard for it lives at that call
+        (MusicPlayer._dispose_previous_np_card), not here."""
+        entry = parse_queue_entry(
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"T",'
+            b'"requester_id":42,"np_message_id":{"nested":"object"}}'
+        )
+        assert isinstance(entry, SongQueueEntry)
+        assert entry.webpage_url == "https://yt.com/v=1"  # the song survives
+
 
 def _history_entry(**overrides: Any) -> HistoryEntry:
     fields: dict = dict(
@@ -650,6 +739,7 @@ def _history_entry(**overrides: Any) -> HistoryEntry:
         uploader="Chan",
         played_at=1752530000.0,
         message_id=999999999999999999,
+        channel_id=777777777777777777,
         queued_at=1752529000.0,
         queue_position=2,
         query_source="youtube.com",
@@ -669,6 +759,7 @@ class TestHistoryEntryWire:
             b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
             b'"uploader":"Chan","played_at":1752530000.0,'
             b'"message_id":999999999999999999,'
+            b'"channel_id":777777777777777777,'
             b'"queued_at":1752529000.0,"queue_position":2,'
             b'"query_source":"youtube.com"}'
         )
@@ -691,6 +782,7 @@ class TestHistoryEntryWire:
         assert parse_history_entry(pre_postgres) == _history_entry(
             guild_id=0,
             message_id=0,
+            channel_id=0,
             queued_at=0.0,
             queue_position=0,
             query_source="",
@@ -708,7 +800,11 @@ class TestHistoryEntryWire:
             b'"uploader":"Chan","played_at":1752530000.0}'
         )
         assert parse_history_entry(pre_message_id) == _history_entry(
-            message_id=0, queued_at=0.0, queue_position=0, query_source=""
+            message_id=0,
+            channel_id=0,
+            queued_at=0.0,
+            queue_position=0,
+            query_source="",
         )
 
     def test_pre_enqueue_stamp_entry_parses_with_zero_stamps(self) -> None:
@@ -723,8 +819,24 @@ class TestHistoryEntryWire:
             b'"message_id":999999999999999999}'
         )
         assert parse_history_entry(pre_stamps) == _history_entry(
-            queued_at=0.0, queue_position=0, query_source=""
+            channel_id=0, queued_at=0.0, queue_position=0, query_source=""
         )
+
+    def test_pre_channel_id_entry_parses_with_channel_id_zero(self) -> None:
+        # The newest mixed-build case: a writer that stamped message_id but not
+        # its channel. The pair degrades to "unresolvable pointer", which is
+        # exactly what those rows are — not to a wrong channel.
+        pre_channel_id = (
+            b'{"guild_id":111111111111111111,"title":"Song Title",'
+            b'"webpage_url":"https://yt.com/v=1",'
+            b'"duration_secs":242,"played_secs":225,"requester_id":42,'
+            b'"requester_name":"Omkar","thumbnail":"https://i.ytimg.com/t.jpg",'
+            b'"uploader":"Chan","played_at":1752530000.0,'
+            b'"message_id":999999999999999999,'
+            b'"queued_at":1752529000.0,"queue_position":2,'
+            b'"query_source":"youtube.com"}'
+        )
+        assert parse_history_entry(pre_channel_id) == _history_entry(channel_id=0)
 
     def test_snowflake_guild_id_survives_round_trip(self) -> None:
         entry = _history_entry(guild_id=222222222222222222)
@@ -796,6 +908,7 @@ class TestHistoryEntryDomain:
             uploader="chan",
             played_at=1000.0,
             message_id=333333333333333333,
+            channel_id=444444444444444444,
             queued_at=900.0,
             queue_position=3,
             query_source="spotify.com",
@@ -812,6 +925,7 @@ class TestHistoryEntryDomain:
             "uploader": "chan",
             "played_at": 1000.0,
             "message_id": 333333333333333333,
+            "channel_id": 444444444444444444,
             "queued_at": 900.0,
             "queue_position": 3,
             "query_source": "spotify.com",
@@ -997,6 +1111,7 @@ def _history_song_stub(**overrides: Any) -> YTDL:
         queued_at=1752529000.0,
         queue_position=2,
         query_source="youtube.com",
+        played_at=1752530000.0,
     )
     fields.update(overrides)
     return cast(YTDL, SimpleNamespace(**fields))
@@ -1007,8 +1122,8 @@ class TestHistoryEntryFromSong:
         entry = HistoryEntry.from_song(
             _history_song_stub(),
             guild_id=111,
-            played_at=1752530000.0,
             message_id=444444444444444444,
+            channel_id=555555555555555555,
         )
         assert entry == HistoryEntry(
             guild_id=111,
@@ -1022,40 +1137,66 @@ class TestHistoryEntryFromSong:
             uploader="Test Channel",
             played_at=1752530000.0,
             message_id=444444444444444444,
+            channel_id=555555555555555555,
             queued_at=1752529000.0,
             queue_position=2,
             query_source="youtube.com",
         )
 
-    def test_guild_id_and_message_id_are_required_keywords(self) -> None:
-        # Requiredness is the whole protection for message_id: play_history's
-        # CHECK is `message_id >= 0` with default 0, so a forgotten stamp inserts
-        # cleanly and reads as a song that genuinely had no host. pyright catches
-        # a missing argument only while no default exists — adding one silently
-        # retires the guarantee, and this is what notices.
+    def test_played_at_is_read_off_the_song(self) -> None:
+        # It is a stamp the playback loop wrote at vc.play() and every later
+        # fragment inherits, NOT a clock read here: a from_song that called
+        # time.time() would restamp a -playnow resume tail to when the tail
+        # started, filing one play under two different moments across a redelivery.
+        song = _history_song_stub(played_at=1700000000.0)
+        entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
+        assert entry.played_at == 1700000000.0
+
+    def test_unstamped_song_records_unknown_rather_than_now(self) -> None:
+        # 0.0 is the wire's "unknown" sentinel and the loop always stamps before
+        # a song can finish, so this only describes a defect — but it must stay a
+        # visible one, not a plausible timestamp minted at record time.
+        song = _history_song_stub(played_at=0.0)
+        assert (
+            HistoryEntry.from_song(
+                song, guild_id=111, message_id=0, channel_id=0
+            ).played_at
+            == 0.0
+        )
+
+    def test_guild_id_message_id_and_channel_id_are_required_keywords(self) -> None:
+        # play_history's CHECKs are `>= 0` with default 0, so a forgotten host
+        # stamp inserts cleanly and reads as a song that had no host. Requiredness
+        # is what catches it, and pyright only enforces that while no default
+        # exists — adding one would silently retire the guarantee.
         song = _history_song_stub()
         with pytest.raises(TypeError):
-            HistoryEntry.from_song(song, guild_id=111, played_at=1.0)  # pyright: ignore[reportCallIssue]
+            HistoryEntry.from_song(song, guild_id=111, message_id=0)  # pyright: ignore[reportCallIssue]
         with pytest.raises(TypeError):
-            HistoryEntry.from_song(song, played_at=1.0, message_id=0)  # pyright: ignore[reportCallIssue]
+            HistoryEntry.from_song(song, guild_id=111, channel_id=0)  # pyright: ignore[reportCallIssue]
+        with pytest.raises(TypeError):
+            HistoryEntry.from_song(song, message_id=0, channel_id=0)  # pyright: ignore[reportCallIssue]
 
-    def test_message_id_is_caller_supplied(self) -> None:
-        # The song object carries no message id — it comes from the NP host the
+    def test_host_ids_are_caller_supplied(self) -> None:
+        # The song object carries neither id — they come from the NP host the
         # playback loop captured at song end, and 0 means "no message hosted this
         # song's block" rather than "the caller forgot". Both arms are needed: 0
         # is also the dataclass default, so asserting it alone passes even if
         # from_song hardcodes 0, drops the argument, or never sets the field. The
         # non-zero arm is what makes the zero arm mean "0 because the caller said".
         song = _history_song_stub()
-        base = {"guild_id": 111, "played_at": 1.0}
-        assert HistoryEntry.from_song(song, **base, message_id=0).message_id == 0
-        assert HistoryEntry.from_song(song, **base, message_id=888).message_id == 888
+        zeroed = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
+        assert (zeroed.message_id, zeroed.channel_id) == (0, 0)
+        stamped = HistoryEntry.from_song(
+            song, guild_id=111, message_id=888, channel_id=999
+        )
+        assert (stamped.message_id, stamped.channel_id) == (888, 999)
 
     def test_played_secs_is_position_reached(self) -> None:
         song = _history_song_stub(position_secs=100.4)
         assert (
             HistoryEntry.from_song(
-                song, guild_id=111, played_at=1.0, message_id=0
+                song, guild_id=111, message_id=0, channel_id=0
             ).played_secs
             == 100
         )
@@ -1065,20 +1206,20 @@ class TestHistoryEntryFromSong:
         song = _history_song_stub(position_secs=243.02)
         assert (
             HistoryEntry.from_song(
-                song, guild_id=111, played_at=1.0, message_id=0
+                song, guild_id=111, message_id=0, channel_id=0
             ).played_secs
             == 242
         )
 
     def test_unknown_duration_leaves_position_uncapped(self) -> None:
         song = _history_song_stub(duration_secs=0, position_secs=99.6)
-        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
+        entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
         assert entry.duration_secs == 0
         assert entry.played_secs == 100
 
     def test_no_requester_degrades_to_zero_values(self) -> None:
         song = _history_song_stub(requester=None)
-        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
+        entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
         assert entry.requester_id == 0
         assert entry.requester_name == ""
 
@@ -1087,11 +1228,120 @@ class TestHistoryEntryFromSong:
         song = _history_song_stub(
             title=None, webpage_url=None, uploader=None, thumbnail=None
         )
-        entry = HistoryEntry.from_song(song, guild_id=111, played_at=1.0, message_id=0)
+        entry = HistoryEntry.from_song(song, guild_id=111, message_id=0, channel_id=0)
         assert entry.title == ""
         assert entry.webpage_url == ""
         assert entry.uploader == ""
         assert entry.thumbnail == ""
+
+
+def _played_tail(**overrides: Any) -> QueueObject:
+    """A -playnow resume tail: the interrupted song parked at the queue front,
+    carrying the play's start and the absolute position it reached."""
+    fields: dict = dict(
+        webpage_url="https://yt.com/v=1",
+        title="Interrupted Song",
+        requester=SimpleNamespace(id=333, display_name="Omkar"),
+        ts=95,
+        duration=240,
+        uploader="Chan",
+        thumbnail="https://img/x.jpg",
+        is_resume=True,
+        queued_at=1752529000.0,
+        queue_position=2,
+        query_source="youtube.com",
+        played_at=1752530000.0,
+    )
+    fields.update(overrides)
+    return QueueObject(**fields)
+
+
+class TestHistoryEntryFromQueueObject:
+    """The -clear/-remove write path: a song that played, was interrupted by a
+    -playnow, and had its tail destroyed before it could finish. Nothing else will
+    ever record it — the loop's single write site only fires for a song it played
+    to the end — so this classmethod is the whole record."""
+
+    def test_maps_queue_object_fields(self) -> None:
+        entry = HistoryEntry.from_queue_object(_played_tail(), guild_id=111)
+        assert entry == HistoryEntry(
+            guild_id=111,
+            title="Interrupted Song",
+            webpage_url="https://yt.com/v=1",
+            duration_secs=240,
+            played_secs=95,
+            requester_id=333,
+            requester_name="Omkar",
+            thumbnail="https://img/x.jpg",
+            uploader="Chan",
+            played_at=1752530000.0,
+            queued_at=1752529000.0,
+            queue_position=2,
+            query_source="youtube.com",
+        )
+
+    def test_played_secs_is_the_absolute_resume_offset(self) -> None:
+        # `ts` is absolute (YTDL.position_secs = start_offset + elapsed), so it
+        # already spans every earlier fragment of the play. Nothing to sum.
+        assert (
+            HistoryEntry.from_queue_object(
+                _played_tail(ts=137), guild_id=111
+            ).played_secs
+            == 137
+        )
+
+    def test_played_secs_capped_at_duration(self) -> None:
+        # Mirrors from_song's cap: imprecise duration metadata must not archive a
+        # position past the end of the song.
+        entry = HistoryEntry.from_queue_object(
+            _played_tail(ts=300, duration=240), guild_id=111
+        )
+        assert entry.played_secs == 240
+
+    def test_unknown_duration_leaves_position_uncapped(self) -> None:
+        entry = HistoryEntry.from_queue_object(
+            _played_tail(ts=300, duration=None), guild_id=111
+        )
+        assert (entry.duration_secs, entry.played_secs) == (0, 300)
+
+    def test_absent_ts_maps_to_zero(self) -> None:
+        # ts is Optional on QueueObject; None means "from the start".
+        assert (
+            HistoryEntry.from_queue_object(
+                _played_tail(ts=None), guild_id=111
+            ).played_secs
+            == 0
+        )
+
+    def test_host_ids_come_from_the_tails_np_fields(self) -> None:
+        """The tail names the card its interrupted fragment left frozen — the last
+        message that hosted this play, which is what the column means. Still
+        resolvable here: the cleanup that deletes it fires only when a tail STARTS,
+        and a flushed tail never does."""
+        entry = HistoryEntry.from_queue_object(
+            _played_tail(
+                np_message_id=777777777777777777,
+                np_channel_id=888888888888888888,
+                np_dedicated=True,
+            ),
+            guild_id=111,
+        )
+        assert (entry.message_id, entry.channel_id) == (
+            777777777777777777,
+            888888888888888888,
+        )
+
+    def test_an_unstamped_tail_records_unknown_host_ids(self) -> None:
+        # A tail from before the fields existed, or one whose fragment had no
+        # card: the pair degrades to unresolvable, never to a wrong pointer.
+        entry = HistoryEntry.from_queue_object(_played_tail(), guild_id=111)
+        assert (entry.message_id, entry.channel_id) == (0, 0)
+
+    def test_guild_id_is_a_required_keyword(self) -> None:
+        # Same protection as from_song's: guild_id 0 is constructible but not
+        # insertable, so a forgotten stamp would write rows Postgres refuses.
+        with pytest.raises(TypeError):
+            HistoryEntry.from_queue_object(_played_tail())  # pyright: ignore[reportCallIssue]
 
 
 class TestFromCrashedState:
@@ -1125,9 +1375,37 @@ class TestFromCrashedState:
         assert entry.ts is None
         assert entry.requester_id is None  # no requester recorded
 
+    def test_a_resume_tail_is_still_a_resume_after_a_crash(self) -> None:
+        """is_resume and start_paused are BEHAVIOUR, not attribution. Losing them
+        reclassified a -playnow tail as a fresh song on every restart: no resume
+        announcement, _remaining_secs billing the whole duration instead of the
+        tail so every ETA behind it skewed, the tail's NP-card cleanup silently
+        disabled, and a stack parked while paused coming back playing."""
+        state = GuildStateData(
+            current_song_url="https://yt.com/v=tail",
+            current_song_title="Tail",
+            current_song_is_resume=True,
+            current_song_start_paused=True,
+        )
+
+        entry = SongQueueEntry.from_crashed_state(state, position=137)
+
+        assert entry is not None
+        assert entry.is_resume is True
+        assert entry.start_paused is True
+
+    def test_a_fresh_song_stays_fresh_after_a_crash(self) -> None:
+        # The other half: recovery must not INVENT the flag. Synthesizing it from
+        # ts > 0 is the open FIXME, and it moves user-visible wording.
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert (entry.is_resume, entry.start_paused) == (False, False)
+
     def test_interjected_flag_survives_crash(self) -> None:
-        # A crash mid-interjection must not demote the recovered song: a
-        # -playnow after recovery still replaces it instead of stacking.
+        # A crash mid-interjection must not demote the recovered song. Attribution
+        # only since stacking replaced replace semantics — it is what tells you the
+        # song was queued by -playnow, and nothing branches on it.
         state = GuildStateData(
             current_song_url="https://x",
             current_song_title="T",
@@ -1174,6 +1452,27 @@ class TestFromCrashedState:
         entry = SongQueueEntry.from_crashed_state(state, position=42)
         assert entry is not None
         assert entry.query_source == "spotify.com"
+
+    def test_played_at_survives_crash(self) -> None:
+        # A playing song's queue-list entry was LPOPed when it started, so this
+        # hash is the ONLY at-rest copy of its start. Losing it here restamps the
+        # play to the recovery wall clock — and a post-recovery -clear then files
+        # it under a moment nobody was listening.
+        state = GuildStateData(
+            current_song_url="https://x",
+            current_song_title="T",
+            current_song_played_at=1752530000.5,
+        )
+        entry = SongQueueEntry.from_crashed_state(state, position=42)
+        assert entry is not None
+        assert entry.played_at == 1752530000.5
+
+    def test_played_at_defaults_to_unknown(self) -> None:
+        # A hash written by a build that predates the field: unknown, not "now".
+        state = GuildStateData(current_song_url="https://x", current_song_title="T")
+        entry = SongQueueEntry.from_crashed_state(state, position=None)
+        assert entry is not None
+        assert entry.played_at == 0.0
 
 
 class TestGuildPlaybackSnapshot:

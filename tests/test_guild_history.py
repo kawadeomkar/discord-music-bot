@@ -177,6 +177,33 @@ class TestRestore:
 
 
 class TestRecent:
+    async def test_a_stacked_interruption_is_reordered_by_played_at(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The persisted leg is in RECORD order, which is song-end order — and
+        since played_at became the song's START, an interrupted song is recorded
+        after everything that cut in front of it. So the leg's own head can hold
+        the earliest played_at, and the sort in recent() is what stops -history
+        rendering in end order under a "newest first" promise.
+
+        Shaped like a real -playnow stack: A starts, B and C cut in and finish
+        first, A resumes and finishes last."""
+        a, b, c = (
+            _entry(1, played_at=1000.0),
+            _entry(2, played_at=1100.0),
+            _entry(3, played_at=1200.0),
+        )
+        for entry in (b, c, a):  # record order: A ends last despite starting first
+            await store.push_history(entry)
+        h = _history(store)
+
+        assert [e.played_at for e in await store.get_history()] == [
+            1000.0,  # A at the head of the persisted leg — the earliest start
+            1200.0,
+            1100.0,
+        ]
+        assert await h.recent(3) == [c, b, a]  # …but the read is newest-first
+
     async def test_newest_first_selection(self) -> None:
         h = _history(None)
         h.restore([_entry(3), _entry(2), _entry(1)])  # newest-first input

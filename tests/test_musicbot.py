@@ -874,6 +874,11 @@ class TestCleanup:
         mp._pause_debounce_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
+        # None = nothing was playing, the shape most of these tests mean. A bare
+        # MagicMock attribute would read truthy and put a non-awaitable into
+        # cleanup's gather; tests about the teardown itself override it.
+        mp.claim_current_song_for_history = MagicMock(return_value=None)
+        mp.history.add = AsyncMock()
         for attr, val in overrides.items():
             setattr(mp, attr, val)
         music_bot.mps[mock_guild.id] = mp
@@ -1030,6 +1035,119 @@ class TestCleanup:
         mp.store.clear_connection.assert_awaited_once()
         mp.store.refresh_ttl.assert_awaited_once()
 
+    async def test_records_the_song_abandoned_mid_play(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Every teardown converges here — -stop, the alone-disconnect, and an
+        external voice kick — so one write site covers all three. Without it the
+        song a listener was hearing when the bot left is lost outright: it is not
+        in the queue, and the loop is cancelled before its own write site runs."""
+        entry = HistoryEntry(guild_id=mock_guild.id, title="Abandoned")
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(return_value=entry)
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        mp.history.add.assert_awaited_once_with(entry)
+
+    async def test_records_before_the_np_host_is_retired(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The claim reads the live NP host, and retire_np_host_on_stop() disposes
+        of it — so the claim has to happen first or the entry loses the ids."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            side_effect=lambda: (
+                order.append("claim") or HistoryEntry(guild_id=mock_guild.id, title="x")
+            )
+        )
+        mp.retire_np_host_on_stop = AsyncMock(
+            side_effect=lambda: order.append("retire")
+        )
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert order == ["claim", "retire"]
+
+    async def test_every_command_opens_a_span(self, music_bot: MusicBot) -> None:
+        """Repo convention: every command body runs inside its own
+        bot.<name> span, or its errors and timings never reach Tempo. -remove
+        shipped without one and nothing noticed, so this asserts the decorator SET
+        rather than any single member of it."""
+        import inspect
+
+        missing = []
+        for cmd in music_bot.get_commands():
+            src = inspect.getsource(cmd.callback)
+            header = src.split("async def ", 1)[0]
+            if f'start_as_current_span("bot.{cmd.name}")' not in header:
+                missing.append(cmd.name)
+
+        assert missing == [], f"commands with no span: {missing}"
+
+    async def test_the_claim_precedes_every_await_in_cleanup(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The claim is synchronous SO THAT no await can open a window for the
+        loop to record the same song. Ordering against the retire is not enough to
+        pin that: moving the claim after the teardown gather leaves the retire
+        later still. This asserts the claim runs before the first suspension."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            side_effect=lambda: (
+                order.append("claim") or HistoryEntry(guild_id=mock_guild.id, title="x")
+            )
+        )
+
+        async def _cancel(task: Any) -> None:
+            order.append("await")
+
+        mp.retire_np_host_on_stop = AsyncMock(
+            side_effect=lambda: order.append("retire")
+        )
+        mock_guild.voice_client = None
+
+        with patch("src.musicbot.cancel_task", new=_cancel):
+            await music_bot.cleanup(mock_guild)
+
+        assert order[0] == "claim", order
+
+    async def test_the_history_write_never_delays_the_disconnect(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """The write is Redis + outbox IO and nothing below reads it. Inside the
+        teardown gather it delayed the silence -stop asked for, because gather
+        completes on its SLOWEST member — measured at 20s against an unreachable
+        host, unbounded against one that accepts and then stalls."""
+        order: list[str] = []
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mp.claim_current_song_for_history = MagicMock(
+            return_value=HistoryEntry(guild_id=mock_guild.id, title="x")
+        )
+        mp.history.add = AsyncMock(side_effect=lambda _e: order.append("history"))
+        vc = MagicMock()
+        vc.disconnect = AsyncMock(side_effect=lambda **_kw: order.append("disconnect"))
+        mock_guild.voice_client = vc
+
+        await music_bot.cleanup(mock_guild)
+
+        assert order == ["disconnect", "history"]
+
+    async def test_nothing_playing_writes_no_history(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        # The helper's default: a teardown with no live song must not invent one.
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        mp.history.add.assert_not_awaited()
+
     async def test_noop_when_guild_not_in_mps(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -1062,6 +1180,7 @@ class TestCleanup:
         mp._player = _AwaitableTask()
         mp.store = None
         mp.retire_np_host_on_stop = AsyncMock()
+        mp.claim_current_song_for_history = MagicMock(return_value=None)
         music_bot.mps[mock_guild.id] = mp
 
         async def _disconnect(**_kw: Any) -> None:
@@ -2244,6 +2363,7 @@ class TestClearCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_clear = AsyncMock(return_value=[])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
         await command_callback(MusicBot.clear)(music_bot, mock_ctx)
         mp.queue_clear.assert_awaited_once()
@@ -2252,12 +2372,31 @@ class TestClearCommand:
             == "The queue is already empty."
         )
 
+    async def test_an_unrestored_queue_is_never_cleared(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """clear() destroys the Redis mirror while reading the IN-MEMORY display,
+        so against an unrestored player it deletes a saved queue it cannot see —
+        and a -playnow stack loses its rows too, because _flush_played records
+        from that same empty display. validate_commands only requires the AUTHOR
+        in voice, so a cold player is reachable."""
+        mp = MagicMock()
+        mp.queue_clear = AsyncMock(return_value=[])
+        mp.wait_for_restore = AsyncMock(return_value=False)  # snapshot not read
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        mp.queue_clear.assert_not_awaited()
+        assert "Still loading" in mock_ctx.send.await_args.kwargs["embed"].description
+
     async def test_sends_embed_with_cleared_songs(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         cleared = ["Song A - https://yt.com/1", "Song B - https://yt.com/2"]
         mp = MagicMock()
         mp.queue_clear = AsyncMock(return_value=cleared)
+        mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.message.add_reaction = AsyncMock()
         await command_callback(MusicBot.clear)(music_bot, mock_ctx)
@@ -2488,7 +2627,6 @@ class TestPlayWhilePaused:
                 interrupted_title="Paused Song",
                 resume_position=83,
                 was_paused=True,
-                replaced=False,
                 returns_paused=False,
             )
         )
@@ -3306,6 +3444,30 @@ class TestQueueCommand:
 
 
 class TestRemoveCommand:
+    async def test_a_failure_becomes_a_command_error(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Every other command wraps its body; -remove was the one that did not, so
+        a raise escaped to discord.py's generic handler — logged server-side, and
+        answered with nothing the user could act on or quote. _command_error is
+        what renders the embed and puts the trace id in its footer."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(side_effect=RuntimeError("queue exploded"))
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot._command_error = AsyncMock()
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, "https://yt.com/watch?v=abc"
+        )
+
+        music_bot._command_error.assert_awaited_once()
+        recorded = mocked(music_bot._command_error).await_args
+        assert recorded is not None
+        # The real exception, not one manufactured by the handler — that is what
+        # puts a usable type and message in the log and on the span.
+        assert isinstance(recorded.args[1], RuntimeError)
+
     async def test_no_url_sends_usage_message(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -3320,6 +3482,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
 
         await command_callback(MusicBot.remove)(
@@ -3335,6 +3498,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[2])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3355,6 +3519,7 @@ class TestRemoveCommand:
         queue_embed = discord.Embed(title="Queue")
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=queue_embed)
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3373,6 +3538,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3387,6 +3553,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[3])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
         url = "https://yt.com/watch?v=abc"
@@ -3402,6 +3569,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1, 4])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3418,6 +3586,7 @@ class TestRemoveCommand:
     ) -> None:
         mp = MagicMock()
         mp.queue_remove = AsyncMock(return_value=[1])
+        mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
 
@@ -3445,7 +3614,6 @@ class TestPlaynow:
                 interrupted_title="Original Song",
                 resume_position=151,
                 was_paused=False,
-                replaced=False,
             )
         )
         return mp
@@ -3523,7 +3691,6 @@ class TestPlaynow:
                 interrupted_title="Original Song",
                 resume_position=151,
                 was_paused=True,
-                replaced=False,
                 returns_paused=True,
             )
         )
@@ -3555,7 +3722,6 @@ class TestPlaynow:
                 interrupted_title="Almost Done",
                 resume_position=None,
                 was_paused=False,
-                replaced=False,
             )
         )
         music_bot.get_mp = MagicMock(return_value=live_mp)
@@ -3571,21 +3737,23 @@ class TestPlaynow:
         assert "nearly finished" in embed.description
         assert "will not resume" in embed.description
 
-    async def test_replaced_wording(
+    async def test_interjecting_over_an_interjection_promises_a_return(
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
+        """Interjections stack, so a song that was itself queued via -playnow gets
+        the ordinary resume wording. This used to be its own branch announcing
+        "it will not return" — the reply must never say that of a parked song."""
         from src.musicplayer import InterjectOutcome
 
         live_mp.interject = AsyncMock(
             return_value=InterjectOutcome(
                 interrupted_title="Old Interjection",
-                resume_position=None,
+                resume_position=151,
                 was_paused=False,
-                replaced=True,
             )
         )
         music_bot.get_mp = MagicMock(return_value=live_mp)
@@ -3597,8 +3765,9 @@ class TestPlaynow:
         await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
-        assert "Replaced" in embed.description
-        assert "will not return" in embed.description
+        assert "Old Interjection" in embed.description
+        assert "will resume at" in embed.description
+        assert "will not return" not in embed.description
 
     async def test_interject_none_front_enqueues_with_confirmation(
         self,
@@ -3727,7 +3896,6 @@ class TestPlaynow:
             interrupted_title="Original Song",
             resume_position=151,
             was_paused=False,
-            replaced=False,
         )
 
         def _interject_effect(*args: Any, **kwargs: Any) -> InterjectOutcome:

@@ -249,9 +249,9 @@ graph TD
 | `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`), `id` |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; `QueueItem = Union[QueueObject, YTSource]` is the live-item type |
-| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused`; both carry the enqueue stamps `queued_at` / `queue_position` and the parse-time `query_source` |
+| `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the enqueue stamps `queued_at` / `queue_position` and the parse-time `query_source` |
 | `GuildStateData` / `NowPlayingData` / `GuildPlaybackSnapshot` | `guild_state.py` | Typed snapshots of the state hash, now-playing hash, and the full restore read |
-| `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `queued_at`, `queue_position`, `query_source`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
+| `HistoryEntry` | `guild_state.py` | One played song (title, url, durations, requester, `guild_id`, `played_at`, `message_id`, `channel_id`, `queued_at`, `queue_position`, `query_source`) — the wire format shared by the Redis display list, the outbox, and the Postgres row mapping |
 | `GuildRedisStore` | `redis_client.py` | Per-guild Redis operations namespace |
 
 ---
@@ -472,9 +472,7 @@ flowchart TD
     Interject["mp.interject(qobj, vc)"]
     Ended{"song ended\nmid-resolve?"}
     FrontOnly["queue.put_front([qobj])\n(interjected reset)\n'Playing next' notice"]
-    Replace{"current itself\ninterjected?"}
-    NoResume["replaced=True — no resume entry\n(original song's resume tail is\nalready deeper in the queue)"]
-    Resume["build resume SongQueueEntry\n(is_resume=True, ts=position_secs,\nstart_paused=was_paused)"]
+    Resume["build resume SongQueueEntry\n(is_resume=True, ts=position_secs,\nstart_paused=was_paused)\ninherits played_at + query_source"]
     PutFront["queue.put_front([qobj, resume?])\n_skip_history_for = stopped song\nvc.stop() → loop picks up qobj"]
 
     Start --> Live
@@ -482,9 +480,7 @@ flowchart TD
     Live -->|Yes| Resolve --> Warm --> Interject
     Interject --> Ended
     Ended -->|Yes| FrontOnly
-    Ended -->|No| Replace
-    Replace -->|Yes| NoResume --> PutFront
-    Replace -->|No| Resume --> PutFront
+    Ended -->|No| Resume --> PutFront
 ```
 
 Key properties:
@@ -492,8 +488,8 @@ Key properties:
 - **Resume fidelity**: the parked song's position comes from `position_secs` (the frame counter), stored as `ts` on an `is_resume` `SongQueueEntry`. When the loop dequeues that entry it seeks via FFmpeg `-ss ts` and, if `start_paused`, comes back paused — the interruption is invisible to playback position.
 - **Warm before interrupt**: `prefetch_stream` is **awaited** (not fire-and-forget like `queue_put`'s warm-up) so the current song keeps playing through a possible yt-dlp miss rather than cutting to silence before the playnow song is ready.
 - **Nearly-finished guard**: a song with almost no time left gets no resume entry (`resume_position is None`) — it just ends.
-- **Replace semantics**: interjecting on top of another `-playnow` song (`current.interjected`) does **not** stack a second resume — the interrupted interjection is dropped (`replaced=True`); the originally-interrupted song's resume tail is already queued behind it.
-- **History once**: `_skip_history_for` holds the parked song's identity so the stop-transition's history step skips it — it is recorded exactly once, when its resume tail finishes. It holds the song object (not a bare flag) because the song can end naturally during `interject()`'s awaits.
+- **Stacking**: interjecting on top of another `-playnow` song parks it like any other, in front of the tails already waiting, so the queue unwinds LIFO and every parked song returns. Depth is unbounded and recorded on the span as `interject.depth` (the run of consecutive `is_resume` entries from display index 1, i.e. parked *plays*, via `GuildQueue.resume_tail_depth`). `ts` is absolute at every level, so a tail of a tail resumes at the position actually reached rather than at its own fragment's start.
+- **History once**: `_skip_history_for` holds the parked song's identity so the stop-transition's history step skips it — it is recorded exactly once, when its resume tail finishes. It holds the song object (not a bare flag) because the song can end naturally during `interject()`'s awaits. The same marker is what lets a *teardown* record safely: `cog.cleanup` claims the mid-play song through `MusicPlayer.claim_current_song_for_history()`, which declines when the marker already names it (a parked tail will record the play on `-resume`) and otherwise takes the marker so the loop cannot record it twice.
 - **Crash-safe**: resume entries are ordinary persisted `SongQueueEntry`s (LPUSHed to the front of the Redis list), so a crash mid-interjection recovers the parked song from the queue like any other.
 
 ---
@@ -790,10 +786,10 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
-| `guild:{id}:state` | Hash | 14 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_queued_at/_queue_position/_query_source` (a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
+| `guild:{id}:state` | Hash | 18 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
-| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
-| `guild:{id}:history` | List | JSON `HistoryEntry` objects (newest first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
+| `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
+| `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
 | `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
@@ -809,7 +805,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 Applied by the in-app migration runner (`src/db_migrate.py`; files in `migrations/`, `schema_migrations` ledger, `pg_advisory_xact_lock` around each run):
 
-- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz`, `inserted_at timestamptz` (server default; not on the wire), `message_id` (the NP host at song end — a correlation token, not a resolvable pointer), `queued_at timestamptz` and `queue_position` (when the song was first enqueued and how many songs were ahead of it then, counting the one playing; 0 = played immediately, and also what a row predating the fields carries), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
+- **`play_history`** — one row per played song: `id` (identity PK), `guild_id`, `title`, `webpage_url`, `duration_secs`, `played_secs`, `requester_id`, `requester_name`, `thumbnail`, `uploader`, `played_at timestamptz` (when the audio started — stamped once per play, so a `-playnow`-interrupted song files under the moment it first began, not the moment its resume tail ended), `inserted_at timestamptz` (server default; not on the wire), `message_id` and `channel_id` (the NP host at song end and the channel it was in — resolvable only as a pair, via `channel.get_partial_message(message_id)`, and both captured off the same message so they are both real or both `0`), `queued_at timestamptz` and `queue_position` (when the song was first enqueued and how many songs were ahead of it then, counting the one playing; 0 = played immediately, and also what a row predating the fields carries), and `query_source` (how the song was asked for: the literal `search`, or the host of the pasted link — `''` = unknown). **No NULLs** — the wire format's zero-value convention carries over (epoch-0 `played_at`/`queued_at` = unknown), because NULLs would break dedup-index semantics. Named `CHECK` constraints are the schema lock, held up by `HistoryEntry.__post_init__` clamping every value into the column domain before an insert is attempted.
 - **`play_history_dedup`** — unique on `(guild_id, played_at, webpage_url)`: the at-least-once drain's dedup key. Uniqueness only; `play_history_recent` `(guild_id, played_at DESC, id DESC)` serves the reads. It bounds row *selection* for both `-leaderboard` aggregates via its `guild_id` prefix, and their `LATERAL` legs seek on it directly; it cannot bound the aggregation itself, which visits every matching row for that guild by definition.
 - **`play_history_rejected`** — rows the server refused, payload preserved verbatim as `bytea`. Expected to stay empty forever; inspect with `just db-rejects`.
 
@@ -827,7 +823,9 @@ One token, no dataclass per site: a constant for each special-cased service (`yo
 
 `-leaderboard` resolves it through the same `CROSS JOIN LATERAL` that picks each winner's title, so it means "how it was most recently asked for" and costs no extra planner work.
 
-**Wire cost is a step, not a size.** Outbox entries pack into listpack nodes bounded by `stream-node-max-bytes` (4096), so resident memory per entry jumps whenever a node loses one entry rather than tracking the payload. Measured on `redis:7-alpine` over 50 000 entries, that cliff sits at ~440 B of payload: 486.8 B/entry below it, 547.4 B above. Adding this field crossed it, so the 256 MB compose Redis now holds ~491k un-drained plays instead of ~552k — an 11% cut in Postgres-outage runway bought with 18 wire bytes, and the empty token pays it just as fully as a populated one. Anything added to `HistoryEntry` from here is nearly free until the next node boundary; check where it lands before assuming either.
+**Wire cost is a step, not a size.** Outbox entries pack into listpack nodes bounded by `stream-node-max-bytes` (4096), so resident memory per entry jumps whenever a node loses one entry rather than tracking the payload. Measured on `redis:7-alpine` over 50 000 entries, that cliff sits at ~440 B of payload: 486.8 B/entry below it, 547.4 B above. Adding this field crossed it, so the 256 MB compose Redis now holds ~491k un-drained plays instead of ~552k — an 11% cut in Postgres-outage runway bought with 18 wire bytes, and the empty token pays it just as fully as a populated one.
+
+**The next boundary was the allocator's, not the node's.** Adding `channel_id` (~32 B populated) took a 484 B entry to 516 B and cost another 14%: 547.7 → 625.3 B/entry, 490k un-drained plays down to 429k. The node cap explains that one — 8 entries per listpack became 7 — but not the shape of the curve, which is **not monotonic in payload size**. An *unstamped* entry (`channel_id: 0`, 499 B) is the worst of the three at **678.3 B/entry**, worse than the larger stamped one, because 499 B still packs ~8 per node and pushes the listpack from 3872 B to 3977 B — over 4096 with its header, into jemalloc's next size class. So the real step is the allocator bin the *node* lands in, and the reachable pathology is a payload that keeps its entry count while overflowing the node. Measure with 50 000 identical XADDs and `MEMORY USAGE`; `XINFO STREAM`'s `radix-tree-keys` gives entries-per-listpack, which is what makes a result explicable rather than merely observed. Never predict this from `len(to_redis())` — the arithmetic here would have said `+6%` and ranked the three cases in the wrong order.
 
 ---
 
@@ -1189,7 +1187,7 @@ bounded by the number of settings that exist — three fields, ~160 bytes measur
 per guild that has chosen one — so they scale with guild count even more weakly
 (~1.5 MB across ten thousand) and cannot grow on their own at all. The outbox is near-empty
 whenever the drainer keeps up and grows for the whole duration of a Postgres
-outage, at ~487 bytes per play — so the bundled 256 MB budget holds roughly 525k
+outage, at ~625 bytes per play — so the bundled 256 MB budget holds roughly 429k
 un-archived plays. `HISTORY_OUTBOX_MAX` is the opt-in bound on it; it defaults to
 unbounded because dropping entries there is real data loss, and with the lists
 capped a dropped outbox entry has no second copy anywhere.
@@ -1385,6 +1383,30 @@ Song end *releases* the host, leaving a completed bar as truthful history. `-sto
 that never produced audio has its block disposed of rather than finalized, since a
 completed bar would be a false record.
 
+**Interrupted fragments clean up after themselves.** Releasing rather than retiring is
+right for a song that ended, but a `-playnow`-interrupted fragment leaves a bar frozen
+at its interrupt position — and a stack leaves one per interjection. So the resume tail
+inherits a pointer to that card (`np_message_id` / `np_channel_id` / `np_dedicated` on
+the wire, plus a runtime-only `np_host_ref`) and disposes of it when the tail starts,
+strictly *after* its own card is up. Three constraints shape this:
+
+- **Never a re-adopt.** `_adopt_np_host` refuses a message older than the current host
+  by design — the live bar belongs at the channel bottom. The stored ids exist to
+  *dispose* of the old card, never to move back to it.
+- **The channel id comes from the host message**, not from the persisted text-channel id,
+  which `set_context` reassigns on every command and which therefore records where the
+  last command ran rather than where any card was posted.
+- **Capture is late-bound**, at the interrupted fragment's iteration end. Anything read
+  inside `interject()` can name a message the `-playnow` confirmation's own adopt has
+  already retired.
+
+The runtime ref is what allows full fidelity: a card hosted by a *command response* is
+strip-edited back to its own embeds, which ids alone cannot reconstruct. After a restart
+only the ids survive, so by-id cleanup is gated to **dedicated** cards — deleting a
+non-dedicated host would destroy a user's reply. The ids are also not rewritten into the
+already-serialized Redis entry, so post-crash cleanup is best-effort; both gaps leave the
+pre-feature behaviour (the card simply stays) and are accepted as cosmetic.
+
 While a guild has debug mode on, the block carries the debug footer like every other
 embed — see [Debug footer seams](#debug-footer-seams).
 
@@ -1451,7 +1473,7 @@ Every persisted byte is defined in `guild_state.py` as frozen value objects with
 
 ### `-playnow` interjection via front-inserted resume entries
 
-`-playnow` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Stacked interjections don't nest — a `-playnow` on top of a `-playnow` replaces rather than deepens (`replaced=True`). Full design: [PLAYNOW_PROPOSAL.md](PLAYNOW_PROPOSAL.md).
+`-playnow` interrupts the current song and hands it back afterward without any new task, timer, or side channel: the parked song becomes an ordinary `is_resume` `SongQueueEntry` LPUSHed to the front of the queue (`put_front`), carrying its `position_secs` as `ts` and its paused state as `start_paused`. The loop replays it through the same `-ss`/seek path any `?t=` song uses, so resume fidelity and crash recovery come for free. The only extra state is `_skip_history_for` (so a parked song is logged to history once, at its resume tail, not twice). Interjections **stack**: a `-playnow` on top of a `-playnow` parks that song too, and the queue unwinds LIFO. One `_skip_history_for` slot is still enough at any depth — each interjection stops exactly one song, and that song's loop iteration consumes the marker before the next `-playnow` can finish resolving. Full design: [PLAYNOW_PROPOSAL.md](PLAYNOW_PROPOSAL.md).
 
 ### Persisted `YTSource` entries
 

@@ -349,6 +349,7 @@ _COLUMNS = (
     "uploader",
     "played_at",
     "message_id",
+    "channel_id",
     "queued_at",
     "queue_position",
     "query_source",
@@ -367,14 +368,23 @@ class TestRowMapping:
             assert column in _INSERT_SQL
             assert column in _RECENT_SQL
 
-    def test_message_id_round_trips(self) -> None:
-        # The NP host id is a snowflake; it must survive as a native int, and
-        # it must actually reach the row rather than defaulting to 0.
-        entry = HistoryEntry(guild_id=1, title="x", message_id=1234567890123456789)
+    def test_host_ids_round_trip(self) -> None:
+        # Both NP host ids are snowflakes; they must survive as native ints, and
+        # they must actually reach the row rather than defaulting to 0. Distinct
+        # values so a transposition of the adjacent columns is visible.
+        entry = HistoryEntry(
+            guild_id=1,
+            title="x",
+            message_id=1234567890123456789,
+            channel_id=987654321098765432,
+        )
         row = _entry_to_row(entry)
         assert row[_COLUMNS.index("message_id")] == 1234567890123456789
-        assert _row_to_entry(_as_record(dict(zip(_COLUMNS, row)))).message_id == (
-            1234567890123456789
+        assert row[_COLUMNS.index("channel_id")] == 987654321098765432
+        restored = _row_to_entry(_as_record(dict(zip(_COLUMNS, row))))
+        assert (restored.message_id, restored.channel_id) == (
+            1234567890123456789,
+            987654321098765432,
         )
 
     def test_round_trip(self) -> None:
@@ -1016,6 +1026,31 @@ class TestRejectionIsolation:
         assert isinstance(error, asyncpg.exceptions.CheckViolationError)
         assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
 
+    async def test_schema_drift_drains_instead_of_wedging_the_outbox(
+        self, fake_redis: Redis
+    ) -> None:
+        # UndefinedColumnError is the DATABASE being older than this build, not a
+        # bad row, so left transient it fails EVERY insert and redelivers onto
+        # history:outbox — a key with no TTL that eviction may not touch.
+        archive = PoisonArchive(
+            {"Song 1", "Song 2", "Song 3"},
+            exc=asyncpg.exceptions.UndefinedColumnError("channel_id"),
+        )
+        drainer = HistoryOutboxDrainer(fake_redis, archive)
+        await _push(fake_redis, 1, 2, 3)
+
+        assert await drainer._drain_once() == 3
+
+        assert archive.inserted == []
+        assert {e.title for e, _ in archive.rejections} == {
+            "Song 1",
+            "Song 2",
+            "Song 3",
+        }
+        # The invariant: nothing is left to redeliver. The plays are recoverable
+        # from play_history_rejected.payload, and visible to `just db-rejects`.
+        assert await fake_redis.xlen(HISTORY_OUTBOX_KEY) == 0
+
     async def test_the_recorded_entry_is_the_whole_play(
         self, fake_redis: Redis
     ) -> None:
@@ -1098,9 +1133,11 @@ class TestRejectionIsolation:
     ) -> None:
         """An unforeseen error type must keep redelivering rather than drop the
         batch: with the schema lock a data-caused refusal is a CHECK or a
-        DataError, both named in _POISON, so anything else genuinely is transient
-        and dropping would be data loss. The growing outbox is the symptom, and
-        HISTORY_OUTBOX_MAX plus the depth gauge are what page on it."""
+        DataError, and the one schema-caused refusal the build can name is an
+        UndefinedColumnError — all three are in _POISON, so anything else
+        genuinely is transient and dropping would be data loss. The growing
+        outbox is the symptom, and HISTORY_OUTBOX_MAX plus the depth gauge are
+        what page on it."""
 
         class AlwaysFails(RecordsRejections):
             async def insert_batch(self, entries: Sequence[HistoryEntry]) -> None:

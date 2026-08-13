@@ -486,7 +486,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
-| `guild:{id}:history` | list | **none, ever (PERSISTed)** | newest-first HistoryEntry JSON (~547 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
+| `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
@@ -634,12 +634,24 @@ interrupted song back where it was":
 3. `queue.put_front([qobj, resume])` (both persisted → LPUSHed, so crash recovery
    mid-interjection works unchanged), then `vc.stop()` — only if the measured song is
    still current.
-4. **Replace semantics**: interjecting over an interjection (`current.interjected`)
-   builds NO new resume entry — the original song's resume entry at the queue front is
-   untouched. Survives crashes via the `current_song_interjected` state field.
+4. **Stacking**: interjecting over an interjection parks that song too, in front of the
+   tails already waiting, so the queue unwinds LIFO and every parked song returns.
+   Unbounded by design (each `-playnow` pays a 1–4s resolve first); `ts` is absolute at
+   every level, so a tail of a tail resumes where it actually stopped. Depth rides the
+   span as `interject.depth` (`GuildQueue.resume_tail_depth`), and `interjected` is now
+   attribution only — its one behavioural read was the replace gate.
 5. History: the interrupted song is recorded ONCE, when its resume tail finishes
    (`_skip_history_for` holds the song's identity, not a boolean — a stale flag would eat
-   the next song's entry).
+   the next song's entry). One slot suffices at any depth: each interjection stops
+   exactly one song, whose iteration consumes the marker before the next can land. A
+   parked tail destroyed by `-clear`/`-remove` before it can play is recorded there
+   instead (`MusicPlayer._flush_played`) — a queue object is recorded exactly once, when
+   it leaves the queue for good. A song abandoned *mid-play* has no queue object at all
+   (its entry was LPOPed at start), so `cog.cleanup` claims it synchronously before any
+   await — `claim_current_song_for_history()` — and writes it alongside the teardown.
+   That claim takes the same `_skip_history_for` marker, which is what keeps the two
+   writers from both recording; it declines when the marker already names the song,
+   because then a parked tail survives in Redis and records the play on `-resume`.
 
 `-play` while paused routes through the same flow with `resume_paused=False` (the
 interrupted song comes back PLAYING — "-play means play"); `-playnow` restores the exact
@@ -672,6 +684,16 @@ released, one final edit completes the bar — only if the song truly reached it
 (`_reached_end`, 5s margin); skipped/interjected songs finalize at their true position;
 a stream that never produced audio gets its block retired instead (a completed bar would
 be a false record). Pause updates are debounced 0.5s.
+An interjected fragment's frozen bar is the one case release-don't-retire leaves behind,
+and a stack leaves one per interjection — so its resume tail carries a pointer to that
+card (`np_message_id`/`np_channel_id`/`np_dedicated` on the wire, plus a runtime-only
+`np_host_ref`) and disposes of it when the tail starts, **after** its own card is up.
+Never a re-adopt (`_adopt_np_host` refuses older ids by design — the bar belongs at the
+channel bottom); the channel id comes from `message.channel.id`, never the persisted
+home channel; and capture is late-bound to the fragment's iteration end, because an id
+read inside `interject()` can name a message the confirmation's own adopt already
+retired. Only the runtime ref can strip-edit a response host, so the by-id path (post-
+restart) is gated to dedicated cards — deleting a response would destroy a user's reply.
 
 ### yt-dlp: process pool, client strategy, caching, healing
 
@@ -981,8 +1003,13 @@ any guild idle for a day.
 **Add a queue-entry field**: `QueueEntryField` constant → `SongQueueEntry` field with
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
-parse) → `QueueObject` + `GuildQueue._rehydrate` → carry it through
-`_neutralize_prefetch`'s rebuild if playback-relevant.
+parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
+instance assignment, and `YTDL.from_queue_object` in `src/youtube.py`** — miss these three
+and the field is silently dropped the moment the queue object becomes a playing song,
+which is where every read of it happens → carry it through `_neutralize_prefetch`'s
+rebuild if playback-relevant. If it is a DURABLE property of the play rather than of the
+queue slot, it also needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
+`_TRANSIENT_SONG_FIELDS`, or a crash silently resets it (see `is_resume`/`start_paused`).
 
 **Add a schema migration**: **while no deployment holds the schema, don't** — edit
 `migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,
@@ -1010,8 +1037,10 @@ bind-mounted) but the runtime image does.
 `_SLUG_FIELDS` (a machine-minted token, clamped to `^[a-z0-9.-]{0,64}$`) — or
 `__post_init__` silently does not clamp it and the schema lock has a hole** (a test asserts every field is covered, so
 forgetting fails the suite rather than shipping) → check where the added bytes land
-against the outbox's listpack-node cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
-18 bytes once cost 11% of the OOM runway, and the next 60 may cost nothing) → `to_redis`/`parse_history_entry`
+against the outbox's allocator-bin cliff (`docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived`:
+18 bytes once cost 11% of the OOM runway and the next 32 cost another 14%, and the
+curve is NOT monotonic — an unstamped entry measured worse than a larger stamped
+one, so measure every shape a field takes and never just the populated one) → `to_redis`/`parse_history_entry`
 (`.get(..., default)`, so pre-migration wire entries still parse) → the column in
 `migrations/0001_play_history.sql`, plus a named `CHECK` for its domain — inline in the
 table definition pre-release (free to validate on an empty table); a separate `NOT VALID`
