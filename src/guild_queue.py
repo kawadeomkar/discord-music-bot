@@ -268,19 +268,38 @@ class GuildQueue:
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
     async def get(self) -> QueueItem:
-        item = await self._pending.get()
-        # No await between the claim and the return, so a cancellation lands
-        # either side of it and never inside.
+        """Claim the next pending item, waiting for one if the queue is drained.
+
+        `while`, never `if`. Two things depend on the re-test, and dropping it
+        breaks both: a getter cancelled after being woken leaves _wake set with
+        nobody having claimed, and Event.wait() wakes EVERY waiter, so a second
+        consumer would take the item this one was woken for. Re-testing the
+        condition is what makes both harmless — this is the condition-variable
+        pattern, and _sync_wake() is what keeps the condition and the Event
+        honest with each other.
+
+        No await between the claim and the return, so a cancellation lands either
+        side of it and never inside — a claim is atomic on the event loop."""
+        while self._cursor >= len(self._items):
+            await self._wake.wait()
+        item = self._items[self._cursor]
         self._cursor += 1
         self._sync_wake()
+        # Strangler: keep _pending in step for the legs that still read it.
+        # Cannot block — the loop above proved _items[_cursor:] is non-empty, and
+        # _pending holds exactly that.
+        self._pending.get_nowait()
         self._assert_legs_agree()
         return item
 
     def get_nowait(self) -> QueueItem:
         """Raises asyncio.QueueEmpty — the prefetch task relies on that."""
-        item = self._pending.get_nowait()
+        if self._cursor >= len(self._items):
+            raise asyncio.QueueEmpty
+        item = self._items[self._cursor]
         self._cursor += 1
         self._sync_wake()
+        self._pending.get_nowait()  # strangler, see get()
         self._assert_legs_agree()
         return item
 

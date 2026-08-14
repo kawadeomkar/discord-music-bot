@@ -5,6 +5,7 @@ queue, the display deque and the Redis mirror agree (persisted=False items live
 on the in-memory legs only, by design)."""
 
 import redis.asyncio as aioredis
+from collections import deque
 from dataclasses import replace
 from typing import Any
 import asyncio
@@ -160,6 +161,167 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+class TestBlockingWait:
+    """`get()` parks on `_wake` instead of `asyncio.Queue`. Both I3 directions are
+    tested with a BOUND rather than an assertion, because neither one raises: a
+    stale-set Event spins `get()` with no suspension point until pytest's 120 s
+    deadline, and a stale-clear one parks forever. A bounded wait_for turns both
+    into a fast, legible failure."""
+
+    async def test_a_removal_that_empties_the_queue_leaves_get_parked(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The wedge. `put()` sets `_wake`; `remove()` takes the only pending item
+        and needs no cursor fix-up, which is exactly where a per-method rule says
+        "nothing to do here". Leave `_wake` set and `get()`'s `while` loop has no
+        suspension point — `Event.wait()` returns immediately when already set, so
+        the whole event loop stops, not just this task."""
+        item = _qobj(1, mock_author)
+        await gq_no_redis.put([item])
+        assert gq_no_redis._wake.is_set()
+
+        outcome = await gq_no_redis.remove(remove_matcher(item.webpage_url))
+        assert outcome.positions == [1]
+
+        assert not gq_no_redis._wake.is_set()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(gq_no_redis.get(), 0.5)
+
+    async def test_a_restore_wakes_a_parked_getter(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The other direction: restore_* appends to an empty queue while the loop
+        is parked. Today an ordering masks it — _restore_complete is set after the
+        appends and the loop blocks on that first — but nothing states or tests
+        that, so the wake has to be real."""
+        getter = asyncio.create_task(gq_no_redis.get())
+        await asyncio.sleep(0)
+        assert not getter.done()
+
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester_id=mock_author.id,
+        )
+        assert await gq_no_redis.restore_entries([entry]) == 1
+
+        item = await asyncio.wait_for(getter, 0.5)
+        assert isinstance(item, QueueObject)
+        assert item.webpage_url == "https://yt.com/v=1"
+
+    async def test_a_cancelled_getter_leaves_the_cursor_alone(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Cancellation lands in the wait, never mid-claim: there is no await
+        between reading _items[_cursor] and returning it. A cancelled parked getter
+        must claim nothing, or the item it was woken for is lost."""
+        getter = asyncio.create_task(gq_no_redis.get())
+        await asyncio.sleep(0)
+        getter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await getter
+
+        assert gq_no_redis._cursor == 0
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        assert (await asyncio.wait_for(gq_no_redis.get(), 0.5)) is not None
+
+    async def test_a_woken_then_cancelled_getter_does_not_strand_the_item(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The case asyncio.Queue.get() carries a recovery block for. Dropping the
+        Queue drops that block, and the `while` re-test is what replaces it: the
+        next getter re-reads the condition rather than trusting a wakeup handed to
+        someone who never claimed."""
+        getter = asyncio.create_task(gq_no_redis.get())
+        await asyncio.sleep(0)
+        await gq_no_redis.put([_qobj(1, mock_author)])  # wakes it, no chance to run
+        getter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await getter
+
+        assert gq_no_redis._cursor == 0
+        assert (await asyncio.wait_for(gq_no_redis.get(), 0.5)) is not None
+
+    async def test_a_second_waiter_re_parks_instead_of_claiming_thin_air(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Why the wait is a `while` and not an `if`. Event.wait() wakes EVERY
+        waiter, so one item can wake two getters; the first claims it and
+        _sync_wake() clears, and the second must re-test rather than walk off the
+        end of the deque. With an `if` this raises IndexError instead of parking —
+        the mutation that survives every other test here."""
+        first = asyncio.create_task(gq_no_redis.get())
+        second = asyncio.create_task(gq_no_redis.get())
+        await asyncio.sleep(0)
+
+        item = _qobj(1, mock_author)
+        await gq_no_redis.put([item])
+
+        assert (await asyncio.wait_for(first, 0.5)) is item
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(second), 0.3)
+        assert gq_no_redis._cursor == 1
+
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+
+    async def test_a_prefetch_can_take_the_item_a_getter_was_woken_for(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The same race with the real second consumer: the prefetch task takes
+        items through get_nowait(), which can land between a getter's wakeup and
+        its claim."""
+        getter = asyncio.create_task(gq_no_redis.get())
+        await asyncio.sleep(0)
+
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        gq_no_redis.get_nowait()  # the prefetch beats the woken getter to it
+
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(getter), 0.3)
+
+        getter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await getter
+
+    async def test_randomised_park_and_wake_never_loses_an_item(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """A producer that outpaces and underruns a consumer by turns, so the
+        getter both parks and finds work waiting. Every item comes out exactly
+        once, in order, and the queue settles empty with _wake clear."""
+        import random
+
+        rng = random.Random(20260813)
+        total = 60
+        items = [_qobj(n, mock_author) for n in range(total)]
+        got: list[QueueObject] = []
+
+        async def consume() -> None:
+            for _ in range(total):
+                item = await gq_no_redis.get()
+                assert isinstance(item, QueueObject)
+                got.append(item)
+                gq_no_redis.task_done()
+                if rng.random() < 0.3:
+                    await asyncio.sleep(0)
+
+        consumer = asyncio.create_task(consume())
+        sent = 0
+        while sent < total:
+            n = min(rng.randint(1, 5), total - sent)
+            await gq_no_redis.put(items[sent : sent + n])
+            sent += n
+            for _ in range(rng.randint(0, 3)):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(consumer, 2.0)
+        assert got == items
+        assert gq_no_redis.qsize() == 0
+        assert not gq_no_redis._wake.is_set()
+
+
 class TestDrainPending:
     """`_drain_pending` — the shared first step of clear(), shuffle() and remove(),
     so a bug here corrupts three commands at once. Its non-obvious contract is the
@@ -218,13 +380,19 @@ class TestDrainPending:
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
         """The drain/rebuild round-trip all four callers perform: re-putting the
-        drained items must restore order and leave the counter consistent."""
+        drained items must restore order and leave the counter consistent.
+
+        Refills every leg, as clear()/shuffle()/remove() do — a _pending-only
+        refill is a half-queue no caller produces, and get() reads the deque."""
         items = [_qobj(n, mock_author) for n in range(1, 4)]
         await gq_no_redis.put(items)
 
         drained = gq_no_redis._drain_pending()
+        assert drained == items  # FIFO out
         for item in reversed(drained):
             gq_no_redis._pending.put_nowait(item)
+        gq_no_redis._display = deque(reversed(drained))
+        gq_no_redis._items = deque(reversed(drained))
 
         assert [gq_no_redis.get_nowait() for _ in range(3)] == list(reversed(items))
 
