@@ -2231,7 +2231,7 @@ class MusicPlayer:
             # task_done(), so the outer handler can close the books when a failure
             # lands between the dequeue and the normal song-end task_done() instead
             # of drifting the queue's task counter forever.
-            dequeue_owed = False
+            claim_outstanding = False
             # Each iteration spans a full song (3–5 min). Expected — the span stays
             # open across play_next.wait().
             with _tracer.start_as_current_span(
@@ -2243,11 +2243,10 @@ class MusicPlayer:
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
                     if prefetched_song is not None and queue_was_cleared:
-                        # Cleared while _prefetch_next_song ran: the completed task
-                        # consumed a get_nowait(), so balance it with task_done()
-                        # and cleanup() the FFmpeg subprocess so discarding the
-                        # result doesn't leak it.
-                        self.queue.task_done()
+                        # Cleared while _prefetch_next_song ran: clear() reset the
+                        # cursor, so the prefetch's claim is already settled — only
+                        # the FFmpeg subprocess is left to reap, and discarding the
+                        # result without cleanup() would leak it.
                         prefetched_song.cleanup()
                         prefetched_song = None
                     # Captured where each path takes its item, and handed back to
@@ -2257,7 +2256,7 @@ class MusicPlayer:
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
-                        dequeue_owed = True  # the prefetch's get_nowait() is ours
+                        claim_outstanding = True  # the prefetch's get_nowait() is ours
                         # Prefetched items always came through queue_get(), so they
                         # are real Redis-mirrored entries. source stays None:
                         # redis_pop_for(None) treats the dequeue as persisted.
@@ -2268,7 +2267,7 @@ class MusicPlayer:
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
-                                dequeue_owed = True
+                                claim_outstanding = True
                                 # Re-read: queue_get() can block, and a clear()
                                 # during that wait belongs to the queue this item
                                 # came from, not to the one we sampled above.
@@ -2287,7 +2286,7 @@ class MusicPlayer:
                                 await self._retire_failed_dequeue(
                                     source, context="resolve failure"
                                 )
-                                dequeue_owed = False
+                                claim_outstanding = False
                             raise
                         self.current_song = await self._stream_source(source)
                         should_pop_queue = is_persisted(source)
@@ -2296,7 +2295,7 @@ class MusicPlayer:
                         await self._retire_failed_dequeue(
                             source, context="failed-song pop"
                         )
-                        dequeue_owed = False
+                        claim_outstanding = False
                         failure = self._last_stream_error
                         if failure is not None:
                             message = (
@@ -2319,12 +2318,12 @@ class MusicPlayer:
                     span.set_attribute("song.title", self.current_song.title or "")
 
                     if not await self.queue.try_commit_dequeue(commit_generation):
-                        # Cleared while this song resolved (e.g. Inside yt_stream).
-                        # Discard without playing: task_done() balances the get()
-                        # above, and cleanup() terminates the FFmpeg subprocess
-                        # yt_stream already spawned, which would otherwise leak.
-                        self.queue.task_done()
-                        dequeue_owed = False
+                        # Cleared while this song resolved (e.g. inside yt_stream).
+                        # Discard without playing: the clear() that refused this
+                        # commit reset the cursor, so the claim is settled, and
+                        # cleanup() terminates the FFmpeg subprocess yt_stream
+                        # already spawned.
+                        claim_outstanding = False
                         self.current_song.cleanup()
                         self.current_song = None
                         continue
@@ -2575,8 +2574,9 @@ class MusicPlayer:
                     if self.store is not None:
                         await self.store.clear_song_end_state()
 
-                    self.queue.task_done()
-                    dequeue_owed = False
+                    # try_commit_dequeue() released the claim when the song
+                    # started; nothing further to settle.
+                    claim_outstanding = False
                     await self.update_activity(None)
 
                     # Deliberately last: current_song is already cleared, so the
@@ -2596,8 +2596,13 @@ class MusicPlayer:
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,
                     )
-                    if dequeue_owed:
-                        self.queue.task_done()
+                    # A claim survives only if no path settled it: the retire
+                    # paths release, and a refused commit means clear() already
+                    # did. Release rather than merely forgetting — a claim left
+                    # standing keeps its item counted as in flight forever, and
+                    # the next release would settle someone else's song.
+                    if claim_outstanding:
+                        self.queue.release("unhandled loop error")
                     if self._prefetch_task and not self._prefetch_task.done():
                         self._prefetch_task.cancel()
                     self._prefetch_task = None

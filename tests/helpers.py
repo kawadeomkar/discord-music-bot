@@ -116,18 +116,10 @@ def bind_loopback_only(container: Any, port: int) -> None:
 
 
 def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
-    """Put items on the in-memory legs without touching Redis — what a paired
-    `_pending.put()` + `_display.append()` did, kept honest about the strangler's
-    `_items`/`_cursor`/`_wake`.
+    """Queue items without touching Redis — `put()` minus the mirror.
 
-    Poking one leg by hand is what the strangler assertion catches: a test that
-    seeded only `_pending` left the display empty, so any later dequeue reported a
-    cursor the old legs disagreed with. Synchronous so the sync tests — the embed
-    and ETA ones — can use it too. Collapses to two lines once the old legs go
-    (phase 6).
+    Synchronous, so the sync tests (embeds, ETA) can use it too. Nothing here
+    claims: a test wanting an in-flight head calls `get()`, as production does.
     """
-    for item in items:
-        gq._pending.put_nowait(item)  # unbounded, so this never blocks
-        gq._display.append(item)
-        gq._items.append(item)
+    gq._items.extend(items)
     gq._sync_wake()

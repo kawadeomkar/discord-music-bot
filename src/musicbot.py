@@ -978,7 +978,7 @@ class MusicBot(commands.Cog):
                     if front:
                         position = 0
                     else:
-                        # Wait out any in-flight restore first: _display stays
+                        # Wait out any in-flight restore first: the queue stays
                         # empty until restore_entries() replays it, so a -play in
                         # the crash-recovery window would read 0 behind a queue
                         # about to reappear. Already set in the common case.

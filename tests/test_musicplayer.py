@@ -265,9 +265,9 @@ class TestQueuePut:
         self, music_player: MusicPlayer, queue_obj: QueueObject
     ) -> None:
         await music_player.queue_put(queue_obj)
-        assert len(music_player.queue._display) == 1
-        assert isinstance(music_player.queue._display[0], QueueObject)
-        assert music_player.queue._display[0].title == "Test Song"
+        assert len(music_player.queue._items) == 1
+        assert isinstance(music_player.queue._items[0], QueueObject)
+        assert music_player.queue._items[0].title == "Test Song"
 
     async def test_put_list_of_sources(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -279,7 +279,7 @@ class TestQueuePut:
         ]
         await music_player.queue_put(sources)
         assert music_player.queue.qsize() == 3
-        assert len(music_player.queue._display) == 3
+        assert len(music_player.queue._items) == 3
 
     async def test_put_multiple_singles_increments_size(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -288,7 +288,7 @@ class TestQueuePut:
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
             await music_player.queue_put(qobj)
         assert music_player.queue.qsize() == 4
-        assert len(music_player.queue._display) == 4
+        assert len(music_player.queue._items) == 4
 
     async def test_put_mirrors_queue_object_to_redis(
         self,
@@ -408,10 +408,10 @@ class TestQueueClear:
         for i in range(3):
             qobj = QueueObject(f"https://yt.com/watch?v={i}", f"Song {i}", mock_author)
             await music_player.queue_put(qobj)
-        assert len(music_player.queue._display) == 3
+        assert len(music_player.queue._items) == 3
 
         await music_player.queue_clear()
-        assert len(music_player.queue._display) == 0
+        assert len(music_player.queue._items) == 0
 
     async def test_clear_on_empty_queue_is_safe(
         self, music_player: MusicPlayer
@@ -901,7 +901,7 @@ class TestQueueRemove:
 
         assert positions == [1]
         assert music_player.queue.qsize() == 0
-        assert len(music_player.queue._display) == 0
+        assert len(music_player.queue._items) == 0
 
     async def test_remove_by_the_search_text_that_queued_it(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -965,7 +965,7 @@ class TestQueueRemove:
 
         assert positions == []
         assert music_player.queue.qsize() == 1
-        assert len(music_player.queue._display) == 1
+        assert len(music_player.queue._items) == 1
 
     async def test_remove_empty_queue_returns_empty(
         self, music_player: MusicPlayer
@@ -1043,7 +1043,7 @@ class TestQueueRemove:
 
         await music_player.queue_remove("https://yt.com/v=1")
 
-        remaining = list(music_player.queue._display)
+        remaining = list(music_player.queue._items)
         assert len(remaining) == 2
         urls = [item.webpage_url for item in remaining if isinstance(item, QueueObject)]
         assert "https://yt.com/v=0" in urls
@@ -2017,7 +2017,7 @@ class TestEstimatedPlayingAt:
         # ETA ends up, so re-derive it via the same line formatter for index 2.
         now_pst, walk = music_player._queue_eta_seed()
         _, walk = music_player._format_queue_line(
-            music_player.queue._display[0], 1, now_pst, walk
+            music_player.queue._items[0], 1, now_pst, walk
         )
         expected_line, _ = music_player._format_queue_line(
             QueueObject("https://yt.com/v=2", "Song 2", mock_author, duration=60),
@@ -2641,7 +2641,7 @@ class TestMusicPlayerInitialState:
         assert music_player.queue.qsize() == 0
 
     def test_song_queue_starts_empty(self, music_player: MusicPlayer) -> None:
-        assert len(music_player.queue._display) == 0
+        assert len(music_player.queue._items) == 0
 
     def test_history_starts_empty(self, music_player: MusicPlayer) -> None:
         assert len(music_player.history) == 0
@@ -3254,8 +3254,8 @@ class TestStateRestore:
 
         await music_player._restore_state()
         assert music_player.queue.qsize() == 1
-        assert isinstance(music_player.queue._display[0], QueueObject)
-        assert music_player.queue._display[0].title == "Restored Song"
+        assert isinstance(music_player.queue._items[0], QueueObject)
+        assert music_player.queue._items[0].title == "Restored Song"
 
     async def test_restore_sets_volume(
         self, music_player: MusicPlayer, fake_redis: aioredis.Redis
@@ -5884,13 +5884,11 @@ class TestPrefetchNextSong:
 
         assert music_player.queue.qsize() == 2
         assert music_player.queue.display_items() == [queue_obj, queue_obj_no_meta]
-        # Original order restored, and the transferred task slot balances:
-        # consuming both items normally lets join() complete.
+        # Original order restored, and the cancelled prefetch's claim went back
+        # with its item — both are claimable again, in order.
+        assert music_player.queue._cursor == 0
         assert music_player.queue.get_nowait() is queue_obj
-        music_player.queue.task_done()
         assert music_player.queue.get_nowait() is queue_obj_no_meta
-        music_player.queue.task_done()
-        await asyncio.wait_for(music_player.queue._pending.join(), timeout=1)
 
 
 # ── Loop task accounting ──────────────────────────────────────────────────────
@@ -5926,7 +5924,7 @@ class TestLoopTaskAccounting:
         ):
             await music_player.loop()
 
-        await asyncio.wait_for(music_player.queue._pending.join(), timeout=1)
+        assert music_player.queue._cursor == 0  # every claim settled
 
 
 # ── QueueGet ──────────────────────────────────────────────────────────────────
@@ -6150,12 +6148,10 @@ class TestLoop:
         ):
             await music_player.loop()
 
-        assert len(music_player.queue._display) == 0
+        assert len(music_player.queue._items) == 0
         remaining = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
         assert len(remaining) == 0
-        assert (
-            music_player.queue._pending._unfinished_tasks == 0
-        )  # task_done() balanced get()
+        assert music_player.queue._cursor == 0  # task_done() balanced get()
         sent_embed = mocked(music_player._channel.send).call_args.kwargs["embed"]
         assert sent_embed.title == "Playback error — skipping song"
 
@@ -7594,7 +7590,6 @@ class TestInterject:
                 await music_player.queue.try_commit_dequeue(
                     music_player.queue.generation
                 )
-                music_player.queue.task_done()
             live_song.elapsed_secs = float(30 * n)
             music_player.current_song = live_song
             qobj = QueueObject(

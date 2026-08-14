@@ -2882,7 +2882,7 @@ class TestPlayAnalytics:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Crash recovery reconnects voice BEFORE restore_entries() replays the
-        queue into _display. Reading the depth in that window records 0 behind a
+        queue. Reading the depth in that window records 0 behind a
         queue about to reappear, so the read waits the restore out."""
         mock_ctx.voice_client = _playing_vc()
         mp = _mock_mp()
