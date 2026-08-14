@@ -161,6 +161,76 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+class TestTheTwoCounters:
+    """`qsize()` and `display_size()` mean different sets, and after the collapse
+    they are one term apart over the same two fields — `len(_items) - _cursor`
+    against `len(_items)` — so a swap compiles and type-checks.
+
+    Nothing in the suite could tell them apart before: the split legs put them on
+    two different objects, which made confusing them impossible rather than
+    merely unlikely. These pin the gap.
+
+    `display_size()` is the sole input to `play_history.queue_position`
+    (MusicPlayer.enqueue_depth), so getting it wrong writes a plausible wrong
+    number to Postgres permanently, with no error to notice."""
+
+    async def test_they_differ_by_exactly_the_in_flight_head(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        items = [_qobj(n, mock_author) for n in range(1, 4)]
+        await gq_no_redis.put(items)
+        assert (gq_no_redis.qsize(), gq_no_redis.display_size()) == (3, 3)
+
+        await gq_no_redis.get()  # claimed, not yet committed
+
+        # The claimed song is gone from pending and still ahead of an arrival.
+        assert gq_no_redis.qsize() == 2
+        assert gq_no_redis.display_size() == 3
+
+    async def test_a_claim_moves_only_qsize(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Each half of the swap, separately: give qsize() display_size()'s body
+        and this fails; give display_size() qsize()'s body and the next one does."""
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        before = gq_no_redis.qsize()
+        await gq_no_redis.get()
+        assert gq_no_redis.qsize() == before - 1
+
+    async def test_a_claim_leaves_display_size_alone(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        before = gq_no_redis.display_size()
+        await gq_no_redis.get()
+        assert gq_no_redis.display_size() == before
+
+    async def test_committing_the_claim_settles_both(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Only the commit retires the item from both counts — that is the window
+        enqueue_depth's documented over-by-one lives in."""
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        await gq.get()
+        assert (gq.qsize(), gq.display_size()) == (1, 2)
+
+        assert await gq.try_commit_dequeue(gq.generation) is True
+
+        assert (gq.qsize(), gq.display_size()) == (1, 1)
+
+    async def test_empty_tracks_qsize_not_display_size(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """`empty()` is qsize()'s partner and answers about PENDING: a queue whose
+        only item is claimed has nothing left to hand out, and the 300s idle
+        disconnect keys off exactly that."""
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        await gq_no_redis.get()
+
+        assert gq_no_redis.empty() is True
+        assert gq_no_redis.display_size() == 1
+
+
 class TestBlockingWait:
     """`get()` parks on `_wake` instead of `asyncio.Queue`. Both I3 directions are
     tested with a BOUND rather than an assertion, because neither one raises: a
@@ -343,8 +413,11 @@ class TestDrainPending:
     ) -> None:
         await gq_no_redis.put([_qobj(n, mock_author) for n in range(1, 4)])
         gq_no_redis._drain_pending()
-        assert gq_no_redis.qsize() == 0
-        assert gq_no_redis.empty()
+        # The pending LEG, not qsize(): the public counter reads the deque now,
+        # and _drain_pending touches only the leg it is named for. Both go in
+        # phase 6.
+        assert gq_no_redis._pending.qsize() == 0
+        assert gq_no_redis._pending.empty()
 
     async def test_empty_queue_returns_empty_list(
         self, gq_no_redis: GuildQueue
@@ -723,7 +796,7 @@ class TestShuffle:
     ) -> None:
         crashed = _qobj(99, mock_author, persisted=False)
         # Inject the crashed item the way restore does: in-memory only.
-        await seed_queue(gq, crashed)
+        seed_queue(gq, crashed)
         await gq.put([_qobj(n, mock_author) for n in range(1, 5)])
 
         assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
@@ -1279,7 +1352,7 @@ class TestDequeueBookkeeping:
     ) -> None:
         await gq.put([_qobj(1, mock_author)])  # the real, persisted entry
         crashed = _qobj(99, mock_author, persisted=False)
-        await seed_queue(gq, crashed)
+        seed_queue(gq, crashed)
         _ = await gq.get()
         await gq.finish_failed_dequeue(crashed)
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)

@@ -337,19 +337,22 @@ class GuildQueue:
         self._pending.task_done()
 
     def empty(self) -> bool:
-        return self._pending.empty()
+        return self._cursor >= len(self._items)
 
     def qsize(self) -> int:
-        return self._pending.qsize()
+        """PENDING only — what is still waiting to be claimed."""
+        return len(self._items) - self._cursor
 
     def display_size(self) -> int:
-        """Depth of the display leg — what a new arrival actually waits behind.
+        """Pending PLUS in-flight — what a new arrival actually waits behind.
 
-        NOT qsize(): _pending has already given up the in-flight head (a
-        dequeued-but-uncommitted item, or one a prefetch took via get_nowait()),
-        so qsize() undercounts by one exactly when a -play lands during another
-        song's resolve. Both windows are ordinary."""
-        return len(self._display)
+        NOT qsize(), and the two are now one term apart over the same two fields,
+        so a swap compiles and type-checks. It is the sole input to
+        play_history.queue_position (MusicPlayer.enqueue_depth), and a claimed item
+        is still ahead of an arrival — so qsize() here would undercount by one
+        exactly when a -play lands during another song's resolve, and write a
+        plausible wrong number to Postgres with nothing to detect it."""
+        return len(self._items)
 
     def _drain_pending(self) -> list[QueueItem]:
         """Remove and return every item in _pending, in queue order, each balanced
@@ -451,7 +454,7 @@ class GuildQueue:
             self._display.extendleft(reversed(in_flight + new_items))
 
             if in_flight:
-                await self._write_mirror(self._display)
+                await self._write_mirror(self._items)
             elif self._store is not None:
                 # An LPUSH of just the new items, not a replacement — so
                 # deliberately not _write_mirror's job. Reachable only with no
@@ -484,7 +487,7 @@ class GuildQueue:
             self._cleared = True
             self._generation += 1
             self._drain_pending()
-            cleared_items = list(self._display)
+            cleared_items = list(self._items)
             self._display.clear()
             self._items.clear()
             self._cursor = 0
@@ -627,10 +630,10 @@ class GuildQueue:
 
     def display_items(self) -> list[QueueItem]:
         """Snapshot of the queued items in display order."""
-        return list(self._display)
+        return list(self._items)
 
     def peek_next(self) -> Optional[QueueItem]:
-        return self._display[0] if self._display else None
+        return self._items[0] if self._items else None
 
     def has_resume_tail(self, webpage_url: str) -> bool:
         """True when the display already carries the resume tail an interjection
@@ -652,7 +655,7 @@ class GuildQueue:
             isinstance(item, QueueObject)
             and item.is_resume
             and item.webpage_url == webpage_url
-            for item in self._display
+            for item in self._items
         )
 
     def resume_tail_depth(self) -> int:
@@ -661,12 +664,11 @@ class GuildQueue:
         stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
         gone by the time this runs and only its tail is queued.
 
-        The interjected song is not always at index 0 — put_front's in-flight-head
-        branch keeps a dequeued-but-uncommitted item ahead of what it inserts — so
-        the run starts after whatever _pending does not account for."""
-        items = list(self._display)
-        head = len(items) - self._pending.qsize()
-        start = (head if head > 0 else 0) + 1
+        The interjected song is not always at index 0 — put_front inserts behind a
+        dequeued-but-uncommitted item — so the run starts after the claimed prefix,
+        which _cursor names directly."""
+        items = list(self._items)
+        start = self._cursor + 1
         depth = 0
         for item in items[start:]:
             if not (isinstance(item, QueueObject) and item.is_resume):
