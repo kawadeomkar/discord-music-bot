@@ -13,6 +13,7 @@ import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
+from src.guild_queue import GuildQueue, QueueItem
 from src.youtube import QueueObject
 
 
@@ -112,3 +113,20 @@ def bind_loopback_only(container: Any, port: int) -> None:
     hands `.ports` to docker-py, which accepts `(host_ip, host_port)`; `None`
     keeps the random high port. Call before start — that dict is read once."""
     container.ports[port] = ("127.0.0.1", None)
+
+
+async def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
+    """Put items on the in-memory legs without touching Redis — what a paired
+    `_pending.put()` + `_display.append()` did, kept honest about the strangler's
+    `_items`/`_cursor`/`_wake`.
+
+    Poking one leg by hand is what the strangler assertion catches: a test that
+    seeded only `_pending` left the display empty, so any later dequeue reported a
+    cursor the old legs disagreed with. Collapses to two lines once the old legs
+    go (phase 6).
+    """
+    for item in items:
+        await gq._pending.put(item)
+        gq._display.append(item)
+        gq._items.append(item)
+    gq._sync_wake()

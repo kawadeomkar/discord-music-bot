@@ -190,6 +190,9 @@ class GuildQueue:
         "_store",
         "_pending",
         "_display",
+        "_items",
+        "_cursor",
+        "_wake",
         "_mutex",
         "_cleared",
         "_generation",
@@ -200,18 +203,86 @@ class GuildQueue:
         self._store = store
         self._pending: _FrontQueue = _FrontQueue()
         self._display: deque = deque()
+        # ── Strangler: the single-deque legs, maintained but not yet read ─────
+        # _items carries what _display carries; _cursor is the count _pending has
+        # already given up, which _in_flight_head derives by subtraction today.
+        # _assert_legs_agree() checks both against the old legs after every
+        # mutation. All three go away with _pending/_display.
+        self._items: deque[QueueItem] = deque()
+        self._cursor = 0
+        self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
         self._cleared = False
         self._generation = 0
 
+    # ── Strangler bookkeeping (deleted with the old legs) ─────────────────────
+
+    def _sync_wake(self) -> None:
+        """Restore I3: _wake is set iff something is pending.
+
+        The ONLY writer of _wake. A method that sets or clears it by hand states a
+        conclusion, and a wrong one does not degrade — Event.wait() returns without
+        yielding when already set, so a stale set turns the future get()'s wait loop
+        into a loop with no suspension point and the whole event loop stops."""
+        if self._cursor < len(self._items):
+            self._wake.set()
+        else:
+            self._wake.clear()
+
+    def _release(self) -> None:
+        """Settle one claimed item on the new legs: drop index 0 and step the
+        cursor back, which leaves `len - _cursor` unchanged.
+
+        Guarded, and both directions matter. A release with nothing claimed would
+        drive _cursor negative (I1) while still eating a PENDING item, so it
+        no-ops — that is the state clear() leaves behind when the loop's failure
+        path runs after it, and the generation check is what makes it correct
+        rather than merely safe."""
+        if self._cursor == 0:
+            return
+        self._items.popleft()
+        self._cursor -= 1
+        self._sync_wake()
+
+    def _assert_legs_agree(self) -> None:
+        """The strangler's contract: the new legs describe exactly what the old two
+        do. Runs at the end of every mutating method while both are live."""
+        in_flight = len(self._display) - self._pending.qsize()
+        assert list(self._items) == list(self._display), (
+            f"guild {self._guild.id}: _items {len(self._items)} != "
+            f"_display {len(self._display)}"
+        )
+        assert self._cursor == in_flight, (
+            f"guild {self._guild.id}: _cursor {self._cursor} != "
+            f"derived in-flight {in_flight}"
+        )
+        assert 0 <= self._cursor <= len(self._items), (
+            f"guild {self._guild.id}: I1 broken, _cursor={self._cursor} "
+            f"len={len(self._items)}"
+        )
+        assert self._wake.is_set() == (self._cursor < len(self._items)), (
+            f"guild {self._guild.id}: I3 broken, wake={self._wake.is_set()} "
+            f"_cursor={self._cursor} len={len(self._items)}"
+        )
+
     # ── Consumption (playback loop + prefetch task) ───────────────────────────
 
     async def get(self) -> QueueItem:
-        return await self._pending.get()
+        item = await self._pending.get()
+        # No await between the claim and the return, so a cancellation lands
+        # either side of it and never inside.
+        self._cursor += 1
+        self._sync_wake()
+        self._assert_legs_agree()
+        return item
 
     def get_nowait(self) -> QueueItem:
         """Raises asyncio.QueueEmpty — the prefetch task relies on that."""
-        return self._pending.get_nowait()
+        item = self._pending.get_nowait()
+        self._cursor += 1
+        self._sync_wake()
+        self._assert_legs_agree()
+        return item
 
     def requeue_front(self, item: QueueItem) -> None:
         """Undo a get()/get_nowait() whose consumer abandoned the item without
@@ -234,6 +305,14 @@ class GuildQueue:
         # the abandoned get() took it from.
         if self._display:
             self._display[0] = item
+        # Guarded like every other cursor decrement: unguarded, _cursor == 0 would
+        # go negative and _items[-1] = item would clobber the TAIL. Today's
+        # `if self._display:` above makes the old legs a no-op in that state.
+        if self._cursor > 0:
+            self._cursor -= 1
+            self._items[self._cursor] = item
+        self._sync_wake()
+        self._assert_legs_agree()
 
     def task_done(self) -> None:
         self._pending.task_done()
@@ -301,6 +380,11 @@ class GuildQueue:
             for item in queued:
                 await self._pending.put(item)
                 self._display.append(item)
+            # With the in-memory legs, not after the mirror: the early return
+            # below skips the Redis half entirely for a store-less queue.
+            self._items.extend(queued)
+            self._sync_wake()
+            self._assert_legs_agree()
             if self._store is None or not queued:
                 return queued
             entries = [_to_entry(item) for item in queued]
@@ -336,6 +420,10 @@ class GuildQueue:
 
             for item in reversed(new_items):
                 self._pending.put_front_nowait(item)
+            # Inserting at _cursor IS inserting behind the in-flight head — the
+            # lift-and-replace below exists only because a deque cannot splice.
+            for item in reversed(new_items):
+                self._items.insert(self._cursor, item)
             # Lift the in-flight head off, insert behind it, put it back. The tail
             # is carried over rather than recomputed from _pending, so a
             # pre-existing triad drift survives this insert rather than being healed.
@@ -352,6 +440,8 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
+            self._sync_wake()
+            self._assert_legs_agree()
             return new_items
 
     # ── Bulk operations ───────────────────────────────────────────────────────
@@ -377,8 +467,12 @@ class GuildQueue:
             self._drain_pending()
             cleared_items = list(self._display)
             self._display.clear()
+            self._items.clear()
+            self._cursor = 0
+            self._sync_wake()
             if self._store is not None:
                 await self._store.delete_queue()
+            self._assert_legs_agree()
         return cleared_items
 
     async def shuffle(self) -> ShuffleOutcome:
@@ -406,6 +500,8 @@ class GuildQueue:
                 except asyncio.QueueFull:
                     break
             self._display = deque(in_flight + kept)
+            self._items = deque(in_flight + kept)
+            self._sync_wake()
 
             # Was a skip rather than a DELETE when nothing persisted survived —
             # unreachable (that needs 4+ crash-recovered items and restore_crashed
@@ -413,6 +509,7 @@ class GuildQueue:
             # mirror holding entries memory no longer has.
             if kept:
                 await self._write_mirror(in_flight + kept)
+            self._assert_legs_agree()
 
         return ShuffleOutcome.SHUFFLED
 
@@ -448,9 +545,12 @@ class GuildQueue:
             for item in kept:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + kept)
+            self._items = deque(in_flight + kept)
+            self._sync_wake()
 
             if removed_positions:
                 await self._write_mirror(in_flight + kept, removed=removed_items)
+            self._assert_legs_agree()
 
         return RemoveOutcome(
             removed=removed_items,
@@ -482,6 +582,9 @@ class GuildQueue:
             return False
         await self._pending.put(item)
         self._display.append(item)
+        self._items.append(item)
+        self._sync_wake()
+        self._assert_legs_agree()
         return True
 
     async def restore_entries(self, entries: Sequence[QueueEntry]) -> int:
@@ -495,7 +598,10 @@ class GuildQueue:
             if item is not None:
                 await self._pending.put(item)
                 self._display.append(item)
+                self._items.append(item)
                 count += 1
+        self._sync_wake()
+        self._assert_legs_agree()
         return count
 
     # ── Display data (embed/ETA builders live in MusicPlayer) ─────────────────
@@ -559,6 +665,8 @@ class GuildQueue:
             self._display.popleft()
         except IndexError:
             log.warning(f"song_queue was empty on {context} in guild {self._guild.id}")
+        self._release()
+        self._assert_legs_agree()
 
     def try_pop_display_head(self) -> bool:
         """Pop the display head for a song about to play. False means the display
@@ -567,9 +675,11 @@ class GuildQueue:
         bulk-mutation lock: the check must not race a clear()/shuffle()."""
         try:
             self._display.popleft()
-            return True
         except IndexError:
             return False
+        self._release()
+        self._assert_legs_agree()
+        return True
 
     async def finish_failed_dequeue(
         self, item: Optional[QueueItem], *, context: str = "dequeue"

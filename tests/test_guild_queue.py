@@ -24,7 +24,7 @@ from src.guild_state import SearchQueueEntry, SongQueueEntry, parse_queue_entry
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.youtube import QueueObject
-from tests.helpers import queue_object
+from tests.helpers import queue_object, seed_queue
 
 
 @pytest.fixture
@@ -555,8 +555,7 @@ class TestShuffle:
     ) -> None:
         crashed = _qobj(99, mock_author, persisted=False)
         # Inject the crashed item the way restore does: in-memory only.
-        await gq._pending.put(crashed)
-        gq._display.append(crashed)
+        await seed_queue(gq, crashed)
         await gq.put([_qobj(n, mock_author) for n in range(1, 5)])
 
         assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
@@ -1057,6 +1056,9 @@ class TestDequeueBookkeeping:
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
+        # Claim first, as every caller does — this runs only from
+        # finish_failed_dequeue, which is reached after a get().
+        await gq.get()
         gq.pop_display_head()
         assert gq.display_items() == []
 
@@ -1065,6 +1067,7 @@ class TestDequeueBookkeeping:
     ) -> None:
         assert gq.try_pop_display_head() is False
         await gq.put([_qobj(1, mock_author)])
+        await gq.get()  # the claim this settles
         assert gq.try_pop_display_head() is True
         assert gq.display_items() == []
 
@@ -1108,8 +1111,7 @@ class TestDequeueBookkeeping:
     ) -> None:
         await gq.put([_qobj(1, mock_author)])  # the real, persisted entry
         crashed = _qobj(99, mock_author, persisted=False)
-        await gq._pending.put(crashed)
-        gq._display.append(crashed)
+        await seed_queue(gq, crashed)
         _ = await gq.get()
         await gq.finish_failed_dequeue(crashed)
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
@@ -1119,6 +1121,7 @@ class TestDequeueBookkeeping:
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
+        await gq.get()  # the claim the first commit settles
         generation = gq.generation
         assert await gq.try_commit_dequeue(generation) is True
         await gq.clear()
