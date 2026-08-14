@@ -41,9 +41,10 @@ See docs/ARCHITECTURE.md#queue-invariant.
 
 import asyncio
 import random
+import re
 from collections import deque
-from itertools import islice
 from collections.abc import Callable, Sequence
+from itertools import islice
 from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from typing import Optional, Union
@@ -62,17 +63,20 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
-# Above this many removed entries, the pipelined LREMs cost more than rewriting
-# the whole list. Measured on redis:7-alpine at depth 1000 — a rebuild is a flat
-# ~5.7ms whatever it drops, while LREM runs 0.96ms for one entry, 3.4ms for 100
-# and 5.8ms for 250, crossing over near 270. Set below that: the margin absorbs
-# the depth the crossover moves with, and every realistic collection removal
-# (an album, a playlist page) sits far under it.
+# When the pipelined LREMs cost more than rewriting the list. Measured on
+# redis:7-alpine: a rebuild scales with what SURVIVES (0.77ms at 50, 3.75ms at
+# 800, 24.5ms at 4800) while LREM scales with what goes, so the crossover is a
+# RATIO, not a count — near drop = survivors / 4. At depth 250 dropping 200 the
+# ratio gate is what matters: LREM measures 4.7ms against a 0.8ms rebuild. One
+# in five is where every measured point falls on the right side; the true
+# crossover is a band, not a line.
 #
-# NOT the ~40 an earlier estimate gave. That came from fakeredis, where a
-# pipeline costs what its commands cost; against a real server the whole batch
-# is one round trip, so LREM stays ahead roughly six times longer.
+# The absolute cap is a second bound for deep queues, where a quarter of the
+# survivors is still hundreds of round-trip-free LREMs. NOT the ~40 an earlier
+# estimate gave: that came from fakeredis, where a pipeline costs what its
+# commands cost rather than one round trip.
 _LREM_MAX_ENTRIES = 200
+_LREM_MAX_SHARE = 5
 
 
 class ShuffleOutcome(Enum):
@@ -92,13 +96,24 @@ class RemoveMode(StrEnum):
 RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
 
 
+# A link, for folding purposes: a scheme, or a bare dotted host that parse_url
+# also accepts (`-play youtu.be/X` is an ordinary input). Angle brackets are
+# stripped first because Discord adds them when suppressing an embed.
+_LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
+
+
 def _normalize(s: str) -> str:
     """Fold a needle for comparison: collapse whitespace, and casefold anything
-    that is not a URL. Links keep their case because IDs inside them are
-    case-sensitive — a casefolded Spotify base62 id would let ".../album/AbC"
-    match a different album's ".../album/abc"."""
-    s = " ".join(s.split())
-    return s if s[:8].lower().startswith(("http://", "https:/")) else s.casefold()
+    that is not a link. Links keep their case because IDs inside them are
+    case-sensitive — a casefolded Spotify base62 id would let ".../playlist/AbC"
+    match a different playlist's ".../playlist/abc".
+
+    Free text folds under casefold(), which maps some distinct strings together
+    (strasse/straße, U+212A/k). Two searches differing only that way remove each
+    other; accepted, because the alternative is a fold that fails on ordinary
+    case differences, which is what people actually retype."""
+    s = " ".join(s.split()).strip("<>")
+    return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
 
 def remove_matcher(needle: str) -> RemoveMatcher:
@@ -114,9 +129,17 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     album link takes back out exactly the tracks it put in. Links are compared
     literally, so youtu.be/x will not match an entry stored as
     youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
+    # Stripped for the resolved leg, which compares literally: consume-rest keeps
+    # trailing whitespace where the old positional parser tokenized it away.
+    needle = needle.strip()
     folded = _normalize(needle)
 
     def match(item: QueueItem) -> Optional[RemoveMode]:
+        if not needle:
+            # An unresolved search has url=None, which an empty needle would match
+            # as "" and take out every Spotify-playlist track. Unreachable through
+            # discord.py today, one parser change from live.
+            return None
         resolved = (
             item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
         )
@@ -191,12 +214,12 @@ class GuildQueue:
         self._cleared = False
         self._generation = 0
 
-    # ── Strangler bookkeeping (deleted with the old legs) ─────────────────────
+    # ── Wake discipline ───────────────────────────────────────────────────────
 
     def _sync_wake(self) -> None:
         """Restore I3: _wake is set iff something is pending.
 
-        The ONLY writer of _wake. A method that sets or clears it by hand states a
+        The one writer of _wake. A method that sets or clears it by hand states a
         conclusion, and a wrong one does not degrade — Event.wait() returns without
         yielding when already set, so a stale set turns the future get()'s wait loop
         into a loop with no suspension point and the whole event loop stops."""
@@ -237,18 +260,15 @@ class GuildQueue:
         return item
 
     def requeue_front(self, item: QueueItem) -> None:
-        """Undo a get()/get_nowait() whose consumer abandoned the item without
-        playing it (prefetch cancellation). The display and Redis legs never moved,
-        so undoing the pending leg realigns all three and leaves no in-flight head.
-        The abandoned get()'s task slot transfers to the re-put: callers must not
-        also call task_done().
+        """Give a claim back: the consumer abandoned the item without playing it
+        (prefetch cancellation), so the cursor steps back and the item is pending
+        again. The mirror never moved.
 
-        `item` may be the RESOLVED form of what was dequeued (YTSource →
-        QueueObject), so the display head is realigned onto it: put_front's
-        in-flight-head branch rebuilds the Redis mirror FROM the display, and a
-        stale YTSource there would persist a search over an entry that had already
-        resolved — re-running the ytsearch after a crash, free to rank a different
-        video."""
+        `item` may be the RESOLVED form of what was claimed (YTSource →
+        QueueObject), so the slot is rewritten onto it: a later rebuild serializes
+        from the deque, and a stale YTSource there would persist a search over an
+        entry that had already resolved — re-running the ytsearch after a crash,
+        free to rank a different video."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 would
         # go negative and _items[-1] = item would clobber the TAIL.
         if self._cursor > 0:
@@ -297,7 +317,7 @@ class GuildQueue:
         *,
         batch: bool = False,
     ) -> list[QueueItem]:
-        """Enqueue on all three legs: in-memory puts first, then the mirror. Under
+        """Enqueue on the deque first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
         land, resurrecting them as ghosts the next dequeue LPOPs instead of its own
@@ -309,7 +329,13 @@ class GuildQueue:
             self._sync_wake()
             if self._store is None or not queued:
                 return queued
-            entries = [_to_entry(item) for item in queued]
+            # Filtered like every other mirror write. No caller enqueues a
+            # persisted=False item today, but one written here would never be
+            # LPOPed at its dequeue (redis_pop_for skips them), leaving the mirror
+            # a permanent entry ahead.
+            entries = [_to_entry(item) for item in queued if is_persisted(item)]
+            if not entries:
+                return queued
             if batch:
                 await self._store.push_queue_batch(entries)
             else:
@@ -318,12 +344,10 @@ class GuildQueue:
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
-        """Insert items at the front of all three legs — the -playnow interjection
-        path. Under the bulk-mutation mutex, like every multi-leg mutation.
+        """Insert items at the front of the queue — the -playnow interjection path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
-        the inserted items on the display leg and forces the mirror down the
-        rebuild path: its Redis entry still sits at the list head awaiting a
+        the inserted items and forces the mirror down the rebuild path: its Redis entry still sits at the list head awaiting a
         commit-time LPOP, so an LPUSH in front of it would make that LPOP eat the
         new head.
 
@@ -332,14 +356,13 @@ class GuildQueue:
         still reaches it: the song ends naturally, the loop claims a still-running
         prefetch and awaits it (up to yt-dlp's socket timeout), and interject() runs
         inside that await — its neutralize finds no task to take while the prefetch's
-        dequeued item sits uncommitted at the display head.
+        claimed item sits unsettled at the head.
         """
         if not items:
             return []
         async with self._mutex:
             new_items = list(items)
             # Inserting at _cursor IS inserting behind the in-flight head, which is
-            # what the lift-and-replace on the display leg used to spell out.
             # reversed(), or a multi-track insert lands backwards.
             for item in reversed(new_items):
                 self._items.insert(self._cursor, item)
@@ -463,7 +486,7 @@ class GuildQueue:
             # thing the reply has to explain.
             mode=RemoveMode.ORIGIN
             if RemoveMode.ORIGIN in modes
-            else (RemoveMode.RESOLVED if modes else None),
+            else RemoveMode.RESOLVED,
         )
 
     # ── Crash recovery ────────────────────────────────────────────────────────
@@ -475,7 +498,7 @@ class GuildQueue:
         requester_fallback: Union[discord.Member, discord.User, None],
     ) -> bool:
         """Re-queue the crash-recovered "current song" at the front of the line.
-        In-memory legs only: the entry is persisted=False — its LPOP already
+        In memory only: the entry is persisted=False — its LPOP already
         committed, so it is not on the Redis list and the loop must not LPOP for it
         (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
         persisted requester ID that no longer resolves; False when nobody does, and
@@ -489,7 +512,7 @@ class GuildQueue:
 
     async def restore_entries(self, entries: Sequence[QueueEntry]) -> int:
         """Re-queue persisted entries after a restart, preserving order.
-        In-memory legs only — the entries are already on the Redis list.
+        In memory only — the entries are already on the Redis list.
         Entries whose requester cannot be resolved (member left and the guild
         has no owner) are dropped. Returns the number restored."""
         count = 0
@@ -567,7 +590,7 @@ class GuildQueue:
         during the resolve leaves behind. Guarded rather than raising, because
         driving _cursor negative would eat a PENDING item on the next release and
         break I1; the generation check in try_commit_dequeue() is what makes the
-        no-op correct rather than merely safe. Use try_commit_dequeue() unless
+        no-op correct, not just safe. Use try_commit_dequeue() unless
         already holding the bulk-mutation lock: the check must not race a
         clear()/shuffle()."""
         if self._cursor == 0:
@@ -580,27 +603,27 @@ class GuildQueue:
     async def finish_failed_dequeue(
         self, item: Optional[QueueItem], *, context: str = "dequeue"
     ) -> None:
-        """Retire one dequeued item that will never play: drop the display head,
-        mirror the dequeue to Redis, task_done() the get() — the triplet every loop
-        failure path shares. `context` labels the empty-display warning. The mutex
-        spans the display pop and the LPOP so a bulk mutation can't rebuild the
-        mirror between them and have the LPOP hit the new head."""
+        """Settle a claim for an item that will never play, on both legs — the pair
+        every loop failure path shares. `context` labels the nothing-claimed
+        warning. The mutex spans the settle and the LPOP so a bulk mutation cannot
+        rebuild the mirror between them and have the LPOP hit the new head."""
         async with self._mutex:
             self.release(context)
             await self.redis_pop_for(item)
 
     async def try_commit_dequeue(self, generation: int) -> bool:
-        """Commit the display-side dequeue for a song about to play, under the
-        bulk-mutation lock so the check can't race a clear()/shuffle(). False
-        means the queue was cleared during the resolve and the caller discards
-        the song — its task_done() and FFmpeg cleanup stay caller-side.
+        """Settle the claim for a song about to play, under the bulk-mutation lock
+        so the check cannot race a clear()/shuffle(). False means the queue was
+        cleared during the resolve and the caller discards the song; its FFmpeg
+        cleanup stays caller-side.
 
-        `generation` is what the queue read when this dequeue took its item, and
+        `generation` is what the queue read when this claim took its item, and
         neither emptiness nor identity can stand in for it. A put() landing before
-        the commit refills the display, so the head belongs to the NEW song and
-        committing pops that entry while playing (and re-recording) the cleared one.
-        And _resolve_source() replaces a YTSource with the QueueObject it resolved
-        to, so head and item are legitimately different objects for one slot."""
+        the commit refills the queue, so the head belongs to the NEW song and
+        committing settles that instead — playing, and re-recording, the cleared
+        one. And _resolve_source() replaces a YTSource with the QueueObject it
+        resolved to, so head and item are legitimately different objects for one
+        slot."""
         async with self._mutex:
             if generation != self._generation:
                 return False
@@ -633,8 +656,9 @@ class GuildQueue:
 
         `removed` is the LREM shortcut, and only a removal may pass it: it says the
         survivors kept their order, which is false for shuffle and for any insert.
-        Worth it because a rebuild costs the same whether it drops one entry or two
-        hundred, while LREM touches only what goes.
+        Worth it because a rebuild rewrites every survivor while LREM touches only
+        what goes — so it wins on a small removal from a long queue and loses on a
+        large one from a short queue, which is what the ratio gate reads.
 
         The shortcut is guarded twice, because LREM matches on exact bytes and the
         rest of the codebase does not promise them. It is skipped outright when a
@@ -647,13 +671,15 @@ class GuildQueue:
         """
         if self._store is None:
             return
-        if not any(is_persisted(s) for s in items):
+        survivors = sum(1 for s in items if is_persisted(s))
+        if not survivors:
             await self._store.delete_queue()
             return
         dropped = [_to_entry(s) for s in removed if is_persisted(s)]
         if (
             dropped
             and len(dropped) <= _LREM_MAX_ENTRIES
+            and len(dropped) * _LREM_MAX_SHARE <= survivors
             and not self._claimed_blobs(dropped)
         ):
             if await self._store.remove_queue_entries(dropped) == len(dropped):

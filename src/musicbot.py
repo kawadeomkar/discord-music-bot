@@ -1535,7 +1535,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            # Built before the gate opens, while the display head is still the
+            # Built before the gate opens, while the queue head is still the
             # restored one — the loop pops it out from under this.
             embed = mp.build_rejoin_resume_embed()
             if embed is None:
@@ -1727,8 +1727,8 @@ class MusicBot(commands.Cog):
             "queue positions that were dropped, followed by the updated queue.\n\n"
             "Three things match: the YouTube link shown in the **Now Playing** "
             "card, the search text you queued with, and the link you queued with "
-            "— so removing an album or playlist link takes back out every track "
-            "it added. Run it with no argument for a reminder.\n\n"
+            "— so removing a playlist link takes back out every track it added. "
+            "Run it with no argument for a reminder.\n\n"
             "Links are matched as typed, so a `youtu.be` short link will not "
             "match a song queued from a full `youtube.com` one."
         ),
@@ -1737,11 +1737,11 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "-remove never gonna give you up",
-                "-remove https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
             ],
             "note": (
                 "A search term removes what that exact search queued, not "
-                "anything that merely looks similar."
+                "anything that only looks similar."
             ),
         },
     )
@@ -1799,6 +1799,19 @@ class MusicBot(commands.Cog):
                 fields=[
                     ("Matched", _matched_label(outcome, needle), False),
                     (f"{pos_label} removed", pos_str, False),
+                    # Titles, like -clear reports: one argument can now take out a
+                    # whole playlist, and a bare count leaves the user unable to
+                    # tell whether it took what they meant. There is no undo.
+                    (
+                        "Songs",
+                        queue_message(
+                            [
+                                _echo(getattr(i, "title", "") or "?")
+                                for i in outcome.removed
+                            ]
+                        ),
+                        False,
+                    ),
                 ],
             )
             await ctx.send(embed=mp.queue_embed())

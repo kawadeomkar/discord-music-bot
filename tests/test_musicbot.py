@@ -1952,7 +1952,7 @@ class TestResumeCommand:
         with _no_typing():
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
-        # join last: the embed describes the display head, and the head is gone
+        # join last: the embed describes the queue head, and the head is gone
         # once the gate opens behind the join.
         assert calls == ["restore", "build", "join"]
 
@@ -2895,7 +2895,7 @@ class TestPlayAnalytics:
             return True
 
         mp.wait_for_restore = AsyncMock(side_effect=_land_the_restore)
-        # What the real display leg answers on either side of the restore.
+        # What the real queue answers on either side of the restore.
         mp.enqueue_depth = MagicMock(side_effect=lambda: 12 if restored else 0)
         music_bot.get_mp = MagicMock(return_value=mp)
         spy = AsyncMock(

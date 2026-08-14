@@ -186,7 +186,7 @@ class TestOutboxNotifyWiring:
         mock_ctx: MagicMock,
         fake_redis: aioredis.Redis,
     ) -> None:
-        """Construction is not the whole contract — the display legs must still
+        """Construction is not the whole contract — the queue must still
         work, or the default deployment would have a silent -history."""
         mock_bot.history_drainer = None
         mp = MusicPlayer(
@@ -1572,7 +1572,7 @@ class TestResumeNoticeEmbed:
         started: QueueObject,
         mock_author: MagicMock,
     ) -> None:
-        """A crash re-queues the mid-play song as the display head with its
+        """A crash re-queues the mid-play song at the queue head with its
         recovery offset — that song is genuinely where the session left off,
         and it is about to play again."""
         seed_queue(music_player.queue, _crashed(mock_author))
@@ -3175,7 +3175,7 @@ class TestQueuePutFront:
 class TestEnqueueDepth:
     """queue_position is depth at ASK: MusicBot reads mp.enqueue_depth() once at
     command dispatch and constructs every queue object complete — nothing stamps
-    at insert anymore. The depth is the display leg plus the live song, so 0
+    at insert anymore. The depth is everything queued plus the live song, so 0
     means the song will play immediately."""
 
     async def test_idle_player_is_depth_zero(self, music_player: MusicPlayer) -> None:
@@ -7527,7 +7527,7 @@ class TestLoopAdditional:
         mock_song.cleanup = MagicMock()
 
         async def _stream_and_clear(_self: Any, source: Any) -> MagicMock:
-            # A real clear(), not a hand-emptied display leg: the point is that
+            # A real clear(), not a hand-emptied deque: the point is that
             # the commit afterwards finds nothing to settle, and only the real
             # one bumps the generation the commit checks.
             await music_player.queue.clear()

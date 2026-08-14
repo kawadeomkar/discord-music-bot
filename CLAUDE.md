@@ -467,7 +467,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   settle later via `try_commit_dequeue()` / `redis_pop_for()` (or are undone via
   `requeue_front()` / retired via `finish_failed_dequeue()`). `put_front` inserts at
   `_cursor`, which IS inserting behind the in-flight head.
-- **`_sync_wake()` is the only writer of `_wake`**, and that is not style. A stale set
+- **`_sync_wake()` is the only writer of `_wake`.** A stale set
   does not degrade: `Event.wait()` returns without yielding when already set, so `get()`'s
   wait loop loses its suspension point and the whole event loop stops — measured at
   2,000,001 iterations with 0 other loop ticks. The wait is a `while`, never an `if`:

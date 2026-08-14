@@ -1,8 +1,8 @@
 """Tests for src/guild_queue.py — the queue domain class.
 
-Central property: the triad-sync invariant — after every operation the asyncio
-queue, the display deque and the Redis mirror agree (persisted=False items live
-on the in-memory legs only, by design)."""
+Central property: after every operation the deque, the cursor and the Redis
+mirror agree — I4, checked by _assert_mirror_matches. persisted=False items live
+in memory only, by design, so the mirror is a subset rather than a copy."""
 
 import redis.asyncio as aioredis
 from dataclasses import replace
@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
+    _to_entry,
     _LREM_MAX_ENTRIES,
     GuildQueue,
     RemoveMode,
@@ -48,15 +49,18 @@ def _qobj(n: int, requester: Any, *, persisted: bool = True) -> QueueObject:
     )
 
 
-async def _assert_triad_sync(
+async def _assert_mirror_matches(
     gq: GuildQueue, fake_redis: aioredis.Redis, store: GuildRedisStore
 ) -> None:
-    """The invariant: all three legs agree (Redis holds persisted items only)."""
+    """I4: the Redis list equals the persisted subset of the deque, IN ORDER.
+
+    Contents, not counts. A length-only check passes an ordering inversion, which
+    is exactly what a wrong LREM produces — and the next commit-time LPOP then
+    retires the entry at the head rather than its own."""
     items = gq.display_items()
-    assert gq.qsize() == len(items)
-    redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
-    persisted = [i for i in items if is_persisted(i)]
-    assert len(redis_items) == len(persisted)
+    assert gq.qsize() == len(items) - gq._cursor
+    stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+    assert stored == [_to_entry(i).to_redis() for i in items if is_persisted(i)]
 
 
 # ── is_persisted ──────────────────────────────────────────────────────────────
@@ -93,7 +97,7 @@ class TestPut:
         assert gq.display_items() == [item]
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert redis_items == [SongQueueEntry.from_queue_object(item).to_redis()]
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_batch_pushes_in_one_round_trip(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
@@ -125,7 +129,7 @@ class TestPut:
         await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 2
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_ytsource_items_persist_as_search_entries(
         self, gq: GuildQueue, fake_redis: aioredis.Redis, store: GuildRedisStore
@@ -203,6 +207,106 @@ class TestRemoveByOriginSurvivesARestart:
         assert [queue_object(i).webpage_url for i in survivors] == [
             "https://yt.com/v=99"
         ]
+
+
+class TestSmallSurfacesThatNothingElseCovers:
+    """Four behaviours whose mutations survived the whole suite. Each is one line
+    of production code that fails silently."""
+
+    async def test_get_nowait_raises_queue_empty_on_a_drained_queue(
+        self, gq_no_redis: GuildQueue
+    ) -> None:
+        """The prefetch catches asyncio.QueueEmpty specifically. Raise anything
+        else — an IndexError from walking off the deque — and it escapes into the
+        background task instead of returning None."""
+        with pytest.raises(asyncio.QueueEmpty):
+            gq_no_redis.get_nowait()
+
+    async def test_get_nowait_raises_when_everything_is_claimed(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Not just an empty deque: a queue whose every item is in flight has
+        nothing left to hand out either."""
+        await gq_no_redis.put([_qobj(1, mock_author)])
+        await gq_no_redis.get()
+
+        with pytest.raises(asyncio.QueueEmpty):
+            gq_no_redis.get_nowait()
+
+    async def test_requeue_front_with_nothing_claimed_leaves_the_tail_alone(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The guard's BEHAVIOUR, not its spelling. A source-text assertion pins
+        the `if`, but `if self._cursor > 0 or True:` satisfies that and still
+        drives the cursor negative — writing the substitute to _items[-1], the
+        TAIL, and losing whatever was there."""
+        items = [_qobj(1, mock_author), _qobj(2, mock_author)]
+        await gq_no_redis.put(items)
+
+        gq_no_redis.requeue_front(_qobj(99, mock_author))
+
+        assert gq_no_redis._cursor == 0
+        assert gq_no_redis.display_items() == items  # tail intact
+
+    async def test_put_front_never_mirrors_an_unpersisted_item(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """A crash-recovered item is on no Redis list, so writing one there gives
+        it an entry its dequeue will never LPOP — the mirror ends a permanent
+        entry ahead."""
+        await gq.put_front([_qobj(1, mock_author, persisted=False)])
+
+        assert gq.display_size() == 1
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+    async def test_has_resume_tail_ignores_a_plain_copy_of_the_same_url(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """It answers about resume TAILS. Drop the is_resume test and an ordinary
+        second copy of the live song's URL stops the live song being counted,
+        which writes a queue_position one too low to play_history."""
+        url = "https://yt.com/v=same"
+        await gq_no_redis.put([QueueObject(url, "Plain", mock_author)])
+        assert gq_no_redis.has_resume_tail(url) is False
+
+        await gq_no_redis.put([QueueObject(url, "Tail", mock_author, is_resume=True)])
+        assert gq_no_redis.has_resume_tail(url) is True
+
+    async def test_a_large_removal_from_a_short_queue_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The ratio gate. A rebuild scales with what SURVIVES, so dropping most
+        of a short queue is cheaper to rewrite than to LREM one entry at a time —
+        measured 4.7ms against 0.8ms at depth 250 dropping 200. Under the absolute
+        cap alone this took the LREM path."""
+        album = "https://open.spotify.com/playlist/big"
+        await gq.put(
+            [
+                QueueObject(
+                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                )
+                for n in range(8)
+            ]
+            + [_qobj(99, mock_author)]
+        )
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        outcome = await gq.remove(remove_matcher(album))
+
+        assert len(outcome.positions) == 8  # 8 dropped, 1 survivor
+        assert calls == ["rebuild_queue"]
 
 
 class TestReleaseVsFinishFailedDequeue:
@@ -301,8 +405,9 @@ class TestLremFallsBackWhenItCannotBeTrusted:
     async def test_a_clean_removal_still_takes_the_lrem_path(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """The fallback must not swallow the optimisation it guards."""
-        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        """The fallback must not swallow the optimisation it guards. Enough
+        items that the ratio gate is satisfied: one dropped, the rest survive."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         calls: list[str] = []
         for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
             original = getattr(store, name)
@@ -322,7 +427,7 @@ class TestLremFallsBackWhenItCannotBeTrusted:
     ) -> None:
         """@_guild_op turns a Redis error into 0 removed, which is short of what was
         asked for — so it lands on the rebuild rather than reporting success."""
-        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         calls: list[str] = []
 
         async def boom(*_a: Any, **_k: Any) -> int:
@@ -377,7 +482,7 @@ class TestClearWhileAClaimIsOutstanding:
     async def test_the_loops_failure_path_no_ops_instead_of_raising(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """The sequence §5 describes: the loop claims, a -clear lands, and the
+        """The loop claims, a -clear lands, and the
         loop's failure path releases into an empty queue. The guard makes that a
         no-op — with a stale cursor it pops an empty deque instead."""
         await gq_no_redis.put([_qobj(1, mock_author)])
@@ -804,7 +909,7 @@ class TestPutFront:
         await gq.put([_qobj(1, mock_author)])
         await gq.put_front([])
         assert gq.qsize() == 1
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_in_flight_head_stays_ahead_and_redis_rebuilt(
         self,
@@ -1003,7 +1108,7 @@ class TestShuffle:
         # QueueObject is unhashable — compare identity multisets, not sets.
         assert sorted(id(i) for i in gq.display_items()) == sorted(id(i) for i in items)
         assert gq.qsize() == 5
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_persisted_false_item_excluded_from_redis_rebuild(
         self,
@@ -1120,7 +1225,7 @@ class TestRemove:
         assert outcome.positions == [2, 3]
         assert outcome.removed == [target, duplicate]  # the items, not just where
         assert gq.display_items() == [other]
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_no_match_returns_empty_and_mutates_nothing(
         self,
@@ -1575,7 +1680,7 @@ class TestDequeueBookkeeping:
         store: GuildRedisStore,
         mock_author: MagicMock,
     ) -> None:
-        """One call retires a failed dequeue on all three legs: display head
+        """One call settles a failed claim on both legs: the deque head
         popped, Redis LPOPed, task_done balanced."""
         item = _qobj(1, mock_author)
         await gq.put([item])
@@ -1629,7 +1734,7 @@ class TestRequeueFront:
         gq.requeue_front(got)
         assert gq.qsize() == 3
         assert gq.display_items() == [a, b, c]
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
         assert gq.get_nowait() is a
 
     async def test_the_claim_goes_back_with_the_item(
@@ -1694,7 +1799,7 @@ class TestShuffleWithInFlightDequeue:
         # does: display pop + the start transaction's LPOP.
         assert await gq.try_commit_dequeue(gq.generation) is True
         await store.pop_queue()
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
         redis_after = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert [parse_queue_entry(r) for r in redis_after] == [
             SongQueueEntry.from_queue_object(queue_object(i))
@@ -1751,7 +1856,9 @@ class TestMirrorWriteChoice:
     async def test_a_small_removal_lrems(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        await gq.put([_qobj(n, mock_author) for n in range(1, 6)])
+        """Small against the SURVIVORS, not in absolute terms — the gate is a
+        ratio, because a rebuild's cost scales with what it rewrites."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         calls = self._spy(store)
 
         await gq.remove(remove_matcher("https://yt.com/v=3"))
@@ -1836,7 +1943,7 @@ class TestRemoveWithInFlightDequeue:
 
         assert await gq.try_commit_dequeue(gq.generation) is True
         await store.pop_queue()
-        await _assert_triad_sync(gq, fake_redis, store)
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_in_flight_head_never_removed_even_on_url_match(
         self,
