@@ -44,6 +44,7 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
+from itertools import islice
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
@@ -399,13 +400,13 @@ class GuildQueue:
         batch=False one RPUSH per entry."""
         async with self._mutex:
             queued = list(items)
-            for item in queued:
-                await self._pending.put(item)
-                self._display.append(item)
-            # With the in-memory legs, not after the mirror: the early return
-            # below skips the Redis half entirely for a store-less queue.
             self._items.extend(queued)
             self._sync_wake()
+            # Strangler: the old legs follow. Before the early return below, which
+            # skips the Redis half entirely for a store-less queue.
+            for item in queued:
+                self._pending.put_nowait(item)
+                self._display.append(item)
             self._assert_legs_agree()
             if self._store is None or not queued:
                 return queued
@@ -437,23 +438,19 @@ class GuildQueue:
         if not items:
             return []
         async with self._mutex:
-            in_flight = self._in_flight_head(pending_count=self._pending.qsize())
             new_items = list(items)
-
-            for item in reversed(new_items):
-                self._pending.put_front_nowait(item)
-            # Inserting at _cursor IS inserting behind the in-flight head — the
-            # lift-and-replace below exists only because a deque cannot splice.
+            # Inserting at _cursor IS inserting behind the in-flight head, which is
+            # what the lift-and-replace on the display leg used to spell out.
+            # reversed(), or a multi-track insert lands backwards.
             for item in reversed(new_items):
                 self._items.insert(self._cursor, item)
-            # Lift the in-flight head off, insert behind it, put it back. The tail
-            # is carried over rather than recomputed from _pending, so a
-            # pre-existing triad drift survives this insert rather than being healed.
-            for _ in in_flight:
-                self._display.popleft()
-            self._display.extendleft(reversed(in_flight + new_items))
+            self._sync_wake()
+            # Strangler: the old legs follow what the deque now says.
+            for item in reversed(new_items):
+                self._pending.put_front_nowait(item)
+            self._display = deque(self._items)
 
-            if in_flight:
+            if self._cursor:
                 await self._write_mirror(self._items)
             elif self._store is not None:
                 # An LPUSH of just the new items, not a replacement — so
@@ -462,7 +459,6 @@ class GuildQueue:
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
-            self._sync_wake()
             self._assert_legs_agree()
             return new_items
 
@@ -486,12 +482,12 @@ class GuildQueue:
         async with self._mutex:
             self._cleared = True
             self._generation += 1
-            self._drain_pending()
             cleared_items = list(self._items)
-            self._display.clear()
             self._items.clear()
             self._cursor = 0
             self._sync_wake()
+            self._drain_pending()  # strangler
+            self._display.clear()
             if self._store is not None:
                 await self._store.delete_queue()
             self._assert_legs_agree()
@@ -507,30 +503,30 @@ class GuildQueue:
         # "(3+ songs)", so a user with exactly 3 queued is refused by a message
         # stating a requirement they have met. Fix: drop this to < 3, or correct
         # both user-facing strings to 4.
-        if self._pending.qsize() < 4:
+        if self.qsize() < 4:
             return ShuffleOutcome.TOO_FEW_SONGS
 
         async with self._mutex:
-            shuffled = self._drain_pending()
-            in_flight = self._in_flight_head(pending_count=len(shuffled))
-            random.shuffle(shuffled)
-            kept: list[QueueItem] = []
-            for song in shuffled:
-                try:
-                    self._pending.put_nowait(song)
-                    kept.append(song)
-                except asyncio.QueueFull:
-                    break
-            self._display = deque(in_flight + kept)
-            self._items = deque(in_flight + kept)
+            # A list round-trip, not an in-place shuffle: deque has no slicing,
+            # and Fisher-Yates over one measures 434us against 268 for this.
+            head = list(islice(self._items, 0, self._cursor))
+            tail = list(islice(self._items, self._cursor, None))
+            random.shuffle(tail)
+            self._items = deque(head + tail)
             self._sync_wake()
+            # Strangler: the old legs follow. The claimed prefix keeps its
+            # position — only what is still pending is reordered.
+            self._drain_pending()
+            for song in tail:
+                self._pending.put_nowait(song)
+            self._display = deque(self._items)
 
             # Was a skip rather than a DELETE when nothing persisted survived —
             # unreachable (that needs 4+ crash-recovered items and restore_crashed
             # makes one), and the DELETE is the safer of the two anyway: it heals a
             # mirror holding entries memory no longer has.
-            if kept:
-                await self._write_mirror(in_flight + kept)
+            if tail:
+                await self._write_mirror(self._items)
             self._assert_legs_agree()
 
         return ShuffleOutcome.SHUFFLED
@@ -551,11 +547,14 @@ class GuildQueue:
         modes: list[RemoveMode] = []
 
         async with self._mutex:
-            # Drain everything first so positions are numbered before partitioning.
-            drained = self._drain_pending()
-            in_flight = self._in_flight_head(pending_count=len(drained))
-
-            for pos, item in enumerate(drained, start=1 + len(in_flight)):
+            # One pass, and this enumerate IS the position contract: the queue
+            # embed numbers every item from 1 including the in-flight head, so a
+            # pending item sits at _cursor + 1 and up. Skipping `pos <= _cursor`
+            # is what keeps a claimed song un-removable while still counted.
+            for pos, item in enumerate(self._items, start=1):
+                if pos <= self._cursor:
+                    kept.append(item)
+                    continue
                 mode = match(item)
                 if mode is not None:
                     removed_positions.append(pos)
@@ -564,14 +563,19 @@ class GuildQueue:
                 else:
                     kept.append(item)
 
-            for item in kept:
-                self._pending.put_nowait(item)
-            self._display = deque(in_flight + kept)
-            self._items = deque(in_flight + kept)
-            self._sync_wake()
+            # Nothing matched: no structural mutation, so no mirror write and no
+            # legs to rebuild.
+            if not removed_positions:
+                return RemoveOutcome(removed=[], positions=[], mode=None)
 
-            if removed_positions:
-                await self._write_mirror(in_flight + kept, removed=removed_items)
+            self._items = deque(kept)
+            self._sync_wake()  # cursor unchanged — nothing before it can move
+            self._drain_pending()  # strangler
+            for item in kept[self._cursor :]:
+                self._pending.put_nowait(item)
+            self._display = deque(kept)
+
+            await self._write_mirror(self._items, removed=removed_items)
             self._assert_legs_agree()
 
         return RemoveOutcome(
@@ -602,10 +606,10 @@ class GuildQueue:
         item = self._rehydrate(entry, requester_fallback=requester_fallback)
         if item is None:
             return False
-        await self._pending.put(item)
-        self._display.append(item)
         self._items.append(item)
         self._sync_wake()
+        self._pending.put_nowait(item)  # strangler
+        self._display.append(item)
         self._assert_legs_agree()
         return True
 
@@ -618,9 +622,9 @@ class GuildQueue:
         for entry in entries:
             item = self._rehydrate(entry)
             if item is not None:
-                await self._pending.put(item)
-                self._display.append(item)
                 self._items.append(item)
+                self._pending.put_nowait(item)  # strangler
+                self._display.append(item)
                 count += 1
         self._sync_wake()
         self._assert_legs_agree()
@@ -682,11 +686,11 @@ class GuildQueue:
         """Drop the display head for a dequeue that is being retired without
         playing (failed to stream / failed to resolve). Warns instead of
         raising when the display is already empty."""
-        try:
-            self._display.popleft()
-        except IndexError:
+        if self._cursor == 0:
             log.warning(f"song_queue was empty on {context} in guild {self._guild.id}")
+            return
         self._release()
+        self._display.popleft()  # strangler
         self._assert_legs_agree()
 
     def try_pop_display_head(self) -> bool:
@@ -694,11 +698,10 @@ class GuildQueue:
         was empty — the queue was cleared during the resolve and the caller must
         discard the song. Use try_commit_dequeue() unless already holding the
         bulk-mutation lock: the check must not race a clear()/shuffle()."""
-        try:
-            self._display.popleft()
-        except IndexError:
+        if self._cursor == 0:
             return False
         self._release()
+        self._display.popleft()  # strangler
         self._assert_legs_agree()
         return True
 

@@ -161,6 +161,144 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+class TestCursorAndWakeDiscipline:
+    """Structural rules the type checker cannot express, asserted against the
+    source. Both failures are silent at runtime, which is why they are pinned
+    here rather than left to review."""
+
+    @staticmethod
+    def _source() -> list[str]:
+        import inspect
+
+        import src.guild_queue as module
+
+        return inspect.getsource(module).split("\n")
+
+    def test_only_sync_wake_writes_the_event(self) -> None:
+        """`_sync_wake()` derives `_wake` from `_cursor` and `len(_items)`. A method
+        that sets or clears it by hand states a conclusion instead, and a wrong one
+        does not degrade: Event.wait() returns without yielding when already set,
+        so a stale set turns get()'s wait into a loop with no suspension point and
+        the whole event loop stops."""
+        lines = self._source()
+        writers = [
+            (i + 1, ln.strip())
+            for i, ln in enumerate(lines)
+            if "_wake.set()" in ln or "_wake.clear()" in ln
+        ]
+        assert len(writers) == 2, writers
+
+        start = next(i for i, ln in enumerate(lines) if "def _sync_wake" in ln)
+        end = next(
+            i
+            for i, ln in enumerate(lines[start + 1 :], start + 1)
+            if ln.startswith("    def ")
+        )
+        assert all(start < line <= end for line, _ in writers), writers
+
+    def test_every_cursor_decrement_is_guarded(self) -> None:
+        """Unguarded, `_cursor -= 1` goes negative (I1) and the write that follows
+        lands at `_items[-1]` — the TAIL — instead of the head."""
+        lines = self._source()
+        for i, ln in enumerate(lines):
+            if "_cursor -= 1" not in ln:
+                continue
+            preceding = "\n".join(lines[max(0, i - 4) : i])
+            assert (
+                "if self._cursor == 0" in preceding
+                or "if self._cursor > 0" in preceding
+            ), f"unguarded cursor decrement at line {i + 1}: {ln.strip()}"
+
+    def test_only_the_claim_paths_advance_the_cursor(self) -> None:
+        """`_cursor += 1` is a claim. Anywhere else it would hand out an item the
+        queue never gave, which reads as a silently skipped song."""
+        lines = self._source()
+        advances = [i for i, ln in enumerate(lines) if "_cursor += 1" in ln]
+        owners = set()
+        for i in advances:
+            owners.add(
+                next(
+                    lines[j].strip()
+                    for j in range(i, -1, -1)
+                    if lines[j].startswith("    def ")
+                    or lines[j].startswith("    async def ")
+                )
+            )
+        assert owners == {
+            "async def get(self) -> QueueItem:",
+            "def get_nowait(self) -> QueueItem:",
+        }
+
+
+class TestRemovePositionContract:
+    """`RemoveOutcome.positions` is 1-indexed as the queue embed numbers items,
+    and the `-remove` reply prints it — so an off-by-one here is a wrong number in
+    a message the user reads, with nothing to catch it.
+
+    The discriminating case is a removal with an item IN FLIGHT: it occupies a
+    position, is never itself removable, and every plausible wrong formula
+    (0-indexed, pending-relative, skipping `< _cursor` instead of `<=`) gives a
+    different answer for it."""
+
+    async def test_the_second_of_three_with_one_in_flight_is_position_three(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        items = [_qobj(n, mock_author) for n in range(1, 4)]
+        await gq_no_redis.put(items)
+        await gq_no_redis.get()  # items[0] is now in flight, still position 1
+
+        outcome = await gq_no_redis.remove(remove_matcher(items[2].webpage_url))
+
+        assert outcome.positions == [3]
+        assert outcome.removed == [items[2]]
+
+    async def test_positions_match_what_the_queue_embed_shows(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The contract stated as the equality it is: position N is
+        display_items()[N-1], in flight or not."""
+        items = [_qobj(n, mock_author) for n in range(1, 6)]
+        await gq_no_redis.put(items)
+        await gq_no_redis.get()
+        shown = gq_no_redis.display_items()
+
+        outcome = await gq_no_redis.remove(remove_matcher(items[3].webpage_url))
+
+        (pos,) = outcome.positions
+        assert shown[pos - 1] is items[3]
+
+    async def test_an_in_flight_item_is_never_removed_but_still_counts(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """It is committed to play — stopping it is -skip's job — but it holds
+        position 1, which is what shifts every pending position up by one."""
+        items = [_qobj(1, mock_author), _qobj(1, mock_author)]
+        await gq_no_redis.put(items)
+        await gq_no_redis.get()
+
+        outcome = await gq_no_redis.remove(remove_matcher(items[0].webpage_url))
+
+        assert outcome.positions == [2]  # not [1, 2]
+        assert gq_no_redis.display_items() == [items[0]]
+
+    async def test_nothing_matched_leaves_every_leg_untouched(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The short-circuit: no match means no structural mutation, so no mirror
+        write either — a rebuild that changes nothing still costs a round trip."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        before = gq.display_items()
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            setattr(store, name, lambda *a, _n=name, **k: calls.append(_n))
+
+        outcome = await gq.remove(remove_matcher("https://yt.com/v=nope"))
+
+        assert (outcome.positions, outcome.removed, outcome.mode) == ([], [], None)
+        assert gq.display_items() == before
+        assert calls == []
+
+
 class TestTheTwoCounters:
     """`qsize()` and `display_size()` mean different sets, and after the collapse
     they are one term apart over the same two fields — `len(_items) - _cursor`
