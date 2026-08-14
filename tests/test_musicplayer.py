@@ -3198,6 +3198,45 @@ class TestEnqueueDepth:
         assert music_player.queue.display_size() == 1
         assert music_player.enqueue_depth() == 1
 
+    async def test_the_over_by_one_window_during_a_resolve_is_unchanged(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The first of the two ±1 windows the analytics work documented and
+        accepted. current_song is assigned before try_commit_dequeue() settles the
+        claim, so for the length of a probe the same play is both current_song and
+        still in the queue, and the depth counts it twice. Pinned because the
+        single-deque migration had to reproduce it, not close it."""
+        song = MagicMock()
+        song.webpage_url = "https://yt.com/v=1"
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=2", "Two", mock_author)]
+        )
+        await music_player.queue.get()  # the loop claimed it
+        music_player.current_song = song  # ...and assigned it, not yet committed
+
+        # 1 in the queue (claimed, uncommitted) + 1 for the live song = 2, where
+        # only one play is actually ahead of a new arrival.
+        assert music_player.enqueue_depth() == 2
+
+    async def test_the_under_by_one_window_for_a_repeated_url_is_unchanged(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The second window: has_resume_tail matches on URL, not identity, so a
+        tail parked by an EARLIER play of the same song answers True for the
+        current one and the live song stops being counted. Reached by
+        -play X, -playnow Y, -playnow X."""
+        tail = QueueObject(
+            "https://yt.com/v=x", "X", mock_author, is_resume=True, ts=30
+        )
+        await music_player.queue.put([tail])
+        current = MagicMock()
+        current.webpage_url = "https://yt.com/v=x"  # same URL, different play
+        music_player.current_song = current
+
+        # The tail is counted; the live song is NOT, because they look like one
+        # play. Without the collision this would be 2.
+        assert music_player.enqueue_depth() == 1
+
     async def test_resolved_search_passes_its_analytics_through(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:

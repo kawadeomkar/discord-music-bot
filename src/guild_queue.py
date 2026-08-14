@@ -511,7 +511,7 @@ class GuildQueue:
         return self._items[0] if self._items else None
 
     def has_resume_tail(self, webpage_url: str) -> bool:
-        """True when the display already carries the resume tail an interjection
+        """True when the queue already carries the resume tail an interjection
         left behind for `webpage_url`. That entry and the live song are the SAME
         play, so anything counting queue depth must count them once.
 
@@ -519,13 +519,12 @@ class GuildQueue:
         same song answers True for the current one. Its one caller
         (MusicPlayer.enqueue_depth) then under-counts by one; accepted there.
 
-        O(len(display)), and it only early-exits when a tail EXISTS — the common
+        O(len(_items)), and it only early-exits when a tail EXISTS — the common
         no-interjection case is a full scan (measured 90us at 1000 entries,
-        synchronous, at -play dispatch). Left alone deliberately: main ran the
-        identical scan per put(), so this is not a regression, and a maintained
-        tail counter would be a fourth thing every bulk mutation has to keep in
-        sync with the three legs, which is the failure this class exists to
-        prevent. 90us behind a 1-4s extraction does not buy that risk."""
+        synchronous, at -play dispatch). Left alone deliberately: a maintained
+        tail counter would be a second thing every bulk mutation has to keep in
+        step with the deque, which is the failure this class was rebuilt to end.
+        90us behind a 1-4s extraction does not buy that risk."""
         return any(
             isinstance(item, QueueObject)
             and item.is_resume

@@ -160,6 +160,51 @@ class TestPut:
         assert len(gq_no_redis.display_items()) == 1
 
 
+class TestRemoveByOriginSurvivesARestart:
+    """The end-to-end the origin work exists for, through the one hop that can
+    lose it. A Spotify album expands to N unresolved searches whose `ytsearch` is
+    a title this code generated; the album link survives only on the wire, so
+    every leg of enqueue → Redis → restart → rehydrate → match has to carry it.
+
+    Assembled from real store calls rather than asserted leg by leg: the wire
+    round-trip and the rehydration are each covered elsewhere, and both passing
+    would not prove the removal still matches after the trip."""
+
+    async def test_an_album_link_still_removes_its_tracks_after_a_restart(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        mock_guild: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        mock_guild.get_member.return_value = mock_author
+        album = "https://open.spotify.com/album/abc123"
+        await gq.put(
+            [
+                YTSource(ytsearch=f"ytsearch:Track {n}", process=True, user_input=album)
+                for n in range(1, 4)
+            ]
+            + [_qobj(99, mock_author)],  # queued separately, must survive
+            batch=True,
+        )
+
+        # The restart: nothing in memory, everything from the mirror, read the
+        # way _restore_state reads it.
+        restored = GuildQueue(mock_guild, store)
+        snapshot = await store.get_playback_snapshot()
+        assert snapshot is not None
+        assert await restored.restore_entries(snapshot.queue) == 4
+
+        outcome = await restored.remove(remove_matcher(album))
+
+        assert outcome.positions == [1, 2, 3]
+        assert outcome.mode is RemoveMode.ORIGIN
+        survivors = restored.display_items()
+        assert [queue_object(i).webpage_url for i in survivors] == [
+            "https://yt.com/v=99"
+        ]
+
+
 class TestClearWhileAClaimIsOutstanding:
     """`clear()` resets the cursor as well as the deque, and the reset is not
     bookkeeping — it is what keeps the two consistent when the loop is mid-song.
