@@ -171,12 +171,10 @@ class GuildQueue:
         return self._pending.qsize()
 
     def display_size(self) -> int:
-        """Depth of the display leg — what a new arrival actually waits behind.
+        """Depth of the display leg — what a new arrival waits behind.
 
-        NOT qsize(): _pending has already given up the in-flight head (a
-        dequeued-but-uncommitted item, or one a prefetch took via get_nowait()),
-        so qsize() undercounts by one exactly when a -play lands during another
-        song's resolve. Both windows are ordinary."""
+        Counts the in-flight head: an item dequeued from _pending but not yet
+        committed, or one a prefetch took via get_nowait()."""
         return len(self._display)
 
     def _drain_pending(self) -> list[QueueItem]:
@@ -433,17 +431,11 @@ class GuildQueue:
         left behind for `webpage_url`. That entry and the live song are the SAME
         play, so anything counting queue depth must count them once.
 
-        Matches on URL, not identity, so a tail parked by an EARLIER play of the
-        same song answers True for the current one. Its one caller
-        (MusicPlayer.enqueue_depth) then under-counts by one; accepted there.
+        Matches on URL, so a tail parked by an earlier play of the same song
+        answers True for the current one; enqueue_depth under-counts by one there.
 
-        O(len(display)), and it only early-exits when a tail EXISTS — the common
-        no-interjection case is a full scan (measured 90us at 1000 entries,
-        synchronous, at -play dispatch). Left alone deliberately: main ran the
-        identical scan per put(), so this is not a regression, and a maintained
-        tail counter would be a fourth thing every bulk mutation has to keep in
-        sync with the three legs, which is the failure this class exists to
-        prevent. 90us behind a 1-4s extraction does not buy that risk."""
+        O(len(display)), early-exiting only when a tail exists: 90us at 1000
+        entries, synchronous, at -play dispatch."""
         return any(
             isinstance(item, QueueObject)
             and item.is_resume

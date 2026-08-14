@@ -7895,8 +7895,9 @@ class TestNeutralizePrefetch:
     async def test_completed_task_rebuild_keeps_enqueue_stamps(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        # Losing the stamps here would let the rebuilt entry be restamped as
-        # freshly queued at whatever depth the queue happens to be.
+        # Losing them here zeroes the ask this play was queued against, and
+        # nothing re-mints it: the archive would read "queued at unknown,
+        # played immediately".
         original = QueueObject(
             "https://yt.com/v=orig",
             "Interrupted Song",
