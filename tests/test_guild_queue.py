@@ -205,6 +205,144 @@ class TestRemoveByOriginSurvivesARestart:
         ]
 
 
+class TestReleaseVsFinishFailedDequeue:
+    """The distinction the playback loop's error handler turns on. `release()`
+    settles the claim in memory alone; only `finish_failed_dequeue` also mirrors
+    the dequeue to Redis. A handler using the former drops the item from memory
+    and leaves its entry for the next LPOP to retire in place of its own."""
+
+    async def test_release_leaves_the_mirror_alone(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        await gq.get()
+
+        assert gq.try_release() is True
+
+        assert gq.display_size() == 1
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 2
+
+    async def test_finish_failed_dequeue_settles_both(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        first = _qobj(1, mock_author)
+        await gq.put([first, _qobj(2, mock_author)])
+        await gq.get()
+
+        await gq.finish_failed_dequeue(first, context="test")
+
+        assert gq.display_size() == 1
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
+
+class TestLremFallsBackWhenItCannotBeTrusted:
+    """LREM matches on exact serialized bytes, and the rest of the codebase does
+    not promise them. Three production paths mutate a queued object after its
+    mirror entry was written — a resume tail gaining np_* ids, an enriched
+    duration, a substituted requester — so the recomputed blob misses and the
+    mirror silently leads memory forever. The rebuild cannot be wrong, so a
+    shortcut that cannot verify itself must take it."""
+
+    async def test_a_mutated_item_falls_back_to_a_rebuild(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The C2 case, as production reaches it: musicplayer stamps np_message_id
+        onto a queued resume tail in memory only."""
+        tail = _qobj(1, mock_author)
+        keep = _qobj(2, mock_author)
+        await gq.put([tail, keep])
+        tail.np_message_id = 1234  # mirrored entry now says 0
+
+        outcome = await gq.remove(remove_matcher(tail.webpage_url))
+
+        assert outcome.positions == [1]
+        # The mirror agrees with memory — the LREM missed and the rebuild ran.
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [SongQueueEntry.from_queue_object(keep).to_redis()]
+
+    async def test_a_claimed_items_twin_is_never_lremed(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """LREM takes the HEAD-most equal element. remove() never removes a claimed
+        item, but LREM cannot see that rule — so with a byte-identical twin it
+        would eat the entry awaiting a commit-time LPOP."""
+        first, second = _qobj(1, mock_author), _qobj(1, mock_author)
+        await gq.put([first, _qobj(2, mock_author), second])
+        await gq.get()  # `first` is claimed and un-removable
+        assert SongQueueEntry.from_queue_object(first).to_redis() == (
+            SongQueueEntry.from_queue_object(second).to_redis()
+        )
+
+        outcome = await gq.remove(remove_matcher(second.webpage_url))
+
+        assert outcome.positions == [3]  # the pending twin, not the claimed one
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [
+            SongQueueEntry.from_queue_object(first).to_redis(),
+            SongQueueEntry.from_queue_object(_qobj(2, mock_author)).to_redis(),
+        ]
+
+    async def test_a_clean_removal_still_takes_the_lrem_path(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The fallback must not swallow the optimisation it guards."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        await gq.remove(remove_matcher("https://yt.com/v=2"))
+
+        assert calls == ["remove_queue_entries"]
+
+    async def test_a_redis_failure_during_lrem_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """@_guild_op turns a Redis error into 0 removed, which is short of what was
+        asked for — so it lands on the rebuild rather than reporting success."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 4)])
+        calls: list[str] = []
+
+        async def boom(*_a: Any, **_k: Any) -> int:
+            calls.append("remove_queue_entries")
+            return 0
+
+        original_rebuild = store.rebuild_queue
+
+        async def spy_rebuild(*a: Any, **k: Any) -> None:
+            calls.append("rebuild_queue")
+            await original_rebuild(*a, **k)
+
+        store.remove_queue_entries = boom
+        store.rebuild_queue = spy_rebuild
+
+        await gq.remove(remove_matcher("https://yt.com/v=2"))
+
+        assert calls == ["remove_queue_entries", "rebuild_queue"]
+
+
 class TestClearWhileAClaimIsOutstanding:
     """`clear()` resets the cursor as well as the deque, and the reset is not
     bookkeeping — it is what keeps the two consistent when the loop is mid-song.

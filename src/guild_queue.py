@@ -634,20 +634,51 @@ class GuildQueue:
         `removed` is the LREM shortcut, and only a removal may pass it: it says the
         survivors kept their order, which is false for shuffle and for any insert.
         Worth it because a rebuild costs the same whether it drops one entry or two
-        hundred — ~5.7ms at depth 1000, against ~0.96ms to LREM a single entry —
-        and one song is what -remove does nearly every time.
+        hundred, while LREM touches only what goes.
+
+        The shortcut is guarded twice, because LREM matches on exact bytes and the
+        rest of the codebase does not promise them. It is skipped outright when a
+        removed blob is byte-identical to a claimed item's — LREM takes the
+        head-most copy, which would be the entry awaiting a commit-time LPOP. And
+        it falls back to the rebuild when fewer entries were removed than asked
+        for, which is what a queued object mutated after its entry was written
+        looks like (a resume tail gaining np_* ids, an enriched duration, a
+        substituted requester). The rebuild cannot be wrong by construction.
         """
         if self._store is None:
             return
-        entries = [_to_entry(s) for s in items if is_persisted(s)]
-        if not entries:
+        if not any(is_persisted(s) for s in items):
             await self._store.delete_queue()
             return
         dropped = [_to_entry(s) for s in removed if is_persisted(s)]
-        if dropped and len(dropped) <= _LREM_MAX_ENTRIES:
-            await self._store.remove_queue_entries(dropped)
-            return
-        await self._store.rebuild_queue(entries)
+        if (
+            dropped
+            and len(dropped) <= _LREM_MAX_ENTRIES
+            and not self._claimed_blobs(dropped)
+        ):
+            if await self._store.remove_queue_entries(dropped) == len(dropped):
+                return
+            log.warning(
+                f"queue mirror diverged from memory in guild {self._guild.id}; "
+                "rebuilding instead of removing"
+            )
+        await self._store.rebuild_queue(
+            [_to_entry(s) for s in items if is_persisted(s)]
+        )
+
+    def _claimed_blobs(self, dropped: Sequence[QueueEntry]) -> bool:
+        """True when any entry about to be LREMed serializes exactly like a CLAIMED
+        item's. remove() never removes a claimed item, but LREM cannot see that rule
+        — it takes the head-most equal element, which is the one awaiting its
+        commit-time LPOP."""
+        if not self._cursor:
+            return False
+        claimed = {
+            _to_entry(s).to_redis()
+            for s in islice(self._items, 0, self._cursor)
+            if is_persisted(s)
+        }
+        return any(d.to_redis() in claimed for d in dropped)
 
     def _rehydrate(
         self,

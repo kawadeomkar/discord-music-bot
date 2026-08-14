@@ -2328,6 +2328,13 @@ class MusicPlayer:
                         self.current_song = None
                         continue
 
+                    # The commit settled the claim. Clearing here rather than at
+                    # song end is load-bearing: the flag guards a release, and a
+                    # release deletes an item — left standing across the song it
+                    # would settle whatever sits at the head by then, which is the
+                    # next song once the prefetch below claims it.
+                    claim_outstanding = False
+
                     # Safe to assert rather than await readiness: the gate above
                     # opens only once a voice connection is established
                     # (channel.connect() awaits the full handshake), so loop() cannot
@@ -2574,9 +2581,6 @@ class MusicPlayer:
                     if self.store is not None:
                         await self.store.clear_song_end_state()
 
-                    # try_commit_dequeue() released the claim when the song
-                    # started; nothing further to settle.
-                    claim_outstanding = False
                     await self.update_activity(None)
 
                     # Deliberately last: current_song is already cleared, so the
@@ -2596,13 +2600,15 @@ class MusicPlayer:
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,
                     )
-                    # A claim survives only if no path settled it: the retire
-                    # paths release, and a refused commit means clear() already
-                    # did. Release rather than merely forgetting — a claim left
-                    # standing keeps its item counted as in flight forever, and
-                    # the next release would settle someone else's song.
+                    # A claim reaches here only from the window between the
+                    # dequeue and the commit — every other path settles its own.
+                    # finish_failed_dequeue, not release: release drops the item
+                    # from memory alone, leaving its mirror entry for the next
+                    # LPOP to retire in its place.
                     if claim_outstanding:
-                        self.queue.release("unhandled loop error")
+                        await self.queue.finish_failed_dequeue(
+                            source, context="unhandled loop error"
+                        )
                     if self._prefetch_task and not self._prefetch_task.done():
                         self._prefetch_task.cancel()
                     self._prefetch_task = None

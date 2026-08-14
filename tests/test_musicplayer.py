@@ -5965,6 +5965,53 @@ class TestLoopTaskAccounting:
 
         assert music_player.queue._cursor == 0  # every claim settled
 
+    async def test_a_raise_after_the_commit_does_not_eat_the_next_song(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """C3. try_commit_dequeue settles the claim, so the flag guarding the
+        handler's release must be cleared there — not at song end, 253 lines later.
+        Left standing across the song, the release pops index 0, which by then is
+        the NEXT song once the prefetch claims it.
+
+        _send_now_playing is the raiser because it is awaited inline after the
+        commit; the prefetch is spawned as a task, so a raise there never reaches
+        this handler."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        following = QueueObject("https://yt.com/v=next", "Next", queue_obj.requester)
+        seed_queue(music_player.queue, queue_obj, following)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+
+        async def claim_then_raise(_self: MusicPlayer, _song: Any) -> None:
+            # Stand in for the prefetch having claimed the next item by the time
+            # something in the post-commit block fails.
+            music_player.queue.get_nowait()
+            raise RuntimeError("boom after the commit")
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=claim_then_raise),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        titles = [getattr(i, "title", None) for i in music_player.queue.display_items()]
+        assert titles == ["Next"], "the handler settled the prefetch's claim"
+
 
 # ── QueueGet ──────────────────────────────────────────────────────────────────
 

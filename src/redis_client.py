@@ -855,15 +855,23 @@ class GuildRedisStore:
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
 
-    @_guild_op(default=None)
-    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> None:
+    @_guild_op(default=0)
+    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
         """LREM the given entries out of the queue list, leaving the rest in place.
+        Returns HOW MANY were actually removed — the caller must check it.
 
         The alternative to rebuild_queue for a small removal: LREM touches only what
         goes, while a rebuild rewrites the whole list whatever it drops (measured on
         redis:7-alpine at depth 1000: 0.96 ms for one entry against ~5.7 ms to
         rebuild). Far enough up, the per-LREM scans overtake it — GuildQueue owns
         the threshold and the measurement behind it.
+
+        Matching is by exact serialized bytes, which is an assumption about the rest
+        of the codebase rather than about Redis: a queued object mutated after its
+        entry was written no longer serializes to what is stored, and the LREM then
+        silently matches nothing. Hence the count — a short return means the mirror
+        and memory have diverged and only a rebuild can be trusted. A Redis failure
+        returns 0 through @_guild_op and takes the same path.
 
         Counted per distinct serialization, never LREM ... 0: two enqueues of one
         song usually differ on the wire (queue_position, queued_at), but when they
@@ -879,7 +887,8 @@ class GuildRedisStore:
             # is what every other write on this key passes (decode_responses=False).
             pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
         pipe.expire(self.queue_key(), GUILD_TTL)
-        await pipe.execute()
+        replies = await pipe.execute()
+        return sum(cast(list[int], replies[:-1]))  # the last reply is the EXPIRE
 
     # History operations
 

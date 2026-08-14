@@ -190,6 +190,20 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
+# What a user typed, echoed back into an embed. Discord renders markdown in embed
+# descriptions and field values, so an unescaped needle lets any member make the
+# bot post a styled masked link under its own name. 200 leaves room for the
+# surrounding sentence inside the 1024-char field cap even after escaping doubles
+# the length.
+_ECHO_MAX = 200
+
+
+def _echo(needle: str) -> str:
+    """A needle safe to put in an embed: escaped, then bounded."""
+    shown = needle if len(needle) <= _ECHO_MAX else needle[:_ECHO_MAX] + "\u2026"
+    return discord.utils.escape_markdown(shown)
+
+
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
     """How the removal matched, for the reply's "Matched" field.
 
@@ -197,15 +211,16 @@ def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
     whole album, so the reply names which of the user's own inputs did it. The
     resolved-URL case reads as it always has.
     """
+    shown = _echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
-        return f"<{needle}>"
+        return f"`{shown}`"
     kinds = {item.query_source for item in outcome.removed if item.query_source}
     # Only when every removed item agrees — a mixed set has no one kind to name.
     kind = kinds.pop() if len(kinds) == 1 else ""
     them = "them" if len(outcome.removed) > 1 else "it"
     if kind == QUERY_SOURCE_SEARCH:
-        return f"`{needle}` — the search you queued {them} with"
-    return f"<{needle}> — the {kind + ' ' if kind else ''}link you queued {them} with"
+        return f"`{shown}` — the search you queued {them} with"
+    return f"`{shown}` — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -934,7 +949,13 @@ class MusicBot(commands.Cog):
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
-    async def play(self, ctx: commands.Context, url: str) -> None:
+    async def play(self, ctx: commands.Context, *, url: str) -> None:
+        # Consume-rest, so a multi-word search arrives whole. It is what -remove
+        # matches on, and a positional would bind only "never" out of "never gonna
+        # give you up" — making that removable by a prefix nobody typed.
+        # parse_input reads the search off the message either way; only the origin
+        # changes. Stripped because read_rest keeps trailing whitespace.
+        url = url.strip()
         async with background_typing(ctx):
             try:
                 # Paused → interject, not append: appending leaves the bot silent
@@ -1177,7 +1198,8 @@ class MusicBot(commands.Cog):
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
-    async def playnow(self, ctx: commands.Context, url: str) -> None:
+    async def playnow(self, ctx: commands.Context, *, url: str) -> None:
+        url = url.strip()  # consume-rest, as -play — see there
         async with background_typing(ctx):
             try:
                 mp = self.get_mp(ctx)
@@ -1761,7 +1783,7 @@ class MusicBot(commands.Cog):
                 await send_embed(
                     ctx,
                     "",
-                    f"No queued songs found matching: {needle}",
+                    f"No queued songs found matching: `{_echo(needle)}`",
                     discord.Color.red(),
                 )
                 return
