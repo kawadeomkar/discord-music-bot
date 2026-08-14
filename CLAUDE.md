@@ -228,7 +228,7 @@ src/
 ├── main.py           # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool wiring
 ├── musicbot.py       # MusicBot cog — every command, per-guild player registry (mps), crash-recovery entry
 ├── musicplayer.py    # MusicPlayer — per-guild playback loop, prefetch, gate, NP host, ETA, interject
-├── guild_queue.py    # GuildQueue — the three synchronized queue representations + bulk-mutation mutex
+├── guild_queue.py    # GuildQueue — one deque + cursor, the mirror writer, bulk-mutation mutex
 ├── guild_history.py  # GuildHistory — played-song history (capped Redis list + in-memory cache; writes feed the outbox while the archive is enabled, reads never touch Postgres)
 ├── history_archive.py# Postgres archive (asyncpg) + HistoryOutboxDrainer (outbox → play_history)
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
@@ -390,8 +390,8 @@ PHASE 3 — STREAM (playback loop, usually zero extraction):
 The playback loop (`MusicPlayer.loop`, bottom of musicplayer.py) is the most delicate
 code in the repo. Its bookkeeping invariants:
 
-- `dequeue_owed` tracks an unbalanced `queue.get()` so the outer exception handler can
-  `task_done()` and the asyncio.Queue task counter never drifts.
+- `claim_outstanding` tracks an unsettled `queue.get()` so the outer exception handler can
+  settle the claim, so `_cursor` never drifts.
 - `try_commit_dequeue()` (under the queue mutex) detects "queue cleared while this song
   resolved" — the song is discarded and its FFmpeg subprocess `cleanup()`ed (leak
   otherwise).
@@ -443,33 +443,49 @@ concurrent callers no-op). Each player owns:
 the next song mid-teardown), retires the NP host, disconnects voice, resets presence,
 and — for an intentional stop — `clear_connection()` so `on_ready` skips recovery.
 
-### GuildQueue: the three-legged invariant
+### GuildQueue: one deque and a cursor
 
-A guild's queue exists in **three representations that must never desync**, all privately
-owned by `GuildQueue`:
+A guild's queue is **one deque plus an index into it**, privately owned by `GuildQueue`,
+mirrored to Redis:
 
-| Leg | Type | Consumer |
+| | | |
 |---|---|---|
-| `_pending` | `asyncio.Queue` | playback loop + prefetch (`get`/`get_nowait`) |
-| `_display` | `deque` | embeds, ETA math (`display_items`, `peek_next`) |
-| Redis mirror | `guild:{id}:queue` list | persistence / crash recovery |
+| `_items[:_cursor]` | claimed by a consumer, not yet settled | the "in-flight head" |
+| `_items[_cursor:]` | pending | what `get()` hands out |
+| `_wake` | `asyncio.Event`, set iff something is pending | I3 |
+| Redis mirror | `guild:{id}:queue` list | the `is_persisted()` subset, in order |
+
+The cursor is the boundary and NOT a per-item flag, because Redis retires entries by
+LPOP — so in-flight items are necessarily a **prefix** (I6). This replaced an
+`asyncio.Queue` + a parallel `deque` whose agreement had to be maintained by hand.
 
 Rules encoded in the class (violating any of these corrupts the queue or Redis):
 
 - Every multi-leg mutation (`put`, `put_front`, `clear`, `shuffle`, `remove`,
   `finish_failed_dequeue`) runs under one bulk-mutation mutex.
-- A dequeue is **two-phase**: `get()` pops `_pending` immediately; the display pop +
-  Redis LPOP commit later via `try_commit_dequeue()` / `redis_pop_for()` (or are undone
-  via `requeue_front()` / retired via `finish_failed_dequeue()`). During that window the
-  display leads `_pending` by the **in-flight head**; bulk mutations must carry it
-  through untouched (`_in_flight_head` — the branch in `put_front` is load-bearing, not
-  defensive; there is a documented interleaving that reaches it).
+- A dequeue is **two-phase**: `get()` advances `_cursor`; the item and the Redis LPOP
+  settle later via `try_commit_dequeue()` / `redis_pop_for()` (or are undone via
+  `requeue_front()` / retired via `finish_failed_dequeue()`). `put_front` inserts at
+  `_cursor`, which IS inserting behind the in-flight head.
+- **`_sync_wake()` is the only writer of `_wake`**, and that is not style. A stale set
+  does not degrade: `Event.wait()` returns without yielding when already set, so `get()`'s
+  wait loop loses its suspension point and the whole event loop stops — measured at
+  2,000,001 iterations with 0 other loop ticks. The wait is a `while`, never an `if`:
+  `Event` wakes every waiter, and the prefetch's `get_nowait()` is a second consumer.
+- **Every cursor decrement is guarded** (`try_release`, `requeue_front`). Unguarded it goes
+  negative and the write that follows lands at `_items[-1]` — the TAIL. `clear()` resets it
+  to 0 alongside the deque; without that, `qsize()` returns negative and the next release
+  pops an empty deque. Tests assert all of this against the module source.
+- **`qsize()` is PENDING, `display_size()` is pending PLUS in-flight.** One term apart over
+  the same two fields, so a swap compiles and type-checks; `display_size()` is the sole
+  input to `play_history.queue_position`, so a swap writes a plausible wrong number to
+  Postgres forever.
 - Callers with a prefetch task must `_cancel_prefetch()` BEFORE clear/shuffle/remove so
   the prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
 - `clear()` sets a cleared-flag the loop consumes (`consume_cleared_flag`) to discard a
   prefetched song it is holding.
-- `restore_crashed` / `restore_entries` write in-memory legs ONLY (entries are already
-  on / never were on the Redis list, respectively).
+- `restore_crashed` / `restore_entries` write the deque ONLY (entries are already on /
+  never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
 - Every mirror write goes through `_write_mirror(items, *, removed=())`, which owns the
@@ -782,7 +798,7 @@ Per-guild synchronization primitives and what they protect:
 
 | Primitive | Protects |
 |---|---|
-| `GuildQueue._mutex` | all three queue legs during bulk mutations; dequeue commits |
+| `GuildQueue._mutex` | the deque and its Redis mirror during bulk mutations; dequeue commits |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
@@ -1076,7 +1092,7 @@ and the `_YtdlpLogger` warnings after deploy — they are the early-warning syst
 YouTube-side changes.
 
 **Touch the playback loop / queue**: re-read the module docstrings of guild_queue.py and
-the loop() bookkeeping comments first; every `task_done()`, display pop, and Redis
+the loop() bookkeeping comments first; every claim, release, and Redis
 LPOP is accounted for exactly once on every path (success, cleared, resolve-failure,
 stream-failure, cancellation). test_musicplayer.py (6.5k lines) and test_guild_queue.py
 encode these paths — run `just test tests/test_musicplayer.py tests/test_guild_queue.py`

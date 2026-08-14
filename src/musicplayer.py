@@ -1049,11 +1049,11 @@ class MusicPlayer:
         as-is — they are narrow, and the field is documented approximate:
 
         - OVER by one while the loop resolves a stream. current_song is assigned
-          before try_commit_dequeue() pops the display head, so for the length of
-          a probe (100ms-seconds) the same play is in both legs. Not fixable from
-          here: current_song is a YTDL and the display holds QueueObjects, so
-          there is no identity test, and reordering the loop for an analytics
-          field is not a trade worth making.
+          before try_commit_dequeue() settles the claim, so for the length of a
+          probe (100ms-seconds) the same play is both current_song and still in
+          the queue. Not fixable from here: current_song is a YTDL and the queue
+          holds QueueObjects, so there is no identity test, and reordering the
+          loop for an analytics field is not a trade worth making.
         - UNDER by one when the live song has a parked tail from an EARLIER play
           of the same URL (-play X, -playnow Y, -playnow X). has_resume_tail
           matches on URL, so it cannot tell the two plays apart."""

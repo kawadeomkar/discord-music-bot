@@ -3186,9 +3186,9 @@ class TestEnqueueDepth:
     async def test_in_flight_head_still_counts(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        # THE reason the depth reads the display leg: a dequeued-but-uncommitted
-        # head (taken here the way a prefetch takes it, via get_nowait) has left
-        # _pending but is still ahead of a new arrival. qsize() reads 0 and would
+        # THE reason the depth reads display_size(): a claimed-but-unsettled head
+        # (taken here the way a prefetch takes it, via get_nowait) is past the
+        # cursor but still ahead of a new arrival. qsize() reads 0 and would
         # under-report exactly when a -play lands during another song's resolve.
         await music_player.queue.put(
             [QueueObject("https://yt.com/v=1", "One", mock_author)]
