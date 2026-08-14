@@ -828,14 +828,14 @@ class TestRestoreEntries:
         )
         assert await gq.restore_entries([song, search]) == 2
         restored_song, restored_search = gq.display_items()
-        assert (restored_song.queued_at, restored_song.queue_position) == (
-            1752529000.5,
-            3,
-        )
-        assert (restored_search.queued_at, restored_search.queue_position) == (
-            1752529111.5,
-            7,
-        )
+        assert (
+            restored_song.analytics.queued_at,
+            restored_song.analytics.queue_position,
+        ) == (1752529000.5, 3)
+        assert (
+            restored_search.analytics.queued_at,
+            restored_search.analytics.queue_position,
+        ) == (1752529111.5, 7)
 
     async def test_search_entries_rehydrate_to_ytsource(
         self, gq: GuildQueue, mock_guild: MagicMock
@@ -883,7 +883,10 @@ class TestRestoreCrashed:
         )
         assert await gq.restore_crashed(entry, requester_fallback=mock_guild.me)
         item = queue_object(gq.display_items()[0])
-        assert (item.queued_at, item.queue_position) == (1752529000.5, 6)
+        assert (item.analytics.queued_at, item.analytics.queue_position) == (
+            1752529000.5,
+            6,
+        )
 
     async def test_fallback_used_when_member_gone(
         self, gq: GuildQueue, mock_guild: MagicMock

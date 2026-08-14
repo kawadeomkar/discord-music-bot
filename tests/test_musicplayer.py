@@ -17,8 +17,9 @@ import pytest
 from opentelemetry import trace as trace_api
 
 from src.debug import RuntimeSnapshot
-from src.guild_queue import QueueItem
 from src.guild_state import (
+    ANALYTICS_ZERO,
+    Analytics,
     DEFAULT_TIMEZONE,
     GuildStateData,
     HistoryEntry,
@@ -82,12 +83,11 @@ def mock_song() -> MagicMock:
     song.interjected = False
     song.is_resume = False
     song.start_paused = False
-    # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them into
-    # the play_history column domain. query_source likewise a real string — the
-    # slug clamp regex-matches it and a MagicMock raises TypeError there, exactly
-    # as a MagicMock title would.
-    song.queued_at = 0.0
-    song.queue_position = 0
+    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+    # clamps its fields into the play_history column domain. query_source likewise
+    # a real string — the slug clamp regex-matches it and a MagicMock raises
+    # TypeError there, exactly as a MagicMock title would.
+    song.analytics = ANALYTICS_ZERO
     song.query_source = ""
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
@@ -3078,90 +3078,39 @@ class TestQueuePutFront:
         mock_prefetch.assert_not_awaited()
 
 
-# ── Enqueue stamps ────────────────────────────────────────────────────────────
+# ── Ask-time analytics ────────────────────────────────────────────────────────
 
 
-class TestEnqueueStamps:
-    """queued_at / queue_position: written once at enqueue, carried everywhere
-    after. queue_position counts songs ahead INCLUDING the one playing, so 0
-    means the song played immediately."""
+class TestEnqueueDepth:
+    """queue_position is depth at ASK: MusicBot reads mp.enqueue_depth() once at
+    command dispatch and constructs every queue object complete — nothing stamps
+    at insert anymore. The depth is the display leg plus the live song, so 0
+    means the song will play immediately."""
 
-    @pytest.fixture(autouse=True)
-    def _stub_prefetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from src import youtube
+    async def test_idle_player_is_depth_zero(self, music_player: MusicPlayer) -> None:
+        assert music_player.enqueue_depth() == 0
 
-        monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
-
-    async def test_first_song_into_an_idle_player_is_position_zero(
-        self, music_player: MusicPlayer, queue_obj: QueueObject
-    ) -> None:
-        await music_player.queue_put(queue_obj)
-        assert queue_obj.queue_position == 0
-        assert queue_obj.queued_at > 0
-
-    async def test_enqueue_behind_a_live_song_is_position_one(
-        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    async def test_live_song_adds_one(
+        self, music_player: MusicPlayer, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        await music_player.queue_put(queue_obj)
-        assert queue_obj.queue_position == 1
+        assert music_player.enqueue_depth() == 1
 
-    async def test_batch_increments_per_track(
+    async def test_queued_entries_count(
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:
         music_player.current_song = mock_song
-        playlist = [
-            QueueObject(f"https://yt.com/v={i}", f"Song {i}", mock_author)
-            for i in range(3)
-        ]
-        await music_player.queue_put(playlist, prefetch=False)
-        assert [q.queue_position for q in playlist] == [1, 2, 3]
-
-    async def test_second_enqueue_counts_the_queued_song(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        first = QueueObject("https://yt.com/v=1", "One", mock_author)
-        second = QueueObject("https://yt.com/v=2", "Two", mock_author)
-        await music_player.queue_put(first)
-        await music_player.queue_put(second)
-        assert (first.queue_position, second.queue_position) == (0, 1)
-
-    async def test_put_front_while_disconnected_is_position_zero(
-        self, music_player: MusicPlayer, mock_author: MagicMock
-    ) -> None:
-        # -play on a disconnected bot: the persisted queue it jumps ahead of is
-        # behind it, and nothing is playing.
-        await music_player.queue_put(
-            [QueueObject("https://yt.com/v=old", "Old", mock_author)]
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=1", "One", mock_author)]
         )
-        jumper = QueueObject("https://yt.com/v=new", "New", mock_author)
-        await music_player.queue_put_front(jumper)
-        assert jumper.queue_position == 0
-
-    async def test_put_front_behind_a_live_song_is_position_one(
-        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
-    ) -> None:
-        music_player.current_song = mock_song
-        jumper = QueueObject("https://yt.com/v=new", "New", mock_author)
-        await music_player.queue_put_front(jumper)
-        assert jumper.queue_position == 1
-
-    async def test_stamp_uses_the_same_wall_clock_as_played_at(
-        self, music_player: MusicPlayer, queue_obj: QueueObject
-    ) -> None:
-        # queued_at lands in a timestamptz column beside played_at, so it has to
-        # be epoch seconds. A monotonic clock would satisfy every "> 0" assertion
-        # here and archive a song queued in 1970.
-        with patch("src.musicplayer.time.time", return_value=1752530000.5):
-            await music_player.queue_put(queue_obj)
-        assert queue_obj.queued_at == 1752530000.5
+        assert music_player.enqueue_depth() == 2
 
     async def test_live_song_and_its_resume_tail_count_once(
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
     ) -> None:
         # Post-interjection the interrupted song is BOTH current_song and, as its
         # resume tail, an entry on the display. It is one song, so a new arrival
-        # waits behind two — counting it twice would stamp 3.
+        # waits behind two — counting it twice would report 3.
         mock_song.webpage_url = "https://yt.com/v=live"
         music_player.current_song = mock_song
         await music_player.queue.put_front(
@@ -3172,88 +3121,53 @@ class TestEnqueueStamps:
                 ),
             ]
         )
-        later = QueueObject("https://yt.com/v=later", "Later", mock_author)
-        await music_player.queue_put(later)
-        assert later.queue_position == 2
+        assert music_player.enqueue_depth() == 2
 
-    @pytest.mark.parametrize("front", [False, True])
-    async def test_stamp_runs_while_the_queue_mutex_is_held(
-        self,
-        music_player: MusicPlayer,
-        queue_obj: QueueObject,
-        front: bool,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # The whole point of the stamp hook: a depth read outside the mutex can
-        # be invalidated by a clear/shuffle landing before the insert does.
-        locked: list[bool] = []
-        original = MusicPlayer._stamp_at_depth
-
-        def spy(
-            player: MusicPlayer, items: Sequence[QueueItem], queued_ahead: int
-        ) -> list[QueueItem]:
-            locked.append(player.queue._mutex.locked())
-            return original(player, items, queued_ahead)
-
-        monkeypatch.setattr(MusicPlayer, "_stamp_at_depth", spy)
-        enqueue = music_player.queue_put_front if front else music_player.queue_put
-        await enqueue(queue_obj)
-        assert locked == [True]
-
-    async def test_already_stamped_item_is_not_restamped(
-        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
-    ) -> None:
-        # requeue_front and the restore paths hand back items that already
-        # carry a stamp; re-entering an enqueue site must leave them alone.
-        music_player.current_song = mock_song
-        item = QueueObject(
-            "https://yt.com/v=1",
-            "One",
-            mock_author,
-            queued_at=1752530000.5,
-            queue_position=7,
-        )
-        await music_player.queue_put(item)
-        assert (item.queued_at, item.queue_position) == (1752530000.5, 7)
-
-    async def test_yt_source_is_stamped_by_replacement(
-        self, music_player: MusicPlayer, mock_song: MagicMock
-    ) -> None:
-        # YTSource is frozen, so the queue holds a stamped copy — the caller's
-        # instance stays untouched.
-        music_player.current_song = mock_song
-        source = YTSource(ytsearch="ytsearch:a song", process=True)
-        await music_player.queue_put(source)
-        queued = music_player.queue.display_items()[0]
-        assert isinstance(queued, YTSource)
-        assert queued.queue_position == 1
-        assert queued.queued_at > 0
-        assert source.queued_at == 0.0
-
-    async def test_resolved_search_carries_its_stamps(
+    async def test_in_flight_head_still_counts(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        # yt_source builds the QueueObject, so _resolve_source copies the
-        # search's stamps onto it rather than losing them at resolve time.
+        # THE reason the depth reads the display leg: a dequeued-but-uncommitted
+        # head (taken here the way a prefetch takes it, via get_nowait) has left
+        # _pending but is still ahead of a new arrival. qsize() reads 0 and would
+        # under-report exactly when a -play lands during another song's resolve.
+        await music_player.queue.put(
+            [QueueObject("https://yt.com/v=1", "One", mock_author)]
+        )
+        music_player.queue.get_nowait()
+        assert music_player.queue.qsize() == 0
+        assert music_player.queue.display_size() == 1
+        assert music_player.enqueue_depth() == 1
+
+    async def test_resolved_search_passes_its_analytics_through(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        # A Spotify playlist track sat in the queue as a search; _resolve_source
+        # threads its ask-time analytics into yt_source, which is REQUIRED to
+        # take it — there is no post-copy left to forget.
         source = YTSource(
-            ytsearch="ytsearch:a song", queued_at=1752530000.5, queue_position=4
+            ytsearch="ytsearch:a song",
+            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
         )
         resolved = QueueObject("https://yt.com/v=1", "One", mock_author)
-        with patch.object(YTDL, "yt_source", new=AsyncMock(return_value=resolved)):
+        spy = AsyncMock(return_value=resolved)
+        with patch.object(YTDL, "yt_source", new=spy):
             out = await music_player._resolve_source(source)
-        assert (out.queued_at, out.queue_position) == (1752530000.5, 4)
+        assert out is resolved
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["analytics"] == source.analytics
 
-    async def test_resolved_search_carries_its_query_source(
+    async def test_resolved_search_passes_its_query_source_through(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        # A Spotify playlist track: it sat in the queue as a search and resolves
-        # to a YouTube URL here, so this copy is the only thing keeping the
-        # archive from recording it as YouTube.
+        # A Spotify playlist track resolves to a YouTube URL here, so this hop is
+        # the only thing keeping the archive from recording it as YouTube.
         source = YTSource(ytsearch="ytsearch:a song", query_source="spotify.com")
         resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
-        with patch.object(YTDL, "yt_source", new=AsyncMock(return_value=resolved)):
-            out = await music_player._resolve_source(source)
-        assert out.query_source == "spotify.com"
+        spy = AsyncMock(return_value=resolved)
+        with patch.object(YTDL, "yt_source", new=spy):
+            await music_player._resolve_source(source)
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["query_source"] == "spotify.com"
 
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
@@ -6036,11 +5950,10 @@ class TestLoop:
         song.interjected = False
         song.is_resume = False
         song.start_paused = False
-        # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
-        # into the play_history column domain — query_source too, which the slug
-        # clamp regex-matches.
-        song.queued_at = 0.0
-        song.queue_position = 0
+        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+        # clamps its fields into the play_history column domain — query_source
+        # too, which the slug clamp regex-matches.
+        song.analytics = ANALYTICS_ZERO
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
@@ -7199,11 +7112,10 @@ class TestLoopAdditional:
         song.interjected = False
         song.is_resume = False
         song.start_paused = False
-        # Enqueue stamps: real numbers, since HistoryEntry.from_song clamps them
-        # into the play_history column domain — query_source too, which the slug
-        # clamp regex-matches.
-        song.queued_at = 0.0
-        song.queue_position = 0
+        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+        # clamps its fields into the play_history column domain — query_source
+        # too, which the slug clamp regex-matches.
+        song.analytics = ANALYTICS_ZERO
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
@@ -7423,27 +7335,29 @@ class TestInterject:
         assert outcome.resume_position == 42
         assert outcome.was_paused is False
 
-    async def test_interjection_is_position_zero_and_tail_keeps_the_original(
+    async def test_interjection_keeps_its_own_analytics_and_tail_keeps_the_original(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
         playnow_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
-        # The interruption plays immediately; the tail is the same play, so it
-        # keeps the stamps the interrupted song was queued with.
+        # interject() no longer stamps anything: the interruption arrives already
+        # carrying the depth-0 analytics -playnow minted at dispatch, and the tail
+        # is the same play, so it keeps the interrupted song's.
+        playnow_obj.analytics = Analytics(queued_at=1752530500.5, queue_position=0)
         live_song.elapsed_secs = 42.0
-        live_song.queued_at = 1752530000.5
-        live_song.queue_position = 5
+        live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
         music_player.current_song = live_song
 
         await music_player.interject(playnow_obj, mock_vc)
 
-        assert playnow_obj.queue_position == 0
-        assert playnow_obj.queued_at > 0
+        assert playnow_obj.analytics == Analytics(
+            queued_at=1752530500.5, queue_position=0
+        )
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
-        assert (resume.queued_at, resume.queue_position) == (1752530000.5, 5)
+        assert resume.analytics is live_song.analytics
 
     async def test_resume_tail_inherits_the_query_source(
         self,
@@ -7695,8 +7609,7 @@ class TestInterject:
         live_song.is_resume = True  # this fragment is itself a resumed tail
         live_song.elapsed_secs = 95.0
         live_song.played_at = 1752530000.5
-        live_song.queued_at = 1752529000.5
-        live_song.queue_position = 4
+        live_song.analytics = Analytics(queued_at=1752529000.5, queue_position=4)
         music_player.current_song = live_song
 
         await music_player.interject(playnow_obj, mock_vc)
@@ -7704,7 +7617,10 @@ class TestInterject:
         tail = music_player.queue.display_items()[1]
         assert isinstance(tail, QueueObject)
         assert tail.played_at == 1752530000.5
-        assert (tail.queued_at, tail.queue_position) == (1752529000.5, 4)
+        assert (tail.analytics.queued_at, tail.analytics.queue_position) == (
+            1752529000.5,
+            4,
+        )
         assert tail.ts == 95  # absolute, so the next fragment resumes here
 
     async def test_pending_resume_tail_is_set_with_the_history_marker(
@@ -7979,20 +7895,19 @@ class TestNeutralizePrefetch:
     async def test_completed_task_rebuild_keeps_enqueue_stamps(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        # Losing the stamps here would let the rebuilt entry be restamped as
-        # freshly queued at whatever depth the queue happens to be.
+        # Losing them here zeroes the ask this play was queued against, and
+        # nothing re-mints it: the archive would read "queued at unknown,
+        # played immediately".
         original = QueueObject(
             "https://yt.com/v=orig",
             "Interrupted Song",
             mock_author,
-            queued_at=1752530000.5,
-            queue_position=6,
+            analytics=Analytics(queued_at=1752530000.5, queue_position=6),
         )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
 
-        live_song.queued_at = 1752530000.5
-        live_song.queue_position = 6
+        live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=6)
         live_song.cleanup = MagicMock()
 
         async def _done() -> MagicMock:
@@ -8006,7 +7921,10 @@ class TestNeutralizePrefetch:
 
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
-        assert (rebuilt.queued_at, rebuilt.queue_position) == (1752530000.5, 6)
+        assert (rebuilt.analytics.queued_at, rebuilt.analytics.queue_position) == (
+            1752530000.5,
+            6,
+        )
 
     async def test_completed_task_rebuild_keeps_the_np_card_pointer(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock

@@ -2,7 +2,7 @@ import copy
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -15,6 +15,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
 from src.util import fmt_duration, get_logger
@@ -565,12 +566,12 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # ── Enqueue stamps, written once by MusicPlayer and carried thereafter ──
-    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
-    # stamped", which is what makes stamping idempotent across re-queues.
-    queued_at: float = 0.0
-    # Songs ahead of it then, counting the one playing (0 = played immediately).
-    queue_position: int = 0
+    # ── Ask-time analytics, set at construction and carried thereafter ──
+    # queued_at + queue_position in one frozen container (guild_state.Analytics).
+    # yt_source/yt_playlist REQUIRE it, so a QueueObject leaves them complete;
+    # the default exists for rehydration and the carry sites, which always pass
+    # a real value explicitly.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
     query_source: str = ""
@@ -623,8 +624,7 @@ class YTDL(discord.FFmpegOpusAudio):
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
-        queued_at: float = 0.0,
-        queue_position: int = 0,
+        analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
         played_at: float = 0.0,
         np_message_id: int = 0,
@@ -644,10 +644,9 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
-        # Enqueue stamps carried from the QueueObject so the history entry this
-        # song produces records where it started, not when it played.
-        self.queued_at: float = queued_at
-        self.queue_position: int = queue_position
+        # Ask-time analytics carried from the QueueObject so the history entry
+        # this song produces records where it started, not when it played.
+        self.analytics: Analytics = analytics
         self.query_source: str = query_source
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).
@@ -864,8 +863,7 @@ class YTDL(discord.FFmpegOpusAudio):
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
-            queued_at=qo.queued_at,
-            queue_position=qo.queue_position,
+            analytics=qo.analytics,
             query_source=qo.query_source,
             played_at=qo.played_at,
             np_message_id=qo.np_message_id,
@@ -881,12 +879,18 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         search: str,
         *,
+        query_source: str,
+        analytics: Analytics,
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
-        Redis source cache if present."""
+        Redis source cache if present.
+
+        query_source and analytics are REQUIRED so the QueueObject leaves here
+        complete — a default would let a new call site forget them and write a
+        plausible zero, permanently indistinguishable from a real value."""
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
         # per-request playback offset, not part of the video identity.
@@ -908,6 +912,8 @@ class YTDL(discord.FFmpegOpusAudio):
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
                     thumbnail=cached.get("thumbnail"),
+                    query_source=query_source,
+                    analytics=analytics,
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -1007,6 +1013,8 @@ class YTDL(discord.FFmpegOpusAudio):
             duration=duration,
             uploader=uploader,
             thumbnail=thumbnail,
+            query_source=query_source,
+            analytics=analytics,
         )
 
     @staticmethod
@@ -1014,8 +1022,14 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
+        *,
+        query_source: str,
+        analytics: Analytics,
     ) -> list[QueueObject]:
-        """Fetch flat entry metadata for every video in a YouTube playlist."""
+        """Fetch flat entry metadata for every video in a YouTube playlist.
+
+        query_source and analytics are REQUIRED (see yt_source). `analytics` is
+        the head's — track positions are derived per kept track below."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -1043,5 +1057,19 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
-            qobjs.append(QueueObject(video_url, title, requester))
+            # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
+            # skipped null entries above must not leave gaps in queue_position.
+            # replace() so a field added to Analytics later is carried here.
+            qobjs.append(
+                QueueObject(
+                    video_url,
+                    title,
+                    requester,
+                    query_source=query_source,
+                    analytics=replace(
+                        analytics,
+                        queue_position=analytics.queue_position + len(qobjs),
+                    ),
+                )
+            )
         return qobjs

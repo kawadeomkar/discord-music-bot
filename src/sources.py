@@ -1,8 +1,9 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, Optional, Union
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -62,7 +63,11 @@ class SpotifySource:
     stype: URLSource = URLSource.SPOTIFY
 
 
-@dataclass(frozen=True)
+# slots: one of these is retained per unresolved Spotify-playlist track, so a
+# 1000-track playlist holds 1000 until each is dequeued. Measures 344 B -> 120 B
+# per instance. Keep the class free of __dict__ readers (asdict/vars) and off
+# any pickle path; it crosses to Redis as SearchQueueEntry JSON.
+@dataclass(frozen=True, slots=True)
 class YTSource:
     """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
     `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
@@ -80,10 +85,16 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
-    # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
-    # so MusicPlayer stamps by building a replace()d copy.
-    queued_at: float = 0.0
-    queue_position: int = 0
+    # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
+    # this resolves into. Parse-layer minting leaves the zero value — the real
+    # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
+    # yt_source/yt_playlist call for sources resolved directly.
+    #
+    # CONTRACT: the default is for the PARSE layer, which runs before the mint.
+    # Anything handing a YTSource on to be queued must pass a real value —
+    # nothing re-mints downstream, so an omission persists 0.0/0 to Redis and to
+    # play_history with no error and no log line.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
     # Spotify-playlist tracks alike, and it is the only one that survives into Redis
@@ -122,17 +133,21 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(titles: list[str]) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches. The Spotify token is
-    stamped here because it is the last point that knows where these came from —
-    each resolves to a YouTube URL at dequeue."""
+def spotify_playlist_to_ytsearch(
+    titles: list[str], *, analytics: Analytics
+) -> list[YTSource]:
+    """Spotify playlist tracks as lazy YouTube searches. The Spotify token and the
+    ask-time analytics are set here because it is the last point that knows where
+    these came from — each resolves to a YouTube URL at dequeue. `analytics` is
+    the head's; per-track positions are derived from it, as in yt_playlist."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
+            analytics=replace(analytics, queue_position=analytics.queue_position + i),
         )
-        for title in titles
+        for i, title in enumerate(titles)
     ]
 
 

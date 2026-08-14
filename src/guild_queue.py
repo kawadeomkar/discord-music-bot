@@ -36,14 +36,14 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Union
 
 import discord
 
-from src.guild_state import QueueEntry, SearchQueueEntry, SongQueueEntry
+from src.guild_state import Analytics, QueueEntry, SearchQueueEntry, SongQueueEntry
 from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.util import get_logger
@@ -93,15 +93,6 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
-
-
-# Called by put()/put_front() while the bulk-mutation mutex is held, with the
-# number of entries already ahead of the insert point. Returns the list to
-# actually enqueue, so a stamper may replace frozen items. See
-# MusicPlayer._stamp_at_depth — the depth is passed in rather than read back off
-# the queue because reading it outside the mutex is what lets a concurrent
-# enqueue shift it between the read and the insert.
-StampFn = Callable[[Sequence[QueueItem], int], list[QueueItem]]
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -179,6 +170,13 @@ class GuildQueue:
     def qsize(self) -> int:
         return self._pending.qsize()
 
+    def display_size(self) -> int:
+        """Depth of the display leg — what a new arrival waits behind.
+
+        Counts the in-flight head: an item dequeued from _pending but not yet
+        committed, or one a prefetch took via get_nowait()."""
+        return len(self._display)
+
     def _drain_pending(self) -> list[QueueItem]:
         """Remove and return every item in _pending, in queue order, each balanced
         with task_done(). Shared first step of clear()/shuffle()/remove(), which
@@ -215,20 +213,14 @@ class GuildQueue:
         items: Sequence[QueueItem],
         *,
         batch: bool = False,
-        stamp: Optional[StampFn] = None,
     ) -> list[QueueItem]:
         """Enqueue on all three legs: in-memory puts first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
         land, resurrecting them as ghosts the next dequeue LPOPs instead of its own
         entry. batch=True pushes every entry in one round-trip (bulk playlist);
-        batch=False one RPUSH per entry.
-
-        `stamp` runs under the mutex against the display depth and may replace
-        items; the enqueued list is returned for callers that need the result."""
+        batch=False one RPUSH per entry."""
         async with self._mutex:
-            if stamp is not None:
-                items = stamp(items, len(self._display))
             queued = list(items)
             for item in queued:
                 await self._pending.put(item)
@@ -243,14 +235,9 @@ class GuildQueue:
                     await self._store.push_queue(entry)
             return queued
 
-    async def put_front(
-        self, items: Sequence[QueueItem], *, stamp: Optional[StampFn] = None
-    ) -> list[QueueItem]:
+    async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
         """Insert items at the front of all three legs — the -playnow interjection
         path. Under the bulk-mutation mutex, like every multi-leg mutation.
-
-        `stamp` runs under the mutex against the in-flight head count — the only
-        thing a front insertion lands behind — and may replace items.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
         the inserted items on the display leg and forces the mirror down the
@@ -269,8 +256,6 @@ class GuildQueue:
             return []
         async with self._mutex:
             in_flight = self._in_flight_head(pending_count=self._pending.qsize())
-            if stamp is not None:
-                items = stamp(items, len(in_flight))
             new_items = list(items)
 
             for item in reversed(new_items):
@@ -444,7 +429,13 @@ class GuildQueue:
     def has_resume_tail(self, webpage_url: str) -> bool:
         """True when the display already carries the resume tail an interjection
         left behind for `webpage_url`. That entry and the live song are the SAME
-        play, so anything counting queue depth must count them once."""
+        play, so anything counting queue depth must count them once.
+
+        Matches on URL, so a tail parked by an earlier play of the same song
+        answers True for the current one; enqueue_depth under-counts by one there.
+
+        O(len(display)), early-exiting only when a tail exists: 90us at 1000
+        entries, synchronous, at -play dispatch."""
         return any(
             isinstance(item, QueueObject)
             and item.is_resume
@@ -568,8 +559,10 @@ class GuildQueue:
                 url=entry.url,
                 process=entry.process,
                 ts=entry.ts,
-                queued_at=entry.queued_at,
-                queue_position=entry.queue_position,
+                analytics=Analytics(
+                    queued_at=entry.queued_at,
+                    queue_position=entry.queue_position,
+                ),
                 query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
@@ -596,8 +589,10 @@ class GuildQueue:
             interjected=entry.interjected,
             is_resume=entry.is_resume,
             start_paused=entry.start_paused,
-            queued_at=entry.queued_at,
-            queue_position=entry.queue_position,
+            analytics=Analytics(
+                queued_at=entry.queued_at,
+                queue_position=entry.queue_position,
+            ),
             query_source=entry.query_source,
             played_at=entry.played_at,
             # No np_host_ref: a live Message cannot survive a restart, so a

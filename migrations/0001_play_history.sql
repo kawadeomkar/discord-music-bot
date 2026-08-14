@@ -55,10 +55,20 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- "what was playing at time T" has more than one answer here.
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
 
-    -- When the song was first added to the queue (epoch 0 = unknown, the same
-    -- sentinel as played_at) and how many songs were ahead of it then, counting
-    -- the one playing. 0 = played immediately, which is also what an entry
-    -- written before these fields existed parses as.
+    -- When the user ASKED for the song, and how many songs were ahead of it at
+    -- that moment, counting the one playing. Epoch 0 = unknown (the same
+    -- sentinel as played_at), and 0 = played immediately; both are also what an
+    -- entry written before these fields existed parses as.
+    --
+    -- queued_at is the command message's snowflake time, on DISCORD's clock
+    -- while played_at is on the host's, so their difference is cross-clock and
+    -- goes slightly negative under drift. A `played_at >= queued_at` filter
+    -- drops those real plays.
+    --
+    -- queue_position is depth at ASK, left approximate against where the song
+    -- landed by the loop's continuous dequeuing, so it disagrees with played_at
+    -- ordering. Rows imported by `just db-backfill` predate the switch and hold
+    -- the older meaning of both columns: insert time, and position at insert.
     queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
     queue_position integer     NOT NULL DEFAULT 0,
 

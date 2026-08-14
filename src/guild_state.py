@@ -30,6 +30,37 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# ── Pure-analytics values, grouped ───────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Analytics:
+    """Values carried on live queue objects (QueueObject, YTSource, YTDL) for
+    storage alone: read only to serialize or to carry onto the next object.
+    Admission rule — a field anything branches on or renders belongs elsewhere.
+
+    An in-memory shape only. Wire entries and play_history columns stay FLAT,
+    exploded at the serialization boundary in this module.
+
+    Frozen: carry sites alias one instance across a resume tail and its source
+    (analytics=current.analytics)."""
+
+    # Unix epoch when the user ASKED for the song: the command message's
+    # snowflake time. Discord's clock, so played_at - queued_at is cross-clock
+    # and goes slightly negative under host drift.
+    # 0.0 = unknown (pre-feature wire entries).
+    queued_at: float
+    # Songs ahead at ask time, counting the one playing (0 = played immediately).
+    # Read once at command dispatch (MusicPlayer.enqueue_depth), so the loop's
+    # continuous dequeuing leaves it approximate against the insert.
+    queue_position: int
+
+
+# The unknown value: what a pre-feature wire entry rehydrates as, and the
+# default on live objects whose construction site cannot know the values yet.
+ANALYTICS_ZERO: Final[Analytics] = Analytics(queued_at=0.0, queue_position=0)
+
+
 # ── guild:{id}:state hash — field name constants ─────────────────────────────
 
 
@@ -57,8 +88,8 @@ class StateField:
     # the tail's NP-card cleanup, so losing it across a crash changes behaviour.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
     CURRENT_SONG_START_PAUSED: Final[str] = "current_song_start_paused"
-    # Stamped at enqueue and carried, never restamped, so a crash-recovered song
-    # still archives the position it was originally queued at.
+    # Set once at ask time and carried, never rewritten, so a crash-recovered
+    # song still archives the position it was originally queued at.
     CURRENT_SONG_QUEUED_AT: Final[str] = "current_song_queued_at"
     CURRENT_SONG_QUEUE_POSITION: Final[str] = "current_song_queue_position"
     # Same reason: without it a song recovered after a crash archives as unknown,
@@ -510,8 +541,10 @@ class QueueEntryField:
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
-    # Enqueue stamps, carried on both entry types — absent on pre-feature
-    # entries, parsed as the 0 defaults.
+    # Ask-time analytics, carried on both entry types. FLAT on the wire even
+    # though they group as Analytics in memory — nesting would break these
+    # parsers, the clamp-domain coverage and the positional row mapping. Absent
+    # on pre-feature entries, parsed as the 0 defaults.
     QUEUED_AT: Final[str] = "queued_at"
     QUEUE_POSITION: Final[str] = "queue_position"
     # Parse-time classification, carried on both entry types (see sources.py).
@@ -563,7 +596,7 @@ class SongQueueEntry:
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
-    # Enqueue stamps (0 = unknown / played immediately), see QueueObject.
+    # Ask-time analytics (0 = unknown / played immediately), see Analytics.
     queued_at: float = 0.0
     queue_position: int = 0
     # How it was asked for ("" = unknown), see QueueObject.
@@ -595,8 +628,8 @@ class SongQueueEntry:
             interjected=item.interjected,
             is_resume=item.is_resume,
             start_paused=item.start_paused,
-            queued_at=item.queued_at,
-            queue_position=item.queue_position,
+            queued_at=item.analytics.queued_at,
+            queue_position=item.analytics.queue_position,
             query_source=item.query_source,
             played_at=item.played_at,
             np_message_id=item.np_message_id,
@@ -619,8 +652,8 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             interjected=song.interjected,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
+            queued_at=song.analytics.queued_at,
+            queue_position=song.analytics.queue_position,
             query_source=song.query_source,
             played_at=song.played_at,
         )
@@ -712,8 +745,8 @@ class SearchQueueEntry:
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
-    # Enqueue stamps: searches are stamped like resolved songs, so a Spotify
-    # playlist track keeps its position through the resolve at dequeue.
+    # Ask-time analytics, carried so a Spotify playlist track keeps its position
+    # through the resolve at dequeue.
     queued_at: float = 0.0
     queue_position: int = 0
     # Likewise for the classification — this is the leg that makes a Spotify
@@ -727,8 +760,8 @@ class SearchQueueEntry:
             url=source.url,
             process=source.process,
             ts=source.ts,
-            queued_at=source.queued_at,
-            queue_position=source.queue_position,
+            queued_at=source.analytics.queued_at,
+            queue_position=source.analytics.queue_position,
             query_source=source.query_source,
         )
 
@@ -892,8 +925,8 @@ class HistoryEntry:
     played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
     channel_id: int = 0  # the channel that host was in; 0 = unknown, always paired
-    queued_at: float = 0.0  # unix epoch when first enqueued; 0 = unknown
-    # Songs ahead of it at that moment, counting the one playing. 0 means it
+    queued_at: float = 0.0  # unix epoch when the user ASKED; 0 = unknown
+    # Songs ahead of it at ask time, counting the one playing. 0 means it
     # played immediately — and is also what a pre-feature entry parses as.
     queue_position: int = 0
     # How the song was asked for: "search", or the host of the link that was
@@ -988,8 +1021,8 @@ class HistoryEntry:
             played_at=song.played_at,
             message_id=message_id,
             channel_id=channel_id,
-            queued_at=song.queued_at,
-            queue_position=song.queue_position,
+            queued_at=song.analytics.queued_at,
+            queue_position=song.analytics.queue_position,
             query_source=song.query_source,
         )
 
@@ -1027,8 +1060,8 @@ class HistoryEntry:
             played_at=item.played_at,
             message_id=item.np_message_id,
             channel_id=item.np_channel_id,
-            queued_at=item.queued_at,
-            queue_position=item.queue_position,
+            queued_at=item.analytics.queued_at,
+            queue_position=item.analytics.queue_position,
             query_source=item.query_source,
         )
 

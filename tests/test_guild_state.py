@@ -16,6 +16,7 @@ from src import guild_state
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
+    Analytics,
     DEFAULT_TIMEZONE,
     ConfigField,
     GuildConfig,
@@ -618,8 +619,7 @@ class TestSongQueueEntryWire:
             webpage_url="https://yt.com/v=1",
             title="Golden Song",
             requester=_requester_stub(222222222222222222),
-            queued_at=1752530000.5,
-            queue_position=4,
+            analytics=Analytics(queued_at=1752530000.5, queue_position=4),
         )
         entry = SongQueueEntry.from_queue_object(item)
         parsed = parse_queue_entry(entry.to_redis())
@@ -683,7 +683,8 @@ class TestSearchQueueEntryWire:
 
     def test_enqueue_stamps_round_trip(self) -> None:
         source = YTSource(
-            ytsearch="ytsearch:x", queued_at=1752530000.5, queue_position=7
+            ytsearch="ytsearch:x",
+            analytics=Analytics(queued_at=1752530000.5, queue_position=7),
         )
         entry = SearchQueueEntry.from_ytsource(source)
         parsed = parse_queue_entry(entry.to_redis())
@@ -1108,8 +1109,7 @@ def _history_song_stub(**overrides: Any) -> YTDL:
         position_secs=225.0,
         thumbnail="https://img/x.jpg",
         requester=SimpleNamespace(id=333, display_name="Omkar"),
-        queued_at=1752529000.0,
-        queue_position=2,
+        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
         query_source="youtube.com",
         played_at=1752530000.0,
     )
@@ -1247,8 +1247,7 @@ def _played_tail(**overrides: Any) -> QueueObject:
         uploader="Chan",
         thumbnail="https://img/x.jpg",
         is_resume=True,
-        queued_at=1752529000.0,
-        queue_position=2,
+        analytics=Analytics(queued_at=1752529000.0, queue_position=2),
         query_source="youtube.com",
         played_at=1752530000.0,
     )
