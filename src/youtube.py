@@ -626,6 +626,7 @@ class YTDL(discord.FFmpegOpusAudio):
         start_paused: bool = False,
         analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
+        user_input: Optional[str] = None,
         played_at: float = 0.0,
         np_message_id: int = 0,
         np_channel_id: int = 0,
@@ -648,6 +649,9 @@ class YTDL(discord.FFmpegOpusAudio):
         # this song produces records where it started, not when it played.
         self.analytics: Analytics = analytics
         self.query_source: str = query_source
+        # What the user typed, carried so -remove still matches a song that has
+        # become a playing one — a -playnow resume tail is rebuilt from here.
+        self.user_input: Optional[str] = user_input
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).
         self.played_at: float = played_at
@@ -865,6 +869,7 @@ class YTDL(discord.FFmpegOpusAudio):
             start_paused=qo.start_paused,
             analytics=qo.analytics,
             query_source=qo.query_source,
+            user_input=qo.user_input,
             played_at=qo.played_at,
             np_message_id=qo.np_message_id,
             np_channel_id=qo.np_channel_id,

@@ -1322,6 +1322,27 @@ class TestRestoreEntries:
         assert item.interjected is False
         assert item.ts == 151
 
+    async def test_origin_rehydrates_on_the_song_branch(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The hop a plain `-play <search text>` takes. The restart end-to-end
+        covers only the search branch, so dropping this carry left `-remove <search
+        text>` broken after a restart with nothing red."""
+        mock_guild.get_member.return_value = mock_author
+        typed = "never gonna give you up"
+        entry = SongQueueEntry(
+            webpage_url="https://yt.com/v=1",
+            title="Song 1",
+            requester_id=mock_author.id,
+            user_input=typed,
+        )
+        assert await gq.restore_entries([entry]) == 1
+
+        (restored,) = gq.display_items()
+        assert isinstance(restored, QueueObject)
+        assert restored.user_input == typed
+        assert remove_matcher(typed)(restored) is RemoveMode.ORIGIN
+
     async def test_origin_rehydrates_on_the_search_branch(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:

@@ -90,6 +90,9 @@ def mock_song() -> MagicMock:
     # TypeError there, exactly as a MagicMock title would.
     song.analytics = ANALYTICS_ZERO
     song.query_source = ""
+    # Same reason: the resume tail a -playnow builds carries it, and that tail is
+    # serialized straight to the queue mirror.
+    song.user_input = None
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
     song.played_at = 0.0
@@ -791,6 +794,34 @@ class TestQueueClearFlushesPlayedSongs:
         [remaining] = music_player.queue.display_items()
         assert isinstance(remaining, QueueObject)
         assert remaining.webpage_url == "https://yt.com/v=new"
+
+    async def test_only_the_generation_refuses_when_the_refill_is_claimed(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The test above no longer reaches the generation check. Under the single
+        deque, clear() resets the cursor, so try_release() refuses on its own and
+        the check is never consulted — it passed for a different reason than it
+        used to, and deleting the check left the suite green.
+
+        A SECOND consumer is what reaches the state only the generation can refuse:
+        the prefetch claims the refill, so there IS a claim to settle, and without
+        the check the stale commit would settle the new song's."""
+        first = QueueObject("https://yt.com/v=first", "First", mock_author)
+        await music_player.queue_put(first)
+        assert music_player.queue.get_nowait() is first  # the loop claims
+        generation = music_player.queue.generation
+
+        await music_player.queue_clear()
+        refill = QueueObject("https://yt.com/v=refill", "Refill", mock_author)
+        await music_player.queue_put(refill)
+        assert music_player.queue.get_nowait() is refill  # the prefetch claims
+        assert music_player.queue._cursor == 1  # so try_release() alone would say True
+
+        assert await music_player.queue.try_commit_dequeue(generation) is False
+
+        # The refill's claim is untouched — the stale commit settled nothing.
+        assert music_player.queue._cursor == 1
+        assert music_player.queue.display_items() == [refill]
 
 
 # ── QueueShuffle ──────────────────────────────────────────────────────────────
@@ -3217,6 +3248,39 @@ class TestEnqueueDepth:
         # 1 in the queue (claimed, uncommitted) + 1 for the live song = 2, where
         # only one play is actually ahead of a new arrival.
         assert music_player.enqueue_depth() == 2
+
+    async def test_a_resume_tail_keeps_the_origin_it_was_queued_with(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_vc: MagicMock
+    ) -> None:
+        """H5. The tail is a rebuild, and YTDL had no user_input at all — so the
+        origin died the moment a song started playing, and `-remove <album link>`
+        left the parked track behind while taking every other track."""
+        album = "https://open.spotify.com/album/abc123"
+        current = MagicMock()
+        current.webpage_url = "https://yt.com/v=parked"
+        current.title = "Parked"
+        current.requester = mock_author
+        current.position_secs = 40.0
+        current.duration_secs = 300
+        current.user_input = album
+        current.query_source = "spotify.com"
+        current.analytics = ANALYTICS_ZERO
+        current.played_at = 1.0
+        current.interjected = False
+        current.is_resume = False
+        current.start_paused = False
+        music_player.current_song = current
+
+        await music_player.interject(
+            QueueObject("https://yt.com/v=urgent", "Urgent", mock_author), mock_vc
+        )
+
+        tails = [
+            i
+            for i in music_player.queue.display_items()
+            if isinstance(i, QueueObject) and i.is_resume
+        ]
+        assert [t.user_input for t in tails] == [album]
 
     async def test_the_under_by_one_window_for_a_repeated_url_is_unchanged(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -5965,6 +6029,93 @@ class TestLoopTaskAccounting:
 
         assert music_player.queue._cursor == 0  # every claim settled
 
+    async def test_a_raise_before_the_commit_settles_the_claim_on_both_legs(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        """The window the handler's release exists for: _stream_source sits outside
+        the inner try, so a raise there reaches the outer handler with the claim
+        still live. Settling it must reach Redis too — release() alone drops the
+        item from memory and leaves its entry for the next LPOP to retire instead
+        of its own."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        assert music_player.store is not None
+        await music_player.queue_put(queue_obj)  # real put, so Redis has the entry
+        popped: list[int] = []
+        original = music_player.store.pop_queue
+
+        async def spy_pop() -> None:
+            popped.append(1)
+            await original()
+
+        music_player.store.pop_queue = spy_pop
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer,
+                "_stream_source",
+                new=AsyncMock(side_effect=RuntimeError("boom before the commit")),
+            ),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert music_player.queue._cursor == 0, "the claim was left standing"
+        assert popped == [1], "the mirror kept an entry memory dropped"
+
+    async def test_the_commit_uses_the_generation_captured_at_the_claim(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        """Re-reading the generation at commit time instead of using the one
+        captured at the claim cannot be caught by a clear() alone — clear() zeroes
+        the cursor, so the release refuses either way. It needs a second consumer
+        claiming the refill: then a stale commit would settle THAT claim."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=first", "First", mock_author)
+        )
+        refill = QueueObject("https://yt.com/v=refill", "Refill", mock_author)
+        # No voice client, so a commit that wrongly SUCCEEDS falls straight into
+        # the outer handler instead of hanging on play_next — the mutation should
+        # fail by assertion, not by timeout.
+        mocked(music_player._guild).voice_client = None
+
+        async def clear_refill_and_claim(_self: MusicPlayer, source: Any) -> MagicMock:
+            # A -clear and a -play land while this song resolves, and the prefetch
+            # claims what the -play added.
+            await music_player.queue_clear()
+            await music_player.queue_put(refill)
+            music_player.queue.get_nowait()
+            return mock_song
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(side_effect=lambda s: s)
+            ),
+            patch.object(MusicPlayer, "_stream_source", new=clear_refill_and_claim),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        # The commit was refused, so the refill's claim is untouched and its item
+        # is still queued for its own iteration.
+        assert music_player.queue._cursor == 1
+        assert music_player.queue.display_items() == [refill]
+
     async def test_a_raise_after_the_commit_does_not_eat_the_next_song(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
@@ -6106,6 +6257,7 @@ class TestLoop:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
@@ -7246,6 +7398,7 @@ class TestLoopAdditional:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.

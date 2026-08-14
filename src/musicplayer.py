@@ -1765,6 +1765,9 @@ class MusicPlayer:
                     # classification is not recoverable from webpage_url — a Spotify
                     # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
+                    # Same reason -remove matches on it: without this the parked
+                    # tail is the one track an album link cannot take back out.
+                    user_input=current.user_input,
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
@@ -1857,6 +1860,7 @@ class MusicPlayer:
             start_paused=song.start_paused,
             analytics=song.analytics,
             query_source=song.query_source,
+            user_input=song.user_input,
             played_at=song.played_at,
             np_message_id=song.np_message_id,
             np_channel_id=song.np_channel_id,
@@ -2609,8 +2613,14 @@ class MusicPlayer:
                         await self.queue.finish_failed_dequeue(
                             source, context="unhandled loop error"
                         )
-                    if self._prefetch_task and not self._prefetch_task.done():
-                        self._prefetch_task.cancel()
+                    # Awaited, matching _cancel_prefetch: the prefetch returns its
+                    # item through requeue_front, and an unawaited cancel leaves that
+                    # to whatever awaits next. Two live claims settle by POSITION, so
+                    # each would take the other's song. Today the awaits below happen
+                    # to give the cancelled task its turn, which is why no test can
+                    # tell the two apart — this makes the ordering a guarantee rather
+                    # than a side effect of them.
+                    await cancel_task(self._prefetch_task)
                     self._prefetch_task = None
                     await self._cancel_progress_task()
                     await self._cancel_pause_debounce()
