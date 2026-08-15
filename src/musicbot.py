@@ -83,6 +83,7 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
+    truncate_embed_title,
     get_logger,
 )
 
@@ -226,6 +227,7 @@ class Placement(Enum):
 
     TAIL = "tail"
     COLD_FRONT = "cold_front"
+    NEXT = "next"
 
 
 # Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
@@ -420,6 +422,42 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
     # matching some other part of a YouTube URL is not a case that arises.
     if source.video_id in tracks[0].webpage_url:
         tracks[0].ts = source.ts
+
+
+def _plays_after_note(
+    mp: MusicPlayer, voice_client: Optional[discord.VoiceProtocol]
+) -> str:
+    """What a `--next` confirmation says about when the song will be heard.
+
+    Names the song it waits behind rather than quoting a time — see the comment at
+    the call site for why an ETA is the wrong tool for the very next slot. The
+    paused sentence is not decoration: `--next` deliberately does NOT interject a
+    paused song (the request is not buried behind it, it IS next), so the bot stays
+    silent afterwards and nothing else would say why.
+    """
+    current = mp.current_song
+    if current is None:
+        return "Nothing is playing, so it starts now."
+    note = f"Plays after **{current.title or 'the current song'}**."
+    if isinstance(voice_client, discord.VoiceClient) and voice_client.is_paused():
+        note += " Playback is paused — `-resume` to carry on."
+    return note
+
+
+def _front_insert_depth(mp: MusicPlayer) -> int:
+    """Ask-time `queue_position` for a song going to the FRONT of the queue: it
+    waits behind the song playing and nothing else.
+
+    One definition for the two callers — `-play --next`, and the interjection whose
+    song ended before it could be interrupted — because they front-insert into the
+    same queue and a drift between them would write two different numbers to
+    Postgres for the same situation, permanently.
+
+    Known ±1, of the same kind enqueue_depth() already documents: two `--next` in a
+    row both record 1, though the second pushed the first to 2. The field is an
+    ask-time depth by definition, not a promise about playback order.
+    """
+    return 1 if mp.current_song is not None else 0
 
 
 def _join_succeeded(ctx: commands.Context) -> bool:
@@ -946,8 +984,23 @@ class MusicBot(commands.Cog):
         search resolution while YouTube playlists arrive pre-resolved."""
         # A playlist front-inserts in full, in order — unlike `--now`, which
         # collapses it to the first track to bound how long an interrupted song
-        # waits. Nothing is playing to interrupt on this path.
-        enqueue = mp.queue_put if placement is Placement.TAIL else mp.queue_put_front
+        # waits. Neither front placement interrupts anything: COLD_FRONT has no
+        # current song at all, and NEXT lets the one playing finish.
+        #
+        # NEXT takes queue_put_next, not queue_put_front: with a song playing, the
+        # loop's prefetch holds a claim a plain front-insert would land behind, and
+        # the playlist would start one song late. COLD_FRONT cannot be in that
+        # state — the gate is held shut across the insert, so no iteration has run
+        # to spawn a prefetch.
+        enqueue = {
+            Placement.TAIL: mp.queue_put,
+            Placement.COLD_FRONT: mp.queue_put_front,
+            Placement.NEXT: mp.queue_put_next,
+        }[placement]
+        # Said, not implied: "Queued playlist" reads as "at the back" to anyone who
+        # has used the command without a flag. Appended rather than woven in, so
+        # both branches' titles keep the shape they already had.
+        next_suffix = " — plays next" if placement is Placement.NEXT else ""
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(
@@ -957,7 +1010,7 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    "Queued playlist",
+                    "Queued playlist" + next_suffix,
                     f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
                     discord.Color.blue(),
                 ),
@@ -989,13 +1042,41 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    f"Queued playlist — {count} {pluralize(count, 'song')}",
+                    f"Queued playlist — {count} "
+                    f"{pluralize(count, 'song')}{next_suffix}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n{skipped_line}\n{queue_message([q.title for q in islice(tracks, 10)])}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
                 ctx.message.add_reaction("👍"),
             )
+
+    async def _send_playing_next(
+        self,
+        ctx: commands.Context,
+        qobj: QueueObject,
+        *,
+        note: str,
+        reaction: str = "👍",
+    ) -> None:
+        """The "Playing next" confirmation.
+
+        One builder for the two paths that make that promise — `-play --next`, and
+        the interjection whose song ended before it could be interrupted — because
+        they are the same claim about the same queue position, and a copy that
+        drifted between them would describe the same insert two ways. `note` is the
+        only difference: why this song is next.
+        """
+        await asyncio.gather(
+            send_embed(
+                ctx,
+                truncate_embed_title(f"▶️ Playing next: {qobj.title}"),
+                f"Requested by: [{ctx.author.mention}]\n{note}",
+                discord.Color.blue(),
+                thumbnail=qobj.thumbnail,
+            ),
+            ctx.message.add_reaction(reaction),
+        )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
@@ -1022,6 +1103,21 @@ class MusicBot(commands.Cog):
                 coros.append(ctx.send(embed=resume_notice))
             await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
+            return
+
+        if placement is Placement.NEXT:
+            # No "Est. playing at": estimated_playing_at() walks the whole queue and
+            # seeds from the current song's FULL duration as a proxy for what is
+            # left of it — fine at the back, badly wrong for the very next slot. A
+            # precise one computed from position_secs would give this reply a
+            # different clock from the progress bar, -queue and the presence line,
+            # which is a bug this repo has had once already. Naming the song it
+            # waits behind is exact and needs no new arithmetic.
+            await asyncio.gather(
+                mp.queue_put_next(qobj),
+                self._send_playing_next(ctx, qobj, note=_plays_after_note(mp, vc)),
+            )
+            log.info(f"play (next) qsize: {mp.queue.qsize()}")
             return
 
         should_show_queued = mp.queue.qsize() > 0 or (
@@ -1132,7 +1228,7 @@ class MusicBot(commands.Cog):
                     await ctx.send(
                         embed=notice_embed(
                             f"Missing argument: `url`. Usage: `{ctx.prefix}play "
-                            f"[{NOW_FLAG}] <url|search>`",
+                            f"[{NOW_FLAG}|{NEXT_FLAG}] <url|search>`",
                             discord.Color.red(),
                         )
                     )
@@ -1161,11 +1257,18 @@ class MusicBot(commands.Cog):
                     if args.mode is PlayMode.NOW:
                         interjecting = True
                         return await self._interject_flow(ctx, url, mp, live_vc)
-                    if live_vc.is_paused():
+                    if live_vc.is_paused() and args.mode is not PlayMode.NEXT:
                         # Paused → interject, not append: appending leaves the bot
                         # silent with the request buried behind a paused song. The
                         # interrupted song returns PLAYING — "-play means play" —
                         # which is the one thing that differs from the --now leg.
+                        #
+                        # `--next` is carved out because that reasoning does not
+                        # survive it: the request is not buried behind the paused
+                        # song, it IS next. Interjecting would stop the song the
+                        # user chose to keep, which is the opposite of what they
+                        # typed. The confirmation says playback is still paused,
+                        # since nothing else would.
                         interjecting = True
                         return await self._interject_flow(
                             ctx,
@@ -1192,12 +1295,23 @@ class MusicBot(commands.Cog):
                     # The position is a separate question, which is why it is a
                     # separate `placement` value further down.
                     cold_start = not ctx.voice_client
+                    if cold_start:
+                        placement = Placement.COLD_FRONT
+                    elif args.mode is PlayMode.NEXT:
+                        placement = Placement.NEXT
+                    else:
+                        placement = Placement.TAIL
                     # Ask-time analytics, read ONCE at dispatch: the command
                     # message's snowflake time, so the wait covers gateway
                     # delivery and the resolve below. Cold ⇒ depth 0, the
                     # cold-start song plays ahead of the restored queue.
                     if cold_start:
                         position = 0
+                    elif placement is Placement.NEXT:
+                        # No restore wait for the depth here — this number does not
+                        # come from the queue at all, so a queue still replaying
+                        # cannot make it wrong.
+                        position = _front_insert_depth(mp)
                     else:
                         # Wait out any in-flight restore: the queue stays empty
                         # until restore_entries() replays it, so a -play in the
@@ -1251,14 +1365,26 @@ class MusicBot(commands.Cog):
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
-                    if cold_start:
+                    if placement is not Placement.TAIL:
                         # Order matters: put_front LPUSHes the mirror while
                         # restore_entries replays already-listed entries in memory
                         # only, so inserting first double-queues this song. A restore
                         # that never lands is therefore a reason NOT to insert — and
                         # the wait is bounded, since the pool sets no socket_timeout.
+                        #
+                        # Every front insert, not just the cold one: a warm `--next`
+                        # is nearly always past its restore (a playing song proves
+                        # the loop cleared _restore_complete), but connected-and-idle
+                        # during crash recovery is exactly the window this guards,
+                        # and the warm path's own 1s wait ignores its result because
+                        # only an analytics integer rides on it.
                         if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                            await self._abandon_cold_start(ctx, mp)
+                            # Cold start ONLY. _abandon_cold_start cancels the
+                            # player's tasks and disconnects it, which is right for a
+                            # join that never landed and catastrophic on a warm
+                            # player — it would stop the music over a Redis blink.
+                            if cold_start:
+                                await self._abandon_cold_start(ctx, mp)
                             await ctx.send(
                                 embed=notice_embed(
                                     "Couldn't reach this server's saved queue, so "
@@ -1269,10 +1395,6 @@ class MusicBot(commands.Cog):
                             )
                             return
 
-                    # The one line that decides both the insert position and the
-                    # confirmation. Cold start is the only placement that front-inserts
-                    # today; --next joins it here.
-                    placement = Placement.COLD_FRONT if cold_start else Placement.TAIL
                     if isinstance(qobj, QueueObject):
                         await self._enqueue_single(ctx, qobj, mp, placement=placement)
                     else:
@@ -1429,8 +1551,7 @@ class MusicBot(commands.Cog):
             # DIFFERENT song, which this insert waits behind. One, never the
             # queue depth: it goes to the front.
             qobj.analytics = replace(
-                qobj.analytics,
-                queue_position=1 if mp.current_song is not None else 0,
+                qobj.analytics, queue_position=_front_insert_depth(mp)
             )
             # queue_put_next, not queue_put_front: the embed below promises "play
             # next", and a bare front-insert only delivers that when nothing is
@@ -1439,17 +1560,14 @@ class MusicBot(commands.Cog):
             # neutralize, so this is the one path that still has to do it.
             # prefetch=False — the stream URL was warmed above.
             await mp.queue_put_next(qobj, prefetch=False)
-            await asyncio.gather(
-                send_embed(
-                    ctx,
-                    f"▶️ Playing next: {qobj.title}",
-                    f"Requested by: [{ctx.author.mention}]\n"
+            await self._send_playing_next(
+                ctx,
+                qobj,
+                note=(
                     "The song being interrupted already ended — "
-                    "queued to play next instead.",
-                    discord.Color.blue(),
-                    thumbnail=qobj.thumbnail,
+                    "queued to play next instead."
                 ),
-                ctx.message.add_reaction("⏯️"),
+                reaction="⏯️",
             )
             return
 
