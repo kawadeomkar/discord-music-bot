@@ -387,18 +387,49 @@ def _join_succeeded(ctx: commands.Context) -> bool:
     return isinstance(vc, discord.VoiceClient) and vc.is_connected()
 
 
+def _play_will_interject(
+    ctx: commands.Context, voice_client: Optional[discord.VoiceClient]
+) -> bool:
+    """Whether this -play will stop what is playing rather than append to it.
+
+    Reads the PARSED argument: Command.prepare() runs _parse_arguments before
+    call_before_hooks, so ctx.kwargs is filled by the time the gate runs. Other
+    commands carry no `url` and fall out at the `.get`.
+
+    Deliberately conservative. A paused voice client counts as interjecting even
+    though the body also requires a current song, because the gate cannot ask for
+    one without building a player — and refusing a borderline cross-channel
+    interjection is the safe direction to be wrong in.
+    """
+    if voice_client is None:
+        return False
+    if voice_client.is_paused():
+        return True
+    return split_play_args(str(ctx.kwargs.get("url", ""))).now
+
+
 def _check_voice_permissions(
     author: Union[discord.Member, discord.User],
     voice_client: Optional[discord.VoiceClient],
     command_name: str,
+    *,
+    interjecting: bool = False,
 ) -> Optional[str]:
-    """Returns an error message string if validation fails, None if OK."""
+    """Returns an error message string if validation fails, None if OK.
+
+    -play alone is exempt from the same-channel rule: queueing into a session
+    running elsewhere costs its listeners nothing, they just hear the song later.
+    An INTERJECTION is not that — it stops what that channel is hearing right now,
+    so it is gated like every other command even when it arrives as -play. Without
+    the flag, a member in another channel could cut the song for a room they are
+    not in.
+    """
     if isinstance(author, discord.User):
         return f"You must be a member of this channel {author}"
     if not author.voice or not author.voice.channel:
         return f"You are not connected to a voice channel, you silly baka {author}"
     if (
-        command_name != "play"
+        (command_name != "play" or interjecting)
         and voice_client is not None
         and voice_client.channel != author.voice.channel
     ):
@@ -737,7 +768,12 @@ class MusicBot(commands.Cog):
         vc = ctx.voice_client
         voice_client = vc if isinstance(vc, discord.VoiceClient) else None
         command_name = ctx.command.name if ctx.command is not None else ""
-        msg = _check_voice_permissions(ctx.author, voice_client, command_name)
+        msg = _check_voice_permissions(
+            ctx.author,
+            voice_client,
+            command_name,
+            interjecting=_play_will_interject(ctx, voice_client),
+        )
         if msg:
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))
             raise commands.CommandError(msg)
@@ -967,31 +1003,38 @@ class MusicBot(commands.Cog):
         name="play",
         aliases=["p", "sing"],
         brief="queue a song and start playing",
-        usage="<url|search>",
+        usage="[--now] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
             "playlist, a Spotify track or playlist link, a SoundCloud link, or "
             "plain words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
             "If something is already playing, the song is appended to the queue "
-            "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
-            "A YouTube playlist link copied from partway through — one carrying "
-            "an `&index=` — queues from that position, skipping the songs "
-            "before it. Drop the `&index=` to queue the whole playlist."
+            "and you get an estimated start time. A `?t=` / `?ts=` timestamp starts "
+            "the song at that offset, and a playlist link's `&index=` queues from "
+            "that position instead of from the first track.\n\n"
+            "`--now`, as the first word, plays the song immediately instead. The "
+            "interrupted song is not lost — it returns from the exact position it "
+            "left off at, and returns paused if it was paused. One that was nearly "
+            "over will not return. Run it again and the song you just interrupted "
+            "waits its turn too, most recent first. Only a playlist's **first "
+            "track** can interrupt; use plain `-play` for the whole thing."
         ),
         extras={
             "category": "Playback",
             "examples": [
                 "-play never gonna give you up",
+                "-p --now never gonna give you up",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, "
-                "so a long playlist takes a few seconds to finish queueing."
+                "Spotify links are matched to YouTube audio one title at a time, so a "
+                "long playlist takes a few seconds to finish queueing — and one `-play` "
+                "runs at a time per server, so a `--now` sent while a long playlist is "
+                "still queueing is asked to wait rather than cutting the line."
             ),
         },
     )
@@ -1010,22 +1053,75 @@ class MusicBot(commands.Cog):
         # is passed here is the whole input as far as everything downstream knows.
         # discord.py already strips a consume-rest argument; this covers the direct
         # callers (tests) that never went through its parser.
-        url = url.strip()
+        await self._play(ctx, split_play_args(url.strip()))
+
+    async def _play(self, ctx: commands.Context, args: PlayArgs) -> None:
+        """The body behind -play. Takes the argument already split, so the caller
+        decides whether this is an interjection."""
+        trace.get_current_span().set_attribute("play.now", args.now)
+        # ONE rebind, so every `origin=url` below is the query the user typed with
+        # the flag off it. Threading args.query per call site instead would leave a
+        # fourth to miss, and a leaked flag persists a user_input -remove cannot
+        # match — silently, since nothing else reads that field.
+        url = args.query
+        # The error title names the branch, not the flag: `-p --now x` on an idle
+        # bot queues like any other -play, and "failed to play song now" would
+        # describe an interjection that never happened.
+        interjecting = False
         async with background_typing(ctx):
             try:
-                # Paused → interject, not append: appending leaves the bot silent
-                # with the request buried behind a paused song. The interrupted song
-                # returns PLAYING, unlike -playnow. Checked before parse_input so the
-                # paused path parses once, inside _interject_flow.
-                paused_vc = ctx.voice_client
-                if isinstance(paused_vc, discord.VoiceClient) and paused_vc.is_paused():
-                    paused_mp = self.get_mp(ctx)
-                    if paused_mp.current_song is not None:
+                if args.dash_typo:
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"Did you mean `{NOW_FLAG}`? Options take two dashes.",
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                if not url:
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"Missing argument: `url`. Usage: `{ctx.prefix}play "
+                            f"[{NOW_FLAG}] <url|search>`",
+                            discord.Color.red(),
+                        )
+                    )
+                    return
+
+                # Bound before the join below, not after: every failure path hands
+                # this exact player to _abandon_cold_start, and a get_mp() issued
+                # after its cleanup() would build and start a fresh one. Free here —
+                # cog_before_invoke already created it before this body ran.
+                mp = self.get_mp(ctx)
+                vc = ctx.voice_client
+                # A narrowed Optional, NOT a bool: VoiceProtocol carries neither
+                # is_playing nor is_paused, so a `live: bool` leaves vc unnarrowed
+                # at both use sites and pyright rejects the lot. Load-bearing.
+                live_vc = (
+                    vc
+                    if isinstance(vc, discord.VoiceClient)
+                    and mp.current_song is not None
+                    and (vc.is_playing() or vc.is_paused())
+                    else None
+                )
+                # Decided BEFORE the resolve, as -playnow's own test was: "nothing
+                # live" is what lets a playlist enqueue whole, while the interject
+                # path collapses it to one track.
+                if live_vc is not None:
+                    if args.now:
+                        interjecting = True
+                        return await self._interject_flow(ctx, url, mp, live_vc)
+                    if live_vc.is_paused():
+                        # Paused → interject, not append: appending leaves the bot
+                        # silent with the request buried behind a paused song. The
+                        # interrupted song returns PLAYING — "-play means play" —
+                        # which is the one thing that differs from the --now leg.
+                        interjecting = True
                         return await self._interject_flow(
                             ctx,
                             url,
-                            paused_mp,
-                            paused_vc,
+                            mp,
+                            live_vc,
                             resume_paused=False,
                             require_paused=True,
                         )
@@ -1041,10 +1137,6 @@ class MusicBot(commands.Cog):
                     # -play on a disconnected bot means "play this", not "play
                     # the leftovers".
                     front = not ctx.voice_client
-                    # Bound before the join, not after: every failure path below
-                    # hands this exact player to _abandon_cold_start, and a get_mp()
-                    # issued after its cleanup() would build and start a fresh one.
-                    mp = self.get_mp(ctx)
                     # Ask-time analytics, read ONCE at dispatch: the command
                     # message's snowflake time, so the wait covers gateway
                     # delivery and the resolve below. front ⇒ depth 0, the
@@ -1136,7 +1228,13 @@ class MusicBot(commands.Cog):
                         )
 
             except Exception as e:
-                await self._command_error(ctx, e, title="Failed to queue song")
+                await self._command_error(
+                    ctx,
+                    e,
+                    title="Failed to play song now"
+                    if interjecting
+                    else "Failed to queue song",
+                )
 
     async def _resolve_interjection_source(
         self,
@@ -1250,25 +1348,15 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
     async def playnow(self, ctx: commands.Context, *, url: str) -> None:
-        url = url.strip()  # consume-rest, as -play — see there
-        async with background_typing(ctx):
-            try:
-                mp = self.get_mp(ctx)
-                vc = ctx.voice_client
-                # Nothing live to interrupt → equivalent to -play (which also
-                # covers not-connected, since play joins first). Playlists enqueue
-                # in full here: interjection semantics don't apply to an idle
-                # player.
-                if (
-                    mp.current_song is None
-                    or not isinstance(vc, discord.VoiceClient)
-                    or not (vc.is_playing() or vc.is_paused())
-                ):
-                    return await ctx.invoke(self.play, url=url)
-
-                await self._interject_flow(ctx, url, mp, vc)
-            except Exception as e:
-                await self._command_error(ctx, e, title="Failed to play song now")
+        # Folded into `-p --now`; this command is deleted in the next commit and
+        # only survives it so the merge and the removal stay separately reviewable.
+        # The flag is forced rather than parsed: `-playnow --now x` should search
+        # for what was typed, exactly as `-p --now --now x` does.
+        #
+        # The whole body is _play's now, including the idle fall-through that used
+        # to be `ctx.invoke(self.play)` — which skipped checks, hooks and this
+        # command's own concurrency bucket on the way past.
+        await self._play(ctx, PlayArgs(now=True, query=url.strip()))
 
     @_tracer.start_as_current_span("bot.interject_flow")
     async def _interject_flow(
