@@ -330,7 +330,7 @@ def _apply_playlist_index(
     reports success. The empty-playlist guard lives here too, so both callers
     get it.
 
-    keep_first_only trims to the one track -playnow interjects, which also keeps
+    keep_first_only trims to the one track an interjection plays, which also keeps
     the rebase below off the tracks that caller discards (~1ms for a 1000-track
     link).
     """
@@ -895,7 +895,7 @@ class MusicBot(commands.Cog):
         """Queue a resolved playlist and notify the channel — branches on the
         resolved shape since Spotify playlists arrive as titles needing YouTube
         search resolution while YouTube playlists arrive pre-resolved."""
-        # A playlist front-inserts in full, in order — unlike -playnow, which
+        # A playlist front-inserts in full, in order — unlike `--now`, which
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
         enqueue = mp.queue_put_front if front else mp.queue_put
@@ -1104,7 +1104,7 @@ class MusicBot(commands.Cog):
                     and (vc.is_playing() or vc.is_paused())
                     else None
                 )
-                # Decided BEFORE the resolve, as -playnow's own test was: "nothing
+                # Decided BEFORE the resolve, as the separate command was: "nothing
                 # live" is what lets a playlist enqueue whole, while the interject
                 # path collapses it to one track.
                 if live_vc is not None:
@@ -1247,8 +1247,8 @@ class MusicBot(commands.Cog):
         collapse to their first track — interjecting a whole one would delay the
         interrupted song's return indefinitely (use -play).
 
-        Named for what it does rather than for who asks: -playnow is one caller,
-        and -play on a paused song is the other.
+        Named for what it does rather than for who asks: `-play --now` is one
+        caller, and -play on a paused song is the other.
 
         `origin` is the raw command argument, passed down by every branch — for a
         collapsed playlist it is the link, not the title the expansion generated."""
@@ -1289,7 +1289,7 @@ class MusicBot(commands.Cog):
                 analytics=analytics,
                 user_input=origin,
             )
-            # Indexed here too: -playnow on a link copied mid-playlist should
+            # Indexed here too: `--now` on a link copied mid-playlist should
             # interject the track the user was looking at, not the playlist's
             # first. The slice makes tracks[0] that track.
             tracks, skipped = _apply_playlist_index(
@@ -1312,52 +1312,6 @@ class MusicBot(commands.Cog):
         assert isinstance(qobj, QueueObject)
         return qobj
 
-    @commands.command(
-        name="playnow",
-        aliases=["pn"],
-        brief="play a song immediately, resuming the current one after",
-        usage="<url|search>",
-        help=(
-            "Interrupts whatever is playing so your song starts right now. The "
-            "interrupted song is not lost — it comes back from the exact position "
-            "it left off at, and if it was paused it returns paused.\n\n"
-            "Takes the same input as `-play`. If nothing is playing there is "
-            "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
-            "A playlist can't be interjected — only its **first track** is played, "
-            "since queueing the whole thing would delay the interrupted song "
-            "indefinitely. Use `-play` for the full playlist."
-        ),
-        extras={
-            "category": "Playback",
-            "examples": [
-                "-playnow never gonna give you up",
-                "-pn https://youtu.be/dQw4w9WgXcQ",
-            ],
-            "note": (
-                "`-play` adds to the back of the queue; `-playnow` cuts the line and "
-                "hands the current song back afterwards. A song that was nearly over "
-                "will not return. Otherwise they stack: run it again and the song "
-                "you just interrupted waits its turn too, each one resuming from "
-                "where it left off, most recent first."
-            ),
-        },
-    )
-    # See -play: interject() re-checks current_song, but current_song outlives
-    # the check by a whole song, so the re-check cannot serialize two callers.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
-    @commands.before_invoke(validate_commands)
-    @_tracer.start_as_current_span("bot.playnow")
-    async def playnow(self, ctx: commands.Context, *, url: str) -> None:
-        # Folded into `-p --now`; this command is deleted in the next commit and
-        # only survives it so the merge and the removal stay separately reviewable.
-        # The flag is forced rather than parsed: `-playnow --now x` should search
-        # for what was typed, exactly as `-p --now --now x` does.
-        #
-        # The whole body is _play's now, including the idle fall-through that used
-        # to be `ctx.invoke(self.play)` — which skipped checks, hooks and this
-        # command's own concurrency bucket on the way past.
-        await self._play(ctx, PlayArgs(now=True, query=url.strip()))
-
     @_tracer.start_as_current_span("bot.interject_flow")
     async def _interject_flow(
         self,
@@ -1371,8 +1325,8 @@ class MusicBot(commands.Cog):
     ) -> None:
         """Resolve `url` to one song, interrupt what is playing, and report.
 
-        Shared by `-playnow` and by `-play` on a paused song; they differ only in
-        resume_paused (`-playnow` restores paused-in → paused-out, `-play` brings it
+        Shared by `-play --now` and by `-play` on a paused song; they differ only
+        in resume_paused (`--now` restores paused-in → paused-out, plain `-play` brings it
         back playing). require_paused re-reads the pause state after resolution,
         before committing: `-play` interjects only *because* the song is paused, so a
         `-resume` landing during the 1–4s extraction removes the reason and the track
@@ -1823,7 +1777,7 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             # Destroys the Redis mirror while reading the IN-MEMORY display, so an
             # unrestored player deletes a saved queue it cannot see — including the
-            # -playnow tails _flush_played would have recorded. validate_commands
+            # interjection tails _flush_played would have recorded. validate_commands
             # only requires the AUTHOR in voice, so a cold player reaches here.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
@@ -1904,7 +1858,7 @@ class MusicBot(commands.Cog):
             mp = self.get_mp(ctx)
             # Destroys the Redis mirror while reading the IN-MEMORY display, so an
             # unrestored player deletes a saved queue it cannot see — including the
-            # -playnow tails _flush_played would have recorded. validate_commands
+            # interjection tails _flush_played would have recorded. validate_commands
             # only requires the AUTHOR in voice, so a cold player reaches here.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(

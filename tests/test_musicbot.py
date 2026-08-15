@@ -4254,7 +4254,7 @@ class TestCommandArgumentBinding:
     because the binding is a property of the signature and the tests that missed
     this were the ones that hand-built the value instead."""
 
-    @pytest.mark.parametrize("name", ["play", "playnow", "remove"])
+    @pytest.mark.parametrize("name", ["play", "remove"])
     def test_the_argument_consumes_the_rest_of_the_line(self, name: str) -> None:
         import inspect
 
@@ -4552,7 +4552,13 @@ class TestRemoveCommand:
 # ── -playnow ──────────────────────────────────────────────────────────────────
 
 
-class TestPlaynow:
+class TestPlayNowFlag:
+    """`-p --now` end to end: resolve one song, interrupt, and report.
+
+    Was TestPlaynow, driving the command that has now been folded into this
+    flag. The assertions are unchanged — what they pin is the interjection
+    path, and only its entry point moved."""
+
     @pytest.fixture
     def live_mp(self) -> MagicMock:
         """A MusicPlayer mock with a song currently playing.
@@ -4598,7 +4604,7 @@ class TestPlaynow:
         music_bot._command_error = AsyncMock()
 
         with _no_typing():
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         music_bot._interject_flow.assert_not_awaited()
         music_bot._enqueue_single.assert_awaited_once()
@@ -4622,7 +4628,7 @@ class TestPlaynow:
         music_bot._command_error = AsyncMock()
 
         with _no_typing():
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         music_bot._interject_flow.assert_not_awaited()
         music_bot.queue_source.assert_awaited_once()
@@ -4640,7 +4646,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         assert qobj.interjected is True
         # The origin reaches the song through yt_source's required user_input, not
@@ -4684,7 +4690,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "return paused" in embed.description
@@ -4714,7 +4720,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Almost Done" in embed.description
@@ -4746,7 +4752,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Old Interjection" in embed.description
@@ -4772,9 +4778,14 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        mock_ctx.invoke.assert_not_awaited()
+        # Resolved once. This used to assert that -play was not re-invoked; with
+        # one command there is nothing left to re-invoke, so what still needs
+        # pinning is that the song is not resolved a SECOND time — a re-resolve
+        # would re-parse and, for a playlist, enqueue every track right after the
+        # first-track-only notice.
+        music_bot.queue_source.assert_awaited_once()
         # The player's wrapper, not queue.put_front directly — same plumbing as
         # every other insert; the stream was warmed, so it must not prefetch again.
         live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
@@ -4807,7 +4818,9 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
         ) as ys:
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
 
         music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
         ys.assert_awaited_once()
@@ -4838,7 +4851,9 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[first, second])
         ):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
 
         live_mp.interject.assert_awaited_once()
         assert live_mp.interject.call_args.args[0] is first
@@ -4854,7 +4869,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
@@ -4891,7 +4906,7 @@ class TestPlaynow:
         live_mp.interject = AsyncMock(side_effect=_interject_effect)
 
         with patch("src.musicbot.YTDL.prefetch_stream", new=prefetch):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]
