@@ -855,6 +855,34 @@ class GuildRedisStore:
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
 
+    @_guild_op(default=0)
+    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
+        """LREM the given entries out of the queue list, leaving the rest in place.
+        Returns how many were actually removed, which the caller must check: short
+        of what it asked for means the mirror no longer holds what memory does.
+
+        The alternative to rebuild_queue for a small removal: LREM touches only what
+        goes, while a rebuild rewrites the whole list whatever it drops. Far enough
+        up, the per-LREM scans overtake it — GuildQueue owns that threshold.
+
+        Counted per distinct serialization, never LREM ... 0: two enqueues of one
+        song usually differ on the wire (queue_position, queued_at), but when they
+        do not, removing "all matching" would take out a copy still queued.
+        """
+        counts: dict[bytes, int] = {}
+        for entry in entries:
+            blob = entry.to_redis()
+            counts[blob] = counts.get(blob, 0) + 1
+        pipe = self.redis.pipeline(transaction=True)
+        for blob, count in counts.items():
+            # redis-py's stub types `value` as str; its encoder takes bytes, which
+            # is what every other write on this key passes (decode_responses=False).
+            pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
+        pipe.expire(self.queue_key(), GUILD_TTL)
+        replies = await pipe.execute()
+        # The trailing reply is the EXPIRE, not an LREM count.
+        return sum(cast(list[int], replies[:-1]))
+
     # History operations
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.

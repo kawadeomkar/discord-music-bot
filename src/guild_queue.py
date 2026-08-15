@@ -55,6 +55,11 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
+# Above this many removed entries, rebuilding the whole list is cheaper than the
+# per-LREM scans. Set below the measured crossover so queue depth, which moves it,
+# has margin. See docs/ARCHITECTURE.md#queue-operations.
+_LREM_MAX_ENTRIES = 200
+
 
 class _FrontQueue(asyncio.Queue[QueueItem]):
     """asyncio.Queue plus head insertion.
@@ -406,7 +411,7 @@ class GuildQueue:
             self._display = deque(in_flight + kept)
 
             if removed_positions:
-                await self._write_mirror(in_flight + kept)
+                await self._write_mirror(in_flight + kept, removed=removed_items)
 
         return RemoveOutcome(
             removed=removed_items,
@@ -561,7 +566,9 @@ class GuildQueue:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    async def _write_mirror(self, items: Sequence[QueueItem]) -> None:
+    async def _write_mirror(
+        self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
+    ) -> None:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
         order.
 
@@ -572,6 +579,11 @@ class GuildQueue:
 
         Empty means DELETE, not skip, or the old list survives for the next restore
         to find.
+
+        Only a removal may pass `removed`: LREM assumes the survivors kept their
+        order, which is false for shuffle and for any insert. A short LREM count
+        means the mirror no longer held what it was asked to drop, so this falls
+        through to the rebuild, which restates the whole list from memory.
         """
         if self._store is None:
             return
@@ -579,6 +591,14 @@ class GuildQueue:
         if not entries:
             await self._store.delete_queue()
             return
+        dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+        if dropped and len(dropped) <= _LREM_MAX_ENTRIES:
+            if await self._store.remove_queue_entries(dropped) == len(dropped):
+                return
+            log.warning(
+                f"queue mirror diverged from memory in guild {self._guild.id}; "
+                "rebuilding instead of removing"
+            )
         await self._store.rebuild_queue(entries)
 
     def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
