@@ -1,10 +1,12 @@
 import asyncio
 import contextlib
+import re
 import time
 from dataclasses import dataclass, replace
 from itertools import islice
 from typing import (
     Any,
+    Final,
     Optional,
     Union,
     assert_never,
@@ -185,6 +187,63 @@ DEPTH_RESTORE_WAIT_SECS = 1.0
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+NOW_FLAG: Final[str] = "--now"
+
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
+# hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
+# turns a typed `--` into a single em dash on its own, which is the common way a
+# correctly-typed flag still arrives spelled wrong.
+_DASHES: Final[str] = "-‐‑‒–—―"
+_NEAR_NOW_RE: Final[re.Pattern[str]] = re.compile(f"[{_DASHES}]{{1,2}}now")
+
+
+@dataclass(frozen=True, slots=True)
+class PlayArgs:
+    """`-play`'s argument, split into the interjection flag and the query behind it.
+
+    `dash_typo` is the third state: the leading token is recognisably a misspelt
+    `--now` rather than either a flag or a search, so the command asks instead of
+    guessing. It is mutually exclusive with `now` — the whole point is that we do
+    not know which the user meant.
+    """
+
+    now: bool
+    query: str
+    dash_typo: bool = False
+
+
+def split_play_args(argument: str) -> PlayArgs:
+    """Split a leading `--now` off `-play`'s argument.
+
+    Only the FIRST token is considered, so a `--now` further along stays part of the
+    search text. Stripping it from anywhere would silently eat the token out of a
+    legitimate search, and would leave the origin `-remove` matches on as the line
+    minus a hole rather than as something the user typed.
+
+    Hand-parsed rather than a FlagConverter (as in src/debug.py's parse_debug_arg, and
+    unlike HistoryFlags above): the converter's grammar is `--flag value`, which cannot
+    express a valueless switch, and it matches flags anywhere in the line — which is
+    exactly the leading-token rule this has to enforce.
+
+    A leading token that is only a dash away from the flag gets `dash_typo`, because
+    `-now` or an autocorrected `—now` cannot be anything else. A bare leading `now`
+    deliberately does NOT: `-p now thats what i call music` is a real search, and
+    guessing there would break it.
+    """
+    stripped = argument.strip()
+    parts = stripped.split(maxsplit=1)
+    if not parts:
+        return PlayArgs(now=False, query="")
+    head = parts[0].lower()
+    # No strip on the tail: `stripped` had none, and split() eats the separator run.
+    rest = parts[1] if len(parts) > 1 else ""
+    if head == NOW_FLAG:
+        return PlayArgs(now=True, query=rest)
+    if _NEAR_NOW_RE.fullmatch(head):
+        return PlayArgs(now=False, query=stripped, dash_typo=True)
+    return PlayArgs(now=False, query=stripped)
 
 
 # What a user typed, echoed back into an embed. Discord renders markdown in embed

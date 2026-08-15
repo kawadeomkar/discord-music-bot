@@ -27,12 +27,14 @@ from src.musicbot import (
     EmptyPlaylistError,
     HistoryFlags,
     MusicBot,
+    PlayArgs,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
     _join_succeeded,
+    split_play_args,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
@@ -2674,6 +2676,88 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
         return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
     )
     return mp
+
+
+# ── -play argument parsing ────────────────────────────────────────────────────
+
+
+class TestSplitPlayArgs:
+    """`--now` comes off the front of -play's argument, or not at all.
+
+    The leading-token rule is the whole design: the remainder becomes both the
+    YouTube search and the origin `-remove` matches on, so a flag stripped from the
+    middle of a line would leave a value the user never typed."""
+
+    @pytest.mark.parametrize(
+        "argument,now,query",
+        [
+            ("never gonna give you up", False, "never gonna give you up"),
+            ("--now never gonna give you up", True, "never gonna give you up"),
+            ("--NOW song", True, "song"),
+            ("--now   https://youtu.be/x", True, "https://youtu.be/x"),
+            ("--now", True, ""),
+            ("  --now  song  ", True, "song"),
+            # A word that merely starts with the flag is a search, not a flag —
+            # and not a typo either, on both the two-dash and one-dash side.
+            ("--nowhere man", False, "--nowhere man"),
+            ("-nowhere man", False, "-nowhere man"),
+            # Trailing and repeated flags stay in the text: only the head is read.
+            ("song --now", False, "song --now"),
+            ("--now --now song", True, "--now song"),
+            ("", False, ""),
+            ("   ", False, ""),
+        ],
+    )
+    def test_the_head_decides(self, argument: str, now: bool, query: str) -> None:
+        args = split_play_args(argument)
+        assert (args.now, args.query) == (now, query)
+        assert args.dash_typo is False
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "-now song",  # one ASCII hyphen
+            "–now song",  # en dash
+            "—now song",  # em dash — what iOS turns a typed `--` into
+            "―now song",  # horizontal bar
+            "-–now song",  # mixed pair
+            "—NOW song",  # the typo is case-insensitive too
+            "-now",  # nothing behind it
+        ],
+    )
+    def test_a_dash_away_from_the_flag_asks(self, argument: str) -> None:
+        """These cannot be anything but a misspelt `--now`, so the command asks
+        rather than searching YouTube for the user's own flag."""
+        args = split_play_args(argument)
+        assert args.dash_typo is True
+        assert args.now is False
+
+    @pytest.mark.parametrize(
+        "argument",
+        ["now thats what i call music", "now", "nowhere", "now --now"],
+    )
+    def test_a_bare_now_is_a_search(self, argument: str) -> None:
+        """The did-you-mean deliberately stops at the dash. `-p now thats what i
+        call music` is a real search, and guessing there would break it."""
+        args = split_play_args(argument)
+        assert (args.now, args.dash_typo, args.query) == (False, False, argument)
+
+    def test_the_query_keeps_its_case(self) -> None:
+        """Only the head is lowercased to match the flag — the search is what the
+        user typed, since it is also the origin -remove matches on."""
+        assert split_play_args("--now Never Gonna GIVE").query == "Never Gonna GIVE"
+
+    def test_it_splits_on_any_whitespace(self) -> None:
+        """Discord messages carry newlines; the head is a token, not everything up
+        to the first space."""
+        assert split_play_args("--now\nsong") == PlayArgs(now=True, query="song")
+
+    def test_play_args_is_immutable(self) -> None:
+        """Frozen: the split happens once at the top of the body and every consumer
+        downstream — the gate, the branch, the origin — reads that same value."""
+        args = split_play_args("--now song")
+        with pytest.raises(AttributeError):
+            setattr(args, "now", False)
 
 
 class TestPlayCommand:
