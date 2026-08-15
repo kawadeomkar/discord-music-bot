@@ -267,15 +267,11 @@ class GuildQueue:
                 self._display.popleft()
             self._display.extendleft(reversed(in_flight + new_items))
 
-            if self._store is None:
-                return new_items
             if in_flight:
-                entries = [_to_entry(s) for s in self._display if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
-            else:
+                await self._write_mirror(self._display)
+            elif self._store is not None:
+                # An LPUSH of just the new items, not a replacement: reachable
+                # only with no in-flight head, where nothing ahead needs keeping.
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
@@ -329,15 +325,11 @@ class GuildQueue:
                     break
             self._display = deque(in_flight + kept)
 
-            # Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a
-            # window where a concurrent LPOP sees an empty queue), under the mutex
-            # so a concurrent put()'s pushes can't be wiped by a rebuild that
-            # predates them. persisted=False items were never RPUSHed — never
-            # write them in.
-            if self._store is not None and kept:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
+            # With no persisted survivor this DELETEs the mirror rather than
+            # leaving it stale. Unreachable today: it needs 4+ crash-recovered
+            # items, and restore_crashed makes one.
+            if kept:
+                await self._write_mirror(in_flight + kept)
 
         return ShuffleOutcome.SHUFFLED
 
@@ -373,12 +365,8 @@ class GuildQueue:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + kept)
 
-            if removed_positions and self._store is not None:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
+            if removed_positions:
+                await self._write_mirror(in_flight + kept)
 
         return RemoveOutcome(removed=removed_items, positions=removed_positions)
 
@@ -524,6 +512,26 @@ class GuildQueue:
             await self._store.pop_queue()
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    async def _write_mirror(self, items: Sequence[QueueItem]) -> None:
+        """Bring the Redis mirror in line with `items` — the persisted subset, in
+        order.
+
+        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
+        mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
+        predates them. persisted=False items were never RPUSHed — never write them in.
+
+        Empty means DELETE, not skip, or the old list survives for the next restore
+        to find.
+        """
+        if self._store is None:
+            return
+        entries = [_to_entry(s) for s in items if is_persisted(s)]
+        if not entries:
+            await self._store.delete_queue()
+            return
+        await self._store.rebuild_queue(entries)
 
     def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
         """The dequeued-but-uncommitted items at the display head.

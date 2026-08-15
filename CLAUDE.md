@@ -472,6 +472,8 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   on / never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
+- Every mirror write goes through `_write_mirror(items)`, which owns the rebuild /
+  DELETE choice. Empty means DELETE, never skip.
 
 ### Redis schema and persistence model
 

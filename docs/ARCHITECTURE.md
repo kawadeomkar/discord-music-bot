@@ -630,9 +630,11 @@ Every mutation that touches the Redis mirror (put, clear, shuffle, remove, `fini
 
 `MusicPlayer`'s thin wrappers (`queue_clear`/`queue_shuffle`/`queue_remove`) call `_cancel_prefetch()` **before** delegating — a still-running prefetch holds an item from `get_nowait()`, and cancellation returns it via `requeue_front()` so the bulk mutation processes it with everything else.
 
-- **Shuffle**: drains all legs under the mutex, `random.shuffle`, re-enqueues, rebuilds the Redis list via `MULTI/EXEC` (`DEL` + `RPUSH` atomically — no empty-key window for a concurrent LPOP). Returns a `ShuffleOutcome` enum.
+- **Shuffle**: drains all legs under the mutex, `random.shuffle`, re-enqueues, rebuilds the mirror. Returns a `ShuffleOutcome` enum.
 - **Clear**: drains all three legs, sets the cleared-flag the loop consumes (`consume_cleared_flag()`), returns the removed titles for the report embed.
 - **Remove**: filters all matching URLs from all legs, returns the removed 1-based positions.
+
+**One writer for the mirror.** `_write_mirror(items)` owns the rebuild-vs-delete choice for all three bulk mutations; before, each of them inlined its own copy and they disagreed about the empty case. Empty means `DELETE`, not skip — a queue whose every persisted entry just went would otherwise leave the old list behind for the next restore to find. The rebuild is `MULTI/EXEC` (`DEL` + `RPUSH` atomically, so a concurrent LPOP never sees an empty-key window).
 
 **Known residual window (by design)**: the loop's `try_commit_dequeue()` → `pop_queue_and_start_song()` handoff releases the mutex before the store's atomic transaction dispatches; a bulk mutation scheduled in that single event-loop tick can race the LPOP server-side. The start transaction is a store-level atomicity boundary — see the `guild_queue.py` module docstring.
 
