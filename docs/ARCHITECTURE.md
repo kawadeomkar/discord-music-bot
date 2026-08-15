@@ -468,7 +468,7 @@ flowchart TD
     Start(["-playnow url"])
     Live{"a song live?\n(current_song + vc playing/paused)"}
     Fallback["fall back to -play\n(joins if needed; playlists enqueue in full)"]
-    Resolve["parse_input + _resolve_playnow_source\n(playlist → first track only)\nqobj.interjected = True"]
+    Resolve["parse_input + _resolve_interjection_source\n(playlist → first track only)\nqobj.interjected = True"]
     Warm["await YTDL.prefetch_stream(qobj)\nwarm stream cache BEFORE interrupting\n(avoids dead air; back-fills embed metadata)"]
     Interject["mp.interject(qobj, vc)"]
     Ended{"song ended\nmid-resolve?"}

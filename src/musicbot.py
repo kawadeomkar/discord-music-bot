@@ -1138,16 +1138,19 @@ class MusicBot(commands.Cog):
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
 
-    async def _resolve_playnow_source(
+    async def _resolve_interjection_source(
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
         origin: str,
     ) -> QueueObject:
-        """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
-        their first track — interjecting a whole one would delay the interrupted
-        song's return indefinitely (use -play).
+        """Resolve an interjection's input to exactly one QueueObject. Playlists
+        collapse to their first track — interjecting a whole one would delay the
+        interrupted song's return indefinitely (use -play).
+
+        Named for what it does rather than for who asks: -playnow is one caller,
+        and -play on a paused song is the other.
 
         `origin` is the raw command argument, passed down by every branch — for a
         collapsed playlist it is the link, not the title the expansion generated."""
@@ -1289,7 +1292,7 @@ class MusicBot(commands.Cog):
         a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url)
-        qobj = await self._resolve_playnow_source(ctx, source, origin=url)
+        qobj = await self._resolve_interjection_source(ctx, source, origin=url)
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts

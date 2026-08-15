@@ -498,7 +498,7 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot._resolve_playnow_source(
+            result = await music_bot._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN
             )
         assert result.title == "T2"
@@ -517,7 +517,9 @@ class TestQuerySourceClassification:
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
             pytest.raises(PlaylistIndexError) as excinfo,
         ):
-            await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
+            await music_bot._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN
+            )
 
         await music_bot._command_error(
             mock_ctx, excinfo.value, title="Failed to play song now"
@@ -530,7 +532,7 @@ class TestQuerySourceClassification:
     async def test_playnow_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        # _resolve_playnow_source resolves both playlist shapes directly, so a
+        # _resolve_interjection_source resolves both playlist shapes directly, so a
         # token passed only from queue_source would leave these two unclassified.
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None
@@ -538,7 +540,9 @@ class TestQuerySourceClassification:
         fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
-            await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
+            await music_bot._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN
+            )
         assert self._passed_query_source(spy) == "spotify.com"
 
     async def test_playnow_youtube_playlist_bypasses_queue_source(
@@ -549,7 +553,9 @@ class TestQuerySourceClassification:
         tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
         spy = AsyncMock(return_value=tracks)
         with patch("src.musicbot.YTDL.yt_playlist", new=spy):
-            await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
+            await music_bot._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN
+            )
         assert self._passed_query_source(spy) == "youtube.com"
 
     async def test_playnow_indexed_playlist_rebases_only_the_track_it_keeps(
@@ -570,7 +576,7 @@ class TestQuerySourceClassification:
             for i in range(6)
         ]
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            kept = await music_bot._resolve_playnow_source(
+            kept = await music_bot._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN
             )
 
@@ -590,7 +596,9 @@ class TestQuerySourceClassification:
         fake_qobj = QueueObject(url, "Song", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
-            await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
+            await music_bot._resolve_interjection_source(
+                mock_ctx, source, origin=_ORIGIN
+            )
         assert spy.await_args is not None
         analytics = spy.await_args.kwargs["analytics"]
         assert analytics.queue_position == 0
@@ -3161,7 +3169,7 @@ class TestPlayWhilePaused:
         ]
         mock_ctx.message.add_reaction = AsyncMock()
         # Distinct sentinel, not tracks[0]: if the URL ever stops parsing as a
-        # playlist, _resolve_playnow_source falls through to queue_source, and
+        # playlist, _resolve_interjection_source falls through to queue_source, and
         # the identity assertion below catches it. (Stubbing it at all is also
         # a network guard — an unstubbed one runs a real yt-dlp extraction.)
         music_bot.queue_source = AsyncMock(
