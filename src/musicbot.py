@@ -474,25 +474,31 @@ def _join_succeeded(ctx: commands.Context) -> bool:
     return isinstance(vc, discord.VoiceClient) and vc.is_connected()
 
 
-def _play_will_interject(
+def _play_takes_the_queue(
     ctx: commands.Context, voice_client: Optional[discord.VoiceClient]
 ) -> bool:
-    """Whether this -play will stop what is playing rather than append to it.
+    """Whether this -play decides what a channel hears next, rather than adding to
+    the end of what it is already hearing.
+
+    `--now` stops the current song; `--next` takes the front of the queue. Both are
+    queue control, which every command other than -play is gated on — the exemption
+    exists because appending costs the listeners in another channel nothing, and
+    neither of these appends.
 
     Reads the PARSED argument: Command.prepare() runs _parse_arguments before
     call_before_hooks, so ctx.kwargs is filled by the time the gate runs. Other
     commands carry no `url` and fall out at the `.get`.
 
-    Deliberately conservative. A paused voice client counts as interjecting even
-    though the body also requires a current song, because the gate cannot ask for
-    one without building a player — and refusing a borderline cross-channel
-    interjection is the safe direction to be wrong in.
+    Deliberately conservative. A paused voice client counts even though the body
+    also requires a current song, because the gate cannot ask for one without
+    building a player — and a wrongly-refused command costs a re-send from the right
+    channel, where a wrongly-allowed one cannot be undone by the people it affected.
     """
     if voice_client is None:
         return False
     if voice_client.is_paused():
         return True
-    return split_play_args(str(ctx.kwargs.get("url", ""))).mode is PlayMode.NOW
+    return split_play_args(str(ctx.kwargs.get("url", ""))).mode is not PlayMode.NORMAL
 
 
 def _check_voice_permissions(
@@ -500,23 +506,24 @@ def _check_voice_permissions(
     voice_client: Optional[discord.VoiceClient],
     command_name: str,
     *,
-    interjecting: bool = False,
+    queue_control: bool = False,
 ) -> Optional[str]:
     """Returns an error message string if validation fails, None if OK.
 
     -play alone is exempt from the same-channel rule: queueing into a session
     running elsewhere costs its listeners nothing, they just hear the song later.
-    An INTERJECTION is not that — it stops what that channel is hearing right now,
-    so it is gated like every other command even when it arrives as -play. Without
-    the flag, a member in another channel could cut the song for a room they are
-    not in.
+    QUEUE CONTROL is not that — `--now` stops what that channel is hearing right
+    now, and `--next` decides what it hears when the current song ends — so it is
+    gated like every other order-changing command (-skip, -shuffle, -remove, -clear)
+    even when it arrives as -play. Without the flag, a member in another channel
+    could cut the line for a room they are not in.
     """
     if isinstance(author, discord.User):
         return f"You must be a member of this channel {author}"
     if not author.voice or not author.voice.channel:
         return f"You are not connected to a voice channel, you silly baka {author}"
     if (
-        (command_name != "play" or interjecting)
+        (command_name != "play" or queue_control)
         and voice_client is not None
         and voice_client.channel != author.voice.channel
     ):
@@ -859,7 +866,7 @@ class MusicBot(commands.Cog):
             ctx.author,
             voice_client,
             command_name,
-            interjecting=_play_will_interject(ctx, voice_client),
+            queue_control=_play_takes_the_queue(ctx, voice_client),
         )
         if msg:
             await ctx.send(embed=notice_embed(msg, discord.Color.red()))

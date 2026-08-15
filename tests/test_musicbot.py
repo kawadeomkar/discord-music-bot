@@ -36,7 +36,7 @@ from src.musicbot import (
     SpotifyDisabledError,
     _check_voice_permissions,
     _join_succeeded,
-    _play_will_interject,
+    _play_takes_the_queue,
     split_play_args,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
@@ -200,7 +200,7 @@ class TestCheckVoicePermissions:
         vc = MagicMock(spec=discord.VoiceClient)
         vc.channel = MagicMock()  # not the member's channel
         assert (
-            _check_voice_permissions(member, vc, "play", interjecting=True) is not None
+            _check_voice_permissions(member, vc, "play", queue_control=True) is not None
         )
 
     def test_an_interjecting_play_in_the_same_channel_is_fine(self) -> None:
@@ -210,11 +210,11 @@ class TestCheckVoicePermissions:
         member.voice.channel = channel
         vc = MagicMock(spec=discord.VoiceClient)
         vc.channel = channel
-        assert _check_voice_permissions(member, vc, "play", interjecting=True) is None
+        assert _check_voice_permissions(member, vc, "play", queue_control=True) is None
 
 
-class TestPlayWillInterject:
-    """What the voice gate reads to decide whether a -play is an interjection.
+class TestPlayTakesTheQueue:
+    """What the voice gate reads to decide whether a -play is queue control.
 
     It runs as a before_invoke hook, which discord.py calls AFTER parsing —
     Command.prepare() runs _parse_arguments and then call_before_hooks — so the
@@ -233,41 +233,52 @@ class TestPlayWillInterject:
         return vc
 
     def test_no_voice_client_never_interjects(self) -> None:
-        assert _play_will_interject(self._ctx("--now song"), None) is False
+        assert _play_takes_the_queue(self._ctx("--now song"), None) is False
 
     def test_the_flag_says_so(self) -> None:
         assert (
-            _play_will_interject(self._ctx("--now song"), self._vc(paused=False))
+            _play_takes_the_queue(self._ctx("--now song"), self._vc(paused=False))
             is True
         )
 
     def test_a_plain_play_appends(self) -> None:
-        assert _play_will_interject(self._ctx("song"), self._vc(paused=False)) is False
+        assert _play_takes_the_queue(self._ctx("song"), self._vc(paused=False)) is False
+
+    def test_the_next_flag_says_so_too(self) -> None:
+        """`--next` interrupts nothing, but it decides what the channel hears when
+        the current song ends — which is queue control, the thing -skip, -shuffle,
+        -remove and -clear are all gated on. -play's exemption exists because
+        APPENDING costs the other channel's listeners nothing, and this does not
+        append."""
+        assert (
+            _play_takes_the_queue(self._ctx("--next song"), self._vc(paused=False))
+            is True
+        )
 
     def test_a_paused_song_interjects_without_the_flag(self) -> None:
         """-play on a paused song interrupts it to bring it back playing, so it
         has always been an interjection — and has always carried -play's
         exemption. Closing that is why this reads the pause state too."""
-        assert _play_will_interject(self._ctx("song"), self._vc(paused=True)) is True
+        assert _play_takes_the_queue(self._ctx("song"), self._vc(paused=True)) is True
 
     def test_a_trailing_flag_is_not_the_flag(self) -> None:
         """Same leading-token rule as everywhere else: the gate must agree with
         the body about what counts, or one refuses what the other would append."""
         assert (
-            _play_will_interject(self._ctx("song --now"), self._vc(paused=False))
+            _play_takes_the_queue(self._ctx("song --now"), self._vc(paused=False))
             is False
         )
 
     def test_a_command_with_no_url_argument_falls_out(self) -> None:
         ctx = MagicMock()
         ctx.kwargs = {}
-        assert _play_will_interject(ctx, self._vc(paused=False)) is False
+        assert _play_takes_the_queue(ctx, self._vc(paused=False)) is False
 
 
-class TestValidateCommandsGatesInterjections:
+class TestValidateCommandsGatesQueueControl:
     """The hook wires the two halves together. Both are tested apart above, and
-    both stay green if the hook stops passing the flag — so this is what proves
-    a cross-channel `-p --now` is actually refused end to end."""
+    both stay green if the hook stops passing the flag — so this is what proves a
+    cross-channel `-p --now` / `-p --next` is actually refused end to end."""
 
     @staticmethod
     def _ctx(url: str, *, same_channel: bool) -> MagicMock:
@@ -285,10 +296,11 @@ class TestValidateCommandsGatesInterjections:
         ctx.send = AsyncMock()
         return ctx
 
-    async def test_a_cross_channel_interjection_is_refused(
-        self, music_bot: MusicBot
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_cross_channel_queue_control_is_refused(
+        self, music_bot: MusicBot, flag: str
     ) -> None:
-        ctx = self._ctx("--now song", same_channel=False)
+        ctx = self._ctx(f"{flag} song", same_channel=False)
         with pytest.raises(commands.CommandError):
             await music_bot.validate_commands(ctx)
         assert "already being used" in described(ctx.send.call_args.kwargs["embed"])
@@ -301,10 +313,11 @@ class TestValidateCommandsGatesInterjections:
         await music_bot.validate_commands(ctx)
         ctx.send.assert_not_awaited()
 
-    async def test_a_same_channel_interjection_is_allowed(
-        self, music_bot: MusicBot
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_same_channel_queue_control_is_allowed(
+        self, music_bot: MusicBot, flag: str
     ) -> None:
-        ctx = self._ctx("--now song", same_channel=True)
+        ctx = self._ctx(f"{flag} song", same_channel=True)
         await music_bot.validate_commands(ctx)
         ctx.send.assert_not_awaited()
 
