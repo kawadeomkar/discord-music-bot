@@ -257,7 +257,7 @@ class TestQuerySourceClassification:
     async def test_plaintext_search(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = parse_input("never gonna give you up", "-play never gonna give you up")
+        source = parse_input("never gonna give you up")
         fake_qobj = QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
@@ -270,7 +270,7 @@ class TestQuerySourceClassification:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         url = "https://www.tiktok.com/@user/video/1234567890"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         fake_qobj = QueueObject(url, "Clip", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
@@ -285,7 +285,7 @@ class TestQuerySourceClassification:
         # One token for the whole playlist: yt_playlist stamps it onto each
         # QueueObject it builds, so the call carries it once.
         url = "https://www.youtube.com/playlist?list=PLabc"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"T{i}", mock_ctx.author)
             for i in range(3)
@@ -310,7 +310,7 @@ class TestQuerySourceClassification:
     ) -> None:
         """A link copied at position 4 queues from #4, not from the top."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
@@ -328,7 +328,7 @@ class TestQuerySourceClassification:
         every kept track three deeper than it actually waited — invisible unless
         a test carries an index."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = [
             QueueObject(
                 f"https://yt.com/watch?v=v{i}",
@@ -355,7 +355,7 @@ class TestQuerySourceClassification:
         """The rebase subtracts the dropped count, it does not zero the field: a
         playlist queued behind two songs still waits behind them."""
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = [
             QueueObject(
                 f"https://yt.com/watch?v=v{i}",
@@ -378,7 +378,7 @@ class TestQuerySourceClassification:
         """index=1 is the first song, so it drops nothing — the common shape,
         since YouTube stamps it onto a share copied at the top."""
         url = "https://www.youtube.com/watch?v=v0&list=PLabc&index=1"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
@@ -394,7 +394,7 @@ class TestQuerySourceClassification:
         """Not a silent empty enqueue: an out-of-range index would otherwise
         report "Queued playlist — 0 songs" and queue nothing."""
         url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with (
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
@@ -411,7 +411,7 @@ class TestQuerySourceClassification:
         """The same guard -playnow already had: a playlist that resolves to
         nothing is an error, not a successful enqueue of zero songs."""
         url = "https://www.youtube.com/playlist?list=PLabc"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         with (
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[])),
             pytest.raises(EmptyPlaylistError),
@@ -426,7 +426,7 @@ class TestQuerySourceClassification:
         """`t=` names an offset into the `v=` video, and `index=` makes that
         video the head of the queue — so the offset lands on it."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4&t=90"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
@@ -443,7 +443,7 @@ class TestQuerySourceClassification:
         """No index, so the queue starts at track 1 — which is not the video the
         offset belongs to. Seeking it would start the wrong song mid-way."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&t=30"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 6)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot.queue_source(
@@ -495,7 +495,7 @@ class TestQuerySourceClassification:
     ) -> None:
         """-playnow interjects the track the link was copied at, not track 1."""
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
             result = await music_bot._resolve_playnow_source(
@@ -511,7 +511,7 @@ class TestQuerySourceClassification:
         """-playnow shares the guard, and its own error path renders the same
         embed under its own title."""
         url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 3)
         with (
             patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)),
@@ -545,7 +545,7 @@ class TestQuerySourceClassification:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         url = "https://www.youtube.com/playlist?list=PLabc"
-        source = parse_input(url, f"-play {url}")
+        source = parse_input(url)
         tracks = [QueueObject("https://yt.com/v=1", "T", mock_ctx.author)]
         spy = AsyncMock(return_value=tracks)
         with patch("src.musicbot.YTDL.yt_playlist", new=spy):
@@ -559,7 +559,7 @@ class TestQuerySourceClassification:
         only consumer throws it away, so keep_first_only trims first — and the
         one survivor still lands at 0, the depth an interjection actually has."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
-        source = parse_input(url, f"-playnow {url}")
+        source = parse_input(url)
         tracks = [
             QueueObject(
                 f"https://yt.com/watch?v=v{i}",
@@ -586,7 +586,7 @@ class TestQuerySourceClassification:
         # An interjection plays immediately by definition, so -playnow reads no
         # queue depth at all — and its queued_at is still the ask time.
         url = "https://www.youtube.com/watch?v=abc"
-        source = parse_input(url, f"-playnow {url}")
+        source = parse_input(url)
         fake_qobj = QueueObject(url, "Song", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
@@ -3170,9 +3170,6 @@ class TestPlayWhilePaused:
             )
         )
         url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
-        # parse_input splits the full message to count args — an unset MagicMock
-        # content makes every URL fall back to the ytsearch branch.
-        mock_ctx.message.content = f"-play {url}"
 
         with (
             _no_typing(),
@@ -3905,7 +3902,10 @@ class TestCommandArgumentBinding:
         "typed,expected",
         [
             ("never gonna give you up", "never gonna give you up"),
-            ("some song   ", "some song"),  # read_rest keeps trailing whitespace
+            # discord.py strips a consume-rest argument before the body sees it;
+            # this pins that play() does not re-introduce the whitespace when it
+            # hands the origin on.
+            ("some song   ", "some song"),
         ],
     )
     async def test_what_the_user_typed_reaches_queue_source_whole(
@@ -3917,7 +3917,6 @@ class TestCommandArgumentBinding:
     ) -> None:
         """The end-to-end C1 guards: the origin -remove matches on is the whole
         line, stripped. Previously it was the first word."""
-        mock_ctx.message.content = f"-play {typed}"
         mock_ctx.voice_client = _connected_vc()
         music_bot.queue_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
@@ -4243,7 +4242,6 @@ class TestPlaynow:
     ) -> None:
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
-        mock_ctx.message.content = "-playnow test song"
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
@@ -4407,7 +4405,6 @@ class TestPlaynow:
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
-        mock_ctx.message.content = f"-playnow {url}"
         assert music_bot.spotify is not None  # fixture provides a mock client
         music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
@@ -4440,7 +4437,6 @@ class TestPlaynow:
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         url = "https://www.youtube.com/playlist?list=PLtest123"
-        mock_ctx.message.content = f"-playnow {url}"
         first = QueueObject("https://yt.com/v=1", "Track One", mock_ctx.author)
         second = QueueObject("https://yt.com/v=2", "Track Two", mock_ctx.author)
 

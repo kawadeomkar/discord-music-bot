@@ -1005,9 +1005,11 @@ class MusicBot(commands.Cog):
     async def play(self, ctx: commands.Context, *, url: str) -> None:
         # Consume-rest, so a multi-word search arrives whole. It is what -remove
         # matches on, and a positional would bind only "never" out of "never gonna
-        # give you up" — making that removable by a prefix nobody typed.
-        # parse_input reads the search off the message either way; only the origin
-        # changes. Stripped because read_rest keeps trailing whitespace.
+        # give you up" — making that removable by a prefix nobody typed. parse_input
+        # reads the search off THIS argument, not off the raw message, so whatever
+        # is passed here is the whole input as far as everything downstream knows.
+        # discord.py already strips a consume-rest argument; this covers the direct
+        # callers (tests) that never went through its parser.
         url = url.strip()
         async with background_typing(ctx):
             try:
@@ -1028,7 +1030,7 @@ class MusicBot(commands.Cog):
                             require_paused=True,
                         )
 
-                source = parse_input(url, ctx.message.content)
+                source = parse_input(url)
 
                 qobj: Union[
                     QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
@@ -1286,7 +1288,7 @@ class MusicBot(commands.Cog):
         is appended instead. Reading it here rather than at command entry also means
         a song that fails to resolve never stops the paused song.
         """
-        source = parse_input(url, ctx.message.content)
+        source = parse_input(url)
         qobj = await self._resolve_playnow_source(ctx, source, origin=url)
         qobj.interjected = True
 

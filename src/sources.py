@@ -170,12 +170,9 @@ def _playlist_index(raw: str) -> Optional[int]:
     return value if value >= 1 else None
 
 
-def parse_url(
-    url: str, message: str
-) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
-    `message` is the full message content. domain regex groups: 1/2 = http/www prefix,
-    3 = domain, 4 = path."""
+    domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
     args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
@@ -241,17 +238,23 @@ def parse_url(
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
-def parse_input(
-    user_input: str, message: str
-) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Top-level entry point for command input: tries parse_url, falls back to ytsearch.
     parse_url is attempted only for single-word input, since URLs never contain spaces; a
     single-word term with a slash ("98/99") still reaches it but raises ValueError on the
-    dotless host and falls back to search."""
-    args = message.split(" ")[1:]
+    dotless host and falls back to search.
+
+    Reads only what the caller passes. It used to re-derive the search from the raw
+    message content, which was possible only while `-play` bound one word — and which
+    counted the whitespace between prefix and argument as part of the term, so a
+    double-spaced `-play  <link>` was searched for as text instead of parsed as a URL.
+    A caller that strips a flag off the front now gets the answer for what remains."""
+    args = user_input.split()
     if len(args) == 1:
         try:
-            return parse_url(user_input, message)
+            # args[0], not user_input: the token without whatever whitespace
+            # surrounded it, since parse_url hands this straight to YTSource.url.
+            return parse_url(args[0])
         except ValueError:
             pass
     ytsearch = " ".join(args)
