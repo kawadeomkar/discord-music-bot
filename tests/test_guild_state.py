@@ -446,7 +446,8 @@ _GOLDEN_QOBJ_UNPERSISTED = (
 )
 _GOLDEN_QOBJ_PRE_PLAYNOW = b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"Golden Song","requester_id":222222222222222222,"ts":30,"user_input":"golden song","duration":240,"uploader":"Golden Channel","thumbnail":"https://img.yt/1.jpg","persisted":true}'
 _GOLDEN_YTSOURCE = (
-    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null,'
+    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,'
+    b'"ts":null,"user_input":null,'
     + _ENQUEUE_STAMPS_ZERO
     + b","
     + _QUERY_SOURCE_UNKNOWN
@@ -648,6 +649,24 @@ class TestSearchQueueEntryWire:
     def test_writer_matches_golden_bytes(self) -> None:
         entry = SearchQueueEntry(ytsearch="ytsearch:some song", process=True)
         assert entry.to_redis() == _GOLDEN_YTSOURCE
+
+    def test_origin_survives_the_wire(self) -> None:
+        """An unresolved Spotify-album track is the only place the album link still
+        exists: its ytsearch is a title the expansion generated, and the resolved
+        YouTube URL it becomes names neither. Drop this field on the wire and
+        -remove <album link> stops matching the moment the bot restarts."""
+        album = "https://open.spotify.com/album/abc123"
+        entry = SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.user_input == album
+
+    def test_pre_feature_entry_parses_with_no_origin(self) -> None:
+        """Absent reads as None, not as an error — the same convention every other
+        added field follows, so a queue written by an older build still restores."""
+        parsed = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_STAMPS)
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.user_input is None
 
     def test_reader_parses_golden_bytes(self) -> None:
         entry = parse_queue_entry(_GOLDEN_YTSOURCE)

@@ -474,6 +474,9 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   observes an empty-window queue.
 - Every mirror write goes through `_write_mirror(items)`, which owns the rebuild /
   DELETE choice. Empty means DELETE, never skip.
+- `remove()` takes a **predicate**, and `remove_matcher()` beside the class owns the
+  policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
+  casefolds — folding a link would let one Spotify album's base62 id match another's.
 
 ### Redis schema and persistence model
 
@@ -486,7 +489,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | Key | Type | TTL | Contents |
 |---|---|---|---|
 | `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
-| `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks) |
+| `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks). Both carry `user_input`, what the user typed; on a search entry it is the ONLY surviving record of the collection link, since its `ytsearch` is a generated title |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |

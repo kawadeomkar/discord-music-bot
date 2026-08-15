@@ -95,6 +95,10 @@ class YTSource:
     # nothing re-mints downstream, so an omission persists 0.0/0 to Redis and to
     # play_history with no error and no log line.
     analytics: Analytics = ANALYTICS_ZERO
+    # What the user typed, for -remove to match on. Same contract as analytics:
+    # the parse layer leaves None, and an old wire entry rehydrates as None too, so
+    # an omission downstream is silent rather than reported.
+    user_input: Optional[str] = None
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
     # Spotify-playlist tracks alike, and it is the only one that survives into Redis
@@ -134,18 +138,20 @@ def query_source_of(
 
 
 def spotify_playlist_to_ytsearch(
-    titles: list[str], *, analytics: Analytics
+    titles: list[str], *, analytics: Analytics, origin: str
 ) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches. The Spotify token and the
-    ask-time analytics are set here because it is the last point that knows where
-    these came from — each resolves to a YouTube URL at dequeue. `analytics` is
-    the head's; per-track positions are derived from it, as in yt_playlist."""
+    """Spotify playlist tracks as lazy YouTube searches. The Spotify token, the
+    ask-time analytics and `origin` are set here because it is the last point that
+    knows where these came from — each resolves to a YouTube URL at dequeue.
+    `analytics` is the head's; per-track positions are derived from it, as in
+    yt_playlist. `origin` is the album/playlist link the user pasted."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
             analytics=replace(analytics, queue_position=analytics.queue_position + i),
+            user_input=origin,
         )
         for i, title in enumerate(titles)
     ]

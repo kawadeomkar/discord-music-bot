@@ -36,9 +36,9 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum, StrEnum, auto
 from typing import Optional, Union
 
 import discord
@@ -78,6 +78,46 @@ class ShuffleOutcome(Enum):
     TOO_FEW_SONGS = auto()  # fewer than 4 queued items — nothing was mutated
 
 
+class RemoveMode(StrEnum):
+    """How a removal matched, for the reply to explain itself with."""
+
+    RESOLVED = "resolved"  # the yt-dlp URL, as the Now Playing card shows it
+    ORIGIN = "origin"  # what the user typed: a search term, or a source link
+
+
+# One queue item → the mode it matched under, or None. Built by remove_matcher().
+RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
+
+
+def _normalize(s: str) -> str:
+    """Fold a needle for comparison: collapse whitespace, and casefold anything
+    that is not a URL. Links keep their case — the ids inside them are
+    case-sensitive, so folding one would match a different album."""
+    s = " ".join(s.split())
+    return s if s[:8].lower().startswith(("http://", "https:/")) else s.casefold()
+
+
+def remove_matcher(needle: str) -> RemoveMatcher:
+    """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
+    first, then what the user typed. An origin match takes out every item sharing
+    it, so one album link removes the tracks it queued. Links compare literally —
+    youtu.be/x does not match an entry stored as youtube.com/watch?v=x."""
+    folded = _normalize(needle)
+
+    def match(item: QueueItem) -> Optional[RemoveMode]:
+        resolved = (
+            item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
+        )
+        if resolved == needle:
+            return RemoveMode.RESOLVED
+        origin = item.user_input
+        if origin is not None and _normalize(origin) == folded:
+            return RemoveMode.ORIGIN
+        return None
+
+    return match
+
+
 @dataclass(frozen=True)
 class RemoveOutcome:
     """What remove() took out. The positions are what the command reports; the
@@ -86,6 +126,8 @@ class RemoveOutcome:
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
+    # ORIGIN when anything matched on what the user typed; None when nothing did.
+    mode: Optional[RemoveMode] = None
 
 
 def _to_entry(item: QueueItem) -> QueueEntry:
@@ -333,17 +375,17 @@ class GuildQueue:
 
         return ShuffleOutcome.SHUFFLED
 
-    async def remove(self, url: str) -> RemoveOutcome:
-        """Remove every queued item whose webpage_url (QueueObject) or url
-        (YTSource) matches. Returns the removed items with their 1-indexed
-        positions as the queue embed shows them — the items because a removed
-        entry can be the last record of a song that already played. An in-flight
-        dequeue is never removed even on a URL match (it is committed to play;
+    async def remove(self, match: RemoveMatcher) -> RemoveOutcome:
+        """Remove every queued item `match` accepts. Returns the removed items with
+        their 1-indexed positions as the queue embed shows them — the items because
+        a removed entry can be the last record of a song that already played. An
+        in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset."""
+        the numbering offset. The matching policy is remove_matcher's."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
+        modes: list[RemoveMode] = []
 
         async with self._mutex:
             # Drain everything first so positions are numbered before partitioning.
@@ -351,13 +393,11 @@ class GuildQueue:
             in_flight = self._in_flight_head(pending_count=len(drained))
 
             for pos, item in enumerate(drained, start=1 + len(in_flight)):
-                if isinstance(item, QueueObject):
-                    match = item.webpage_url == url
-                else:
-                    match = (item.url or "") == url
-                if match:
+                mode = match(item)
+                if mode is not None:
                     removed_positions.append(pos)
                     removed_items.append(item)
+                    modes.append(mode)
                 else:
                     kept.append(item)
 
@@ -368,7 +408,15 @@ class GuildQueue:
             if removed_positions:
                 await self._write_mirror(in_flight + kept)
 
-        return RemoveOutcome(removed=removed_items, positions=removed_positions)
+        return RemoveOutcome(
+            removed=removed_items,
+            positions=removed_positions,
+            # ORIGIN if anywhere in the run: the argument reached items the
+            # resolved URL alone would not have.
+            mode=RemoveMode.ORIGIN
+            if RemoveMode.ORIGIN in modes
+            else (RemoveMode.RESOLVED if modes else None),
+        )
 
     # ── Crash recovery ────────────────────────────────────────────────────────
 
@@ -571,6 +619,7 @@ class GuildQueue:
                     queued_at=entry.queued_at,
                     queue_position=entry.queue_position,
                 ),
+                user_input=entry.user_input,
                 query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None
