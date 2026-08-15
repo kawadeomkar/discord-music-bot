@@ -1432,10 +1432,13 @@ class MusicBot(commands.Cog):
                 qobj.analytics,
                 queue_position=1 if mp.current_song is not None else 0,
             )
-            # The player's wrapper, not queue.put_front directly — the same
-            # item-vs-list plumbing as every other user-facing insert.
+            # queue_put_next, not queue_put_front: the embed below promises "play
+            # next", and a bare front-insert only delivers that when nothing is
+            # queued — the loop's prefetch holds a claim the insert would land
+            # behind. interject() returned None here without reaching its own
+            # neutralize, so this is the one path that still has to do it.
             # prefetch=False — the stream URL was warmed above.
-            await mp.queue_put_front(qobj, prefetch=False)
+            await mp.queue_put_next(qobj, prefetch=False)
             await asyncio.gather(
                 send_embed(
                     ctx,

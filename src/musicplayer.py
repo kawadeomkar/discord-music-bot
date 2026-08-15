@@ -1106,6 +1106,39 @@ class MusicPlayer:
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
 
+    async def queue_put_next(
+        self,
+        obj: Union[QueueItem, Sequence[QueueItem]],
+        *,
+        prefetch: bool = True,
+    ) -> None:
+        """Insert so this plays NEXT, without interrupting what is playing.
+
+        queue_put_front() alone does not do that. loop() spawns
+        _prefetch_next_song() on every iteration, and its get_nowait() holds an open
+        claim for the rest of the current song — so with anything queued at all,
+        put_front lands the item at _cursor, BEHIND that claimed head, and it plays
+        second. Nothing may be inserted ahead of the claim: I6 makes the claimed
+        items a prefix because Redis retires them by LPOP, so an entry in front
+        would make that LPOP eat the wrong one. Giving the claim back first is the
+        only correct move, which is why interject() opens the same way.
+
+        The bill is one killed FFmpeg subprocess. The stream URL survives in
+        ytdl:stream:*, so the neutralized song's later re-resolve is a cache hit
+        plus a spawn, not a fresh extraction — the same bill `--now` already pays.
+
+        The prefetch is deliberately NOT re-spawned afterwards. _prefetch_task is a
+        single slot with a claim-then-null protocol between interject() and loop();
+        if the current song ends between the neutralize and a re-spawn, loop() reads
+        None, dequeues normally, and then overwrites the slot with its own
+        iteration's task — orphaning ours with a claim nothing will ever settle, and
+        drifting _cursor by one permanently. interject() accepts the same one-song
+        gap. The `prefetch` flag below is the other, unrelated prefetch: a stream-URL
+        warm that never touches the queue.
+        """
+        await self._neutralize_prefetch()
+        await self.queue_put_front(obj, prefetch=prefetch)
+
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()
 

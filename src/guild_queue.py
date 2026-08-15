@@ -563,7 +563,12 @@ class GuildQueue:
 
         The interjected song is not always at index 0 — put_front inserts behind a
         dequeued-but-uncommitted item — so the run starts after the claimed prefix,
-        which _cursor names directly."""
+        which _cursor names directly.
+
+        Reads _items[_cursor] AS the interjection, so it is only meaningful called
+        from interject() — its one caller, for a span attribute. Anything else that
+        front-inserts (queue_put_next) leaves its own song there, and this would
+        then describe that song as having parked the tails behind it."""
         items = list(self._items)
         start = self._cursor + 1
         depth = 0

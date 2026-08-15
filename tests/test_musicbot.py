@@ -4847,7 +4847,7 @@ class TestNowFlag:
         enqueue every track right after the first-track-only notice. The user still
         gets a confirmation embed."""
         live_mp.interject = AsyncMock(return_value=None)
-        live_mp.queue_put_front = AsyncMock()
+        live_mp.queue_put_next = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = live_vc
         mock_ctx.invoke = AsyncMock()
@@ -4862,9 +4862,12 @@ class TestNowFlag:
         # would re-parse and, for a playlist, enqueue every track right after the
         # first-track-only notice.
         music_bot.queue_source.assert_awaited_once()
-        # The player's wrapper, not queue.put_front directly — same plumbing as
-        # every other insert; the stream was warmed, so it must not prefetch again.
-        live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
+        # queue_put_next, not queue_put_front: the embed promises "play next", and
+        # a bare front-insert only delivers that with nothing queued — the loop's
+        # prefetch holds a claim the insert would land behind. interject() returned
+        # None without reaching its own neutralize, so this path owes it.
+        # prefetch=False — the stream was warmed, so it must not warm again.
+        live_mp.queue_put_next.assert_awaited_once_with(qobj, prefetch=False)
         # interject() also returns None when the loop moved on to a DIFFERENT
         # song, which this insert waits behind: one, not the 0 an interjection
         # would have had, and not the queue depth — it goes to the front.
