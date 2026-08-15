@@ -881,6 +881,7 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         query_source: str,
         analytics: Analytics,
+        user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
@@ -888,9 +889,15 @@ class YTDL(discord.FFmpegOpusAudio):
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
         Redis source cache if present.
 
-        query_source and analytics are REQUIRED so the QueueObject leaves here
-        complete — a default would let a new call site forget them and write a
-        plausible zero, permanently indistinguishable from a real value."""
+        query_source, analytics and user_input are REQUIRED so the QueueObject
+        leaves here complete — a default would let a new call site forget them and
+        write a plausible zero, permanently indistinguishable from a real value.
+
+        user_input is what the user typed; None falls back to `search`, which is the
+        same string only for a direct -play of one song. For an expanded collection
+        `search` is a title this code generated, so the fallback would lose the album
+        link -remove matches on."""
+        origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
         # per-request playback offset, not part of the video identity.
@@ -908,7 +915,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     cached["title"],
                     requester,
                     ts=ts,
-                    user_input=search,
+                    user_input=origin,
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
                     thumbnail=cached.get("thumbnail"),
@@ -1009,7 +1016,7 @@ class YTDL(discord.FFmpegOpusAudio):
             title,
             requester,
             ts=ts,
-            user_input=search,
+            user_input=origin,
             duration=duration,
             uploader=uploader,
             thumbnail=thumbnail,
@@ -1025,11 +1032,14 @@ class YTDL(discord.FFmpegOpusAudio):
         *,
         query_source: str,
         analytics: Analytics,
+        user_input: str,
     ) -> list[QueueObject]:
         """Fetch flat entry metadata for every video in a YouTube playlist.
 
-        query_source and analytics are REQUIRED (see yt_source). `analytics` is
-        the head's — track positions are derived per kept track below."""
+        query_source, analytics and user_input are REQUIRED (see yt_source).
+        `analytics` is the head's — track positions are derived per kept track
+        below. `user_input` is the playlist link the user pasted, carried onto every
+        track so -remove can match it."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -1065,6 +1075,7 @@ class YTDL(discord.FFmpegOpusAudio):
                     video_url,
                     title,
                     requester,
+                    user_input=user_input,
                     query_source=query_source,
                     analytics=replace(
                         analytics,

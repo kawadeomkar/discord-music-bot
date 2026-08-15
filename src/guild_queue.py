@@ -36,9 +36,9 @@ See docs/ARCHITECTURE.md#queue-invariant.
 import asyncio
 import random
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum, StrEnum, auto
 from typing import Optional, Union
 
 import discord
@@ -54,6 +54,11 @@ log = get_logger(__name__)
 # Live queue items — what the in-memory legs hold. The at-rest twin is
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
+
+# Above this many removed entries, rebuilding the whole list is cheaper than the
+# per-LREM scans. Set below the measured crossover so queue depth, which moves it,
+# has margin. See docs/ARCHITECTURE.md#queue-operations.
+_LREM_MAX_ENTRIES = 200
 
 
 class _FrontQueue(asyncio.Queue[QueueItem]):
@@ -78,6 +83,46 @@ class ShuffleOutcome(Enum):
     TOO_FEW_SONGS = auto()  # fewer than 4 queued items — nothing was mutated
 
 
+class RemoveMode(StrEnum):
+    """How a removal matched, for the reply to explain itself with."""
+
+    RESOLVED = "resolved"  # the yt-dlp URL, as the Now Playing card shows it
+    ORIGIN = "origin"  # what the user typed: a search term, or a source link
+
+
+# One queue item → the mode it matched under, or None. Built by remove_matcher().
+RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
+
+
+def _normalize(s: str) -> str:
+    """Fold a needle for comparison: collapse whitespace, and casefold anything
+    that is not a URL. Links keep their case — the ids inside them are
+    case-sensitive, so folding one would match a different album."""
+    s = " ".join(s.split())
+    return s if s[:8].lower().startswith(("http://", "https:/")) else s.casefold()
+
+
+def remove_matcher(needle: str) -> RemoveMatcher:
+    """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
+    first, then what the user typed. An origin match takes out every item sharing
+    it, so one album link removes the tracks it queued. Links compare literally —
+    youtu.be/x does not match an entry stored as youtube.com/watch?v=x."""
+    folded = _normalize(needle)
+
+    def match(item: QueueItem) -> Optional[RemoveMode]:
+        resolved = (
+            item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
+        )
+        if resolved == needle:
+            return RemoveMode.RESOLVED
+        origin = item.user_input
+        if origin is not None and _normalize(origin) == folded:
+            return RemoveMode.ORIGIN
+        return None
+
+    return match
+
+
 @dataclass(frozen=True)
 class RemoveOutcome:
     """What remove() took out. The positions are what the command reports; the
@@ -86,6 +131,8 @@ class RemoveOutcome:
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
+    # ORIGIN when anything matched on what the user typed; None when nothing did.
+    mode: Optional[RemoveMode] = None
 
 
 def _to_entry(item: QueueItem) -> QueueEntry:
@@ -267,15 +314,11 @@ class GuildQueue:
                 self._display.popleft()
             self._display.extendleft(reversed(in_flight + new_items))
 
-            if self._store is None:
-                return new_items
             if in_flight:
-                entries = [_to_entry(s) for s in self._display if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
-            else:
+                await self._write_mirror(self._display)
+            elif self._store is not None:
+                # An LPUSH of just the new items, not a replacement: reachable
+                # only with no in-flight head, where nothing ahead needs keeping.
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
@@ -329,29 +372,25 @@ class GuildQueue:
                     break
             self._display = deque(in_flight + kept)
 
-            # Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a
-            # window where a concurrent LPOP sees an empty queue), under the mutex
-            # so a concurrent put()'s pushes can't be wiped by a rebuild that
-            # predates them. persisted=False items were never RPUSHed — never
-            # write them in.
-            if self._store is not None and kept:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
+            # With no persisted survivor this DELETEs the mirror rather than
+            # leaving it stale. Unreachable today: it needs 4+ crash-recovered
+            # items, and restore_crashed makes one.
+            if kept:
+                await self._write_mirror(in_flight + kept)
 
         return ShuffleOutcome.SHUFFLED
 
-    async def remove(self, url: str) -> RemoveOutcome:
-        """Remove every queued item whose webpage_url (QueueObject) or url
-        (YTSource) matches. Returns the removed items with their 1-indexed
-        positions as the queue embed shows them — the items because a removed
-        entry can be the last record of a song that already played. An in-flight
-        dequeue is never removed even on a URL match (it is committed to play;
+    async def remove(self, match: RemoveMatcher) -> RemoveOutcome:
+        """Remove every queued item `match` accepts. Returns the removed items with
+        their 1-indexed positions as the queue embed shows them — the items because
+        a removed entry can be the last record of a song that already played. An
+        in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset."""
+        the numbering offset. The matching policy is remove_matcher's."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
+        modes: list[RemoveMode] = []
 
         async with self._mutex:
             # Drain everything first so positions are numbered before partitioning.
@@ -359,13 +398,11 @@ class GuildQueue:
             in_flight = self._in_flight_head(pending_count=len(drained))
 
             for pos, item in enumerate(drained, start=1 + len(in_flight)):
-                if isinstance(item, QueueObject):
-                    match = item.webpage_url == url
-                else:
-                    match = (item.url or "") == url
-                if match:
+                mode = match(item)
+                if mode is not None:
                     removed_positions.append(pos)
                     removed_items.append(item)
+                    modes.append(mode)
                 else:
                     kept.append(item)
 
@@ -373,14 +410,18 @@ class GuildQueue:
                 self._pending.put_nowait(item)
             self._display = deque(in_flight + kept)
 
-            if removed_positions and self._store is not None:
-                entries = [_to_entry(s) for s in in_flight + kept if is_persisted(s)]
-                if entries:
-                    await self._store.rebuild_queue(entries)
-                else:
-                    await self._store.delete_queue()
+            if removed_positions:
+                await self._write_mirror(in_flight + kept, removed=removed_items)
 
-        return RemoveOutcome(removed=removed_items, positions=removed_positions)
+        return RemoveOutcome(
+            removed=removed_items,
+            positions=removed_positions,
+            # ORIGIN if anywhere in the run: the argument reached items the
+            # resolved URL alone would not have.
+            mode=RemoveMode.ORIGIN
+            if RemoveMode.ORIGIN in modes
+            else (RemoveMode.RESOLVED if modes else None),
+        )
 
     # ── Crash recovery ────────────────────────────────────────────────────────
 
@@ -525,6 +566,41 @@ class GuildQueue:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    async def _write_mirror(
+        self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
+    ) -> None:
+        """Bring the Redis mirror in line with `items` — the persisted subset, in
+        order.
+
+        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
+        mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
+        predates them. persisted=False items were never RPUSHed — never write them in.
+
+        Empty means DELETE, not skip, or the old list survives for the next restore
+        to find.
+
+        Only a removal may pass `removed`: LREM assumes the survivors kept their
+        order, which is false for shuffle and for any insert. A short LREM count
+        means the mirror no longer held what it was asked to drop, so this falls
+        through to the rebuild, which restates the whole list from memory.
+        """
+        if self._store is None:
+            return
+        entries = [_to_entry(s) for s in items if is_persisted(s)]
+        if not entries:
+            await self._store.delete_queue()
+            return
+        dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+        if dropped and len(dropped) <= _LREM_MAX_ENTRIES:
+            if await self._store.remove_queue_entries(dropped) == len(dropped):
+                return
+            log.warning(
+                f"queue mirror diverged from memory in guild {self._guild.id}; "
+                "rebuilding instead of removing"
+            )
+        await self._store.rebuild_queue(entries)
+
     def _in_flight_head(self, *, pending_count: int) -> list[QueueItem]:
         """The dequeued-but-uncommitted items at the display head.
 
@@ -563,6 +639,7 @@ class GuildQueue:
                     queued_at=entry.queued_at,
                     queue_position=entry.queue_position,
                 ),
+                user_input=entry.user_input,
                 query_source=entry.query_source,
             )
         requester: Union[discord.Member, discord.User, None] = None

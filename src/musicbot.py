@@ -40,7 +40,9 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
+from src.guild_queue import RemoveMode, RemoveOutcome
 from src.sources import (
+    QUERY_SOURCE_SEARCH,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -183,6 +185,21 @@ DEPTH_RESTORE_WAIT_SECS = 1.0
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
+    """How the removal matched, for the reply's "Matched" field. An origin match
+    names which of the user's own inputs did it, since one argument can take out a
+    whole album."""
+    if outcome.mode is not RemoveMode.ORIGIN:
+        return f"<{needle}>"
+    kinds = {item.query_source for item in outcome.removed if item.query_source}
+    # Only when every removed item agrees — a mixed set has no one kind to name.
+    kind = kinds.pop() if len(kinds) == 1 else ""
+    them = "them" if len(outcome.removed) > 1 else "it"
+    if kind == QUERY_SOURCE_SEARCH:
+        return f"`{needle}` — the search you queued {them} with"
+    return f"<{needle}> — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -699,13 +716,16 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
         analytics: Analytics,
+        origin: str,
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
         ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
         a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject.
 
         `analytics` is the command's ask-time head value, minted at dispatch;
-        playlist tracks derive their per-track positions from it."""
+        playlist tracks derive their per-track positions from it. `origin` is the
+        raw command argument, carried onto every resulting item — for a collection
+        the link, not the per-track search its expansion generated."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
             # they become, carrying this command's analytics.
@@ -720,6 +740,7 @@ class MusicBot(commands.Cog):
                 ctx.author,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
             tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
@@ -743,6 +764,7 @@ class MusicBot(commands.Cog):
                 redis=self.redis,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
@@ -754,6 +776,7 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         analytics: Analytics,
+        origin: str,
         front: bool = False,
     ) -> None:
         """Queue a resolved playlist and notify the channel — branches on the
@@ -765,7 +788,9 @@ class MusicBot(commands.Cog):
         enqueue = mp.queue_put_front if front else mp.queue_put
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(titles, analytics=analytics)
+            qobjs_yt = spotify_playlist_to_ytsearch(
+                titles, analytics=analytics, origin=origin
+            )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
             await asyncio.gather(
                 send_embed(
@@ -965,7 +990,7 @@ class MusicBot(commands.Cog):
                         join_task = asyncio.create_task(ctx.invoke(self.join))
                         try:
                             qobj = await self.queue_source(
-                                ctx, source, analytics=analytics
+                                ctx, source, analytics=analytics, origin=url
                             )
                             await join_task
                         except BaseException:
@@ -988,7 +1013,9 @@ class MusicBot(commands.Cog):
                             await self._abandon_cold_start(ctx, mp)
                             return
                     else:
-                        qobj = await self.queue_source(ctx, source, analytics=analytics)
+                        qobj = await self.queue_source(
+                            ctx, source, analytics=analytics, origin=url
+                        )
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
@@ -1011,11 +1038,16 @@ class MusicBot(commands.Cog):
                             return
 
                     if isinstance(qobj, QueueObject):
-                        qobj.user_input = url
                         await self._enqueue_single(ctx, qobj, mp, front=front)
                     else:
                         await self._enqueue_playlist(
-                            ctx, source, qobj, mp, front=front, analytics=analytics
+                            ctx,
+                            source,
+                            qobj,
+                            mp,
+                            front=front,
+                            analytics=analytics,
+                            origin=url,
                         )
 
             except Exception as e:
@@ -1025,10 +1057,15 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        origin: str,
     ) -> QueueObject:
         """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
         their first track — interjecting a whole one would delay the interrupted
-        song's return indefinitely (use -play)."""
+        song's return indefinitely (use -play).
+
+        `origin` is the raw command argument, passed down by every branch — for a
+        collapsed playlist it is the link, not the title the expansion generated."""
         playlist_notice = notice_embed(
             "Playlists can't be interjected — playing the **first track** now. "
             "Use `-play` for the full playlist.",
@@ -1045,7 +1082,9 @@ class MusicBot(commands.Cog):
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1], analytics=analytics)[0]
+            yts = spotify_playlist_to_ytsearch(
+                titles[:1], analytics=analytics, origin=origin
+            )[0]
             # Both playlist branches resolve directly rather than through
             # queue_source, so each passes its own metadata.
             return await YTDL.yt_source(
@@ -1054,6 +1093,7 @@ class MusicBot(commands.Cog):
                 redis=self.redis,
                 query_source=query_source_of(yts),
                 analytics=analytics,
+                user_input=origin,
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(
@@ -1061,6 +1101,7 @@ class MusicBot(commands.Cog):
                 ctx.author,
                 query_source=query_source_of(source),
                 analytics=analytics,
+                user_input=origin,
             )
             # Indexed here too: -playnow on a link copied mid-playlist should
             # interject the track the user was looking at, not the playlist's
@@ -1081,7 +1122,7 @@ class MusicBot(commands.Cog):
             else:
                 await ctx.send(embed=playlist_notice)
             return tracks[0]
-        qobj = await self.queue_source(ctx, source, analytics=analytics)
+        qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
         return qobj
 
@@ -1162,8 +1203,7 @@ class MusicBot(commands.Cog):
         a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url, ctx.message.content)
-        qobj = await self._resolve_playnow_source(ctx, source)
-        qobj.user_input = url
+        qobj = await self._resolve_playnow_source(ctx, source, origin=url)
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
@@ -1641,29 +1681,45 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="remove",
         aliases=["rm"],
-        brief="remove queued songs matching a URL",
-        usage="<url>",
+        brief="remove queued songs by link or by what you typed",
+        usage="<link or search text>",
         help=(
-            "Removes every queued song matching a YouTube URL and reports the "
+            "Removes every queued song matching what you give it and reports the "
             "queue positions that were dropped, followed by the updated queue.\n\n"
-            "The URL must match the YouTube link shown in the **Now Playing** "
-            "card — not the Spotify or search text you originally queued with. "
-            "Run it with no URL for a reminder of the format."
+            "Three things match: the YouTube link shown in the **Now Playing** "
+            "card, the search text you queued with, and the link you queued with "
+            "— so removing an album or playlist link takes back out every track "
+            "it added. Run it with no argument for a reminder.\n\n"
+            "Links are matched as typed, so a `youtu.be` short link will not "
+            "match a song queued from a full `youtube.com` one."
         ),
         extras={
             "category": "Queue",
-            "examples": ["-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+            "examples": [
+                "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "-remove never gonna give you up",
+                "-remove https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+            ],
+            "note": (
+                "A search term removes what that exact search queued, not "
+                "anything that merely looks similar."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.remove")
-    async def remove(self, ctx: commands.Context, url: Optional[str] = None) -> None:
+    async def remove(
+        self, ctx: commands.Context, *, needle: Optional[str] = None
+    ) -> None:
         try:
-            if url is None:
+            if needle is None:
                 await ctx.send(
                     embed=notice_embed(
-                        "`-remove <url>` — removes all songs matching the given URL from the queue. "
-                        "The URL must match the YouTube link shown in the **Now Playing** embed.",
+                        "`-remove <link or search text>` — removes every queued "
+                        "song that matches. Give it the YouTube link from the "
+                        "**Now Playing** card, or the search text or link you "
+                        "queued with; a collection link removes every track it "
+                        "added.",
                         discord.Color.blue(),
                     )
                 )
@@ -1682,12 +1738,13 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            positions = await mp.queue_remove(url)
+            outcome = await mp.queue_remove(needle)
+            positions = outcome.positions
             if not positions:
                 await send_embed(
                     ctx,
                     "",
-                    f"No queued songs found matching: <{url}>",
+                    f"No queued songs found matching: {needle}",
                     discord.Color.red(),
                 )
                 return
@@ -1701,7 +1758,7 @@ class MusicBot(commands.Cog):
                 "",
                 discord.Color.orange(),
                 fields=[
-                    ("URL", f"<{url}>", False),
+                    ("Matched", _matched_label(outcome, needle), False),
                     (f"{pos_label} removed", pos_str, False),
                 ],
             )
