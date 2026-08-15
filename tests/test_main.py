@@ -840,6 +840,68 @@ class TestHelpFlag:
         ctx.send_help.assert_not_awaited()
 
 
+class TestCommandNotFound:
+    """Unknown commands are dropped without a log line; everything else keeps
+    discord.py's own handling.
+
+    The prefix is a bare `-` with strip_after_prefix, so a plain markdown bullet
+    ("- milk") dispatches CommandNotFound for the command `milk`. discord.py's
+    default handler logs each one at ERROR with a traceback, which buried real
+    failures in the same stream."""
+
+    def _ctx(self, invoked_with: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.invoked_with = invoked_with
+        return ctx
+
+    async def test_unknown_command_is_dropped(self, app: MusicBotApp) -> None:
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(
+                self._ctx("milk"),
+                commands.CommandNotFound('Command "milk" is not found'),
+            )
+        mock_super.assert_not_awaited()
+
+    async def test_every_other_error_is_delegated(self, app: MusicBotApp) -> None:
+        """The guard is one isinstance, not a blanket swallow: anything else must
+        reach the default, whose command/cog checks are what stop
+        MusicBot.cog_command_error's errors being logged a second time."""
+        ctx = self._ctx("play")
+        error = commands.CheckFailure("nope")
+        with patch.object(
+            commands.AutoShardedBot, "on_command_error", new=AsyncMock()
+        ) as mock_super:
+            await app.on_command_error(ctx, error)
+        mock_super.assert_awaited_once_with(ctx, error)
+
+    async def test_the_logged_token_is_bounded(self, app: MusicBotApp) -> None:
+        """invoked_with is one whitespace-free token and nothing caps its length —
+        a 2,000-character dash-prefixed message must not log whole."""
+        with (
+            patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()),
+            patch("src.main.log") as mock_log,
+        ):
+            await app.on_command_error(
+                self._ctx("x" * 2000), commands.CommandNotFound("...")
+            )
+        logged = mock_log.debug.call_args.args[0]
+        assert len(logged) < 64, logged
+
+    @pytest.mark.parametrize("token", ["milk", "pn", "playnow", "paly"])
+    async def test_no_token_earns_a_reply(self, app: MusicBotApp, token: str) -> None:
+        """Dropping is silent for the user too — no token gets a did-you-mean.
+        Retiring a command is a standing temptation to answer its name with a
+        pointer to the replacement, and a reply here is reachable from ordinary
+        chat: with strip_after_prefix, a bullet reading "- pn" lands in exactly
+        this branch."""
+        ctx = self._ctx(token)
+        with patch.object(commands.AutoShardedBot, "on_command_error", new=AsyncMock()):
+            await app.on_command_error(ctx, commands.CommandNotFound("..."))
+        ctx.send.assert_not_called()
+
+
 class TestOnReady:
     @pytest.fixture(autouse=True)
     def _patch_latency(self) -> Iterator[None]:
