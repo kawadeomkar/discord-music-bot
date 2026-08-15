@@ -7732,6 +7732,37 @@ def interject_obj(mock_author: MagicMock) -> QueueObject:
 
 
 class TestInterject:
+    async def test_follow_on_sits_between_the_head_and_the_resume_tail(
+        self,
+        music_player: MusicPlayer,
+        interject_obj: QueueObject,
+        mock_vc: MagicMock,
+        live_song: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """`--now <playlist>`: the head interrupts, the rest play in order behind
+        it, and the interrupted song comes back after ALL of it.
+
+        The ordering is the decision, not an accident of insertion — a resume tail
+        that landed between the head and the tracks would make `--now` on a playlist
+        mean "play one track of this now", which is the behaviour this replaced.
+        """
+        music_player.current_song = live_song
+        rest = [
+            QueueObject(f"https://yt.com/v=t{i}", f"Track {i}", mock_author)
+            for i in (2, 3)
+        ]
+
+        outcome = await music_player.interject(interject_obj, mock_vc, follow_on=rest)
+
+        assert outcome is not None
+        titles = [
+            queue_object(item).title for item in music_player.queue.display_items()
+        ]
+        assert titles == ["Urgent Song", "Track 2", "Track 3", live_song.title]
+        tail = queue_object(music_player.queue.display_items()[-1])
+        assert tail.is_resume is True
+
     async def test_returns_none_without_current_song(
         self, music_player: MusicPlayer, interject_obj: QueueObject, mock_vc: MagicMock
     ) -> None:

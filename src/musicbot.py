@@ -43,7 +43,7 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
-from src.guild_queue import RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     SoundcloudSource,
@@ -369,8 +369,6 @@ class ResolvedYoutubePlaylist:
 def _apply_playlist_index(
     tracks: list[QueueObject],
     index: Optional[int],
-    *,
-    keep_first_only: bool = False,
 ) -> tuple[list[QueueObject], int]:
     """Drop the tracks ahead of YouTube's 1-based `index=`, returning what is left
     and how many went. A share link copied mid-playlist carries the position it was
@@ -380,21 +378,15 @@ def _apply_playlist_index(
     the user named a position this playlist does not have, and an empty enqueue
     reports success. The empty-playlist guard lives here too, so both callers
     get it.
-
-    keep_first_only trims to the one track an interjection plays, which also keeps
-    the rebase below off the tracks that caller discards (~1ms for a 1000-track
-    link).
     """
     if not tracks:
         raise EmptyPlaylistError
     if index is None or index <= 1:
-        return (tracks[:1] if keep_first_only else tracks), 0
+        return tracks, 0
     if index > len(tracks):
         raise PlaylistIndexError(index, len(tracks))
     kept = tracks[index - 1 :]
     dropped = index - 1
-    if keep_first_only:
-        kept = kept[:1]
     # Positions were assigned at construction, before this slice. Rebase to
     # kept-relative: the dropped tracks never enqueue, so an &index=N link would
     # otherwise record every kept track N-1 too deep.
@@ -1430,23 +1422,31 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
         origin: str,
-    ) -> QueueObject:
-        """Resolve an interjection's input to exactly one QueueObject. Playlists
-        collapse to their first track — interjecting a whole one would delay the
-        interrupted song's return indefinitely (use -play).
+    ) -> tuple[QueueObject, list[QueueItem]]:
+        """Resolve an interjection's input into (head, everything behind it).
+
+        Two values rather than one list because the head is not interchangeable
+        with the rest: it has to be a resolved QueueObject to be interrupted with,
+        while the tail may hold lazy YTSources. Returning one list would need an
+        `assert isinstance` at the call site to say so, and `python -O` strips those
+        (see the HACK on the playlist branch of `play`).
+
+        The head interrupts and the rest queue behind it, so a playlist no longer
+        collapses to its first track. That collapse used to exist to bound how long
+        the interrupted song waited to come back; it now waits for the whole
+        playlist, which is a deliberate call — `--now <playlist>` most plainly means
+        "play this playlist now", and one `-remove <the link>` takes the whole thing
+        back out if it was a misfire.
 
         Named for what it does rather than for who asks: `-play --now` is one
         caller, and -play on a paused song is the other.
 
         `origin` is the raw command argument, passed down by every branch — for a
-        collapsed playlist it is the link, not the title the expansion generated."""
-        playlist_notice = notice_embed(
-            "Playlists can't be interjected — playing the **first track** now. "
-            "Use `-play` for the full playlist.",
-            discord.Color.orange(),
-        )
-        # Ask-time analytics: the message's snowflake time, and depth 0 — an
-        # interjection plays immediately. The caller re-mints the depth on the
+        playlist it is the link, not the titles the expansion generated."""
+        # Ask-time analytics: the message's snowflake time, and depth 0 for the head
+        # — an interjection plays immediately. Tracks behind it derive their own
+        # positions from this base (yt_playlist and spotify_playlist_to_ytsearch
+        # both do), so they read 1, 2, … The caller re-mints the head's depth on the
         # two paths where it ends up queueing instead.
         analytics = Analytics(
             queued_at=ctx.message.created_at.timestamp(), queue_position=0
@@ -1455,20 +1455,23 @@ class MusicBot(commands.Cog):
             titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
-            await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(
-                titles[:1], analytics=analytics, origin=origin
-            )[0]
+                titles, analytics=analytics, origin=origin
+            )
+            # Only the head is resolved here — it has to be playable to interrupt
+            # with. The rest stay lazy YouTube searches resolved at dequeue, which
+            # is what keeps a 100-track album from paying 100 searches up front.
             # Both playlist branches resolve directly rather than through
             # queue_source, so each passes its own metadata.
-            return await YTDL.yt_source(
+            head = await YTDL.yt_source(
                 ctx.author,
-                yts.ytsearch or "",
+                yts[0].ytsearch or "",
                 redis=self.redis,
-                query_source=query_source_of(yts),
+                query_source=query_source_of(yts[0]),
                 analytics=analytics,
                 user_input=origin,
             )
+            return head, list(yts[1:])
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(
                 source.playlist_url,
@@ -1477,28 +1480,22 @@ class MusicBot(commands.Cog):
                 analytics=analytics,
                 user_input=origin,
             )
-            # Indexed here too: `--now` on a link copied mid-playlist should
-            # interject the track the user was looking at, not the playlist's
-            # first. The slice makes tracks[0] that track.
-            tracks, skipped = _apply_playlist_index(
-                tracks, source.index, keep_first_only=True
-            )
+            # Indexed here too: `--now` on a link copied mid-playlist starts at the
+            # track the user was looking at, not the playlist's first.
+            tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
             if skipped:
                 await ctx.send(
                     embed=notice_embed(
-                        f"Playlists can't be interjected — playing **#"
-                        f"{skipped + 1}** now. Use `-play` for the full "
-                        f"playlist.",
+                        f"Starting at **#{skipped + 1}** — skipped {skipped} "
+                        f"earlier {pluralize(skipped, 'song')}.",
                         discord.Color.orange(),
                     )
                 )
-            else:
-                await ctx.send(embed=playlist_notice)
-            return tracks[0]
+            return tracks[0], list(tracks[1:])
         qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
-        return qobj
+        return qobj, []
 
     @_tracer.start_as_current_span("bot.interject_flow")
     async def _interject_flow(
@@ -1522,13 +1519,21 @@ class MusicBot(commands.Cog):
         a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url)
-        qobj = await self._resolve_interjection_source(ctx, source, origin=url)
+        qobj, follow_on = await self._resolve_interjection_source(
+            ctx, source, origin=url
+        )
+        # The head only. `interjected` is attribution — which song cut the line —
+        # and the tracks behind it queued normally, exactly as a plain -play's would.
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
         # seconds of yt-dlp dead air between the interrupt and the new song. Awaited,
         # not spawned — the current song plays through the wait. No-op without Redis;
         # also back-fills duration/thumbnail for the embeds below.
+        #
+        # The head only, again: warming N tracks would be N concurrent extractions
+        # minting URLs that expire long before playback reaches them, which is the
+        # same reason bulk enqueues pass prefetch=False.
         await YTDL.prefetch_stream(qobj, redis=self.redis)
 
         if require_paused and not vc.is_paused():
@@ -1542,9 +1547,15 @@ class MusicBot(commands.Cog):
             # resolve.
             qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
             await self._enqueue_single(ctx, qobj, mp)
+            if follow_on:
+                # The playlist behind it still belongs behind it, and the head just
+                # went to the tail — so these follow, not front-insert.
+                await mp.queue_put(follow_on, prefetch=False)
             return
 
-        outcome = await mp.interject(qobj, vc, resume_paused=resume_paused)
+        outcome = await mp.interject(
+            qobj, vc, resume_paused=resume_paused, follow_on=follow_on
+        )
         if outcome is None:
             # The song ended during the resolve — nothing left to interrupt. Insert
             # qobj directly rather than re-invoking -play, which would re-parse,
@@ -1566,7 +1577,7 @@ class MusicBot(commands.Cog):
             # behind. interject() returned None here without reaching its own
             # neutralize, so this is the one path that still has to do it.
             # prefetch=False — the stream URL was warmed above.
-            await mp.queue_put_next(qobj, prefetch=False)
+            await mp.queue_put_next([qobj, *follow_on], prefetch=False)
             await self._send_playing_next(
                 ctx,
                 qobj,
@@ -1600,10 +1611,28 @@ class MusicBot(commands.Cog):
                 f"**{outcome.interrupted_title}** will resume at "
                 f"`{outcome.resume_position_str}`."
             )
+        if follow_on:
+            # The whole playlist came with it, so the interrupted song now waits
+            # behind all of it — on a long link, in practice forever. Said outright
+            # rather than left to be discovered from -queue, and paired with the
+            # undo, because a 500-track `--now` is a plausible misfire and
+            # `-remove <the link>` takes every track of it back out in one command
+            # (remove_matcher matches on user_input, which each track carries).
+            total = len(follow_on) + 1
+            returns = (
+                f" **{outcome.interrupted_title}** returns after the last of them."
+                if outcome.resume_position is not None
+                else ""
+            )
+            desc += (
+                f"\n\nQueued **{total}** {pluralize(total, 'song')} from the "
+                f"playlist.{returns}\nNot what you wanted? "
+                f"`-remove {_echo(url)}` takes the whole playlist back out."
+            )
         await asyncio.gather(
             send_embed(
                 ctx,
-                f"▶️ Playing now: {qobj.title}",
+                truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
                 f"Requested by: [{ctx.author.mention}]\n{desc}",
                 discord.Color.blue(),
                 thumbnail=qobj.thumbnail,

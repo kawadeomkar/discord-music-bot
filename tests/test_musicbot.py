@@ -634,10 +634,13 @@ class TestQuerySourceClassification:
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            result = await music_bot._resolve_interjection_source(
+            head, rest = await music_bot._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN
             )
-        assert result.title == "T2"
+        assert head.title == "T2"
+        # The tracks after it come too, in order — the playlist is no longer
+        # collapsed to the one track that interrupts.
+        assert [queue_object(item).title for item in rest] == ["T3", "T4"]
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
@@ -694,12 +697,12 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "youtube.com"
 
-    async def test_interjection_indexed_playlist_rebases_only_the_track_it_keeps(
+    async def test_interjection_indexed_playlist_rebases_every_kept_track(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """An interjection plays exactly one track. Rebasing the rest is work whose
-        only consumer throws it away, so keep_first_only trims first — and the
-        one survivor still lands at 0, the depth an interjection actually has."""
+        """The head lands at 0 — the depth an interjection actually has — and the
+        tracks behind it count up from there. Without the rebase an `&index=4` link
+        would file every track three deeper than it played."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
         source = parse_input(url)
         tracks = [
@@ -712,15 +715,13 @@ class TestQuerySourceClassification:
             for i in range(6)
         ]
         with patch("src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=tracks)):
-            kept = await music_bot._resolve_interjection_source(
+            head, rest = await music_bot._resolve_interjection_source(
                 mock_ctx, source, origin=_ORIGIN
             )
 
-        assert kept is tracks[3]
-        assert kept.analytics.queue_position == 0
-        # The discarded tail keeps its construction-time positions — untouched,
-        # which is the whole point of trimming before the rebase.
-        assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
+        assert head is tracks[3]
+        assert head.analytics.queue_position == 0
+        assert [queue_object(item).analytics.queue_position for item in rest] == [1, 2]
 
     async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3642,12 +3643,12 @@ class TestPlayWhilePaused:
         assert mp.current_song is not None
         mock_ctx.send.assert_awaited()  # error embed
 
-    async def test_playlist_collapses_to_first_track(
+    async def test_playlist_interjects_head_first_and_queues_the_rest(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Unlike the disconnected path (whole playlist front-inserted), an
-        interjection collapses to one track so the paused song's return is not
-        delayed indefinitely — and says so."""
+        """The head interrupts and the rest queue behind it, so the paused song
+        comes back after the WHOLE playlist. That is the deliberate call, and the
+        confirmation both states it and names the one command that undoes it."""
         mock_ctx.voice_client = _paused_vc()
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
@@ -3676,13 +3677,15 @@ class TestPlayWhilePaused:
 
         mp.interject.assert_awaited_once()
         assert mp.interject.await_args.args[0] is tracks[0]
+        assert list(mp.interject.await_args.kwargs["follow_on"]) == tracks[1:]
         sent = mock_ctx.send.await_args_list + mock_ctx.send.call_args_list
         notices = [
             c.kwargs["embed"].description
             for c in sent
             if c.kwargs.get("embed") is not None
         ]
-        assert any("first track" in (d or "") for d in notices), notices
+        assert any("**3** songs" in (d or "") for d in notices), notices
+        assert any("-remove" in (d or "") for d in notices), notices
 
 
 class TestPlayFrontInsertion:
@@ -4908,7 +4911,9 @@ class TestNowFlag:
         origin_call = music_bot.queue_source.await_args
         assert origin_call is not None
         assert origin_call.kwargs["origin"] == "test"
-        live_mp.interject.assert_awaited_once_with(qobj, live_vc, resume_paused=True)
+        live_mp.interject.assert_awaited_once_with(
+            qobj, live_vc, resume_paused=True, follow_on=[]
+        )
         # Confirmation embed names both songs and the resume position.
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Urgent" in embed.title
@@ -5044,7 +5049,7 @@ class TestNowFlag:
         # prefetch holds a claim the insert would land behind. interject() returned
         # None without reaching its own neutralize, so this path owes it.
         # prefetch=False — the stream was warmed, so it must not warm again.
-        live_mp.queue_put_next.assert_awaited_once_with(qobj, prefetch=False)
+        live_mp.queue_put_next.assert_awaited_once_with([qobj], prefetch=False)
         # interject() also returns None when the loop moved on to a DIFFERENT
         # song, which this insert waits behind: one, not the 0 an interjection
         # would have had, and not the queue depth — it goes to the front.
@@ -5057,7 +5062,7 @@ class TestNowFlag:
         assert "already ended" in embed.description
         mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
 
-    async def test_spotify_playlist_interjects_first_track_only(
+    async def test_spotify_playlist_interjects_head_and_queues_the_rest(
         self,
         music_bot: MusicBot,
         mock_ctx: MagicMock,
@@ -5083,13 +5088,17 @@ class TestNowFlag:
         assert ys.call_args.args[1] == "ytsearch:First Song"
         live_mp.interject.assert_awaited_once()
         assert live_mp.interject.call_args.args[0] is qobj
-        # First-track notice + confirmation.
+        # Only the HEAD is resolved to a playable song: the rest stay lazy YouTube
+        # searches, which is what keeps a 100-track album from paying 100 searches
+        # before a note is heard.
+        follow_on = live_mp.interject.call_args.kwargs["follow_on"]
+        assert [item.ytsearch for item in follow_on] == ["ytsearch:Second"]
         notices = [
             c.kwargs["embed"].description
             for c in mock_ctx.send.call_args_list
             if "embed" in c.kwargs
         ]
-        assert any("first track" in d for d in notices)
+        assert any("**2** songs" in d for d in notices), notices
 
     async def test_yt_playlist_interjects_first_track_only(
         self,
