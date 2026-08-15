@@ -64,11 +64,9 @@ class SpotifySource:
 
 
 # slots: one of these is retained per unresolved Spotify-playlist track, so a
-# 1000-track playlist holds 1000 of them until each is dequeued and resolved.
-# Dropping the per-instance __dict__ measures 344 B -> 120 B, so ~224 B each
-# (~224 KB for that playlist) — five times what Analytics costs. Safe here
-# because the class is frozen, has no __dict__ reader (no asdict/vars), and is
-# never pickled — it crosses to Redis as SearchQueueEntry JSON, not as an object.
+# 1000-track playlist holds 1000 until each is dequeued. Measures 344 B -> 120 B
+# per instance. Keep the class free of __dict__ readers (asdict/vars) and off
+# any pickle path; it crosses to Redis as SearchQueueEntry JSON.
 @dataclass(frozen=True, slots=True)
 class YTSource:
     """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
@@ -92,17 +90,14 @@ class YTSource:
     # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
     # yt_source/yt_playlist call for sources resolved directly.
     #
-    # CONTRACT: the default is for the PARSE layer, which runs before the mint
-    # and has nothing truthful to put here. Anything that hands a YTSource on to
-    # be queued must pass a real value. Nothing re-mints downstream — the stamp
-    # hook that used to backfill a zero is gone — so an omission here persists
-    # 0.0/0 to Redis and to play_history with no error and no log line, and
-    # "unknown / played immediately" is indistinguishable from the real thing.
+    # CONTRACT: the default is for the PARSE layer, which runs before the mint.
+    # Anything handing a YTSource on to be queued must pass a real value —
+    # nothing re-mints downstream, so an omission persists 0.0/0 to Redis and to
+    # play_history with no error and no log line.
     analytics: Analytics = ANALYTICS_ZERO
     # What the user typed, for -remove to match on. Same contract as analytics:
-    # the parse layer leaves None, and None is also what a pre-feature wire entry
-    # rehydrates as, so an omission downstream is indistinguishable from an old
-    # entry rather than reported.
+    # the parse layer leaves None, and an old wire entry rehydrates as None too, so
+    # an omission downstream is silent rather than reported.
     user_input: Optional[str] = None
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
@@ -149,8 +144,7 @@ def spotify_playlist_to_ytsearch(
     ask-time analytics and `origin` are set here because it is the last point that
     knows where these came from — each resolves to a YouTube URL at dequeue.
     `analytics` is the head's; per-track positions are derived from it, as in
-    yt_playlist. `origin` is the album/playlist link the user pasted, which is what
-    makes one -remove take the whole album back out."""
+    yt_playlist. `origin` is the album/playlist link the user pasted."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",

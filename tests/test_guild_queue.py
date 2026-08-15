@@ -1900,6 +1900,26 @@ class TestMirrorWriteChoice:
 
         assert calls == ["delete_queue"]
 
+    async def test_a_short_lrem_falls_through_to_the_rebuild(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The mirror can lose entries with nothing raising — an evicted key (it
+        is TTL'd, so volatile-lru may take it), a swallowed write. Editing it in
+        place would leave it short forever, since every later removal takes the
+        same path; the rebuild restates the whole list from memory."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
+        await fake_redis.delete(store.queue_key())
+        calls = self._spy(store)
+
+        await gq.remove(remove_matcher("https://yt.com/v=3"))
+
+        assert calls == ["remove_queue_entries", "rebuild_queue"]
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 6
+
     async def test_shuffle_always_rebuilds(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:

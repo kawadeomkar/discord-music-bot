@@ -35,25 +35,24 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Analytics:
-    """Pure-analytics values carried on live queue objects (QueueObject, YTSource,
-    YTDL): zero reads outside serialize/carry. Admission rule — a field ANYTHING
-    branches on or renders does NOT belong here (query_source is rendered by
-    -leaderboard, played_at is branched on, np_* drive card disposal). The wire
-    entries and the play_history columns stay FLAT: this container is an
-    in-memory shape only, exploded at the serialization boundary in this module.
+    """Values carried on live queue objects (QueueObject, YTSource, YTDL) for
+    storage alone: read only to serialize or to carry onto the next object.
+    Admission rule — a field anything branches on or renders belongs elsewhere.
 
-    Frozen on purpose: carry sites alias one instance across a resume tail and
-    its source (analytics=current.analytics), which is only safe immutable."""
+    An in-memory shape only. Wire entries and play_history columns stay FLAT,
+    exploded at the serialization boundary in this module.
 
-    # Unix epoch when the user ASKED for the song — the command message's
-    # snowflake time, not time.time(), so played_at - queued_at is cross-clock:
-    # under host drift a slightly negative wait is skew, not corruption.
+    Frozen: carry sites alias one instance across a resume tail and its source
+    (analytics=current.analytics)."""
+
+    # Unix epoch when the user ASKED for the song: the command message's
+    # snowflake time. Discord's clock, so played_at - queued_at is cross-clock
+    # and goes slightly negative under host drift.
     # 0.0 = unknown (pre-feature wire entries).
     queued_at: float
     # Songs ahead at ask time, counting the one playing (0 = played immediately).
-    # Read once at command dispatch (MusicPlayer.enqueue_depth) and approximate
-    # against insert by design — the loop dequeues continuously, and the exact
-    # wait sits beside it as played_at - queued_at.
+    # Read once at command dispatch (MusicPlayer.enqueue_depth), so the loop's
+    # continuous dequeuing leaves it approximate against the insert.
     queue_position: int
 
 
@@ -746,9 +745,8 @@ class SearchQueueEntry:
     url: str | None = None
     process: bool | None = None
     ts: int | None = None
-    # What the user typed, carried so -remove can match on it. A Spotify-playlist
-    # track's origin is the album link, which nothing downstream can reconstruct:
-    # the ytsearch here is a title the expansion generated.
+    # What the user typed, for -remove to match on. Nothing downstream can
+    # reconstruct it: the ytsearch here is a title the expansion generated.
     user_input: str | None = None
     # Ask-time analytics, carried so a Spotify playlist track keeps its position
     # through the resolve at dequeue.

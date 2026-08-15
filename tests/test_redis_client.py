@@ -435,8 +435,24 @@ class TestRemoveQueueEntries:
         await store.remove_queue_entries([_entry(1)])
         assert await fake_redis.ttl(store.queue_key()) > 0
 
+    async def test_returns_how_many_were_removed(self, store: GuildRedisStore) -> None:
+        """Exactly the LREM counts — the pipeline's trailing EXPIRE reply is a 1
+        of its own, and summing it in would report a phantom removal."""
+        await store.rebuild_queue([_entry(n) for n in range(1, 5)])
+        assert await store.remove_queue_entries([_entry(2), _entry(4)]) == 2
+
+    async def test_returns_short_when_the_mirror_no_longer_holds_them(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The count is GuildQueue's only signal that the mirror and memory
+        disagree: LREM raises nothing when what it was told to drop is absent."""
+        await store.rebuild_queue([_entry(1)])
+        assert await store.remove_queue_entries([_entry(1), _entry(2)]) == 1
+
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
-        await broken_store.remove_queue_entries([_entry(1)])  # must not raise
+        # 0 rather than None: it cannot match what the caller asked for, so a
+        # failed LREM routes it to the rebuild like any other short count.
+        assert await broken_store.remove_queue_entries([_entry(1)]) == 0
 
 
 # ── History operations ────────────────────────────────────────────────────────

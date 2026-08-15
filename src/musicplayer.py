@@ -1036,27 +1036,22 @@ class MusicPlayer:
     def enqueue_depth(self) -> int:
         """Songs a new arrival waits behind: everything queued, plus the one playing.
 
-        Read once at command dispatch — queue_position is depth at ASK, and
-        approximate against insert by design: the loop dequeues continuously, so
-        the two differ routinely with no user involvement, and wait duration is
-        measured exactly as played_at - queued_at beside it.
+        Read once at command dispatch, so the loop's continuous dequeuing leaves
+        queue_position approximate against the insert.
 
         The live song is NOT counted when its resume tail is already queued: after
         an interjection that entry is the same play as current_song, and counting
         both puts a new arrival one song too deep.
 
-        Two known ±1 windows, both pre-dating the ask-time switch and both left
-        as-is — they are narrow, and the field is documented approximate:
+        Two accepted ±1 windows:
 
-        - OVER by one while the loop resolves a stream. current_song is assigned
-          before try_commit_dequeue() settles the claim, so for the length of a
-          probe (100ms-seconds) the same play is both current_song and still in
-          the queue. Not fixable from here: current_song is a YTDL and the queue
-          holds QueueObjects, so there is no identity test, and reordering the
-          loop for an analytics field is not a trade worth making.
+        - OVER by one while the loop resolves a stream, since current_song is
+          assigned before try_commit_dequeue() settles the claim, so the play is
+          both current_song and still queued for the length of a probe
+          (100ms-seconds).
         - UNDER by one when the live song has a parked tail from an EARLIER play
-          of the same URL (-play X, -playnow Y, -playnow X). has_resume_tail
-          matches on URL, so it cannot tell the two plays apart."""
+          of the same URL (-play X, -playnow Y, -playnow X), which
+          has_resume_tail matches by URL."""
         depth = self.queue.display_size()
         current = self.current_song
         if current is not None and not self.queue.has_resume_tail(current.webpage_url):
@@ -1230,8 +1225,8 @@ class MusicPlayer:
     async def queue_remove(self, needle: str) -> RemoveOutcome:
         """Remove every queued item matching `needle` — the resolved yt-dlp URL, or
         what the user originally typed (see remove_matcher). Returns the whole
-        outcome: the command reports the positions AND names the mode, because an
-        origin match is the case where one argument removes many songs.
+        outcome, since the command reports the positions and names the mode.
+
         """
         await self._cancel_prefetch()
         outcome = await self.queue.remove(remove_matcher(needle))
@@ -1843,10 +1838,9 @@ class MusicPlayer:
         if song is None:
             return
         # Carry the -ss offset, every -playnow flag and the analytics through the
-        # rebuild: dropping them makes a neutralized resume entry restart from 0:00
-        # (unpaused, unannounced), loses an ordinary prefetched song's ?t= offset,
-        # and zeroes the ask this play was queued against — nothing re-mints it,
-        # so the archive would read "queued at unknown, played immediately".
+        # rebuild: dropping them restarts a neutralized resume entry from 0:00
+        # (unpaused, unannounced), loses a prefetched song's ?t= offset, and zeroes
+        # the ask this play was queued against, which nothing re-mints.
         rebuilt = QueueObject(
             song.webpage_url or "",
             song.title or "",

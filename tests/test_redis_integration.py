@@ -911,10 +911,21 @@ class TestLremRemovalPath:
         store = GuildRedisStore(redis, guild_id=3)
         await store.rebuild_queue([self._entry(1), self._entry(2)])
 
-        await store.remove_queue_entries([self._entry(99)])
+        assert await store.remove_queue_entries([self._entry(99)]) == 0
 
         items = await redis.lrange(store.queue_key(), 0, -1)
         assert items == [self._entry(1).to_redis(), self._entry(2).to_redis()]
+
+    async def test_the_count_is_the_lrems_alone(self, redis: aioredis.Redis) -> None:
+        """What GuildQueue compares against len(dropped) to decide whether the
+        mirror still matches memory. A real server answers the pipeline's trailing
+        EXPIRE with 1, so counting it would mask exactly the short LREM the caller
+        is watching for."""
+        store = GuildRedisStore(redis, guild_id=6)
+        await store.rebuild_queue([self._entry(n) for n in range(1, 4)])
+
+        assert await store.remove_queue_entries([self._entry(1), self._entry(2)]) == 2
+        assert await store.remove_queue_entries([self._entry(3), self._entry(99)]) == 1
 
     async def test_the_ttl_is_refreshed_like_every_other_queue_write(
         self, redis: aioredis.Redis

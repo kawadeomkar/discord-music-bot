@@ -177,12 +177,9 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 # that accepts the connection then stalls would hang the command outright.
 RESTORE_WAIT_SECS = 5.0
 
-# The same wait, for a warm -play reading its ask-time queue depth. Deliberately
-# far shorter: the cold path waits to decide whether it may INSERT at all and
-# refuses on timeout, while this one only decides what number to record. A
-# restore that has not landed within a second is not going to answer usefully,
-# and the price of giving up is one approximate analytics field — not worth
-# holding a user's command for five seconds.
+# How long a warm -play waits for its restore before reading the ask-time queue
+# depth. Short because a timeout here only costs an approximate analytics field:
+# the depth is recorded from whatever has landed and the command proceeds.
 DEPTH_RESTORE_WAIT_SECS = 1.0
 
 
@@ -274,10 +271,9 @@ def _apply_playlist_index(
     reports success. The empty-playlist guard lives here too, so both callers
     get it.
 
-    keep_first_only trims to the one track -playnow interjects. Not merely a
-    convenience for the caller: it also keeps the rebase below off the tracks
-    that caller is about to discard, which for a 1000-track link is ~1ms of work
-    with no consumer.
+    keep_first_only trims to the one track -playnow interjects, which also keeps
+    the rebase below off the tracks that caller discards (~1ms for a 1000-track
+    link).
     """
     if not tracks:
         raise EmptyPlaylistError
@@ -289,10 +285,9 @@ def _apply_playlist_index(
     dropped = index - 1
     if keep_first_only:
         kept = kept[:1]
-    # Positions were assigned at construction, before this slice — rebase, or an
-    # &index=N link stamps every kept track N-1 too deep (and -playnow's single
-    # track lands at N-1 instead of 0). Kept-relative is the true depth: the
-    # dropped tracks never enqueue.
+    # Positions were assigned at construction, before this slice. Rebase to
+    # kept-relative: the dropped tracks never enqueue, so an &index=N link would
+    # otherwise record every kept track N-1 too deep.
     for track in kept:
         track.analytics = replace(
             track.analytics,
@@ -747,9 +742,8 @@ class MusicBot(commands.Cog):
 
         `analytics` is the command's ask-time head value, minted at dispatch;
         playlist tracks derive their per-track positions from it. `origin` is the
-        raw command argument, carried onto every resulting item so -remove can
-        match what the user typed — for a collection that is the link, never the
-        per-track search its expansion generated."""
+        raw command argument, carried onto every resulting item — for a collection
+        the link, not the per-track search its expansion generated."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
             # they become, carrying this command's analytics.
@@ -990,22 +984,17 @@ class MusicBot(commands.Cog):
                     # hands this exact player to _abandon_cold_start, and a get_mp()
                     # issued after its cleanup() would build and start a fresh one.
                     mp = self.get_mp(ctx)
-                    # Ask-time analytics, read ONCE at dispatch. queued_at is the
-                    # command message's snowflake time, not time.time() — gateway
-                    # delivery lag is real time the user waited (cross-clock with
-                    # played_at; a small negative wait in the archive reads as
-                    # host drift). front ⇒ depth 0: a cold-start song jumps the
-                    # restored queue and plays first.
+                    # Ask-time analytics, read ONCE at dispatch: the command
+                    # message's snowflake time, so the wait covers gateway
+                    # delivery and the resolve below. front ⇒ depth 0, the
+                    # cold-start song plays ahead of the restored queue.
                     if front:
                         position = 0
                     else:
-                        # Wait out any in-flight restore first: the queue stays
-                        # empty until restore_entries() replays it, so a -play in
-                        # the crash-recovery window would read 0 behind a queue
-                        # about to reappear. Already set in the common case.
-                        # Unlike the front path a timeout is NOT a reason to
-                        # refuse — nothing is inserted against an unread snapshot
-                        # here, so a stale depth beats rejecting the command.
+                        # Wait out any in-flight restore: the queue stays empty
+                        # until restore_entries() replays it, so a -play in the
+                        # crash-recovery window would read 0 behind a queue about
+                        # to reappear. Already set in the common case.
                         await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
                         position = mp.enqueue_depth()
                     analytics = Analytics(
@@ -1099,18 +1088,16 @@ class MusicBot(commands.Cog):
         their first track — interjecting a whole one would delay the interrupted
         song's return indefinitely (use -play).
 
-        `origin` is the raw command argument; every branch passes it down rather
-        than letting yt_source fall back to the search it was handed, which for a
-        collapsed playlist is a title this code generated."""
+        `origin` is the raw command argument, passed down by every branch — for a
+        collapsed playlist it is the link, not the title the expansion generated."""
         playlist_notice = notice_embed(
             "Playlists can't be interjected — playing the **first track** now. "
             "Use `-play` for the full playlist.",
             discord.Color.orange(),
         )
         # Ask-time analytics: the message's snowflake time, and depth 0 — an
-        # interjection plays immediately by definition. The one caller path that
-        # appends instead (a -resume landing during the resolve) re-mints the
-        # depth itself, since 0 would then claim a wait the song never had.
+        # interjection plays immediately. The caller re-mints the depth on the
+        # two paths where it ends up queueing instead.
         analytics = Analytics(
             queued_at=ctx.message.created_at.timestamp(), queue_position=0
         )
@@ -1256,10 +1243,9 @@ class MusicBot(commands.Cog):
             # playing. Clear the marker: a normally queued song must not trigger
             # replace semantics later.
             qobj.interjected = False
-            # Re-mint the depth too: _resolve_playnow_source minted 0 because an
-            # interjection plays immediately, and this is now an ordinary append
-            # behind the whole queue. Read here rather than at dispatch — this is
-            # the ask that lands, and the queue moved during the resolve.
+            # An ordinary append now, behind the whole queue, so replace the 0
+            # minted for the interjection. Read here: the queue moved during the
+            # resolve.
             qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
             await self._enqueue_single(ctx, qobj, mp)
             return
@@ -1274,9 +1260,9 @@ class MusicBot(commands.Cog):
             # It interrupted nothing, so keeping the marker would attribute an
             # interjection that never happened.
             qobj.interjected = False
-            # And it no longer plays immediately. interject() also returns None
-            # when the loop moved on to a DIFFERENT song, which this insert then
-            # waits behind — one, never the queue, because it goes to the front.
+            # interject() also returns None when the loop moved on to a
+            # DIFFERENT song, which this insert waits behind. One, never the
+            # queue depth: it goes to the front.
             qobj.analytics = replace(
                 qobj.analytics,
                 queue_position=1 if mp.current_song is not None else 0,

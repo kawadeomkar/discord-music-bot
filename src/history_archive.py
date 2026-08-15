@@ -828,9 +828,8 @@ class HistoryOutboxDrainer:
     # bounded by stream-node-max-bytes (4096), and the step is the ALLOCATOR BIN the
     # node lands in. Measured on redis:7-alpine at 1-byte resolution: ~548 B/entry
     # up to 497 B of wire, a SPIKE to ~676 at 498-499 B exactly, then ~626 from
-    # 500 B on. The spike is a function of WIRE SIZE ALONE — it is what an earlier
-    # unstamped 499 B entry measured at 678.3, which is not a property of being
-    # unstamped. So 256 MB holds ~429k entries, ~397k for a shape on the spike.
+    # 500 B on — a function of wire size alone, whatever the field values are.
+    # So 256 MB holds ~429k entries, ~397k for a shape on the spike.
     # See docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0

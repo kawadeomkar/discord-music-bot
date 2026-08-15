@@ -898,11 +898,10 @@ class YTDL(discord.FFmpegOpusAudio):
         leaves here complete — a default would let a new call site forget them and
         write a plausible zero, permanently indistinguishable from a real value.
 
-        user_input is what the USER typed, and None falls back to `search` only
-        because a direct -play of one song makes those the same string. They are
-        NOT the same for an expanded collection: a Spotify album track's `search`
-        is a title this code generated, so recording it would lose the album link
-        that -remove matches on."""
+        user_input is what the user typed; None falls back to `search`, which is the
+        same string only for a direct -play of one song. For an expanded collection
+        `search` is a title this code generated, so the fallback would lose the album
+        link -remove matches on."""
         origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
@@ -1044,8 +1043,8 @@ class YTDL(discord.FFmpegOpusAudio):
 
         query_source, analytics and user_input are REQUIRED (see yt_source).
         `analytics` is the head's — track positions are derived per kept track
-        below. `user_input` is the playlist link the user pasted, and every track
-        carries it: that is what lets one -remove take the whole playlist out."""
+        below. `user_input` is the playlist link the user pasted, carried onto every
+        track so -remove can match it."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -1075,12 +1074,7 @@ class YTDL(discord.FFmpegOpusAudio):
             )
             # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
             # skipped null entries above must not leave gaps in queue_position.
-            #
-            # replace(), though it measures ~1.8x an explicit Analytics(...) here
-            # (+1.8ms per 1000 tracks, behind a 1-4s extraction). Spelling the
-            # fields out would silently drop any field added to Analytics later
-            # with a default — the exact silent-zero failure this container was
-            # built to end. Not worth 0.1% of one command.
+            # replace() so a field added to Analytics later is carried here.
             qobjs.append(
                 QueueObject(
                     video_url,

@@ -757,8 +757,8 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes with no ack, so a crash after this loses the
-        # song from Redis. Accepted — the in-memory asyncio.Queue is the source of
-        # truth; at-least-once would need a stream and an XACK.
+        # song from Redis. Accepted — GuildQueue's in-memory deque is the source
+        # of truth; at-least-once would need a stream and an XACK.
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(

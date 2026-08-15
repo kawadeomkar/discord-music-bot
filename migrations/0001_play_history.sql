@@ -60,24 +60,15 @@ CREATE TABLE IF NOT EXISTS play_history (
     -- sentinel as played_at), and 0 = played immediately; both are also what an
     -- entry written before these fields existed parses as.
     --
-    -- Two things a reader will otherwise assume and be wrong about:
+    -- queued_at is the command message's snowflake time, on DISCORD's clock
+    -- while played_at is on the host's, so their difference is cross-clock and
+    -- goes slightly negative under drift. A `played_at >= queued_at` filter
+    -- drops those real plays.
     --
-    -- queued_at is the COMMAND MESSAGE's snowflake time, taken before the 1-4s
-    -- yt-dlp resolve, so it is on DISCORD's clock while played_at is on the
-    -- host's. played_at - queued_at is therefore a cross-clock interval and can
-    -- come out slightly negative under host drift. That is skew, not corruption
-    -- — do not filter it out with `WHERE played_at >= queued_at`, which would
-    -- silently drop real plays.
-    --
-    -- queue_position is depth at ASK, read once at command dispatch, and is
-    -- approximate against where the song actually landed: the playback loop
-    -- dequeues continuously, so the two differ routinely with no user
-    -- involvement. Do not join it against played_at ordering and expect
-    -- agreement. The exact wait is the interval above, not this column.
-    --
-    -- Rows imported by `just db-backfill` from a Redis history list predate the
-    -- switch and carry the OLD meaning of both columns: insert time on the
-    -- host's clock, and position at insert. Nothing distinguishes them.
+    -- queue_position is depth at ASK, left approximate against where the song
+    -- landed by the loop's continuous dequeuing, so it disagrees with played_at
+    -- ordering. Rows imported by `just db-backfill` predate the switch and hold
+    -- the older meaning of both columns: insert time, and position at insert.
     queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
     queue_position integer     NOT NULL DEFAULT 0,
 
