@@ -25,6 +25,8 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   pinned to the bottom of the channel, re-attaching itself beneath every bot response
 - **`-play --now` interjection** — interrupt the current song with another one; the
   interrupted song resumes afterward from the exact position it left off
+- **`-play --next` queue jump** — put a song (or a whole playlist) at the front of the
+  queue without interrupting what is playing
 - **Crash recovery** — queue, current song (with playback position), volume, and
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
@@ -55,7 +57,7 @@ details, aliases, and examples.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `-play [--now] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately; the interrupted song resumes after |
+| `-play [--now\|--next] <url\|search>` | `p`, `sing` | Queue a song and start playing. `--now` plays it immediately and the interrupted song resumes after; `--next` puts it at the front of the queue without interrupting anything |
 | `-skip` | `sk` | Skip to the next song in the queue |
 | `-pause` | `po` | Pause the current song (reports the exact position) |
 | `-resume` | `r` | Resume from where the song was paused |
@@ -477,6 +479,25 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | | `http://localhost:4317` | OTLP gRPC endpoint for traces |
 | `OTEL_SDK_DISABLED` | | `false` | Set `true` to disable tracing entirely |
 
+## Upgrading to 2.27.0
+
+**`-play` takes a `--next` flag**, which queues a song at the front without
+interrupting what is playing:
+
+```
+-p --next never gonna give you up
+```
+
+Like `--now`, it must be the **first** word, and it is subject to the "bot is already
+being used in channel X" rule — cutting to the front of a queue is queue control, the
+same as `-skip` or `-shuffle`.
+
+**A playlist is no longer collapsed to its first track.** `-p --now <playlist>` used to
+play track 1 and discard the rest; it now plays track 1 immediately and queues the whole
+playlist behind it. The song it interrupted therefore does not return until the last
+track — on a long playlist, in practice, never. If that was not what you wanted,
+`-remove <the same link>` takes every track of it back out in one command.
+
 ## Upgrading to 2.26.0
 
 **`-playnow` and its `pn` alias are gone.** They are replaced by a flag on `-play`:
@@ -486,9 +507,8 @@ Compose; for local runs, export them or use your shell's dotenv tooling).
 ```
 
 The behaviour is unchanged — the interrupted song still returns from the exact position
-it left off at, interjections still stack, and a playlist still interjects only its first
-track. Only the spelling moved, and the flag must be the **first** word so a `--now`
-inside a search term stays part of the search.
+it left off at, and interjections still stack. Only the spelling moved, and the flag must
+be the **first** word so a `--now` inside a search term stays part of the search.
 
 `-pn` now answers with nothing, the way any unknown command does. Two things changed
 alongside it:

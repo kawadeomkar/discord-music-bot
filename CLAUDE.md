@@ -159,7 +159,8 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     command is a minor bump, not a major one: the version is a deploy tag for a
     self-hosted bot, nothing links against these names, and CI validates only that the
     string is semver-shaped. The interjection command was folded into `-p --now` and
-    deleted in 2.26.0 under this rule. A removal still owes users an
+    deleted in 2.26.0 under this rule, and `--now` stopped collapsing a playlist to
+    its first track in 2.27.0 under the same one. A removal still owes users an
     `## Upgrading to <version>` section in README.md — nothing else records the
     migration, and the release notes are minted from the tag.
 
@@ -649,7 +650,7 @@ Known limitation (FIXME in guild_state.py): recovery counts **bot downtime** as 
 position — a song 30s in that stays down 10min resumes near its end (duration−10s cap).
 The designed fix is a periodic position heartbeat, not yet implemented.
 
-### `-play --now` interjection and resume entries
+### `-play --now` / `--next` placement, interjection and resume entries
 
 `MusicPlayer.interject(qobj, vc, resume_paused)` implements "play this now, then put the
 interrupted song back where it was":
@@ -689,9 +690,24 @@ interrupted song back where it was":
 `-play` while paused routes through the same flow with `resume_paused=False` (the
 interrupted song comes back PLAYING — "-play means play"); `--now` restores the exact
 paused state (`start_paused` re-pauses the player thread synchronously at `vc.play`,
-before any await, leaking at most a frame or two). Playlists collapse to their first
-track for `--now`; plain `-play` front-inserts a playlist in full (nothing is playing
-to keep waiting).
+before any await, leaking at most a frame or two). **`--next` is carved out of the
+paused branch** — the request is not buried behind the paused song, it IS next, so
+interjecting would stop the song the user chose to keep.
+
+**Every placement takes a playlist in full.** `--now` interjects the head and puts the
+rest between it and the resume entry, so the interrupted song returns after the WHOLE
+playlist — deliberate, stated in the confirmation, and undone by one `-remove <the
+link>` (which matches on `user_input`, carried by every track). Only the head is
+resolved and stream-warmed; a Spotify collection's tail stays lazy `YTSource`s.
+
+`--next` front-inserts without interrupting, via `MusicPlayer.queue_put_next` —
+`_neutralize_prefetch()` then `put_front`, because `loop()`'s prefetch holds a claim
+for the whole current song and a bare `put_front` lands BEHIND it (the song would play
+second). It deliberately does not re-spawn the prefetch: `_prefetch_task` is one slot
+under a claim-then-null protocol with `loop()`, and a re-spawn racing the loop's own
+would strand a claim and drift `_cursor` permanently. Both flags are gated by the
+same-channel rule (`_play_takes_the_queue`): line-jumping is queue control, like
+`-skip`/`-shuffle`/`-remove`.
 
 ### The Now Playing host system
 

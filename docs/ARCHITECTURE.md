@@ -266,7 +266,8 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 | Command | Aliases | Arguments | Description |
 |---|---|---|---|
 | `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/playlist, or SoundCloud URL. Joins voice first if not connected. |
-| `-play --now` | — | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Behaves as a plain `-play` when nothing is live. Playlists interject only their first track. See [-play --now Interjection](#-play---now-interjection). |
+| `-play --now` | — | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Behaves as a plain `-play` when nothing is live. A playlist comes in full: its head interrupts and the rest queue behind it, so the parked song returns only after the last track. See [-play --now Interjection](#-play---now-interjection). |
+| `-play --next` | — | `url` | Front-insert without interrupting: the song plays when the current one ends. A playlist front-inserts in full, in order. Identical to a plain `-play` when nothing is queued, since a front insert into an empty queue *is* an append. Goes through `MusicPlayer.queue_put_next`, which neutralizes the loop's prefetch first — a bare `put_front` lands behind the prefetch's open claim and the song plays second. |
 | `-skip` | `sk` | — | Stop the current song and advance to the next. |
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
 | `-pause` | `po` | — | Pause playback. Adds ⏸️ and sends a confirmation embed showing the frozen position. |
@@ -292,7 +293,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 2. The author is in a voice channel
 3. For non-`play` commands: the bot is in the same voice channel as the author
 
-`-help` (and the `--help` flag on any command) is exempt from the voice-channel gate: the help command carries no `before_invoke(validate_commands)`, and `--help` short-circuits in `invoke()` ahead of it — so help is always reachable, even from outside a voice channel. `-play --now` is gated MORE strictly than a plain `-play`: the same-channel exemption is lifted for an interjection, since it stops what another channel is hearing.
+`-help` (and the `--help` flag on any command) is exempt from the voice-channel gate: the help command carries no `before_invoke(validate_commands)`, and `--help` short-circuits in `invoke()` ahead of it — so help is always reachable, even from outside a voice channel. `-play --now` and `-play --next` are gated MORE strictly than a plain `-play`: the same-channel exemption is lifted for both, since one stops what another channel is hearing and the other decides what it hears next. Appending is what the exemption was for, and neither appends.
 
 **Supported `-play` inputs:**
 
@@ -302,7 +303,7 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | YouTube short URL | `https://youtu.be/...` | `YTSource(process=False)` |
 | YouTube URL with timestamp | `?t=120` | `YTSource(ts=120)` → seeks via FFmpeg `-ss` |
 | YouTube playlist URL | `.../playlist?list=...`, or any `watch?v=…&list=…` | `YTSource(type=PLAYLIST, list_id=...)` → `YTDL.yt_playlist` (flat extraction) → N `QueueObject`s. `_YTDL_PLAYLIST_OPTS` uses `extract_flat="in_playlist"`, not `True`: a watch URL resolves to a `url_result` pointing at the playlist, and `True` stops at it with no entries |
-| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` interjects that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
+| …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `--now` starts the playlist at that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
 | Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N `YTSource` search items |
@@ -461,20 +462,22 @@ Playlists (both kinds) enqueue with `prefetch=False` so a 100-track playlist doe
 
 ### -play --now Interjection
 
-`-play --now` plays a song **immediately**, parking the current one to resume from its exact position afterward.
+`-play --now` plays a song **immediately**, parking the current one to resume from its exact position afterward. A playlist arrives whole: the head interrupts, `follow_on` sits between it and the resume entry, and the parked song therefore returns after the LAST track — on a long link, in practice never. That is a deliberate call rather than an oversight; the confirmation states it and names `-remove <the same link>`, which takes every track back out because `remove_matcher` matches on the `user_input` each one carries.
+
+`-play --next` is the third placement: front-insert, interrupt nothing. It routes through `MusicPlayer.queue_put_next`, which calls `_neutralize_prefetch()` before `put_front` — `loop()` spawns `_prefetch_next_song()` every iteration and its `get_nowait()` holds a claim for the rest of the current song, so a bare `put_front` inserts at `_cursor`, BEHIND that claim, and the song plays second. Nothing may go ahead of the claim (I6 makes the claimed items a prefix because Redis retires them by `LPOP`), so handing it back is the only correct move. It deliberately does not re-spawn the prefetch: `_prefetch_task` is a single slot under a claim-then-null protocol with `loop()`, and a re-spawn racing the loop's own would orphan one task holding a claim nothing settles, drifting `_cursor` permanently.
 
 ```mermaid
 flowchart TD
     Start(["-play --now url"])
     Live{"a song live?\n(current_song + vc playing/paused)"}
     Fallback["fall back to -play\n(joins if needed; playlists enqueue in full)"]
-    Resolve["parse_input + _resolve_interjection_source\n(playlist → first track only)\nqobj.interjected = True"]
-    Warm["await YTDL.prefetch_stream(qobj)\nwarm stream cache BEFORE interrupting\n(avoids dead air; back-fills embed metadata)"]
-    Interject["mp.interject(qobj, vc)"]
+    Resolve["parse_input + _resolve_interjection_source\n→ (head, follow_on)\nhead.interjected = True"]
+    Warm["await YTDL.prefetch_stream(head)\nwarm stream cache BEFORE interrupting\n(head only: N warms mint URLs that expire)"]
+    Interject["mp.interject(head, vc, follow_on=…)"]
     Ended{"song ended\nmid-resolve?"}
-    FrontOnly["queue.put_front([qobj])\n(interjected reset)\n'Playing next' notice"]
+    FrontOnly["mp.queue_put_next([head, *follow_on])\n(interjected reset)\n'Playing next' notice"]
     Resume["build resume SongQueueEntry\n(is_resume=True, ts=position_secs,\nstart_paused=was_paused)\ninherits played_at + query_source"]
-    PutFront["queue.put_front([qobj, resume?])\n_skip_history_for = stopped song\nvc.stop() → loop picks up qobj"]
+    PutFront["queue.put_front([head, *follow_on, resume?])\n_skip_history_for = stopped song\nvc.stop() → loop picks up head"]
 
     Start --> Live
     Live -->|No| Fallback

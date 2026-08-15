@@ -160,7 +160,7 @@ class TestCommandList:
         and arguments survive unwrapped — not discord.py's `-[play|p|sing]`."""
         await help_command.command_callback(ctx, command=None)
         body = "\n".join("\n".join(lines) for lines in self._sections(ctx).values())
-        assert "-play, -p, -sing [--now] <url|search>" in body
+        assert "-play, -p, -sing [--now|--next] <url|search>" in body
         assert "-volume, -v, -vol, -sound <0-100>" in body
         assert "-now, -np, -rn, -nowplaying" in body
         assert "[play|p|sing]" not in body
@@ -250,9 +250,9 @@ class TestCommandHelp:
         fields = {f.name: f.value or "" for f in sent_embed(ctx).fields}
         lines = fields["SYNOPSIS"].strip("`").strip("\n").splitlines()
         assert lines == [
-            "-play [--now] <url|search>",
-            "-p [--now] <url|search>",
-            "-sing [--now] <url|search>",
+            "-play [--now|--next] <url|search>",
+            "-p [--now|--next] <url|search>",
+            "-sing [--now|--next] <url|search>",
         ]
 
     async def test_resolves_an_alias_to_its_command(
