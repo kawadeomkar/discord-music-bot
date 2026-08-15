@@ -28,6 +28,7 @@ from src.musicbot import (
     HistoryFlags,
     MusicBot,
     PlayArgs,
+    Placement,
     PlayMode,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
@@ -3629,7 +3630,7 @@ class TestPlayFrontInsertion:
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
-        assert single_call.kwargs["front"] is True
+        assert single_call.kwargs["placement"] is Placement.COLD_FRONT
 
     async def test_cold_path_queues_nothing_when_the_join_never_connected(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3741,7 +3742,7 @@ class TestPlayFrontInsertion:
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
-        assert single_call.kwargs["front"] is False
+        assert single_call.kwargs["placement"] is Placement.TAIL
         # No playback hold on the warm path — the gate is already open. (It DOES
         # wait on the restore, but only to read a meaningful queue depth, and on
         # the short bound; see test_warm_path_reads_the_depth_after_the_restore.)
@@ -3824,7 +3825,9 @@ class TestPlayFrontInsertion:
         mp = _mock_mp(qsize=3)
         mock_ctx.message.add_reaction = AsyncMock()
 
-        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+        await music_bot._enqueue_single(
+            mock_ctx, qobj, mp, placement=Placement.COLD_FRONT
+        )
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mp.queue_put.assert_not_awaited()
@@ -3844,7 +3847,9 @@ class TestPlayFrontInsertion:
         mp = _mock_mp(qsize=0)
         mock_ctx.message.add_reaction = AsyncMock()
 
-        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+        await music_bot._enqueue_single(
+            mock_ctx, qobj, mp, placement=Placement.COLD_FRONT
+        )
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mock_ctx.send.assert_not_awaited()
@@ -3867,7 +3872,7 @@ class TestPlayFrontInsertion:
             source,
             ResolvedYoutubePlaylist(tracks),
             mp,
-            front=True,
+            placement=Placement.COLD_FRONT,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
         )
@@ -3879,7 +3884,8 @@ class TestPlayFrontInsertion:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """End-to-end wiring for the playlist half of the cold path: play()'s
-        list branch must carry front=True into _enqueue_playlist. Previously
+        list branch must carry the COLD_FRONT placement into _enqueue_playlist.
+        Previously
         only _enqueue_playlist was tested directly, leaving this dispatch —
         and the decision that a playlist front-inserts in full — unpinned."""
         mock_ctx.voice_client = None
@@ -3908,7 +3914,7 @@ class TestPlayFrontInsertion:
         music_bot._enqueue_single.assert_not_awaited()
         pl_call = music_bot._enqueue_playlist.await_args
         assert pl_call is not None
-        assert pl_call.kwargs["front"] is True
+        assert pl_call.kwargs["placement"] is Placement.COLD_FRONT
         assert pl_call.args[2] == ResolvedYoutubePlaylist(tracks)
 
     async def test_front_insert_after_restore_orders_both_legs(
@@ -3943,7 +3949,9 @@ class TestPlayFrontInsertion:
         qobj = QueueObject("https://yt.com/v=new", "New Song", mock_author)
         mock_ctx.message.add_reaction = AsyncMock()
         with patch("src.youtube.YTDL.prefetch_stream", new=AsyncMock()):
-            await music_bot._enqueue_single(mock_ctx, qobj, music_player, front=True)
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, music_player, placement=Placement.COLD_FRONT
+            )
 
         titles = [
             queue_object(item).title for item in music_player.queue.display_items()
@@ -3966,6 +3974,29 @@ class TestPlayFrontInsertion:
 
 
 class TestEnqueueSingle:
+    @pytest.mark.parametrize("placement", list(Placement))
+    async def test_only_a_cold_front_builds_a_resume_notice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, placement: Placement
+    ) -> None:
+        """The reason placement is a value and not a `front: bool`.
+
+        `build_resume_notice_embed` says "Resumed from queue … N songs from the
+        previous session resume after it", which is true only for a disconnected
+        bot waking a persisted queue. Parametrized over every member on purpose:
+        a placement added later that front-inserts while the bot is playing would
+        otherwise inherit that copy silently, and it returns None only when the
+        queue is EMPTY — so it renders exactly on the case that would be wrong.
+        """
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        mp = _mock_mp(qsize=3)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp, placement=placement)
+
+        assert mp.build_resume_notice_embed.called is (
+            placement is Placement.COLD_FRONT
+        )
+
     async def test_shows_queued_embed_with_eta_when_song_playing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:

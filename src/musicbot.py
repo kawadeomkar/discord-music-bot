@@ -212,6 +212,22 @@ _FLAG_MODES: Final[dict[str, PlayMode]] = {
     NEXT_FLAG: PlayMode.NEXT,
 }
 
+
+class Placement(Enum):
+    """Where an enqueue puts its songs, AND which confirmation says so.
+
+    One value rather than a `front: bool`, because those are two decisions that
+    only look like one. `build_resume_notice_embed` — "❗ Resumed from queue …
+    N songs from the previous session resume after it" — is true for a
+    disconnected bot waking a persisted queue and false in every clause for a warm
+    front-insert, and it returns None only when the queue is EMPTY, so it renders
+    exactly on the case that would be wrong.
+    """
+
+    TAIL = "tail"
+    COLD_FRONT = "cold_front"
+
+
 # Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
 # hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
 # turns a typed `--` into a single em dash on its own, which is the common way a
@@ -923,7 +939,7 @@ class MusicBot(commands.Cog):
         *,
         analytics: Analytics,
         origin: str,
-        front: bool = False,
+        placement: Placement = Placement.TAIL,
     ) -> None:
         """Queue a resolved playlist and notify the channel — branches on the
         resolved shape since Spotify playlists arrive as titles needing YouTube
@@ -931,7 +947,7 @@ class MusicBot(commands.Cog):
         # A playlist front-inserts in full, in order — unlike `--now`, which
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
-        enqueue = mp.queue_put_front if front else mp.queue_put
+        enqueue = mp.queue_put if placement is Placement.TAIL else mp.queue_put_front
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(
@@ -988,10 +1004,10 @@ class MusicBot(commands.Cog):
         qobj: QueueObject,
         mp: MusicPlayer,
         *,
-        front: bool = False,
+        placement: Placement = Placement.TAIL,
     ) -> None:
         vc = ctx.voice_client
-        if front:
+        if placement is Placement.COLD_FRONT:
             # The "Est. playing at" embed below would be wrong: a restored queue is
             # non-empty but its entries sit BEHIND this song. The resume notice
             # replaces it — it names the song starting now (nothing else does; the
@@ -1166,16 +1182,21 @@ class MusicBot(commands.Cog):
                     QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
                 ]
                 async with contextlib.AsyncExitStack() as stack:
-                    # front: not connected, so this song jumps ahead of any queue
-                    # restored from Redis (a -stop leaves its queue persisted).
-                    # -play on a disconnected bot means "play this", not "play
-                    # the leftovers".
-                    front = not ctx.voice_client
+                    # Not connected, so this song jumps ahead of any queue restored
+                    # from Redis (a -stop leaves its queue persisted). -play on a
+                    # disconnected bot means "play this", not "play the leftovers".
+                    #
+                    # Named for the CAUSE, not the effect: this one flag decides the
+                    # analytics shortcut, the join dance below, and the insert
+                    # position, and only the first two are about being out of voice.
+                    # The position is a separate question, which is why it is a
+                    # separate `placement` value further down.
+                    cold_start = not ctx.voice_client
                     # Ask-time analytics, read ONCE at dispatch: the command
                     # message's snowflake time, so the wait covers gateway
-                    # delivery and the resolve below. front ⇒ depth 0, the
+                    # delivery and the resolve below. Cold ⇒ depth 0, the
                     # cold-start song plays ahead of the restored queue.
-                    if front:
+                    if cold_start:
                         position = 0
                     else:
                         # Wait out any in-flight restore: the queue stays empty
@@ -1188,7 +1209,7 @@ class MusicBot(commands.Cog):
                         queued_at=ctx.message.created_at.timestamp(),
                         queue_position=position,
                     )
-                    if front:
+                    if cold_start:
                         # Hold the gate across the join below: join opens it the
                         # moment the handshake lands, which would start the
                         # restored head while queue_source is still extracting.
@@ -1230,7 +1251,7 @@ class MusicBot(commands.Cog):
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
-                    if front:
+                    if cold_start:
                         # Order matters: put_front LPUSHes the mirror while
                         # restore_entries replays already-listed entries in memory
                         # only, so inserting first double-queues this song. A restore
@@ -1248,15 +1269,19 @@ class MusicBot(commands.Cog):
                             )
                             return
 
+                    # The one line that decides both the insert position and the
+                    # confirmation. Cold start is the only placement that front-inserts
+                    # today; --next joins it here.
+                    placement = Placement.COLD_FRONT if cold_start else Placement.TAIL
                     if isinstance(qobj, QueueObject):
-                        await self._enqueue_single(ctx, qobj, mp, front=front)
+                        await self._enqueue_single(ctx, qobj, mp, placement=placement)
                     else:
                         await self._enqueue_playlist(
                             ctx,
                             source,
                             qobj,
                             mp,
-                            front=front,
+                            placement=placement,
                             analytics=analytics,
                             origin=url,
                         )
