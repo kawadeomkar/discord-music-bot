@@ -465,7 +465,7 @@ class TestQuerySourceClassification:
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
-        # keep_first_only is -playnow's; -play enqueues the whole tail.
+        # keep_first_only is the interjection's; -play enqueues the whole tail.
         assert len(result.tracks) == 3
         # The ask time is untouched by the slice — one instant for the command.
         assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
@@ -529,7 +529,7 @@ class TestQuerySourceClassification:
     async def test_empty_playlist_raises_instead_of_queueing_nothing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The same guard -playnow already had: a playlist that resolves to
+        """The same guard the interjection path already had: a playlist that resolves to
         nothing is an error, not a successful enqueue of zero songs."""
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
@@ -611,10 +611,10 @@ class TestQuerySourceClassification:
         assert "ValueError" not in embed.description
         assert "EmptyPlaylistError" not in embed.description
 
-    async def test_playnow_honours_the_playlist_index(
+    async def test_interjection_honours_the_playlist_index(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow interjects the track the link was copied at, not track 1."""
+        """An interjection plays the track the link was copied at, not track 1."""
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
@@ -626,10 +626,10 @@ class TestQuerySourceClassification:
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
-    async def test_playnow_index_past_the_end_reports_it(
+    async def test_interjection_index_past_the_end_reports_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow shares the guard, and its own error path renders the same
+        """The interjection path shares the guard, and its own error path renders the same
         embed under its own title."""
         url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
         source = parse_input(url)
@@ -650,7 +650,7 @@ class TestQuerySourceClassification:
         assert "**#9**" in embed.description
         assert "**3 songs**" in embed.description
 
-    async def test_playnow_spotify_playlist_bypasses_queue_source(
+    async def test_interjection_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # _resolve_interjection_source resolves both playlist shapes directly, so a
@@ -666,7 +666,7 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "spotify.com"
 
-    async def test_playnow_youtube_playlist_bypasses_queue_source(
+    async def test_interjection_youtube_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         url = "https://www.youtube.com/playlist?list=PLabc"
@@ -679,10 +679,10 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "youtube.com"
 
-    async def test_playnow_indexed_playlist_rebases_only_the_track_it_keeps(
+    async def test_interjection_indexed_playlist_rebases_only_the_track_it_keeps(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow interjects exactly one track. Rebasing the rest is work whose
+        """An interjection plays exactly one track. Rebasing the rest is work whose
         only consumer throws it away, so keep_first_only trims first — and the
         one survivor still lands at 0, the depth an interjection actually has."""
         url = "https://www.youtube.com/watch?v=v3&list=PLabc&index=4"
@@ -707,10 +707,10 @@ class TestQuerySourceClassification:
         # which is the whole point of trimming before the rebase.
         assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
 
-    async def test_playnow_analytics_is_depth_zero(
+    async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        # An interjection plays immediately by definition, so -playnow reads no
+        # An interjection plays immediately by definition, so it reads no
         # queue depth at all — and its queued_at is still the ask time.
         url = "https://www.youtube.com/watch?v=abc"
         source = parse_input(url)
@@ -2518,7 +2518,7 @@ class TestHistoryCommand:
         either — both join, and the second MOVES the bot to its own author's channel.
         `-play` for a fifth: two concurrent invocations against a PAUSED song both
         read it live and both park a resume tail, so one play comes back twice —
-        which is also why `-playnow` merging into it must not drop the guard.
+        which is also why folding the interjection command in must not drop the guard.
 
         command_callback() strips decorators everywhere else in this file, so this
         is the only place any of these guards is reachable at all."""
@@ -2709,7 +2709,7 @@ class TestClearCommand:
     ) -> None:
         """clear() destroys the Redis mirror while reading the IN-MEMORY display,
         so against an unrestored player it deletes a saved queue it cannot see —
-        and a -playnow stack loses its rows too, because _flush_played records
+        and an interjection stack loses its rows too, because _flush_played records
         from that same empty display. validate_commands only requires the AUTHOR
         in voice, so a cold player is reachable."""
         mp = MagicMock()
@@ -2813,7 +2813,7 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
 # ── -play --now routing ───────────────────────────────────────────────────────
 
 
-class TestPlayNowFlagRouting:
+class TestNowFlagRouting:
     """The six rows of the branch matrix, over one command body.
 
     Two shallow commands became one branchy body, so this is what stops a later
@@ -3807,7 +3807,7 @@ class TestPlayFrontInsertion:
     async def test_front_playlist_inserts_all_tracks_in_order(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Unlike -playnow (first track only), -play front-inserts a playlist in
+        """Unlike `--now` (first track only), plain -play front-inserts a playlist in
         full — nothing is playing here to delay the return of."""
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
@@ -4243,7 +4243,7 @@ class TestEchoIsSafeInAnEmbed:
 
 
 class TestCommandArgumentBinding:
-    """`-play`, `-playnow` and `-remove` all consume the rest of the line.
+    """`-play` and `-remove` both consume the rest of the line.
 
     A positional binds ONE WORD. `-play` stores its argument as the origin
     `-remove` matches on, so a positional there meant `-play never gonna give you
@@ -4549,15 +4549,15 @@ class TestRemoveCommand:
         assert removal_embed.colour == discord.Color.orange()
 
 
-# ── -playnow ──────────────────────────────────────────────────────────────────
+# ── -play --now ──────────────────────────────────────────────────────────────
 
 
-class TestPlayNowFlag:
+class TestNowFlag:
     """`-p --now` end to end: resolve one song, interrupt, and report.
 
-    Was TestPlaynow, driving the command that has now been folded into this
-    flag. The assertions are unchanged — what they pin is the interjection
-    path, and only its entry point moved."""
+    The assertions are unchanged from when a separate command drove this
+    path — what they pin is the interjection itself, and only its entry point
+    moved."""
 
     @pytest.fixture
     def live_mp(self) -> MagicMock:
@@ -4670,7 +4670,7 @@ class TestPlayNowFlag:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """-playnow restores exactly what it interrupted, so a paused song is
+        """`--now` restores exactly what it interrupted, so a paused song is
         announced as returning paused. returns_paused is what the wording keys
         off — was_paused alone is the observed state and is also True on the
         -play path, where the song comes back playing."""
@@ -4734,7 +4734,7 @@ class TestPlayNowFlag:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """Interjections stack, so a song that was itself queued via -playnow gets
+        """Interjections stack, so a song that was itself interjected gets
         the ordinary resume wording. This used to be its own branch announcing
         "it will not return" — the reply must never say that of a parked song."""
         from src.musicplayer import InterjectOutcome
@@ -4794,7 +4794,7 @@ class TestPlayNowFlag:
         # would have had, and not the queue depth — it goes to the front.
         assert qobj.analytics.queue_position == 1
         # The interjection marker must not leak onto a normally queued song —
-        # a later -playnow would otherwise "replace" it without a resume entry.
+        # a later interjection would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Playing next" in embed.title
@@ -4883,7 +4883,7 @@ class TestPlayNowFlag:
     ) -> None:
         """The stream-URL cache is warmed before interject stops the current
         song — a cache miss at dequeue would otherwise put yt-dlp dead air
-        between the interrupt and the playnow song starting."""
+        between the interrupt and the interjected song starting."""
         from src.musicplayer import InterjectOutcome
 
         music_bot.get_mp = MagicMock(return_value=live_mp)

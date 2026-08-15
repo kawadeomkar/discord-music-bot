@@ -217,7 +217,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
     """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
     CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
     field is silently dropped at. `user_input` reached it late: it is what
-    `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
+    `-remove` matches on, and an interjection's resume tail is rebuilt from the YTDL, so
     losing it here leaves the parked track un-removable by origin."""
 
     @staticmethod
@@ -1490,7 +1490,7 @@ class TestPrefetchStream:
         assert cached is None
 
 
-class TestYTStreamPlaynowFlags:
+class TestYTStreamInterjectionFlags:
     async def test_flags_carried_onto_ytdl(self, mock_ctx: MagicMock) -> None:
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)

@@ -344,7 +344,7 @@ class GuildQueue:
             return queued
 
     async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
-        """Insert items at the front of the queue — the -playnow interjection path. Under the bulk-mutation mutex, like every multi-leg mutation.
+        """Insert items at the front of the queue — the interjection path. Under the bulk-mutation mutex, like every multi-leg mutation.
 
         An in-flight head (dequeued but uncommitted) keeps its position AHEAD of
         the inserted items and forces the mirror down the rebuild path: its Redis entry still sits at the list head awaiting a
@@ -388,7 +388,7 @@ class GuildQueue:
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything that was on it — the claimed
         prefix included. The caller records these (MusicPlayer._flush_played), so
-        returning only what was pending would drop a parked -playnow tail's
+        returning only what was pending would drop a parked resume tail's
         play_history row with no error.
 
         Sets the cleared-flag under the mutex before draining, so a loop iteration
@@ -557,7 +557,7 @@ class GuildQueue:
 
     def resume_tail_depth(self) -> int:
         """How many parked plays are waiting behind the song that just cut the line
-        — the run of consecutive resume tails after it. 1 is a plain -playnow, 2+ a
+        — the run of consecutive resume tails after it. 1 is a plain interjection, 2+ a
         stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
         gone by the time this runs and only its tail is queued.
 

@@ -875,7 +875,7 @@ class TestBlockingWait:
         assert not gq_no_redis._wake.is_set()
 
 
-# ── put_front (-playnow interjection) ─────────────────────────────────────────
+# ── put_front (interjection) ─────────────────────────────────────────────────
 
 
 class TestPutFront:
@@ -1269,7 +1269,7 @@ class TestRemove:
 
 
 class TestResumeTailDepth:
-    """How deep the -playnow stack is: the run of parked plays behind the head.
+    """How deep the interjection stack is: the run of parked plays behind the head.
     Index 0 is skipped because it is the song that just cut the line, not
     something waiting to resume."""
 
@@ -1322,7 +1322,7 @@ class TestResumeTailDepth:
     ) -> None:
         """Songs past the tails were queued normally and were never interrupted.
         Counting them would report depth as "queue length" on any guild that had
-        ever used -playnow."""
+        ever interjected."""
         await gq_no_redis.put(
             [
                 _qobj(9, mock_author),
@@ -1407,7 +1407,7 @@ class TestRestoreEntries:
         assert count == 0
         assert gq.qsize() == 0
 
-    async def test_playnow_flags_rehydrate(
+    async def test_interjection_flags_rehydrate(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         mock_guild.get_member.return_value = mock_author

@@ -169,7 +169,7 @@ class TestCommandList:
         self, help_command: MusicHelpCommand, ctx: MagicMock
     ) -> None:
         """Within a category, commands render by importance/frequency of use
-        (play before playnow before pause…), not alphabetically — which put
+        (play before pause before resume…), not alphabetically — which put
         `pause` above `play`."""
         await help_command.command_callback(ctx, command=None)
         for name, lines in self._sections(ctx).items():

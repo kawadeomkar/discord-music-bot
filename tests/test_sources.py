@@ -368,7 +368,7 @@ class TestSpotifyPlaylistToYTSearch:
 
 class TestYTSourcePlaylistUrl:
     """`YTSource.playlist_url` — the single spelling of the
-    `url or ".../playlist?list={list_id}"` fallback that the enqueue, playnow
+    `url or ".../playlist?list={list_id}"` fallback that the enqueue, interject
     and resolve paths all need."""
 
     def test_pasted_url_wins_over_rebuild(self) -> None:

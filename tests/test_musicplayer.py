@@ -79,7 +79,7 @@ def mock_song() -> MagicMock:
     song.abr = 128
     song.asr = 44100
     song.acodec = "opus"
-    # -playnow flags a real YTDL always carries — as bare MagicMock attributes
+    # Interjection flags a real YTDL always carries — as bare MagicMock attributes
     # they'd read truthy and trip the loop's start_paused/is_resume gates.
     song.interjected = False
     song.is_resume = False
@@ -90,7 +90,7 @@ def mock_song() -> MagicMock:
     # TypeError there, exactly as a MagicMock title would.
     song.analytics = ANALYTICS_ZERO
     song.query_source = ""
-    # Same reason: the resume tail a -playnow builds carries it, and that tail is
+    # Same reason: the resume tail an interjection builds carries it, and it is
     # serialized straight to the queue mirror.
     song.user_input = None
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
@@ -457,7 +457,7 @@ class TestQueueClear:
 
 class TestQueueClearFlushesPlayedSongs:
     """A song records exactly once, when its queue object leaves the queue for
-    good. A -playnow resume tail cleared before it can finish has already been
+    good. An interjection's resume tail cleared before it finishes has already been
     heard and will never reach the loop's write site, so -clear is its only
     chance at a history row."""
 
@@ -568,7 +568,7 @@ class TestQueueClearFlushesPlayedSongs:
     async def test_every_tail_of_a_stacked_queue_is_recorded(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """What a 3-deep -playnow stack leaves behind: one tail per interrupted
+        """What a 3-deep interjection stack leaves behind: one tail per interrupted
         song, each with its own start and its own absolute position, plus the
         interruption that has not played. Clearing it must produce a row per
         HEARD song and nothing for the one that was only queued.
@@ -3288,7 +3288,7 @@ class TestEnqueueDepth:
         """The second window: has_resume_tail matches on URL, not identity, so a
         tail parked by an EARLIER play of the same song answers True for the
         current one and the live song stops being counted. Reached by
-        -play X, -playnow Y, -playnow X."""
+        -play X, -p --now Y, -p --now X."""
         tail = QueueObject(
             "https://yt.com/v=x", "X", mock_author, is_resume=True, ts=30
         )
@@ -3467,7 +3467,7 @@ class TestRestoreCrashedSong:
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """A crash three deep into a -playnow stack.
+        """A crash three deep into an interjection stack.
 
         Every level is an ordinary persisted SongQueueEntry on the Redis list, so
         recovery needs no stack-specific code — which is exactly the claim worth
@@ -4824,7 +4824,7 @@ class TestNpHostAdoptRetire:
         """And the asymmetry is deliberate. Nothing can resurrect a DELETED
         message — a late tick edit 404s and is swallowed — while message deletion
         is its own, stricter ratelimit bucket. Held across it, one 429 stalled
-        every NP edit for the NEW song, so a burst of -playnow serialized the live
+        every NP edit for the NEW song, so a burst of interjections serialized the live
         progress bar behind a queue of deletes."""
         order: list[str] = []
         old = AsyncMock(spec=discord.Message)
@@ -6248,7 +6248,7 @@ class TestLoop:
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # -playnow flags a real YTDL always carries — truthy MagicMock
+        # Interjection flags a real YTDL always carries — truthy MagicMock
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
@@ -6650,7 +6650,7 @@ class TestLoop:
     async def test_a_dead_resume_tail_still_records_what_was_heard(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """Same dead stream, but on a -playnow resume tail. Zero frames HERE does
+        """Same dead stream, but on an interjection's resume tail. Zero frames HERE does
         not mean nothing was heard: the offset is audio the interrupted fragment
         played, and that fragment suppressed its own record so this tail would
         carry it. Dropping it on stream_failed lost the whole play."""
@@ -6914,7 +6914,7 @@ class TestLoop:
     async def test_inherited_played_at_is_not_restamped(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """A -playnow resume tail arrives already carrying the interrupted song's
+        """An interjection's resume tail arrives already carrying the interrupted song's
         start, and the or-stamp must leave it alone: restamping files the two
         fragments of one play as two plays, minutes apart."""
         assert music_player.store is not None
@@ -7389,7 +7389,7 @@ class TestLoopAdditional:
         # Real number: loop()'s history step feeds this through
         # HistoryEntry.from_song, and round(MagicMock) raises.
         song.position_secs = 195.0
-        # -playnow flags a real YTDL always carries — truthy MagicMock
+        # Interjection flags a real YTDL always carries — truthy MagicMock
         # attributes would trip the loop's start_paused/is_resume gates.
         song.interjected = False
         song.is_resume = False
@@ -7548,7 +7548,7 @@ class TestLoopAdditional:
         mock_song.cleanup.assert_called_once()
 
 
-# ── -playnow interjection ─────────────────────────────────────────────────────
+# ── interjection ─────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -7561,7 +7561,7 @@ def mock_vc() -> MagicMock:
 
 @pytest.fixture
 def live_song(mock_song: MagicMock) -> MagicMock:
-    """mock_song with the -playnow flags a real YTDL carries — bare MagicMock
+    """mock_song with the interjection flags a real YTDL carries — bare MagicMock
     attributes would read truthy and trip the loop's is_resume/start_paused
     gates."""
     mock_song.interjected = False
@@ -7571,7 +7571,7 @@ def live_song(mock_song: MagicMock) -> MagicMock:
 
 
 @pytest.fixture
-def playnow_obj(mock_author: MagicMock) -> QueueObject:
+def interject_obj(mock_author: MagicMock) -> QueueObject:
     return QueueObject(
         webpage_url="https://www.youtube.com/watch?v=urgent",
         title="Urgent Song",
@@ -7583,17 +7583,17 @@ def playnow_obj(mock_author: MagicMock) -> QueueObject:
 
 class TestInterject:
     async def test_returns_none_without_current_song(
-        self, music_player: MusicPlayer, playnow_obj: QueueObject, mock_vc: MagicMock
+        self, music_player: MusicPlayer, interject_obj: QueueObject, mock_vc: MagicMock
     ) -> None:
         music_player.current_song = None
-        assert await music_player.interject(playnow_obj, mock_vc) is None
+        assert await music_player.interject(interject_obj, mock_vc) is None
         mock_vc.stop.assert_not_called()
 
-    async def test_front_inserts_playnow_then_resume(
+    async def test_front_inserts_the_interjection_then_resume(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
         mock_author: MagicMock,
     ) -> None:
@@ -7602,10 +7602,10 @@ class TestInterject:
         queued = QueueObject("https://yt.com/v=b", "Queued B", mock_author)
         await music_player.queue.put([queued])
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
         items = music_player.queue.display_items()
-        assert items[0] is playnow_obj
+        assert items[0] is interject_obj
         resume = items[1]
         assert isinstance(resume, QueueObject)
         assert resume.is_resume is True
@@ -7626,20 +7626,20 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         # interject() no longer stamps anything: the interruption arrives already
-        # carrying the depth-0 analytics -playnow minted at dispatch, and the tail
+        # carrying the depth-0 analytics the command minted at dispatch, and the tail
         # is the same play, so it keeps the interrupted song's.
-        playnow_obj.analytics = Analytics(queued_at=1752530500.5, queue_position=0)
+        interject_obj.analytics = Analytics(queued_at=1752530500.5, queue_position=0)
         live_song.elapsed_secs = 42.0
         live_song.analytics = Analytics(queued_at=1752530000.5, queue_position=5)
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
-        assert playnow_obj.analytics == Analytics(
+        assert interject_obj.analytics == Analytics(
             queued_at=1752530500.5, queue_position=0
         )
         resume = music_player.queue.display_items()[1]
@@ -7650,7 +7650,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """The tail writes the ONLY history row for an interrupted play — the
@@ -7663,7 +7663,7 @@ class TestInterject:
         live_song.query_source = "spotify.com"
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
@@ -7673,7 +7673,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         # The tail IS the interrupted play, so history files it under when that
@@ -7683,39 +7683,39 @@ class TestInterject:
         live_song.played_at = 1752530000.5
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
         assert resume.played_at == 1752530000.5
         # The interruption is its own play and has not started yet.
-        assert playnow_obj.played_at == 0.0
+        assert interject_obj.played_at == 0.0
 
     async def test_paused_song_returns_start_paused(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
         mock_vc.is_paused.return_value = True
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
         assert resume.start_paused is True
         assert outcome is not None and outcome.was_paused is True
-        # -playnow's default: restore exactly what was interrupted.
+        # `--now`'s default: restore exactly what was interrupted.
         assert outcome.returns_paused is True
 
     async def test_resume_paused_false_returns_song_playing(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
@@ -7726,7 +7726,7 @@ class TestInterject:
         mock_vc.is_paused.return_value = True
 
         outcome = await music_player.interject(
-            playnow_obj, mock_vc, resume_paused=False
+            interject_obj, mock_vc, resume_paused=False
         )
 
         resume = music_player.queue.display_items()[1]
@@ -7743,7 +7743,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 30.0
@@ -7751,7 +7751,7 @@ class TestInterject:
         mock_vc.is_paused.return_value = False
 
         outcome = await music_player.interject(
-            playnow_obj, mock_vc, resume_paused=False
+            interject_obj, mock_vc, resume_paused=False
         )
 
         resume = music_player.queue.display_items()[1]
@@ -7763,7 +7763,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """Nearly-finished song → no resume entry at all, so nothing returns."""
@@ -7771,7 +7771,7 @@ class TestInterject:
         music_player.current_song = live_song
         mock_vc.is_paused.return_value = True
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
         assert outcome is not None
         assert outcome.resume_position is None
@@ -7781,20 +7781,20 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
-        """The inverse of the old replace semantics: a song queued via -playnow is
+        """The inverse of the old replace semantics: an interjected song is
         parked like any other. Its own resume tail, if it has one, is already
         behind it and stays there — the queue unwinds LIFO."""
-        live_song.interjected = True  # the playing song is itself a -playnow song
+        live_song.interjected = True  # the playing song is itself interjected
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
         display = music_player.queue.display_items()
-        assert display[0] is playnow_obj
+        assert display[0] is interject_obj
         parked = display[1]
         assert isinstance(parked, QueueObject)
         assert parked.is_resume is True
@@ -7815,14 +7815,14 @@ class TestInterject:
         depth: int,
     ) -> list[QueueObject]:
         """Interject `depth` times, each over the previous interjection, as a user
-        running -playnow repeatedly would. Returns the songs in the order they cut
+        running it repeatedly would. Returns the songs in the order they cut
         in. Each round makes the new song current, since the loop is not running
         here to do it."""
         cut_in: list[QueueObject] = []
         for n in range(1, depth + 1):
             if cut_in:
                 # The playback loop consumes the song that just cut in before the
-                # next -playnow can land. Without this the display keeps entries a
+                # next interjection can land. Without this the display keeps entries a
                 # running loop would already have dequeued, and the tails stop
                 # being contiguous.
                 assert music_player.queue.get_nowait() is cut_in[-1]
@@ -7853,7 +7853,7 @@ class TestInterject:
         mock_vc: MagicMock,
         mock_author: MagicMock,
     ) -> None:
-        """The whole feature: three -playnows leave three parked plays, each
+        """The whole feature: three interjections leave three parked plays, each
         resuming from where it actually stopped, most recent first."""
         cut_in = await self._stack(music_player, live_song, mock_vc, mock_author, 3)
 
@@ -7886,7 +7886,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """A resumed song interrupted a second time is still ONE play: it keeps the
@@ -7898,7 +7898,7 @@ class TestInterject:
         live_song.analytics = Analytics(queued_at=1752529000.5, queue_position=4)
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         tail = music_player.queue.display_items()[1]
         assert isinstance(tail, QueueObject)
@@ -7913,7 +7913,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """The tail cannot be stamped with its NP card here — the confirmation
@@ -7923,7 +7923,7 @@ class TestInterject:
         live_song.elapsed_secs = 42.0
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         tail = music_player.queue.display_items()[1]
         assert music_player._pending_resume_tail is tail
@@ -7940,7 +7940,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         # Nearly-over song: no tail exists, so neither slot may be set — a stale
@@ -7948,7 +7948,7 @@ class TestInterject:
         live_song.elapsed_secs = 207.0
         music_player.current_song = live_song
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         assert music_player._pending_resume_tail is None
         assert music_player._skip_history_for is None
@@ -7957,15 +7957,15 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 207.0  # 3s left of 210 — below the 5s floor
         music_player.current_song = live_song
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
-        assert music_player.queue.display_items() == [playnow_obj]
+        assert music_player.queue.display_items() == [interject_obj]
         assert outcome is not None and outcome.resume_position is None
         assert music_player._skip_history_for is None
 
@@ -7973,13 +7973,13 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 205.0  # 5s left: resumable, but capped to 200
         music_player.current_song = live_song
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
@@ -7990,23 +7990,23 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.webpage_url = None
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
 
-        outcome = await music_player.interject(playnow_obj, mock_vc)
+        outcome = await music_player.interject(interject_obj, mock_vc)
 
-        assert music_player.queue.display_items() == [playnow_obj]
+        assert music_player.queue.display_items() == [interject_obj]
         assert outcome is not None and outcome.resume_position is None
 
     async def test_stop_skipped_when_song_changed_during_insert(
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 30.0
@@ -8020,7 +8020,7 @@ class TestInterject:
         # Class-level patch: GuildQueue uses __slots__, so patch.object on the
         # instance can't set the attribute.
         with patch.object(GuildQueue, "put_front", side_effect=put_front_and_advance):
-            await music_player.interject(playnow_obj, mock_vc)
+            await music_player.interject(interject_obj, mock_vc)
 
         mock_vc.stop.assert_not_called()
         # The marker is taken even though the song moved on: the tail is on the
@@ -8032,7 +8032,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """Asserted on the SPAN, not by calling resume_tail_depth() directly. The
@@ -8047,7 +8047,7 @@ class TestInterject:
         span.set_attribute = lambda k, v: attrs.__setitem__(k, v)
 
         with patch("src.musicplayer.trace.get_current_span", return_value=span):
-            await music_player.interject(playnow_obj, mock_vc)
+            await music_player.interject(interject_obj, mock_vc)
 
         assert attrs["interject.depth"] == 1
         assert attrs["interject.over_interjection"] is True
@@ -8056,7 +8056,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """A teardown landing inside put_front's Redis round trip must find the
@@ -8074,7 +8074,7 @@ class TestInterject:
         from src.guild_queue import GuildQueue
 
         with patch.object(GuildQueue, "put_front", side_effect=claim_mid_await):
-            await music_player.interject(playnow_obj, mock_vc)
+            await music_player.interject(interject_obj, mock_vc)
 
         assert seen == [None]  # the teardown declined; the tail owns the record
 
@@ -8082,7 +8082,7 @@ class TestInterject:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         live_song.elapsed_secs = 30.0
@@ -8090,7 +8090,7 @@ class TestInterject:
         blocker = asyncio.create_task(asyncio.sleep(30))
         music_player._prefetch_task = blocker
 
-        await music_player.interject(playnow_obj, mock_vc)
+        await music_player.interject(interject_obj, mock_vc)
 
         assert blocker.cancelled()
         assert music_player._prefetch_task is None
@@ -8137,11 +8137,11 @@ class TestNeutralizePrefetch:
         assert rebuilt.webpage_url == live_song.webpage_url
         assert rebuilt.title == live_song.title
 
-    async def test_completed_task_rebuild_keeps_offset_and_playnow_flags(
+    async def test_completed_task_rebuild_keeps_offset_and_interjection_flags(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        """Nested -playnow: the prefetcher resolves the first interjection's resume
-        entry on a cache hit, so a second -playnow neutralizes a completed prefetch
+        """Nested interjection: the prefetcher resolves the first one's resume
+        entry on a cache hit, so a second one neutralizes a completed prefetch
         holding a flagged, offset entry. A rebuild dropping ts/is_resume/start_paused
         restarts the interrupted song from 0:00, unpaused and unannounced."""
         original = QueueObject(
@@ -8215,7 +8215,7 @@ class TestNeutralizePrefetch:
     async def test_completed_task_rebuild_keeps_the_np_card_pointer(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        # A prefetched resume tail neutralized by a second -playnow: dropping these
+        # A prefetched resume tail neutralized by a second interjection: dropping these
         # strands the previous fragment's frozen card with nothing left that knows
         # to delete it. The runtime ref rides along too — it is what allows a
         # strip-edit, which the ids alone cannot do.
@@ -8264,7 +8264,7 @@ class TestNeutralizePrefetch:
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
         # A resume tail is the only prefetch that carries a start, and a second
-        # -playnow neutralizing it is exactly when that happens. Dropped here, the
+        # An interjection neutralizing it is exactly when that happens. Dropped here,
         # loop's or-stamp refiles the tail under whenever it eventually resumes.
         original = QueueObject(
             "https://yt.com/v=orig",
@@ -8328,11 +8328,11 @@ class TestNeutralizePrefetch:
     async def test_completed_task_rebuild_keeps_interjected_flag(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
-        """A parked playnow entry must keep its marker through the rebuild —
-        losing it would make a later -playnow stack a resume entry for it
+        """A parked interjected entry must keep its marker through the rebuild —
+        losing it would make a later interjection stack a resume entry for it
         instead of applying replace semantics."""
         original = QueueObject(
-            "https://yt.com/v=pn", "Playnow Song", mock_author, interjected=True
+            "https://yt.com/v=pn", "Interjected Song", mock_author, interjected=True
         )
         await music_player.queue.put([original])
         assert music_player.queue.get_nowait() is original
@@ -8536,8 +8536,8 @@ class TestStartOffsetAnnounce:
         assert entry.is_resume is False  # the stamp that decides the arm
         mock_song.is_resume = entry.is_resume
         mock_song.start_offset = entry.ts
-        vc = TestPlaynowLoopStart()._vc()
-        _, announce_mock, offset_mock = await TestPlaynowLoopStart()._run_one_song(
+        vc = TestInterjectLoopStart()._vc()
+        _, announce_mock, offset_mock = await TestInterjectLoopStart()._run_one_song(
             music_player, queue_obj, mock_song, vc
         )
         offset_mock.assert_awaited_once_with(mock_song)
@@ -8841,7 +8841,7 @@ class TestHistorySkipMarker:
         """Stacking three deep does not need three markers.
 
         Each interjection stops exactly ONE song, and that song's loop iteration
-        consumes the marker before the next -playnow can finish resolving — so the
+        consumes the marker before the next interjection can finish resolving — so the
         single slot never has to hold two identities at once. What makes it safe is
         that it holds an identity rather than a flag: the marker left by the last
         interjection must suppress only the song it named."""
@@ -8874,7 +8874,7 @@ class TestHistorySkipMarker:
 
 class TestDisposePreviousNpCard:
     """Cleanup of the card an interrupted fragment left frozen. Without it a
-    -playnow stack accumulates one dead partial bar per interjection: song end
+    An interjection stack accumulates one dead partial bar each: song end
     RELEASES the host rather than retiring it, by design."""
 
     def _song(self, **attrs: Any) -> MagicMock:
@@ -9097,7 +9097,7 @@ class TestInterjectPostNeutralizeRecheck:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
     ) -> None:
         """Neutralize can block up to yt-dlp's socket timeout (cancellation
@@ -9113,7 +9113,7 @@ class TestInterjectPostNeutralizeRecheck:
         with patch.object(
             MusicPlayer, "_neutralize_prefetch", new=neutralize_and_advance
         ):
-            outcome = await music_player.interject(playnow_obj, mock_vc)
+            outcome = await music_player.interject(interject_obj, mock_vc)
 
         assert outcome is None
         assert music_player.queue.display_items() == []  # nothing inserted
@@ -9124,7 +9124,7 @@ class TestInterjectPostNeutralizeRecheck:
         self,
         music_player: MusicPlayer,
         live_song: MagicMock,
-        playnow_obj: QueueObject,
+        interject_obj: QueueObject,
         mock_vc: MagicMock,
         mock_author: MagicMock,
     ) -> None:
@@ -9152,7 +9152,7 @@ class TestInterjectPostNeutralizeRecheck:
         with patch.object(
             MusicPlayer, "_neutralize_prefetch", new=neutralize_and_advance
         ):
-            outcome = await music_player.interject(playnow_obj, mock_vc)
+            outcome = await music_player.interject(interject_obj, mock_vc)
 
         assert outcome is None
         assert music_player.queue.display_items() == parked
@@ -9160,8 +9160,8 @@ class TestInterjectPostNeutralizeRecheck:
         mock_vc.stop.assert_not_called()
 
 
-class TestPlaynowLoopStart:
-    """Loop-level behavior for -playnow entries at song start (review gap):
+class TestInterjectLoopStart:
+    """Loop-level behavior for interjected entries at song start (review gap):
     start_paused parks the player, is_resume announces from the start path."""
 
     async def _run_one_song(

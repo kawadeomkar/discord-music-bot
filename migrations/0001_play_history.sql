@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS play_history (
     thumbnail      text        NOT NULL DEFAULT '',
     uploader       text        NOT NULL DEFAULT '',
     -- When the audio STARTED, one value per PLAY rather than per fragment: every
-    -- -playnow resume tail inherits the played_at of the fragment it continues.
+    -- An interjection's resume tail inherits the played_at of what it continues.
     -- So rows are not in recording order, and an interrupted play's [played_at,
     -- played_at + played_secs] interval overlaps the songs that interrupted it —
     -- "what was playing at time T" has more than one answer here.

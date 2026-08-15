@@ -155,6 +155,14 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
     history or config keys: history is bounded by LENGTH, and config is bounded by
     the number of settings that exist.
 
+13. **The chat-command surface is not a SemVer API.** Adding, renaming or REMOVING a
+    command is a minor bump, not a major one: the version is a deploy tag for a
+    self-hosted bot, nothing links against these names, and CI validates only that the
+    string is semver-shaped. The interjection command was folded into `-p --now` and
+    deleted in 2.26.0 under this rule. A removal still owes users an
+    `## Upgrading to <version>` section in README.md — nothing else records the
+    migration, and the release notes are minted from the tag.
+
 ## Commands
 
 All dev commands go through `just` (must be installed system-wide, not only in the venv —
@@ -641,7 +649,7 @@ Known limitation (FIXME in guild_state.py): recovery counts **bot downtime** as 
 position — a song 30s in that stays down 10min resumes near its end (duration−10s cap).
 The designed fix is a periodic position heartbeat, not yet implemented.
 
-### `-playnow` interjection and resume entries
+### `-play --now` interjection and resume entries
 
 `MusicPlayer.interject(qobj, vc, resume_paused)` implements "play this now, then put the
 interrupted song back where it was":
@@ -661,7 +669,7 @@ interrupted song back where it was":
    still current.
 4. **Stacking**: interjecting over an interjection parks that song too, in front of the
    tails already waiting, so the queue unwinds LIFO and every parked song returns.
-   Unbounded by design (each `-playnow` pays a 1–4s resolve first); `ts` is absolute at
+   Unbounded by design (each interjection pays a 1–4s resolve first); `ts` is absolute at
    every level, so a tail of a tail resumes where it actually stopped. Depth rides the
    span as `interject.depth` (`GuildQueue.resume_tail_depth`), and `interjected` is now
    attribution only — its one behavioural read was the replace gate.
@@ -679,10 +687,10 @@ interrupted song back where it was":
    because then a parked tail survives in Redis and records the play on `-resume`.
 
 `-play` while paused routes through the same flow with `resume_paused=False` (the
-interrupted song comes back PLAYING — "-play means play"); `-playnow` restores the exact
+interrupted song comes back PLAYING — "-play means play"); `--now` restores the exact
 paused state (`start_paused` re-pauses the player thread synchronously at `vc.play`,
 before any await, leaking at most a frame or two). Playlists collapse to their first
-track for `-playnow`; plain `-play` front-inserts a playlist in full (nothing is playing
+track for `--now`; plain `-play` front-inserts a playlist in full (nothing is playing
 to keep waiting).
 
 ### The Now Playing host system

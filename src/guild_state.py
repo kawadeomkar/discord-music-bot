@@ -80,10 +80,10 @@ class StateField:
     CURRENT_SONG_DURATION: Final[str] = "current_song_duration"
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
-    # "1" when the playing song was queued via -playnow — attribution that would
+    # "1" when the playing song was queued by an interjection — attribution that
     # otherwise be lost across a crash mid-interjection.
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
-    # "1" when the playing song is a -playnow resume tail, and when it was parked
+    # "1" when the playing song is an interjection's resume tail, and when parked
     # paused. is_resume drives the resume announcement, _remaining_secs' billing and
     # the tail's NP-card cleanup, so losing it across a crash changes behaviour.
     CURRENT_SONG_IS_RESUME: Final[str] = "current_song_is_resume"
@@ -537,7 +537,7 @@ class QueueEntryField:
     UPLOADER: Final[str] = "uploader"
     THUMBNAIL: Final[str] = "thumbnail"
     PERSISTED: Final[str] = "persisted"
-    # -playnow flags — absent on pre-feature entries, parsed as False.
+    # Interjection flags — absent on pre-feature entries, parsed as False.
     INTERJECTED: Final[str] = "interjected"
     IS_RESUME: Final[str] = "is_resume"
     START_PAUSED: Final[str] = "start_paused"
@@ -592,7 +592,7 @@ class SongQueueEntry:
     uploader: str | None = None
     thumbnail: str | None = None
     persisted: bool = True
-    # -playnow flags — see the matching QueueObject field comments.
+    # Interjection flags — see the matching QueueObject field comments.
     interjected: bool = False
     is_resume: bool = False
     start_paused: bool = False
@@ -602,7 +602,7 @@ class SongQueueEntry:
     # How it was asked for ("" = unknown), see QueueObject.
     query_source: str = ""
     # When the audio started (0.0 = not played yet), see QueueObject. Carried so a
-    # song interrupted by -playnow, or recovered from a crash, still records the
+    # song interrupted by an interjection, or recovered from a crash, still records
     # start of the play rather than the start of its last fragment.
     played_at: float = 0.0
     # The interrupted fragment's frozen NP card, see QueueObject. The live
@@ -672,12 +672,12 @@ class SongQueueEntry:
         passed in so this stays a pure field mapping.
 
         FIXME: A recovered song is a resume in everything but the flag.
-        A FRESH one, now — a song that WAS a -playnow tail round-trips is_resume
+        A FRESH one, now — a song that WAS a resume tail round-trips is_resume
         through the state hash. `ts` holds the interrupt position but nothing ever
         set the flag, so the loop announces "Starting song at 137 seconds" rather
         than resuming, and _remaining_secs bills the whole duration instead of the
         tail, skewing every ETA behind it. Synthesizing it from `ts > 0` would also
-        move the queue display and the -playnow wording, so it wants its own change.
+        move the queue display and the interjection wording, so it wants its own change.
         """
         if not state.has_crashed_song:
             return None
@@ -926,7 +926,7 @@ class HistoryEntry:
     thumbnail: str = ""
     uploader: str = ""
     # Unix epoch when the audio started; drives <t:…:f>. One value per play, not
-    # per fragment: a -playnow resume tail inherits the interrupted song's stamp,
+    # per fragment: an interjection's resume tail inherits the interrupted stamp,
     # so an interrupted play files under when the listener first heard it.
     played_at: float = 0.0
     message_id: int = 0  # NP host at song end; 0 = unknown (see class docstring)
@@ -1006,7 +1006,7 @@ class HistoryEntry:
         once, under the moment it actually started.
 
         played_secs is the position reached (start_offset + audio delivered), capped
-        at duration when known. A -playnow-interrupted song is recorded once at its
+        at duration when known. An interrupted song is recorded once at its
         resume tail, whose position spans the full listened range; a ?t= song
         includes the skip.
         """
@@ -1037,7 +1037,7 @@ class HistoryEntry:
         """A played song recorded as it LEAVES the queue, rather than as it ends.
 
         The -clear/-remove counterpart to from_song. There is no YTDL to hand it:
-        this entry was interrupted by a -playnow and destroyed before its tail could
+        this entry was interrupted by an interjection and destroyed before its tail could
         play, so the queue object is all that is left of it.
 
         played_secs comes from `ts`, the resume offset, which is ABSOLUTE (see
