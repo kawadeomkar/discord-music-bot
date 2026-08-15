@@ -3,6 +3,7 @@ import contextlib
 import re
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from itertools import islice
 from typing import (
     Any,
@@ -190,60 +191,92 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
 
 
 NOW_FLAG: Final[str] = "--now"
+NEXT_FLAG: Final[str] = "--next"
+
+
+class PlayMode(Enum):
+    """Where a `-play` invocation puts its song.
+
+    One field rather than a bool per flag: the flags contradict each other, and two
+    bools would make `now and next` representable — a state every branch downstream
+    would then have to decide about.
+    """
+
+    NORMAL = "normal"
+    NOW = "now"
+    NEXT = "next"
+
+
+_FLAG_MODES: Final[dict[str, PlayMode]] = {
+    NOW_FLAG: PlayMode.NOW,
+    NEXT_FLAG: PlayMode.NEXT,
+}
 
 # Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
 # hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
 # turns a typed `--` into a single em dash on its own, which is the common way a
 # correctly-typed flag still arrives spelled wrong.
 _DASHES: Final[str] = "-‐‑‒–—―"
-_NEAR_NOW_RE: Final[re.Pattern[str]] = re.compile(f"[{_DASHES}]{{1,2}}now")
+# Alternation built from _FLAG_MODES' own keys, so a renamed flag cannot leave this
+# branch offering one that no longer exists. The group is a flag minus its dashes;
+# split_play_args re-attaches them for the reply.
+_NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
+    f"[{_DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class PlayArgs:
-    """`-play`'s argument, split into the interjection flag and the query behind it.
+    """`-play`'s argument, split into the placement flag and the query behind it.
 
-    `dash_typo` is the third state: the leading token is recognisably a misspelt
-    `--now` rather than either a flag or a search, so the command asks instead of
-    guessing. It is mutually exclusive with `now` — the whole point is that we do
-    not know which the user meant.
+    `dash_typo` is the third state: the leading token is recognisably a misspelt flag
+    rather than either a flag or a search, so the command asks instead of guessing. It
+    names the flag meant, and only ever accompanies `PlayMode.NORMAL` — the whole
+    point is that we do not know which the user meant.
     """
 
-    now: bool
+    mode: PlayMode
     query: str
-    dash_typo: bool = False
+    dash_typo: Optional[str] = None
 
 
 def split_play_args(argument: str) -> PlayArgs:
-    """Split a leading `--now` off `-play`'s argument.
+    """Split a leading `--now`/`--next` off `-play`'s argument.
 
-    Only the FIRST token is considered, so a `--now` further along stays part of the
+    Only the FIRST token is considered, so a flag further along stays part of the
     search text. Stripping it from anywhere would silently eat the token out of a
     legitimate search, and would leave the origin `-remove` matches on as the line
-    minus a hole rather than as something the user typed.
+    minus a hole rather than as something the user typed. One flag, never a run:
+    `-p --now --next x` takes `--now` and searches for "--next x", exactly as a
+    second `--now` would.
 
     Hand-parsed rather than a FlagConverter (as in src/debug.py's parse_debug_arg, and
     unlike HistoryFlags above): the converter's grammar is `--flag value`, which cannot
     express a valueless switch, and it matches flags anywhere in the line — which is
     exactly the leading-token rule this has to enforce.
 
-    A leading token that is only a dash away from the flag gets `dash_typo`, because
-    `-now` or an autocorrected `—now` cannot be anything else. A bare leading `now`
-    deliberately does NOT: `-p now thats what i call music` is a real search, and
-    guessing there would break it.
+    A leading token that is only a dash away from a flag gets `dash_typo`, because
+    `-now` or an autocorrected `—next` cannot be anything else. The exact-match lookup
+    runs first for that reason: a real `--now` also satisfies the near-miss pattern. A
+    bare leading `now`/`next` deliberately does NOT: `-p now thats what i call music`
+    and `-p next to me` are real searches, and guessing there would break them.
     """
     stripped = argument.strip()
     parts = stripped.split(maxsplit=1)
     if not parts:
-        return PlayArgs(now=False, query="")
+        return PlayArgs(mode=PlayMode.NORMAL, query="")
     head = parts[0].lower()
     # No strip on the tail: `stripped` had none, and split() eats the separator run.
     rest = parts[1] if len(parts) > 1 else ""
-    if head == NOW_FLAG:
-        return PlayArgs(now=True, query=rest)
-    if _NEAR_NOW_RE.fullmatch(head):
-        return PlayArgs(now=False, query=stripped, dash_typo=True)
-    return PlayArgs(now=False, query=stripped)
+    mode = _FLAG_MODES.get(head)
+    if mode is not None:
+        return PlayArgs(mode=mode, query=rest)
+    typo = _NEAR_FLAG_RE.fullmatch(head)
+    if typo is not None:
+        return PlayArgs(
+            mode=PlayMode.NORMAL, query=stripped, dash_typo=f"--{typo.group(1)}"
+        )
+    return PlayArgs(mode=PlayMode.NORMAL, query=stripped)
 
 
 # What a user typed, echoed back into an embed. Discord renders markdown in embed
@@ -405,7 +438,7 @@ def _play_will_interject(
         return False
     if voice_client.is_paused():
         return True
-    return split_play_args(str(ctx.kwargs.get("url", ""))).now
+    return split_play_args(str(ctx.kwargs.get("url", ""))).mode is PlayMode.NOW
 
 
 def _check_voice_permissions(
@@ -1058,7 +1091,7 @@ class MusicBot(commands.Cog):
     async def _play(self, ctx: commands.Context, args: PlayArgs) -> None:
         """The body behind -play. Takes the argument already split, so the caller
         decides whether this is an interjection."""
-        trace.get_current_span().set_attribute("play.now", args.now)
+        trace.get_current_span().set_attribute("play.mode", args.mode.value)
         # ONE rebind, so every `origin=url` below is the query the user typed with
         # the flag off it. Threading args.query per call site instead would leave a
         # fourth to miss, and a leaked flag persists a user_input -remove cannot
@@ -1070,10 +1103,11 @@ class MusicBot(commands.Cog):
         interjecting = False
         async with background_typing(ctx):
             try:
-                if args.dash_typo:
+                if args.dash_typo is not None:
                     await ctx.send(
                         embed=notice_embed(
-                            f"Did you mean `{NOW_FLAG}`? Options take two dashes.",
+                            f"Did you mean `{args.dash_typo}`? Options take two "
+                            "dashes.",
                             discord.Color.orange(),
                         )
                     )
@@ -1108,7 +1142,7 @@ class MusicBot(commands.Cog):
                 # live" is what lets a playlist enqueue whole, while the interject
                 # path collapses it to one track.
                 if live_vc is not None:
-                    if args.now:
+                    if args.mode is PlayMode.NOW:
                         interjecting = True
                         return await self._interject_flow(ctx, url, mp, live_vc)
                     if live_vc.is_paused():
