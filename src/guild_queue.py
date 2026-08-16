@@ -13,9 +13,10 @@ The cursor is the boundary, not a per-item flag, because Redis retires entries
 by LPOP — so in-flight items are necessarily a PREFIX. Both legs are private:
 no caller can move one without the other, and every mirror-touching mutation
 (put, put_front, clear, shuffle, remove, finish_failed_dequeue) holds one
-bulk-mutation mutex across its memory AND mirror writes. One residual window
-remains — see the ISSUE below. The cleared-flag the playback loop consumes
-lives here too.
+bulk-mutation mutex across its memory AND mirror writes, and the dequeue commit
+extends that hold over the caller's Redis write (see commit_dequeue). Invalidation
+is carried by the generation counter and the cursor alone; there is deliberately
+no flag beside them (see clear()).
 
 Two counters, adjacent names, different sets: qsize() is PENDING
 (len - cursor), display_size() is pending PLUS in-flight (len). They are one
@@ -32,18 +33,18 @@ Not known here:
 See docs/ARCHITECTURE.md#queue-invariant.
 """
 
-# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
-# try_commit_dequeue() releases the bulk mutex before pop_queue_and_start_song()'s
-# atomic LPOP+HSET dispatches, so a -clear landing in that tick pops an entry the clear
-# already deleted: memory and Redis drift by one until the next rebuild, and a crash
-# inside the drift restores the queue one song out of alignment. Accepted. Cheapest fix:
-# hold the mutex across the store dispatch, costing one ~1ms round-trip.
+# The dequeue-commit/Redis-LPOP race this file used to carry as an accepted ISSUE is
+# CLOSED: commit_dequeue() holds the bulk mutex across the caller's store dispatch, so
+# no put_front() can land between the cursor reset and the LPOP that retires its entry.
+# Cost is one ~1ms Redis round trip under the mutex per song start. Do not reintroduce a
+# commit that releases the lock before the write — see commit_dequeue's docstring.
 
 import asyncio
 import random
 import re
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from itertools import islice
 from enum import Enum, StrEnum, auto
@@ -141,8 +142,8 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     tried first, which keeps every removal that worked before working the same way.
 
     Matching an origin removes every item sharing it, which is the point: one
-    playlist link takes back out exactly the tracks it put in. Links are compared
-    literally, so youtu.be/x will not match an entry stored as
+    album or playlist link takes back out exactly the tracks it put in. Links are
+    compared literally, so youtu.be/x will not match an entry stored as
     youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
     # Angle brackets go for BOTH legs, not just the fold: Discord adds them when a
     # user suppresses a link's embed, so `-remove <https://youtu.be/x>` is an
@@ -216,13 +217,23 @@ class GuildQueue:
         "_cursor",
         "_wake",
         "_mutex",
-        "_cleared",
         "_generation",
+        "_user_lookup",
     )
 
-    def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
+    def __init__(
+        self,
+        guild: discord.Guild,
+        store: Optional[GuildRedisStore],
+        *,
+        user_lookup: Optional[Callable[[int], Optional[discord.User]]] = None,
+    ) -> None:
         self._guild = guild
         self._store = store
+        # The process-wide user cache (Bot.get_user), the second leg _rehydrate
+        # resolves a persisted requester through. Injected rather than reached
+        # for, because this class holds a guild and no bot — see _rehydrate.
+        self._user_lookup = user_lookup
         # The queue, and the boundary through it. _items[:_cursor] are claimed
         # but not yet settled; _items[_cursor:] are pending. See I1-I6 in
         # docs/ARCHITECTURE.md#queue-invariant.
@@ -230,7 +241,6 @@ class GuildQueue:
         self._cursor = 0
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
-        self._cleared = False
         self._generation = 0
 
     # ── Wake discipline ───────────────────────────────────────────────────────
@@ -313,14 +323,6 @@ class GuildQueue:
         plausible wrong number to Postgres with nothing to detect it."""
         return len(self._items)
 
-    def consume_cleared_flag(self) -> bool:
-        """Read-and-reset the queue-was-cleared flag. clear() sets it under the
-        mutex; the loop consumes it once per iteration to learn that a prefetched
-        song it is holding was invalidated and must be discarded."""
-        was_cleared = self._cleared
-        self._cleared = False
-        return was_cleared
-
     @property
     def generation(self) -> int:
         """Monotonic counter of queue invalidations, bumped by clear() and by
@@ -338,8 +340,17 @@ class GuildQueue:
         TOCTOU bug, not an alternative. See docs/ARCHITECTURE.md#queue-invariant."""
         return self._generation
 
-    async def bump_generation(self) -> None:
+    def bump_generation(self) -> None:
         """Invalidate in-flight streamed enqueues without clearing the queue.
+
+        SYNCHRONOUS, and deliberately does NOT take the bulk-mutation mutex. It is
+        cleanup()'s FIRST step, ahead of the voice disconnect, and every
+        mirror-touching method holds that mutex across its Redis round trip — so
+        taking it here made a Redis that accepts and then stalls (the pool sets no
+        socket_timeout) block -stop, a kick and the alone-timer before they could
+        silence the bot. Correct without the lock because the readers that matter
+        check-then-mutate with no await between (put/put_front), so a bump that
+        cannot suspend cannot land inside one of those windows. Keep it awaitless.
 
         Called by MusicBot.cleanup() — the single teardown choke point: -stop,
         a kick (on_voice_state_update), the alone-disconnect timer, the 300s
@@ -358,8 +369,7 @@ class GuildQueue:
         clear() does not call this — it bumps inline under the same mutex hold
         that drains the deque, so no page can land between the drain and the
         bump."""
-        async with self._mutex:
-            self._generation += 1
+        self._generation += 1
 
     async def has_restored_backlog(self) -> bool:
         """True when anything is queued in memory OR on the Redis mirror.
@@ -494,12 +504,17 @@ class GuildQueue:
         returning only what was pending would drop a parked -playnow tail's
         play_history row with no error.
 
-        Sets the cleared-flag under the mutex before draining, so a loop iteration
-        holding a prefetched song discards it. The DEL is inside the mutex too:
-        released early, a concurrent put()'s mirror writes would land between the
-        drain and the DEL and be wiped."""
+        Bumps the generation under the mutex before draining, which is the whole
+        signal: a dequeue already in flight — including one a prefetch claimed a
+        song ago — captured the old value and is refused by try_commit_dequeue().
+        There is deliberately no second cleared-flag beside it. One existed, was
+        read once per loop iteration, and could therefore be set AFTER that read
+        and survive an entire song, so the loop discarded a song claimed long
+        after the clear and never settled its claim.
+
+        The DEL is inside the mutex too: released early, a concurrent put()'s
+        mirror writes would land between the drain and the DEL and be wiped."""
         async with self._mutex:
-            self._cleared = True
             self._generation += 1
             cleared_items = list(self._items)
             self._items.clear()
@@ -514,11 +529,11 @@ class GuildQueue:
         continuous mutex hold, so the loop never sees a mid-shuffle empty queue.
         Requires 4+ pending items. A claimed item keeps its position — only what
         is still pending is reordered."""
-        # FIXME: -shuffle requires 4 queued songs but tells the user it needs 3.
-        # MusicPlayer.queue_shuffle() refuses with "at least 3 songs" and -help says
-        # "(3+ songs)", so a user with exactly 3 queued is refused by a message
-        # stating a requirement they have met. Fix: drop this to < 3, or correct
-        # both user-facing strings to 4.
+        # 4, and every user-facing string says 4 — they used to say 3, so a user
+        # with exactly 3 queued was refused by a message stating a requirement
+        # they had met. Kept at 4 rather than lowered: a 3-item shuffle has only
+        # two orderings that are not the input, so it reads as a no-op often
+        # enough to look broken.
         async with self._mutex:
             # Inside the lock, not before it: acquiring suspends, and a clear() or
             # remove() completing in that gap left this shuffling 0-1 items while
@@ -684,11 +699,13 @@ class GuildQueue:
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
-    def release(self, context: str = "dequeue") -> None:
-        """Settle a claim being retired without playing (failed to stream, failed
-        to resolve). Warns instead of raising when nothing is claimed."""
-        if not self.try_release():
-            log.warning(f"song_queue was empty on {context} in guild {self._guild.id}")
+    # No release() wrapper here. One existed — try_release() plus a warning when
+    # nothing was claimed — and it read as a live alternative to a two-leg settle
+    # while being memory-only, so a maintainer reaching for it would leave the
+    # mirror entry for the next commit's LPOP to retire in place of its own. Every
+    # production path settles through finish_failed_dequeue() or
+    # try_commit_dequeue(); the "nothing claimed" case is the ordinary outcome of a
+    # clear() landing mid-resolve, which is not worth a log line.
 
     def try_release(self) -> bool:
         """Settle one claim: drop the head and step the cursor back, which leaves
@@ -698,10 +715,13 @@ class GuildQueue:
         False means there was nothing claimed to settle, which is what a clear()
         during the resolve leaves behind. Guarded rather than raising, because
         driving _cursor negative would eat a PENDING item on the next release and
-        break I1; the generation check in try_commit_dequeue() is what makes the
-        no-op correct, not just safe. Use try_commit_dequeue() unless
-        already holding the bulk-mutation lock: the check must not race a
-        clear()/shuffle()."""
+        break I1. Two things make the no-op CORRECT rather than merely safe, and
+        they belong to the two callers: commit_dequeue()'s generation check, which
+        refuses a commit taken before a clear(); and finish_failed_dequeue()'s
+        gating of its LPOP on this return value, since nothing claimed means a
+        clear() already retired the entry and the mirror holds only what was
+        queued afterwards. Reach for one of those unless already holding the
+        bulk-mutation lock: the check must not race a clear()/shuffle()."""
         if self._cursor == 0:
             return False
         self._items.popleft()
@@ -730,8 +750,7 @@ class GuildQueue:
         the mirror holds only whatever was queued afterwards. Popping it anyway
         deletes a song this failure had nothing to do with — at-most-once, so the
         entry is simply gone, and the warning below names the memory leg rather
-        than the deletion. This is the check try_release()'s docstring points at
-        when it says the generation test is what makes the no-op correct."""
+        than the deletion."""
         async with self._mutex:
             if not self.try_release():
                 log.warning(
@@ -753,11 +772,41 @@ class GuildQueue:
         committing settles that instead — playing, and re-recording, the cleared
         one. And _resolve_source() replaces a YTSource with the QueueObject it
         resolved to, so head and item are legitimately different objects for one
-        slot."""
+        slot.
+
+        This is the form for a caller with no Redis write to make — the prefetch
+        refusal path. A caller that follows the commit with the start
+        transaction's server-side LPOP must use commit_dequeue() instead, which
+        keeps both inside one mutex hold."""
         async with self._mutex:
             if generation != self._generation:
                 return False
             return self.try_release()
+
+    @asynccontextmanager
+    async def commit_dequeue(self, generation: int) -> AsyncGenerator[bool]:
+        """try_commit_dequeue(), with the bulk mutex held across the caller's own
+        Redis write — the body runs inside the hold.
+
+        This is what closes the queue-desync window this module's header used to
+        carry as an accepted ISSUE. try_commit_dequeue() releases the mutex the
+        moment it returns, and the playback loop's next await is
+        pop_queue_and_start_song()'s LPOP: in that tick a put_front() reads
+        `_cursor == 0`, takes the LPUSH branch, and prepends ahead of the very
+        entry the in-flight LPOP is about to remove — so the LPOP eats the new
+        song. Memory and Redis then drift by one until the next rebuild, and a
+        crash inside the drift restores the queue one song out of alignment.
+
+        The body must therefore stay SHORT and must not touch Discord: one Redis
+        round trip (~1ms, the documented cost of this fix) is what every
+        concurrent enqueue now waits for at each song start. `vc.play()` belongs
+        inside it — it is synchronous, and starting audio outside the hold would
+        put the timestamp this transaction records on the wrong side of it."""
+        async with self._mutex:
+            if generation != self._generation:
+                yield False
+                return
+            yield self.try_release()
 
     async def redis_pop_for(
         self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
@@ -819,18 +868,22 @@ class GuildQueue:
         if not survivors:
             await self._store.delete_queue()
             return
-        dropped = [_to_entry(s) for s in removed if is_persisted(s)]
+        # COUNTED here, built inside the gate. Both halves cost per entry and
+        # _to_entry is the dearer of the two (2.4us against to_redis's 1.2), so a
+        # removal too big for the shortcut — one -remove of a collection link is
+        # routinely hundreds — must not pay either. Only the count is needed to
+        # decide, and counting is free.
+        dropped_count = sum(1 for s in removed if is_persisted(s))
         if (
-            dropped
-            and len(dropped) <= _LREM_MAX_ENTRIES
-            and len(dropped) * _LREM_MAX_SHARE <= survivors
+            dropped_count
+            and dropped_count <= _LREM_MAX_ENTRIES
+            and dropped_count * _LREM_MAX_SHARE <= survivors
         ):
-            # Serialized here, INSIDE the gate. Above it the count clause has not
-            # run yet, so every removal too big for the shortcut — one -remove of
-            # a collection link is routinely hundreds — paid ~2us an entry to
-            # build blobs the rebuild below never reads (1.1ms at 500, on the
-            # single event loop). remove_queue_entries() re-encodes for its own
-            # pipeline, which is why only the guard is served from here.
+            # Built and serialized INSIDE the gate, for the reason above (1.1ms at
+            # 500 entries, on the single event loop, for blobs the rebuild below
+            # never reads). remove_queue_entries() re-encodes for its own pipeline,
+            # which is why only the guard is served from here.
+            dropped = [_to_entry(s) for s in removed if is_persisted(s)]
             dropped_blobs = [entry.to_redis() for entry in dropped]
             if not self._claimed_blobs(dropped_blobs):
                 if await self._store.remove_queue_entries(dropped) == len(dropped):
@@ -865,11 +918,18 @@ class GuildQueue:
     ) -> Optional[QueueItem]:
         """At-rest entry → live queue item: the one construction path for
         everything coming back from Redis (pending entries and the crashed head).
-        SongQueueEntry needs a requester resolved from the guild: the persisted
-        member ID, else requester_fallback (default guild.owner), else dropped.
-        A SearchQueueEntry carries its requester as an ID all the way to the
-        resolve at dequeue, which is the only place a member can be looked up
-        without this method's drop-on-failure contract losing the song."""
+        SongQueueEntry needs a requester resolved here and now: the persisted
+        member ID, then the process-wide user cache, else requester_fallback
+        (default guild.owner), else dropped. A SearchQueueEntry carries its
+        requester as an ID all the way to the resolve at dequeue, which is the
+        only place a member can be looked up without this method's
+        drop-on-failure contract losing the song.
+
+        The user-cache leg mirrors MusicPlayer._resolve_requester's, and the two
+        must agree: a member who left the guild resolves through it either way, so
+        one restored snapshot cannot archive the same person's songs and searches
+        as two different requesters. Without it every song of a departed member
+        archived as guild.owner — permanently, and inflating their -leaderboard."""
         if isinstance(entry, SearchQueueEntry):
             return YTSource(
                 ytsearch=entry.ytsearch,
@@ -887,6 +947,8 @@ class GuildQueue:
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
             requester = self._guild.get_member(entry.requester_id)
+            if requester is None and self._user_lookup is not None:
+                requester = self._user_lookup(entry.requester_id)
         if requester is None:
             requester = (
                 requester_fallback

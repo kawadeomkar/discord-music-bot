@@ -54,10 +54,18 @@ _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # loop, so conftest rebinds this handle per test.
 _MAX_CONCURRENT_REQUESTS = 10
 _MAX_429_RETRIES = 3
-# Capped because Spotify's Retry-After can be minutes. _MAX_429_RETRIES * this
-# (30s) stays under musicbot._COLLECTION_DRAIN_TIMEOUT_SECS (45s), so one
-# rate-limited page fits inside a drain's budget while sustained limiting trips
-# the drain bound instead. Keep that inequality if either moves.
+# Capped because Spotify's Retry-After can be minutes.
+#
+# The LADDER, not just the sleeps: a fully rate-limited request costs
+# (_MAX_429_RETRIES + 1) attempts of up to _HTTP_TIMEOUT each PLUS
+# _MAX_429_RETRIES sleeps of up to this — ~150s at today's values, not the 30s
+# an earlier revision of this comment claimed by counting the sleeps alone.
+# musicbot.py states the honest number beside the page-1 deadline. That is why
+# the ladder does NOT fit inside _COLLECTION_DRAIN_TIMEOUT_SECS and is not meant
+# to: the drain deadline is what cuts a rate-limited page short, and every leg
+# that can reach this ladder is wrapped in one. Keeping some inequality between
+# these two constants is not the invariant — a test pins
+# _HTTP_TIMEOUT < _COLLECTION_DRAIN_TIMEOUT_SECS, which is.
 _MAX_RETRY_AFTER_SECS = 10.0
 _request_slots = asyncio.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
@@ -78,8 +86,13 @@ def _track_search_title(track: dict[str, Any]) -> str:
     """ "<name> <artist1> <artist2> ..." — the yt-dlp search string a Spotify track
     resolves to. Shared by track() and the collection streams so a single track, an
     album item and a playlist entry render identically. Album items are the track
-    itself (no wrapper); playlist_stream guards missing name/artists before calling
-    this — a playlist can legally hold podcast episodes, which carry no artists."""
+    itself (no wrapper).
+
+    NOT total — it subscripts `name` and `artists`. Both collection streams guard
+    those two before calling it: a playlist can legally hold podcast episodes,
+    which carry no artists, and an album page can be malformed. Keep the guards at
+    the call sites rather than defaulting here, or a nameless item becomes a
+    `ytsearch:` for the empty string."""
     return track["name"] + "".join(f" {a['name']}" for a in track["artists"])
 
 
@@ -193,6 +206,20 @@ class SpotifyAuthError(Exception):
         super().__init__(
             f"Spotify rejected the credentials (HTTP {status})"
             + (f": {detail}" if detail else "")
+        )
+
+    @property
+    def user_message(self) -> str:
+        """The same split SpotifyRequestError uses, and needed for the same
+        reason: `detail` is the request endpoint, and on the collection paths
+        that is the `next` cursor — so rendering str(self) published an internal
+        API URL with its offset into a channel, under a
+        `**SpotifyAuthError:**` prefix. The status is a bot-side
+        misconfiguration, so the copy points at the operator, not the user."""
+        return (
+            "Spotify isn't accepting this bot's credentials right now — "
+            "the server owner needs to check them. Try a YouTube or SoundCloud "
+            "link, or just search by name."
         )
 
 
@@ -480,8 +507,18 @@ class Spotify:
         pages_seen = 0
         while True:
             # Album items ARE the track (SimplifiedTrackObject) — no ["track"]
-            # wrapper, no episodes, so no unwrap guard.
-            titles = [_track_search_title(t) for t in page.get("items") or []]
+            # wrapper and no episodes, so no UNWRAP guard is needed. The
+            # name/artists guard still is: _track_search_title subscripts both,
+            # so a null or nameless item on a malformed page raises TypeError
+            # from inside this generator — and TypeError is not in
+            # _command_error's allowlist, so it reaches the user as
+            # "**TypeError:** 'NoneType' object is not subscriptable". Same two
+            # conditions playlist_stream skips on, for the same reason.
+            titles = [
+                _track_search_title(t)
+                for t in page.get("items") or []
+                if t and t.get("name") and t.get("artists")
+            ]
             next_url = page.get("next")
             all_titles.extend(titles)
             pages_seen += 1

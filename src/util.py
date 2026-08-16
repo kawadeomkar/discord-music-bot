@@ -101,7 +101,12 @@ async def send_embed(
     thumbnail: Optional[str] = None,
     fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
-    embed = discord.Embed(title=title, description=description, color=color)
+    # Clamped here, the last point before Discord — see EMBED_DESCRIPTION_LIMIT.
+    embed = discord.Embed(
+        title=truncate(title, EMBED_TITLE_LIMIT),
+        description=truncate_escaped(description, EMBED_DESCRIPTION_LIMIT),
+        color=color,
+    )
     if footer:
         embed.set_footer(text=footer)
     if thumbnail:
@@ -166,6 +171,14 @@ FOOTER_LIMIT = 2048
 # than trusting the caller's arithmetic about how long its inputs can get.
 EMBED_FIELD_LIMIT = 1024
 
+# The same again, for a DESCRIPTION. Enforced in send_embed rather than at each
+# caller for the reason _field exists: the three list-built descriptions (a
+# queued playlist, a queued collection, a cleared queue) are ten escaped rows
+# wide, so nothing but the row-width constant keeps them under this — and the
+# 400 lands after the enqueue or the clear has already committed, telling the
+# user the command failed for work that happened.
+EMBED_DESCRIPTION_LIMIT = 4096
+
 
 # Control characters end a rendered embed line early, which is how text can hide
 # whatever follows it. Flattened rather than escaped — they have no visible form.
@@ -196,6 +209,26 @@ def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def truncate_escaped(text: str, limit: int) -> str:
+    """truncate(), for text that has ALREADY been through escape_markdown.
+
+    safe_label caps before escaping precisely so this case does not arise, but
+    two clamps sit downstream of it and cannot: a field or a description built by
+    joining N escaped rows has a length no single row's cap controls. Cutting
+    there can land between a backslash and the character it escapes, and the
+    orphan then escapes whatever follows — the ellipsis — so the clip is rendered
+    as a literal character and the reader loses the "there is more" signal.
+
+    An ODD trailing run of backslashes is the orphaned one; an even run is
+    escaped backslashes, which are complete and must be kept."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if (len(cut) - len(cut.rstrip("\\"))) % 2:
+        cut = cut[:-1]
+    return cut + "…"
 
 
 def truncate_embed_title(title: str) -> str:

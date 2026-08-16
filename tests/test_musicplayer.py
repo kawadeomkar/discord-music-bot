@@ -8,7 +8,13 @@ import re
 from zoneinfo import ZoneInfo
 import time
 from typing import Any, Never, cast
-from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Generator,
+    Sequence,
+)
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -840,13 +846,13 @@ class TestQueueShuffle:
             await music_player.queue_put(qobj)
 
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
 
     async def test_shuffle_empty_queue_returns_error(
         self, music_player: MusicPlayer
     ) -> None:
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
 
     async def test_shuffle_sufficient_songs_returns_shuffled(
         self, music_player: MusicPlayer, mock_author: MagicMock
@@ -1476,6 +1482,56 @@ class TestResumeNoticeEmbed:
             "Playing now: The Requested Song "
             "- (https://www.youtube.com/watch?v=started)"
         )
+
+    def test_a_hostile_title_cannot_forge_a_link_in_any_of_the_three_slots(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Every yt-dlp title on this embed goes through safe_label.
+
+        Three slots render one: the description names the song being started, and
+        _resume_left_off_field names either the crash-recovered head or the newest
+        history entry. All three used truncate_embed_title, which is a LENGTH cap
+        — Discord renders markdown in descriptions and field values, so a video
+        titled `[FREE NITRO](https://evil.example)` posted a live styled link to
+        an attacker's URL, apparently written by the bot. The embed TITLE slot is
+        the one place the length cap alone is right; Discord renders no markdown
+        there.
+
+        The "Left off on" leg is covered here; its history twin has its own test,
+        because the two are mutually exclusive — a crashed head wins when one is
+        present."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", hostile, mock_author)
+        crashed = QueueObject(
+            "https://yt.com/v=c", hostile, mock_author, persisted=False, ts=10
+        )
+        seed_queue(music_player.queue, crashed)
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        assert "](https://evil.example)" not in described(embed)
+        left_off = next(f for f in embed.fields if f.name == "Left off on")
+        assert "](https://evil.example)" not in (left_off.value or "")
+
+    def test_a_hostile_history_title_cannot_forge_a_link_either(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The other "Left off on" leg — reached after a -stop, where the newest
+        history entry stands in for the interrupted song. Same yt-dlp title, same
+        field, and it was escaped by nothing."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", "Fine Title", mock_author)
+        seed_queue(
+            music_player.queue, QueueObject("https://yt.com/v=q", "Q", mock_author)
+        )
+        music_player.history.restore([HistoryEntry(title=hostile, played_at=1.0)])
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        last_played = next(f for f in embed.fields if f.name == "Last played")
+        assert "](https://evil.example)" not in (last_played.value or "")
 
     def test_thumbnail_is_the_started_song_not_the_last_played(
         self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
@@ -2689,6 +2745,16 @@ class TestMusicPlayerInitialState:
     def test_restore_task_is_none_before_start(self, music_player: MusicPlayer) -> None:
         assert music_player._restore_task is None
 
+    def test_the_queue_gets_the_bots_user_cache(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """GuildQueue holds a guild and no bot, so its second requester leg has
+        to be handed in. Without this wiring, restore_entries resolves a departed
+        member's songs to guild.owner while _resolve_requester keeps them on the
+        member — one restored snapshot, two requesters, and the songs are what
+        reaches play_history."""
+        assert music_player.queue._user_lookup == music_player.bot.get_user
+
 
 # ── RedisHelpers ──────────────────────────────────────────────────────────────
 
@@ -3188,7 +3254,7 @@ class TestQueuePutGenerationForwarding:
     ) -> None:
         assert music_player.store is not None
         gen = music_player.queue.generation
-        await music_player.queue.bump_generation()
+        music_player.queue.bump_generation()
 
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
@@ -3229,7 +3295,7 @@ class TestQueuePutGenerationForwarding:
             QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
         )
         gen = music_player.queue.generation
-        await music_player.queue.bump_generation()
+        music_player.queue.bump_generation()
 
         with patch(
             "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
@@ -3433,6 +3499,28 @@ class TestEnqueueDepth:
             await music_player._resolve_source(source)
         assert spy.await_args is not None
         assert spy.await_args.kwargs["query_source"] == "spotify.com"
+
+    async def test_resolved_search_passes_its_user_input_through(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The origin, not the generated search. `ytsearch` is the string right
+        beside it in the call, so substituting it is a plausible edit — and a
+        silent one: the track still resolves and still plays.
+
+        What breaks is everything downstream that treats user_input as "what the
+        user typed". `-remove <album link>` stops matching the track the album
+        queued, and SongQueueEntry.from_song parks the ytsearch string in
+        current_song_user_input, so after a crash the recovered head is the one
+        track the collection link cannot take back out — the exact defect
+        CURRENT_SONG_USER_INPUT was added to close."""
+        album = "https://open.spotify.com/album/xyz"
+        source = YTSource(ytsearch="ytsearch:Artist - Title", user_input=album)
+        resolved = QueueObject("https://youtube.com/watch?v=1", "One", mock_author)
+        spy = AsyncMock(return_value=resolved)
+        with patch.object(YTDL, "yt_source", new=spy):
+            await music_player._resolve_source(source)
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["user_input"] == album
 
 
 # ── StateRestore ──────────────────────────────────────────────────────────────
@@ -7658,13 +7746,18 @@ class TestLoopAdditional:
         assert activity_mock.call_args_list[0].args[0] is mock_song
         assert activity_mock.call_args_list[1].args[0] is None
 
-    async def test_prefetched_song_cleaned_up_when_queue_was_cleared(
+    async def test_prefetched_song_cleaned_up_when_cleared_mid_prefetch(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """_queue_cleared set while a prefetch is in-flight: the loop discards the
+        """clear() landing while a prefetch is in-flight: the loop discards the
         prefetched song and cleanup()s it so no FFmpeg subprocess leaks. Iteration 1
-        plays song 1 while the prefetch dequeues song 2 and sets the flag; iteration
-        2 fires the guard (claim already settled + cleanup + discard), then times out."""
+        plays song 1 while the prefetch claims song 2 and a clear lands behind it;
+        iteration 2's commit is refused and cleans up.
+
+        The refusal is the whole mechanism, and clear()'s cursor reset is what
+        drives it: try_release() finds nothing claimed and returns False. There is
+        no cleared-flag any more — see
+        test_a_song_prefetched_after_a_clear_still_plays for what one got wrong."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, False, True]
@@ -7696,7 +7789,7 @@ class TestLoopAdditional:
                 music_player.queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-            music_player.queue._cleared = True
+            await music_player.queue.clear()
             return prefetched
 
         async def _stop_noop(_self: Any) -> None:
@@ -7724,6 +7817,85 @@ class TestLoopAdditional:
             await music_player.loop()
 
         prefetched.cleanup.assert_called_once()
+
+    async def test_a_song_prefetched_after_a_clear_still_plays(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A clear that lands BEFORE the prefetch's claim must not discard it.
+
+        This is the P0 the generation capture replaced. clear() used to set a level
+        flag the loop read once per iteration, before parking in queue_get() — where
+        it sits for up to 300s on an idle connected bot. A `-clear` landing during
+        that park survived the whole next song and fired at the TOP of the iteration
+        after it, so the loop destroyed a song the prefetch had claimed long after
+        the clear, and — believing clear() had settled the claim — never released
+        the cursor. It drifted for the rest of the session: every later commit
+        popped the wrong deque entry and every start transaction LPOPed the wrong
+        mirror entry.
+
+        Shaped as the sequence that produced it: clear, then two -plays, both while
+        the loop is parked in its first queue_get().
+        """
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        queue_obj2 = QueueObject(
+            "https://yt.com/watch?v=2", "Song 2", queue_obj.requester
+        )
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        prefetched = MagicMock()
+        prefetched.cleanup = MagicMock()
+        prefetched.persisted = True
+
+        gets: list[int] = []
+
+        async def _clear_then_queue_two(_self: Any) -> Any:
+            if gets:
+                raise asyncio.TimeoutError()
+            gets.append(1)
+            # The -clear lands while the loop is parked here, on an empty queue,
+            # and the two -plays follow it.
+            await music_player.queue.clear()
+            seed_queue(music_player.queue, queue_obj, queue_obj2)
+            return await music_player.queue.get()
+
+        async def _prefetch_after_the_clear(_self: Any) -> MagicMock:
+            music_player.queue.get_nowait()
+            return prefetched
+
+        async def _stop_noop(_self: Any) -> None:
+            pass
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=_prefetch_after_the_clear
+            ),
+            patch.object(MusicPlayer, "queue_get", new=_clear_then_queue_two),
+            patch.object(MusicPlayer, "stop", new=_stop_noop),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        prefetched.cleanup.assert_not_called()
+        # Both songs reached vc.play — the prefetched one is the second.
+        assert vc.play.call_count == 2
+        assert vc.play.call_args_list[1].args[0] is prefetched
+        # And the claim it arrived with was settled, not leaked.
+        assert music_player.queue._cursor == 0
 
     async def test_discards_song_and_calls_cleanup_when_song_queue_cleared_mid_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -8274,6 +8446,31 @@ class TestInterject:
         assert attrs["interject.depth"] == 1
         assert attrs["interject.over_interjection"] is True
 
+    async def test_the_resume_tail_keeps_the_interjected_marker(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The tail is the same play, so a song that was itself a -playnow must
+        come back saying so.
+
+        Two sites turn a playing song back into a queue object and only
+        _neutralize_prefetch's carried this one — every other hop preserves it,
+        which is what made the omission look like an oversight. Attribution-only
+        today, and the visible cost is the span above: at the second and later
+        levels of a stack, over_interjection reported False."""
+        live_song.elapsed_secs = 30.0
+        live_song.interjected = True
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        tail = queue_object(music_player.queue.display_items()[-1])
+        assert tail.is_resume is True
+        assert tail.interjected is True
+
     async def test_the_marker_is_taken_before_the_insert_await(
         self,
         music_player: MusicPlayer,
@@ -8316,6 +8513,19 @@ class TestInterject:
 
         assert blocker.cancelled()
         assert music_player._prefetch_task is None
+
+
+@contextlib.asynccontextmanager
+async def _raising_commit() -> AsyncGenerator[bool]:
+    """A GuildQueue.commit_dequeue stand-in that dies on entry.
+
+    The claim→commit window is one `async with` now — the commit and the start
+    transaction's LPOP share a mutex hold — so "something raised before the claim
+    was settled" is modelled by the context manager failing to enter, which leaves
+    claim_outstanding standing for the loop's outer handler exactly as a raise in
+    the old two-step did."""
+    raise RuntimeError("boom inside the claim window")
+    yield False  # pragma: no cover - unreachable, satisfies the generator shape
 
 
 class TestPrefetchedHeadRespectsPersistence:
@@ -8448,18 +8658,18 @@ class TestFailedPrefetchedClaimRespectsPersistence:
             return prefetched
 
         # Raise inside the claim→commit window, on the prefetched iteration only.
-        # try_commit_dequeue is the one await in that window, which is what makes
-        # this the narrow-but-real path the handler exists for. Patched on the
-        # CLASS: GuildQueue is __slots__ed, so the instance takes no override.
-        real_commit = GuildQueue.try_commit_dequeue
+        # commit_dequeue is the one await in that window, which is what makes this
+        # the narrow-but-real path the handler exists for. Patched on the CLASS:
+        # GuildQueue is __slots__ed, so the instance takes no override.
+        real_commit = GuildQueue.commit_dequeue
         commits = 0
 
-        async def _commit(queue: GuildQueue, generation: int) -> bool:
+        def _commit(queue: GuildQueue, generation: int) -> Any:
             nonlocal commits
             commits += 1
             if commits == 2:
-                raise RuntimeError("boom inside the claim window")
-            return await real_commit(queue, generation)
+                return _raising_commit()
+            return real_commit(queue, generation)
 
         assert music_player.store is not None
         lpop_spy = AsyncMock()
@@ -8480,7 +8690,7 @@ class TestFailedPrefetchedClaimRespectsPersistence:
                 music_player.store, "pop_queue_and_start_song", new=AsyncMock()
             ),
             patch.object(music_player.store, "set_current_song_state", new=AsyncMock()),
-            patch.object(GuildQueue, "try_commit_dequeue", new=_commit),
+            patch.object(GuildQueue, "commit_dequeue", new=_commit),
             patch.object(music_player.store, "pop_queue", lpop_spy),
         ):
             await music_player.loop()
@@ -8513,6 +8723,133 @@ class TestFailedPrefetchedClaimRespectsPersistence:
         lpop_spy = await self._run_until_it_breaks(
             music_player, queue_obj, mock_song, live_song
         )
+        lpop_spy.assert_awaited_once()
+
+
+class TestDirectDequeueRespectsPersistence:
+    """The same two rules on the branch every recovery actually takes.
+
+    loop() reads `persisted` twice on the non-prefetched leg — `claim_persisted`
+    beside the claim, `should_pop_queue` after the stream — and both were unpinned
+    while their prefetched twins had a class each. Hardcoding either to True
+    passed the whole suite, and something asserting the LPOP *happens* for a
+    persisted head is not the same assertion: it cannot see a constant.
+
+    This is the leg a crash-recovered head takes. `_restore_state` re-queues it
+    persisted=False (its LPOP committed in the crashed run), so an LPOP here
+    retires the NEXT queued song's entry — at-most-once, no error, no log line,
+    and the saved queue is one song short from the following restart onward."""
+
+    @staticmethod
+    def _drive(music_player: MusicPlayer, head: QueueObject, song: MagicMock) -> None:
+        """One iteration, no prefetch: the direct queue_get() → resolve → stream
+        path, which is what every restored entry and every non-prefetched song
+        takes."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, head)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        song.persisted = head.persisted
+
+    async def _run(
+        self, music_player: MusicPlayer, head: QueueObject, song: MagicMock
+    ) -> tuple[AsyncMock, AsyncMock]:
+        self._drive(music_player, head, song)
+        assert music_player.store is not None
+        pop_spy = AsyncMock()
+        set_spy = AsyncMock()
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=head)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(music_player.store, "pop_queue_and_start_song", pop_spy),
+            patch.object(music_player.store, "set_current_song_state", set_spy),
+        ):
+            await music_player.loop()
+        return pop_spy, set_spy
+
+    async def test_an_unpersisted_head_writes_state_without_lpopping(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        head = QueueObject(
+            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+        )
+        pop_spy, set_spy = await self._run(music_player, head, mock_song)
+        pop_spy.assert_not_awaited()
+        set_spy.assert_awaited_once()
+
+    async def test_a_persisted_head_still_lpops(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        """The other half — a fix that simply stopped popping would leave the
+        mirror permanently one entry ahead of memory."""
+        head = QueueObject("https://yt.com/v=1", "Queued", mock_author)
+        pop_spy, set_spy = await self._run(music_player, head, mock_song)
+        pop_spy.assert_awaited_once()
+        set_spy.assert_not_awaited()
+
+    async def _run_until_it_breaks(
+        self, music_player: MusicPlayer, head: QueueObject, song: MagicMock
+    ) -> AsyncMock:
+        """Same leg, dying inside the claim→commit window, so the outer handler's
+        finish_failed_dequeue() decides the LPOP instead."""
+        self._drive(music_player, head, song)
+        assert music_player.store is not None
+        lpop_spy = AsyncMock()
+
+        def _commit(_queue: GuildQueue, _generation: int) -> Any:
+            return _raising_commit()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=head)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "send_with_np", new=AsyncMock()),
+            patch.object(
+                music_player.store, "pop_queue_and_start_song", new=AsyncMock()
+            ),
+            patch.object(music_player.store, "set_current_song_state", new=AsyncMock()),
+            patch.object(GuildQueue, "commit_dequeue", new=_commit),
+            patch.object(music_player.store, "pop_queue", lpop_spy),
+        ):
+            await music_player.loop()
+        return lpop_spy
+
+    async def test_an_unpersisted_claim_is_settled_without_an_lpop(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        head = QueueObject(
+            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+        )
+        lpop_spy = await self._run_until_it_breaks(music_player, head, mock_song)
+        lpop_spy.assert_not_awaited()
+
+    async def test_a_persisted_claim_still_retires_its_entry(
+        self, music_player: MusicPlayer, mock_author: MagicMock, mock_song: MagicMock
+    ) -> None:
+        head = QueueObject("https://yt.com/v=1", "Queued", mock_author)
+        lpop_spy = await self._run_until_it_breaks(music_player, head, mock_song)
         lpop_spy.assert_awaited_once()
 
 

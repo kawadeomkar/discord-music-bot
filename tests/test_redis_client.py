@@ -318,6 +318,20 @@ class TestPushQueueBatch:
         await store.push_queue_batch([])
         assert await fake_redis.exists(store.queue_key()) == 0
 
+    async def test_sets_ttl_on_queue_key(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Both siblings assert this; the batch path did not, and it is the one
+        every collection page and every YouTube playlist takes.
+
+        Without the refresh the queue key keeps whatever expiry it had, so a
+        guild whose only writes are batch enqueues watches its saved queue expire
+        24h after the FIRST one — dropping the mirror while the deque still holds
+        it. Removing `_pipe_expire_all` from push_queue_batch used to pass the
+        whole suite, while the same removal from push_queue_front was caught."""
+        await store.push_queue_batch([_entry(1), _entry(2)])
+        assert await fake_redis.ttl(store.queue_key()) > 0
+
     async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
         await broken_store.push_queue_batch([_entry(1)])  # must not raise
 

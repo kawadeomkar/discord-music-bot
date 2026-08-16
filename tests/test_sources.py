@@ -217,9 +217,20 @@ class TestParseUrlSpotify:
             parse_url(url, f"-play {url}")
         assert "'artist'" in str(exc_info.value)
 
-    def test_spotify_link_without_id_raises_cleanly(self) -> None:
-        """A bare /album (type, no id) used to escape as a raw IndexError."""
-        url = "https://open.spotify.com/album"
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # A bare /album: len(path) < 2, the leg that used to raise IndexError.
+            "https://open.spotify.com/album",
+            # A trailing slash: len(path) == 2 with path[1] == "", so only the
+            # `not path[1]` half of the guard catches it. Untested, that half
+            # could be dropped with the suite green — and a SpotifySource with
+            # an empty id resolves to a 404 the user cannot act on.
+            "https://open.spotify.com/album/",
+            "https://open.spotify.com/intl-de/track/",
+        ],
+    )
+    def test_spotify_link_without_id_raises_cleanly(self, url: str) -> None:
         with pytest.raises(UnsupportedSpotifyLinkError, match="has no id"):
             parse_url(url, f"-play {url}")
 

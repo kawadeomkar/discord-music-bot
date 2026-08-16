@@ -89,9 +89,12 @@ HISTORY_CACHE_LIMIT = 50
 # can't drift by hand-editing one and forgetting the other.
 # ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
 # since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
-# _start_paused in the hash and from_crashed_state can later read a value belonging
-# to a song that finished under the old build. Bounded: this build rewrites all
-# three on every song start. Delete once no rollback target predates them.
+# _start_paused / _user_input in the hash and from_crashed_state can later read a
+# value belonging to a song that finished under the old build. Bounded: this build
+# rewrites all four on every song start. _user_input is the one with a user-visible
+# consequence — a stale one makes `-remove <album link>` take out an unrelated
+# recovered song — so keep this list COMPLETE: it is the only place the "delete once
+# no rollback target predates them" condition can be computed from.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,

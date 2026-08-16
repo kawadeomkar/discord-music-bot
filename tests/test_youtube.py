@@ -213,10 +213,33 @@ class TestYTDLPositionSecs:
         assert song.position_secs == 90.0
 
 
+def _carried_queueobject_fields() -> set[str]:
+    """QueueObject fields that must reach the playing YTDL, by name.
+
+    Derived from the dataclass rather than listed, so a field added tomorrow is
+    covered by both guards below without either being edited. Anything genuinely
+    not meant to cross is named here, with the reason."""
+    import dataclasses
+
+    not_carried = {
+        # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
+        "webpage_url",
+        "title",
+        "duration",
+        "uploader",
+        "thumbnail",
+        # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
+        "ts",
+        # Runtime-only NP handle; a live Message cannot be carried on a source.
+        "np_host_ref",
+    }
+    return {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+
+
 class TestYtStreamCarriesTheQueueObjectsFields:
     """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
-    CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
-    field is silently dropped at. `user_input` reached it late: it is what
+    one of the sites docs/ARCHITECTURE.md#queue-entry-field-plumbing lists a new
+    field as silently dropped at. `user_input` reached it late: it is what
     `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
     losing it here leaves the parked track un-removable by origin."""
 
@@ -249,23 +272,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         seventh — which is exactly how `user_input` and then `persisted` reached
         this hop late, the second as a live AttributeError. Anything genuinely not
         meant to cross gets named in the allow-list, with the reason."""
-        import dataclasses
         import inspect
 
-        # Fields that legitimately do not cross into YTDL.
-        not_carried = {
-            # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
-            "webpage_url",
-            "title",
-            "duration",
-            "uploader",
-            "thumbnail",
-            # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
-            "ts",
-            # Runtime-only NP handle; a live Message cannot be carried on a source.
-            "np_host_ref",
-        }
-        carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+        carried = _carried_queueobject_fields()
         params = set(inspect.signature(YTDL.__init__).parameters)
         missing = sorted(carried - params)
         assert not missing, (
@@ -276,8 +285,20 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
         """A field added to QueueObject and forgotten here dies at playback, where
-        every read of it happens. Asserted together so an omission fails rather
-        than needing to be noticed."""
+        every read of it happens.
+
+        Reflective on BOTH halves, which the hand-written tuple this replaced was
+        not: it listed seven of the twelve carried fields and claimed totality, so
+        np_message_id / np_channel_id / np_dedicated could be — and were — dropped
+        from yt_stream and from YTDL.from_queue_object with the suite green. The
+        sibling guard above only reads YTDL.__init__'s SIGNATURE, which is not the
+        leg a field goes missing on.
+
+        The differs-from-default half is what keeps it honest: a new field the
+        constructor below does not set would otherwise arrive at its default and
+        compare equal to itself."""
+        import dataclasses
+
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",
@@ -289,19 +310,35 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             start_paused=True,
             persisted=False,
             played_at=12.5,
+            analytics=Analytics(queued_at=99.5, queue_position=7),
+            np_message_id=555,
+            np_channel_id=666,
+            np_dedicated=True,
+        )
+        carried = _carried_queueobject_fields()
+        defaults = {
+            f.name: f.default
+            for f in dataclasses.fields(QueueObject)
+            if f.default is not dataclasses.MISSING
+        }
+        undistinguished = sorted(
+            name
+            for name in carried
+            if name in defaults and getattr(qobj, name) == defaults[name]
+        )
+        assert not undistinguished, (
+            f"left at its default, so this test cannot see it dropped: "
+            f"{undistinguished}. Give it a non-default value above."
         )
 
         song = await self._played(qobj)
 
-        assert (
-            song.user_input,
-            song.query_source,
-            song.interjected,
-            song.is_resume,
-            song.start_paused,
-            song.persisted,
-            song.played_at,
-        ) == ("typed", "search", True, True, True, False, 12.5)
+        mismatched = {
+            name: (getattr(qobj, name), getattr(song, name, "<<absent>>"))
+            for name in sorted(carried)
+            if getattr(song, name, "<<absent>>") != getattr(qobj, name)
+        }
+        assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
         """`persisted` reached the YTDL last, and its absence was a live crash

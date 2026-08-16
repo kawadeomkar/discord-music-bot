@@ -86,8 +86,8 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
-    truncate,
     truncate_embed_title,
+    truncate_escaped,
     get_logger,
 )
 
@@ -99,7 +99,10 @@ class SpotifyDisabledError(Exception):
     """Raised when a Spotify link is played but Spotify support isn't usable.
     Carries the SpotifyStatus so the message can separate no credentials configured
     (disabled) from configured but rejected at startup (invalid). The message is
-    user-facing — _command_error renders it into the error embed."""
+    user-facing, which is what user_message below states in the one form
+    _command_error's allowlist reads — without it the embed rendered as
+    "**SpotifyDisabledError:** Spotify links aren't available…", the exact defect
+    UnsupportedSpotifyLinkError was given a user_message to fix."""
 
     def __init__(self, status: SpotifyStatus) -> None:
         self.status = status
@@ -117,6 +120,10 @@ class SpotifyDisabledError(Exception):
                 "Try a YouTube or SoundCloud link, or just search by name."
             )
         super().__init__(message)
+
+    @property
+    def user_message(self) -> str:
+        return str(self)
 
 
 class PlaylistInputError(ValueError):
@@ -180,19 +187,24 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
 
-# How long a cold-start command (-play, -resume) waits for its restore. Generous for
-# one pipelined read; bounded because the pool sets no socket_timeout, so a server
-# that accepts the connection then stalls would hang the command outright.
+# How long a command that touches the queue waits for this guild's restore.
+# Generous for one pipelined read; bounded because the pool sets no socket_timeout,
+# so a server that accepts the connection then stalls would hang the command
+# outright.
+#
+# SIX call sites, not the two cold-start ones this used to name: -play (warm and
+# cold), -resume, -shuffle, -clear and -remove. The cold-start pair must not
+# INSERT against an unread snapshot; the other four must not REBUILD the mirror
+# from a deque the restore has not filled yet, which deletes the saved queue
+# outright. Tuning this bound is tuning both.
+#
+# The warm -play leg used to take a SHORTER bound and IGNORE the result, on the
+# reasoning that a timeout "only costs an approximate analytics field" — it does
+# not. restore_entries() appends, so a put() that lands first leaves the deque
+# holding the new song ahead of entries Redis already lists behind it: every
+# later commit-time LPOP then retires the wrong entry, and if the snapshot read
+# lands after the RPUSH the song is queued twice and plays twice.
 RESTORE_WAIT_SECS = 5.0
-
-# A warm -play waits on the same bound and refuses on the same failure. It used to
-# take a shorter one and IGNORE the result, on the reasoning that a timeout "only
-# costs an approximate analytics field" — it does not. restore_entries() appends,
-# so a put() that lands first leaves the deque holding the new song ahead of
-# entries Redis already lists behind it: every later commit-time LPOP then retires
-# the wrong entry, and if the snapshot read lands after the RPUSH the song is
-# queued twice and plays twice. Same hazard the three commands below already
-# refuse for, so it refuses the same way.
 
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
@@ -205,9 +217,16 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
 # still-waiting command. A test pins the inequality.
 # See docs/ARCHITECTURE.md#queue-invariant.
 _ENQUEUE_WAIT_SECS = 60.0
-# Beyond this many queued waiters, decline instead of stacking further — a
-# user spamming -play with collections would otherwise pile up unbounded
-# waiters that all fire into the queue at once when the drain finishes.
+# Beyond this many queued waiters, decline instead of stacking further: each
+# waiter holds a live MusicPlayer whose 300s gate clock is already running, and
+# they all fire into the queue at once when the drain finishes.
+#
+# NOT -play. That carries max_concurrency(1, guild, wait=False), so a second one
+# is rejected before its body runs and can never become a waiter. The commands
+# that can stack here are the ones with no such guard — -shuffle and -remove,
+# which take this slot because they rebuild the mirror from memory and must not
+# run mid-drain. So the copy below names what is queued AHEAD of the waiter,
+# never what the waiter itself ran.
 _ENQUEUE_MAX_WAITERS = 5
 # _HTTP_TIMEOUT bounds one request, so a 100-page playlist could otherwise run
 # 3000s. Bounds each drain leg SEPARATELY — the page-1 fetch, the tail, and the
@@ -227,6 +246,16 @@ _ECHO_MAX = 200
 # One row of a multi-row field. Tighter than _ECHO_MAX because ten of these share
 # the budget one needle gets to itself.
 _ECHO_ROW_MAX = 70
+
+# How many rows queue_message() keeps. Every caller escaping a list for it must
+# slice to _ECHO_ROWS + 1 FIRST: safe_label is a regex sub, a truncate, three
+# str.replaces and an escape per title, and a collection can legally hold 10,000
+# of them — escaping all of them to render ten measured 96ms of blocked event
+# loop, which is every guild's progress tick and the outbox drain, not just this
+# one's. The +1 is queue_message's own "…" test: it appends one when it was
+# handed more than it keeps, so a slice of exactly _ECHO_ROWS silently drops the
+# "there are more" hint.
+_ECHO_ROWS = 10
 
 # The most dropped positions worth spelling out. Past this the list is a wall of
 # numbers that answers nothing the count above it did not.
@@ -254,15 +283,22 @@ def _field(value: str) -> str:
     """An embed field value that cannot 400 the send. The last guard before
     Discord, deliberately dumb: the callers below build from lists whose length
     is the user's to choose, and the send happens AFTER the queue has already
-    been mutated \u2014 so a field that is merely usually short is not good enough."""
-    return truncate(value, EMBED_FIELD_LIMIT)
+    been mutated \u2014 so a field that is merely usually short is not good enough.
+
+    truncate_ESCAPED, because every caller here joins rows that already went
+    through _echo: ten rows capped pre-escape at _ECHO_ROW_MAX reach ~1440
+    characters once escaped, so this clamp really fires \u2014 and a plain cut can
+    orphan a backslash onto the ellipsis, the exact order safe_label's docstring
+    forbids."""
+    return truncate_escaped(value, EMBED_FIELD_LIMIT)
 
 
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
     """How the removal matched, for the reply's "Matched" field.
 
     An origin match is the one that needs explaining: one argument can take out a
-    whole playlist, so the reply names which of the user's own inputs did it. The
+    whole album or playlist, so the reply names which of the user's own inputs did
+    it. The
     resolved-URL case reads as it always has.
     """
     # Not wrapped in a code span. The needle is escaped, so markdown cannot fire
@@ -450,6 +486,50 @@ def _is_collection(
     if isinstance(source, SpotifySource):
         return source.type in (SpotifyType.PLAYLIST, SpotifyType.ALBUM)
     return isinstance(source, YTSource) and source.type is YTType.PLAYLIST
+
+
+# How many titles one mint pass turns into YTSources before yielding. The
+# buffered front path is the only place a WHOLE collection is minted in one call
+# — the streamed path does a page at a time and yields at each push_queue_batch —
+# and Spotify allows 10,000 tracks: measured at 22.5ms of uninterrupted event
+# loop at n=5000, on top of the put's own serialization. 500 keeps each pass
+# near 2ms, which is the same order as one Redis round trip.
+_MINT_CHUNK = 500
+
+
+async def _mint_collection_entries(
+    titles: list[str],
+    requester_id: int,
+    *,
+    analytics: Analytics,
+    origin: str,
+) -> list[YTSource]:
+    """spotify_titles_to_ytsearch over a whole collection, yielding between
+    chunks so one -play cannot stall every other guild's progress tick, song
+    start and outbox drain.
+
+    The per-chunk analytics offset is what keeps the result identical to one
+    call: queue_position is derived from the index WITHIN the list handed over,
+    so each chunk has to start where the last one ended — the same arithmetic
+    _drain_collection_tail does per page.
+
+    Yielding here opens a window a single call did not have, and the caller's
+    expected_generation is what closes it: a -clear landing mid-mint refuses the
+    put outright rather than half-queueing the collection."""
+    minted: list[YTSource] = []
+    for start in range(0, len(titles), _MINT_CHUNK):
+        minted.extend(
+            spotify_titles_to_ytsearch(
+                titles[start : start + _MINT_CHUNK],
+                requester_id,
+                analytics=replace(
+                    analytics, queue_position=analytics.queue_position + start
+                ),
+                origin=origin,
+            )
+        )
+        await asyncio.sleep(0)
+    return minted
 
 
 async def _send_queueing_stopped(ctx: commands.Context, noun: str) -> None:
@@ -658,7 +738,13 @@ class MusicBot(commands.Cog):
             # command task this method does not cancel. The single teardown
             # choke point, so one bump covers -stop, kick, alone-timer, gate
             # timeout and play's error path.
-            await mp.queue.bump_generation()
+            #
+            # Not awaited, and that is the point: this runs BEFORE the
+            # disconnect, so anything here that can suspend on Redis delays the
+            # silence -stop asked for — the same rule the pending_history write
+            # below states. bump_generation() is synchronous and lock-free for
+            # exactly that reason; do not give it an await.
+            mp.queue.bump_generation()
             # Cancel tasks before disconnecting so the loop cannot wake and start
             # the next song between voice_client.stop() and cancellation.
             # disconnect() calls stop() internally, silencing audio below.
@@ -872,6 +958,8 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SpotifyAuthError,
+                    SpotifyDisabledError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
                     UnsupportedSpotifyLinkError,
@@ -970,6 +1058,7 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         front: bool = False,
+        expected_generation: Optional[int] = None,
     ) -> None:
         """Queue a resolved YouTube playlist in one batch and notify the channel.
         Spotify collections stream page-by-page via _begin_collection_enqueue instead.
@@ -977,7 +1066,13 @@ class MusicBot(commands.Cog):
         Takes no analytics/origin: yt_playlist already stamped both onto every
         track it built, so there is nothing left to mint here. The streamed
         collection path is the one that still needs them, because its YTSources
-        are minted per page."""
+        are minted per page.
+
+        expected_generation is the same compare-and-put every Spotify page uses,
+        and this path needs it for the same reason: yt_playlist takes 1-4s, and a
+        -clear or -stop landing inside that resolve would otherwise be undone by a
+        thousand tracks arriving afterwards. Refused ⇒ nothing is queued, nothing
+        is sent but the refusal, and no 👍 lands on a message that queued nothing."""
         # A playlist front-inserts in full, in order — unlike -playnow, which
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
@@ -994,8 +1089,17 @@ class MusicBot(commands.Cog):
             else ""
         )
         shown_titles = queue_message(
-            [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, _ECHO_ROWS + 1)]
         )
+        # Enqueued FIRST, alone: the notification and the reaction may only
+        # describe a put that actually landed. Gathering them as this once did
+        # sent "Queued playlist — 1000 songs" for a put the generation refused.
+        if not await enqueue(
+            tracks, prefetch=False, expected_generation=expected_generation
+        ):
+            log.info("yt playlist enqueue abandoned: queue invalidated")
+            await _send_queueing_stopped(ctx, "playlist")
+            return
         await asyncio.gather(
             send_embed(
                 ctx,
@@ -1004,7 +1108,6 @@ class MusicBot(commands.Cog):
                 f"{skipped_line}\n{shown_titles}",
                 discord.Color.blue(),
             ),
-            enqueue(tracks, prefetch=False),
             ctx.message.add_reaction("👍"),
         )
 
@@ -1028,8 +1131,8 @@ class MusicBot(commands.Cog):
             if entry.waiters >= _ENQUEUE_MAX_WAITERS:
                 await ctx.send(
                     embed=notice_embed(
-                        "Too many albums/playlists are queueing right now — try "
-                        "again in a moment.",
+                        "Too many commands are already waiting on an album or "
+                        "playlist here — try again in a moment.",
                         discord.Color.orange(),
                     )
                 )
@@ -1046,7 +1149,7 @@ class MusicBot(commands.Cog):
                 # waiters are queued — the shared timeout bounds that window.
                 await ctx.send(
                     embed=notice_embed(
-                        "Waiting for another album/playlist to finish queueing…",
+                        "Waiting for an album or playlist to finish queueing…",
                         discord.Color.blue(),
                     )
                 )
@@ -1056,7 +1159,8 @@ class MusicBot(commands.Cog):
             except TimeoutError:
                 await ctx.send(
                     embed=notice_embed(
-                        "Still queueing a large collection — try again in a moment.",
+                        "An album or playlist is still queueing — try again in a "
+                        "moment.",
                         discord.Color.orange(),
                     )
                 )
@@ -1135,7 +1239,11 @@ class MusicBot(commands.Cog):
             # would invert page order. has_restored_backlog reads the mirror too,
             # since qsize()==0 with a mirror ghost must still buffer.
             titles = list(page1.titles)
-            truncated = False
+            # The clause the "queued the first N" notice reads, or None when the
+            # drain completed. A reason rather than a bool because the two ways a
+            # buffered drain ends early are not the same news to a user: one is
+            # "come back in a moment", the other is "Spotify stopped answering".
+            truncated_reason: Optional[str] = None
             async with contextlib.aclosing(resolved.pages) as pages:
                 # aclosing sits outside the timeout: on expiry the generator is
                 # suspended at an await inside __anext__, and aclose() must run
@@ -1148,16 +1256,35 @@ class MusicBot(commands.Cog):
                     # Keep what arrived: this drain holds the playback gate, and
                     # running to the gate's own 300s timeout tears the player down
                     # and refuses the put_front below.
-                    truncated = True
+                    truncated_reason = "was taking too long to load"
                     log.warning(
                         f"buffered {noun} drain hit "
                         f"{_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s; queueing "
                         f"{len(titles)} of ~{collection.total}"
                     )
+                except (
+                    SpotifyRateLimitError,
+                    SpotifyRequestError,
+                    SpotifyAuthError,
+                ) as e:
+                    # Same answer as the timeout, for the same reason. The
+                    # streaming path keeps page 1 when the tail fails; this one
+                    # used to discard everything it had fetched and re-raise, so
+                    # the SAME command queued 100 songs or zero depending on
+                    # whether a saved queue existed — a difference the user cannot
+                    # see. Re-raised below only when nothing arrived at all, which
+                    # is play's error path reporting a genuine failure.
+                    truncated_reason = "stopped loading partway"
+                    log.warning(
+                        f"buffered {noun} drain failed after {len(titles)} "
+                        f"titles: {type(e).__name__}: {e}"
+                    )
+                    if not titles:
+                        raise
             if not titles:
                 raise ValueError(f"The {noun} has no queueable tracks")
             ok = await mp.queue_put_front(
-                spotify_titles_to_ytsearch(
+                await _mint_collection_entries(
                     titles, ctx.author.id, analytics=analytics, origin=origin
                 ),
                 prefetch=False,
@@ -1172,11 +1299,11 @@ class MusicBot(commands.Cog):
             await self._notify_collection_enqueued(
                 ctx, resolved.kind, collection, titles, enqueued=len(titles)
             )
-            if truncated:
+            if truncated_reason is not None:
                 with contextlib.suppress(Exception):
                     await ctx.send(
                         embed=notice_embed(
-                            f"The {noun} was taking too long to load — queued "
+                            f"The {noun} {truncated_reason} — queued "
                             f"the first {len(titles)} "
                             f"{pluralize(len(titles), 'song')}. Run the command "
                             f"again to add the rest.",
@@ -1287,8 +1414,13 @@ class MusicBot(commands.Cog):
         track title — is echoed through safe_label: an embed renders markdown,
         and a track called `[click](https://evil)` would otherwise post a styled
         masked link under the bot's own name. The album title goes through the
-        embed-title clamp instead, which Discord does not render markdown in."""
-        shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
+        embed-title clamp instead, which Discord does not render markdown in.
+
+        Sliced before the escape, not after — see _ECHO_ROWS. `titles` here is a
+        whole buffered collection, up to Spotify's 10,000."""
+        shown_titles = queue_message(
+            [safe_label(t, _ECHO_ROW_MAX) for t in islice(titles, _ECHO_ROWS + 1)]
+        )
         if kind is SpotifyType.ALBUM:
             count = collection.total
             await send_embed(
@@ -1497,7 +1629,12 @@ class MusicBot(commands.Cog):
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
 
-        should_show_queued = mp.queue.qsize() > 0 or (
+        # display_size(), not qsize(): the two are one term apart and this is the
+        # one that must count the in-flight head. While the loop holds the only
+        # queued song and is resolving it, qsize() is 0 AND is_playing() is still
+        # False, so a -play landing in that window got a bare 👍 — no confirmation,
+        # no ETA — for a song that really was queued behind another.
+        should_show_queued = mp.queue.display_size() > 0 or (
             isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
         coros: list[Coroutine[Any, Any, Any]] = [
@@ -1619,12 +1756,35 @@ class MusicBot(commands.Cog):
                     if slot is not None:
                         slot.lock.release()
 
-                if paused_vc is not None and is_collection:
-                    # After the enqueue, never before: resuming first would restart
-                    # the paused song only for a failed resolve to leave the user
-                    # with playback they did not ask to change. The state is
-                    # re-read because a -resume may have landed during the drain.
-                    await self._resume_after_collection(ctx)
+                    if paused_vc is not None and is_collection:
+                        # After the enqueue, never before: resuming first would
+                        # restart the paused song only for a failed resolve to
+                        # leave the user with playback they did not ask to change.
+                        # The state is re-read because a -resume may have landed
+                        # during the drain.
+                        #
+                        # INSIDE the finally, not after it. The enqueue commits
+                        # well before _play_resolved can raise — a page that 503s
+                        # mid-drain re-raises after page 1 landed, and
+                        # _enqueue_playlist's gather raises Forbidden after the
+                        # enqueue when the channel denies Add Reactions — and a
+                        # raise that skipped this left the guild paused forever
+                        # with the collection queued behind a song nothing would
+                        # restart. The guard re-reads the voice state, so running
+                        # it while unwinding is idempotent.
+                        try:
+                            await self._resume_after_collection(ctx)
+                        except Exception as resume_error:
+                            # Never replace the error already unwinding: that one
+                            # says why the enqueue failed, which is what the user
+                            # needs. On the success path this is the only failure
+                            # in flight, and it is not worth an embed either — the
+                            # songs are queued and `-resume` still works.
+                            log.warning(
+                                f"Failed to resume after queueing a collection in "
+                                f"guild {getattr(ctx.guild, 'id', None)}: "
+                                f"{resume_error}"
+                            )
 
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
@@ -1653,6 +1813,14 @@ class MusicBot(commands.Cog):
                 # this exact player to _abandon_cold_start, and a get_mp() issued
                 # after its cleanup() would build and start a fresh one.
                 mp = self.get_mp(ctx)
+                # Snapshot before the resolve, not after — the resolve IS the
+                # window. A YouTube playlist spends 1-4s in yt_playlist and then
+                # lands as one batch, so a -clear or -stop inside it must refuse
+                # the batch rather than have it reappear seconds later. Only
+                # _enqueue_playlist takes this: a single track is one song the
+                # user did ask for, and the Spotify path snapshots its own after
+                # page 1 (a teardown during page 1 has its own check there).
+                playlist_generation = mp.queue.generation
                 # Ask-time analytics, read ONCE at dispatch: the command
                 # message's snowflake time, so the wait covers gateway
                 # delivery and the resolve below. front ⇒ depth 0, the
@@ -1760,7 +1928,13 @@ class MusicBot(commands.Cog):
                         ctx, qobj, mp, analytics=analytics, origin=url, front=front
                     )
                 else:
-                    await self._enqueue_playlist(ctx, qobj, mp, front=front)
+                    await self._enqueue_playlist(
+                        ctx,
+                        qobj,
+                        mp,
+                        front=front,
+                        expected_generation=playlist_generation,
+                    )
 
             # Stack exited: the gate is open and the first song is starting.
             # The tail still runs inside this command — no background task, no
@@ -1815,7 +1989,18 @@ class MusicBot(commands.Cog):
                 else spotify.playlist_stream(source.id)
             )
             async with contextlib.aclosing(pager) as pages:
-                page1 = await anext(pages, None)
+                try:
+                    # The same bound _begin_collection_enqueue puts on its page-1
+                    # fetch, and for the same reason: unbounded, this is a fetch
+                    # outside every deadline, so a rate-limited identity call runs
+                    # http_call's whole ladder (~150s) while holding -playnow's
+                    # max_concurrency(1, guild) slot and a typing indicator.
+                    async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                        page1 = await anext(pages, None)
+                except TimeoutError:
+                    raise ValueError(
+                        f"Spotify took too long loading the {noun} — try again shortly"
+                    ) from None
             titles = page1.titles if page1 is not None else []
             if not titles:
                 raise ValueError(f"The {noun} has no queueable tracks")
@@ -2298,7 +2483,7 @@ class MusicBot(commands.Cog):
         name="shuffle",
         brief="randomly reorder the queue",
         help=(
-            "Randomly reorders the songs waiting in the queue. Needs at least 3 "
+            "Randomly reorders the songs waiting in the queue. Needs at least 4 "
             "queued songs to have any effect. The song currently playing is left "
             "alone — shuffling only touches what comes after it."
         ),
@@ -2312,7 +2497,7 @@ class MusicBot(commands.Cog):
             # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
             # so running it before restore_entries() has replayed the saved queue
             # writes an unrestored deque over it and deletes the persisted entries
-            # outright. Alone it merely reported "at least 3 songs" against a queue
+            # outright. Alone it merely reported "at least 4 songs" against a queue
             # it could not see; combined with an enqueue it destroys one.
             if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
@@ -2447,7 +2632,11 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
+            # Sliced before the escape — see _ECHO_ROWS. -clear returns a title
+            # for every item it dropped, which is the whole queue.
+            description = queue_message(
+                [safe_label(t, _ECHO_ROW_MAX) for t in islice(cleared, _ECHO_ROWS + 1)]
+            )
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -2470,7 +2659,8 @@ class MusicBot(commands.Cog):
             "queue positions that were dropped, followed by the updated queue.\n\n"
             "Three things match: the YouTube link shown in the **Now Playing** "
             "card, the search text you queued with, and the link you queued with "
-            "— so removing a playlist link takes back out every track it added. "
+            "— so removing an album or playlist link takes back out every track "
+            "it added. "
             "Run it with no argument for a reminder.\n\n"
             "Links are matched as typed, so a `youtu.be` short link will not "
             "match a song queued from a full `youtube.com` one."
@@ -2480,7 +2670,10 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "-remove never gonna give you up",
-                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                # A real album, and one this branch vetted. The old example was
+                # the editorial (37i9…) playlist Spotify 404s for third-party
+                # apps — the same one -play's examples already dropped.
+                "-remove https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
             ],
             "note": (
                 "A search term removes what that exact search queued, not "
@@ -2520,7 +2713,37 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            outcome = await mp.queue_remove(needle)
+            # Waits for an in-flight collection drain, exactly as -shuffle does and
+            # for the same reason: this command's headline case is taking a
+            # collection back out by its link, and a drain is still streaming pages
+            # under that same link. Run mid-stream it removes pages 1..k, reports
+            # "Removed 100 songs", and then pages k+1..n arrive and re-queue the
+            # rest — the user's only recovery being -clear.
+            #
+            # Waiting rather than bumping the generation: the counter's OTHER
+            # reader is the playback loop's commit, and -remove deliberately spares
+            # the in-flight head ("stopping it is -skip's job"), so a bump here
+            # would discard the song currently being resolved.
+            slot = await self._acquire_enqueue_slot(ctx)
+            if slot is None:
+                return
+            try:
+                # The wait can end on a teardown — the drain holding this slot
+                # abandons and its release wakes us on a popped player, whose
+                # mirror rebuild would resurrect the queue -stop left persisted.
+                assert ctx.guild is not None
+                if self.mps.get(ctx.guild.id) is not mp:
+                    await ctx.send(
+                        embed=notice_embed(
+                            "Playback was shut down while remove waited — "
+                            "nothing to remove.",
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                outcome = await mp.queue_remove(needle)
+            finally:
+                slot.lock.release()
             positions = outcome.positions
             if not positions:
                 await send_embed(
@@ -2561,8 +2784,8 @@ class MusicBot(commands.Cog):
                                     _echo(_removed_label(i), _ECHO_ROW_MAX)
                                     # queue_message keeps 10; echoing all of them
                                     # first escaped a playlist's worth to throw
-                                    # the rest away.
-                                    for i in outcome.removed[:10]
+                                    # the rest away. See _ECHO_ROWS for the +1.
+                                    for i in outcome.removed[: _ECHO_ROWS + 1]
                                 ]
                             )
                         ),

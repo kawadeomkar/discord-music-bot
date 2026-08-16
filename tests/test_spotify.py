@@ -953,6 +953,86 @@ class TestAlbumStream:
         assert not pages[-1].is_last
         assert await fake_redis.get("spotify:album_tracks:albstuck") is None
 
+    async def test_a_malformed_empty_page_one_cannot_divide_by_zero(
+        self, spotify: Spotify, fake_redis: Redis
+    ) -> None:
+        """Two guards that are individually inert and together are a crash.
+
+        The page cap's stride is page 1's own item count, and an empty page 1
+        that still carries a `next` makes that 0. `_cursor_page_cap`'s
+        `max(1, page_size)` and the call site's `or 50` each stop the
+        ZeroDivisionError on their own, so dropping either passed the whole
+        suite — and the exception would come out of the generator, land outside
+        `_command_error`'s allowlist, and reach the user as a raw
+        ZeroDivisionError."""
+        pages_sent = 0
+
+        async def malformed(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            nonlocal pages_sent
+            nxt = "https://api.spotify.com/v1/albums/albz/tracks?offset=0&limit=50"
+            if endpoint.endswith("v1/albums/albz"):
+                return {
+                    "name": "Empty",
+                    "artists": [{"name": "A"}],
+                    "tracks": {"items": [], "limit": 50, "total": 10, "next": nxt},
+                }
+            pages_sent += 1
+            # Keeps the cursor live so the cap is what ends the walk.
+            return {"items": [_album_track(0)], "next": nxt}
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=malformed)):
+            pages = await _drain(spotify.album_stream("albz"))
+
+        assert len(pages) == _cursor_page_cap(10, 50)  # finite, not a crash
+        assert await fake_redis.get("spotify:album_tracks:albz") is None
+
+    def test_the_page_cap_survives_a_zero_stride(self) -> None:
+        """The other half of the same guard, asserted directly — `max(1, ...)`
+        is the reason this returns a number instead of raising."""
+        assert _cursor_page_cap(100, 0) == 102
+
+    async def test_a_null_or_nameless_album_item_is_skipped(
+        self, spotify: Spotify
+    ) -> None:
+        """`_track_search_title` subscripts name and artists, so it is not total.
+
+        The album loop had no guard at all — its comment justified that on SHAPE
+        grounds (album items are the track, no ["track"] wrapper, no episodes),
+        which says nothing about absence. A null item on a malformed page raised
+        TypeError from inside the generator, and TypeError is not in
+        `_command_error`'s allowlist, so it reached the user as
+        "**TypeError:** 'NoneType' object is not subscriptable"."""
+
+        async def ragged(
+            endpoint: str, params: Optional[dict[str, Any]] = None, **kw: Any
+        ) -> dict[str, Any]:
+            return {
+                "name": "Ragged",
+                "artists": [{"name": "A"}],
+                "tracks": {
+                    "items": [
+                        _album_track(0),
+                        None,
+                        {"artists": [{"name": "A"}]},  # no name
+                        {"name": "No artists"},
+                        _album_track(1),
+                    ],
+                    "limit": 50,
+                    "total": 5,
+                    "next": None,
+                },
+            }
+
+        with patch.object(spotify, "http_call", new=AsyncMock(side_effect=ragged)):
+            pages = await _drain(spotify.album_stream("albragged"))
+
+        assert [t for p in pages for t in p.titles] == [
+            "Track 0 Artist",
+            "Track 1 Artist",
+        ]
+
     async def test_failed_page_propagates_and_writes_no_cache(
         self, spotify: Spotify, fake_redis: Redis
     ) -> None:
