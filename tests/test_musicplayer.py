@@ -846,13 +846,13 @@ class TestQueueShuffle:
             await music_player.queue_put(qobj)
 
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
 
     async def test_shuffle_empty_queue_returns_error(
         self, music_player: MusicPlayer
     ) -> None:
         result = await music_player.queue_shuffle()
-        assert result == "There must be at least 3 songs to shuffle the queue"
+        assert result == "There must be at least 4 songs to shuffle the queue"
 
     async def test_shuffle_sufficient_songs_returns_shuffled(
         self, music_player: MusicPlayer, mock_author: MagicMock

@@ -1281,7 +1281,7 @@ class MusicPlayer:
         await self._cancel_prefetch()
         outcome = await self.queue.shuffle()
         if outcome is ShuffleOutcome.TOO_FEW_SONGS:
-            return "There must be at least 3 songs to shuffle the queue"
+            return "There must be at least 4 songs to shuffle the queue"
         return "Shuffled!"
 
     async def queue_remove(self, needle: str) -> RemoveOutcome:
