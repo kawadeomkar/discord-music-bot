@@ -765,7 +765,14 @@ then caps at 30min.
 
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` and `-vn`; `?t=`/interject
-seeks via `-ss`; volume via `-filter:a volume=` (which is why `-volume` applies from the
+seeks are a **two-pass `-ss`** — `-ss N` before `-i` for the HTTP range request, `-ss 0`
+after it to drop the pre-roll that lands in. Both halves are measured, not stylistic:
+output-side alone downloads and decodes from 0:00 (a 40min-in crash recovery pulled
+40min of audio first), input-side alone lands on the nearest webm cluster and measured
+**5–10s early** across offsets, codecs and hosts — which `position_secs` would then
+overstate everywhere and a `-playnow` resume would replay. `-accurate_seek` is already
+the default and does not fix it;
+volume via `-filter:a volume=` (which is why `-volume` applies from the
 next song). `read()` counts frames → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, pause confirmation, history,
 interject resume point) and freezes during any pause automatically.

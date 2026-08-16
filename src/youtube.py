@@ -1030,7 +1030,29 @@ class YTDL(discord.FFmpegOpusAudio):
 
         ffmpeg_opts = cls.FFMPEG_OPTS.copy()
         if qo.ts is not None:
-            ffmpeg_opts["options"] += f" -ss {qo.ts}"
+            # Two-pass seek, and BOTH halves are load-bearing — measured, because the
+            # obvious single-sided forms are each wrong in one direction:
+            #
+            #   output-side alone   ffmpeg opens the stream at 0:00 and decodes its
+            #                       way to the offset, so a crash-recovered song 40min
+            #                       in pulls 40min of audio through the CDN before its
+            #                       first frame. Accurate, and slow.
+            #   input-side alone    a real HTTP range request, but it lands on the
+            #                       nearest webm cluster BEFORE the target: measured
+            #                       5-10s early across offsets, on live googlevideo and
+            #                       on the same stream saved to disk, under both libopus
+            #                       and copy. `-accurate_seek` is already the default
+            #                       and does not fix it. Fast, and up to 10s wrong —
+            #                       which position_secs (start_offset + elapsed) would
+            #                       then overstate on every surface, and a -playnow
+            #                       resume would replay.
+            #
+            # Input seek for the range request, then `-ss 0` on the output to drop the
+            # pre-roll it lands in (that pre-roll carries negative timestamps, which is
+            # what makes 0 the right threshold). Measured back to +/-0.02s at every
+            # offset, with the deep range request intact.
+            ffmpeg_opts["before_options"] += f" -ss {qo.ts}"
+            ffmpeg_opts["options"] += " -ss 0"
             # No user notice here. This runs at CONSTRUCTION, which prefetch does
             # while the previous song is still playing, so announcing "Starting song
             # at Xs" from here fired at the wrong moment. MusicPlayer's start path

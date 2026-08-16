@@ -981,9 +981,14 @@ class TestYTStream:
 
         assert "volume=0.5" in captured_options["options"]
 
-    async def test_yt_stream_appends_seek_when_ts_set(
+    async def test_yt_stream_seeks_on_both_sides_when_ts_is_set(
         self, mock_ctx: MagicMock
     ) -> None:
+        """Two-pass seek: `-ss N` before -i for the range request, `-ss 0` after it to
+        drop the pre-roll the input seek lands in. Input-side alone measured 5-10s
+        early (webm cluster granularity) — which position_secs would then overstate
+        on every surface. The volume filter must NOT follow the seek to the input
+        side: ffmpeg silently ignores -filter:a placed ahead of the input."""
         fake_data = _fake_ytdl_data()
         channel = AsyncMock(spec=discord.TextChannel)
         channel.send = AsyncMock()
@@ -1003,14 +1008,19 @@ class TestYTStream:
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
+            captured_options["before_options"] = before_options
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
         ):
-            await YTDL.yt_stream(qobj, channel)
+            await YTDL.yt_stream(qobj, channel, volume=0.5)
 
-        assert "-ss 90" in captured_options["options"]
+        assert "-ss 90" in captured_options["before_options"]
+        assert "-ss 0" in captured_options["options"]
+        assert "-ss 90" not in captured_options["options"]
+        assert "volume=0.5" in captured_options["options"]
+        assert "volume" not in captured_options["before_options"]
 
     async def test_yt_stream_carries_ts_as_start_offset(
         self, mock_ctx: MagicMock
@@ -1732,7 +1742,7 @@ class TestYTStreamPlaynowFlags:
             options: Optional[str],
         ) -> None:
             noop_ffmpeg_init(self)
-            captured_options["options"] = options
+            captured_options["before_options"] = before_options
 
         with (
             patch("src.youtube._ytdlp_extract", return_value=fake_data),
@@ -1741,7 +1751,7 @@ class TestYTStreamPlaynowFlags:
             await YTDL.yt_stream(qobj, channel)
 
         channel.send.assert_not_awaited()
-        assert "-ss 151" in captured_options["options"]
+        assert "-ss 151" in captured_options["before_options"]
 
 
 class TestProcessBoundaryContract:
