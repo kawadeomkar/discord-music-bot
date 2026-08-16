@@ -8,7 +8,7 @@ import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Generator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -19,9 +19,12 @@ from redis.asyncio import Redis
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, remove_matcher
+import src.musicbot as musicbot_module
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
     DEPTH_RESTORE_WAIT_SECS,
+    _echo,
+    _removed_label,
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
     HistoryFlags,
@@ -30,6 +33,7 @@ from src.musicbot import (
     ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
+    _ECHO_ROWS,
     _check_voice_permissions,
     _join_succeeded,
 )
@@ -37,6 +41,7 @@ from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
+from src.util import EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -1951,7 +1956,7 @@ class TestResumeCommand:
         with _no_typing():
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
-        # join last: the embed describes the display head, and the head is gone
+        # join last: the embed describes the queue head, and the head is gone
         # once the gate opens behind the join.
         assert calls == ["restore", "build", "join"]
 
@@ -2922,7 +2927,7 @@ class TestPlayAnalytics:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Crash recovery reconnects voice BEFORE restore_entries() replays the
-        queue into _display. Reading the depth in that window records 0 behind a
+        queue. Reading the depth in that window records 0 behind a
         queue about to reappear, so the read waits the restore out."""
         mock_ctx.voice_client = _playing_vc()
         mp = _mock_mp()
@@ -2934,7 +2939,7 @@ class TestPlayAnalytics:
             return True
 
         mp.wait_for_restore = AsyncMock(side_effect=_land_the_restore)
-        # What the real display leg answers on either side of the restore.
+        # What the real queue answers on either side of the restore.
         mp.enqueue_depth = MagicMock(side_effect=lambda: 12 if restored else 0)
         music_bot.get_mp = MagicMock(return_value=mp)
         spy = AsyncMock(
@@ -3804,6 +3809,330 @@ def _removed_song(n: int, query_source: str = "") -> QueueObject:
     )
 
 
+class TestEchoIsSafeInAnEmbed:
+    """`-remove`'s argument is user text echoed back into an embed, and Discord
+    renders markdown in descriptions and field values. Escaping it is not
+    cosmetic: unescaped, any member can make the bot post a styled masked link
+    under its own name, with no queue state required."""
+
+    def test_a_masked_link_cannot_form(self) -> None:
+        """Asserted on the OUTCOME, not on the escape: what matters is that no
+        `](` pair can survive to pick a link's label and destination. Escaping
+        alone never covered this — brackets are not in escape_markdown's set."""
+        attack = "[Free Discord Nitro](https://evil.example/phish)"
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
+
+    def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
+        """The regression that shipped: escape_markdown defaults to
+        ignore_links=True, which passes any http(s) URL through UNTOUCHED — so an
+        attack prefixed with a bare link was echoed verbatim, and the earlier
+        bracket test passed only because its attack started at the bracket."""
+        attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
+        assert "`" not in out
+
+    def test_emphasis_behind_a_url_is_escaped(self) -> None:
+        """What `ignore_links=False` still buys, now that the brackets are
+        neutralized outright: escape_markdown's URL exemption covers the WHOLE
+        token, so emphasis after a scheme renders styled unless the flag is off.
+        Pinned separately because the masked-link tests above pass either way."""
+        out = _echo("https://x.com/**bold**_em_")
+        assert "\\*\\*" in out
+        assert "\\_" in out
+
+    def test_a_backtick_cannot_close_the_code_span(self) -> None:
+        """Two call sites wrap this in a code span, and Discord gives a backslash
+        NO meaning inside one — so an ESCAPED backtick still closes the span and
+        renders everything after it. The backtick has to go, not be escaped."""
+        out = _echo("foo` **bold** `bar")
+        assert "`" not in out
+        assert "\\*\\*" in out
+
+    def test_control_characters_cannot_end_the_line_early(self) -> None:
+        """A control character truncates the rendered line, hiding whatever the
+        needle put after it."""
+        assert _echo("a\x00b\x1fc\x7fd") == "a b c d"
+
+    def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
+        """Discord 400s the whole send past 1024 chars in a field value, and
+        escaping can double the length. The removal has already committed by then,
+        so the user sees "Command failed" for a removal that happened.
+
+        `*`, not `x`: escaping leaves `x` alone, so the old input never exercised
+        the doubling this test's own docstring is about."""
+        assert len(_echo("*" * 5000)) <= 1024
+
+    def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
+        assert _echo("never gonna give you up") == "never gonna give you up"
+
+
+class TestRemovedLabelNamesEveryItemType:
+    """The Songs field exists because one argument can now take out a whole
+    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
+    for it rendered every unresolved Spotify-playlist track as `?` — the exact
+    case the field was added for, and the one the -remove help now advertises."""
+
+    def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
+        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
+        assert _removed_label(item) == "Real Title"
+
+    def test_an_unresolved_search_uses_its_search_text(self) -> None:
+        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        assert _removed_label(item) == "Artist - Song"
+
+    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
+        item = YTSource(url="https://yt.com/v=2", process=True)
+        assert _removed_label(item) == "https://yt.com/v=2"
+
+
+class TestRemoveReplyStaysInsideDiscordsCaps:
+    """Every field of the `-remove` reply is built from a list the USER sizes —
+    the removed songs and their positions — and the send happens AFTER
+    queue_remove() has already mutated memory and Redis. So an over-length field
+    is not a cosmetic bug: Discord 400s the whole send, `_command_error` reports
+    "Command failed", and the user is told nothing happened to a queue that has
+    already been irreversibly changed.
+
+    Asserted on the ASSEMBLED embed rather than on `_echo` alone. The bug these
+    pin shipped past a test that checked one echo against the cap while ten of
+    them shared the same field."""
+
+    @staticmethod
+    def _fields(mock_ctx: MagicMock) -> list[discord.embeds.EmbedProxy]:
+        return list(mock_ctx.send.await_args_list[0][1]["embed"].fields)
+
+    async def _run(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        *,
+        removed: list[QueueItem],
+        positions: list[int],
+    ) -> None:
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=removed, positions=positions, mode=RemoveMode.RESOLVED
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's; unregistered,
+        # it reports the teardown notice and every assertion here passes over an
+        # embed with no fields.
+        music_bot.mps[mock_ctx.guild.id] = mp
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://yt.com/v=0"
+        )
+
+    async def test_ten_long_titles_fit_the_songs_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """99 characters is INSIDE YouTube's own 100-char title limit, so this
+        needs no crafted content — ten ordinary songs used to overflow at 1030."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_markdown_heavy_title_cannot_blow_the_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Escaping roughly doubles a title of pure markdown characters, which is
+        the shape a hostile uploader picks."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_playlists_worth_of_positions_fits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """One `-remove <playlist link>` drops every track the link added. A raw
+        join passes 1024 characters at 227 positions — well inside what a real
+        playlist holds."""
+        songs: list[QueueItem] = [_removed_song(i) for i in range(240)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        fields = {f.name: f.value or "" for f in self._fields(mock_ctx)}
+        positions_field = next(v for k, v in fields.items() if k and "removed" in k)
+        assert len(positions_field) <= EMBED_FIELD_LIMIT
+        # The count is still honest about what went, even though the list is cut.
+        assert "180 more" in positions_field
+
+    async def test_the_whole_embed_stays_under_the_total_cap(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord caps an embed at 6000 characters across every part, so three
+        fields each legal on their own can still fail together."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(240)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        assert len(mock_ctx.send.await_args_list[0][1]["embed"]) <= 6000
+
+
+class TestCommandArgumentBinding:
+    """`-play`, `-playnow` and `-remove` all consume the rest of the line.
+
+    A positional binds ONE WORD. `-play` stores its argument as the origin
+    `-remove` matches on, so a positional there meant `-play never gonna give you
+    up` recorded `"never"` — the help's own example matched nothing, and
+    `-remove never` became a wildcard over every song starting with that word.
+
+    Asserted on the callback signature rather than through a parsed message,
+    because the binding is a property of the signature and the tests that missed
+    this were the ones that hand-built the value instead."""
+
+    @pytest.mark.parametrize("name", ["play", "playnow", "remove"])
+    def test_the_argument_consumes_the_rest_of_the_line(self, name: str) -> None:
+        import inspect
+
+        callback = getattr(MusicBot, name).callback
+        param = list(inspect.signature(callback).parameters.values())[2]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"-{name}'s {param.name} is positional; discord.py will bind one word"
+        )
+
+    @pytest.mark.parametrize(
+        "typed,expected",
+        [
+            ("never gonna give you up", "never gonna give you up"),
+            ("some song   ", "some song"),  # read_rest keeps trailing whitespace
+        ],
+    )
+    async def test_what_the_user_typed_reaches_queue_source_whole(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        typed: str,
+        expected: str,
+    ) -> None:
+        """The end-to-end C1 guards: the origin -remove matches on is the whole
+        line, stripped. Previously it was the first word."""
+        mock_ctx.message.content = f"-play {typed}"
+        mock_ctx.voice_client = _connected_vc()
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=typed)
+
+        call = music_bot.queue_source.await_args
+        assert call is not None
+        assert call.kwargs["origin"] == expected
+
+
+class TestListBuiltDescriptionsStayCheapAndInsideTheCap:
+    """Three embed descriptions are built from a list the user sizes — a queued
+    playlist, a queued collection, a cleared queue — and each row costs a
+    safe_label.
+
+    So each is bounded twice. Escaping every row to render ten blocks the single
+    event loop for ~96ms on a 10,000-track collection, which is every guild's
+    progress tick and the outbox drain. And ten escaped rows are the whole 4096
+    budget, on a send that lands after the enqueue or the clear has committed."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _counting_safe_label() -> Generator[list[int]]:
+        calls = [0]
+        real = musicbot_module.safe_label
+
+        def counted(text: str, limit: int) -> str:
+            calls[0] += 1
+            return real(text, limit)
+
+        with patch.object(musicbot_module, "safe_label", counted):
+            yield calls
+
+    @staticmethod
+    def _descriptions(mock_ctx: MagicMock) -> list[str]:
+        sent = mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+        return [
+            c.kwargs["embed"].description or ""
+            for c in sent
+            if c.kwargs.get("embed") is not None
+        ]
+
+    async def test_clear_escapes_only_the_rows_it_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=["*" * 5000] * 5000)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with self._counting_safe_label() as calls:
+            await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        assert calls[0] <= _ECHO_ROWS + 1
+        for description in self._descriptions(mock_ctx):
+            assert len(description) <= EMBED_DESCRIPTION_LIMIT
+
+    async def test_a_widened_row_cap_cannot_400_the_send(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The clamp, distinct from the slice: ten rows at the current row width
+        fit comfortably, so the slice alone keeps these legal and proves nothing
+        about the boundary.
+
+        Widen _ECHO_ROW_MAX to 700 and ten markdown-heavy rows reach 14,030
+        characters, on a send that lands after the clear has committed — so
+        send_embed clamps, the way _field does for field values."""
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=["*" * 5000] * 50)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch.object(musicbot_module, "_ECHO_ROW_MAX", 700):
+            await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        descriptions = self._descriptions(mock_ctx)
+        # The unclamped build really is over the cap — otherwise this passes for
+        # the slice's reason and the clamp is untested.
+        assert any(len(d) == EMBED_DESCRIPTION_LIMIT for d in descriptions), [
+            len(d) for d in descriptions
+        ]
+
+    async def test_the_shown_rows_still_say_there_are_more(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The slice is _ECHO_ROWS + 1 because queue_message appends its "…" only
+        when handed more rows than it keeps."""
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=[f"Song {i}" for i in range(50)])
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        assert any(d.endswith("\n...") for d in self._descriptions(mock_ctx))
+
+
 class TestRemoveCommand:
     async def test_a_failure_becomes_a_command_error(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3816,6 +4145,8 @@ class TestRemoveCommand:
         mp.queue_remove = AsyncMock(side_effect=RuntimeError("queue exploded"))
         mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
         music_bot._command_error = AsyncMock()
 
         await command_callback(MusicBot.remove)(
@@ -3847,6 +4178,8 @@ class TestRemoveCommand:
         )
         mp.wait_for_restore = AsyncMock(return_value=True)
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=notfound"
@@ -3870,6 +4203,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
@@ -3897,6 +4232,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=queue_embed)
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
@@ -3922,6 +4259,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
@@ -3947,6 +4286,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=album)
 
@@ -3954,9 +4295,40 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert (
-            fields["Matched"]
-            == f"<{album}> — the spotify.com link you queued them with"
+            fields["Matched"] == f"{album} — the spotify.com link you queued them with"
         )
+
+    async def test_a_mixed_origin_match_names_no_kind(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The "only when every removed item agrees" branch.
+
+        `kinds` is a set and `pop()` on a two-element one is arbitrary, so a mixed
+        run would otherwise claim "the spotify.com link you queued them with" for
+        a removal that also took YouTube searches. The needle stays; only the
+        claim about what it was drops."""
+        needle = "https://open.spotify.com/album/abc123"
+        removed: list[QueueItem] = [
+            _removed_song(1, "spotify.com"),
+            _removed_song(2, "search"),
+        ]
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=removed, positions=[1, 2], mode=RemoveMode.ORIGIN
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=needle)
+
+        fields = {
+            f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+        }
+        assert fields["Matched"] == f"{needle} — the link you queued them with"
 
     async def test_a_search_match_is_quoted_not_linked(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3973,6 +4345,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="never gonna give you up"
@@ -3982,7 +4356,7 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert fields["Matched"] == (
-            "`never gonna give you up` — the search you queued it with"
+            "never gonna give you up — the search you queued it with"
         )
 
     async def test_removal_embed_names_what_it_matched(
@@ -3999,14 +4373,18 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
         url = "https://yt.com/watch?v=abc"
 
         await command_callback(MusicBot.remove)(music_bot, mock_ctx, needle=url)
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         fields = {f.name: f.value for f in removal_embed.fields}
-        # A resolved-URL match reads as it always has: the link, nothing more.
-        assert fields["Matched"] == f"<{url}>"
+        # Escaped, and deliberately NOT wrapped in a code span: escaping inside
+        # one renders the backslashes literally, and a bare URL auto-links —
+        # which the angle-bracket form this replaced also did.
+        assert fields["Matched"] == url
 
     async def test_removal_embed_shows_positions(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4022,6 +4400,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
@@ -4045,6 +4425,8 @@ class TestRemoveCommand:
         mp.wait_for_restore = AsyncMock(return_value=True)
         mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
         music_bot.get_mp = MagicMock(return_value=mp)
+        # -remove re-checks that this player is still the guild's, as -shuffle does.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.remove)(
             music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"

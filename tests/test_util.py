@@ -16,7 +16,41 @@ from src.util import (
     get_logger,
     pluralize,
     queue_message,
+    safe_label,
+    truncate,
+    truncate_escaped,
 )
+
+
+class TestTruncateEscaped:
+    """A field or description is built by joining N escaped rows, and its length
+    is not controlled by any one row's cap — so the clamp on it needs a cut that
+    knows what it is cutting."""
+
+    def test_short_text_is_untouched(self) -> None:
+        assert truncate_escaped("hello", 10) == "hello"
+
+    def test_an_orphaned_escape_is_dropped_with_its_partner(self) -> None:
+        """A cut between a backslash and the character it escapes leaves an orphan
+        that escapes the ellipsis, so the clip renders as a literal character."""
+        text = "abc" + "\\*" * 10  # what escape_markdown does to a run of asterisks
+        # limit-1 == 4 lands one character past the backslash at index 3.
+        assert truncate(text, 5)[-2] == "\\"
+        clipped = truncate_escaped(text, 5)
+        assert clipped == "abc…"
+        assert not clipped[:-1].endswith("\\")
+
+    def test_a_complete_escape_pair_is_kept(self) -> None:
+        """An even trailing run is escaped backslashes, which are complete text —
+        dropping one eats a character the user typed."""
+        assert truncate_escaped("ab\\\\cd", 5) == "ab\\\\…"
+
+    def test_a_real_escaped_label_survives_the_clamp(self) -> None:
+        """End to end against the real escaper, where the pairs come from."""
+        escaped = " ".join(safe_label("*" * 60, 60) for _ in range(10))
+        clipped = truncate_escaped(escaped, 1024)
+        assert len(clipped) <= 1024
+        assert not clipped[:-1].endswith("\\")
 
 
 class TestQueueMessage:

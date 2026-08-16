@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
-from typing import Any, Optional
+import re
+from typing import Any, Final, Optional
 from collections.abc import AsyncGenerator, Coroutine
 
 import discord
@@ -100,7 +101,12 @@ async def send_embed(
     thumbnail: Optional[str] = None,
     fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
-    embed = discord.Embed(title=title, description=description, color=color)
+    # Clamped here, the last point before Discord — see EMBED_DESCRIPTION_LIMIT.
+    embed = discord.Embed(
+        title=truncate(title, EMBED_TITLE_LIMIT),
+        description=truncate_escaped(description, EMBED_DESCRIPTION_LIMIT),
+        color=color,
+    )
     if footer:
         embed.set_footer(text=footer)
     if thumbnail:
@@ -159,12 +165,66 @@ EMBED_TITLE_LIMIT = 256
 # and debug.py already imports ping.py, so importing it back closes a hard cycle.
 FOOTER_LIMIT = 2048
 
+# The same again, for a field VALUE. A field built from a list the user can grow
+# (removed songs, dropped positions) has no natural ceiling, and the 400 lands
+# after the command has already mutated state — so clamp at the boundary rather
+# than trusting the caller's arithmetic about how long its inputs can get.
+EMBED_FIELD_LIMIT = 1024
+
+# The same again, for a DESCRIPTION. Enforced in send_embed rather than at each
+# caller for the reason _field exists: the three list-built descriptions (a
+# queued playlist, a queued collection, a cleared queue) are ten escaped rows
+# wide, so nothing but the row-width constant keeps them under this — and the
+# 400 lands after the enqueue or the clear has already committed, telling the
+# user the command failed for work that happened.
+EMBED_DESCRIPTION_LIMIT = 4096
+
+
+# Control characters end a rendered embed line early, which is how text can hide
+# whatever follows it. Flattened rather than escaped — they have no visible form.
+_LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_label(text: str, limit: int) -> str:
+    """Attacker-influenceable text — a user's search term, a yt-dlp title, an
+    uploader name — rendered into an embed without being able to style it or
+    forge a link.
+
+    Three neutralizations, then the escape, because `escape_markdown` covers none
+    of them: `[` and `]` are not in its set at all and are the half of a masked
+    link that picks the label; a backtick closes any code span the caller wrapped
+    this in, where a backslash means nothing; and `ignore_links` defaults to TRUE,
+    passing an entire http(s) token through untouched.
+
+    Cap BEFORE escaping — escaping first and cutting after can split an escape
+    pair and leave a trailing backslash that eats the next character."""
+    flattened = _LABEL_UNSAFE.sub(" ", text)
+    clipped = truncate(flattened, limit)
+    neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")
+    return discord.utils.escape_markdown(neutralized, ignore_links=False)
+
 
 def truncate(text: str, limit: int) -> str:
     """Clip to `limit` characters, ellipsizing if clipped."""
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def truncate_escaped(text: str, limit: int) -> str:
+    """truncate(), for text that has already been through escape_markdown.
+
+    A field or description built by joining N escaped rows has a length no single
+    row's cap controls, so this clamp fires. A cut landing between a backslash and
+    the character it escapes leaves an orphan that escapes the ellipsis instead,
+    rendering the clip as a literal character. An ODD trailing run of backslashes
+    is that orphan; an even run is escaped backslashes and is kept."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if (len(cut) - len(cut.rstrip("\\"))) % 2:
+        cut = cut[:-1]
+    return cut + "…"
 
 
 def truncate_embed_title(title: str) -> str:
