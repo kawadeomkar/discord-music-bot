@@ -2342,86 +2342,99 @@ class MusicPlayer:
 
                     span.set_attribute("song.title", self.current_song.title or "")
 
-                    if not await self.queue.try_commit_dequeue(commit_generation):
-                        # Cleared while this song resolved, or while the prefetch
-                        # that claimed it ran. Discard without playing: the clear()
-                        # reset the cursor, so the claim is settled, and cleanup()
-                        # terminates the FFmpeg subprocess.
+                    # The commit and the start transaction's LPOP under ONE mutex
+                    # hold — see GuildQueue.commit_dequeue. Everything in this body
+                    # is synchronous but the store dispatch; nothing that touches
+                    # Discord belongs here.
+                    async with self.queue.commit_dequeue(commit_generation) as ok:
+                        if not ok:
+                            # Cleared while this song resolved, or while the
+                            # prefetch that claimed it ran. Discard without playing:
+                            # the clear() reset the cursor, so the claim is settled,
+                            # and cleanup() terminates the FFmpeg subprocess.
+                            #
+                            # bump_generation() refuses here without resetting the
+                            # cursor, leaving the claim standing — sound only while
+                            # its single caller is MusicBot.cleanup(), which is
+                            # cancelling this task. A second caller has to settle
+                            # the claim in this branch first.
+                            claim_outstanding = False
+                            self.current_song.cleanup()
+                            self.current_song = None
+                            continue
+
+                        # The commit settled the claim. Clearing here rather than at
+                        # song end matters: the flag guards a release, and a
+                        # release deletes an item — left standing across the song it
+                        # would settle whatever sits at the head by then, which is the
+                        # next song once the prefetch below claims it.
                         claim_outstanding = False
-                        self.current_song.cleanup()
-                        self.current_song = None
-                        continue
 
-                    # The commit settled the claim. Clearing here rather than at
-                    # song end matters: the flag guards a release, and a release
-                    # deletes an item — left standing across the song it would
-                    # settle whatever sits at the head by then, which is the next
-                    # song once the prefetch below claims it.
-                    claim_outstanding = False
+                        # Safe to assert rather than await readiness: the gate above
+                        # opens only once a voice connection is established
+                        # (channel.connect() awaits the full handshake), so loop() cannot
+                        # reach vc.play() mid-handshake.
+                        vc = self._guild.voice_client
+                        assert isinstance(vc, discord.VoiceClient)
+                        assert self.current_song is not None
+                        # Local binding: pyright's narrowing doesn't survive the awaits
+                        # below, and it keeps every write in this iteration on the same
+                        # song even if current_song is reassigned.
+                        song = self.current_song
 
-                    # Safe to assert rather than await readiness: the gate above
-                    # opens only once a voice connection is established
-                    # (channel.connect() awaits the full handshake), so loop() cannot
-                    # reach vc.play() mid-handshake.
-                    vc = self._guild.voice_client
-                    assert isinstance(vc, discord.VoiceClient)
-                    assert self.current_song is not None
-                    # Local binding: pyright's narrowing doesn't survive the awaits
-                    # below, and it keeps every write in this iteration on the same
-                    # song even if current_song is reassigned.
-                    song = self.current_song
+                        # Written from the player thread, read after play_next.wait();
+                        # call_soon_threadsafe orders the write before the wait returns.
+                        play_error: list[Optional[Exception]] = [None]
 
-                    # Written from the player thread, read after play_next.wait();
-                    # call_soon_threadsafe orders the write before the wait returns.
-                    play_error: list[Optional[Exception]] = [None]
+                        def _after_play(
+                            error: Optional[Exception], _title: str = song.title or ""
+                        ) -> None:
+                            # discord.py hands ffmpeg's failure here and nowhere else —
+                            # a `lambda _:` would drop it, making a stream that never
+                            # opened indistinguishable from a song that ended. A
+                            # deliberate vc.stop() arrives as error=None.
+                            if error is not None:
+                                play_error[0] = error
+                                log.error(f"playback error for {_title}: {error}")
+                            self.bot.loop.call_soon_threadsafe(self.play_next.set)
 
-                    def _after_play(
-                        error: Optional[Exception], _title: str = song.title or ""
-                    ) -> None:
-                        # discord.py hands ffmpeg's failure here and nowhere else —
-                        # a `lambda _:` would drop it, making a stream that never
-                        # opened indistinguishable from a song that ended. A
-                        # deliberate vc.stop() arrives as error=None.
-                        if error is not None:
-                            play_error[0] = error
-                            log.error(f"playback error for {_title}: {error}")
-                        self.bot.loop.call_soon_threadsafe(self.play_next.set)
+                        vc.play(song, after=_after_play)
+                        if song.start_paused:
+                            # Park the player thread SYNCHRONOUSLY, before any await, so
+                            # a song returning paused leaks a frame or two rather than a
+                            # Redis round-trip of audio. Idempotent with the full pause()
+                            # below, which runs after the start transaction so its
+                            # pause_start_epoch survives that transaction's HDEL.
+                            vc.pause()
+                        play_start = (
+                            time.time()
+                        )  # capture immediately before any awaits
+                        # Stamped once and inherited by every later fragment (a resume
+                        # tail arrives carrying it). Before the state write below, or
+                        # the parked entry persists 0.0 and a crash recovers no start.
+                        song.played_at = song.played_at or play_start
 
-                    vc.play(song, after=_after_play)
-                    if song.start_paused:
-                        # Park the player thread SYNCHRONOUSLY, before any await, so
-                        # a song returning paused leaks a frame or two rather than a
-                        # Redis round-trip of audio. Idempotent with the full pause()
-                        # below, which runs after the start transaction so its
-                        # pause_start_epoch survives that transaction's HDEL.
-                        vc.pause()
-                    play_start = time.time()  # capture immediately before any awaits
-                    # Stamped once and inherited by every later fragment (a resume
-                    # tail arrives carrying it). Before the state write below, or
-                    # the parked entry persists 0.0 and a crash recovers no start.
-                    song.played_at = song.played_at or play_start
-
-                    # Mirror the now-playing song to Redis. should_pop_queue=True →
-                    # one MULTI/EXEC atomically LPOPs the queue and writes every state
-                    # field plus the display snapshot, closing the at-most-once
-                    # window. A crash-recovered "current song" was never on the Redis
-                    # list, so only state is written — an LPOP would drop a queued one.
-                    if self.store is not None:
-                        # Backdated by the FFmpeg -ss offset so recovery math (now -
-                        # play_start_epoch - pauses) yields true audio position, not
-                        # time-since-vc.play(). Without it, ?t= songs and
-                        # double-crash recoveries resume start_offset seconds early.
-                        backdated_start = play_start - song.start_offset
-                        current = SongQueueEntry.from_song(song)
-                        now_playing = NowPlayingData.from_song(song)
-                        if should_pop_queue:
-                            await self.store.pop_queue_and_start_song(
-                                current, backdated_start, now_playing=now_playing
-                            )
-                        else:
-                            await self.store.set_current_song_state(
-                                current, backdated_start, now_playing=now_playing
-                            )
+                        # Mirror the now-playing song to Redis. should_pop_queue=True →
+                        # one MULTI/EXEC atomically LPOPs the queue and writes every state
+                        # field plus the display snapshot, closing the at-most-once
+                        # window. A crash-recovered "current song" was never on the Redis
+                        # list, so only state is written — an LPOP would drop a queued one.
+                        if self.store is not None:
+                            # Backdated by the FFmpeg -ss offset so recovery math (now -
+                            # play_start_epoch - pauses) yields true audio position, not
+                            # time-since-vc.play(). Without it, ?t= songs and
+                            # double-crash recoveries resume start_offset seconds early.
+                            backdated_start = play_start - song.start_offset
+                            current = SongQueueEntry.from_song(song)
+                            now_playing = NowPlayingData.from_song(song)
+                            if should_pop_queue:
+                                await self.store.pop_queue_and_start_song(
+                                    current, backdated_start, now_playing=now_playing
+                                )
+                            else:
+                                await self.store.set_current_song_state(
+                                    current, backdated_start, now_playing=now_playing
+                                )
 
                     if song.start_paused:
                         # Returns parked where -playnow interrupted it (the player

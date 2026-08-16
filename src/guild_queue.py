@@ -32,17 +32,11 @@ Not known here:
 See docs/ARCHITECTURE.md#queue-invariant.
 """
 
-# ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
-# try_commit_dequeue() releases the bulk mutex before pop_queue_and_start_song()'s
-# atomic LPOP+HSET dispatches, so a -clear landing in that tick pops an entry the clear
-# already deleted: memory and Redis drift by one until the next rebuild, and a crash
-# inside the drift restores the queue one song out of alignment. Accepted. Cheapest fix:
-# hold the mutex across the store dispatch, costing one ~1ms round-trip.
-
 import asyncio
 import random
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from itertools import islice
 from enum import Enum, StrEnum, auto
@@ -621,6 +615,26 @@ class GuildQueue:
             if generation != self._generation:
                 return False
             return self.try_release()
+
+    @asynccontextmanager
+    async def commit_dequeue(self, generation: int) -> AsyncGenerator[bool]:
+        """try_commit_dequeue(), with the bulk mutex held across the caller's own
+        Redis write — the body runs inside the hold.
+
+        Both legs settle under one hold, so a put_front() cannot read
+        `_cursor == 0` between them, take the LPUSH branch, and prepend ahead of
+        the entry the pending LPOP retires — which loses the inserted song and
+        drifts memory from the mirror until the next rebuild.
+
+        The body holds the mutex for every concurrent enqueue, so keep it to the
+        one Redis round trip (~1ms) and nothing that touches Discord. vc.play()
+        belongs inside: it is synchronous, and starting audio outside the hold
+        puts the timestamp this transaction records on the wrong side of it."""
+        async with self._mutex:
+            if generation != self._generation:
+                yield False
+                return
+            yield self.try_release()
 
     async def redis_pop_for(
         self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
