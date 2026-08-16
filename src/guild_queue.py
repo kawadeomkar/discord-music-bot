@@ -265,15 +265,27 @@ class GuildQueue:
         again. The mirror never moved.
 
         `item` may be the RESOLVED form of what was claimed (YTSource →
-        QueueObject), so the slot is rewritten onto it: a later rebuild serializes
-        from the deque, and a stale YTSource there would persist a search over an
-        entry that had already resolved — re-running the ytsearch after a crash,
-        free to rank a different video."""
+        QueueObject), so the returned entry replaces the claimed one: a later
+        rebuild serializes from the deque, and a stale YTSource there would persist
+        a search over an entry that had already resolved — re-running the ytsearch
+        after a crash, free to rank a different video.
+
+        The item goes back into the OLDEST claimed slot, index 0, and the cursor
+        gives up the NEWEST — not `_items[_cursor] = item`, which is the same slot
+        only while this caller holds the sole claim. The prefetch's cancel awaits,
+        so loop() can take a second claim inside that window; writing at the cursor
+        then overwrote the entry loop() had just claimed, destroying it in memory
+        while the mirror kept it — a divergence the next commit made permanent.
+
+        Two live claims still settle by position, so each can take the other's song
+        (loop() says so where it cancels). That is the accepted cost; losing an
+        entry outright and desyncing Redis was not. Deque order is never permuted
+        here, because it is the mirror's order."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 would
         # go negative and _items[-1] = item would clobber the TAIL.
         if self._cursor > 0:
             self._cursor -= 1
-            self._items[self._cursor] = item
+            self._items[0] = item
         self._sync_wake()
 
     def empty(self) -> bool:
@@ -580,11 +592,14 @@ class GuildQueue:
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
-    def release(self, context: str = "dequeue") -> None:
+    def release(self, context: str = "dequeue") -> bool:
         """Settle a claim being retired without playing (failed to stream, failed
-        to resolve). Warns instead of raising when nothing is claimed."""
-        if not self.try_release():
+        to resolve). Warns instead of raising when nothing is claimed, and returns
+        whether it settled one — callers with a Redis leg must not run it on False."""
+        settled = self.try_release()
+        if not settled:
             log.warning(f"song_queue was empty on {context} in guild {self._guild.id}")
+        return settled
 
     def try_release(self) -> bool:
         """Settle one claim: drop the head and step the cursor back, which leaves
@@ -611,10 +626,15 @@ class GuildQueue:
         """Settle a claim for an item that will never play, on both legs — the pair
         every loop failure path shares. `context` labels the nothing-claimed
         warning. The mutex spans the settle and the LPOP so a bulk mutation cannot
-        rebuild the mirror between them and have the LPOP hit the new head."""
+        rebuild the mirror between them and have the LPOP hit the new head.
+
+        The LPOP is gated on the settle for the same reason try_release() guards
+        its decrement: nothing claimed means a clear() landed during the resolve,
+        and the mirror now holds whatever was queued after it. Popping there
+        retires a song this dequeue never owned, and only Redis loses it."""
         async with self._mutex:
-            self.release(context)
-            await self.redis_pop_for(item)
+            if self.release(context):
+                await self.redis_pop_for(item)
 
     async def try_commit_dequeue(self, generation: int) -> bool:
         """Settle the claim for a song about to play, under the bulk-mutation lock

@@ -346,6 +346,30 @@ class TestReleaseVsFinishFailedDequeue:
         assert gq.display_size() == 1
         assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
 
+    async def test_a_cleared_claim_does_not_pop_the_song_that_replaced_it(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """-clear during a resolve leaves nothing claimed, and the queue has since
+        been refilled. The settle correctly no-ops; an LPOP alongside it would
+        retire the NEW head, which this dequeue never owned — losing it from Redis
+        alone, so it survives in memory until a restart drops it."""
+        claimed = _qobj(1, mock_author)
+        await gq.put([claimed])
+        await gq.get()
+
+        await gq.clear()
+        replacement = _qobj(2, mock_author)
+        await gq.put([replacement])
+
+        await gq.finish_failed_dequeue(claimed, context="test")
+
+        assert gq.display_items() == [replacement]
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
 
 class TestLremFallsBackWhenItCannotBeTrusted:
     """LREM matches on exact serialized bytes, and the rest of the codebase does
@@ -1750,6 +1774,35 @@ class TestRequeueFront:
         assert gq.qsize() == 1
         assert gq.get_nowait() is a
         assert gq._cursor == 1  # and the new consumer holds it
+
+    async def test_a_returned_claim_does_not_destroy_a_later_one(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """Two claims are live: the prefetch's, and the loop's, taken while the
+        prefetch's cancel was still awaiting. The returned item belongs in its own
+        slot, index 0. Writing it at the cursor put it over the entry loop() had
+        just claimed, which destroyed that entry in memory while the mirror kept
+        it — and the deque must never disagree with the mirror, because the commit
+        pops both by position."""
+        prefetched, claimed_by_loop, pending = (
+            _qobj(n, mock_author) for n in (1, 2, 3)
+        )
+        await gq.put([prefetched, claimed_by_loop, pending])
+        assert gq.get_nowait() is prefetched
+        assert gq.get_nowait() is claimed_by_loop
+
+        gq.requeue_front(prefetched)
+
+        # Nothing destroyed, nothing duplicated, order untouched — and one claim
+        # given back, so the newest entry is pending again.
+        assert gq.display_items() == [prefetched, claimed_by_loop, pending]
+        assert gq._cursor == 1
+        assert gq.qsize() == 2
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_accepts_resolved_substitute(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
