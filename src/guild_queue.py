@@ -175,6 +175,19 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     return SearchQueueEntry.from_ytsource(item)
 
 
+def item_label(item: QueueItem) -> str:
+    """What to call a queued item in a reply, resolved or not.
+
+    A YTSource has no `title` — it is an unresolved search, and a Spotify playlist
+    enqueues one per track — so anything reaching for `.title` renders every track
+    of the collection as the fallback. Its search term with the `ytsearch:` prefix
+    off is what the user would recognise.
+    """
+    if isinstance(item, QueueObject):
+        return item.title
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+
+
 def is_persisted(item: Optional[QueueItem]) -> bool:
     """True when the item has a matching entry on the Redis queue list — its
     dequeue must be mirrored with an LPOP, and rebuilds may write it back. Only

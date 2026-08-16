@@ -7026,6 +7026,55 @@ class TestLoop:
         ):
             await music_player.loop()
 
+    async def test_a_crash_recovered_head_never_lpops_a_queued_song(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """persisted=False says this song's entry was LPOPed in the run that
+        crashed, so nothing on the list belongs to it. An LPOP here retires the
+        HEAD instead — an unrelated, still-queued song, deleted from Redis on every
+        restart-with-recovery, with no error and nothing in memory to notice."""
+        assert music_player.store is not None
+        crashed = QueueObject(
+            "https://yt.com/v=crashed", "Crashed", mock_author, persisted=False
+        )
+        queued = QueueObject("https://yt.com/v=queued", "Queued", mock_author)
+        # The production shape restore_crashed leaves behind: the crashed head is
+        # in memory only, the queued song is on both legs.
+        seed_queue(music_player.queue, crashed)
+        await music_player.queue.put([queued])
+        assert len(await fake_redis.lrange(music_player.store.queue_key(), 0, -1)) == 1
+
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=crashed)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        stored = await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        assert stored == [SongQueueEntry.from_queue_object(queued).to_redis()]
+
     async def test_played_at_is_stamped_before_the_start_transaction(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:

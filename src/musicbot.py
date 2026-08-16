@@ -43,7 +43,7 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     SoundcloudSource,
@@ -439,6 +439,47 @@ def _plays_after_note(
     if isinstance(voice_client, discord.VoiceClient) and voice_client.is_paused():
         note += " Playback is paused — `-resume` to carry on."
     return note
+
+
+def _with_queue_position(item: QueueItem, position: int) -> QueueItem:
+    """Re-mint one item's ask-time `queue_position`.
+
+    QueueObject is mutable and YTSource is frozen, so one is stamped in place and
+    the other returns a copy — the caller must use the return value either way.
+    """
+    analytics = replace(item.analytics, queue_position=position)
+    if isinstance(item, QueueObject):
+        item.analytics = analytics
+        return item
+    return replace(item, analytics=analytics)
+
+
+def _collection_note(
+    url: str, queued: int, *, returns: str = "", head_playing: bool
+) -> str:
+    """What a `-play` that queued a whole collection owes the user: how many tracks
+    landed, when the interrupted song comes back, and the one-command undo.
+
+    One builder for the three paths that queue a collection — the interjection, the
+    one whose song ended mid-resolve, and the one resumed mid-resolve — because they
+    make the same promise about the same tracks, and only one of them used to say
+    anything at all. The other two queued a whole playlist behind a reply that named
+    a single song.
+
+    `head_playing` is not cosmetic. A playing song has no queue object — its entry
+    was LPOPed when it started — so `-remove` cannot reach it and only `-skip` will.
+    Offering "takes the whole playlist back out" there leaves behind the one track
+    the user is most likely trying to undo.
+    """
+    undo = (
+        "the queued ones back out; the one playing needs `-skip`."
+        if head_playing
+        else "the whole playlist back out."
+    )
+    return (
+        f"\n\nQueued **{queued}** {pluralize(queued, 'song')} from the playlist."
+        f"{returns}\nNot what you wanted? `-remove {_echo(url)}` takes {undo}"
+    )
 
 
 def _front_insert_depth(mp: MusicPlayer) -> int:
@@ -1097,6 +1138,7 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         placement: Placement = Placement.TAIL,
+        note: str = "",
     ) -> None:
         vc = ctx.voice_client
         if placement is Placement.COLD_FRONT:
@@ -1131,8 +1173,13 @@ class MusicBot(commands.Cog):
             log.info(f"play (next) qsize: {mp.queue.qsize()}")
             return
 
-        should_show_queued = mp.queue.qsize() > 0 or (
-            isinstance(vc, discord.VoiceClient) and vc.is_playing()
+        # A note is never dropped: it is the only word the user gets about tracks
+        # queued behind this one, and the queue being empty is not a reason to
+        # withhold it.
+        should_show_queued = (
+            bool(note)
+            or mp.queue.qsize() > 0
+            or (isinstance(vc, discord.VoiceClient) and vc.is_playing())
         )
         coros: list[Coroutine[Any, Any, Any]] = [
             mp.queue_put(qobj),
@@ -1146,7 +1193,7 @@ class MusicBot(commands.Cog):
                     (
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
-                        f"Est. playing at {mp.estimated_playing_at()}"
+                        f"Est. playing at {mp.estimated_playing_at()}{note}"
                     ),
                     discord.Color.blue(),
                     thumbnail=qobj.thumbnail,
@@ -1594,12 +1641,22 @@ class MusicBot(commands.Cog):
             # An ordinary append now, behind the whole queue, so replace the 0
             # minted for the interjection. Read here: the queue moved during the
             # resolve.
-            qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
-            await self._enqueue_single(ctx, qobj, mp)
+            depth = mp.enqueue_depth()
+            qobj.analytics = replace(qobj.analytics, queue_position=depth)
+            note = ""
             if follow_on:
                 # The playlist behind it still belongs behind it, and the head just
-                # went to the tail — so these follow, not front-insert.
+                # went to the tail — so these follow, not front-insert. Their
+                # ask-time depths were minted for a front insert (1..N-1) and are
+                # re-minted here for the same reason the head's is: they went to the
+                # BACK, and play_history keeps whatever number is on them forever.
+                follow_on = [
+                    _with_queue_position(item, depth + offset)
+                    for offset, item in enumerate(follow_on, start=1)
+                ]
                 await mp.queue_put(follow_on, prefetch=False)
+                note = _collection_note(url, len(follow_on) + 1, head_playing=False)
+            await self._enqueue_single(ctx, qobj, mp, note=note)
             return
 
         outcome = await mp.interject(
@@ -1627,15 +1684,15 @@ class MusicBot(commands.Cog):
             # neutralize, so this is the one path that still has to do it.
             # prefetch=False — the stream URL was warmed above.
             await mp.queue_put_next([qobj, *follow_on], prefetch=False)
-            await self._send_playing_next(
-                ctx,
-                qobj,
-                note=(
-                    "The song being interrupted already ended — "
-                    "queued to play next instead."
-                ),
-                reaction="⏯️",
+            note = (
+                "The song being interrupted already ended — "
+                "queued to play next instead."
             )
+            if follow_on:
+                # Nothing was interrupted, so the head is QUEUED rather than
+                # playing: it counts, and -remove reaches it.
+                note += _collection_note(url, len(follow_on) + 1, head_playing=False)
+            await self._send_playing_next(ctx, qobj, note=note, reaction="⏯️")
             return
 
         if outcome.resume_position is None:
@@ -1665,18 +1722,20 @@ class MusicBot(commands.Cog):
             # behind all of it — on a long link, in practice forever. Said outright
             # rather than left to be discovered from -queue, and paired with the
             # undo, because a 500-track `--now` is a plausible misfire and
-            # `-remove <the link>` takes every track of it back out in one command
+            # `-remove <the link>` takes those tracks back out in one command
             # (remove_matcher matches on user_input, which each track carries).
-            total = len(follow_on) + 1
-            returns = (
-                f" **{outcome.interrupted_title}** returns after the last of them."
-                if outcome.resume_position is not None
-                else ""
-            )
-            desc += (
-                f"\n\nQueued **{total}** {pluralize(total, 'song')} from the "
-                f"playlist.{returns}\nNot what you wanted? "
-                f"`-remove {_echo(url)}` takes the whole playlist back out."
+            #
+            # The tail only, and head_playing: this song is playing NOW, so it has
+            # no queue object for -remove to match and the count must not include it.
+            desc += _collection_note(
+                url,
+                len(follow_on),
+                returns=(
+                    f" **{outcome.interrupted_title}** returns after the last of them."
+                    if outcome.resume_position is not None
+                    else ""
+                ),
+                head_playing=True,
             )
         await asyncio.gather(
             send_embed(
@@ -2162,10 +2221,7 @@ class MusicBot(commands.Cog):
                     (
                         "Songs",
                         queue_message(
-                            [
-                                _echo(getattr(i, "title", "") or "?")
-                                for i in outcome.removed
-                            ]
+                            [_echo(item_label(i) or "?") for i in outcome.removed]
                         ),
                         False,
                     ),

@@ -3745,6 +3745,53 @@ class TestPlayWhilePaused:
         assert single_call is not None
         assert single_call.args[1] is tracks[0]
         mp.queue_put.assert_awaited_once_with(tracks[1:], prefetch=False)
+        # And SAID so. Queueing a playlist behind a reply that names one song is
+        # how 199 tracks arrive unannounced.
+        note = single_call.kwargs["note"]
+        assert "**3** songs" in note
+        assert "-remove" in note
+
+    async def test_a_resume_mid_resolve_restamps_the_tail_it_moved(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The tail's ask-time depths were minted for a FRONT insert (1..N-1), and
+        this path sends it to the back instead. play_history keeps whatever number
+        is on them forever, so the head being re-minted and the tail not left one
+        row at the real depth and the rest claiming the front of the queue."""
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        mp.enqueue_depth = MagicMock(return_value=20)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        tracks = [
+            QueueObject(
+                f"https://yt.com/v={i}",
+                f"Track {i}",
+                mock_ctx.author,
+                analytics=Analytics(queued_at=1.0, queue_position=i),
+            )
+            for i in range(3)
+        ]
+        music_bot._enqueue_single = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> None:
+            vc.is_paused.return_value = False
+            return None
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(
+                YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
+            ),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://www.youtube.com/playlist?list=PLabc"
+            )
+
+        queued = mp.queue_put.await_args.args[0]
+        assert [item.analytics.queue_position for item in queued] == [21, 22]
 
     async def test_resolution_failure_leaves_paused_song_untouched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3806,8 +3853,12 @@ class TestPlayWhilePaused:
             for c in sent
             if c.kwargs.get("embed") is not None
         ]
-        assert any("**3** songs" in (d or "") for d in notices), notices
+        # TWO, not three: the head is playing now, and a playing song has no queue
+        # object — its entry was LPOPed at start — so -remove cannot reach it.
+        # Counting it would offer an undo that leaves the interrupting track behind.
+        assert any("**2** songs" in (d or "") for d in notices), notices
         assert any("-remove" in (d or "") for d in notices), notices
+        assert any("`-skip`" in (d or "") for d in notices), notices
 
 
 class TestPlayFrontInsertion:
@@ -4355,6 +4406,23 @@ class TestEnqueueSingle:
         assert "starts now" not in description
         assert "Plays after the song starting now." in description
 
+    async def test_a_long_title_cannot_400_the_confirmation(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord rejects the WHOLE send past 256 title chars, and qobj.title is
+        yt-dlp metadata from arbitrary sites — not just YouTube's 100-char ceiling.
+        Unguarded, `-p --next <long-titled video>` queues the song and then reports
+        nothing at all."""
+        qobj = QueueObject("https://yt.com/v=1", "T" * 400, mock_ctx.author)
+        mp = _mock_mp()
+        mp.current_song = None
+        mock_ctx.message.add_reaction = AsyncMock()
+        mock_ctx.voice_client = _connected_vc()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp, placement=Placement.NEXT)
+
+        assert len(mock_ctx.send.call_args.kwargs["embed"].title) <= 256
+
     def test_the_front_insert_depth_counts_an_open_claim(self) -> None:
         """Same window, on the number that goes to Postgres forever: the song is
         queued behind the one about to play, so the ask-time depth is 1. Reading
@@ -4680,7 +4748,14 @@ class TestEchoIsSafeInAnEmbed:
         """Discord 400s the whole send past 1024 chars in a field value, and
         escaping can double the length. The removal has already committed by then,
         so the user sees "Command failed" for a removal that happened."""
-        assert len(_echo("x" * 5000)) <= 1024
+        # A LITERAL bound, not one derived from _ECHO_MAX, and tight: the old 1024
+        # passed at five times the real value, so raising _ECHO_MAX kept this green
+        # while pushing the composed field — ten of these in ONE 1024-char value —
+        # past the cap. 410 is the true worst case: escape_markdown adds a
+        # backslash per character, so 200 raw chars become 400 plus the ellipsis.
+        # Markdown-heavy input, or the doubling this docstring argues about is
+        # never actually exercised.
+        assert len(_echo("*" * 5000)) <= 410
 
     def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
         assert _echo("never gonna give you up") == "never gonna give you up"
@@ -4819,6 +4894,41 @@ class TestRemoveCommand:
         assert "embed" in first_kwargs
         removal_embed = first_kwargs["embed"]
         assert "Removed" in removal_embed.title
+
+    async def test_lazy_playlist_tracks_are_named_not_rendered_as_unknown(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A Spotify playlist enqueues one lazy YTSource per track, and YTSource has
+        no `title` at all — so the Songs field rendered `?` for every track of the
+        collection, which is the case it was added for. The field exists because a
+        bare count leaves the user unable to tell whether it took what they meant,
+        and there is no undo."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=[
+                    YTSource(ytsearch=f"ytsearch:Track {i} Artist") for i in range(3)
+                ],
+                positions=[1, 2, 3],
+                mode=RemoveMode.ORIGIN,
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://open.spotify.com/playlist/abc"
+        )
+
+        songs = next(
+            f
+            for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
+            if f.name == "Songs"
+        )
+        assert "Track 0 Artist" in (songs.value or "")
+        assert "ytsearch:" not in (songs.value or "")
+        assert "?" not in (songs.value or "")
 
     async def test_match_sends_updated_queue_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -5250,6 +5360,43 @@ class TestNowFlag:
         assert "already ended" in embed.description
         mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
 
+    async def test_a_playlist_that_fell_through_says_how_many_it_queued(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """Same fall-through, with a playlist behind it: all N front-insert while
+        the reply named Track 1 alone. Nothing was interrupted here, so the head is
+        QUEUED — it counts, and -remove reaches it."""
+        live_mp.interject = AsyncMock(return_value=None)
+        live_mp.queue_put_next = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.message.add_reaction = AsyncMock()
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        url = "https://www.youtube.com/playlist?list=PLabc"
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
+
+        live_mp.queue_put_next.assert_awaited_once_with(tracks, prefetch=False)
+        description = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "**3** songs" in description
+        assert "-remove" in description
+        # No -skip caveat: nothing is playing that -remove cannot reach.
+        assert "`-skip`" not in description
+
     async def test_spotify_playlist_interjects_head_and_queues_the_rest(
         self,
         music_bot: MusicBot,
@@ -5286,7 +5433,9 @@ class TestNowFlag:
             for c in mock_ctx.send.call_args_list
             if "embed" in c.kwargs
         ]
-        assert any("**2** songs" in d for d in notices), notices
+        # ONE: the tail. The head is playing, so -remove cannot take it back out.
+        assert any("**1** song" in d for d in notices), notices
+        assert any("`-skip`" in d for d in notices), notices
 
     async def test_yt_playlist_interjects_first_track_only(
         self,
