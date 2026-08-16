@@ -8246,6 +8246,38 @@ class TestNeutralizePrefetch:
         assert rebuilt.webpage_url == live_song.webpage_url
         assert rebuilt.title == live_song.title
 
+    async def test_completed_task_rebuild_keeps_origin_and_persistence(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The rebuild is one of two places a playing song becomes a queue object
+        again, and both fields below have already been lost here.
+
+        `user_input` is what -remove matches on, so dropping it leaves the
+        neutralized track the one entry its own collection link cannot take back
+        out. `persisted` decides whether the dequeue LPOPs: defaulted to True on a
+        crash-recovered head it writes an entry into the mirror that was never on
+        the list, and every later LPOP then retires the wrong one."""
+        original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+        live_song.cleanup = MagicMock()
+        live_song.user_input = "https://open.spotify.com/playlist/abc"
+        live_song.persisted = False
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.user_input == "https://open.spotify.com/playlist/abc"
+        assert rebuilt.persisted is False
+
     async def test_completed_task_rebuild_keeps_offset_and_playnow_flags(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:

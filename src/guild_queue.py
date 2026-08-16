@@ -571,12 +571,20 @@ class GuildQueue:
         return True
 
     async def finish_failed_dequeue(
-        self, item: Optional[QueueItem], *, context: str = "dequeue"
+        self,
+        item: Optional[QueueItem],
+        *,
+        context: str = "dequeue",
+        persisted: Optional[bool] = None,
     ) -> None:
         """Settle a claim for an item that will never play, on both legs — the pair
         every loop failure path shares. `context` labels the nothing-claimed
         warning. The mutex spans the settle and the LPOP so a bulk mutation cannot
         rebuild the mirror between them and have the LPOP hit the new head.
+
+        `persisted` overrides what `item` says about itself, and exists for the one
+        caller holding a claim it cannot describe with a QueueItem — see
+        redis_pop_for.
 
         The LPOP is GATED on the settle, and the two must not drift apart: nothing
         claimed means a clear() already retired this item and reset the cursor, so
@@ -591,7 +599,7 @@ class GuildQueue:
                     "leaving the mirror alone"
                 )
                 return
-            await self.redis_pop_for(item)
+            await self.redis_pop_for(item, persisted=persisted)
 
     async def try_commit_dequeue(self, generation: int) -> bool:
         """Settle the claim for a song about to play, under the bulk-mutation lock
@@ -614,13 +622,25 @@ class GuildQueue:
                 return False
             return self.try_release()
 
-    async def redis_pop_for(self, item: Optional[QueueItem]) -> None:
-        """Mirror one in-memory dequeue to Redis via LPOP — unless the item was
+    async def redis_pop_for(
+        self, item: Optional[QueueItem], *, persisted: Optional[bool] = None
+    ) -> None:
+        """Mirror one in-memory dequeue to Redis via LPOP — unless the entry was
         never on the list (persisted=False: the crash-recovered "current song",
         whose LPOP committed in the crashed run), where an LPOP would silently
-        delete an unrelated, still-queued song. item=None is the prefetch path,
-        which only ever dequeues real mirrored entries — so None pops."""
-        if self._store is not None and is_persisted(item):
+        delete an unrelated, still-queued song.
+
+        `persisted` is for a caller whose claim is not a QueueItem it can hand
+        over: the playback loop settles a claim it took as a prefetched YTDL, and
+        the answer lives on that object rather than on anything passed here. It is
+        NOT a convenience — item=None defaults to popping, and a prefetch really
+        can hold an unpersisted claim (a cold-start -play front-inserts at cursor
+        0, which is AHEAD of a crash-recovered head, so the prefetch behind it
+        takes that head), so the default is wrong for exactly that case and only
+        an explicit False says so."""
+        if persisted is None:
+            persisted = is_persisted(item)
+        if self._store is not None and persisted:
             await self._store.pop_queue()
 
     # ── Internal ──────────────────────────────────────────────────────────────
