@@ -47,17 +47,20 @@ from src.sources import (
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
+    UnsupportedSpotifyLinkError,
     YTSource,
     YTType,
     parse_input,
     query_source_of,
-    spotify_playlist_to_ytsearch,
+    spotify_titles_to_ytsearch,
 )
 from src.spotify import (
     Spotify,
     SpotifyAuthError,
+    SpotifyCollection,
     SpotifyRateLimitError,
     SpotifyRequestError,
+    TrackPage,
 )
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
@@ -83,6 +86,7 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
+    truncate_embed_title,
     truncate_escaped,
     get_logger,
 )
@@ -95,7 +99,8 @@ class SpotifyDisabledError(Exception):
     """Raised when a Spotify link is played but Spotify support isn't usable.
     Carries the SpotifyStatus so the message can separate no credentials configured
     (disabled) from configured but rejected at startup (invalid). The message is
-    user-facing — _command_error renders it into the error embed."""
+    user-facing, and user_message exposes it under the name _command_error's
+    allowlist renders, so the embed carries no class-name prefix."""
 
     def __init__(self, status: SpotifyStatus) -> None:
         self.status = status
@@ -113,6 +118,10 @@ class SpotifyDisabledError(Exception):
                 "Try a YouTube or SoundCloud link, or just search by name."
             )
         super().__init__(message)
+
+    @property
+    def user_message(self) -> str:
+        return str(self)
 
 
 class PlaylistInputError(ValueError):
@@ -181,15 +190,34 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 # that accepts the connection then stalls would hang the command outright.
 RESTORE_WAIT_SECS = 5.0
 
-# How long a warm -play waits for its restore before reading the ask-time queue
-# depth. Short because a timeout here only costs an approximate analytics field:
-# the depth is recorded from whatever has landed and the command proceeds.
-DEPTH_RESTORE_WAIT_SECS = 1.0
-
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
+
+# Must stay well under musicplayer._PLAYBACK_GATE_TIMEOUT (300s): a waiter's
+# player already exists, so its gate clock is ticking while it waits, and a
+# bound at or above the gate timeout lets the player be torn down underneath a
+# still-waiting command. A test pins the inequality.
+# See docs/ARCHITECTURE.md#queue-invariant.
+_ENQUEUE_WAIT_SECS = 60.0
+# Beyond this many queued waiters, decline: each waiter holds a live MusicPlayer
+# whose 300s gate clock is already running, and they all fire into the queue at
+# once when the drain finishes.
+#
+# The waiters are -shuffle and -remove, which take this slot because they rebuild
+# the mirror from memory and must not run mid-drain. -play carries
+# max_concurrency(1, guild, wait=False), so a second one is rejected before its
+# body runs. The copy below therefore names what is queued AHEAD of the waiter.
+_ENQUEUE_MAX_WAITERS = 5
+# _HTTP_TIMEOUT bounds one request, so a 100-page playlist could otherwise run
+# 3000s. Bounds each drain leg SEPARATELY — the page-1 fetch, the tail, and the
+# buffered front drain each get one budget — keeping the whole enqueue-lock
+# hold well under the 300s playback gate. It does NOT keep the hold under
+# _ENQUEUE_WAIT_SECS: two legs plus sends can outlive 60s, so that bound is how
+# long a waiter is willing to stand in line, not a promise the line moves.
+# Timing out keeps what arrived. See docs/ARCHITECTURE.md#queue-invariant.
+_COLLECTION_DRAIN_TIMEOUT_SECS = 45.0
 
 # What a user typed, echoed back into an embed. Discord renders markdown in embed
 # descriptions and field values, so an unescaped needle lets any member make the
@@ -280,17 +308,57 @@ class ActiveCommand:
     started: float
 
 
-@dataclass
-class ResolvedSpotifyPlaylist:
-    """A Spotify playlist resolved to track titles — still needs per-title
-    YouTube search resolution before it can be queued."""
+class _GuildEnqueueLock:
+    """A guild's collection-enqueue slot: the lock plus its waiter count.
 
-    titles: list[str]
+    asyncio.Lock specifically — it is documented fair ("thread always waits
+    its turn"), so waiting collections land in arrival order. discord.py's
+    max_concurrency semaphore was rejected for this job: per-Command buckets
+    can't serialize play against shuffle, ctx.invoke bypasses prepare() (the
+    -playnow→play delegation would escape it), and its acquire fast-path
+    barges past just-woken waiters.
+    """
+
+    __slots__ = ("lock", "waiters")
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.waiters = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SpotifyCollectionPager:
+    """A Spotify collection resolving page-by-page — LAZILY: constructing one
+    performs no I/O, and page 1 is fetched by _begin_collection_enqueue under
+    its own drain budget. (An eager page-1 task that overlapped the voice-join
+    handshake was removed as review simplification S2: it bought ~200ms on the
+    cold-cache front path only, and cost a hand-managed task lifecycle —
+    cancel-on-abandon, exception retrieval, capture-before-join.)
+
+    A STARTED pager must still be closed exactly once — aclose() or a full
+    drain, never neither. Abandoning a started generator defers finalization
+    to asyncio's asyncgen hooks, which raise GeneratorExit at an arbitrary
+    later point; under filterwarnings=["error"] the resulting warning is a
+    hard test failure. An unstarted one is inert (aclose() is a no-op).
+    """
+
+    kind: SpotifyType
+    pages: AsyncGenerator[TrackPage]
+
+    async def aclose(self) -> None:
+        """Finalize the generator now (no-op if never started or already
+        finished)."""
+        await self.pages.aclose()
 
 
 @dataclass
 class ResolvedYoutubePlaylist:
     """A YouTube playlist already resolved to playable QueueObjects.
+
+    Carries its own playlist_url so the enqueue path never needs the original
+    source object — the correlation "a ResolvedYoutubePlaylist always arrives
+    with a YTSource" is now expressed by construction instead of a runtime
+    assert (built in queue_source, where the source is already narrowed).
 
     `skipped` is how many leading tracks the URL's `index=` dropped, carried for
     the enqueue embed alone: tracks is already sliced, so nothing downstream has
@@ -298,7 +366,26 @@ class ResolvedYoutubePlaylist:
     """
 
     tracks: list[QueueObject]
+    playlist_url: str
     skipped: int = 0
+
+
+@dataclass(slots=True, kw_only=True)
+class _CollectionDrain:
+    """The state _begin_collection_enqueue hands to _drain_collection_tail: everything
+    the tail needs to keep enqueueing pages after the playback gate opened."""
+
+    resolved: SpotifyCollectionPager
+    generation: int  # snapshot the compare-and-put checks every page against
+    enqueued: int
+    total: int  # collection.total — an upper bound for playlists
+    completion_notice: bool  # multi-page playlist: report the real count at the end
+    # The command's ask-time head analytics and its raw argument. Every page
+    # re-derives its per-track positions from `analytics` plus `enqueued`, so a
+    # collection numbers continuously across page boundaries instead of
+    # restarting at the head depth on every page.
+    analytics: Analytics
+    origin: str
 
 
 def _apply_playlist_index(
@@ -357,6 +444,78 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
     # matching some other part of a YouTube URL is not a case that arises.
     if source.video_id in tracks[0].webpage_url:
         tracks[0].ts = source.ts
+
+
+def _is_collection(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> bool:
+    """True when this source enqueues more than one entry — the tier-1 rule.
+
+    Knowable before any I/O (parse_input is pure string work), which is what
+    lets play acquire the collection lock ahead of the AsyncExitStack without
+    holding a playback-gate deferral while it waits. YT playlists count: their
+    single batch put would otherwise land between a Spotify collection's pages
+    and split the collection. Single tracks and searches never take the lock —
+    they append at the current tail immediately, accepted interleaving
+    (an immediate single can even land ahead of a collection that
+    arrived earlier and is still waiting).
+    """
+    if isinstance(source, SpotifySource):
+        return source.type in (SpotifyType.PLAYLIST, SpotifyType.ALBUM)
+    return isinstance(source, YTSource) and source.type is YTType.PLAYLIST
+
+
+# How many titles one mint pass turns into YTSources before yielding. The buffered
+# front path mints a WHOLE collection in one call, and Spotify allows 10,000 tracks
+# — 22.5ms of uninterrupted event loop at n=5000. 500 keeps each pass near 2ms.
+_MINT_CHUNK = 500
+
+
+async def _mint_collection_entries(
+    titles: list[str],
+    requester_id: int,
+    *,
+    analytics: Analytics,
+    origin: str,
+) -> list[YTSource]:
+    """spotify_titles_to_ytsearch over a whole collection, yielding between
+    chunks so one -play cannot stall every other guild's progress tick, song
+    start and outbox drain.
+
+    queue_position is derived from the index WITHIN the list handed over, so each
+    chunk offsets its analytics to start where the last one ended — the same
+    arithmetic _drain_collection_tail does per page. The caller's
+    expected_generation covers a -clear landing between chunks."""
+    minted: list[YTSource] = []
+    for start in range(0, len(titles), _MINT_CHUNK):
+        minted.extend(
+            spotify_titles_to_ytsearch(
+                titles[start : start + _MINT_CHUNK],
+                requester_id,
+                analytics=replace(
+                    analytics, queue_position=analytics.queue_position + start
+                ),
+                origin=origin,
+            )
+        )
+        await asyncio.sleep(0)
+    return minted
+
+
+async def _send_queueing_stopped(ctx: commands.Context, noun: str) -> None:
+    """The refusal notice for a collection that never reached the queue — a
+    clear/teardown landed first. Suppressed: a failed send must not mask the
+    outcome play's error path is about to report.
+    """
+    with contextlib.suppress(Exception):
+        await ctx.send(
+            embed=notice_embed(
+                f"Queueing stopped — the queue was cleared or "
+                f"playback was stopped before the {noun} could "
+                f"be added.",
+                discord.Color.orange(),
+            )
+        )
 
 
 def _join_succeeded(ctx: commands.Context) -> bool:
@@ -433,6 +592,11 @@ class MusicBot(commands.Cog):
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
+        # Only collection enqueues and -shuffle take these; singles never wait.
+        # On the cog, not MusicPlayer: cleanup() destroys players, and a lock
+        # destroyed mid-wait orphans its waiters. Never pruned — an entry with
+        # live waiters cannot be popped safely (~100B per guild).
+        self._enqueue_locks: dict[int, _GuildEnqueueLock] = {}
         # id(ctx) → the in-flight command's span, otel token and start time.
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
@@ -540,6 +704,15 @@ class MusicBot(commands.Cog):
         # left the queue at start, and clear_connection() drops the parked copy.
         pending_history = mp.claim_current_song_for_history()
         try:
+            # Invalidate any in-flight collection drain first: it runs in a
+            # command task this method does not cancel. The single teardown
+            # choke point, so one bump covers -stop, kick, alone-timer, gate
+            # timeout and play's error path.
+            #
+            # Not awaited: this runs before the disconnect, so anything that can
+            # suspend on Redis delays the silence -stop asked for — the same rule
+            # the pending_history write below states.
+            mp.queue.bump_generation()
             # Cancel tasks before disconnecting so the loop cannot wake and start
             # the next song between voice_client.stop() and cancellation.
             # disconnect() calls stop() internally, silencing audio below.
@@ -753,8 +926,11 @@ class MusicBot(commands.Cog):
                 (
                     ExtractionError,
                     PlaylistInputError,
+                    SpotifyAuthError,
+                    SpotifyDisabledError,
                     SpotifyRateLimitError,
                     SpotifyRequestError,
+                    UnsupportedSpotifyLinkError,
                 ),
             ):
                 # Show the user-safe line, not the raw message: yt-dlp's carries
@@ -780,21 +956,31 @@ class MusicBot(commands.Cog):
         *,
         analytics: Analytics,
         origin: str,
-    ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
+    ) -> Union[QueueObject, SpotifyCollectionPager, ResolvedYoutubePlaylist]:
         """Resolve a parsed URL/search source into something enqueueable: a
-        ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
-        a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject.
+        SpotifyCollectionPager (lazy — no I/O until _begin_collection_enqueue
+        starts it, so no ordering decision is made here), a
+        ResolvedYoutubePlaylist (already resolved in full), or a bare QueueObject.
 
         `analytics` is the command's ask-time head value, minted at dispatch;
         playlist tracks derive their per-track positions from it. `origin` is the
         raw command argument, carried onto every resulting item — for a collection
-        the link, not the per-track search its expansion generated."""
-        if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
-            # they become, carrying this command's analytics.
-            return ResolvedSpotifyPlaylist(
-                await self._require_spotify().playlist(source.id)
+        the link, not the per-track search its expansion generated. Neither
+        reaches a pager here: its pages are minted per-page by
+        _begin_collection_enqueue, which is handed both."""
+        if isinstance(source, SpotifySource) and source.type in (
+            SpotifyType.ALBUM,
+            SpotifyType.PLAYLIST,
+        ):
+            # Titles, not QueueObjects — spotify_titles_to_ytsearch mints the
+            # YTSources they become, carrying this command's analytics.
+            spotify = self._require_spotify()
+            pages = (
+                spotify.album_stream(source.id)
+                if source.type is SpotifyType.ALBUM
+                else spotify.playlist_stream(source.id)
             )
+            return SpotifyCollectionPager(source.type, pages)
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
@@ -807,7 +993,9 @@ class MusicBot(commands.Cog):
             )
             tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
-            return ResolvedYoutubePlaylist(tracks, skipped=skipped)
+            return ResolvedYoutubePlaylist(
+                tracks, playlist_url=source.playlist_url, skipped=skipped
+            )
         else:
             ts: Optional[int] = None
             search: str
@@ -834,69 +1022,548 @@ class MusicBot(commands.Cog):
     async def _enqueue_playlist(
         self,
         ctx: commands.Context,
-        source: Union[SpotifySource, YTSource, SoundcloudSource],
-        qobj: Union[ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
+        qobj: ResolvedYoutubePlaylist,
         mp: MusicPlayer,
         *,
-        analytics: Analytics,
-        origin: str,
         front: bool = False,
+        expected_generation: Optional[int] = None,
     ) -> None:
-        """Queue a resolved playlist and notify the channel — branches on the
-        resolved shape since Spotify playlists arrive as titles needing YouTube
-        search resolution while YouTube playlists arrive pre-resolved."""
+        """Queue a resolved YouTube playlist in one batch and notify the channel.
+        Spotify collections stream page-by-page via _begin_collection_enqueue instead.
+
+        Takes no analytics/origin: yt_playlist already stamped both onto every
+        track it built, so there is nothing left to mint here. The streamed
+        collection path is the one that still needs them, because its YTSources
+        are minted per page.
+
+        expected_generation is the compare-and-put every Spotify page uses:
+        yt_playlist takes 1-4s, and a -clear or -stop inside that resolve must not
+        be undone by a thousand tracks arriving afterwards. Refused ⇒ nothing is
+        queued and nothing is sent but the refusal."""
         # A playlist front-inserts in full, in order — unlike -playnow, which
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
         enqueue = mp.queue_put_front if front else mp.queue_put
-        if isinstance(qobj, ResolvedSpotifyPlaylist):
-            titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(
-                titles, analytics=analytics, origin=origin
-            )
-            log.info(f"ytsearch qobjs: {qobjs_yt}")
-            await asyncio.gather(
-                send_embed(
-                    ctx,
-                    "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
-                    discord.Color.blue(),
+        tracks = qobj.tracks
+        count = len(tracks)
+        log.info(f"yt playlist track count: {count}")
+        # Stated, not silent: the user pasted a link and got fewer songs than the
+        # playlist holds, and only the `index=` in their own URL explains it.
+        skipped_line = (
+            f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} earlier "
+            f"{pluralize(qobj.skipped, 'song')}\n"
+            if qobj.skipped
+            else ""
+        )
+        shown_titles = queue_message(
+            [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, _ECHO_ROWS + 1)]
+        )
+        # Enqueued first, alone: the notification and the reaction may only
+        # describe a put that landed. Gathered with it, "Queued playlist — 1000
+        # songs" goes out for a put the generation refused.
+        if not await enqueue(
+            tracks, prefetch=False, expected_generation=expected_generation
+        ):
+            log.info("yt playlist enqueue abandoned: queue invalidated")
+            await _send_queueing_stopped(ctx, "playlist")
+            return
+        await asyncio.gather(
+            send_embed(
+                ctx,
+                f"Queued playlist — {count} {pluralize(count, 'song')}",
+                f"Requested by: [{ctx.author.mention}]\n{qobj.playlist_url}\n"
+                f"{skipped_line}\n{shown_titles}",
+                discord.Color.blue(),
+            ),
+            ctx.message.add_reaction("👍"),
+        )
+
+    async def _acquire_enqueue_slot(
+        self, ctx: commands.Context
+    ) -> Optional[_GuildEnqueueLock]:
+        """Serialize collection enqueues (and -shuffle) per guild.
+
+        Returns the held slot on success — the caller must release
+        `slot.lock` in a finally — or None when declined, in which case the
+        user has already been told why. Best-effort FIFO: asyncio.Lock is
+        fair once waiting, and arrival order matches gateway order because
+        nothing awaits before this point in the command body. Acquired in the
+        body (not a decorator) so ctx.invoke delegation — -playnow's idle
+        path invokes play directly, bypassing prepare() — picks it up too.
+        """
+        assert ctx.guild is not None
+        entry = self._enqueue_locks.setdefault(ctx.guild.id, _GuildEnqueueLock())
+        waiting = entry.lock.locked()
+        if waiting:
+            if entry.waiters >= _ENQUEUE_MAX_WAITERS:
+                await ctx.send(
+                    embed=notice_embed(
+                        "Too many commands are already waiting on an album or "
+                        "playlist here — try again in a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return None
+            entry.waiters += 1
+        try:
+            if waiting:
+                # A command sitting silently behind a 40s drain reads as a dead
+                # bot — acknowledge the wait before blocking. Only real waiters
+                # get the ack (and the counter): the uncontended path below has
+                # no await between the locked() check above and acquire(), so
+                # it cannot barge past a live waiter. It can still park during
+                # a release→wakeup handoff, when locked() reads False while
+                # waiters are queued — the shared timeout bounds that window.
+                await ctx.send(
+                    embed=notice_embed(
+                        "Waiting for an album or playlist to finish queueing…",
+                        discord.Color.blue(),
+                    )
+                )
+            try:
+                async with asyncio.timeout(_ENQUEUE_WAIT_SECS):
+                    await entry.lock.acquire()
+            except TimeoutError:
+                await ctx.send(
+                    embed=notice_embed(
+                        "An album or playlist is still queueing — try again in a "
+                        "moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return None
+        finally:
+            if waiting:
+                entry.waiters -= 1
+        return entry
+
+    @_tracer.start_as_current_span("bot.enqueue_collection")
+    async def _begin_collection_enqueue(
+        self,
+        ctx: commands.Context,
+        resolved: SpotifyCollectionPager,
+        mp: MusicPlayer,
+        *,
+        analytics: Analytics,
+        origin: str,
+        front: bool,
+    ) -> Optional[_CollectionDrain]:
+        """Enqueue a Spotify collection's page 1 (or, on the buffered path,
+        all of it) and send the enqueue embed. Runs inside play's
+        AsyncExitStack — on the front path the playback gate is still held, so
+        everything here happens before the first note. Returns the drain state
+        for _drain_collection_tail, or None when the tail must not run (buffered
+        path done, empty collection raised, or the enqueue was refused by a
+        concurrent clear/teardown).
+
+        `analytics` is the command's ask-time head value and `origin` its raw
+        argument (the collection link) — both minted at dispatch and stamped onto
+        every track here rather than at the per-title search, which by then knows
+        only the title the expansion generated.
+        """
+        is_album = resolved.kind is SpotifyType.ALBUM
+        noun = "album" if is_album else "playlist"
+        try:
+            # This anext is what STARTS the pager (construction is lazy), and
+            # it is bounded like every other drain leg: unbounded, page 1 was
+            # the one fetch outside every deadline, and a rate-limited identity
+            # call could hold the enqueue lock (and, on the front path, the
+            # playback gate) for http_call's full retry ladder — ~150s against
+            # waiters that give up at 60. On expiry the cancellation lands
+            # inside the generator's own await and finalizes it; the abandon
+            # path's aclose() is then a no-op.
+            async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                page1 = await anext(resolved.pages)
+        except TimeoutError:
+            raise ValueError(
+                f"Spotify took too long loading the {noun} — try again shortly"
+            ) from None
+        except StopAsyncIteration:
+            # The generators always yield at least one page; this is belt and
+            # braces so a future edit can't turn it into an opaque crash.
+            raise ValueError(f"The {noun} has no tracks") from None
+        if page1.is_last and not page1.titles:
+            # Empty collection: raise before anything is queued — play's error
+            # path reports it. A non-last empty page (a playlist whose first
+            # 100 items are all episodes) streams on; the drain may still find
+            # tracks later.
+            raise ValueError(f"The {noun} has no queueable tracks")
+        collection = page1.collection
+        # A teardown can land inside the page-1 round-trip above, and cleanup()
+        # pops the player before bumping the generation — so a snapshot taken
+        # after the pop reads the post-teardown value and every page commits onto
+        # a dead guild. No await separates this check from the snapshot below.
+        assert ctx.guild is not None
+        if self.mps.get(ctx.guild.id) is not mp:
+            log.info("collection enqueue abandoned: guild torn down during page 1")
+            await _send_queueing_stopped(ctx, noun)
+            return None
+        gen = mp.queue.generation
+
+        if front and await mp.queue.has_restored_backlog():
+            # Buffered path: restored entries exist, so the collection lands
+            # ahead of them via one put_front — successive streamed put_fronts
+            # would invert page order. has_restored_backlog reads the mirror too,
+            # since qsize()==0 with a mirror ghost must still buffer.
+            titles = list(page1.titles)
+            # The clause the "queued the first N" notice reads, or None when the
+            # drain completed. A reason, not a bool: a timeout says "come back in
+            # a moment" and a failed page says "Spotify stopped answering".
+            truncated_reason: Optional[str] = None
+            async with contextlib.aclosing(resolved.pages) as pages:
+                # aclosing sits outside the timeout: on expiry the generator is
+                # suspended at an await inside __anext__, and aclose() must run
+                # after the cancellation has been converted, not during it.
+                try:
+                    async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                        async for page in pages:
+                            titles.extend(page.titles)
+                except TimeoutError:
+                    # Keep what arrived: this drain holds the playback gate, and
+                    # running to the gate's own 300s timeout tears the player down
+                    # and refuses the put_front below.
+                    truncated_reason = "was taking too long to load"
+                    log.warning(
+                        f"buffered {noun} drain hit "
+                        f"{_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s; queueing "
+                        f"{len(titles)} of ~{collection.total}"
+                    )
+                except (
+                    SpotifyRateLimitError,
+                    SpotifyRequestError,
+                    SpotifyAuthError,
+                ) as e:
+                    # Same answer as the timeout: keep what arrived, matching the
+                    # streaming path, which keeps page 1 when its tail fails.
+                    # Re-raised only when nothing arrived at all.
+                    truncated_reason = "stopped loading partway"
+                    log.warning(
+                        f"buffered {noun} drain failed after {len(titles)} "
+                        f"titles: {type(e).__name__}: {e}"
+                    )
+                    if not titles:
+                        raise
+            if not titles:
+                raise ValueError(f"The {noun} has no queueable tracks")
+            ok = await mp.queue_put_front(
+                await _mint_collection_entries(
+                    titles, ctx.author.id, analytics=analytics, origin=origin
                 ),
-                enqueue(qobjs_yt, prefetch=False),
+                prefetch=False,
+                expected_generation=gen,
+            )
+            if not ok:
+                log.info("buffered collection enqueue abandoned: queue invalidated")
+                # Tell the user — they waited through the full fetch, and a
+                # silently swallowed -play reads as a dead bot.
+                await _send_queueing_stopped(ctx, noun)
+                return None
+            await self._notify_collection_enqueued(
+                ctx, resolved.kind, collection, titles, enqueued=len(titles)
+            )
+            if truncated_reason is not None:
+                with contextlib.suppress(Exception):
+                    await ctx.send(
+                        embed=notice_embed(
+                            f"The {noun} {truncated_reason} — queued "
+                            f"the first {len(titles)} "
+                            f"{pluralize(len(titles), 'song')}. Run the command "
+                            f"again to add the rest.",
+                            discord.Color.orange(),
+                        )
+                    )
+            return None
+
+        # Streaming path: page 1 in now, tail after the gate opens. prefetch
+        # =False on every page — the default would RPUSH one entry per item
+        # (a 100-item page = 100 round-trips) and spawn N prefetch tasks.
+        ok = await mp.queue_put(
+            spotify_titles_to_ytsearch(
+                page1.titles, ctx.author.id, analytics=analytics, origin=origin
+            ),
+            prefetch=False,
+            expected_generation=gen,
+        )
+        if not ok:
+            log.info("collection enqueue abandoned before page 1: queue invalidated")
+            await _send_queueing_stopped(ctx, noun)
+            return None
+        exact = len(page1.titles) if page1.is_last else None
+        drain = _CollectionDrain(
+            resolved=resolved,
+            generation=gen,
+            enqueued=len(page1.titles),
+            total=collection.total,
+            analytics=analytics,
+            origin=origin,
+            # Albums report collection.total upfront (exact — items are never
+            # skipped); a multi-page playlist's real count is only known once
+            # drained, so it gets a completion notice (L6/G5).
+            completion_notice=not is_album and not page1.is_last,
+        )
+        # Built before the notification, which cannot abort it: page 1 is already
+        # committed, so a raise here would return None, the caller would aclose()
+        # the generator, and the collection would truncate to page 1. A channel
+        # without Add Reactions makes that deterministic.
+        await self._notify_collection_enqueued(
+            ctx, resolved.kind, collection, page1.titles, enqueued=exact
+        )
+        return drain
+
+    async def _resume_after_collection(self, ctx: commands.Context) -> None:
+        """Resume a player that was paused when -play queued a collection.
+
+        Mirrors the -resume command's guard rather than calling it, so a
+        -resume that landed while the collection was queueing is a no-op here
+        instead of a second resume.
+        """
+        vc = ctx.voice_client
+        if (
+            isinstance(vc, discord.VoiceClient)
+            and not vc.is_playing()
+            and vc.is_paused()
+        ):
+            mp = self.get_mp(ctx)
+            await mp.resume(vc)
+            await mp.rehost_np_after_resume()
+
+    async def _notify_collection_enqueued(
+        self,
+        ctx: commands.Context,
+        kind: SpotifyType,
+        collection: SpotifyCollection,
+        titles: list[str],
+        *,
+        enqueued: Optional[int],
+    ) -> None:
+        """Enqueue embed + 👍 for a committed collection page.
+
+        Never raises: by the time this runs the songs are queued, so a failed
+        send or a missing Add Reactions permission is a notification problem,
+        not an enqueue failure — propagating it would report success as
+        "Failed to queue song" and, on the streaming path, discard the tail.
+        """
+        try:
+            await asyncio.gather(
+                self._send_collection_embed(
+                    ctx, kind, collection, titles, enqueued=enqueued
+                ),
                 ctx.message.add_reaction("👍"),
             )
+        except Exception as e:
+            log.warning(
+                f"collection enqueue notification failed: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+
+    async def _send_collection_embed(
+        self,
+        ctx: commands.Context,
+        kind: SpotifyType,
+        collection: SpotifyCollection,
+        titles: list[str],
+        *,
+        enqueued: Optional[int],
+    ) -> None:
+        """The enqueue embed for a streamed collection. Albums get their own
+        embed — name, artists, count and cover art all ride the same
+        GET /v1/albums/{id} call that produced page 1. Playlists cannot have
+        name/art and say "~total" until the drain reports the real
+        enqueued count — total is an upper bound because episode/null items
+        are skipped, never queued.
+
+        Every string Spotify supplies — the album name, the artist line, each
+        track title — is echoed through safe_label: an embed renders markdown,
+        and a track called `[click](https://evil)` would otherwise post a styled
+        masked link under the bot's own name. The album title goes through the
+        embed-title clamp instead, which Discord does not render markdown in.
+
+        Sliced before the escape — see _ECHO_ROWS. `titles` here is a whole
+        buffered collection, up to Spotify's 10,000."""
+        shown_titles = queue_message(
+            [safe_label(t, _ECHO_ROW_MAX) for t in islice(titles, _ECHO_ROWS + 1)]
+        )
+        if kind is SpotifyType.ALBUM:
+            count = collection.total
+            await send_embed(
+                ctx,
+                truncate_embed_title(
+                    f"Queued album — {collection.name or 'Unknown album'}"
+                ),
+                (
+                    f"by {_echo(collection.artist_line)} · {count} "
+                    f"{pluralize(count, 'song')}\n"
+                    f"Requested by: [{ctx.author.mention}]\n\n"
+                    f"{shown_titles}"
+                ),
+                discord.Color.blue(),
+                thumbnail=collection.thumbnail,
+            )
+            return
+        if enqueued is not None:
+            head = f"Queued playlist — {enqueued} {pluralize(enqueued, 'song')}"
+            body = f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
         else:
-            # HACK: this assert stands in for a correlation the signature cannot
-            # express — `source` and `qobj` are separate parameters, but a
-            # ResolvedYoutubePlaylist always arrives with a YTSource. `python -O`
-            # strips it, leaving the attribute reads below unguarded. Fix: have the
-            # Resolved*Playlist dataclasses carry their own source.
-            assert isinstance(source, YTSource)
-            playlist_url = source.playlist_url
-            # Mirrors the Spotify branch: a YTSource playlist resolves via
-            # yt_playlist() to fully-formed QueueObjects.
-            tracks = qobj.tracks
-            count = len(tracks)
-            log.info(f"yt playlist track count: {count}")
-            # Stated, not silent: the user pasted a link and got fewer songs than
-            # the playlist holds, and only the `index=` in their own URL explains
-            # it.
-            skipped_line = (
-                f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
-                f"earlier {pluralize(qobj.skipped, 'song')}\n"
-                if qobj.skipped
-                else ""
+            head = "Queued playlist"
+            body = (
+                f"Requested by: [{ctx.author.mention}]\n"
+                f"Queueing ~{collection.total} songs — the rest are on their "
+                f"way.\n\n{shown_titles}"
             )
-            await asyncio.gather(
-                send_embed(
-                    ctx,
-                    f"Queued playlist — {count} {pluralize(count, 'song')}",
-                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n{skipped_line}\n{queue_message([q.title for q in islice(tracks, 10)])}",
-                    discord.Color.blue(),
-                ),
-                enqueue(tracks, prefetch=False),
-                ctx.message.add_reaction("👍"),
+        await send_embed(ctx, head, body, discord.Color.blue())
+
+    @_tracer.start_as_current_span("bot.drain_collection_tail")
+    async def _drain_collection_tail(
+        self, ctx: commands.Context, mp: MusicPlayer, drain: _CollectionDrain
+    ) -> None:
+        """Drain a pager's remaining pages into the queue, inside the command
+        body, after play's AsyncExitStack has exited — the gate is open and
+        the first song is already starting, so nothing here is on the
+        time-to-first-song path. Runs as the command task on purpose: no
+        background task means no sixth cleanup() entry, no cross-coroutine
+        lock handoff, and command-error reporting for free.
+        background_typing is still active throughout — the typing indicator
+        doubling as a "still queueing" signal is intended.
+
+        Every page is a compare-and-put against the generation snapshotted
+        before page 1: a -clear or any teardown (stop/kick/alone-timer/gate
+        timeout — all bump via cleanup()) refuses the next page atomically,
+        and the drain stops quietly. Completion/abandon/failure are reported
+        as fresh notice embeds, never by editing the enqueue message — the
+        Now Playing host machinery re-edits its host message from its own
+        snapshot, so an out-of-band edit of a message it owns would be
+        overwritten (and would fight the strip-back on host migration).
+        """
+        span = trace.get_current_span()
+        span.set_attribute("spotify.kind", drain.resolved.kind.value)
+        span.set_attribute("spotify.total", drain.total)
+        try:
+            async with contextlib.aclosing(drain.resolved.pages) as pages:
+                # Bounded because this drain holds the enqueue lock: unbounded, a
+                # slow collection stalls -shuffle and YouTube-playlist enqueues
+                # until they are declined. One rolling deadline covers every
+                # page FETCH, but each queue_put runs OUTSIDE it — the same
+                # discipline as the buffered path. A put is a two-leg
+                # mutation whose Redis leg suspends inside the queue mutex;
+                # a deadline expiring there cancels between the deque and
+                # the mirror, leaving `-queue` showing songs a restart
+                # silently drops. aclosing sits outside so aclose() runs after
+                # the cancellation is converted, not during it.
+                deadline = (
+                    asyncio.get_running_loop().time() + _COLLECTION_DRAIN_TIMEOUT_SECS
+                )
+                while True:
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            page = await anext(pages)
+                    except StopAsyncIteration:
+                        break
+                    ok = await mp.queue_put(
+                        # ctx.author, not mp._last_author: this drain runs after
+                        # the gate opened, so other users' commands are landing
+                        # while it enqueues. The pages belong to whoever asked.
+                        #
+                        # The ask-time depth advances by what this collection has
+                        # already enqueued, so page 2's first track records the
+                        # position it actually waited at rather than repeating
+                        # page 1's head. Only this collection's own tracks count:
+                        # a single -play landing mid-drain is accepted drift, the
+                        # same approximation enqueue_depth() already carries.
+                        spotify_titles_to_ytsearch(
+                            page.titles,
+                            ctx.author.id,
+                            analytics=replace(
+                                drain.analytics,
+                                queue_position=drain.analytics.queue_position
+                                + drain.enqueued,
+                            ),
+                            origin=drain.origin,
+                        ),
+                        prefetch=False,
+                        expected_generation=drain.generation,
+                    )
+                    if not ok:
+                        # A clear/teardown landed: the collection this page
+                        # belongs to was deleted. Abandon without refilling —
+                        # the regression this design exists to prevent.
+                        log.info("collection drain abandoned: queue invalidated")
+                        # Teardown-neutral copy: of the five doors that bump
+                        # the generation, only -clear empties the queue — the
+                        # others (-stop, kick, alone-timer, gate timeout)
+                        # deliberately leave pages 1..k persisted.
+                        with contextlib.suppress(Exception):
+                            await ctx.send(
+                                embed=notice_embed(
+                                    f"Queueing stopped after {drain.enqueued} "
+                                    f"{pluralize(drain.enqueued, 'song')} — "
+                                    "the queue was cleared or playback was "
+                                    "stopped.",
+                                    discord.Color.orange(),
+                                )
+                            )
+                        return
+                    drain.enqueued += len(page.titles)
+        except TimeoutError:
+            # Budget spent. What is queued stays queued and the command ends
+            # here rather than holding the enqueue lock any longer — every
+            # other queue command in the guild is waiting on it.
+            log.warning(
+                f"collection drain hit {_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s "
+                f"after {drain.enqueued} songs"
             )
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')} — the rest was taking "
+                        f"too long to load. Run the command again to add the "
+                        f"remainder.",
+                        discord.Color.orange(),
+                    )
+                )
+            return
+        except SpotifyRateLimitError as e:
+            # Deliberately not the generic "re-running will re-add" copy below:
+            # a re-run refetches every page from 1 and doubles the load that
+            # earned the 429. Tell them to wait instead.
+            log.warning(f"collection drain rate-limited after {drain.enqueued} songs")
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')}. {e.user_message}",
+                        discord.Color.orange(),
+                    )
+                )
+            return
+        except Exception:
+            # Honest notice, no resume machinery: resume-from-offset is unsound
+            # for playlists, since an edit shifts every offset. The suppress keeps
+            # a failed notice send from masking the real error.
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')} — the rest failed "
+                        f"to load. Re-running the command will re-add the "
+                        f"first {drain.enqueued}.",
+                        discord.Color.red(),
+                    )
+                )
+            raise
+        span.set_attribute("spotify.enqueued", drain.enqueued)
+        if drain.completion_notice:
+            # Suppressed: a failed SEND of the success notice must not reach
+            # play's error handler, which would report a fully successful
+            # enqueue as "Failed to queue song".
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Playlist finished queueing — {drain.enqueued} "
+                        f"{pluralize(drain.enqueued, 'song')} in total.",
+                        discord.Color.blue(),
+                    )
+                )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
@@ -909,11 +1576,10 @@ class MusicBot(commands.Cog):
     ) -> None:
         vc = ctx.voice_client
         if front:
-            # The "Est. playing at" embed below would be wrong: a restored queue is
-            # non-empty but its entries sit BEHIND this song. The resume notice
-            # replaces it — it names the song starting now (nothing else does; the
-            # gate is shut, so there is no NP block to host). Built before the
-            # insert, while the queue holds only the restored entries.
+            # The "Est. playing at" embed below would be wrong: a restored queue
+            # is non-empty but its entries sit behind this song. The resume notice
+            # replaces it, naming the song starting now. Built before the insert,
+            # while the queue holds only the restored entries.
             resume_notice = mp.build_resume_notice_embed(qobj)
             coros: list[Coroutine[Any, Any, Any]] = [
                 mp.queue_put_front(qobj),
@@ -925,7 +1591,10 @@ class MusicBot(commands.Cog):
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
 
-        should_show_queued = mp.queue.qsize() > 0 or (
+        # display_size(), so the in-flight head counts: while the loop holds the
+        # only queued song and resolves it, qsize() is 0 and is_playing() is still
+        # False, and a -play landing there is queued behind a song all the same.
+        should_show_queued = mp.queue.display_size() > 0 or (
             isinstance(vc, discord.VoiceClient) and vc.is_playing()
         )
         coros: list[Coroutine[Any, Any, Any]] = [
@@ -956,7 +1625,7 @@ class MusicBot(commands.Cog):
         usage="<url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track or playlist link, a SoundCloud link, or "
+            "playlist, a Spotify track, album or playlist link, a SoundCloud link, or "
             "plain words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
             "If something is already playing, the song is appended to the queue "
@@ -972,12 +1641,17 @@ class MusicBot(commands.Cog):
                 "-play never gonna give you up",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
-                "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+                # A real album; the old playlist example was an editorial
+                # (37i9…) playlist, which Spotify 404s for third-party apps —
+                # a documented example that could never work.
+                "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
+                "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, "
-                "so a long playlist takes a few seconds to finish queueing."
+                "Spotify links are matched to YouTube audio one title at a time. "
+                "An album or playlist starts playing after its first page loads "
+                "and keeps queueing in the background."
             ),
         },
     )
@@ -999,12 +1673,22 @@ class MusicBot(commands.Cog):
         url = unquote_argument(url.strip())
         async with background_typing(ctx):
             try:
-                # Paused → interject, not append: appending leaves the bot silent
-                # with the request buried behind a paused song. The interrupted song
-                # returns PLAYING, unlike -playnow. Checked before parse_input so the
-                # paused path parses once, inside _interject_flow.
-                paused_vc = ctx.voice_client
-                if isinstance(paused_vc, discord.VoiceClient) and paused_vc.is_paused():
+                source = parse_input(url, ctx.message.content)
+                is_collection = _is_collection(source)
+                # Non-None exactly when the bot is connected AND paused, so both
+                # branches below share one already-narrowed value.
+                vc_now = ctx.voice_client
+                paused_vc = (
+                    vc_now
+                    if isinstance(vc_now, discord.VoiceClient) and vc_now.is_paused()
+                    else None
+                )
+
+                # Paused → interject, not append, so the request is not buried
+                # behind a paused song; the interrupted song returns playing,
+                # unlike -playnow. Collections are exempt: interjection resolves to
+                # one song, so they queue in full below and resume afterwards.
+                if paused_vc is not None and not is_collection:
                     paused_mp = self.get_mp(ctx)
                     if paused_mp.current_song is not None:
                         return await self._interject_flow(
@@ -1016,113 +1700,210 @@ class MusicBot(commands.Cog):
                             require_paused=True,
                         )
 
-                source = parse_input(url, ctx.message.content)
+                # Only collections take the per-guild lock — a second collection
+                # queueing while one streams would interleave its pages into the
+                # first. A single track appends at the current tail even mid-stream
+                # (accepted interleaving).
+                slot: Optional[_GuildEnqueueLock] = None
+                if is_collection:
+                    slot = await self._acquire_enqueue_slot(ctx)
+                    if slot is None:
+                        return  # declined — the user has been told why
 
-                qobj: Union[
-                    QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
-                ]
-                async with contextlib.AsyncExitStack() as stack:
-                    # front: not connected, so this song jumps ahead of any queue
-                    # restored from Redis (a -stop leaves its queue persisted).
-                    # -play on a disconnected bot means "play this", not "play
-                    # the leftovers".
-                    front = not ctx.voice_client
-                    # Bound before the join, not after: every failure path below
-                    # hands this exact player to _abandon_cold_start, and a get_mp()
-                    # issued after its cleanup() would build and start a fresh one.
-                    mp = self.get_mp(ctx)
-                    # Ask-time analytics, read ONCE at dispatch: the command
-                    # message's snowflake time, so the wait covers gateway
-                    # delivery and the resolve below. front ⇒ depth 0, the
-                    # cold-start song plays ahead of the restored queue.
-                    if front:
-                        position = 0
-                    else:
-                        # Wait out any in-flight restore: _display stays empty
-                        # until restore_entries() replays it, so a -play in the
-                        # crash-recovery window would read 0 behind a queue about
-                        # to reappear. Already set in the common case.
-                        await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
-                        position = mp.enqueue_depth()
-                    analytics = Analytics(
-                        queued_at=ctx.message.created_at.timestamp(),
-                        queue_position=position,
-                    )
-                    if front:
-                        # Hold the gate across the join below: join opens it the
-                        # moment the handshake lands, which would start the
-                        # restored head while queue_source is still extracting.
-                        # Released on exiting the stack, after the front insertion.
-                        await stack.enter_async_context(mp.defer_playback())
-                        # Concurrent with queue_source: both are pure I/O (voice
-                        # handshake vs yt-dlp extraction) with no data dependency.
-                        # Awaiting join_task after queue_source guarantees the voice
-                        # client is ready before queue_put fires.
-                        join_task = asyncio.create_task(ctx.invoke(self.join))
+                try:
+                    await self._play_resolved(ctx, url, source)
+                finally:
+                    if slot is not None:
+                        slot.lock.release()
+
+                    if paused_vc is not None and is_collection:
+                        # After the enqueue, never before: resuming first would
+                        # restart the paused song only for a failed resolve to
+                        # leave the user with playback they did not ask to change.
+                        # The state is re-read because a -resume may have landed
+                        # during the drain.
+                        #
+                        # Inside the finally: the enqueue commits well before
+                        # _play_resolved can raise — a page 503ing mid-drain, or
+                        # the gather hitting Forbidden on Add Reactions — and a
+                        # raise past this leaves the guild paused forever with the
+                        # collection queued behind a song nothing restarts. The
+                        # guard re-reads the voice state, so it is idempotent.
                         try:
-                            qobj = await self.queue_source(
-                                ctx, source, analytics=analytics, origin=url
+                            await self._resume_after_collection(ctx)
+                        except Exception as resume_error:
+                            # Never replace the error already unwinding: that one
+                            # says why the enqueue failed. On the success path the
+                            # songs are queued and `-resume` still works, so this
+                            # is not worth an embed either.
+                            log.warning(
+                                f"Failed to resume after queueing a collection in "
+                                f"guild {getattr(ctx.guild, 'id', None)}: "
+                                f"{resume_error}"
                             )
-                            await join_task
-                        except BaseException:
-                            if not join_task.done():
-                                join_task.cancel()
-                                with contextlib.suppress(
-                                    asyncio.CancelledError, Exception
-                                ):
-                                    await join_task
-                            # Full cleanup, not just disconnect: cog_before_invoke
-                            # already started a MusicPlayer's loop(), which would
-                            # zombie for up to 300s on queue.get() with
-                            # clear_connection() never firing — spurious crash
-                            # recovery on restart.
-                            await self._abandon_cold_start(ctx, mp)
-                            raise
-                        # Inserting onto a join that produced no usable client hands
-                        # the loop a song it can only raise on.
-                        if not _join_succeeded(ctx):
-                            await self._abandon_cold_start(ctx, mp)
-                            return
-                    else:
-                        qobj = await self.queue_source(
-                            ctx, source, analytics=analytics, origin=url
-                        )
-
-                    log.info(f"Voice client: {ctx.voice_client}")
-
-                    if front:
-                        # Order matters: put_front LPUSHes the mirror while
-                        # restore_entries replays already-listed entries in memory
-                        # only, so inserting first double-queues this song. A restore
-                        # that never lands is therefore a reason NOT to insert — and
-                        # the wait is bounded, since the pool sets no socket_timeout.
-                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                            await self._abandon_cold_start(ctx, mp)
-                            await ctx.send(
-                                embed=notice_embed(
-                                    "Couldn't reach this server's saved queue, so "
-                                    "your song wasn't queued — try again in a "
-                                    "moment.",
-                                    discord.Color.red(),
-                                )
-                            )
-                            return
-
-                    if isinstance(qobj, QueueObject):
-                        await self._enqueue_single(ctx, qobj, mp, front=front)
-                    else:
-                        await self._enqueue_playlist(
-                            ctx,
-                            source,
-                            qobj,
-                            mp,
-                            front=front,
-                            analytics=analytics,
-                            origin=url,
-                        )
 
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
+
+    async def _play_resolved(
+        self,
+        ctx: commands.Context,
+        url: str,
+        source: Union[SpotifySource, YTSource, SoundcloudSource],
+    ) -> None:
+        """The body of -play after parse + lock admission: resolve, enqueue,
+        and — for a streamed collection — drain the tail inline. Split out of
+        play() so the collection-lock release wraps exactly this much and the
+        error handler stays in play()."""
+        pager: Optional[SpotifyCollectionPager] = None
+        drain: Optional[_CollectionDrain] = None
+        try:
+            qobj: Union[QueueObject, SpotifyCollectionPager, ResolvedYoutubePlaylist]
+            async with contextlib.AsyncExitStack() as stack:
+                # front: not connected, so this song jumps ahead of any queue
+                # restored from Redis (a -stop leaves its queue persisted).
+                # -play on a disconnected bot means "play this", not "play
+                # the leftovers".
+                front = not ctx.voice_client
+                # Bound before the join, not after: every failure path below hands
+                # this exact player to _abandon_cold_start, and a get_mp() issued
+                # after its cleanup() would build and start a fresh one.
+                mp = self.get_mp(ctx)
+                # Snapshot before the resolve, which is the window: a YouTube
+                # playlist spends 1-4s in yt_playlist and then lands as one batch,
+                # so a -clear or -stop inside it refuses the batch. Only
+                # _enqueue_playlist reads this; the Spotify path snapshots its own
+                # after page 1.
+                playlist_generation = mp.queue.generation
+                # Ask-time analytics, read ONCE at dispatch: the command
+                # message's snowflake time, so the wait covers gateway
+                # delivery and the resolve below. front ⇒ depth 0, the
+                # cold-start song plays ahead of the restored queue.
+                if front:
+                    position = 0
+                else:
+                    # Wait out any in-flight restore: the queue stays empty
+                    # until restore_entries() replays it, so a -play here would
+                    # both read 0 behind a queue about to reappear AND enqueue
+                    # ahead of it. Already set in the common case; a restore
+                    # that never lands is a reason not to insert at all.
+                    if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                        await ctx.send(
+                            embed=notice_embed(
+                                "Still loading this server's saved queue — try "
+                                "again in a moment.",
+                                discord.Color.orange(),
+                            )
+                        )
+                        return
+                    position = mp.enqueue_depth()
+                analytics = Analytics(
+                    queued_at=ctx.message.created_at.timestamp(),
+                    queue_position=position,
+                )
+                if front:
+                    # Hold the playback gate across the join: join opens it the
+                    # moment the handshake lands, which would start the restored
+                    # head while queue_source is still extracting. Released on
+                    # exiting the stack — never across the collection tail.
+                    await stack.enter_async_context(mp.defer_playback())
+                    # Concurrent with queue_source: both are pure I/O with no
+                    # data dependency. For single tracks and searches that
+                    # overlap covers the extraction; a Spotify collection's
+                    # queue_source is pure construction (the pager is lazy),
+                    # so its page 1 is fetched after the join instead — the
+                    # deliberate S2 trade: ~200ms of cold-cache front-path
+                    # latency for not managing an eager task's lifecycle.
+                    # Awaiting join_task after queue_source guarantees the
+                    # voice client is ready before queue_put fires.
+                    join_task = asyncio.create_task(ctx.invoke(self.join))
+                    try:
+                        qobj = await self.queue_source(
+                            ctx, source, analytics=analytics, origin=url
+                        )
+                        # Captured before awaiting the join so a join failure
+                        # still routes the pager through the finally below.
+                        # With a lazy pager this is belt-and-braces (an
+                        # unstarted generator is inert), kept so the invariant
+                        # stays one sentence: every pager that exists is
+                        # closed on every path.
+                        if isinstance(qobj, SpotifyCollectionPager):
+                            pager = qobj
+                        await join_task
+                    except BaseException:
+                        if not join_task.done():
+                            join_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await join_task
+                        # Full cleanup, not just disconnect: cog_before_invoke
+                        # already started a MusicPlayer's loop(), which would zombie
+                        # for up to 300s with clear_connection() never firing. Its
+                        # generation bump also invalidates our pager, which the
+                        # finally below closes on the way out.
+                        await self._abandon_cold_start(ctx, mp)
+                        raise
+                    # Inserting onto a join that produced no usable client hands
+                    # the loop a song it can only raise on.
+                    if not _join_succeeded(ctx):
+                        await self._abandon_cold_start(ctx, mp)
+                        return
+                else:
+                    qobj = await self.queue_source(
+                        ctx, source, analytics=analytics, origin=url
+                    )
+
+                if isinstance(qobj, SpotifyCollectionPager):
+                    pager = qobj
+
+                log.info(f"Voice client: {ctx.voice_client}")
+
+                if front:
+                    # Order matters: put_front LPUSHes the mirror, while
+                    # restore_entries replays already-listed entries in memory
+                    # only, so inserting first double-queues this song. A restore
+                    # that never lands is therefore a reason NOT to insert — and
+                    # the wait is bounded, since the pool sets no socket_timeout.
+                    if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                        await self._abandon_cold_start(ctx, mp)
+                        await ctx.send(
+                            embed=notice_embed(
+                                "Couldn't reach this server's saved queue, so "
+                                "your song wasn't queued — try again in a "
+                                "moment.",
+                                discord.Color.red(),
+                            )
+                        )
+                        return
+
+                if isinstance(qobj, QueueObject):
+                    await self._enqueue_single(ctx, qobj, mp, front=front)
+                elif isinstance(qobj, SpotifyCollectionPager):
+                    drain = await self._begin_collection_enqueue(
+                        ctx, qobj, mp, analytics=analytics, origin=url, front=front
+                    )
+                else:
+                    await self._enqueue_playlist(
+                        ctx,
+                        qobj,
+                        mp,
+                        front=front,
+                        expected_generation=playlist_generation,
+                    )
+
+            # Stack exited: the gate is open and the first song is starting.
+            # The tail still runs inside this command — no background task, no
+            # sixth cleanup() entry, no cross-coroutine lock handoff;
+            # play()'s error handler covers tail failures for free.
+            if drain is not None:
+                await self._drain_collection_tail(ctx, mp, drain)
+        finally:
+            if pager is not None and drain is None:
+                # queue_source or _begin_collection_enqueue bailed before the tail
+                # took ownership: close the generator and cancel the in-flight
+                # page-1 task rather than leaving finalization to asyncgen
+                # hooks (see SpotifyCollectionPager.aclose).
+                with contextlib.suppress(Exception):
+                    await pager.aclose()
 
     async def _resolve_playnow_source(
         self,
@@ -1131,32 +1912,62 @@ class MusicBot(commands.Cog):
         *,
         origin: str,
     ) -> QueueObject:
-        """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
-        their first track — interjecting a whole one would delay the interrupted
-        song's return indefinitely (use -play).
+        """Resolve -playnow input to exactly one QueueObject. Collections (playlists
+        and albums) collapse to their first track — interjecting a whole one would
+        delay the interrupted song's return indefinitely (use -play).
+
+        The Spotify path consumes page 1 of the pager and abandons the generator
+        under aclosing: at most one HTTP call (zero on a warm cache), and no cache
+        write — the pagers cache only on a full drain, so a page-1-only read can
+        never poison the cache with a truncated collection.
 
         `origin` is the raw command argument, passed down by every branch — for a
-        collapsed playlist it is the link, not the title the expansion generated."""
-        playlist_notice = notice_embed(
-            "Playlists can't be interjected — playing the **first track** now. "
-            "Use `-play` for the full playlist.",
-            discord.Color.orange(),
-        )
+        collapsed collection it is the link, not the title the expansion
+        generated."""
         # Ask-time analytics: the message's snowflake time, and depth 0 — an
         # interjection plays immediately. The caller re-mints the depth on the
         # two paths where it ends up queueing instead.
         analytics = Analytics(
             queued_at=ctx.message.created_at.timestamp(), queue_position=0
         )
-        if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
-            titles = await self._require_spotify().playlist(source.id)
+        if isinstance(source, SpotifySource) and source.type in (
+            SpotifyType.PLAYLIST,
+            SpotifyType.ALBUM,
+        ):
+            is_album = source.type is SpotifyType.ALBUM
+            noun = "album" if is_album else "playlist"
+            spotify = self._require_spotify()
+            pager = (
+                spotify.album_stream(source.id)
+                if is_album
+                else spotify.playlist_stream(source.id)
+            )
+            async with contextlib.aclosing(pager) as pages:
+                try:
+                    # The bound _begin_collection_enqueue puts on its own page-1
+                    # fetch: unbounded, a rate-limited identity call runs
+                    # http_call's whole ladder (~150s) while holding -playnow's
+                    # max_concurrency slot and a typing indicator.
+                    async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
+                        page1 = await anext(pages, None)
+                except TimeoutError:
+                    raise ValueError(
+                        f"Spotify took too long loading the {noun} — try again shortly"
+                    ) from None
+            titles = page1.titles if page1 is not None else []
             if not titles:
-                raise ValueError("Playlist has no tracks")
-            await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(
-                titles[:1], analytics=analytics, origin=origin
+                raise ValueError(f"The {noun} has no queueable tracks")
+            await ctx.send(
+                embed=notice_embed(
+                    f"{noun.capitalize()}s can't be interjected — playing the "
+                    f"**first track** now. Use `-play` for the full {noun}.",
+                    discord.Color.orange(),
+                )
+            )
+            yts = spotify_titles_to_ytsearch(
+                titles[:1], ctx.author.id, analytics=analytics, origin=origin
             )[0]
-            # Both playlist branches resolve directly rather than through
+            # Both collection branches resolve directly rather than through
             # queue_source, so each passes its own metadata.
             return await YTDL.yt_source(
                 ctx.author,
@@ -1181,17 +1992,14 @@ class MusicBot(commands.Cog):
                 tracks, source.index, keep_first_only=True
             )
             _apply_playlist_timestamp(tracks, source)
-            if skipped:
-                await ctx.send(
-                    embed=notice_embed(
-                        f"Playlists can't be interjected — playing **#"
-                        f"{skipped + 1}** now. Use `-play` for the full "
-                        f"playlist.",
-                        discord.Color.orange(),
-                    )
+            which = f"**#{skipped + 1}**" if skipped else "the **first track**"
+            await ctx.send(
+                embed=notice_embed(
+                    f"Playlists can't be interjected — playing {which} "
+                    f"now. Use `-play` for the full playlist.",
+                    discord.Color.orange(),
                 )
-            else:
-                await ctx.send(embed=playlist_notice)
+            )
             return tracks[0]
         qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
@@ -1208,9 +2016,9 @@ class MusicBot(commands.Cog):
             "it left off at, and if it was paused it returns paused.\n\n"
             "Takes the same input as `-play`. If nothing is playing there is "
             "nothing to interrupt, so this behaves exactly like `-play`.\n\n"
-            "A playlist can't be interjected — only its **first track** is played, "
-            "since queueing the whole thing would delay the interrupted song "
-            "indefinitely. Use `-play` for the full playlist."
+            "A playlist or album can't be interjected — only its **first track** "
+            "is played, since queueing the whole thing would delay the "
+            "interrupted song indefinitely. Use `-play` for the full collection."
         ),
         extras={
             "category": "Playback",
@@ -1643,9 +2451,33 @@ class MusicBot(commands.Cog):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
                 )
-                msg = await mp.queue_shuffle()
-                await ctx.message.add_reaction("🔀")
-                await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
+                # Shuffle waits for an in-flight collection drain because it needs
+                # the complete collection — run mid-stream it reorders only the
+                # pages that arrived, and the tail then appends in order behind it,
+                # silently half-shuffling.
+                slot = await self._acquire_enqueue_slot(ctx)
+                if slot is None:
+                    return
+                try:
+                    # The wait can end because of a teardown: the drain holding
+                    # this slot abandons and its release wakes us on a guild whose
+                    # player was popped. Shuffling the dead player would rebuild
+                    # the mirror, resurrecting a queue -stop left persisted.
+                    assert ctx.guild is not None
+                    if self.mps.get(ctx.guild.id) is not mp:
+                        await ctx.send(
+                            embed=notice_embed(
+                                "Playback was shut down while shuffle waited "
+                                "— nothing to shuffle.",
+                                discord.Color.orange(),
+                            )
+                        )
+                        return
+                    msg = await mp.queue_shuffle()
+                    await ctx.message.add_reaction("🔀")
+                    await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
+                finally:
+                    slot.lock.release()
         except Exception as e:
             await self._command_error(ctx, e)
 
@@ -1693,7 +2525,7 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
                 # Not ctx.invoke(self.ping): that runs the full ~3s dashboard on
-                # every join/cold-play AND skips prepare(), losing ping's
+                # every join/cold-play and skips prepare(), losing ping's
                 # max_concurrency guard. Cheap one-liner only.
                 send_latency_line(ctx, self.bot.latency),
             )
@@ -1817,7 +2649,34 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            outcome = await mp.queue_remove(needle)
+            # Waits for an in-flight collection drain, as -shuffle does: this
+            # command's headline case is taking a collection back out by its link,
+            # and run mid-stream it removes pages 1..k, reports "Removed 100
+            # songs", and then pages k+1..n re-queue the rest.
+            #
+            # It waits rather than bumping the generation because the counter's
+            # other reader is the playback loop's commit, and -remove spares the
+            # in-flight head.
+            slot = await self._acquire_enqueue_slot(ctx)
+            if slot is None:
+                return
+            try:
+                # The wait can end on a teardown — the drain holding this slot
+                # abandons and its release wakes us on a popped player, whose
+                # mirror rebuild would resurrect the queue -stop left persisted.
+                assert ctx.guild is not None
+                if self.mps.get(ctx.guild.id) is not mp:
+                    await ctx.send(
+                        embed=notice_embed(
+                            "Playback was shut down while remove waited — "
+                            "nothing to remove.",
+                            discord.Color.orange(),
+                        )
+                    )
+                    return
+                outcome = await mp.queue_remove(needle)
+            finally:
+                slot.lock.release()
             positions = outcome.positions
             if not positions:
                 await send_embed(

@@ -227,8 +227,8 @@ graph TD
 | `backfill_history.py` | One-shot CLI (`just db-backfill [--dry-run]`): copies pre-archive `guild:{id}:history` entries into `play_history`, stamping the real guild id from the key (legacy entries parse as `guild_id=0`). Inserts directly rather than through the outbox. Idempotent (dedup index + ON CONFLICT), so it is safe to re-run and safe to interrupt. Must run **before** this build is deployed — `push_history` LTRIMs each list on the guild's next song end. |
 | `youtube.py` | yt-dlp integration. `QueueObject` dataclass. `YTDL(FFmpegOpusAudio)` with frame-counted position tracking. `yt_source`, `yt_stream`, `prefetch_stream`, `yt_playlist` classmethods. Holds the process's one `YtdlpPool` instance. |
 | `ytdlp_pool.py` | `YtdlpPool` — lifecycle for the process pool that runs yt-dlp extraction: lazy creation, prewarm, heal-a-broken-pool-once, bounded shutdown, `PoolClosedError` after close. Knows nothing about yt-dlp (the callable is supplied per call). |
-| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track or playlist), or `SoundcloudSource`. |
-| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `playlist`, `artists`, `albums` methods with per-type Redis cache TTLs. |
+| `sources.py` | Input parsing. `parse_input`/`parse_url` classify a string into `YTSource` (track or playlist), `SpotifySource` (track, playlist or album), or `SoundcloudSource`; an unqueueable Spotify link type (`/artist/`, `/show/`) raises `UnsupportedSpotifyLinkError`, deliberately not a `ValueError`. |
+| `spotify.py` | Spotify Client Credentials API over aiohttp. Double-checked locking for token refresh; token itself is Redis-cached across restarts. `track`, `artists`, `albums` lookups plus the `album_stream`/`playlist_stream` async-generator pagers, with per-type Redis cache TTLs. |
 | `redis_client.py` | Connection-pool lifecycle + `GuildRedisStore` (per-guild Redis ops: queue/state/now-playing/history/config keys, pause epochs, recovery gate + lock, atomic start-song transaction). Every write to `guild:{id}:config` `PERSIST`s it and no path `EXPIRE`s it — that key is a guild's durable settings and is excluded from every shared TTL pipeline. Module-level `cache_get`/`cache_set`, the outbox-stream helpers, `read_guild_configs` (pipelined, chunked — the per-guild fan-out it replaced exhausted the connection pool above `max_connections` guilds and reported the failures as "never chose") and Spotify-token helpers. Every store method catches and logs Redis errors — Redis being down degrades persistence, never playback. |
 | `leaderboard.py` | `-leaderboard`'s tunables (`TOP_N`, `MAX_DAYS`, `CACHE_TTL_SECS`), `LeaderboardFlags`, the Redis result-cache codec (`cache_key`/`to_cache`/`from_cache`, versioned so a shape change cannot decode stale) and the embed renderer (`build_embed`). Pure — takes a `Leaderboard` and returns strings, dicts or an embed. The command stays on the cog, where dispatch, the archive handle and the error-embed policy are. Cannot live in `util.py`: that module is in the yt-dlp worker import graph and this one reads `history_archive`'s row types. |
 | `telemetry.py` | `setup_telemetry()` (tracer + logger + **meter** providers, OTLP gRPC exporters, structlog config, asyncpg/redis/aiohttp auto-instrumentation; no-op when `OTEL_SDK_DISABLED=true`), `get_tracer()`, `get_meter()` (API-level proxy — instruments created before setup are no-ops that upgrade when the provider lands), `shutdown_telemetry()` (force-flush incl. metrics). |
@@ -246,7 +246,7 @@ graph TD
 | `QueueObject` | `youtube.py` | Dataclass: `webpage_url`, `title`, `requester`, `ts` (seek secs), `user_input`, `duration`, `uploader`, `thumbnail`, `persisted` (False only for the crash-recovered current song) |
 | `YTDL` | `youtube.py` | `FFmpegOpusAudio` subclass with full song metadata; counts its own `read()` calls → `elapsed_secs`/`position_secs`; the object passed to `voice_client.play()` |
 | `YTSource` | `sources.py` | Frozen dataclass: `url`, `ytsearch`, `ts`, `process`, `type` (`YTType.TRACK`/`PLAYLIST`), `list_id`, `index` (the playlist's 1-based start position) and `video_id` (the link's `v=`, kept only to tell whether `ts` belongs to the queued head) — an unresolved YouTube item |
-| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`), `id` |
+| `SpotifySource` | `sources.py` | Frozen dataclass: `type` (`SpotifyType.TRACK`/`PLAYLIST`/`ALBUM`), `id` |
 | `SoundcloudSource` | `sources.py` | Frozen dataclass: `url` |
 | `GuildQueue` | `guild_queue.py` | Queue domain class; `QueueItem = Union[QueueObject, YTSource]` is the live-item type |
 | `SongQueueEntry` / `SearchQueueEntry` | `guild_state.py` | At-rest queue entries (`"qobj"` / `"ytsource"` wire discriminator). `SongQueueEntry` also carries the `-playnow` fields `interjected` / `is_resume` / `start_paused`, the play's start `played_at`, and the `np_message_id` / `np_channel_id` / `np_dedicated` pointer a resume tail disposes its fragment's card by; both carry the ask-time analytics `queued_at` / `queue_position` (flat on the wire; grouped as `Analytics` in memory), the parse-time `query_source`, and `user_input` — what the user typed, which `-remove` matches on. For an unresolved Spotify-playlist track that field is the **only** surviving record of the collection link: its `ytsearch` is a title the expansion generated, and the YouTube URL it resolves to names neither |
@@ -265,7 +265,7 @@ Every command also accepts a `--help` flag anywhere in its message: `MusicBotApp
 
 | Command | Aliases | Arguments | Description |
 |---|---|---|---|
-| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/playlist, or SoundCloud URL. Joins voice first if not connected. |
+| `-play` | `p`, `sing` | `url` | Enqueue a YouTube URL / search / **YouTube playlist**, Spotify track/playlist/album, or SoundCloud URL. Joins voice first if not connected. |
 | `-playnow` | `pn` | `url` | Interject a song **immediately**, parking the current one to resume from its exact position afterward. Falls back to `-play` when nothing is live. Playlists interject only their first track. See [-playnow Interjection](#-playnow-interjection). |
 | `-skip` | `sk` | — | Stop the current song and advance to the next. |
 | `-stop` | `st` | — | Stop playback, disconnect from voice, and clean up the player. |
@@ -305,7 +305,9 @@ Every command that touches playback is gated by `@commands.before_invoke(validat
 | …carrying `&index=N` | `watch?v=…&list=…&index=4` | 1-based start position — `_apply_playlist_index` drops the N−1 tracks ahead of it. N past the end raises `PlaylistIndexError`, whose `user_message` names both the requested index and the real length (rendered by `_command_error`, like the yt-dlp user-facing errors) rather than enqueueing nothing. `-playnow` interjects that track instead of the first. A `t=` on the same link applies to the queued head only when it is the `v=` video (`_apply_playlist_timestamp`), since one offset cannot belong to N tracks |
 | YouTube search string | `never gonna give you up` | `YTSource(ytsearch="ytsearch:...", process=True)` |
 | Spotify track URL | `https://open.spotify.com/track/...` | `SpotifySource(TRACK)` → `Spotify.track()` → YouTube search |
-| Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist()` → N `YTSource` search items |
+| Spotify playlist URL | `https://open.spotify.com/playlist/...` | `SpotifySource(PLAYLIST)` → `Spotify.playlist_stream()` (sequential `next`-cursor pages) → N `YTSource` search items |
+| Spotify album URL | `https://open.spotify.com/album/...` | `SpotifySource(ALBUM)` → `Spotify.album_stream()` (page 1 rides `GET /v1/albums/{id}`, later pages follow its embedded `next` cursor) → N `YTSource` search items. A leading locale segment (`/intl-de/…`, what Spotify's own share sheet emits for non-English clients) is dropped before the type is read |
+| Other Spotify link | `/artist/`, `/show/`, … | `UnsupportedSpotifyLinkError` — never a `ValueError`, which would fall back to a YouTube search for the raw URL |
 | SoundCloud URL | `https://soundcloud.com/...` | `SoundcloudSource` → yt-dlp directly |
 
 ---
@@ -433,10 +435,11 @@ sequenceDiagram
     Bot->>Sources: parse_input(url)
     Sources-->>Bot: YTSource | SpotifySource | SoundcloudSource
 
-    alt Spotify playlist
-        Bot->>SP: spotify.playlist(id) → List[str] titles
-        Bot->>Sources: spotify_playlist_to_ytsearch(titles) → List[YTSource]
+    alt Spotify album / playlist
+        Bot->>SP: album_stream(id) / playlist_stream(id) → TrackPage (page 1)
+        Bot->>Sources: spotify_titles_to_ytsearch(page1.titles) → List[YTSource]
         Bot->>MP: queue_put(items, prefetch=False)
+        Note over Bot,MP: remaining pages drain inline after the gate opens,<br/>each a compare-and-put against the queue generation
     else YouTube playlist
         Bot->>YTDL: yt_playlist(playlist_url, author) → List[QueueObject]
         Bot->>MP: queue_put(tracks, prefetch=False)
@@ -522,7 +525,7 @@ flowchart TD
 
 Spotify sources are converted to YouTube searches before any audio work:
 - **Track**: `Spotify.track(id)` → `"Title Artist"` → `YTSource(ytsearch=..., process=True)`
-- **Playlist**: `Spotify.playlist(id)` → `List[str]` titles → `spotify_playlist_to_ytsearch()` wraps each as a `YTSource`
+- **Playlist / album**: `Spotify.playlist_stream(id)` / `Spotify.album_stream(id)` yield `TrackPage`s of titles → `spotify_titles_to_ytsearch()` wraps each as a `YTSource`. Page 1 is enqueued before the rest is fetched, so playback starts without waiting for a 700-track collection to page in
 
 ---
 
@@ -819,7 +822,8 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
-| `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
+| `spotify:playlist_tracks:{id}` | String | orjson object (`_collection_to_cache`: id/total/name/artists/thumbnail/release_date/titles), written only on a full drain | 1 h (user-editable) |
+| `spotify:album_tracks:{id}` | String | same object shape, written only on a full drain whose title count equals the album's `total` | 24 h (albums are immutable) |
 | `spotify:artist:{ids}` / `spotify:album:{ids}` | String | JSON (ids comma-joined, sorted) | 24 h |
 | Spotify token | String | Access token cached with its remaining TTL | token expiry |
 
@@ -921,6 +925,12 @@ Spotify URLs are resolved to YouTube search strings before any audio work begins
 | `track(id)` | `spotify:track:{id}` | 24 h | `"Title Artist"` search string |
 | `artists(ids)` | `spotify:artist:{sorted,ids}` | 24 h | Artist JSON |
 | `albums(ids)` | `spotify:album:{sorted,ids}` | 24 h | Album JSON |
+
+The collection pagers (`playlist_stream`, `album_stream`) sit outside `_cached_call`:
+they read `spotify:{playlist,album}_tracks:{id}` up front and write it only when the
+consumer iterates past the final page. A partially-consumed generator — `-playnow`
+taking page 1 only, a preemption, a mid-stream error — takes `GeneratorExit` at a
+yield and never reaches the write, so a truncated collection can never be cached.
 
 ---
 
@@ -1415,6 +1425,120 @@ interleaving silently eats the new head.
 
 Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
 and `-help` both say 3 (tracked by an in-code FIXME).
+
+**The generation counter.** A Spotify collection enqueues over many pages spread across
+seconds, so a `-clear` or a teardown can land *between* two pages. Without a guard the
+drain's tail refills the queue the user just emptied. `GuildQueue.generation` is a plain
+counter incremented by `clear()` and by `bump_generation()`; `cleanup()` calls the latter
+at the single teardown choke point, so `-stop`, a kick, the alone-timer, the gate timeout
+and `play`'s error path are all covered by one bump. `bump_generation()` is **synchronous
+and lock-free** — it runs ahead of the voice disconnect, and taking the bulk-mutation
+mutex there let a stalled Redis (the pool sets no `socket_timeout`) block `-stop` from
+ever silencing the bot. Every streamed page — and the YouTube-playlist batch, which
+resolves for the same 1-4s — enqueues with
+`put(..., expected_generation=snapshot)`, which returns `None` and touches **no leg** if
+the counter moved. (`put` otherwise returns the enqueued items — an empty page returns
+`[]`, which is success, not refusal.)
+
+The same counter answers the *dequeue* side: `try_commit_dequeue(generation)` refuses to
+settle a claim taken before a bump. Only `clear()` resets the cursor as it bumps, so a
+`bump_generation()` refusal leaves the claim standing — sound only because its single
+caller has already popped the player and is cancelling the loop. A second call site would
+have to settle the claim in the loop's refused-commit branch first; a test pins the
+one-caller rule. It is also why `remove()` does **not** bump: `-remove` deliberately
+spares the in-flight head, so it waits on the enqueue slot (as `-shuffle` does) to stop a
+collection drain, rather than invalidating a dequeue it never meant to touch.
+
+Two placement rules are load-bearing:
+
+1. **The check runs inside the same mutex hold as the mutation.** Read the property and
+   call `put()` without `expected_generation` and an entire `clear()` — which runs wholly
+   under that mutex — fits between the check and the write.
+2. **The snapshot is taken only after confirming the player is still the guild's live
+   one.** `cleanup()` pops the player from `mps` *before* calling `bump_generation()`, so
+   a snapshot taken after the pop reads the post-teardown value and every page then
+   matches and commits onto a dead guild's persisted mirror.
+
+**Drain bounds.** `_HTTP_TIMEOUT` bounds one request, not a stream, so every drain leg —
+the page-1 fetch, the streaming tail, and the buffered front drain — runs under its own
+`_COLLECTION_DRAIN_TIMEOUT_SECS` budget. Per-leg budgets keep the whole enqueue-lock hold
+well under the 300s playback gate (the buffered front path holds the gate, and reaching
+the gate's own timeout tears the player down and refuses the finished `put_front`, losing
+the collection). They do **not** keep the hold under `_ENQUEUE_WAIT_SECS`: two legs plus
+notification sends can outlive 60s, so that constant is how long a *waiter* is willing to
+stand in line before being declined, not a promise that the line moves. The tail's
+deadline covers page **fetches** only — each `queue_put` runs outside it, because a put
+is a two-leg mutation whose Redis leg suspends inside the queue mutex, and a deadline
+expiring there would split memory from the mirror (the buffered path has always kept its
+`put_front` outside the timeout for the same reason). Timing out keeps what already
+arrived and reports a partial enqueue.
+
+<a id="queue-entry-field-plumbing"></a>
+#### Queue-entry field plumbing
+
+A field on `QueueObject` has to be carried by hand at every hop, and each hop drops it
+silently. The full add-a-field recipe lives in CLAUDE.md; what belongs here is the set of
+sites, because comments in `src/` cite it and CLAUDE.md's recipe is a bold line rather
+than a heading, so it has no anchor to link:
+
+| Hop | Where |
+|---|---|
+| queue entry ⇄ wire | `QueueEntryField`, `SongQueueEntry`, `to_redis`, `parse_queue_entry` |
+| entry → live item | `GuildQueue._rehydrate` |
+| item → playing song | `YTDL.__init__` keyword, its instance assignment, and the construction in `YTDL.yt_stream` |
+| playing song → item, twice | `MusicPlayer._neutralize_prefetch`'s rebuild and `MusicPlayer.interject`'s resume tail |
+| durable property of the play | `StateField` + `GuildStateData` + `_now_playing_state_mapping` + `_TRANSIENT_SONG_FIELDS` |
+
+Two fields have already been lost between the last two rows (`user_input`, `persisted`),
+and they fail differently: a `YTDL` missing the attribute outright **raises** and strands
+the prefetch's claim, while one that merely defaults reappears wrong after a restart. Both
+are invisible to pyright unless `_prefetch_task` stays parameterized as
+`asyncio.Task[Optional[YTDL]]`, and invisible to the tests while their song fixtures are
+bare `MagicMock()` rather than `spec=YTDL`.
+`tests/test_youtube.py::TestYtStreamCarriesTheQueueObjectsFields` is the reflective guard
+for the item → playing-song hop: it derives the carried set from the dataclass, so a new
+field is covered without editing it.
+
+### Spotify collection paging
+
+Albums and playlists resolve through async-generator pagers (`album_stream`,
+`playlist_stream`) yielding `TrackPage`s of YouTube search titles, so `-play` can enqueue
+page 1 and start playback while the rest arrives. **One exception:** `-play` on a
+disconnected bot whose previous queue is still persisted (a `-stop` leaves it in Redis)
+takes the *buffered* front path — the whole collection is drained first and lands ahead
+of the restored backlog in a single `put_front`, because successive per-page front
+inserts would invert page order. On that path playback starts only after the drain
+(bounded by `_COLLECTION_DRAIN_TIMEOUT_SECS`; a timeout keeps what arrived).
+
+**Both pagers walk Spotify's own `next` cursor sequentially.** An album's page 1 rides
+the single `GET /v1/albums/{id}` that also returns its identity (name, artists, cover
+art, total); later pages follow the embedded paging object's cursor verbatim, exactly as
+playlists follow theirs. Sequential paging was chosen over an offset fanout even though
+album immutability would make one safe: the tail drains after playback has started, so
+the latency a fanout saves is invisible, while a cursor cannot skip or duplicate a run
+of tracks the way offset arithmetic against a lying `total`/`limit` could. Both walks
+are bounded by a page cap (`ceil(total/page_size)` + slack) so a cursor that stops
+advancing abandons the drain finite and uncached instead of spinning duplicates into
+the queue. A drained album is cached only when its title count equals the album's own
+`total` — albums never skip items, so short means truncated, and a truncation cached
+for 24h would be served as the whole album with no error anywhere. (Playlists carry no
+such equality: episode/null items are legitimately skipped, so their `total` is an
+upper bound.)
+
+**Cache discipline.** `spotify:{album,playlist}_tracks:{id}` is written only when the
+consumer iterates *past* the final page — i.e. the generator resumes after its last yield.
+A partially-consumed generator (`-playnow` taking page 1 only, a preemption, a mid-stream
+error, an `aclose()`) takes `GeneratorExit` at a yield and never reaches the write, so a
+truncated collection can never poison the entry. Nothing awaits on that path: an await
+during finalization is illegal, and the resulting unraisable warning is a hard test
+failure under `filterwarnings=["error"]`. An empty result is never cached either — the
+edit that follows "no queueable tracks" is usually the user adding the songs.
+
+**Rate limiting.** Un-truncating playlists turned one request per command into
+`ceil(total/100)`, and the enqueue lock is per guild, so a process-wide semaphore is the
+only bound on app-wide request rate against a single client-credentials app. A 429 is
+retried on its `Retry-After` (capped) and then raised as `SpotifyRateLimitError`, which
+the drain reports as "wait" rather than "re-run" — a re-run refetches every page.
 
 ### Now Playing host model
 

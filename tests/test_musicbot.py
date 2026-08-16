@@ -8,7 +8,7 @@ import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
-from collections.abc import Coroutine, Generator, Iterator
+from collections.abc import AsyncGenerator, Coroutine, Generator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -18,11 +18,17 @@ from redis.asyncio import Redis
 
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, remove_matcher
+from src.guild_queue import (
+    GuildQueue,
+    QueueItem,
+    RemoveMode,
+    RemoveOutcome,
+    remove_matcher,
+)
 import src.musicbot as musicbot_module
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
-    DEPTH_RESTORE_WAIT_SECS,
+    RESTORE_WAIT_SECS,
     _echo,
     _removed_label,
     HISTORY_MAX_LIMIT,
@@ -30,18 +36,37 @@ from src.musicbot import (
     HistoryFlags,
     MusicBot,
     PlaylistIndexError,
-    ResolvedSpotifyPlaylist,
     ResolvedYoutubePlaylist,
+    SpotifyCollectionPager,
     SpotifyDisabledError,
     _ECHO_ROWS,
+    _ENQUEUE_MAX_WAITERS,
+    _MINT_CHUNK,
+    _ENQUEUE_WAIT_SECS,
+    _GuildEnqueueLock,
+    _CollectionDrain,
     _check_voice_permissions,
+    _is_collection,
     _join_succeeded,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
-from src.musicplayer import InterjectOutcome
-from src.spotify import SpotifyAuthError
 from src.util import EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
+from src.sources import (
+    SoundcloudSource,
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+)
+from src.musicplayer import InterjectOutcome, _PLAYBACK_GATE_TIMEOUT
+from src.spotify import (
+    SpotifyAuthError,
+    SpotifyCollection,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+    TrackPage,
+)
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
@@ -54,6 +79,77 @@ from tests.helpers import (
 # command paths mint this at dispatch from ctx.message.created_at + enqueue_depth.
 _ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=0)
 _ORIGIN = "https://yt.com/v=origin"
+
+
+# ── Streamed-collection test helpers ──────────────────────────────────────────
+
+
+def _scollection(
+    kind: SpotifyType,
+    *,
+    total: int,
+    name: Optional[str] = "200% Electronica",
+    thumbnail: Optional[str] = "https://i.scdn.co/image/640",
+) -> SpotifyCollection:
+    """A SpotifyCollection fixture. Playlist collections carry no identity
+    fields, matching what /v1/playlists/{id}/tracks can actually yield."""
+    if kind is SpotifyType.PLAYLIST:
+        return SpotifyCollection(kind=kind, id="cid", total=total)
+    return SpotifyCollection(
+        kind=kind,
+        id="cid",
+        total=total,
+        name=name,
+        artists=["ESPRIT 空想", "George Clanton"],
+        thumbnail=thumbnail,
+        release_date="2017-11-17",
+    )
+
+
+def _spage(
+    collection: SpotifyCollection, titles: list[str], *, is_last: bool
+) -> TrackPage:
+    return TrackPage(collection=collection, titles=titles, is_last=is_last)
+
+
+async def _sgen(
+    pages: list[TrackPage],
+    *,
+    fail_at: Optional[int] = None,
+    yielded: Optional[list[int]] = None,
+) -> AsyncGenerator[TrackPage]:
+    """An async generator of TrackPages. fail_at=i raises before yielding
+    pages[i] (a mid-drain page-fetch failure); `yielded` records indices as
+    they go out, so a test can prove the drain stopped consuming."""
+    for i, page in enumerate(pages):
+        if fail_at is not None and i == fail_at:
+            raise SpotifyAuthError(401, "page fetch failed mid-drain")
+        if yielded is not None:
+            yielded.append(i)
+        yield page
+
+
+def _collection_mp(
+    bot: MusicBot,
+    ctx: MagicMock,
+    *,
+    generation: int = 0,
+    backlog: bool = False,
+) -> MagicMock:
+    """MusicPlayer stand-in for the streamed-enqueue paths.
+
+    Registered in bot.mps under ctx.guild.id because _begin_collection_enqueue
+    checks that the player it was handed is still the guild's live one — an
+    unregistered mock is indistinguishable from a guild torn down during the
+    page-1 fetch, and would take the abandon path instead of the one under
+    test."""
+    mp = MagicMock()
+    mp.queue_put = AsyncMock(return_value=True)
+    mp.queue_put_front = AsyncMock(return_value=True)
+    mp.queue.generation = generation
+    mp.queue.has_restored_backlog = AsyncMock(return_value=backlog)
+    bot.mps[ctx.guild.id] = mp
+    return mp
 
 
 class TestCommandErrorRendering:
@@ -79,6 +175,95 @@ class TestCommandErrorRendering:
         detail = call.args[2]
         assert detail == "[youtube] v9: Video unavailable"
         assert "ExtractionError" not in detail  # not the raw type: message form
+
+    async def test_spotify_request_error_renders_its_user_message(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Every page of every collection is a door to this error; the raw args
+        carry the endpoint and the offset, which are not the user's business."""
+        err = SpotifyRequestError(
+            503, "https://api.spotify.com/v1/albums/6WgS/tracks", {"offset": 50}
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert "api.spotify.com" not in detail
+        assert "offset" not in detail
+
+    async def test_spotify_auth_error_hides_the_endpoint_and_the_class_name(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The one Spotify error that carried a URL into the channel.
+
+        `detail` is the endpoint, and on the collection paths that is the `next`
+        cursor — so the generic arm rendered
+        `**SpotifyAuthError:** … endpoint: https://api.spotify.com/…?offset=50`,
+        publishing an internal API URL with its offset. It is also a bot-side
+        misconfiguration, so the copy has to point at the operator rather than
+        leave the user retrying."""
+        err = SpotifyAuthError(
+            401, "endpoint: https://api.spotify.com/v1/albums/6WgS/tracks?offset=50"
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert "SpotifyAuthError" not in detail
+        assert "api.spotify.com" not in detail
+        assert "offset" not in detail
+
+    async def test_spotify_disabled_error_renders_without_class_name(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Its own docstring says "The message is user-facing — _command_error
+        renders it", and it was rendering as
+        `**SpotifyDisabledError:** Spotify links aren't available…` — the same
+        defect the sibling below was given a user_message to fix."""
+        err = SpotifyDisabledError(SpotifyStatus.DISABLED)
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == str(err)
+        assert "SpotifyDisabledError" not in detail
+
+    async def test_unsupported_spotify_link_renders_without_class_name(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The class exists to give the user "an error they can act on";
+        falling to the generic arm would prefix it with
+        `**UnsupportedSpotifyLinkError:**`, which is noise on the way there."""
+        from src.sources import UnsupportedSpotifyLinkError
+
+        err = UnsupportedSpotifyLinkError(
+            "Spotify 'artist' links aren't supported — try a track, "
+            "playlist or album link"
+        )
+        with (
+            patch("src.musicbot.send_embed", new=AsyncMock()) as send_embed,
+            patch("src.musicbot.record_span_error"),
+        ):
+            await music_bot._command_error(mock_ctx, err)
+
+        assert (call := send_embed.await_args) is not None
+        detail = call.args[2]
+        assert detail == err.user_message
+        assert "UnsupportedSpotifyLinkError" not in detail
 
     async def test_unexpected_extraction_error_is_generic(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -189,16 +374,77 @@ class TestCheckVoicePermissions:
 
 
 class TestQueueSource:
-    async def test_spotify_playlist_returns_list(
+    async def test_spotify_playlist_returns_pager(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
+        col = _scollection(SpotifyType.PLAYLIST, total=2)
+        gen = _sgen([_spage(col, ["Song A", "Song B"], is_last=True)])
+        music_bot.spotify.playlist_stream = MagicMock(return_value=gen)
+
         result = await music_bot.queue_source(
             mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
         )
-        assert result == ResolvedSpotifyPlaylist(titles=["Song A", "Song B"])
+
+        assert isinstance(result, SpotifyCollectionPager)
+        assert result.kind is SpotifyType.PLAYLIST
+        music_bot.spotify.playlist_stream.assert_called_once_with("pid123")
+        # Lazy: page 1 is fetched only when the enqueue path starts the pager.
+        page1 = await anext(result.pages)
+        assert page1.titles == ["Song A", "Song B"]
+        await result.aclose()
+
+    async def test_spotify_album_returns_pager(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.ALBUM, total=1)
+        gen = _sgen([_spage(col, ["Track 0 Artist"], is_last=True)])
+        music_bot.spotify.album_stream = MagicMock(return_value=gen)
+
+        result = await music_bot.queue_source(
+            mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+        )
+
+        assert isinstance(result, SpotifyCollectionPager)
+        assert result.kind is SpotifyType.ALBUM
+        music_bot.spotify.album_stream.assert_called_once_with("aid123")
+        # album_stream chosen, not playlist_stream — the two endpoints and
+        # unwraps differ; routing an album through playlist_stream
+        # would KeyError on the missing ["track"] wrapper.
+        await result.aclose()
+
+    async def test_pager_is_lazy_leaving_queue_source(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """S2 inverted the old H7 guard: queue_source must return WITHOUT
+        starting the pager. No task exists to cancel or retrieve on abandon
+        paths, and every fetch — page 1 included — happens inside
+        _begin_collection_enqueue's bounded anext. An eager fetch sneaking
+        back in would resurrect the hand-managed lifecycle S2 removed."""
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None
+        started = asyncio.Event()
+        col = _scollection(SpotifyType.ALBUM, total=1)
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            started.set()  # first line of the generator body = the HTTP call site
+            yield _spage(col, ["T"], is_last=True)
+
+        music_bot.spotify.album_stream = MagicMock(return_value=gen())
+
+        result = await music_bot.queue_source(
+            mock_ctx, source, analytics=_ANALYTICS, origin=_ORIGIN
+        )
+        assert isinstance(result, SpotifyCollectionPager)
+        await asyncio.sleep(0)  # a tick an eager task would have used to run
+        assert not started.is_set()
+        # The fetch happens exactly when the enqueue path asks for it.
+        page1 = await anext(result.pages)
+        assert started.is_set() and page1.titles == ["T"]
+        await result.aclose()
 
     async def test_spotify_track_calls_yt_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -532,16 +778,42 @@ class TestQuerySourceClassification:
     async def test_playnow_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        # _resolve_playnow_source resolves both playlist shapes directly, so a
+        # _resolve_playnow_source resolves both collection shapes directly, so a
         # token passed only from queue_source would leave these two unclassified.
         source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
         assert music_bot.spotify is not None
-        music_bot.spotify.playlist = AsyncMock(return_value=["Song A", "Song B"])
+        col = _scollection(SpotifyType.PLAYLIST, total=2)
+        music_bot.spotify.playlist_stream = MagicMock(
+            return_value=_sgen([_spage(col, ["Song A", "Song B"], is_last=True)])
+        )
         fake_qobj = QueueObject("https://yt.com/v=1", "Song A", mock_ctx.author)
         spy = AsyncMock(return_value=fake_qobj)
         with patch("src.musicbot.YTDL.yt_source", new=spy):
             await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
         assert self._passed_query_source(spy) == "spotify.com"
+
+    async def test_playnow_spotify_page1_is_bounded(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-playnow's page-1 fetch runs under the same deadline
+        _begin_collection_enqueue puts on its own: unbounded, a rate-limited
+        identity call runs http_call's whole ladder (~150s) while holding
+        max_concurrency(1, guild) and a typing indicator."""
+        source = SpotifySource(type=SpotifyType.ALBUM, id="aid123")
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.ALBUM, total=1)
+
+        async def _hung() -> AsyncGenerator[TrackPage]:
+            await asyncio.sleep(30)
+            yield _spage(col, ["never A"], is_last=True)
+
+        music_bot.spotify.album_stream = MagicMock(return_value=_hung())
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", -1.0):
+            with pytest.raises(ValueError, match="took too long"):
+                await music_bot._resolve_playnow_source(
+                    mock_ctx, source, origin=_ORIGIN
+                )
 
     async def test_playnow_youtube_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -734,7 +1006,10 @@ class TestSpotifyDisabled:
             analytics=_ANALYTICS,
             user_input=_ORIGIN,
         )
-        assert result == ResolvedYoutubePlaylist(tracks=fake_qobjs)
+        assert result == ResolvedYoutubePlaylist(
+            tracks=fake_qobjs,
+            playlist_url="https://www.youtube.com/playlist?list=PLtest123",
+        )
 
     async def test_youtube_playlist_raises_if_list_id_missing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -792,11 +1067,7 @@ class TestEnqueuePlaylist:
     async def test_yt_sends_embed_with_song_count_and_playlist_url(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = YTSource(
-            url="https://www.youtube.com/playlist?list=PLtest",
-            type=YTType.PLAYLIST,
-            list_id="PLtest",
-        )
+        url = "https://www.youtube.com/playlist?list=PLtest"
         qobjs = [
             QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author),
             QueueObject("https://yt.com/watch?v=2", "Track 2", mock_ctx.author),
@@ -804,17 +1075,12 @@ class TestEnqueuePlaylist:
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
-            mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks=qobjs),
-            mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
+            mock_ctx, ResolvedYoutubePlaylist(tracks=qobjs, playlist_url=url), mp
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "2 songs" in embed.title
-        assert source.url in embed.description
+        assert url in embed.description
         assert "Track 1" in embed.description
 
     async def test_yt_embed_states_the_skipped_songs(
@@ -822,22 +1088,14 @@ class TestEnqueuePlaylist:
     ) -> None:
         """A shorter queue than the playlist needs an explanation, and only the
         user's own `index=` provides one."""
-        source = YTSource(
-            url="https://www.youtube.com/watch?v=x&list=PLtest&index=4",
-            type=YTType.PLAYLIST,
-            list_id="PLtest",
-            index=4,
-        )
+        url = "https://www.youtube.com/watch?v=x&list=PLtest&index=4"
         qobjs = [QueueObject("https://yt.com/watch?v=4", "Track 4", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
             mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks=qobjs, skipped=3),
+            ResolvedYoutubePlaylist(tracks=qobjs, playlist_url=url, skipped=3),
             mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -847,44 +1105,101 @@ class TestEnqueuePlaylist:
     async def test_yt_embed_omits_the_skip_line_when_nothing_was_skipped(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = YTSource(
-            url="https://www.youtube.com/playlist?list=PLtest",
-            type=YTType.PLAYLIST,
-            list_id="PLtest",
-        )
         qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
             mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks=qobjs),
+            ResolvedYoutubePlaylist(
+                tracks=qobjs,
+                playlist_url="https://www.youtube.com/playlist?list=PLtest",
+            ),
             mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
         assert "Starting at" not in embed.description
 
+    async def test_a_stale_generation_queues_nothing_and_says_so(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The YouTube-playlist enqueue carries the compare-and-put every Spotify
+        page does: it takes the same per-guild lock, resolves for the same 1-4s,
+        and lands a thousand tracks in one batch, so a -clear two seconds into the
+        resolve must not watch the queue refill.
+
+        The notification is asserted absent too — it may only describe a put that
+        landed."""
+        qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
+        mp = self._make_enqueue_mp(mock_ctx)
+        mp.queue_put = AsyncMock(return_value=False)  # what a refused put returns
+
+        await music_bot._enqueue_playlist(
+            mock_ctx,
+            ResolvedYoutubePlaylist(
+                tracks=qobjs,
+                playlist_url="https://www.youtube.com/playlist?list=PLtest",
+            ),
+            mp,
+            expected_generation=3,
+        )
+
+        assert mp.queue_put.await_args is not None
+        assert mp.queue_put.await_args.kwargs["expected_generation"] == 3
+        mock_ctx.message.add_reaction.assert_not_awaited()
+        sent = mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+        descriptions = [
+            c.kwargs["embed"].description
+            for c in sent
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("Queueing stopped" in (d or "") for d in descriptions), descriptions
+        assert not any("Queued playlist" in (d or "") for d in descriptions)
+
+    async def test_play_snapshots_the_generation_before_the_resolve(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The snapshot is taken before yt_playlist, because the resolve is the
+        window: taken after, a -clear inside those seconds moves the counter
+        before the value is read and the refusal never fires."""
+        mock_ctx.voice_client = _playing_vc()
+        mp = _mock_mp()
+        mp.queue.generation = 11
+        music_bot.get_mp = MagicMock(return_value=mp)
+        playlist = ResolvedYoutubePlaylist(
+            tracks=[QueueObject("https://yt.com/v=1", "T", mock_ctx.author)],
+            playlist_url="https://www.youtube.com/playlist?list=PLtest",
+        )
+
+        async def _resolve(*_a: Any, **_k: Any) -> ResolvedYoutubePlaylist:
+            mp.queue.generation = 12  # a -clear landing during the resolve
+            return playlist
+
+        music_bot.queue_source = AsyncMock(side_effect=_resolve)
+        spy = AsyncMock()
+        music_bot._enqueue_playlist = spy
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="https://www.youtube.com/playlist?list=PLtest"
+            )
+
+        assert spy.await_args is not None
+        assert spy.await_args.kwargs["expected_generation"] == 11
+
     async def test_yt_singular_song_count_in_title(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = YTSource(
-            url="https://www.youtube.com/playlist?list=PLtest",
-            type=YTType.PLAYLIST,
-            list_id="PLtest",
-        )
         qobjs = [QueueObject("https://yt.com/watch?v=1", "Only Track", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
             mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks=qobjs),
+            ResolvedYoutubePlaylist(
+                tracks=qobjs,
+                playlist_url="https://www.youtube.com/playlist?list=PLtest",
+            ),
             mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
         )
 
         embed = mock_ctx.send.call_args[1]["embed"]
@@ -894,63 +1209,16 @@ class TestEnqueuePlaylist:
     async def test_yt_calls_queue_put_with_prefetch_false(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        source = YTSource(
-            url="https://www.youtube.com/playlist?list=PLtest",
-            type=YTType.PLAYLIST,
-            list_id="PLtest",
-        )
         qobjs = [QueueObject("https://yt.com/watch?v=1", "Track 1", mock_ctx.author)]
         mp = self._make_enqueue_mp(mock_ctx)
 
         await music_bot._enqueue_playlist(
             mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks=qobjs),
+            ResolvedYoutubePlaylist(
+                tracks=qobjs,
+                playlist_url="https://www.youtube.com/playlist?list=PLtest",
+            ),
             mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-        )
-
-        mp.queue_put.assert_awaited_once()
-        _, call_kwargs = mp.queue_put.call_args
-        assert call_kwargs.get("prefetch") is False
-
-    # ── Spotify playlist path ─────────────────────────────────────────────────
-
-    async def test_spotify_sends_queued_playlist_embed(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
-        titles = ["Song A", "Song B", "Song C"]
-        mp = self._make_enqueue_mp(mock_ctx)
-
-        await music_bot._enqueue_playlist(
-            mock_ctx,
-            source,
-            ResolvedSpotifyPlaylist(titles=titles),
-            mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
-        )
-
-        embed = mock_ctx.send.call_args[1]["embed"]
-        assert "Queued playlist" in embed.title
-        assert "Song A" in embed.description
-
-    async def test_spotify_calls_queue_put_with_prefetch_false(
-        self, music_bot: MusicBot, mock_ctx: MagicMock
-    ) -> None:
-        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pid123")
-        titles = ["Song A", "Song B"]
-        mp = self._make_enqueue_mp(mock_ctx)
-
-        await music_bot._enqueue_playlist(
-            mock_ctx,
-            source,
-            ResolvedSpotifyPlaylist(titles=titles),
-            mp,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
         )
 
         mp.queue_put.assert_awaited_once()
@@ -1076,6 +1344,10 @@ class TestCleanup:
         mp._pause_debounce_task = None
         mp.retire_np_host_on_stop = AsyncMock()
         mp.update_activity = AsyncMock()
+        # cleanup() calls this on every teardown (the stream-preemption bump).
+        # MagicMock, not AsyncMock: it is synchronous so it cannot suspend on the
+        # mutex ahead of the disconnect.
+        mp.queue.bump_generation = MagicMock()
         # None = nothing was playing, the shape most of these tests mean. A bare
         # MagicMock attribute would read truthy and put a non-awaitable into
         # cleanup's gather; tests about the teardown itself override it.
@@ -1356,6 +1628,88 @@ class TestCleanup:
         mock_guild.voice_client = None
         await music_bot.cleanup(mock_guild)  # must not raise
 
+    async def test_cleanup_bumps_queue_generation(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """cleanup() is the single teardown choke point — -stop, a kick, the
+        alone-disconnect timer, the gate timeout, and play's error path all
+        funnel through it. The generation bump must land here (not in the
+        stop/clear commands alone) so an in-flight collection drain is refused
+        after ANY teardown; without it the drain keeps RPUSHing the Redis
+        mirror of a guild being torn down."""
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        mock_guild.voice_client = None
+        await music_bot.cleanup(mock_guild)
+        mp.queue.bump_generation.assert_called_once()
+
+    async def test_cleanup_bumps_generation_before_cancelling_tasks(
+        self, music_bot: MusicBot, mock_guild: MagicMock
+    ) -> None:
+        """Bumping before the cancellations is what stops a page landing after
+        teardown: bumped after, a drain page parked on the queue mutex commits
+        to the mirror of a guild mid-teardown."""
+        events: list[str] = []
+
+        async def parked() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+
+        task = asyncio.create_task(parked())
+        await asyncio.sleep(0)  # park it
+        mp = self._make_minimal_mp(music_bot, mock_guild, _prefetch_task=task)
+        mp.queue.bump_generation = MagicMock(side_effect=lambda: events.append("bump"))
+        mock_guild.voice_client = None
+
+        await music_bot.cleanup(mock_guild)
+
+        assert events == ["bump", "cancelled"]
+
+    async def test_a_stalled_redis_cannot_stop_the_disconnect(
+        self, music_bot: MusicBot, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The generation bump runs before the disconnect, so it must not block.
+
+        Every mirror-touching queue method holds the bulk-mutation mutex across its
+        Redis round trip and the pool sets no socket_timeout, so a server that
+        accepts and then stalls holds it indefinitely. A bump that waits on it
+        parks -stop, a kick and the alone-timer before any of them silence the bot.
+        Uses a real GuildQueue, since the lock is the subject."""
+        mp = self._make_minimal_mp(music_bot, mock_guild)
+        store = MagicMock()
+        real_queue = GuildQueue(mock_guild, store)
+        mp.queue = real_queue
+
+        stuck = asyncio.Event()  # never set: a server that accepts, then stalls
+
+        async def _never_answers(_entries: Any) -> None:
+            await stuck.wait()
+
+        store.push_queue_batch = AsyncMock(side_effect=_never_answers)
+        drain = asyncio.create_task(
+            real_queue.put(
+                [QueueObject("https://yt.com/v=1", "T", mock_author)], batch=True
+            )
+        )
+        await asyncio.sleep(0)
+        assert real_queue._mutex.locked(), "the drain must be holding the mutex"
+
+        vc = MagicMock()
+        vc.disconnect = AsyncMock()
+        mock_guild.voice_client = vc
+
+        async with asyncio.timeout(2):
+            await music_bot.cleanup(mock_guild)
+
+        vc.disconnect.assert_awaited_once()
+        assert real_queue.generation == 1  # and the bump still happened
+
+        drain.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await drain
+
     async def test_cancels_player_task_before_disconnect(
         self, music_bot: MusicBot, mock_guild: MagicMock
     ) -> None:
@@ -1382,6 +1736,7 @@ class TestCleanup:
         mp._player = _AwaitableTask()
         mp.store = None
         mp.retire_np_host_on_stop = AsyncMock()
+        mp.queue.bump_generation = MagicMock()
         mp.claim_current_song_for_history = MagicMock(return_value=None)
         music_bot.mps[mock_guild.id] = mp
 
@@ -2971,6 +3326,9 @@ class TestPlayWhilePaused:
                 returns_paused=False,
             )
         )
+        # The collection path resumes instead of interjecting.
+        mp.resume = AsyncMock()
+        mp.rehost_np_after_resume = AsyncMock()
         return mp
 
     async def test_interjects_with_resume_paused_false(
@@ -3106,29 +3464,28 @@ class TestPlayWhilePaused:
         assert mp.current_song is not None
         mock_ctx.send.assert_awaited()  # error embed
 
-    async def test_playlist_collapses_to_first_track(
+    async def test_collection_queues_in_full_and_resumes(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Unlike the disconnected path (whole playlist front-inserted), an
-        interjection collapses to one track so the paused song's return is not
-        delayed indefinitely — and says so."""
-        mock_ctx.voice_client = _paused_vc()
+        """A paused -play <collection> must not interject.
+
+        Interjection resolves to exactly one song, so collapsing here would
+        discard the rest of the playlist and answer with "use -play for the
+        full playlist" — the command the user just ran. It queues in full and
+        playback resumes afterwards instead, so -play still means play.
+        """
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
         mp = self._paused_mp()
         music_bot.get_mp = MagicMock(return_value=mp)
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
             for i in range(3)
         ]
+        order: list[str] = []
+        mp.queue_put.side_effect = lambda *a, **k: order.append("enqueue") or True
+        mp.resume.side_effect = lambda *a, **k: order.append("resume")
         mock_ctx.message.add_reaction = AsyncMock()
-        # Distinct sentinel, not tracks[0]: if the URL ever stops parsing as a
-        # playlist, _resolve_playnow_source falls through to queue_source, and
-        # the identity assertion below catches it. (Stubbing it at all is also
-        # a network guard — an unstubbed one runs a real yt-dlp extraction.)
-        music_bot.queue_source = AsyncMock(
-            return_value=QueueObject(
-                "https://yt.com/v=fell-through", "X", mock_ctx.author
-            )
-        )
         url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
         # parse_input splits the full message to count args — an unset MagicMock
         # content makes every URL fall back to the ytsearch branch.
@@ -3141,15 +3498,110 @@ class TestPlayWhilePaused:
         ):
             await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
-        mp.interject.assert_awaited_once()
-        assert mp.interject.await_args.args[0] is tracks[0]
+        mp.interject.assert_not_awaited()
+        mp.queue_put.assert_awaited_once()
+        assert list(mp.queue_put.await_args.args[0]) == tracks
+        mp.resume.assert_awaited_once_with(vc)
+        # Enqueue strictly BEFORE resume: resuming first would restart the
+        # paused song only for a failed resolve to leave the user with
+        # playback they did not ask to change. Both calls were asserted;
+        # their order was not, so hoisting the resume stayed green.
+        assert order == ["enqueue", "resume"]
         sent = mock_ctx.send.await_args_list + mock_ctx.send.call_args_list
         notices = [
             c.kwargs["embed"].description
             for c in sent
             if c.kwargs.get("embed") is not None
         ]
-        assert any("first track" in (d or "") for d in notices), notices
+        assert not any("first track" in (d or "") for d in notices), notices
+
+    async def test_a_collection_that_fails_after_the_enqueue_still_resumes(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The enqueue commits before the raise, so the resume has to happen anyway.
+
+        The sibling above pins the happy path; this pins the one that stranded a
+        guild. _play_resolved can raise long after the songs are on the queue and
+        the mirror — a Spotify page that 503s mid-drain re-raises after page 1
+        landed, and _enqueue_playlist's gather raises Forbidden after the enqueue
+        when the channel denies Add Reactions. With the resume sitting after the
+        try/finally, that raise skipped it: the guild stayed paused forever with
+        the collection queued behind a song nothing would ever restart, and the
+        only signal was a red embed that reads as "nothing happened".
+        """
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        order: list[str] = []
+        mp.queue_put.side_effect = lambda *a, **k: order.append("enqueue") or True
+        mp.resume.side_effect = lambda *a, **k: order.append("resume")
+        # The enqueue lands, and the reaction that follows it raises — the
+        # permission shape, which needs no outage to reproduce.
+        mock_ctx.message.add_reaction = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+        )
+        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+        mock_ctx.message.content = f"-play {url}"
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        mp.queue_put.assert_awaited_once()  # the songs really did land
+        mp.resume.assert_awaited_once_with(vc)
+        assert order == ["enqueue", "resume"]
+
+    @pytest.mark.parametrize("still_paused", [False, True])
+    async def test_resume_skipped_when_a_resume_already_landed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, still_paused: bool
+    ) -> None:
+        """_resume_after_collection mirrors -resume's guard instead of calling it,
+        so a -resume landing while the collection queues is a no-op here rather
+        than a second resume() plus a spurious NP-host migration.
+
+        Parametrized because a single case flipping both terms constrains only
+        `is_paused()`. `still_paused=True` is the impossible-in-discord.py state
+        (both True) that only a mock can build, which pins `not vc.is_playing()`
+        as the defensive term it is."""
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        def _user_resumed_mid_drain(*a: Any, **k: Any) -> bool:
+            # The -resume lands during the enqueue: by the time
+            # _resume_after_collection re-reads the state, playback is live.
+            vc.is_playing.return_value = True
+            vc.is_paused.return_value = still_paused
+            return True
+
+        mp.queue_put.side_effect = _user_resumed_mid_drain
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        mock_ctx.message.add_reaction = AsyncMock()
+        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp_Pm8_VleD68f9s14-"
+        mock_ctx.message.content = f"-play {url}"
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        mp.queue_put.assert_awaited_once()
+        mp.resume.assert_not_awaited()
+        mp.rehost_np_after_resume.assert_not_awaited()
 
 
 class TestPlayFrontInsertion:
@@ -3300,8 +3752,7 @@ class TestPlayFrontInsertion:
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
-            and mp.wait_for_restore.await_args.kwargs["timeout"]
-            == DEPTH_RESTORE_WAIT_SECS
+            and mp.wait_for_restore.await_args.kwargs["timeout"] == RESTORE_WAIT_SECS
         )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(
@@ -3410,21 +3861,21 @@ class TestPlayFrontInsertion:
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
             for i in range(3)
         ]
-        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
         mp = _mock_mp()
         mock_ctx.message.add_reaction = AsyncMock()
 
         await music_bot._enqueue_playlist(
             mock_ctx,
-            source,
-            ResolvedYoutubePlaylist(tracks),
+            ResolvedYoutubePlaylist(
+                tracks, playlist_url="https://yt.com/playlist?list=X"
+            ),
             mp,
             front=True,
-            analytics=_ANALYTICS,
-            origin=_ORIGIN,
         )
 
-        mp.queue_put_front.assert_awaited_once_with(tracks, prefetch=False)
+        mp.queue_put_front.assert_awaited_once_with(
+            tracks, prefetch=False, expected_generation=None
+        )
         mp.queue_put.assert_not_awaited()
 
     async def test_cold_path_routes_playlist_through_front(
@@ -3440,7 +3891,11 @@ class TestPlayFrontInsertion:
             for i in range(3)
         ]
 
-        music_bot.queue_source = AsyncMock(return_value=ResolvedYoutubePlaylist(tracks))
+        music_bot.queue_source = AsyncMock(
+            return_value=ResolvedYoutubePlaylist(
+                tracks, playlist_url="https://yt.com/playlist?list=X"
+            )
+        )
         music_bot._enqueue_playlist = AsyncMock()
         music_bot._enqueue_single = AsyncMock()
         music_bot.get_mp = MagicMock(return_value=_mock_mp())
@@ -3461,7 +3916,9 @@ class TestPlayFrontInsertion:
         pl_call = music_bot._enqueue_playlist.await_args
         assert pl_call is not None
         assert pl_call.kwargs["front"] is True
-        assert pl_call.args[2] == ResolvedYoutubePlaylist(tracks)
+        assert pl_call.args[1] == ResolvedYoutubePlaylist(
+            tracks, playlist_url="https://yt.com/playlist?list=X"
+        )
 
     async def test_front_insert_after_restore_orders_both_legs(
         self,
@@ -3518,6 +3975,43 @@ class TestPlayFrontInsertion:
 
 
 class TestEnqueueSingle:
+    @staticmethod
+    def _mp(mock_ctx: MagicMock) -> MagicMock:
+        """A player stand-in whose queue is real.
+
+        A MagicMock queue answers every accessor with a truthy Mock, so the
+        `display_size() > 0` gate these tests exercise would be decided by mock
+        semantics rather than by the queue."""
+        mp = MagicMock()
+        mp.queue = GuildQueue(mock_ctx.guild, None)
+        mp.queue_put = AsyncMock()
+        return mp
+
+    async def test_a_claimed_head_still_counts_as_queued(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """display_size(), not qsize(): while the loop holds the only queued song
+        and resolves it, the pending count is 0 and is_playing() is still False,
+        yet a -play landing there is queued behind a song all the same."""
+        mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
+        mock_ctx.voice_client.is_playing.return_value = False
+        mp = self._mp(mock_ctx)
+        await mp.queue.put(
+            [QueueObject("https://yt.com/v=0", "Resolving", mock_ctx.author)]
+        )
+        await mp.queue.get()  # the loop claims it and starts resolving
+        assert mp.queue.qsize() == 0 and mp.queue.display_size() == 1
+        mp.estimated_playing_at.return_value = "**7:42 PM PST**"
+
+        await music_bot._enqueue_single(
+            mock_ctx,
+            QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author),
+            mp,
+        )
+
+        mock_ctx.send.assert_awaited_once()
+        assert "Queued song" in mock_ctx.send.call_args.kwargs["embed"].title
+
     async def test_shows_queued_embed_with_eta_when_song_playing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -3525,9 +4019,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
-        mp = MagicMock()
-        mp.queue.qsize.return_value = 0
-        mp.queue_put = AsyncMock()
+        mp = self._mp(mock_ctx)
         mp.estimated_playing_at.return_value = "**7:42 PM PST**"
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
@@ -3543,9 +4035,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client = None
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
-        mp = MagicMock()
-        mp.queue.qsize.return_value = 0
-        mp.queue_put = AsyncMock()
+        mp = self._mp(mock_ctx)
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
 
@@ -3564,9 +4054,7 @@ class TestEnqueueSingle:
             thumbnail="https://img.youtube.com/vi/1/0.jpg",
         )
 
-        mp = MagicMock()
-        mp.queue.qsize.return_value = 0
-        mp.queue_put = AsyncMock()
+        mp = self._mp(mock_ctx)
         mp.estimated_playing_at.return_value = "**7:42 PM PST**"
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
@@ -3581,9 +4069,7 @@ class TestEnqueueSingle:
         mock_ctx.voice_client.is_playing.return_value = True
         qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
 
-        mp = MagicMock()
-        mp.queue.qsize.return_value = 0
-        mp.queue_put = AsyncMock()
+        mp = self._mp(mock_ctx)
         mp.estimated_playing_at.return_value = "**7:42 PM PST**"
 
         await music_bot._enqueue_single(mock_ctx, qobj, mp)
@@ -4091,6 +4577,50 @@ class TestListBuiltDescriptionsStayCheapAndInsideTheCap:
         for description in self._descriptions(mock_ctx):
             assert len(description) <= EMBED_DESCRIPTION_LIMIT
 
+    async def test_the_collection_embed_escapes_only_the_rows_it_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=5000)
+
+        with self._counting_safe_label() as calls:
+            await music_bot._send_collection_embed(
+                mock_ctx,
+                SpotifyType.ALBUM,
+                col,
+                ["*" * 5000] * 5000,
+                enqueued=5000,
+            )
+
+        # +1 for the artist line, which _echo() runs through the same function.
+        assert calls[0] <= _ECHO_ROWS + 2
+        for description in self._descriptions(mock_ctx):
+            assert len(description) <= EMBED_DESCRIPTION_LIMIT
+
+    async def test_the_playlist_embed_escapes_only_the_rows_it_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 5000, mock_ctx.author)
+            for i in range(5000)
+        ]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock(return_value=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with self._counting_safe_label() as calls:
+            await music_bot._enqueue_playlist(
+                mock_ctx,
+                ResolvedYoutubePlaylist(
+                    tracks=tracks,
+                    playlist_url="https://www.youtube.com/playlist?list=PLtest",
+                ),
+                mp,
+            )
+
+        assert calls[0] <= _ECHO_ROWS + 1
+        for description in self._descriptions(mock_ctx):
+            assert len(description) <= EMBED_DESCRIPTION_LIMIT
+
     async def test_a_widened_row_cap_cannot_400_the_send(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -4216,6 +4746,61 @@ class TestRemoveCommand:
         assert "embed" in first_kwargs
         removal_embed = first_kwargs["embed"]
         assert "Removed" in removal_embed.title
+
+    async def test_waits_for_an_in_flight_collection_drain(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """-remove's headline case is taking a collection back out by its link,
+        and a drain can still be streaming pages under that same link: run
+        mid-stream it reports "Removed 100 songs" and pages k+1..n re-queue the
+        rest.
+
+        It waits rather than bumping the generation, because that counter's other
+        reader is the playback loop's commit and -remove spares the in-flight
+        head."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(removed=[], positions=[])
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+        entry = music_bot._enqueue_locks.setdefault(
+            mock_ctx.guild.id, _GuildEnqueueLock()
+        )
+        await entry.lock.acquire()  # the drain holding the slot
+
+        removal = asyncio.create_task(
+            command_callback(MusicBot.remove)(
+                music_bot, mock_ctx, needle="https://open.spotify.com/playlist/x"
+            )
+        )
+        await asyncio.sleep(0)
+        mp.queue_remove.assert_not_awaited()
+
+        entry.lock.release()  # the drain finishes
+        await removal
+
+        mp.queue_remove.assert_awaited_once()
+        assert not entry.lock.locked()  # released on the way out
+
+    async def test_a_declined_slot_removes_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Declined means the user has already been told why, so this returns
+        without touching the queue — the same contract -shuffle has."""
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=None)
+
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://yt.com/watch?v=abc"
+        )
+
+        mp.queue_remove.assert_not_awaited()
 
     async def test_match_sends_updated_queue_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4661,7 +5246,12 @@ class TestPlaynow:
         url = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
         mock_ctx.message.content = f"-playnow {url}"
         assert music_bot.spotify is not None  # fixture provides a mock client
-        music_bot.spotify.playlist = AsyncMock(return_value=["First Song", "Second"])
+        col = _scollection(SpotifyType.PLAYLIST, total=2)
+        # Page 1 only, via the stream: one HTTP call, generator abandoned
+        # under aclosing, no cache write (the pagers cache on full drain only).
+        music_bot.spotify.playlist_stream = MagicMock(
+            return_value=_sgen([_spage(col, ["First Song", "Second"], is_last=True)])
+        )
         qobj = QueueObject("https://yt.com/v=first", "First Song", mock_ctx.author)
 
         with patch(
@@ -4669,7 +5259,9 @@ class TestPlaynow:
         ) as ys:
             await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
 
-        music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
+        music_bot.spotify.playlist_stream.assert_called_once_with(
+            "37i9dQZF1DXcBWIGoYBM5M"
+        )
         ys.assert_awaited_once()
         assert ys.call_args.args[1] == "ytsearch:First Song"
         live_mp.interject.assert_awaited_once()
@@ -4678,9 +5270,60 @@ class TestPlaynow:
         notices = [
             c.kwargs["embed"].description
             for c in mock_ctx.send.call_args_list
-            if "embed" in c.kwargs
+            if "embed" in c.kwargs and c.kwargs["embed"].description
         ]
         assert any("first track" in d for d in notices)
+
+    async def test_spotify_album_interjects_first_track_with_album_copy(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """-playnow on an album: page 1 of the stream, first track only, and
+        the notice says album — not a playlist embed with different words."""
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        mock_ctx.message.content = f"-playnow {url}"
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.ALBUM, total=11)
+        consumed: list[int] = []
+        music_bot.spotify.album_stream = MagicMock(
+            return_value=_sgen(
+                [
+                    _spage(
+                        col,
+                        ["Iridescence ESPRIT 空想", "Second Track"],
+                        is_last=False,
+                    ),
+                    _spage(col, ["Third Track", "Fourth Track"], is_last=True),
+                ],
+                yielded=consumed,
+            )
+        )
+        qobj = QueueObject("https://yt.com/v=first", "Iridescence", mock_ctx.author)
+
+        with patch(
+            "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
+        ) as ys:
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+
+        music_bot.spotify.album_stream.assert_called_once_with("6WgSCcRfaXuBVfM2TpV0Kl")
+        # Page-1-only, pinned against a MULTI-page stream: a mutation that
+        # drains everything before taking track 1 fetches page 2.
+        assert consumed == [0]
+        ys.assert_awaited_once()
+        assert ys.call_args.args[1] == "ytsearch:Iridescence ESPRIT 空想"
+        live_mp.interject.assert_awaited_once()
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs and c.kwargs["embed"].description
+        ]
+        assert any("Albums can't be interjected" in n for n in notices)
+        assert any("full album" in n for n in notices)
 
     async def test_yt_playlist_interjects_first_track_only(
         self,
@@ -4756,6 +5399,1824 @@ class TestPlaynow:
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]
+
+
+# ── Streamed collection enqueue ──────────────────────────────────────────────
+
+
+class TestIsCollection:
+    def test_spotify_album_and_playlist_are_collections(self) -> None:
+        assert _is_collection(SpotifySource(SpotifyType.ALBUM, "a")) is True
+        assert _is_collection(SpotifySource(SpotifyType.PLAYLIST, "p")) is True
+
+    def test_spotify_track_is_not(self) -> None:
+        assert _is_collection(SpotifySource(SpotifyType.TRACK, "t")) is False
+
+    def test_yt_playlist_is_a_collection_but_track_is_not(self) -> None:
+        assert _is_collection(YTSource(type=YTType.PLAYLIST, list_id="PL1")) is True
+        assert _is_collection(YTSource(url="https://yt.com/watch?v=1")) is False
+
+    def test_soundcloud_and_search_are_not(self) -> None:
+        assert _is_collection(SoundcloudSource(url="https://sc.com/a/t")) is False
+        assert _is_collection(YTSource(ytsearch="ytsearch:despacito")) is False
+
+
+class TestEnqueueGuardrails:
+    def test_bounded_wait_stays_well_under_the_gate_timeout(self) -> None:
+        """G3 tripwire: a lock-waiter's player already exists (get_mp runs in
+        cog_before_invoke, before any command body), so on a disconnected bot
+        its 300s gate clock is ticking WHILE it waits. A wait bound at or above
+        the gate timeout lets the player be torn down under a still-waiting
+        command, which then enqueues into a dead guild."""
+        assert _ENQUEUE_WAIT_SECS < _PLAYBACK_GATE_TIMEOUT
+        # "well under": leave real headroom, not a 1-second technicality.
+        assert _ENQUEUE_WAIT_SECS <= _PLAYBACK_GATE_TIMEOUT / 2
+
+    def test_timeout_chain_nests(self) -> None:
+        """The full documented nesting: one HTTP request fits inside a drain
+        leg, a drain leg inside a waiter's patience. Only the gate leg was
+        pinned before; the branch that added the middle constants deleted the
+        only assertion on _HTTP_TIMEOUT's value, so any of them could drift
+        past its neighbour with a green suite. (The lock HOLD spans several
+        legs and may legitimately exceed _ENQUEUE_WAIT_SECS — see the comment
+        on _COLLECTION_DRAIN_TIMEOUT_SECS — but each leg must stay inside the
+        next bound up or its timeout fires inside an in-flight request.)"""
+        from src.musicbot import _COLLECTION_DRAIN_TIMEOUT_SECS
+        from src.spotify import _HTTP_TIMEOUT
+
+        assert _HTTP_TIMEOUT.total is not None
+        assert _HTTP_TIMEOUT.total < _COLLECTION_DRAIN_TIMEOUT_SECS
+        assert _COLLECTION_DRAIN_TIMEOUT_SECS < _ENQUEUE_WAIT_SECS
+
+    def test_the_waiter_cap_stays_small(self) -> None:
+        """A value pin, which the two behavioural tests below cannot be: both size
+        their own input from the constant, so the cap can drift upward with them
+        still green.
+
+        Every waiter holds a live MusicPlayer whose 300s gate clock is already
+        running, and they all fire into the queue when the drain releases. Ten is
+        generous for how many collections one guild can have in flight."""
+        assert _ENQUEUE_MAX_WAITERS <= 10
+
+
+class TestAcquireEnqueueSlot:
+    async def test_uncontended_acquire_returns_held_slot(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        slot = await music_bot._acquire_enqueue_slot(mock_ctx)
+        assert slot is not None
+        assert slot.lock.locked()
+        mock_ctx.send.assert_not_awaited()  # no ack when nobody is ahead
+        slot.lock.release()
+
+    async def test_waiter_gets_ack_then_the_slot_in_order(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        first = await music_bot._acquire_enqueue_slot(mock_ctx)
+        assert first is not None
+
+        waiter = asyncio.create_task(music_bot._acquire_enqueue_slot(mock_ctx))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)  # let the waiter send its ack and park
+        acks = [c.kwargs["embed"].description for c in mock_ctx.send.call_args_list]
+        assert any("Waiting for an album or playlist" in a for a in acks)
+        assert not waiter.done()
+
+        first.lock.release()
+        second = await waiter
+        assert second is not None
+        assert second.lock.locked()
+        assert second.waiters == 0  # count restored after the wait
+        second.lock.release()
+
+    async def test_bounded_wait_times_out_with_notice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        first = await music_bot._acquire_enqueue_slot(mock_ctx)
+        assert first is not None
+        try:
+            with patch("src.musicbot._ENQUEUE_WAIT_SECS", 0.01):
+                slot = await music_bot._acquire_enqueue_slot(mock_ctx)
+            assert slot is None
+            notices = [
+                c.kwargs["embed"].description for c in mock_ctx.send.call_args_list
+            ]
+            assert any("still queueing" in n for n in notices)
+            assert first.waiters == 0  # the timed-out waiter deregistered
+        finally:
+            first.lock.release()
+
+    async def test_backlog_cap_declines_immediately(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        first = await music_bot._acquire_enqueue_slot(mock_ctx)
+        assert first is not None
+        try:
+            first.waiters = _ENQUEUE_MAX_WAITERS
+            slot = await music_bot._acquire_enqueue_slot(mock_ctx)
+            assert slot is None
+            notices = [
+                c.kwargs["embed"].description for c in mock_ctx.send.call_args_list
+            ]
+            assert any("Too many commands are already waiting" in n for n in notices)
+        finally:
+            first.waiters = 0
+            first.lock.release()
+
+    async def test_backlog_cap_reached_through_real_waiters(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The cap's two halves were only tested in isolation: the decline
+        above compares against a HAND-SET counter, so moving `waiters += 1`
+        below the ack send — a plausible "acknowledge first" refactor — or
+        deleting the increment/decrement pair entirely kept every assertion
+        green while a gateway burst of collections stacked unbounded. Here the
+        counter is driven only by real waiting acquires."""
+
+        def _wctx() -> MagicMock:
+            ctx = MagicMock()
+            ctx.guild.id = mock_ctx.guild.id
+            ctx.send = AsyncMock()
+            return ctx
+
+        holder = await music_bot._acquire_enqueue_slot(mock_ctx)
+        assert holder is not None
+        waiter_tasks: list[asyncio.Task[Any]] = []
+        try:
+            for _ in range(_ENQUEUE_MAX_WAITERS):
+                waiter_tasks.append(
+                    asyncio.create_task(music_bot._acquire_enqueue_slot(_wctx()))
+                )
+            # Let each waiter send its ack and park on the acquire.
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # Counted by the production increments, not by this test.
+            assert holder.waiters == _ENQUEUE_MAX_WAITERS
+
+            declined = await music_bot._acquire_enqueue_slot(mock_ctx)
+            assert declined is None
+            notices = [
+                c.kwargs["embed"].description for c in mock_ctx.send.call_args_list
+            ]
+            assert any("Too many commands are already waiting" in n for n in notices)
+        finally:
+            # Unwind FIFO: each waiter wins the lock in turn and releases it.
+            holder.lock.release()
+            for task in waiter_tasks:
+                slot = await task
+                assert slot is not None
+                slot.lock.release()
+        # The decrement wire: every waiter that stopped waiting was uncounted.
+        assert holder.waiters == 0
+
+    async def test_fast_path_is_bounded_during_release_handoff(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """During asyncio.Lock's release→wakeup handoff, locked() reads False while
+        the woken waiter is still queued, so the fast path's acquire() parks behind
+        it. It must park bounded — unbounded, this call blocks with no notice, no
+        cap and no waiter count.
+
+        The budget is already spent rather than short: `asyncio.timeout` arms a
+        timer for `loop.time() + delay`, so a negative delay is expired at every
+        suspension and the outcome needs no wall clock."""
+        monkeypatch.setattr("src.musicbot._ENQUEUE_WAIT_SECS", -1.0)
+        entry = music_bot._enqueue_locks.setdefault(
+            mock_ctx.guild.id, _GuildEnqueueLock()
+        )
+        await entry.lock.acquire()  # the drain holding the slot
+        waiter = asyncio.create_task(entry.lock.acquire())  # a parked waiter
+        await asyncio.sleep(0)
+        entry.lock.release()  # the handoff window
+        assert not entry.lock.locked()  # ...in which locked() reads False
+
+        slot = await music_bot._acquire_enqueue_slot(mock_ctx)
+
+        assert slot is None  # timed out instead of parking forever
+        notices = [c.kwargs["embed"].description for c in mock_ctx.send.call_args_list]
+        assert any("still queueing" in n for n in notices)
+        await waiter  # the woken waiter did get the lock
+        entry.lock.release()
+
+
+class TestPlayAdmission:
+    """The tier rule at the top of play(): collections take the per-guild
+    lock, singles never do (M5 → b)."""
+
+    async def test_single_track_never_takes_the_lock(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        mock_ctx.message.content = "-play despacito"
+        music_bot._acquire_enqueue_slot = AsyncMock()
+        music_bot._play_resolved = AsyncMock()
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="despacito")
+
+        music_bot._acquire_enqueue_slot.assert_not_awaited()
+        music_bot._play_resolved.assert_awaited_once()
+
+    async def test_collection_takes_and_releases_the_lock(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        mock_ctx.message.content = f"-play {url}"
+        held_during_body: list[bool] = []
+
+        async def probe(*args: Any, **kwargs: Any) -> None:
+            held_during_body.append(
+                music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+            )
+
+        music_bot._play_resolved = AsyncMock(side_effect=probe)
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        music_bot._play_resolved.assert_awaited_once()
+        # Held ACROSS the body — an acquire-release-immediately would pass a
+        # released-after check alone — then released.
+        assert held_during_body == [True]
+        entry = music_bot._enqueue_locks[mock_ctx.guild.id]
+        assert not entry.lock.locked()
+
+    async def test_declined_admission_skips_resolution(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        mock_ctx.message.content = f"-play {url}"
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=None)
+        music_bot._play_resolved = AsyncMock()
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        music_bot._play_resolved.assert_not_awaited()
+
+    async def test_lock_released_when_resolution_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.voice_client = None
+        url = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+        mock_ctx.message.content = f"-play {url}"
+        music_bot._play_resolved = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        entry = music_bot._enqueue_locks[mock_ctx.guild.id]
+        assert not entry.lock.locked()
+
+
+class TestSpotifyCollectionPagerAclose:
+    """The lazy pager's close contract (S2 removed the eager page-1 task and
+    with it the settled-task arms this class used to cover): construction
+    performs no work, a started generator is finalized by aclose(), and the
+    no-op arms — unstarted, already-finished, double-close — must not raise."""
+
+    async def test_construction_starts_nothing_and_aclose_is_a_noop(self) -> None:
+        """The S2 property itself: building a pager fires no I/O, so an
+        abandon path that never started it (a failed voice join) has nothing
+        to cancel, retrieve, or finalize — and wastes no Spotify request."""
+        entered: list[bool] = []
+
+        async def _gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(
+                _scollection(SpotifyType.ALBUM, total=1), ["T A"], is_last=True
+            )
+
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _gen())
+        assert entered == []  # lazy: nothing ran at construction
+        await resolved.aclose()  # unstarted: must not raise…
+        assert entered == []  # …and must not start it either
+
+    async def test_aclose_finalizes_a_started_generator(self) -> None:
+        """A pager suspended at a yield is the state every begin-then-bail
+        path leaves behind; aclose() must run its finally now rather than
+        deferring to asyncgen hooks (whose warning is a hard failure under
+        filterwarnings=["error"]). Double-close is a no-op."""
+        closed: list[bool] = []
+
+        async def _gen() -> AsyncGenerator[TrackPage]:
+            try:
+                yield _spage(
+                    _scollection(SpotifyType.ALBUM, total=2), ["T A"], is_last=False
+                )
+                yield _spage(
+                    _scollection(SpotifyType.ALBUM, total=2), ["U A"], is_last=True
+                )
+            finally:
+                closed.append(True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _gen())
+        await anext(resolved.pages)  # start it, park at the first yield
+        await resolved.aclose()
+        assert closed == [True]
+        await resolved.aclose()  # already finished: must not raise
+        assert closed == [True]
+
+
+class TestPlayCollectionIntegration:
+    """-play <collection> driven end-to-end through the REAL glue: play()'s
+    command body, a real SpotifyCollectionPager from the real queue_source, a
+    real GuildQueue, and the fake-redis mirror. Every other class in this file
+    mocks at least one of those layers, which left the dispatch in
+    _play_resolved, the gate/tail ordering, and the cross-page mirror order
+    pinned by nothing."""
+
+    _URL = "https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl"
+
+    def _wire(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        pages: AsyncGenerator[TrackPage],
+    ) -> None:
+        assert music_bot.spotify is not None  # fixture provides a mock client
+        music_bot.mps[mock_ctx.guild.id] = music_player
+        music_bot.spotify.album_stream = MagicMock(return_value=pages)
+        mock_ctx.message.content = f"-play {self._URL}"
+
+    @staticmethod
+    def _join_lands(mock_ctx: MagicMock) -> AsyncMock:
+        """ctx.invoke for a join that CONNECTS. A bare AsyncMock leaves
+        voice_client None, which _join_succeeded rejects — the cold path then
+        abandons and nothing reaches the queue."""
+
+        async def _invoke(*_args: object, **_kwargs: object) -> None:
+            mock_ctx.voice_client = _connected_vc()
+
+        return AsyncMock(side_effect=_invoke)
+
+    async def test_page1_failure_reports_and_closes_the_generator(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """Spotify down on the page-1 call — the mainline outage path.
+
+        queue_source returns the lazy stream; _begin_collection_enqueue's
+        anext starts it, the raise happens there, drain stays None, and
+        _play_resolved's finally aclose()s a generator that already finished
+        raising — a no-op that must not mask the real error. The user must
+        still be told, and the enqueue lock released.
+        """
+
+        async def _boom() -> AsyncGenerator[TrackPage]:
+            raise SpotifyAuthError(401, "page 1 failed")
+            yield  # pragma: no cover - unreachable, makes this a generator
+
+        self._wire(music_bot, music_player, mock_ctx, _boom())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert music_player.queue.qsize() == 0
+        # The lock is released even though the command failed.
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        errors = [
+            c.kwargs["embed"]
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert errors, "the user was told nothing"
+
+    async def test_join_failure_leaves_pager_unstarted_and_cleans_up(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """queue_source SUCCEEDS and the voice join then raises. Under the
+        lazy pager (S2) this path is inert by construction: page 1 has not
+        been fetched, so there is no in-flight task to cancel and no Spotify
+        request wasted — the property the eager design bought with a
+        hand-managed lifecycle. The generator must never be STARTED by the
+        abandon path either (aclose on an unstarted generator is a no-op),
+        and full cleanup must still run."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        entered: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=False)
+            yield _spage(col, ["T2 A", "T3 A"], is_last=True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None  # front path: the join actually runs
+        mock_ctx.invoke = AsyncMock(
+            side_effect=discord.ClientException("voice channel is full")
+        )
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert entered == [], "a failed join must not cost a Spotify fetch"
+        # The join failure ran full cleanup: player gone, nothing queued, and
+        # the enqueue lock released for the next command.
+        assert mock_ctx.guild.id not in music_bot.mps
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_join_without_a_client_abandons_before_the_pager_starts(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """A join that returns WITHOUT connecting — _join_succeeded's case,
+        which leaves by `return` rather than by raising. The collection must
+        take the same exit as a raising join: nothing queued, the player torn
+        down, the lock released, and no Spotify fetch spent on a bot that is
+        not in voice."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        entered: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = AsyncMock()  # join reports its own failure, connects nothing
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert entered == [], "a join that connected nothing must not cost a fetch"
+        assert mock_ctx.guild.id not in music_bot.mps
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_unreadable_restore_abandons_the_collection_and_says_so(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The bounded restore wait timing out on the front path. Front-inserting
+        a collection against an unread snapshot double-queues every page, so the
+        whole collection is abandoned — and unlike the join paths, this one owes
+        the user a notice, because nothing else reported anything."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        entered: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            entered.append(True)
+            yield _spage(col, ["T0 A", "T1 A"], is_last=True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = self._join_lands(mock_ctx)
+        # The real timeout, not a stubbed return: an event that is never set
+        # against a 10ms budget can only expire.
+        music_player._restore_complete.clear()
+        monkeypatch.setattr("src.musicbot.RESTORE_WAIT_SECS", 0.01)
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert entered == [], "an unread restore must not cost a Spotify fetch"
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        told = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("saved queue" in (d or "") for d in told), told
+
+    async def test_begin_bailing_after_page1_finalizes_the_generator(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """The abandon path that still carries the leak risk under the lazy
+        pager: _begin_collection_enqueue consumed page 1 (the generator is
+        started, suspended at its yield) and then bailed — here, the
+        empty-collection raise. drain stays None, so _play_resolved's finally
+        must aclose() the suspended generator NOW; leaving it to asyncgen-hook
+        finalization is a hard suite failure under filterwarnings=["error"],
+        but only at GC time, which is why the finally needs its own test."""
+        col = _scollection(SpotifyType.ALBUM, total=0)
+        closed: list[bool] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            try:
+                yield _spage(col, [], is_last=True)  # empty album → raise
+            finally:
+                closed.append(True)
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert closed == [True], "the suspended generator was never finalized"
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        errors = [
+            c.kwargs["embed"]
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert errors, "the user was told nothing"
+
+    async def test_album_play_drains_all_pages_to_queue_and_mirror_in_order(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+    ) -> None:
+        """The mirror-order guarantee the design promises: pages land on the
+        Redis leg contiguously and in collection order, via the real
+        queue_put → GuildQueue → push_queue_batch chain."""
+        col = _scollection(SpotifyType.ALBUM, total=6)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=False),
+            _spage(col, ["T4 A", "T5 A"], is_last=True),
+        ]
+        self._wire(music_bot, music_player, mock_ctx, _sgen(pages))
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert music_player.queue.qsize() == 6
+        assert music_player.store is not None
+        stored = [
+            orjson.loads(raw)["ytsearch"]
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert stored == [f"ytsearch:T{i} A" for i in range(6)]
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+
+    async def test_gate_hold_releases_after_page_one_before_tail_drains(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """The latency property the streaming design exists for: page 1 is
+        consumed inside the playback-gate hold, the tail strictly after it.
+        _playback_holds is the real hold count defer_playback maintains, read
+        at each yield — moving _drain_collection_tail back inside the
+        AsyncExitStack turns the tail's 0s into 1s."""
+        col = _scollection(SpotifyType.ALBUM, total=6)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=False),
+            _spage(col, ["T4 A", "T5 A"], is_last=True),
+        ]
+        holds_at_yield: list[int] = []
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            for page in pages:
+                holds_at_yield.append(music_player._playback_holds)
+                yield page
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        mock_ctx.voice_client = None  # front path: the gate hold is live
+        mock_ctx.invoke = self._join_lands(mock_ctx)
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert music_player.queue.qsize() == 6
+        assert holds_at_yield == [1, 0, 0]
+
+    async def test_front_backlog_buffers_collection_ahead_on_both_legs(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """front=True with a persisted backlog takes the buffered path: the
+        whole collection lands ahead of the backlog on BOTH legs. Dropping
+        front= from the _begin_collection_enqueue dispatch appends behind 'Old'
+        instead."""
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
+        )
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=True),
+        ]
+        self._wire(music_bot, music_player, mock_ctx, _sgen(pages))
+        mock_ctx.voice_client = None
+        mock_ctx.invoke = self._join_lands(mock_ctx)
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert music_player.queue.qsize() == 5
+        assert music_player.store is not None
+        stored = [
+            orjson.loads(raw)
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert [d.get("ytsearch") or d.get("title") for d in stored] == [
+            "ytsearch:T0 A",
+            "ytsearch:T1 A",
+            "ytsearch:T2 A",
+            "ytsearch:T3 A",
+            "Old",
+        ]
+
+    async def test_failed_enqueue_closes_pager_before_play_returns(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+    ) -> None:
+        """When _begin_collection_enqueue raises (empty collection), the finally
+        in _play_resolved must aclose() the stream before play returns — the
+        generator's own finally is the proof. Leaving finalization to asyncgen
+        GC hooks runs it too late for this assert (and, under
+        filterwarnings=error, loudly)."""
+        col = _scollection(SpotifyType.ALBUM, total=0)
+        closed = asyncio.Event()
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            try:
+                yield _spage(col, [], is_last=True)
+            finally:
+                closed.set()
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert closed.is_set()
+        assert music_player.queue.qsize() == 0
+        assert not music_bot._enqueue_locks[mock_ctx.guild.id].lock.locked()
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs
+        ]
+        assert any("no queueable tracks" in (n or "") for n in notices)
+
+    async def test_clear_mid_drain_stops_the_pager_and_queue_stays_empty(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+    ) -> None:
+        """A -clear landing between pages: the next put is refused against the
+        real GuildQueue and the drain abandons WITHOUT refilling either leg —
+        the clear-then-refill regression, checked end-to-end."""
+        col = _scollection(SpotifyType.ALBUM, total=6)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=False),
+            _spage(col, ["T4 A", "T5 A"], is_last=True),
+        ]
+        page3_requested = False
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            nonlocal page3_requested
+            yield pages[0]
+            await music_player.queue.clear()  # -clear lands mid-drain
+            yield pages[1]
+            page3_requested = True
+            yield pages[2]
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+
+        assert music_player.queue.qsize() == 0
+        assert music_player.store is not None
+        assert await fake_redis.lrange(music_player.store.queue_key(), 0, -1) == []
+        assert not page3_requested  # the drain stopped consuming
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs
+        ]
+        assert any("Queueing stopped" in (n or "") for n in notices)
+
+    async def test_single_play_mid_drain_lands_at_current_tail(
+        self,
+        music_bot: MusicBot,
+        music_player: MusicPlayer,
+        mock_ctx: MagicMock,
+        fake_redis: Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """M5→b's other half: a single -play issued mid-drain neither waits on
+        the collection lock nor lands after the still-arriving collection — it
+        appends at the CURRENT tail, between pages."""
+        col = _scollection(SpotifyType.ALBUM, total=6)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=False),
+            _spage(col, ["T4 A", "T5 A"], is_last=True),
+        ]
+        release = asyncio.Event()
+
+        async def gen() -> AsyncGenerator[TrackPage]:
+            yield pages[0]
+            await release.wait()  # the drain parks here, slot held
+            yield pages[1]
+            yield pages[2]
+
+        self._wire(music_bot, music_player, mock_ctx, gen())
+        collection_task = asyncio.create_task(
+            command_callback(MusicBot.play)(music_bot, mock_ctx, url=self._URL)
+        )
+        async with asyncio.timeout(5):
+            while music_player.queue.qsize() < 2:  # page 1 has landed
+                await asyncio.sleep(0)
+
+        single = QueueObject("https://yt.com/v=s", "Single", mock_author)
+        mock_ctx.message.content = "-play single song"
+        with (
+            patch("src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=single)),
+            patch("src.musicplayer.YTDL.prefetch_stream", new=AsyncMock()),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="single song"
+            )
+            assert music_player.queue.qsize() == 3  # landed immediately, no wait
+
+            release.set()
+            await collection_task
+
+        assert music_player.store is not None
+        stored = [
+            orjson.loads(raw)
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert [d.get("ytsearch") or d.get("title") for d in stored] == [
+            "ytsearch:T0 A",
+            "ytsearch:T1 A",
+            "Single",
+            "ytsearch:T2 A",
+            "ytsearch:T3 A",
+            "ytsearch:T4 A",
+            "ytsearch:T5 A",
+        ]
+
+
+class TestCollectionRequesterAttribution:
+    """2026-08-07: a 22-track album queued by one user played and archived
+    entirely as someone else, because the lazy YTSource entries carried no
+    requester and the resolve at dequeue fell back to whoever had typed most
+    recently. Every path that mints one must stamp ctx.author."""
+
+    async def test_page1_stamps_the_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        queued = mp.queue_put.call_args[0][0]
+        assert [y.requester_id for y in queued] == [mock_ctx.author.id] * 2
+        await resolved.aclose()
+
+    async def test_buffered_front_path_stamps_the_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mp.queue.has_restored_backlog.return_value = True
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        queued = mp.queue_put_front.call_args[0][0]
+        assert [y.requester_id for y in queued] == [mock_ctx.author.id] * 2
+        await resolved.aclose()
+
+    async def test_tail_pages_stamp_the_original_requester(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The exposed one: the tail drain runs after the playback gate opened,
+        so other users' commands are landing while it is still enqueueing. Every
+        page belongs to whoever ran the command, not to the newest typist."""
+        col = _scollection(SpotifyType.PLAYLIST, total=3)
+        pages = [
+            _spage(col, ["T0 A"], is_last=False),
+            _spage(col, ["T1 A"], is_last=False),
+            _spage(col, ["T2 A"], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        stamped = [
+            y.requester_id
+            for call in mp.queue_put.await_args_list
+            for y in call.args[0]
+        ]
+        assert stamped == [mock_ctx.author.id] * 3
+
+
+class TestCollectionAnalyticsAndOrigin:
+    """The streamed path mints its own YTSources page by page, so the ask-time
+    analytics and the pasted link have to be threaded down to it — nothing
+    re-mints them later, and an omission persists 0.0/0 to Redis and to
+    play_history with no error, and leaves `-remove <the collection link>`
+    matching nothing."""
+
+    async def test_page1_carries_the_analytics_and_the_origin(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        queued = mp.queue_put.call_args[0][0]
+        assert [y.user_input for y in queued] == [_ORIGIN] * 2
+        assert all(y.analytics.queued_at == _ANALYTICS.queued_at for y in queued)
+        # The head's depth fans out across the page, as yt_playlist does.
+        assert [y.analytics.queue_position for y in queued] == [
+            _ANALYTICS.queue_position,
+            _ANALYTICS.queue_position + 1,
+        ]
+
+    async def test_buffered_front_path_carries_them_too(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=2)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["A x", "B x"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        queued = mp.queue_put_front.call_args[0][0]
+        assert [y.user_input for y in queued] == [_ORIGIN] * 2
+        assert [y.analytics.queue_position for y in queued] == [
+            _ANALYTICS.queue_position,
+            _ANALYTICS.queue_position + 1,
+        ]
+
+    async def test_tail_positions_continue_instead_of_restarting(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Each page re-derives its base from the head plus what this collection
+        has already enqueued. Passing the head's analytics straight through would
+        record every page as waiting at the head's depth — track 200 of an album
+        claiming it played immediately."""
+        col = _scollection(SpotifyType.PLAYLIST, total=4)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        positions = [
+            y.analytics.queue_position
+            for call in mp.queue_put.await_args_list
+            for y in call.args[0]
+        ]
+        base = _ANALYTICS.queue_position
+        assert positions == [base, base + 1, base + 2, base + 3]
+        origins = [
+            y.user_input for call in mp.queue_put.await_args_list for y in call.args[0]
+        ]
+        assert origins == [_ORIGIN] * 4
+
+
+class TestBeginCollectionEnqueue:
+    async def test_streaming_puts_page1_and_returns_drain_state(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.PLAYLIST, total=250)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(200, 250)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, generation=7)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        assert drain.generation == 7
+        assert drain.enqueued == 100
+        assert drain.total == 250
+        assert drain.completion_notice is True
+        mp.queue_put.assert_awaited_once()
+        args, kwargs = mp.queue_put.call_args
+        assert [y.ytsearch for y in args[0]] == [f"ytsearch:T{i} A" for i in range(100)]
+        assert kwargs["prefetch"] is False
+        assert kwargs["expected_generation"] == 7
+        mp.queue_put_front.assert_not_awaited()
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "~250" in embed.description
+        await resolved.aclose()
+
+    async def test_slow_page1_is_bounded_and_reports_cleanly(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Page 1 was the one fetch outside every deadline: unbounded, a
+        rate-limited identity call holds the enqueue lock (and, on the front
+        path, the playback gate) for http_call's full retry ladder — ~150s
+        against waiters that give up at 60. The bound converts it into the
+        same clean per-leg budget the drains already have."""
+        col = _scollection(SpotifyType.PLAYLIST, total=100)
+
+        async def _hung() -> AsyncGenerator[TrackPage]:
+            await asyncio.sleep(30)  # page-1 fetch that never returns in time
+            yield _spage(col, ["T0 A"], is_last=True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _hung())
+        mp = _collection_mp(music_bot, mock_ctx)
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", 0.05):
+            with pytest.raises(ValueError, match="took too long"):
+                await music_bot._begin_collection_enqueue(
+                    mock_ctx,
+                    resolved,
+                    mp,
+                    analytics=_ANALYTICS,
+                    origin=_ORIGIN,
+                    front=False,
+                )
+
+        # Nothing was queued — the failure precedes any put.
+        mp.queue_put.assert_not_awaited()
+        mp.queue_put_front.assert_not_awaited()
+        # The abandon path (play's finally) still owns generator cleanup.
+        await resolved.aclose()
+
+    async def test_album_gets_album_embed_with_art_and_exact_count(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=11)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM,
+            _sgen([_spage(col, [f"T{i} A" for i in range(11)], is_last=True)]),
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        assert drain.completion_notice is False  # album count was exact upfront
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Queued album — 200% Electronica" in embed.title
+        assert "ESPRIT 空想, George Clanton" in embed.description
+        assert "11 songs" in embed.description
+        # The track list is the confirmation the user actually reads; main had
+        # an equivalent assertion that was deleted with Spotify.playlist(), and
+        # without it queue_message(titles) can be dropped with a green suite.
+        assert "T0 A" in embed.description
+        assert embed.thumbnail.url == "https://i.scdn.co/image/640"
+        await resolved.aclose()
+
+    async def test_a_multi_page_album_reports_its_full_total_not_page_one(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The album count is `collection.total`, and only a multi-page album can
+        tell that apart from `len(titles)`.
+
+        Albums are the one kind that gets no completion notice, so this number is
+        the only count the user is shown: a page-1 reading says 50 while 150 are
+        queued, and nothing later corrects it."""
+        col = _scollection(SpotifyType.ALBUM, total=150)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM,
+            _sgen(
+                [
+                    _spage(col, [f"T{i} A" for i in range(50)], is_last=False),
+                    _spage(col, [f"T{i} A" for i in range(50, 150)], is_last=True),
+                ]
+            ),
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        assert drain.completion_notice is False  # albums never send one
+        embed = mock_ctx.send.call_args[1]["embed"]
+        # Anchored on the separator: a bare "50 songs" is a substring of the
+        # right answer, so the negative arm has to be able to tell them apart.
+        assert "· 150 songs" in embed.description
+        assert "· 50 songs" not in embed.description
+        await resolved.aclose()
+
+    async def test_single_page_playlist_reports_exact_enqueued_count(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """L6: total counts skipped episodes; a drained page 1 reports what was
+        actually queued."""
+        col = _scollection(SpotifyType.PLAYLIST, total=5)  # 2 items were skipped
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST,
+            _sgen([_spage(col, ["A x", "B y", "C z"], is_last=True)]),
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert "Queued playlist — 3 songs" in embed.title
+        assert "A x" in embed.description  # see the album test's note
+        await resolved.aclose()
+
+    async def test_empty_collection_raises_before_anything_queues(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.ALBUM, total=0)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, [], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+
+        with pytest.raises(ValueError, match="album has no queueable tracks"):
+            await music_bot._begin_collection_enqueue(
+                mock_ctx,
+                resolved,
+                mp,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                front=False,
+            )
+
+        mp.queue_put.assert_not_awaited()
+        mp.queue_put_front.assert_not_awaited()
+        mock_ctx.send.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_refused_page1_returns_none_with_notice_and_no_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A clear/teardown landed between the generation snapshot and the
+        put: nothing was queued, so no enqueue embed and no 👍 — but the user
+        is told, not silently swallowed."""
+        col = _scollection(SpotifyType.ALBUM, total=11)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mp.queue_put = AsyncMock(return_value=False)
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is None
+        assert mock_ctx.send.await_count == 1
+        notice = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "Queueing stopped" in notice
+        mock_ctx.message.add_reaction.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_buffered_drain_timeout_queues_what_arrived(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The buffered drain holds the playback gate, so it must be bounded.
+
+        Left unbounded it can run to the gate's own 300s timeout, which tears
+        the player down and refuses the finished put_front — losing the whole
+        collection after five minutes of silence. Timing out keeps what
+        arrived.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=500)
+
+        async def _slow() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            yield _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False)
+            await asyncio.sleep(30)  # never arrives within the budget
+            yield _spage(col, ["never A"], is_last=True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _slow())
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", 0.05):
+            drain = await music_bot._begin_collection_enqueue(
+                mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+            )
+
+        assert drain is None  # buffered path never returns a tail
+        mp.queue_put_front.assert_awaited_once()
+        assert len(mp.queue_put_front.await_args.args[0]) == 200
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("taking too long" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
+    async def test_the_buffered_mint_yields_and_still_numbers_every_track(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The buffered front path mints a whole collection in one stretch, and
+        Spotify allows 10,000 tracks — 22.5ms of uninterrupted event loop at
+        n=5000, which is every guild's progress tick and the outbox drain.
+
+        Both halves are asserted: chunking without offsetting the per-chunk
+        analytics restarts queue_position at every boundary and writes a plausible
+        wrong number to Postgres for every track past the first chunk."""
+        n = _MINT_CHUNK * 2 + 7
+        col = _scollection(SpotifyType.PLAYLIST, total=n)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST,
+            _sgen([_spage(col, [f"T{i} A" for i in range(n)], is_last=True)]),
+        )
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        yields = 0
+        real_sleep = asyncio.sleep
+
+        async def counting_sleep(delay: float, *a: Any, **k: Any) -> Any:
+            nonlocal yields
+            if delay == 0:
+                yields += 1
+            return await real_sleep(delay, *a, **k)
+
+        with patch("src.musicbot.asyncio.sleep", new=counting_sleep):
+            await music_bot._begin_collection_enqueue(
+                mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+            )
+
+        assert yields >= 3  # one per chunk: 500, 500, 7
+        queued = mp.queue_put_front.await_args.args[0]
+        assert len(queued) == n
+        # Contiguous from the head's own position — the chunk boundaries left no
+        # gap and no restart.
+        assert [y.analytics.queue_position for y in queued] == [
+            _ANALYTICS.queue_position + i for i in range(n)
+        ]
+        await resolved.aclose()
+
+    async def test_buffered_drain_keeps_what_arrived_when_spotify_fails(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A mid-drain Spotify failure is the same news as the timeout: keep what
+        arrived.
+
+        The streaming path keeps page 1 in this situation, and which path runs
+        depends only on whether a saved queue exists — invisible to the user, so
+        the two must agree. On the front path the alternative is worse still: the
+        bot plays the leftover queue the user was trying to jump ahead of."""
+        col = _scollection(SpotifyType.PLAYLIST, total=500)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages, fail_at=1))
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        assert drain is None  # buffered path never returns a tail
+        mp.queue_put_front.assert_awaited_once()
+        assert len(mp.queue_put_front.await_args.args[0]) == 100
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("stopped loading partway" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
+    async def test_buffered_drain_reraises_when_nothing_arrived(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """With an empty page 1 — a playlist whose first items are all episodes —
+        there is nothing to keep, so the failure reaches play's error path rather
+        than the "no queueable tracks" ValueError below, which names a different
+        cause."""
+        col = _scollection(SpotifyType.PLAYLIST, total=500)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST,
+            _sgen(
+                [
+                    _spage(col, [], is_last=False),
+                    _spage(col, ["never A"], is_last=True),
+                ],
+                fail_at=1,
+            ),
+        )
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+
+        with pytest.raises(SpotifyAuthError):
+            await music_bot._begin_collection_enqueue(
+                mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+            )
+
+        mp.queue_put_front.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_notification_failure_keeps_the_drain(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A failed embed or 👍 must not discard the tail.
+
+        Page 1 is already committed when the notification runs, so raising here
+        would return None, the caller would aclose() the generator, and the
+        collection would truncate to page 1 while play reported "Failed to
+        queue song" for songs that are playing. A channel without Add Reactions
+        makes that deterministic for every -play <collection>.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=250)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 250)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, generation=2)
+        mock_ctx.message.add_reaction = AsyncMock(
+            side_effect=discord.Forbidden(MagicMock(status=403), "Missing Permissions")
+        )
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        assert drain.generation == 2
+        assert drain.enqueued == 100
+        assert drain.total == 250
+        mp.queue_put.assert_awaited_once()
+        await resolved.aclose()
+
+    async def test_teardown_during_page1_fetch_queues_nothing(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A teardown landing inside the page-1 round-trip must not enqueue.
+
+        cleanup() pops the player before bumping the generation, so a snapshot
+        taken after the pop reads the post-teardown value and every page then
+        matches and commits onto a dead guild's persisted mirror — a "Queued
+        album" success embed after the user pressed -stop. The generation
+        cannot catch this one; only the player-identity check can.
+        """
+        col = _scollection(SpotifyType.ALBUM, total=11)
+        mp = _collection_mp(music_bot, mock_ctx, generation=5)
+
+        async def _gen() -> AsyncGenerator[TrackPage]:
+            # The teardown happens while page 1 is in flight: cleanup() pops
+            # the player, then bumps the generation the snapshot has not read
+            # yet.
+            del music_bot.mps[mock_ctx.guild.id]
+            mp.queue.generation = 6
+            yield _spage(col, [f"T{i} A" for i in range(11)], is_last=True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _gen())
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is None
+        mp.queue_put.assert_not_awaited()
+        mp.queue_put_front.assert_not_awaited()
+        assert mock_ctx.send.await_count == 1
+        assert "Queueing stopped" in mock_ctx.send.call_args.kwargs["embed"].description
+        mock_ctx.message.add_reaction.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_front_with_backlog_buffers_into_one_put_front(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Ordering matrix row 3: restored entries exist, so the whole
+        collection buffers into one put_front — successive streamed put_fronts
+        would invert page order (put_front inserts at the head)."""
+        col = _scollection(SpotifyType.PLAYLIST, total=150)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 150)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, generation=3, backlog=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        assert drain is None  # nothing left to drain — the buffer consumed it all
+        mp.queue_put.assert_not_awaited()
+        mp.queue_put_front.assert_awaited_once()
+        args, kwargs = mp.queue_put_front.call_args
+        assert [y.ytsearch for y in args[0]] == [f"ytsearch:T{i} A" for i in range(150)]
+        assert kwargs["prefetch"] is False
+        assert kwargs["expected_generation"] == 3
+        # The success side is user-visible too: embed + 👍 — inverting the
+        # refusal guard would silence exactly this.
+        assert mock_ctx.send.await_count == 1
+        assert "150 songs" in mock_ctx.send.call_args.kwargs["embed"].title
+        mock_ctx.message.add_reaction.assert_awaited_once()
+
+    async def test_refused_buffered_put_front_notifies_and_returns_none(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The buffered arm of the M6 fix: the user waited through the whole
+        fetch — a refusal here must say so, and send no enqueue embed."""
+        col = _scollection(SpotifyType.ALBUM, total=4)
+        pages = [
+            _spage(col, ["T0 A", "T1 A"], is_last=False),
+            _spage(col, ["T2 A", "T3 A"], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, backlog=True)
+        mp.queue_put_front = AsyncMock(return_value=False)
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        assert drain is None
+        assert mock_ctx.send.await_count == 1
+        notice = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "Queueing stopped" in notice
+        mock_ctx.message.add_reaction.assert_not_awaited()
+        await resolved.aclose()
+
+    async def test_empty_non_last_page1_streams_on(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A playlist whose first 100 items are all skipped (episodes/nulls)
+        yields an EMPTY non-last page 1: that streams on — only an empty LAST
+        page means the collection has nothing. Tightening the
+        guard to `not page1.titles` kills such playlists."""
+        col = _scollection(SpotifyType.PLAYLIST, total=101)
+        pages = [
+            _spage(col, [], is_last=False),
+            _spage(col, ["T A"], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx)
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None  # did not raise "no queueable tracks"
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+        assert drain.enqueued == 1
+
+    async def test_album_embed_title_is_truncated(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord rejects >256-char embed titles, failing the whole send, so
+        the album name goes through truncate_embed_title."""
+        col = _scollection(SpotifyType.ALBUM, total=1, name="X" * 300)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.ALBUM, _sgen([_spage(col, ["T A"], is_last=True)])
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+
+        assert drain is not None
+        embed = mock_ctx.send.call_args[1]["embed"]
+        assert len(embed.title) <= 256
+
+    async def test_front_without_backlog_streams(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Ordering matrix row 2: memory and mirror empty — appending to an
+        empty queue IS front insertion, so the fast streamed path applies."""
+        col = _scollection(SpotifyType.ALBUM, total=60)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(50)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(50, 60)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, backlog=False)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=True
+        )
+
+        assert drain is not None
+        mp.queue.has_restored_backlog.assert_awaited_once()
+        mp.queue_put.assert_awaited_once()
+        mp.queue_put_front.assert_not_awaited()
+        await resolved.aclose()
+
+
+class TestDrainCollectionTail:
+    async def test_failed_completion_notice_does_not_raise(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A Discord error sending the SUCCESS notice must not escape to
+        play's error handler, which would report a fully successful enqueue
+        as 'Failed to queue song'."""
+        col = _scollection(SpotifyType.PLAYLIST, total=200)
+        pages = [
+            _spage(col, ["T0 A"], is_last=False),
+            _spage(col, ["T1 A"], is_last=True),
+        ]
+        mp = _collection_mp(music_bot, mock_ctx)
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None and drain.completion_notice
+
+        mock_ctx.send = AsyncMock(side_effect=RuntimeError("discord hiccup"))
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)  # must not raise
+
+        assert drain.enqueued == 2  # the enqueue itself completed
+
+    async def test_tail_drains_all_pages_in_order_with_batch_flags(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        col = _scollection(SpotifyType.PLAYLIST, total=250)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(200, 250)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx, generation=4)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        assert mp.queue_put.await_count == 3
+        all_titles = [
+            y.ytsearch for call in mp.queue_put.await_args_list for y in call.args[0]
+        ]
+        assert all_titles == [f"ytsearch:T{i} A" for i in range(250)]
+        for call in mp.queue_put.await_args_list:
+            assert call.kwargs["prefetch"] is False
+            assert call.kwargs["expected_generation"] == 4
+        assert drain.enqueued == 250
+        # Multi-page playlist → completion notice with the REAL count (G5/L6).
+        final = mock_ctx.send.call_args_list[-1].kwargs["embed"].description
+        assert "finished queueing — 250 songs" in final
+
+    async def test_album_tail_sends_no_completion_notice(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The album embed carried the exact count upfront — a completion
+        notice would be noise."""
+        col = _scollection(SpotifyType.ALBUM, total=60)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(50)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(50, 60)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.ALBUM, _sgen(pages))
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        sends_before = mock_ctx.send.await_count
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        assert mock_ctx.send.await_count == sends_before  # no extra message
+
+    async def test_refused_page_abandons_quietly_and_stops_consuming(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The H2 regression guard at the tail: a -clear (or any teardown)
+        refuses the next compare-and-put; the drain stops, tells the user what
+        landed, and never fetches further pages."""
+        col = _scollection(SpotifyType.PLAYLIST, total=400)
+        yielded: list[int] = []
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(200, 300)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(300, 400)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST, _sgen(pages, yielded=yielded)
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        # page 1 lands; first tail page lands; second tail page refused.
+        mp.queue_put = AsyncMock(side_effect=[True, True, False])
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        assert mp.queue_put.await_count == 3
+        assert drain.enqueued == 200  # the refused page was never counted
+        assert yielded == [0, 1, 2]  # page 4 was never even fetched
+        final = mock_ctx.send.call_args_list[-1].kwargs["embed"].description
+        assert "Queueing stopped" in final
+        assert "200 songs" in final
+
+    async def test_tail_timeout_keeps_what_queued_and_releases(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The tail holds the per-guild enqueue lock, so it must be bounded.
+
+        Unbounded, a slow collection stalls -shuffle and every YouTube-playlist
+        enqueue in the guild until they are declined at _ENQUEUE_WAIT_SECS. It
+        returns rather than raising: the songs already queued ARE queued, so
+        play's handler must not report the command as failed.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=400)
+
+        async def _slow() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            await asyncio.sleep(30)
+            yield _spage(col, ["never A"], is_last=True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _slow())
+        mp = _collection_mp(music_bot, mock_ctx)
+        drain = _CollectionDrain(
+            resolved=resolved,
+            generation=0,
+            enqueued=100,
+            total=400,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            completion_notice=True,
+        )
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", 0.05):
+            await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("taking too long" in (d or "") for d in notices), notices
+        # The completion notice must not also fire — the drain did not complete.
+        assert not any("finished queueing" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
+    async def test_deadline_never_cancels_a_queue_put(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The drain deadline bounds page fetches only, like the buffered path.
+        queue_put is a two-leg mutation whose Redis leg suspends inside the queue
+        mutex, so a deadline expiring there cancels between the in-memory legs and
+        the mirror, and the desync self-heals only on the next shuffle/remove. A
+        put running under an expired deadline still commits; the timeout lands on
+        the next fetch.
+
+        The budget is already spent (`loop.time() + -1.0`), and `asyncio.timeout`
+        cancels only at a suspension inside its own scope: page 2 is yielded
+        without awaiting and is delivered, the put that follows suspends with no
+        scope open and commits, and page 3's fetch does await and is cancelled.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=300)
+
+        async def _pages() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, ["p1 A"], is_last=False)
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            await asyncio.sleep(30)  # the fetch the expired deadline lands on
+            yield _spage(col, ["tail A"], is_last=True)
+
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _pages())
+        # Production always consumes page 1 (_begin_collection_enqueue's
+        # anext) before a drain exists; the tail starts from page 2.
+        await anext(resolved.pages)
+        mp = _collection_mp(music_bot, mock_ctx)
+        put_completed: list[int] = []
+
+        async def slow_put(items: Any, **kwargs: Any) -> bool:
+            # The suspension that matters: inside the old timeout scope this is
+            # exactly where the cancellation landed, between the deque and the
+            # mirror. sleep(0) is enough — the deadline is already past, so if a
+            # scope were open the very first yield to the loop would cancel it.
+            await asyncio.sleep(0)
+            put_completed.append(len(items))
+            return True
+
+        mp.queue_put = AsyncMock(side_effect=slow_put)
+        drain = _CollectionDrain(
+            resolved=resolved,
+            generation=0,
+            enqueued=100,
+            total=300,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            completion_notice=True,
+        )
+
+        with patch("src.musicbot._COLLECTION_DRAIN_TIMEOUT_SECS", -1.0):
+            await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        # Page 2's put ran to completion under an expired deadline; the budget
+        # then fired on the page-3 fetch, not mid-put.
+        assert put_completed == [100]
+        assert drain.enqueued == 200
+        await resolved.aclose()
+
+    async def test_rate_limited_tail_does_not_advise_rerunning(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The generic failure copy says "re-running will re-add the first N".
+        For a 429 that is the worst possible advice: the re-run refetches every
+        page from 1 and doubles the load that earned the limit."""
+        col = _scollection(SpotifyType.PLAYLIST, total=400)
+
+        async def _limited() -> AsyncGenerator[TrackPage]:
+            yield _spage(col, [f"T{i} A" for i in range(100)], is_last=False)
+            raise SpotifyRateLimitError(7.0)
+
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _limited())
+        mp = _collection_mp(music_bot, mock_ctx)
+        drain = _CollectionDrain(
+            resolved=resolved,
+            generation=0,
+            enqueued=100,
+            total=400,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+            completion_notice=True,
+        )
+
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert any("rate-limiting" in (d or "") for d in notices), notices
+        assert not any("Re-running" in (d or "") for d in notices), notices
+        await resolved.aclose()
+
+    async def test_midstream_failure_sends_honest_notice_and_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """H3 → (c): partial failure reports what landed and what a re-run
+        does. No resume machinery — resume-from-offset is unsound for
+        playlists (mutability shifts offsets)."""
+        col = _scollection(SpotifyType.PLAYLIST, total=300)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(200, 300)], is_last=True),
+        ]
+        resolved = SpotifyCollectionPager(SpotifyType.PLAYLIST, _sgen(pages, fail_at=2))
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        with pytest.raises(SpotifyAuthError):
+            await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        assert drain.enqueued == 200
+        final = mock_ctx.send.call_args_list[-1].kwargs["embed"].description
+        assert "Queued 200 of ~300" in final
+        assert "re-add the first 200" in final
+
+
+class TestShuffleSerialized:
+    async def test_shuffle_acquires_and_releases_the_slot(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        entry = _GuildEnqueueLock()
+        await entry.lock.acquire()
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
+        music_bot.get_mp = MagicMock(return_value=mp)
+        # The M1 guard shuffles only the guild's REGISTERED player.
+        music_bot.mps[mock_ctx.guild.id] = mp
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        music_bot._acquire_enqueue_slot.assert_awaited_once()
+        mp.queue_shuffle.assert_awaited_once()
+        assert not entry.lock.locked()  # released even on the happy path
+
+    async def test_slot_released_when_shuffle_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A leaked slot is forever: every later collection/-shuffle in the
+        guild eats the full wait timeout then declines."""
+        entry = _GuildEnqueueLock()
+        await entry.lock.acquire()
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock(side_effect=RuntimeError("boom"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        assert not entry.lock.locked()
+
+    async def test_shuffle_bails_when_player_torn_down_during_wait(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The wait can end BECAUSE of a teardown (cleanup() aborts the drain
+        holding the slot). Shuffling the popped player would rebuild the Redis
+        mirror from a dead snapshot — resurrecting a queue -stop deliberately
+        left persisted."""
+        entry = _GuildEnqueueLock()
+        await entry.lock.acquire()
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=entry)
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps.pop(mock_ctx.guild.id, None)  # cleanup() popped it mid-wait
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
+        assert not entry.lock.locked()
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list
+            if "embed" in c.kwargs
+        ]
+        assert any("while shuffle waited" in (n or "") for n in notices)
+
+    async def test_declined_shuffle_does_not_run(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._acquire_enqueue_slot = AsyncMock(return_value=None)
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
 
 
 class TestDebugCommand:

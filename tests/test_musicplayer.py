@@ -45,7 +45,7 @@ from src.musicplayer import (
     _requester_mention,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
-from src.sources import YTSource
+from src.sources import YTSource, spotify_titles_to_ytsearch
 from src.util import cancel_task, fmt_duration
 from src.youtube import NpHostRef, QueueObject, YTDL
 from tests.helpers import seed_queue, described, mocked, queue_object, stub_create_task
@@ -2740,6 +2740,15 @@ class TestMusicPlayerInitialState:
     def test_restore_task_is_none_before_start(self, music_player: MusicPlayer) -> None:
         assert music_player._restore_task is None
 
+    def test_the_queue_gets_the_bots_user_cache(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """GuildQueue holds a guild and no bot, so its second requester leg is
+        handed in. Unwired, restore_entries resolves a departed member's songs to
+        guild.owner while _resolve_requester keeps them on the member — one
+        restored snapshot, two requesters."""
+        assert music_player.queue._user_lookup == music_player.bot.get_user
+
 
 # ── RedisHelpers ──────────────────────────────────────────────────────────────
 
@@ -3218,6 +3227,108 @@ class TestQueuePutFront:
             await asyncio.sleep(0)
 
         mock_prefetch.assert_not_awaited()
+
+
+# ── Queue generation forwarding ───────────────────────────────────────────────
+
+
+class TestQueuePutGenerationForwarding:
+    """queue_put/queue_put_front must FORWARD expected_generation into the real
+    GuildQueue compare-and-put. This glue is pinned nowhere else: musicbot's
+    stream tests mock queue_put, and guild_queue's generation tests bypass
+    MusicPlayer — so silently dropping the forwarding kwarg would disable
+    streamed-collection preemption end-to-end (a cleared queue refilled by a
+    dead drain) with every other suite still green."""
+
+    async def test_stale_generation_put_refused_nothing_touched(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        assert music_player.store is not None
+        gen = music_player.queue.generation
+        music_player.queue.bump_generation()
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put(queue_obj, expected_generation=gen)
+            await asyncio.sleep(0)
+
+        assert ok is False
+        assert music_player.queue.qsize() == 0
+        assert music_player.queue.display_size() == 0
+        assert await fake_redis.lrange(music_player.store.queue_key(), 0, -1) == []
+        # A refused put spawns no prefetch for a song that was never queued.
+        mock_pf.assert_not_awaited()
+
+    async def test_current_generation_put_succeeds_and_prefetches(
+        self, music_player: MusicPlayer, queue_obj: QueueObject
+    ) -> None:
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put(
+                queue_obj, expected_generation=music_player.queue.generation
+            )
+            await asyncio.sleep(0)
+
+        assert ok is True
+        assert music_player.queue.qsize() == 1
+        mock_pf.assert_awaited_once()
+
+    async def test_stale_generation_put_front_refused_nothing_touched(
+        self,
+        music_player: MusicPlayer,
+        mock_author: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        assert music_player.store is not None
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
+        )
+        gen = music_player.queue.generation
+        music_player.queue.bump_generation()
+
+        with patch(
+            "src.musicplayer.YTDL.prefetch_stream", new_callable=AsyncMock
+        ) as mock_pf:
+            ok = await music_player.queue_put_front(
+                QueueObject("https://yt.com/v=new", "New", mock_author),
+                expected_generation=gen,
+            )
+            await asyncio.sleep(0)
+
+        assert ok is False
+        assert [queue_object(i).title for i in music_player.queue.display_items()] == [
+            "Old"
+        ]
+        stored = [
+            orjson.loads(raw)["title"]
+            for raw in await fake_redis.lrange(music_player.store.queue_key(), 0, -1)
+        ]
+        assert stored == ["Old"]
+        mock_pf.assert_not_awaited()
+
+    async def test_current_generation_put_front_lands_at_head(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        await music_player.queue_put(
+            QueueObject("https://yt.com/v=old", "Old", mock_author), prefetch=False
+        )
+
+        ok = await music_player.queue_put_front(
+            QueueObject("https://yt.com/v=new", "New", mock_author),
+            prefetch=False,
+            expected_generation=music_player.queue.generation,
+        )
+
+        assert ok is True
+        assert [queue_object(i).title for i in music_player.queue.display_items()] == [
+            "New",
+            "Old",
+        ]
 
 
 # ── Ask-time analytics ────────────────────────────────────────────────────────
@@ -4102,6 +4213,121 @@ class TestResolveSource:
             )
         assert isinstance(result, QueueObject)
         assert result.title == "Resolved"
+
+
+# ── ResolveRequester ──────────────────────────────────────────────────────────
+
+
+class TestResolveRequester:
+    """A collection's tracks resolve minutes to an hour after the command that
+    queued them returned, by which time _last_author is whoever typed most
+    recently. These cover the four ways the stored ID lands."""
+
+    @staticmethod
+    def _member(id_: int) -> MagicMock:
+        m = MagicMock(spec=discord.Member)
+        m.id = id_
+        return m
+
+    async def test_stored_requester_beats_last_author(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        queuer = self._member(424242424242424242)
+        music_player._guild.get_member = MagicMock(return_value=queuer)
+        music_player._last_author = mock_author
+
+        fake_qobj = QueueObject("https://yt.com/v=1", "Resolved", queuer)
+        yt_source = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
+            await music_player._resolve_source(
+                YTSource(ytsearch="ytsearch:test", requester_id=424242424242424242)
+            )
+
+        assert yt_source.await_args is not None
+        assert yt_source.await_args.args[0] is queuer
+
+    def test_absent_id_falls_back_to_last_author(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        # The compatibility path: entries queued before the field existed.
+        music_player._last_author = mock_author
+        assert music_player._resolve_requester(None) is mock_author
+
+    def test_departed_member_resolves_through_the_user_cache(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Leaving the guild mid-queue must not reassign someone's plays."""
+        gone = MagicMock(spec=discord.User)
+        gone.id = 424242424242424242
+        music_player._guild.get_member = MagicMock(return_value=None)
+        music_player.bot.get_user = MagicMock(return_value=gone)
+        music_player._last_author = mock_author
+
+        assert music_player._resolve_requester(424242424242424242) is gone
+
+    def test_unresolvable_id_falls_back_rather_than_raising(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        music_player._guild.get_member = MagicMock(return_value=None)
+        music_player.bot.get_user = MagicMock(return_value=None)
+        music_player._last_author = mock_author
+
+        assert music_player._resolve_requester(424242424242424242) is mock_author
+
+    async def test_survives_the_restart_that_caused_the_incident(
+        self,
+        music_player: MusicPlayer,
+        mock_guild: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """2026-08-07: a 22-track album queued by one user restarted 24s later and
+        played entirely as someone else. The full path — enqueue, serialize, a NEW
+        player whose _last_author is a different person, restore, resolve.
+
+        Deliberately end-to-end rather than four unit assertions: every leg of it
+        was individually plausible and the chain was what broke.
+        """
+        queuer = self._member(424242424242424242)
+        mock_guild.get_member = MagicMock(return_value=queuer)
+
+        # The album is queued and mirrored to Redis.
+        await music_player.queue_put(
+            spotify_titles_to_ytsearch(
+                ["Fukk A Interview Future"],
+                queuer.id,
+                analytics=ANALYTICS_ZERO,
+                origin="https://open.spotify.com/album/abc123",
+            ),
+            prefetch=False,
+        )
+
+        # Restart: a fresh player, built by whoever's command brought the bot back.
+        someone_else = self._member(146503163363459072)
+        revived = MusicPlayer(
+            music_player.bot, mock_guild, music_player._channel, music_player._cog
+        )
+        revived._last_author = someone_else
+        revived.store = music_player.store
+
+        # Read the mirror back exactly as restore does — the entry the new player
+        # sees is bytes off Redis, not the object that was queued.
+        store = music_player.store
+        assert store is not None
+        raw = await fake_redis.lrange(store.queue_key(), 0, -1)
+        entries = [e for e in map(parse_queue_entry, raw) if e is not None]
+        assert await revived.queue.restore_entries(entries) == 1
+
+        restored = revived.queue.display_items()[0]
+        assert isinstance(restored, YTSource)
+
+        yt_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Fukk A Interview", queuer)
+        )
+        with patch("src.musicplayer.YTDL.yt_source", new=yt_source):
+            await revived._resolve_source(restored)
+
+        assert yt_source.await_args is not None
+        assert yt_source.await_args.args[0] is queuer
 
 
 # ── StreamSource ──────────────────────────────────────────────────────────────
@@ -7873,7 +8099,7 @@ class TestInterject:
         mock_vc: MagicMock,
     ) -> None:
         """-play on a paused song means "stop being paused, play this" — the
-                interrupted song comes back PLAYING at its pause position
+                interrupted song comes back playing at its pause position
         ."""
         live_song.elapsed_secs = 30.0
         music_player.current_song = live_song
@@ -8205,6 +8431,26 @@ class TestInterject:
 
         assert attrs["interject.depth"] == 1
         assert attrs["interject.over_interjection"] is True
+
+    async def test_the_resume_tail_keeps_the_interjected_marker(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The tail is the same play, so a song that was itself a -playnow comes
+        back saying so. Attribution-only today: the span above reads it at the
+        second and later levels of a stack."""
+        live_song.elapsed_secs = 30.0
+        live_song.interjected = True
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        tail = queue_object(music_player.queue.display_items()[-1])
+        assert tail.is_resume is True
+        assert tail.interjected is True
 
     async def test_the_marker_is_taken_before_the_insert_await(
         self,

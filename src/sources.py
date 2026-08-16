@@ -47,6 +47,7 @@ def normalize_query_host(host: str) -> str:
 class SpotifyType(Enum):
     TRACK = "track"
     PLAYLIST = "playlist"
+    ALBUM = "album"
 
 
 class YTType(Enum):
@@ -87,7 +88,7 @@ class YTSource:
     video_id: Optional[str] = None
     # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
     # this resolves into. Parse-layer minting leaves the zero value — the real
-    # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
+    # one arrives per-track in spotify_titles_to_ytsearch, or rides the
     # yt_source/yt_playlist call for sources resolved directly.
     #
     # CONTRACT: the default is for the PARSE layer, which runs before the mint.
@@ -105,6 +106,12 @@ class YTSource:
     # (as SearchQueueEntry), so a lazily-resolved Spotify track still archives as
     # Spotify rather than as the YouTube URL it resolves into.
     query_source: str = ""
+    # Who asked for this track. An ID, not a Member: this module is discord-free,
+    # and a live member could not survive the Redis round-trip anyway. None on the
+    # parse-time sources, which resolve inside the command that built them, and on
+    # entries queued before this field existed — both fall back to _last_author,
+    # which is what they have always resolved to.
+    requester_id: Optional[int] = None
 
     @property
     def playlist_url(self) -> str:
@@ -137,19 +144,25 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_playlist_to_ytsearch(
-    titles: list[str], *, analytics: Analytics, origin: str
+def spotify_titles_to_ytsearch(
+    titles: list[str], requester_id: int, *, analytics: Analytics, origin: str
 ) -> list[YTSource]:
-    """Spotify playlist tracks as lazy YouTube searches. The Spotify token, the
-    ask-time analytics and `origin` are set here because it is the last point that
-    knows where these came from — each resolves to a YouTube URL at dequeue.
+    """Spotify album or playlist tracks as lazy YouTube searches. The Spotify token,
+    the requester, the ask-time analytics and `origin` are set here because it is
+    the last point that knows where these came from — each resolves to a YouTube
+    URL at dequeue, minutes to an hour after the command that asked for it returned.
     `analytics` is the head's; per-track positions are derived from it, as in
-    yt_playlist. `origin` is the album/playlist link the user pasted."""
+    yt_playlist. `origin` is the collection link the user pasted.
+
+    requester_id is required rather than defaulted on purpose: a caller that omits
+    it silently attributes every track to whoever ran a command most recently,
+    which is exactly the defect this parameter exists to close."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
+            requester_id=requester_id,
             analytics=replace(analytics, queue_position=analytics.queue_position + i),
             user_input=origin,
         )
@@ -170,12 +183,30 @@ def _playlist_index(raw: str) -> Optional[int]:
     return value if value >= 1 else None
 
 
+class UnsupportedSpotifyLinkError(Exception):
+    """A Spotify URL naming a type this bot does not queue (/artist/, /show/, …).
+
+    Deliberately not a ValueError: parse_input catches ValueError and falls back
+    to a YouTube search, which would turn an /artist/ link into a nonsense
+    `ytsearch:https://open.spotify.com/...` query instead of an error the user
+    can act on.
+    """
+
+    @property
+    def user_message(self) -> str:
+        """The message is already written for the user; exposing it under the
+        name _command_error's allowlist renders keeps the embed free of the
+        `**UnsupportedSpotifyLinkError:**` class-name prefix."""
+        return str(self)
+
+
 def parse_url(
     url: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
-    """Parse a URL into a source dataclass. Raises ValueError if no domain matches.
-    `message` is the full message content. domain regex groups: 1/2 = http/www prefix,
-    3 = domain, 4 = path."""
+    """Parse a URL into a source dataclass. Raises ValueError if no domain matches,
+    and UnsupportedSpotifyLinkError for a Spotify link type the bot does not queue
+    (not a ValueError — see that class's docstring). `message` is the full message
+    content. domain regex groups: 1/2 = http/www prefix, 3 = domain, 4 = path."""
     domain_re = r"(https:\/\/)?(www\.)?([\w+|\.]+)\/([^?]*)"
     args_re = r"(\?|\&)([^=]+)\=([^&]+)"
 
@@ -215,10 +246,30 @@ def parse_url(
         return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
+        # Spotify's web player and mobile share sheet prefix a locale segment
+        # (/intl-de/album/…) for every non-English client. It carries no
+        # routing information — drop it, or the share URL half the world copies
+        # is rejected while the hand-trimmed one works.
+        if path and path[0].startswith("intl-"):
+            path = path[1:]
+        kind = path[0] if path else ""
         try:
-            spotify_type = SpotifyType(path[0])
+            spotify_type = SpotifyType(kind)
         except ValueError:
-            raise Exception(f"Unknown Spotify track type: {path}")
+            values = [t.value for t in SpotifyType]
+            supported = ", ".join(values[:-1]) + f" or {values[-1]}"
+            # `from None`: the ValueError above is an implementation detail of
+            # the enum lookup; chaining it turns the user-facing error into a
+            # two-traceback log entry (the exact noise the incident log shows).
+            raise UnsupportedSpotifyLinkError(
+                f"Spotify {kind!r} links aren't supported — try a {supported} link"
+            ) from None
+        if len(path) < 2 or not path[1]:
+            # A bare /album or /intl-de/track: the type without an id. The
+            # IndexError this used to raise rendered as a stack trace.
+            raise UnsupportedSpotifyLinkError(
+                f"That Spotify {kind} link has no id — copy the full link"
+            ) from None
         log.info(f"Spotify source ID: {path[1]}")
         return SpotifySource(spotify_type, path[1], process=True)
     elif domain in ("soundcloud.com",):

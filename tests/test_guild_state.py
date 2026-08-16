@@ -453,10 +453,20 @@ _GOLDEN_YTSOURCE = (
     + _ENQUEUE_STAMPS_ZERO
     + b","
     + _QUERY_SOURCE_UNKNOWN
-    + b"}"
+    + b',"requester_id":null}'
 )
 # Written before the enqueue stamps existed: the reader defaults both to 0.
 _GOLDEN_YTSOURCE_PRE_STAMPS = b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null}'
+# Written before searches carried a requester — the shape every entry queued
+# before this build has. requester_id must read back as None, not 0: the resolve
+# path routes None to the fallback requester and 0 to member 0, which is nobody.
+_GOLDEN_YTSOURCE_PRE_REQUESTER = (
+    b'{"type":"ytsource","ytsearch":"ytsearch:some song","url":null,"process":true,"ts":null,'
+    + _ENQUEUE_STAMPS_ZERO
+    + b","
+    + _QUERY_SOURCE_UNKNOWN
+    + b"}"
+)
 
 _FULL_ENTRY = SongQueueEntry(
     webpage_url="https://yt.com/v=1",
@@ -713,6 +723,27 @@ class TestSearchQueueEntryWire:
         assert isinstance(parsed, SearchQueueEntry)
         assert (parsed.queued_at, parsed.queue_position) == (1752530000.5, 7)
 
+    def test_requester_round_trips_through_the_lazy_resolve(self) -> None:
+        # The leg that keeps an album attributed to whoever queued it: these
+        # entries sit unresolved for as long as the collection is long, and the
+        # resolve at dequeue has no other record of who asked.
+        source = YTSource(ytsearch="ytsearch:x", requester_id=424242424242424242)
+        entry = SearchQueueEntry.from_ytsource(source)
+        parsed = parse_queue_entry(entry.to_redis())
+        assert isinstance(parsed, SearchQueueEntry)
+        assert parsed.requester_id == 424242424242424242
+
+    def test_from_ytsource_without_requester_stays_none(self) -> None:
+        entry = SearchQueueEntry.from_ytsource(YTSource(ytsearch="ytsearch:x"))
+        assert entry.requester_id is None
+
+    def test_reader_parses_pre_requester_entry_as_none(self) -> None:
+        # Not 0: absent means no requester was ever recorded, which is what sends
+        # the entry to the fallback rather than to member 0.
+        entry = parse_queue_entry(_GOLDEN_YTSOURCE_PRE_REQUESTER)
+        assert isinstance(entry, SearchQueueEntry)
+        assert entry.requester_id is None
+
 
 class TestParseQueueEntryCorrupt:
     @pytest.mark.parametrize(
@@ -726,6 +757,19 @@ class TestParseQueueEntryCorrupt:
     def test_corrupt_entry_dropped_with_warning(
         self, raw: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
+        with caplog.at_level(logging.WARNING, logger="src.guild_state"):
+            assert parse_queue_entry(raw) is None
+        assert "corrupt queue entry" in caplog.text
+
+    def test_song_without_requester_is_still_corrupt(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Searches relaxed requester_id to Optional; songs did NOT. A resolved
+        song has always had one by the time it is written, so a missing field
+        there is a corrupt entry, not a pre-feature one."""
+        raw = (
+            b'{"type":"qobj","webpage_url":"https://yt.com/v=1","title":"No Requester"}'
+        )
         with caplog.at_level(logging.WARNING, logger="src.guild_state"):
             assert parse_queue_entry(raw) is None
         assert "corrupt queue entry" in caplog.text
