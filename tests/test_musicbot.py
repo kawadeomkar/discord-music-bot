@@ -3624,6 +3624,48 @@ class TestPlayWhilePaused:
         # this song played immediately when it waited behind the whole queue.
         assert qobj.analytics.queue_position == 9
 
+    async def test_a_resume_mid_resolve_still_queues_the_rest_of_the_playlist(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The append path has a playlist behind it too, and dropping it is silent.
+
+        A `-resume` landing during the extraction turns the interjection into an
+        ordinary append — but the head arrived with the rest of its playlist, and
+        without this the tail is discarded with no error, no log line, and a reply
+        that says the song was queued. The tracks follow the head to the tail rather
+        than front-inserting: the head just went to the back of the queue, and the
+        playlist belongs behind it either way."""
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        music_bot._enqueue_single = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+        url = "https://www.youtube.com/playlist?list=PLabc"
+
+        async def _resolve_then_resume(*a: Any, **kw: Any) -> None:
+            vc.is_paused.return_value = False  # user hit -resume mid-extraction
+            return None
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+            patch.object(
+                YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
+            ),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        mp.interject.assert_not_awaited()
+        single_call = music_bot._enqueue_single.await_args
+        assert single_call is not None
+        assert single_call.args[1] is tracks[0]
+        mp.queue_put.assert_awaited_once_with(tracks[1:], prefetch=False)
+
     async def test_resolution_failure_leaves_paused_song_untouched(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -3750,6 +3792,41 @@ class TestPlayFrontInsertion:
         music_bot._enqueue_single.assert_not_awaited()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
         mp.repark_crashed_head.assert_awaited_once()
+
+    async def test_a_cold_start_beats_the_next_flag_to_the_placement(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`-p --next` on a disconnected bot is a COLD_FRONT, not a NEXT.
+
+        Both front-insert, so the queue ends up the same either way and the
+        difference is entirely in the reply: COLD_FRONT sends the resume notice,
+        which is the ONLY thing naming the song about to start (the gate is still
+        shut, so there is no Now Playing block yet), while NEXT would send "Playing
+        next" — true of nothing here, since the song is what plays. The precedence
+        is one `if`/`elif` ordering and nothing else pins it."""
+        mock_ctx.voice_client = None
+        fake_qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+        music_bot.queue_source = AsyncMock(return_value=fake_qobj)
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro: Any) -> asyncio.Future[None]:
+            coro.close()
+            mock_ctx.voice_client = _connected_vc()  # what a real join leaves
+            return join_task
+
+        with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="--next test"
+            )
+
+        single_call = music_bot._enqueue_single.await_args
+        assert single_call is not None
+        assert single_call.kwargs["placement"] is Placement.COLD_FRONT
 
     async def test_cold_path_queues_nothing_when_the_restore_never_lands(
         self, music_bot: MusicBot, mock_ctx: MagicMock
