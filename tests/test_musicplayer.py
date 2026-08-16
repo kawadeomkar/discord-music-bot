@@ -90,6 +90,7 @@ def mock_song() -> MagicMock:
     # TypeError there, exactly as a MagicMock title would.
     song.analytics = ANALYTICS_ZERO
     song.query_source = ""
+    song.user_input = None
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
     song.played_at = 0.0
@@ -5997,6 +5998,7 @@ class TestLoop:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
@@ -7159,6 +7161,7 @@ class TestLoopAdditional:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
