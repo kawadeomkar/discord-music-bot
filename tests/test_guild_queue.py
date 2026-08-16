@@ -887,6 +887,15 @@ class TestRemoveMatcher:
     def _song(self, url: str, origin: str | None) -> QueueObject:
         return QueueObject(url, "Song", MagicMock(), user_input=origin)
 
+    def test_an_empty_needle_matches_nothing(self) -> None:
+        """An unresolved search carries url=None, which the resolved leg reads as
+        "" — so an empty needle compares equal to it and `-remove` takes out every
+        lazily-queued Spotify track in the guild."""
+        match = remove_matcher("")
+        assert match(YTSource(ytsearch="ytsearch:a song")) is None
+        assert match(self._song("https://yt.com/v=1", "")) is None
+        assert match(self._song("", None)) is None
+
     def test_resolved_url_still_matches(self) -> None:
         item = self._song("https://yt.com/v=1", "some search")
         assert remove_matcher("https://yt.com/v=1")(item) is RemoveMode.RESOLVED
@@ -928,6 +937,29 @@ class TestRemoveMatcher:
     def test_unrelated_needle_matches_nothing(self) -> None:
         item = self._song("https://yt.com/v=1", "some search")
         assert remove_matcher("something else")(item) is None
+
+
+class TestAngleBracketedLinks:
+    """Discord wraps a link in <> when a user suppresses its embed, so
+    `-remove <https://youtu.be/x>` is an ordinary thing to paste back.
+
+    _normalize stripped them for the FOLD, so an origin match worked — but the
+    resolved leg compared literally and never saw the stripping, so the bracketed
+    form could only ever match by origin. An entry queued through a playlist
+    expansion carries the collection link as its origin, not the track URL, so for
+    those it matched nothing at all."""
+
+    def test_the_resolved_leg_sees_through_the_brackets(
+        self, mock_author: MagicMock
+    ) -> None:
+        item = _qobj(1, mock_author)  # user_input is None: origin cannot match
+        assert item.user_input is None
+        match = remove_matcher(f"<{item.webpage_url}>")
+        assert match(item) is RemoveMode.RESOLVED
+
+    def test_a_bare_link_still_matches(self, mock_author: MagicMock) -> None:
+        item = _qobj(1, mock_author)
+        assert remove_matcher(item.webpage_url)(item) is RemoveMode.RESOLVED
 
 
 class TestRemove:

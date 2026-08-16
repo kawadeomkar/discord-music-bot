@@ -34,6 +34,7 @@ See docs/ARCHITECTURE.md#queue-invariant.
 
 import asyncio
 import random
+import re
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -91,26 +92,59 @@ class RemoveMode(StrEnum):
     ORIGIN = "origin"  # what the user typed: a search term, or a source link
 
 
-# One queue item → the mode it matched under, or None. Built by remove_matcher().
+# One queue item → the mode it matched under, or None. Built by remove_matcher();
+# remove() only applies it, so the policy stays testable without a queue.
 RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
+
+
+# A link, for folding purposes: a scheme, or a bare dotted host that parse_url
+# also accepts (`-play youtu.be/X` is an ordinary input). Angle brackets are
+# stripped first because Discord adds them when suppressing an embed.
+_LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
 
 
 def _normalize(s: str) -> str:
     """Fold a needle for comparison: collapse whitespace, and casefold anything
-    that is not a URL. Links keep their case — the ids inside them are
-    case-sensitive, so folding one would match a different album."""
-    s = " ".join(s.split())
-    return s if s[:8].lower().startswith(("http://", "https:/")) else s.casefold()
+    that is not a link. Links keep their case because IDs inside them are
+    case-sensitive — a casefolded Spotify base62 id would let ".../playlist/AbC"
+    match a different playlist's ".../playlist/abc".
+
+    Free text folds under casefold(), which maps some distinct strings together
+    (strasse/straße, U+212A/k). Two searches differing only that way remove each
+    other; accepted, because the alternative is a fold that fails on ordinary
+    case differences, which is what people actually retype."""
+    s = " ".join(s.split()).strip("<>")
+    return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
 
 def remove_matcher(needle: str) -> RemoveMatcher:
-    """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
-    first, then what the user typed. An origin match takes out every item sharing
-    it, so one album link removes the tracks it queued. Links compare literally —
-    youtu.be/x does not match an entry stored as youtube.com/watch?v=x."""
+    """Match a queue item against one `-remove` argument, by resolved URL or by
+    what the user typed, whichever hits.
+
+    The union rather than a mode flag: the two are disjoint in practice — a
+    resolved yt-dlp URL is not something anyone types to queue with — so
+    `-remove <anything>` does the right thing with no syntax to learn. RESOLVED is
+    tried first, which keeps every removal that worked before working the same way.
+
+    Matching an origin removes every item sharing it, which is the point: one
+    album or playlist link takes back out exactly the tracks it put in. Links are
+    compared literally, so youtu.be/x will not match an entry stored as
+    youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
+    # Angle brackets go for BOTH legs, not just the fold: Discord adds them when a
+    # user suppresses a link's embed, so `-remove <https://youtu.be/x>` is an
+    # ordinary thing to paste — and without this the resolved leg compared the
+    # bracketed form literally and could only ever match by origin.
+    # The strip() is belt-and-braces: Command.transform already strips a
+    # consume-rest argument, but this is reachable from tests and other callers.
+    needle = needle.strip().strip("<>")
     folded = _normalize(needle)
 
     def match(item: QueueItem) -> Optional[RemoveMode]:
+        if not needle:
+            # An unresolved search has url=None, which an empty needle would match
+            # as "" and take out every Spotify-playlist track. Unreachable through
+            # discord.py today, one parser change from live.
+            return None
         resolved = (
             item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
         )
@@ -124,7 +158,7 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     return match
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RemoveOutcome:
     """What remove() took out. The positions are what the command reports; the
     items exist because a removed entry may be a played song whose only remaining
@@ -132,7 +166,9 @@ class RemoveOutcome:
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
-    # ORIGIN when anything matched on what the user typed; None when nothing did.
+    # ORIGIN when anything matched on what the user typed rather than the resolved
+    # URL — the case where one argument removes many songs, so the reply says so.
+    # None when nothing matched.
     mode: Optional[RemoveMode] = None
 
 
