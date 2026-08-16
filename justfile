@@ -531,6 +531,15 @@ services:
         docker compose up -d redis
     fi
 
+# Answers "what would the bot actually play for this?" with the real stream opts —
+# selected format, the ladder it chose from, and the fallback candidates the retry
+# would walk. Run it at every yt-dlp bump: the repo's claims about format selection
+# are empirical, and both YouTube and yt-dlp move under them.
+[doc('Print the format yt-dlp selects and the fallback ladder for a URL')]
+[group('dev')]
+ytdl-formats URL: (_tools 'python')
+    {{ VENV_BIN }}/python -m src.ytdl_formats {{ quote(URL) }}
+
 # Escape hatch for compose commands this file does not wrap, with the archive
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.
 # A raw `docker compose` still works — it just never deploys the archive tier.
