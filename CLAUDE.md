@@ -500,9 +500,15 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
 - Every mirror write goes through `_write_mirror(items, *, removed=())`, which owns the
   rebuild / DELETE / LREM choice. Empty means DELETE, never skip. **Only a removal may
   pass `removed`** — LREM asserts the survivors kept their order, which is false for a
-  shuffle or an insert — and only below `_LREM_MAX_ENTRIES` (200; the measured crossover
-  against a real server is ~270, and the ~40 an earlier fakeredis estimate gave is wrong
-  because a pipeline there costs what its commands cost).
+  shuffle or an insert. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (32),
+  `_claimed_blobs()`, and a short-count fallback. **The count is the bound that
+  matters**: LREM is `O(position)`, so N of them cost `O(N × depth)` against a
+  rebuild's `O(depth)` — the depth cancels and the crossover is a COUNT, measured
+  near 86 asymptotically and near 50 at depth 40k. It is NOT a ratio; an earlier
+  revision said it was and admitted 200-entry LREMs that measured 638ms inside one
+  MULTI/EXEC, which stalls every guild, not just the one removing. A test pins the
+  value (`≤ 48`) because the other tests size their input from the constant and
+  move with it.
 - `remove()` takes a **predicate**, and `remove_matcher()` beside the class owns the
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
   casefolds — folding a link would let one Spotify album's base62 id match another's.

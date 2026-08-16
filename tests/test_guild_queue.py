@@ -276,13 +276,15 @@ class TestSmallSurfacesThatNothingElseCovers:
         await gq_no_redis.put([QueueObject(url, "Tail", mock_author, is_resume=True)])
         assert gq_no_redis.has_resume_tail(url) is True
 
-    async def test_a_large_removal_from_a_short_queue_rebuilds(
+    async def test_a_large_share_of_a_short_queue_still_lrems(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """The ratio gate. A rebuild scales with what SURVIVES, so dropping most
-        of a short queue is cheaper to rewrite than to LREM one entry at a time —
-        measured 4.7ms against 0.8ms at depth 250 dropping 200. Under the absolute
-        cap alone this took the LREM path."""
+        """Share is not what the choice turns on. Eight LREMs against a depth of
+        nine is eight short scans; the rebuild they were compared against is the
+        one that rewrites every survivor. A ratio gate sent this to a rebuild and,
+        at the other end of the same curve, sent 200 LREMs at depth 40k into one
+        MULTI — 638ms of a single-threaded server, stalling every guild. What
+        bounds the LREM path is the COUNT, and eight is far inside it."""
         album = "https://open.spotify.com/playlist/big"
         await gq.put(
             [
@@ -306,7 +308,7 @@ class TestSmallSurfacesThatNothingElseCovers:
         outcome = await gq.remove(remove_matcher(album))
 
         assert len(outcome.positions) == 8  # 8 dropped, 1 survivor
-        assert calls == ["rebuild_queue"]
+        assert calls == ["remove_queue_entries"]
 
 
 class TestReleaseVsFinishFailedDequeue:
@@ -411,11 +413,11 @@ class TestLremFallsBackWhenItCannotBeTrusted:
         item, but LREM cannot see that rule — so with a byte-identical twin it
         would eat the entry awaiting a commit-time LPOP.
 
-        SIZED to clear both numeric gates: one dropped against six survivors
-        satisfies the share gate (1 x _LREM_MAX_SHARE <= 6) and the entry cap, so
-        _claimed_blobs is the only clause left to force the rebuild. At three items
-        the share gate was already false and `and` short-circuited before the guard
-        was ever called — the test passed without reaching what it names."""
+        SIZED so the entry cap is satisfied and _claimed_blobs is the only clause
+        left to force the rebuild. Under the ratio gate this test carried before,
+        three items and one dropped made that clause false and `and` short-circuited
+        before the guard was ever called — it passed without reaching what it
+        names."""
         first, second = _qobj(1, mock_author), _qobj(1, mock_author)
         fillers = [_qobj(n, mock_author) for n in range(2, 7)]
         await gq.put([first, *fillers, second])
@@ -1916,8 +1918,9 @@ class TestMirrorWriteChoice:
     async def test_a_small_removal_lrems(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
     ) -> None:
-        """Small against the SURVIVORS, not in absolute terms — the gate is a
-        ratio, because a rebuild's cost scales with what it rewrites."""
+        """Small in absolute terms. LREM is O(position), so N of them cost
+        O(N x depth) against a rebuild's O(depth) — the depth cancels and what is
+        left to gate on is the COUNT."""
         await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
         calls = self._spy(store)
 
@@ -1947,6 +1950,16 @@ class TestMirrorWriteChoice:
 
         assert len(outcome.positions) == _LREM_MAX_ENTRIES + 1
         assert calls == ["rebuild_queue"]
+
+    def test_the_entry_cap_stays_under_the_measured_crossover(self) -> None:
+        """Pinned by VALUE, because every other test here sizes its input off the
+        constant and would move with it. Measured against a real redis-server:
+        LREM_ms ~ 4.4e-5 x drop x depth against rebuild_ms ~ 3.8e-3 x depth, so the
+        crossover is near 86 asymptotically and near 50 at depth 40k. Above that
+        band the LREMs run inside one MULTI/EXEC on a single-threaded server and
+        stall EVERY guild — 638ms at depth 40k, with an unrelated PING measuring
+        591ms against a 2.5ms idle baseline."""
+        assert _LREM_MAX_ENTRIES <= 48
 
     async def test_removing_everything_deletes_the_key(
         self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock

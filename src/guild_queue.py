@@ -63,20 +63,21 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
-# When the pipelined LREMs cost more than rewriting the list. Measured on
-# redis:7-alpine: a rebuild scales with what SURVIVES (0.77ms at 50, 3.75ms at
-# 800, 24.5ms at 4800) while LREM scales with what goes, so the crossover is a
-# RATIO, not a count — near drop = survivors / 4. At depth 250 dropping 200 the
-# ratio gate is what matters: LREM measures 4.7ms against a 0.8ms rebuild. One
-# in five is where every measured point falls on the right side; the true
-# crossover is a band, not a line.
+# When the pipelined LREMs cost more than rewriting the list. LREM is O(position),
+# so N of them cost O(N x depth) against a rebuild's O(depth): the depth CANCELS
+# and the crossover is a COUNT. Measured against a real redis-server with
+# production-sized blobs, LREM_ms ~ 4.4e-5 x drop x depth against rebuild_ms ~
+# 3.8e-3 x depth, putting the crossover near drop = 86 asymptotically and near 50
+# at depth 40k. 32 sits clear of the low end of that band.
 #
-# The absolute cap is a second bound for deep queues, where a quarter of the
-# survivors is still hundreds of round-trip-free LREMs. NOT the ~40 an earlier
-# estimate gave: that came from fakeredis, where a pipeline costs what its
-# commands cost rather than one round trip.
-_LREM_MAX_ENTRIES = 200
-_LREM_MAX_SHARE = 5
+# It is NOT a ratio. An earlier revision read the curve as one and gated on
+# drop <= survivors / 5, which scales the LREM count WITH the depth — exactly the
+# wrong direction. At depth 40k it admitted 200 LREMs measuring 638ms against a
+# 161ms rebuild, held in ONE MULTI/EXEC: Redis is single-threaded and does not
+# yield inside it, so an unrelated PING measured 591ms against a 2.5ms idle
+# baseline. That stalls every guild, not just the one removing. It also REJECTED
+# real wins — 18 dropped from a depth of 100 measures 0.68x a rebuild.
+_LREM_MAX_ENTRIES = 32
 
 
 class ShuffleOutcome(Enum):
@@ -681,9 +682,9 @@ class GuildQueue:
 
         `removed` is the LREM shortcut, and only a removal may pass it: it says the
         survivors kept their order, which is false for shuffle and for any insert.
-        Worth it because a rebuild rewrites every survivor while LREM touches only
-        what goes — so it wins on a small removal from a long queue and loses on a
-        large one from a short queue, which is what the ratio gate reads.
+        Worth it below _LREM_MAX_ENTRIES and not above: a rebuild rewrites every
+        survivor once, while N LREMs each scan for their own entry, so the depth
+        cancels out of the comparison and what is left is the COUNT.
 
         The shortcut is guarded twice, because LREM matches on exact bytes and the
         rest of the codebase does not promise them. It is skipped outright when a
@@ -704,7 +705,6 @@ class GuildQueue:
         if (
             dropped
             and len(dropped) <= _LREM_MAX_ENTRIES
-            and len(dropped) * _LREM_MAX_SHARE <= survivors
             and not self._claimed_blobs(dropped)
         ):
             if await self._store.remove_queue_entries(dropped) == len(dropped):
