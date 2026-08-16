@@ -185,9 +185,17 @@ HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
 # per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
 
-# How long a cold-start command (-play, -resume) waits for its restore. Generous for
-# one pipelined read; bounded because the pool sets no socket_timeout, so a server
-# that accepts the connection then stalls would hang the command outright.
+# How long a command that touches the queue waits for this guild's restore.
+# Generous for one pipelined read; bounded because the pool sets no socket_timeout,
+# so a server that accepts the connection then stalls would hang the command
+# outright.
+#
+# Six call sites: -play (warm and cold), -resume, -shuffle, -clear and -remove.
+# The cold-start pair must not INSERT against an unread snapshot — restore_entries()
+# appends, so a put() landing first leaves the deque holding the new song ahead of
+# entries Redis lists behind it, and every later commit-time LPOP then retires the
+# wrong one. The other four must not REBUILD the mirror from an unfilled deque,
+# which deletes the saved queue outright. Tuning this bound tunes both.
 RESTORE_WAIT_SECS = 5.0
 
 
@@ -2447,10 +2455,21 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
-            async with background_typing(ctx):
+            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
+            # so running it before restore_entries() has replayed the saved queue
+            # writes an unrestored deque over it and deletes the persisted entries
+            # outright. Alone it merely reported "at least 4 songs" against a queue
+            # it could not see; combined with an enqueue it destroys one.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
                 await ctx.send(
-                    embed=notice_embed("Please wait... shuffling", discord.Color.blue())
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
                 )
+                return
+            async with background_typing(ctx):
                 # Shuffle waits for an in-flight collection drain because it needs
                 # the complete collection — run mid-stream it reorders only the
                 # pages that arrived, and the tail then appends in order behind it,
@@ -2473,6 +2492,11 @@ class MusicBot(commands.Cog):
                             )
                         )
                         return
+                    await ctx.send(
+                        embed=notice_embed(
+                            "Please wait... shuffling", discord.Color.blue()
+                        )
+                    )
                     msg = await mp.queue_shuffle()
                     await ctx.message.add_reaction("🔀")
                     await ctx.send(embed=notice_embed(msg, discord.Color.blue()))
