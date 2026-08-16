@@ -7026,6 +7026,98 @@ class TestLoop:
         ):
             await music_player.loop()
 
+    async def test_the_handler_waits_for_the_prefetch_it_cancelled(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+    ) -> None:
+        """The outer handler awaits the cancel rather than firing and forgetting.
+
+        An unawaited cancel leaves the prefetch's requeue_front to whatever awaits
+        next, and two live claims settle by POSITION — so each takes the other's
+        song. Today the awaits that follow happen to give the cancelled task its
+        turn, which is why swapping the two leaves the queue in the same state; what
+        is pinned here is the guarantee itself, that the prefetch is SETTLED before
+        the handler moves on, rather than that incidental scheduling."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=RuntimeError("boom"))
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        hung = asyncio.create_task(asyncio.sleep(30))
+        music_player._prefetch_task = hung
+        settled: list[bool] = []
+
+        async def _record(_self: MusicPlayer) -> None:
+            settled.append(hung.done())
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "_cancel_progress_task", new=_record),
+        ):
+            await music_player.loop()
+
+        assert settled == [True]
+
+    async def test_a_song_queued_after_a_clear_still_plays(
+        self,
+        music_player: MusicPlayer,
+        mock_song: MagicMock,
+        mock_author: MagicMock,
+    ) -> None:
+        """queue_get() parks, and a -clear during that wait bumps the generation.
+        The commit generation is re-read AFTER the wait for exactly this reason: the
+        item finally handed out came from the queue as it is NOW, so comparing it
+        against a sample taken before the wait voids a dequeue that is perfectly
+        valid — the song queued after the clear is discarded without playing, with
+        no error and no log line."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        queued_after = QueueObject("https://yt.com/v=after", "After", mock_author)
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queued_after)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            runner = asyncio.create_task(music_player.loop())
+            await asyncio.sleep(0)  # park it inside queue_get()
+            await music_player.queue.clear()
+            await music_player.queue.put([queued_after])
+            await runner
+
+        vc.play.assert_called_once()
+
     async def test_a_crash_recovered_head_never_lpops_a_queued_song(
         self,
         music_player: MusicPlayer,

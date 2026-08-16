@@ -2649,9 +2649,10 @@ class MusicPlayer:
                     # item through requeue_front, and an unawaited cancel leaves that
                     # to whatever awaits next. Two live claims settle by POSITION, so
                     # each would take the other's song. The awaits below happen to
-                    # give the cancelled task its turn, which is why no test can
-                    # tell the two apart — this makes the ordering a guarantee rather
-                    # than a side effect of them.
+                    # give the cancelled task its turn, so swapping the two leaves
+                    # the queue in the same state — what the test pins is the
+                    # guarantee itself (the task is DONE before the handler moves
+                    # on), not that incidental scheduling.
                     await cancel_task(self._prefetch_task)
                     self._prefetch_task = None
                     await self._cancel_progress_task()

@@ -553,11 +553,17 @@ class GuildQueue:
         committed, so it is not on the Redis list and the loop must not LPOP for it
         (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
         persisted requester ID that no longer resolves; False when nobody does, and
-        the caller still owns clearing the crashed-song state."""
+        the caller still owns clearing the crashed-song state.
+
+        Inserted at the cursor, which is what "the front of the line" means with a
+        claim outstanding, and what put_front does for the same reason. Its one
+        caller runs before restore_entries() on an empty deque, so today this is an
+        append either way — but a plain append is only correct because of that
+        ordering, and nothing states it where a second caller would read it."""
         item = self._rehydrate(entry, requester_fallback=requester_fallback)
         if item is None:
             return False
-        self._items.append(item)
+        self._items.insert(self._cursor, item)
         self._sync_wake()
         return True
 

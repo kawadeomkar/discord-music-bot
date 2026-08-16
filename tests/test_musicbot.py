@@ -5411,6 +5411,49 @@ class TestNowFlag:
         assert "already ended" in embed.description
         mock_ctx.message.add_reaction.assert_awaited_once_with("⏯️")
 
+    async def test_only_the_head_of_a_playlist_is_marked_interjected(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        live_mp: MagicMock,
+        live_vc: MagicMock,
+    ) -> None:
+        """`interjected` means "this song cut the line", which is true of the head
+        and of nothing behind it — the rest queued the way any -play's tracks do.
+        It is attribution only today (an `interject.over_interjection` span
+        attribute), so marking them all would be wrong quietly: every track of a
+        500-song `--now` filed as its own interjection."""
+        # Captured AT the call: the marker is a mutable field, and the
+        # interject-returned-None path deliberately clears the head's afterwards.
+        marks: list[list[bool]] = []
+
+        async def _record(qobj: QueueObject, _vc: Any, **kw: Any) -> None:
+            marks.append([qobj.interjected, *(i.interjected for i in kw["follow_on"])])
+            return None
+
+        live_mp.interject = AsyncMock(side_effect=_record)
+        live_mp.queue_put_next = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=live_mp)
+        mock_ctx.voice_client = live_vc
+        mock_ctx.message.add_reaction = AsyncMock()
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+
+        with (
+            _no_typing(),
+            patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
+            patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
+        ):
+            await command_callback(MusicBot.play)(
+                music_bot,
+                mock_ctx,
+                url="--now https://www.youtube.com/playlist?list=PLabc",
+            )
+
+        assert marks == [[True, False, False]]
+
     async def test_a_playlist_that_fell_through_says_how_many_it_queued(
         self,
         music_bot: MusicBot,

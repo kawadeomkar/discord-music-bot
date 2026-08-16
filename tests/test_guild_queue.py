@@ -84,6 +84,38 @@ class TestIsPersisted:
 
 
 class TestPut:
+    async def test_an_unpersisted_item_never_reaches_the_mirror(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """persisted=False means "no entry of mine is on that list", and
+        redis_pop_for honours it at the dequeue. Writing one here would therefore
+        leave an entry nothing ever LPOPs — the mirror one ahead of memory forever,
+        with no error. No caller does this today, which is exactly why the filter
+        needs a test rather than a comment."""
+        await gq.put([_qobj(1, mock_author, persisted=False)])
+
+        assert gq.display_size() == 1
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+    async def test_a_mixed_batch_mirrors_only_the_persisted_half(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        persisted = _qobj(2, mock_author)
+        await gq.put([_qobj(1, mock_author, persisted=False), persisted])
+
+        assert gq.display_size() == 2
+        assert await fake_redis.lrange(store.queue_key(), 0, -1) == [
+            SongQueueEntry.from_queue_object(persisted).to_redis()
+        ]
+
     async def test_single_syncs_all_three_legs(
         self,
         gq: GuildQueue,
@@ -347,6 +379,28 @@ class TestReleaseVsFinishFailedDequeue:
 
         assert gq.display_size() == 1
         assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
+    async def test_the_settle_and_the_pop_share_one_mutex_hold(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """Both legs under ONE hold, or a bulk mutation lands between them and
+        rebuilds the mirror — and the LPOP then retires the head of the NEW list.
+        The mutex is what makes the pair atomic; nothing else does."""
+        held: list[bool] = []
+        original = store.pop_queue
+
+        async def spy() -> None:
+            held.append(gq._mutex.locked())
+            await original()
+
+        first = _qobj(1, mock_author)
+        await gq.put([first, _qobj(2, mock_author)])
+        await gq.get()
+
+        with patch.object(store, "pop_queue", spy):
+            await gq.finish_failed_dequeue(first, context="test")
+
+        assert held == [True]
 
     async def test_a_cleared_claim_does_not_pop_the_song_that_replaced_it(
         self,
@@ -1602,6 +1656,47 @@ class TestRestoreCrashed:
         assert item.ts == 95
         assert queue_object(item).persisted is False
         assert queue_object(item).requester is mock_author
+
+    async def test_it_goes_to_the_front_even_with_a_queue_behind_it(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """ "At the front of the line" is the contract, and its one caller happens to
+        run on an empty deque — so a plain append satisfied it by accident, and
+        nothing said which of the two the next caller could rely on. The crashed
+        song is the one that was PLAYING: behind the restored queue it comes back
+        after songs the user queued while it was mid-play."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+
+        assert await gq.restore_crashed(
+            self._crashed_entry(mock_author.id), requester_fallback=mock_guild.me
+        )
+
+        assert [queue_object(i).title for i in gq.display_items()] == [
+            "Crashed",
+            "Song 1",
+            "Song 2",
+        ]
+
+    async def test_it_goes_ahead_of_pending_but_behind_a_claim(
+        self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """Front means the PENDING front. Ahead of a claimed item it would break the
+        claimed-prefix invariant Redis's LPOP retirement depends on."""
+        mock_guild.get_member = MagicMock(return_value=mock_author)
+        await gq.put([_qobj(1, mock_author), _qobj(2, mock_author)])
+        await gq.get()  # Song 1 claimed
+
+        assert await gq.restore_crashed(
+            self._crashed_entry(mock_author.id), requester_fallback=mock_guild.me
+        )
+
+        assert [queue_object(i).title for i in gq.display_items()] == [
+            "Song 1",
+            "Crashed",
+            "Song 2",
+        ]
+        assert gq._cursor == 1
 
     async def test_carries_the_enqueue_stamps_of_the_original_enqueue(
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
