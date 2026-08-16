@@ -1174,15 +1174,21 @@ class YTDL(discord.FFmpegOpusAudio):
         # to the result type, and "raw result" vs "chosen entry" are two things.
         selected: YTDLEntry = data
         if "entries" in data:
-            # TODO: Validate search results have a usable audio format before accepting.
-            # An entry wins purely by being the first non-playlist result — nothing
-            # checks for an https audio URL at a usable bitrate, so a format-less or
-            # low-quality entry is accepted here and only blows up at stream time,
-            # looking unrelated.
-            for entry in data["entries"]:
-                if entry and entry.get("_type", None) != "playlist":
-                    selected = entry
-                    break
+            # An entry used to win purely by being the first non-playlist result, so a
+            # result yt-dlp could select no format for was accepted here and only blew
+            # up at stream time, looking unrelated to the search. Prefer one that
+            # actually carries a stream URL; the first non-playlist entry stays the
+            # fallback, so an entry shape this code does not recognise still plays
+            # rather than failing outright.
+            playable = [
+                entry
+                for entry in data["entries"]
+                if entry and entry.get("_type", None) != "playlist"
+            ]
+            if playable:
+                selected = next(
+                    (entry for entry in playable if entry.get("url")), playable[0]
+                )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named (prepare_filename)

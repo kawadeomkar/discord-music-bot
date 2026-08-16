@@ -766,6 +766,58 @@ class TestYTPlaylistAnalytics:
         assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
+class TestSearchEntrySelection:
+    """Which of a search's entries gets played. The old rule — first non-playlist
+    entry — accepted a result yt-dlp had selected no format for, which then failed at
+    stream time looking unrelated to the search."""
+
+    async def _pick(self, mock_ctx: MagicMock, entries: list[Any]) -> QueueObject:
+        with patch(
+            "src.youtube._ytdlp_extract",
+            return_value={"_type": "playlist", "entries": entries},
+        ):
+            return await YTDL.yt_source(
+                mock_ctx.author,
+                "some song",
+                query_source="search",
+                analytics=_ANALYTICS,
+                user_input="some song",
+            )
+
+    async def test_an_entry_without_a_stream_url_is_passed_over(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        formatless = {"webpage_url": "https://yt.com/v=noformat", "title": "No Format"}
+        playable = _fake_ytdl_data(webpage_url="https://yt.com/v=ok", title="Playable")
+
+        result = await self._pick(mock_ctx, [formatless, playable])
+
+        assert result.title == "Playable"
+
+    async def test_playlists_and_null_entries_are_still_skipped(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        playable = _fake_ytdl_data(webpage_url="https://yt.com/v=ok", title="Playable")
+
+        result = await self._pick(
+            mock_ctx, [None, {"_type": "playlist", "url": "https://x"}, playable]
+        )
+
+        assert result.title == "Playable"
+
+    async def test_the_first_entry_still_wins_when_none_carries_a_url(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The fallback is the old rule, so an entry shape this code does not
+        recognise plays as before rather than failing outright."""
+        first = {"webpage_url": "https://yt.com/v=first", "title": "First"}
+        second = {"webpage_url": "https://yt.com/v=second", "title": "Second"}
+
+        result = await self._pick(mock_ctx, [first, second])
+
+        assert result.title == "First"
+
+
 class TestYTSourceUnifiedExtraction:
     """The unified single-extraction play path: one stream-opts yt-dlp call
     populates both the ytdl:source and ytdl:stream
