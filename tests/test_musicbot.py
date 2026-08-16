@@ -21,7 +21,7 @@ from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
-    DEPTH_RESTORE_WAIT_SECS,
+    RESTORE_WAIT_SECS,
     _echo,
     _removed_label,
     HISTORY_MAX_LIMIT,
@@ -3252,14 +3252,14 @@ class TestPlayFrontInsertion:
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
         assert single_call.kwargs["front"] is False
-        # No playback hold on the warm path — the gate is already open. (It does
-        # wait on the restore, but only to read a meaningful queue depth, and on
-        # the short bound; see test_warm_path_reads_the_depth_after_the_restore.)
+        # No playback hold on the warm path — the gate is already open. It DOES
+        # wait on the restore, on the SAME bound as every other queue-mutating
+        # command: enqueueing ahead of entries restore_entries has not replayed
+        # yet misaligns every later LPOP, so this is not just an analytics read.
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
-            and mp.wait_for_restore.await_args.kwargs["timeout"]
-            == DEPTH_RESTORE_WAIT_SECS
+            and mp.wait_for_restore.await_args.kwargs["timeout"] == RESTORE_WAIT_SECS
         )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(
@@ -4839,3 +4839,41 @@ class TestDebugObservesWithoutCreating:
         inputs = await music_bot._debug_inputs(mock_ctx)
         assert inputs.player is None
         assert inputs.players == 0
+
+
+class TestShuffleWaitsForTheRestore:
+    """-shuffle was the one queue-mutating command with no restore wait and no
+    comment saying why.
+
+    shuffle() REBUILDS the mirror from memory, so running it before
+    restore_entries() has replayed the saved queue writes an unrestored deque over
+    it — deleting the persisted entries outright. Alone it merely reported "at
+    least 3 songs" against a queue it could not see; combined with an enqueue past
+    the same window it destroys one."""
+
+    async def test_it_refuses_until_the_restore_lands(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=False)
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
+        assert "Still loading" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_it_shuffles_once_the_restore_has_landed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_awaited_once()

@@ -181,10 +181,14 @@ HISTORY_EMBEDS_PER_MESSAGE = 8
 # that accepts the connection then stalls would hang the command outright.
 RESTORE_WAIT_SECS = 5.0
 
-# How long a warm -play waits for its restore before reading the ask-time queue
-# depth. Short because a timeout here only costs an approximate analytics field:
-# the depth is recorded from whatever has landed and the command proceeds.
-DEPTH_RESTORE_WAIT_SECS = 1.0
+# A warm -play waits on the same bound and refuses on the same failure. It used to
+# take a shorter one and IGNORE the result, on the reasoning that a timeout "only
+# costs an approximate analytics field" — it does not. restore_entries() appends,
+# so a put() that lands first leaves the deque holding the new song ahead of
+# entries Redis already lists behind it: every later commit-time LPOP then retires
+# the wrong entry, and if the snapshot read lands after the RPUSH the song is
+# queued twice and plays twice. Same hazard the three commands below already
+# refuse for, so it refuses the same way.
 
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
@@ -1031,11 +1035,20 @@ class MusicBot(commands.Cog):
                     if front:
                         position = 0
                     else:
-                        # Wait out any in-flight restore: _display stays empty
-                        # until restore_entries() replays it, so a -play in the
-                        # crash-recovery window would read 0 behind a queue about
-                        # to reappear. Already set in the common case.
-                        await mp.wait_for_restore(timeout=DEPTH_RESTORE_WAIT_SECS)
+                        # Wait out any in-flight restore: the queue stays empty
+                        # until restore_entries() replays it, so a -play here would
+                        # both read 0 behind a queue about to reappear AND enqueue
+                        # ahead of it. Already set in the common case; a restore
+                        # that never lands is a reason not to insert at all.
+                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                            await ctx.send(
+                                embed=notice_embed(
+                                    "Still loading this server's saved queue — try "
+                                    "again in a moment.",
+                                    discord.Color.orange(),
+                                )
+                            )
+                            return
                         position = mp.enqueue_depth()
                     analytics = Analytics(
                         queued_at=ctx.message.created_at.timestamp(),
@@ -1632,6 +1645,20 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
+            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
+            # so running it before restore_entries() has replayed the saved queue
+            # writes an unrestored deque over it and deletes the persisted entries
+            # outright. Alone it merely reported "at least 3 songs" against a queue
+            # it could not see; combined with an enqueue it destroys one.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
             async with background_typing(ctx):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
