@@ -95,6 +95,10 @@ class StateField:
     # Same reason: without it a song recovered after a crash archives as unknown,
     # silently and only for crashed plays.
     CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
+    # What the user typed. The queue entry carries it and -remove matches on it, so
+    # without it here a crash strips the origin off the one song that was PLAYING:
+    # `-remove <collection link>` then takes out every track but that one.
+    CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
     # When the audio started. Not PLAY_START_EPOCH below, which is backdated by the
     # -ss offset, and not derivable from this run's clock at all — a resume tail
     # inherits its value from an earlier fragment.
@@ -339,6 +343,7 @@ class GuildStateData:
     current_song_queued_at: float = 0.0
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
+    current_song_user_input: str | None = None
     current_song_played_at: float = 0.0
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
@@ -423,6 +428,11 @@ class GuildStateData:
                 _b_opt_int(raw, StateField.CURRENT_SONG_QUEUE_POSITION) or 0
             ),
             current_song_query_source=_b_str(raw, StateField.CURRENT_SONG_QUERY_SOURCE),
+            # None, not "": absent means the song predates this field, and an empty
+            # needle must never be what -remove matches against.
+            current_song_user_input=(
+                _b_str(raw, StateField.CURRENT_SONG_USER_INPUT) or None
+            ),
             current_song_played_at=(
                 _b_float(raw, StateField.CURRENT_SONG_PLAYED_AT) or 0.0
             ),
@@ -655,6 +665,7 @@ class SongQueueEntry:
             queued_at=song.analytics.queued_at,
             queue_position=song.analytics.queue_position,
             query_source=song.query_source,
+            user_input=song.user_input,
             played_at=song.played_at,
         )
 
@@ -700,6 +711,10 @@ class SongQueueEntry:
             queued_at=state.current_song_queued_at,
             queue_position=state.current_song_queue_position,
             query_source=state.current_song_query_source,
+            # Origin, so -remove <what was typed> still matches the recovered song.
+            # Its queue entry is gone (LPOPed at start), so this hash is the only
+            # place the link survives a restart.
+            user_input=state.current_song_user_input,
             # The parked entry is the only at-rest copy of a playing song's start
             # (its queue entry was LPOPed when it started), so recovery reads it
             # back rather than restamping to the recovery clock. Absent = 0.0.
