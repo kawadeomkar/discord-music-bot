@@ -13,7 +13,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Coroutine, Sequence
 
 import discord
 from discord.ext import commands
@@ -1020,6 +1020,28 @@ class MusicBot(commands.Cog):
             )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
+    async def _warm_front_track(
+        self, tracks: Sequence[QueueItem], placement: Placement
+    ) -> None:
+        """Warm the stream URL of a playlist's first track when it is about to play.
+
+        Bulk enqueues pass prefetch=False, because N concurrent extractions mint
+        URLs that expire long before playback reaches them. That is right for the
+        tail and wrong for the head under `--next`: queue_put_next has just killed
+        the loop's one-ahead prefetch, and the loop does not spawn another until its
+        next iteration — so the song the user was promised would play next reaches
+        the handoff with nothing cached and pays a full in-band extraction, which is
+        the 1-4s of dead air the three-phase pipeline exists to remove.
+
+        The head ONLY, for exactly the reason the rest are skipped. A lazy Spotify
+        entry has no URL to warm yet (it resolves at dequeue), so it is left alone.
+        """
+        if placement is not Placement.NEXT or not tracks:
+            return
+        head = tracks[0]
+        if isinstance(head, QueueObject):
+            await YTDL.prefetch_stream(head, redis=self.redis)
+
     async def _enqueue_playlist(
         self,
         ctx: commands.Context,
@@ -1034,10 +1056,9 @@ class MusicBot(commands.Cog):
         """Queue a resolved playlist and notify the channel — branches on the
         resolved shape since Spotify playlists arrive as titles needing YouTube
         search resolution while YouTube playlists arrive pre-resolved."""
-        # A playlist front-inserts in full, in order — unlike `--now`, which
-        # collapses it to the first track to bound how long an interrupted song
-        # waits. Neither front placement interrupts anything: COLD_FRONT has no
-        # current song at all, and NEXT lets the one playing finish.
+        # A playlist front-inserts in full, in order, under either flag. Neither
+        # front placement interrupts anything: COLD_FRONT has no current song at
+        # all, and NEXT lets the one playing finish.
         #
         # NEXT takes queue_put_next, not queue_put_front: with a song playing, the
         # loop's prefetch holds a claim a plain front-insert would land behind, and
@@ -1067,6 +1088,7 @@ class MusicBot(commands.Cog):
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
+                self._warm_front_track(qobjs_yt, placement),
                 ctx.message.add_reaction("👍"),
             )
         else:
@@ -1100,6 +1122,7 @@ class MusicBot(commands.Cog):
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
+                self._warm_front_track(tracks, placement),
                 ctx.message.add_reaction("👍"),
             )
 
@@ -1392,7 +1415,15 @@ class MusicBot(commands.Cog):
                     cold_start = not ctx.voice_client
                     if cold_start:
                         placement = Placement.COLD_FRONT
-                    elif args.mode is PlayMode.NEXT:
+                    elif args.mode is not PlayMode.NORMAL:
+                        # BOTH flags, not just --next. `--now` reaches here only
+                        # when there was nothing to interrupt — connected, but no
+                        # song live — and the interruption is the only part of it
+                        # that needs one. Falling to TAIL there put "plays it
+                        # immediately" behind the whole queue, which is strictly
+                        # worse than --next in the same state; it is reachable for
+                        # the length of every resolve, and for a restored queue's
+                        # first song after a restart.
                         placement = Placement.NEXT
                     else:
                         placement = Placement.TAIL

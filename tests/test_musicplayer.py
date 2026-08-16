@@ -7811,6 +7811,10 @@ class TestInterject:
         assert titles == ["Urgent Song", "Track 2", "Track 3", live_song.title]
         tail = queue_object(music_player.queue.display_items()[-1])
         assert tail.is_resume is True
+        # The span attribute describes the same insert: one play is parked. It
+        # counted the CONSECUTIVE run behind the head, which the playlist between
+        # them empties — so every playlist interjection reported 0.
+        assert music_player.queue.resume_tail_depth() == 1
 
     async def test_returns_none_without_current_song(
         self, music_player: MusicPlayer, interject_obj: QueueObject, mock_vc: MagicMock

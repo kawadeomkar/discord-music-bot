@@ -34,10 +34,23 @@ See docs/ARCHITECTURE.md#queue-invariant.
 
 # ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
 # try_commit_dequeue() releases the bulk mutex before pop_queue_and_start_song()'s
-# atomic LPOP+HSET dispatches, so a -clear landing in that tick pops an entry the clear
-# already deleted: memory and Redis drift by one until the next rebuild, and a crash
-# inside the drift restores the queue one song out of alignment. Accepted. Cheapest fix:
-# hold the mutex across the store dispatch, costing one ~1ms round-trip.
+# atomic LPOP+HSET dispatches, so a mutation landing in that tick races it. Accepted,
+# in BOTH directions:
+#
+# - a -clear pops an entry the clear already deleted;
+# - an INSERT (put_front's LPUSH branch) puts its entry at the head, and the pending
+#   LPOP eats the inserted song rather than the played one — memory holds it, the
+#   mirror does not, and a crash restores the song that just played instead.
+#
+# Either way memory and Redis drift by one until the next rebuild. The insert side has
+# three callers now (interject, the cold-start -play, and -play --next), so it is the
+# likelier of the two.
+#
+# The cheapest fix — hold the mutex across the store dispatch — is NOT one round trip
+# from here: the loop starts playback between the commit and that write, so the hold
+# would span vc.play() and block -clear/-remove/-shuffle for the FFmpeg handoff. Doing
+# it properly means moving the commit to just before the store write, which is a change
+# to the loop's claim accounting and wants its own pass.
 
 import asyncio
 import random
@@ -599,22 +612,23 @@ class GuildQueue:
         stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
         gone by the time this runs and only its tail is queued.
 
-        The interjected song is not always at index 0 — put_front inserts behind a
-        dequeued-but-uncommitted item — so the run starts after the claimed prefix,
-        which _cursor names directly.
+        EVERY pending tail, not the consecutive run behind the interjection. `--now`
+        takes a whole playlist, so put_front lays out [head, *playlist, tail] and the
+        run immediately after the head is empty — that read 0 for every playlist
+        interjection, and 0 for a stack of them, which is exactly the case the
+        attribute exists to describe. A parked play is parked wherever it sits.
 
-        Reads _items[_cursor] AS the interjection, so it is only meaningful called
-        from interject() — its one caller, for a span attribute. Anything else that
-        front-inserts (queue_put_next) leaves its own song there, and this would
-        then describe that song as having parked the tails behind it."""
-        items = list(self._items)
-        start = self._cursor + 1
-        depth = 0
-        for item in items[start:]:
-            if not (isinstance(item, QueueObject) and item.is_resume):
-                break
-            depth += 1
-        return depth
+        The scan starts one past the claimed prefix: _items[_cursor] is the song
+        that just cut the line (or an in-flight head), which is a play in progress
+        rather than a parked one.
+
+        O(len(_items)), once per interjection, behind that command's own 1-4s
+        resolve — the same trade has_resume_tail() takes and for the same reason."""
+        return sum(
+            1
+            for item in list(self._items)[self._cursor + 1 :]
+            if isinstance(item, QueueObject) and item.is_resume
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
@@ -696,6 +710,16 @@ class GuildQueue:
     ) -> None:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
         order — by whichever of three writes is right.
+
+        Cost on a big queue, measured so it does not have to be re-derived: 5,000
+        entries serialize in ~38ms (25ms building the entries, 13ms of orjson) for a
+        ~2.1MB RPUSH, and that span is synchronous — it blocks every guild's gateway
+        traffic, not just this one's. Identical on every placement, because it is one
+        rebuild either way; a front insert cannot take the LREM shortcut, but neither
+        can an append. Bounded by playlist length, and the enqueue that reaches here
+        already paid seconds of extraction to produce the items. The way out is to
+        stop enqueueing the whole collection at once (streaming resolve), not to
+        chunk the write.
 
         Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
         where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation

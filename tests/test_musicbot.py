@@ -2895,7 +2895,12 @@ class TestNowFlagRouting:
             ("--now ", False, False, False, False, None, None),
             ("--now ", True, True, False, True, True, None),
             ("--now ", True, False, True, True, True, None),
-            ("--now ", True, False, False, False, None, Placement.TAIL),
+            # Connected with nothing live: there is no song to interrupt, so `--now`
+            # cannot interject — but it still jumps the queue. TAIL here put "plays
+            # it immediately" behind everything queued, which is strictly worse than
+            # what `--next` does in the identical state; the window is every
+            # song-resolve and the whole of a restored queue's first song.
+            ("--now ", True, False, False, False, None, Placement.NEXT),
             # `--next` never interjects, on any row. The paused one is the carve-out
             # that matters: plain `-play` interjects there because the request would
             # otherwise be buried behind a paused song, and with `--next` it is not
@@ -4178,11 +4183,10 @@ class TestPlayFrontInsertion:
     async def test_next_playlist_inserts_all_tracks_through_queue_put_next(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """`--next` takes a playlist in FULL, unlike `--now` (first track only):
-        nothing is being interrupted, so there is no interrupted song whose return
-        needs bounding. queue_put_next rather than queue_put_front because a song IS
-        playing here — the loop's prefetch holds a claim a plain front-insert would
-        land behind, and the playlist would start one song late."""
+        """`--next` takes a playlist in FULL. queue_put_next rather than
+        queue_put_front because a song IS playing here — the loop's prefetch holds a
+        claim a plain front-insert would land behind, and the playlist would start
+        one song late."""
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
             for i in range(3)
@@ -4206,6 +4210,53 @@ class TestPlayFrontInsertion:
         mp.queue_put_front.assert_not_awaited()
         # Said, not implied: "Queued playlist" alone reads as "at the back".
         assert "plays next" in mock_ctx.send.call_args.kwargs["embed"].title
+
+    @pytest.mark.parametrize(
+        "placement,warmed",
+        [
+            (Placement.NEXT, True),
+            (Placement.TAIL, False),
+            (Placement.COLD_FRONT, False),
+        ],
+    )
+    async def test_only_a_next_playlist_warms_its_first_track(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        placement: Placement,
+        warmed: bool,
+    ) -> None:
+        """The bulk enqueue warms nothing, which is right for the tail and wrong for
+        the head under `--next`: queue_put_next just killed the loop's one-ahead
+        prefetch and the loop will not spawn another until its next iteration, so
+        the song promised to play next would reach the handoff with an empty
+        stream cache and pay a full in-band extraction — the dead air the
+        three-phase pipeline exists to remove. The HEAD only, or N concurrent
+        extractions mint URLs that expire before playback reaches them."""
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
+            for i in range(3)
+        ]
+        source = YTSource(url="https://yt.com/playlist?list=X", type=YTType.PLAYLIST)
+        mp = _mock_mp()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch.object(YTDL, "prefetch_stream", new=AsyncMock()) as warm:
+            await music_bot._enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedYoutubePlaylist(tracks),
+                mp,
+                placement=placement,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+            )
+
+        assert warm.await_count == (1 if warmed else 0)
+        if warmed:
+            warmed_call = warm.await_args
+            assert warmed_call is not None
+            assert warmed_call.args[0] is tracks[0]
 
     async def test_cold_path_routes_playlist_through_front(
         self, music_bot: MusicBot, mock_ctx: MagicMock
