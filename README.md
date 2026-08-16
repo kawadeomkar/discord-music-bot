@@ -31,8 +31,9 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
   history persist in Redis; on restart the bot rejoins voice and resumes from the
   saved position
 - **Per-guild isolation** — every server gets its own player, queue, history, and volume
-- **Queue management** — shuffle, clear, remove-by-URL, per-song ETA estimates,
-  persistent play history
+- **Queue management** — shuffle, clear, remove by link or by what you typed
+  (one album or playlist link takes back out every track it added), per-song ETA
+  estimates, persistent play history
 - **Opt-in play-history archive** — off by default, and a default deployment keeps
   nothing long-term: the newest 50 plays per guild live in Redis and no Postgres is
   deployed at all. One flag (`HISTORY_ARCHIVE_ENABLED=true`) makes a deploy bring up
@@ -73,9 +74,9 @@ details, aliases, and examples.
 | `-now` | `np`, `rn`, `nowplaying` | Show the currently playing song |
 | `-history` | `h` | Show recently played songs (up to 50, persists across restarts) |
 | `-leaderboard [--days N]` | `lb`, `top` | Top 10 listeners and top 10 songs by listening time, each song labelled with how it was asked for (Spotify, search, a pasted host) — needs the [play-history archive](#operating-the-play-history-archive) |
-| `-shuffle` | — | Randomly reorder the queue (needs 3+ queued songs) |
+| `-shuffle` | — | Randomly reorder the queue (needs 4+ queued songs) |
 | `-clear` | `c` | Empty the queue (the current song keeps playing) |
-| `-remove <url>` | `rm` | Remove every queued song matching a YouTube URL |
+| `-remove <link or search text>` | `rm` | Remove every queued song matching the link shown in **Now Playing**, the search text you queued with, or the link you queued with — so an album or playlist link takes back out every track it added |
 | `-jump <position>` | `j` | Jump to a queue position *(in development)* |
 
 ### Utility

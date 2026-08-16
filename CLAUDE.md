@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.26.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.28.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -486,8 +486,12 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   Postgres forever.
 - Callers with a prefetch task must `_cancel_prefetch()` BEFORE clear/shuffle/remove so
   the prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
-- `clear()` sets a cleared-flag the loop consumes (`consume_cleared_flag`) to discard a
-  prefetched song it is holding.
+- `clear()` invalidates in-flight work through the generation counter and the cursor
+  reset ALONE — a prefetched song the loop is holding is discarded because
+  `try_commit_dequeue` refuses (nothing is claimed once the cursor is 0). There was once
+  a cleared-flag beside them; it was read once per loop iteration, so a `clear()` landing
+  after that read survived an entire song and destroyed a song claimed long after it,
+  leaking the claim. Do not reintroduce a level flag here.
 - `restore_crashed` / `restore_entries` write the deque ONLY (entries are already on /
   never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
@@ -497,11 +501,21 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   collection enqueues each page under; its check runs **inside** the same mutex hold
   as the mutation — checked outside, an entire `clear()` fits between check and put.
   A refused put touches NO leg (an empty page returns `[]`, which is success);
-  generation-blind callers omit it and are never refused. The same counter answers
-  `try_commit_dequeue`, and `bump_generation()` (one caller: `MusicBot.cleanup`)
-  invalidates in-flight enqueues without clearing.
-- Every mirror write goes through `_write_mirror(items, *, removed=())`, which owns the
-  rebuild / DELETE / LREM choice. Empty means DELETE, never skip. **Only a removal may
+  generation-blind callers omit it and are never refused. The YouTube-playlist
+  batch takes it too — same multi-second resolve, same 1,000-track landing. The
+  same counter answers `try_commit_dequeue`, and `bump_generation()` (one caller:
+  `MusicBot.cleanup`) invalidates in-flight enqueues without clearing; it is
+  **synchronous and lock-free** because it runs ahead of the voice disconnect, and
+  taking the mutex there let a stalled Redis stop `-stop` silencing the bot.
+  `remove()` deliberately does NOT bump — the counter's other reader is the
+  playback loop's commit, and `-remove` spares the in-flight head, so it waits on
+  the enqueue slot instead.
+- Every mirror write **from a bulk mutation** — `clear`, `shuffle`, `remove`,
+  `finish_failed_dequeue` — goes through `_write_mirror(items, *, removed=())`, which
+  owns the rebuild / DELETE / LREM choice. The APPEND paths deliberately do not:
+  `put`/`put_front` call `push_queue`/`push_queue_batch`/`push_queue_front` directly,
+  because routing an append through `_write_mirror` turns an O(1) RPUSH into a full
+  rebuild under the mutex on every `-play`. Empty means DELETE, never skip. **Only a removal may
   pass `removed`** — LREM asserts the survivors kept their order, which is false for a
   shuffle or an insert. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
   `_LREM_MAX_SHARE` (one in five), and `_claimed_blobs()`. **The count is the bound that
@@ -647,13 +661,16 @@ the decision. Symmetrically, the 300s `_PLAYBACK_GATE_TIMEOUT` re-waits instead 
 tearing down while any hold is outstanding — every hold is released by an `async with`,
 raise or not, so it cannot park forever.
 
-Both cold-start commands wait on the restore before touching the queue, bounded by
-`RESTORE_WAIT_SECS` (musicbot.py): the pool sets `socket_connect_timeout` but no
-`socket_timeout`, so a Redis that accepts the connection and then stalls would hang the
-command outright. A restore that does not land is a reason **not** to insert — `-play`
-front-inserting against an unread snapshot double-queues the song — so both abandon and
-say so. `MusicPlayer.restore_read_failed` separates "nothing was saved" from "the store
-could not be read"; only the first may be reported to a guild as an empty queue.
+**Six** call sites wait on the restore before touching the queue, bounded by
+`RESTORE_WAIT_SECS` (musicbot.py): `-play` (warm and cold), `-resume`, `-shuffle`,
+`-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
+so a Redis that accepts the connection and then stalls would hang the command outright.
+The two cold-start sites must not **insert** against an unread snapshot — `-play`
+front-inserting there double-queues the song — and the other four must not **rebuild**
+the mirror from a deque the restore has not filled, which deletes the saved queue
+outright. All six abandon and say so. `MusicPlayer.restore_read_failed` separates
+"nothing was saved" from "the store could not be read"; only the first may be reported
+to a guild as an empty queue.
 
 Known limitation (FIXME in guild_state.py): recovery counts **bot downtime** as playback
 position — a song 30s in that stays down 10min resumes near its end (duration−10s cap).
@@ -837,14 +854,17 @@ Per-guild synchronization primitives and what they protect:
 | `PostgresHistoryArchive._init_lock` | pool creation racing `close()` |
 | `HistoryOutboxDrainer._stop_lock` | concurrent `stop()`s each running their own final drain |
 | claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject) |
-| `MusicBot._enqueue_locks[guild]` | one streamed collection enqueue per guild. Only collections and `-shuffle` take it (singles never wait); it lives on the **cog**, not MusicPlayer, because `cleanup()` destroys players and a lock destroyed mid-wait orphans its waiters. Bounded on both sides — `_ENQUEUE_WAIT_SECS` (60s, which MUST stay under `_PLAYBACK_GATE_TIMEOUT`) and `_ENQUEUE_MAX_WAITERS` |
+| `MusicBot._enqueue_locks[guild]` | one streamed collection enqueue per guild. Collections, `-shuffle` and `-remove` take it (singles never wait) — the last two because both rewrite the mirror from memory, so running mid-drain half-shuffles or lets pages `k+1..n` re-queue what was just removed; it lives on the **cog**, not MusicPlayer, because `cleanup()` destroys players and a lock destroyed mid-wait orphans its waiters. Bounded on both sides — `_ENQUEUE_WAIT_SECS` (60s, which MUST stay under `_PLAYBACK_GATE_TIMEOUT`) and `_ENQUEUE_MAX_WAITERS` |
 | `GuildQueue.generation` (compare-and-put) | a streamed collection's pages landing after the queue they belong to was cleared or torn down. `clear()`/`bump_generation()` increment it; every page enqueues with `expected_generation=` and is refused if it moved. **Reading the property and then calling `put()` without `expected_generation` is a TOCTOU bug, not an alternative** — the check must share the mutex hold with the mutation |
 
-One known, documented, accepted race remains open (ISSUE header in guild_queue.py): a
-bulk mutation can land between `try_commit_dequeue()` releasing the mutex and the start
-transaction's server-side LPOP, drifting memory and Redis by one entry. The sketched fix
-(hold the mutex across the store dispatch) is described there — if you touch this code,
-read that header first.
+The dequeue commit and the start transaction's server-side LPOP share ONE mutex hold,
+via `GuildQueue.commit_dequeue()` — the async context manager the playback loop wraps
+around `vc.play()` and the store dispatch. This closes the race guild_queue.py used to
+carry as an accepted ISSUE: with the lock released between them, a `put_front` scheduled
+in that tick read a cursor of 0, LPUSHed ahead of the entry the pending LPOP was about to
+retire, and the LPOP ate the new song. Cost is one ~1ms Redis round trip under the mutex
+per song start. The body of that `async with` must stay short and must never touch
+Discord; `try_commit_dequeue()` remains for the one caller with no Redis write to make.
 
 ## Code conventions
 
@@ -1007,10 +1027,8 @@ duplicated.
 
 | Where | Marker | Summary |
 |---|---|---|
-| guild_queue.py (module header) | ISSUE | dequeue-commit ↔ Redis-LPOP race window; accepted, fix sketched |
 | guild_state.py `crashed_position_at` | FIXME | bot downtime counted as playback position; heartbeat fix designed |
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
-| guild_queue.py `shuffle` | FIXME | requires 4 songs but the user-facing message and help say 3 |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
 | config.py `_git_branch` | TODO | detached-worktree pytest runs die at collection (warning→error) |
 | youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
