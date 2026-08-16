@@ -409,9 +409,16 @@ class TestLremFallsBackWhenItCannotBeTrusted:
     ) -> None:
         """LREM takes the HEAD-most equal element. remove() never removes a claimed
         item, but LREM cannot see that rule — so with a byte-identical twin it
-        would eat the entry awaiting a commit-time LPOP."""
+        would eat the entry awaiting a commit-time LPOP.
+
+        SIZED to clear both numeric gates: one dropped against six survivors
+        satisfies the share gate (1 x _LREM_MAX_SHARE <= 6) and the entry cap, so
+        _claimed_blobs is the only clause left to force the rebuild. At three items
+        the share gate was already false and `and` short-circuited before the guard
+        was ever called — the test passed without reaching what it names."""
         first, second = _qobj(1, mock_author), _qobj(1, mock_author)
-        await gq.put([first, _qobj(2, mock_author), second])
+        fillers = [_qobj(n, mock_author) for n in range(2, 7)]
+        await gq.put([first, *fillers, second])
         await gq.get()  # `first` is claimed and un-removable
         assert SongQueueEntry.from_queue_object(first).to_redis() == (
             SongQueueEntry.from_queue_object(second).to_redis()
@@ -419,11 +426,11 @@ class TestLremFallsBackWhenItCannotBeTrusted:
 
         outcome = await gq.remove(remove_matcher(second.webpage_url))
 
-        assert outcome.positions == [3]  # the pending twin, not the claimed one
+        assert outcome.positions == [7]  # the pending twin, not the claimed one
         stored = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert stored == [
             SongQueueEntry.from_queue_object(first).to_redis(),
-            SongQueueEntry.from_queue_object(_qobj(2, mock_author)).to_redis(),
+            *(SongQueueEntry.from_queue_object(f).to_redis() for f in fillers),
         ]
 
     async def test_a_clean_removal_still_takes_the_lrem_path(
