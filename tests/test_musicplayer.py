@@ -8020,6 +8020,8 @@ class TestInterject:
         async def put_front_and_advance(items: Any) -> None:
             music_player.current_song = MagicMock()  # loop moved on mid-await
 
+        from src.guild_queue import GuildQueue
+
         # Class-level patch: GuildQueue uses __slots__, so patch.object on the
         # instance can't set the attribute.
         with patch.object(GuildQueue, "put_front", side_effect=put_front_and_advance):
@@ -8074,6 +8076,8 @@ class TestInterject:
         async def claim_mid_await(items: Any) -> None:
             seen.append(music_player.claim_current_song_for_history())
 
+        from src.guild_queue import GuildQueue
+
         with patch.object(GuildQueue, "put_front", side_effect=claim_mid_await):
             await music_player.interject(playnow_obj, mock_vc)
 
@@ -8095,6 +8099,204 @@ class TestInterject:
 
         assert blocker.cancelled()
         assert music_player._prefetch_task is None
+
+
+class TestPrefetchedHeadRespectsPersistence:
+    """The prefetched branch of loop() used to hardcode `should_pop_queue = True`,
+    on the reasoning that a prefetched item always came through queue_get() and is
+    therefore mirrored. A crash-recovered head is not.
+
+    Reachable without a crash of its own: `-play` on a DISCONNECTED bot inserts at
+    cursor 0, which is AHEAD of the head `_restore_state` appended, so the prefetch
+    that follows claims that head. LPOPing for an entry that was never on the list
+    deletes the next real one instead — silently, at-most-once, surfacing only as a
+    queue one song short after the next restart.
+
+    Driven through two real loop iterations, because that is the only way into the
+    branch: iteration 1 spawns the prefetch, iteration 2 consumes its result."""
+
+    async def _run_with_prefetch(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        first_song: MagicMock,
+        prefetched: MagicMock,
+    ) -> tuple[AsyncMock, AsyncMock]:
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        # TWO items: one for iteration 1, one for the prefetch to claim. The stand-in
+        # below takes that claim with get_nowait() exactly as the real
+        # _prefetch_next_song does — without it the commit in iteration 2 finds
+        # nothing claimed and refuses, and the branch under test never runs.
+        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        async def _prefetch() -> MagicMock:
+            music_player.queue.get_nowait()
+            return prefetched
+
+        assert music_player.store is not None
+        pop_spy = AsyncMock()
+        set_spy = AsyncMock()
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=first_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(side_effect=_prefetch)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(music_player.store, "pop_queue_and_start_song", pop_spy),
+            patch.object(music_player.store, "set_current_song_state", set_spy),
+        ):
+            await music_player.loop()
+        return pop_spy, set_spy
+
+    async def test_an_unpersisted_prefetched_head_does_not_lpop(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        live_song.persisted = False
+        pop_spy, set_spy = await self._run_with_prefetch(
+            music_player, queue_obj, mock_song, live_song
+        )
+        # One LPOP for the first (persisted) song, none for the recovered head.
+        assert pop_spy.await_count == 1
+        set_spy.assert_awaited_once()
+
+    async def test_a_persisted_prefetched_head_still_lpops(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """The common case must keep its LPOP — a fix that simply stopped popping
+        would leave the mirror permanently ahead of memory."""
+        live_song.persisted = True
+        pop_spy, set_spy = await self._run_with_prefetch(
+            music_player, queue_obj, mock_song, live_song
+        )
+        assert pop_spy.await_count == 2
+        set_spy.assert_not_awaited()
+
+
+class TestFailedPrefetchedClaimRespectsPersistence:
+    """The same rule on the FAILURE leg. The start path reads `persisted` off the
+    song; the outer handler used to re-derive it from `source`, which the
+    prefetched branch leaves None — and None defaults to popping.
+
+    So an exception between the claim and the commit retired a real Redis entry
+    for a crash-recovered head that never had one, deleting the next queued song.
+    `claim_persisted` is carried from the claim to the handler so neither end has
+    to guess."""
+
+    async def _run_until_it_breaks(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        first_song: MagicMock,
+        prefetched: MagicMock,
+    ) -> AsyncMock:
+        """Two iterations: the first plays normally and spawns the prefetch, the
+        second claims its result and then dies before committing."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        seed_queue(music_player.queue, queue_obj)
+        seed_queue(music_player.queue, queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+
+        async def _prefetch() -> MagicMock:
+            music_player.queue.get_nowait()
+            return prefetched
+
+        # Raise inside the claim→commit window, on the prefetched iteration only.
+        # try_commit_dequeue is the one await in that window, which is what makes
+        # this the narrow-but-real path the handler exists for. Patched on the
+        # CLASS: GuildQueue is __slots__ed, so the instance takes no override.
+        real_commit = GuildQueue.try_commit_dequeue
+        commits = 0
+
+        async def _commit(queue: GuildQueue, generation: int) -> bool:
+            nonlocal commits
+            commits += 1
+            if commits == 2:
+                raise RuntimeError("boom inside the claim window")
+            return await real_commit(queue, generation)
+
+        assert music_player.store is not None
+        lpop_spy = AsyncMock()
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=first_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(side_effect=_prefetch)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch.object(MusicPlayer, "send_with_np", new=AsyncMock()),
+            patch.object(
+                music_player.store, "pop_queue_and_start_song", new=AsyncMock()
+            ),
+            patch.object(music_player.store, "set_current_song_state", new=AsyncMock()),
+            patch.object(GuildQueue, "try_commit_dequeue", new=_commit),
+            patch.object(music_player.store, "pop_queue", lpop_spy),
+        ):
+            await music_player.loop()
+        assert commits == 2, "the prefetched iteration never reached the commit"
+        return lpop_spy
+
+    async def test_an_unpersisted_claim_is_settled_without_an_lpop(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        live_song.persisted = False
+        lpop_spy = await self._run_until_it_breaks(
+            music_player, queue_obj, mock_song, live_song
+        )
+        lpop_spy.assert_not_awaited()
+
+    async def test_a_persisted_claim_still_retires_its_entry(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """The other half: a fix that just stopped popping here would strand the
+        mirror one entry ahead of memory on every failed claim."""
+        live_song.persisted = True
+        lpop_spy = await self._run_until_it_breaks(
+            music_player, queue_obj, mock_song, live_song
+        )
+        lpop_spy.assert_awaited_once()
 
 
 class TestNeutralizePrefetch:
@@ -8137,6 +8339,38 @@ class TestNeutralizePrefetch:
         assert isinstance(rebuilt, QueueObject)
         assert rebuilt.webpage_url == live_song.webpage_url
         assert rebuilt.title == live_song.title
+
+    async def test_completed_task_rebuild_keeps_origin_and_persistence(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The rebuild is one of two places a playing song becomes a queue object
+        again, and both fields below have already been lost here.
+
+        `user_input` is what -remove matches on, so dropping it leaves the
+        neutralized track the one entry its own collection link cannot take back
+        out. `persisted` decides whether the dequeue LPOPs: defaulted to True on a
+        crash-recovered head it writes an entry into the mirror that was never on
+        the list, and every later LPOP then retires the wrong one."""
+        original = QueueObject("https://yt.com/v=next", "Next Song", mock_author)
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+        live_song.cleanup = MagicMock()
+        live_song.user_input = "https://open.spotify.com/playlist/abc"
+        live_song.persisted = False
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.user_input == "https://open.spotify.com/playlist/abc"
+        assert rebuilt.persisted is False
 
     async def test_completed_task_rebuild_keeps_offset_and_playnow_flags(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock

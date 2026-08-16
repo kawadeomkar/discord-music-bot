@@ -213,6 +213,118 @@ class TestYTDLPositionSecs:
         assert song.position_secs == 90.0
 
 
+class TestYtStreamCarriesTheQueueObjectsFields:
+    """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
+    CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
+    field is silently dropped at. `user_input` reached it late: it is what
+    `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
+    losing it here leaves the parked track un-removable by origin."""
+
+    @staticmethod
+    async def _played(qobj: QueueObject) -> YTDL:
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            return await YTDL.yt_stream(qobj, channel)
+
+    async def test_user_input_survives_the_hop(self, mock_ctx: MagicMock) -> None:
+        album = "https://open.spotify.com/album/abc123"
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            user_input=album,
+        )
+
+        assert (await self._played(qobj)).user_input == album
+
+    def test_no_queueobject_field_is_silently_left_behind(self) -> None:
+        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
+        than at playback.
+
+        The hand-written list below it enumerates six fields and cannot notice a
+        seventh — which is exactly how `user_input` and then `persisted` reached
+        this hop late, the second as a live AttributeError. Anything genuinely not
+        meant to cross gets named in the allow-list, with the reason."""
+        import dataclasses
+        import inspect
+
+        # Fields that legitimately do not cross into YTDL.
+        not_carried = {
+            # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
+            "webpage_url",
+            "title",
+            "duration",
+            "uploader",
+            "thumbnail",
+            # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
+            "ts",
+            # Runtime-only NP handle; a live Message cannot be carried on a source.
+            "np_host_ref",
+        }
+        carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+        params = set(inspect.signature(YTDL.__init__).parameters)
+        missing = sorted(carried - params)
+        assert not missing, (
+            f"QueueObject fields with no YTDL.__init__ keyword: {missing}. "
+            "Add them there, assign them, and pass them from yt_stream — or list "
+            "them in not_carried with a reason."
+        )
+
+    async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
+        """A field added to QueueObject and forgotten here dies at playback, where
+        every read of it happens. Asserted together so an omission fails rather
+        than needing to be noticed."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            user_input="typed",
+            query_source="search",
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            persisted=False,
+            played_at=12.5,
+        )
+
+        song = await self._played(qobj)
+
+        assert (
+            song.user_input,
+            song.query_source,
+            song.interjected,
+            song.is_resume,
+            song.start_paused,
+            song.persisted,
+            song.played_at,
+        ) == ("typed", "search", True, True, True, False, 12.5)
+
+    async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
+        """`persisted` reached the YTDL last, and its absence was a live crash
+        rather than a silent drop: `_neutralize_prefetch` reads it back off the
+        playing song to rebuild a QueueObject, so every `-playnow` over a
+        COMPLETED prefetch raised AttributeError — failing the command and
+        stranding the prefetch's claim, which the next commit then settled onto
+        the wrong song.
+
+        False is the value that matters. It marks the crash-recovered head, whose
+        entry is NOT on the Redis list; defaulting it to True in the rebuild would
+        write that head into the mirror, where its dequeue never LPOPs and every
+        later entry sits one place out."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            persisted=False,
+        )
+
+        assert (await self._played(qobj)).persisted is False
+
+
 class TestQueueObject:
     def test_required_fields(self, mock_author: MagicMock) -> None:
         qobj = QueueObject(

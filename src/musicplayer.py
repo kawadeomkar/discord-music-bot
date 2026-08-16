@@ -373,7 +373,11 @@ class MusicPlayer:
     history: GuildHistory
     volume: float
     _player: Optional[asyncio.Task]
-    _prefetch_task: Optional[asyncio.Task]
+    # Parameterized, unlike its siblings: _neutralize_prefetch reads fields off
+    # this task's result, and a bare Task makes result() Any — which is how a
+    # QueueObject-only attribute reached a YTDL and raised at runtime with
+    # pyright reporting nothing.
+    _prefetch_task: Optional[asyncio.Task[Optional[YTDL]]]
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
@@ -443,7 +447,7 @@ class MusicPlayer:
             ),
         )
         self._player: Optional[asyncio.Task] = None
-        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_task: Optional[asyncio.Task[Optional[YTDL]]] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
         # Set when the restore could not READ the store. Without it an empty queue is
@@ -1823,7 +1827,10 @@ class MusicPlayer:
           the pending front, exactly as bulk mutations rely on.
         - completed → rebuild an equivalent QueueObject, return it to the front, kill
           its FFmpeg subprocess. Neither the deque slot nor the mirror moved, so
-          requeue_front() rewrites the slot with the resolved form.
+          requeue_front() rewrites the slot with the resolved form. Carry every
+          field: this is one of the two places a playing song becomes a queue
+          object again, and both have already lost one (see CLAUDE.md's
+          queue-entry-field recipe).
         - completed-with-None → the prefetch already retired its own dequeue.
         """
         task = self._prefetch_task
@@ -1862,6 +1869,7 @@ class MusicPlayer:
             analytics=song.analytics,
             query_source=song.query_source,
             user_input=song.user_input,
+            persisted=song.persisted,
             played_at=song.played_at,
             np_message_id=song.np_message_id,
             np_channel_id=song.np_channel_id,
@@ -2236,6 +2244,12 @@ class MusicPlayer:
             # window. Cleared at the commit, not at song end — the release it
             # guards deletes an item.
             claim_outstanding = False
+            # Whether that claim has an entry on the Redis list, so the outer
+            # handler can settle it WITHOUT re-deriving the answer from `source`.
+            # It cannot: the prefetched branch below leaves `source` None, and
+            # None defaults to popping. Written at the same moment as the flag
+            # above, so it never describes a different item than the one claimed.
+            claim_persisted = True
             # Each iteration spans a full song (3–5 min). Expected — the span stays
             # open across play_next.wait().
             with _tracer.start_as_current_span(
@@ -2261,17 +2275,32 @@ class MusicPlayer:
                         self.current_song = prefetched_song
                         prefetched_song = None
                         claim_outstanding = True  # the prefetch's get_nowait() is ours
-                        # Prefetched items always came through queue_get(), so they
-                        # are real Redis-mirrored entries. source stays None:
-                        # redis_pop_for(None) treats the dequeue as persisted.
+                        # Read off the song, never assumed. A prefetch CAN claim a
+                        # persisted=False item — a cold-start `-play` front-inserts
+                        # at cursor 0, which is AHEAD of the crash-recovered head,
+                        # so the prefetch that follows takes that head. Hardcoding
+                        # True here LPOPed for an entry that was never on the list,
+                        # silently deleting the next real one.
+                        claim_persisted = self.current_song.persisted
+                        # Both settle paths, one read: this decides the start
+                        # transaction's LPOP, and claim_persisted decides the outer
+                        # handler's. `source` stays None because a YTDL is not a
+                        # QueueItem — which is exactly why the flag has to travel.
+                        should_pop_queue = claim_persisted
                         source = None
-                        should_pop_queue = True
                     else:
                         source = None
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
                                 claim_outstanding = True
+                                # Safe to read before the resolve: a YTSource is
+                                # persisted and yt_source() builds a QueueObject
+                                # that defaults the same way, so resolution cannot
+                                # change this answer. Taken here anyway, beside the
+                                # claim it describes, rather than at the one line
+                                # that happens to run before every use of it.
+                                claim_persisted = is_persisted(source)
                                 # Re-read: queue_get() can block, and a clear()
                                 # during that wait belongs to the queue this item
                                 # came from, not to the one we sampled above.
@@ -2609,9 +2638,16 @@ class MusicPlayer:
                     # finish_failed_dequeue, not release: release drops the item
                     # from memory alone, leaving its mirror entry for the next
                     # LPOP to retire in its place.
+                    #
+                    # persisted= is passed rather than left to `source`, which is
+                    # None for a prefetched claim and would default to popping —
+                    # retiring a real entry for a crash-recovered head that never
+                    # had one, and taking the next queued song with it.
                     if claim_outstanding:
                         await self.queue.finish_failed_dequeue(
-                            source, context="unhandled loop error"
+                            source,
+                            context="unhandled loop error",
+                            persisted=claim_persisted,
                         )
                     # Awaited, matching _cancel_prefetch: the prefetch returns its
                     # item through requeue_front, and an unawaited cancel leaves that

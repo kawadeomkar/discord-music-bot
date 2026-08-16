@@ -627,6 +627,7 @@ class YTDL(discord.FFmpegOpusAudio):
         analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
         user_input: Optional[str] = None,
+        persisted: bool = True,
         played_at: float = 0.0,
         np_message_id: int = 0,
         np_channel_id: int = 0,
@@ -652,6 +653,12 @@ class YTDL(discord.FFmpegOpusAudio):
         # What the user typed, carried so -remove still matches a song that has
         # become a playing one — a -playnow resume tail is rebuilt from here.
         self.user_input: Optional[str] = user_input
+        # Whether this song's entry is still on the Redis list, carried for the
+        # SAME rebuild: _neutralize_prefetch reads it back off the playing song to
+        # reconstruct a QueueObject, and defaulting it to True there would write a
+        # crash-recovered head (persisted=False) into the mirror, where its dequeue
+        # never LPOPs and every later entry sits one place out.
+        self.persisted: bool = persisted
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).
         self.played_at: float = played_at
@@ -870,6 +877,7 @@ class YTDL(discord.FFmpegOpusAudio):
             analytics=qo.analytics,
             query_source=qo.query_source,
             user_input=qo.user_input,
+            persisted=qo.persisted,
             played_at=qo.played_at,
             np_message_id=qo.np_message_id,
             np_channel_id=qo.np_channel_id,

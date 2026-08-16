@@ -13,8 +13,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
-    _to_entry,
     _LREM_MAX_ENTRIES,
+    _to_entry,
     GuildQueue,
     RemoveMode,
     ShuffleOutcome,
@@ -75,8 +75,11 @@ class TestIsPersisted:
         assert is_persisted(YTSource(ytsearch="artist song")) is True
 
     def test_none_is_persisted(self) -> None:
-        # The prefetch path's dequeues are always of real, Redis-mirrored
-        # entries — redis_pop_for(None) must pop.
+        # The default for "no item to ask", which is what the ordinary dequeue
+        # paths want. NOT because a caller passing None always holds a persisted
+        # claim — the playback loop's prefetched branch passes None and can hold
+        # an unpersisted one, which is why redis_pop_for takes an explicit
+        # override rather than trusting this.
         assert is_persisted(None) is True
 
 
@@ -1582,6 +1585,44 @@ class TestDequeueBookkeeping:
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 1  # untouched
 
+    async def test_explicit_persisted_false_beats_the_none_default(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """item=None defaults to popping; the override is the only way a caller
+        whose claim is not a QueueItem can say otherwise. The playback loop's
+        prefetched branch is that caller."""
+        await gq.put([_qobj(1, mock_author)])
+        await gq.redis_pop_for(None, persisted=False)
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
+        # And the default still pops, so the override is doing the work rather
+        # than the call shape.
+        await gq.redis_pop_for(None)
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 0
+
+    async def test_finish_failed_dequeue_forwards_the_override(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """The loop's outer handler settles a prefetched claim with item=None and
+        persisted=False. Dropping the forward LPOPs a real entry for a head that
+        never had one."""
+        await gq.put([_qobj(1, mock_author)])  # the real, persisted entry
+        seed_queue(gq, _qobj(99, mock_author, persisted=False))
+        _ = await gq.get()  # the prefetch's claim, as the loop takes it
+        await gq.finish_failed_dequeue(
+            None, context="unhandled loop error", persisted=False
+        )
+        assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+        assert gq._cursor == 0  # settled in memory either way
+
     async def test_pop_display_head_warns_on_empty(
         self, gq: GuildQueue, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -1590,6 +1631,37 @@ class TestDequeueBookkeeping:
         with caplog.at_level(logging.WARNING, logger="src.guild_queue"):
             gq.release("failed-song pop")
         assert "failed-song pop" in caplog.text
+
+    async def test_a_settled_claim_does_not_take_the_mirror_with_it(
+        self,
+        gq: GuildQueue,
+        fake_redis: aioredis.Redis,
+        store: GuildRedisStore,
+        mock_author: MagicMock,
+    ) -> None:
+        """A clear() during a resolve retires the claim and resets the cursor, so
+        the release below is a no-op — and the LPOP must be too.
+
+        Unguarded it fired anyway, against a mirror that by then held only what
+        was queued AFTER the clear, deleting a song this failure had nothing to do
+        with. At-most-once, so there is no error and no second copy: the entry is
+        simply gone, and the next restore hands the guild a queue one song short.
+        The warning names the memory leg, which is what made it look harmless."""
+        await gq.put([_qobj(1, mock_author)])
+        claimed = await gq.get()  # the loop, mid-resolve
+
+        await gq.clear()  # -clear lands
+        await gq.put(  # -play refills, memory and mirror agree
+            [_qobj(2, mock_author), _qobj(3, mock_author), _qobj(4, mock_author)]
+        )
+
+        await gq.finish_failed_dequeue(claimed, context="failed-song pop")
+
+        # Contents, not counts: an LPOP here takes the HEAD, so the survivors are
+        # still a valid-looking list one song short — which is why this went
+        # unnoticed. _assert_mirror_matches is what names the missing entry.
+        assert len(gq.display_items()) == 3
+        await _assert_mirror_matches(gq, fake_redis, store)
 
     async def test_pop_display_head_pops(
         self, gq: GuildQueue, mock_author: MagicMock
