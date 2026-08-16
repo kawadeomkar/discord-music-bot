@@ -254,6 +254,7 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             interjected=True,
             is_resume=True,
             start_paused=True,
+            persisted=False,
             played_at=12.5,
         )
 
@@ -265,8 +266,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
             song.interjected,
             song.is_resume,
             song.start_paused,
+            song.persisted,
             song.played_at,
-        ) == ("typed", "search", True, True, True, 12.5)
+        ) == ("typed", "search", True, True, True, False, 12.5)
 
 
 class TestQueueObject:

@@ -372,7 +372,10 @@ class MusicPlayer:
     history: GuildHistory
     volume: float
     _player: Optional[asyncio.Task]
-    _prefetch_task: Optional[asyncio.Task]
+    # Parameterized deliberately: _neutralize_prefetch rebuilds a QueueObject from
+    # this task's result, and an unparameterized Task makes result() Any, so a field
+    # YTDL does not carry reads clean and raises at runtime instead (it has, twice).
+    _prefetch_task: Optional[asyncio.Task[Optional[YTDL]]]
     store: Optional[GuildRedisStore]
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
@@ -442,7 +445,7 @@ class MusicPlayer:
             ),
         )
         self._player: Optional[asyncio.Task] = None
-        self._prefetch_task: Optional[asyncio.Task] = None
+        self._prefetch_task: Optional[asyncio.Task[Optional[YTDL]]] = None
         self._restore_task: Optional[asyncio.Task] = None
         self._restore_complete = asyncio.Event()
         # Set when the restore could not READ the store. Without it an empty queue is
