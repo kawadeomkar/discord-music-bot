@@ -43,6 +43,7 @@ from src.redis_client import (
 from src.guild_queue import RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
+    unquote_argument,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
@@ -925,7 +926,15 @@ class MusicBot(commands.Cog):
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
-    async def play(self, ctx: commands.Context, url: str) -> None:
+    async def play(self, ctx: commands.Context, *, url: str) -> None:
+        # Consume-rest, so a multi-word search arrives whole. It is what -remove
+        # matches on, and a positional would bind only "never" out of "never gonna
+        # give you up" — making that removable by a prefix nobody typed.
+        # parse_input reads the search off the message either way; only the origin
+        # changes. Unquoted because read_rest, unlike the positional parser it
+        # replaced, hands the quotes through — and `origin` is stamped from this
+        # value, so a quoted one is what -remove would then have to match.
+        url = unquote_argument(url.strip())
         async with background_typing(ctx):
             try:
                 # Paused → interject, not append: appending leaves the bot silent
@@ -1161,7 +1170,8 @@ class MusicBot(commands.Cog):
     @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
-    async def playnow(self, ctx: commands.Context, url: str) -> None:
+    async def playnow(self, ctx: commands.Context, *, url: str) -> None:
+        url = unquote_argument(url.strip())  # consume-rest, as -play — see there
         async with background_typing(ctx):
             try:
                 mp = self.get_mp(ctx)

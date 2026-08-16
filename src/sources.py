@@ -241,6 +241,28 @@ def parse_url(
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
+def unquote_argument(text: str) -> str:
+    """Drop one matched pair of surrounding quotes.
+
+    `-play` and `-playnow` take consume-rest arguments, and discord.py's
+    `read_rest()` does no quote handling — where the old positional parser's
+    `get_quoted_word()` consumed them. So `-play "<url>"` began arriving WITH the
+    quotes, and parse_url's `re.search` still matches the domain inside them while
+    dragging the trailing quote into the path, which yt-dlp then rejects. A quoted
+    search fared no better: it stored `"some song"` as the origin, so retyping the
+    obvious `-remove some song` matched nothing.
+
+    Only a whole argument wrapped at both ends, and never down to nothing — a lone
+    quote or an empty pair is text the user typed, not a wrapper. Applied both here
+    and at the command (which stamps `origin` from its own argument, separately
+    from this), so it has to be safe to run twice; it is, for everything but a
+    doubly-wrapped literal nobody types."""
+    for quote in ('"', "'"):
+        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+            return text[1:-1]
+    return text
+
+
 def parse_input(
     user_input: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
@@ -251,10 +273,10 @@ def parse_input(
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:
-            return parse_url(user_input, message)
+            return parse_url(unquote_argument(user_input), message)
         except ValueError:
             pass
-    ytsearch = " ".join(args)
+    ytsearch = unquote_argument(" ".join(args))
     return YTSource(
         ytsearch=f"ytsearch:{ytsearch}",
         process=True,
