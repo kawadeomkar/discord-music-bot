@@ -1021,6 +1021,7 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -1057,6 +1058,7 @@ class TestYTStream:
             executable: str,
             before_options: str,
             options: str,
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["options"] = options
@@ -1684,6 +1686,55 @@ class TestPrefetchStream:
         assert cached is None
 
 
+class TestOpusPassthrough:
+    """Discord speaks Opus and ~90% of what YouTube serves here already IS Opus, so
+    the encoder was spending a full lossy generation to arrive at the same thing.
+    `codec="copy"` remuxes instead. discord.py resolves `codec` to 'copy' only for
+    ('opus', 'libopus', 'copy') and to 'libopus' for everything else, INCLUDING None
+    — so the gate is a plain codec string, and None is today's behavior."""
+
+    async def _codec(self, **data_overrides: Any) -> Optional[str]:
+        """The codec yt_stream hands FFmpegOpusAudio for this serve."""
+        captured: dict[str, Optional[str]] = {}
+
+        def capture_init(
+            self: Any, url: str, *, codec: Optional[str] = None, **kwargs: Any
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["codec"] = codec
+
+        volume = data_overrides.pop("volume", 1.0)
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=_fake_ytdl_data(**data_overrides),
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(
+                QueueObject("https://yt.com/v=x", "Song", MagicMock()),
+                AsyncMock(spec=discord.TextChannel),
+                volume=volume,
+            )
+        return captured["codec"]
+
+    async def test_an_opus_serve_is_remuxed(self) -> None:
+        assert await self._codec(acodec="opus") == "copy"
+
+    async def test_an_aac_serve_is_still_encoded(self) -> None:
+        """The muxed fallback rungs (itag 18, HLS 91-96) carry AAC."""
+        assert await self._codec(acodec="mp4a.40.2") is None
+
+    async def test_a_volume_filter_forces_the_encoder(self) -> None:
+        """A filter has to touch samples, so it cannot ride the copy path."""
+        assert await self._codec(acodec="opus", volume=0.5) is None
+
+    async def test_a_missing_codec_is_not_assumed_to_be_opus(self) -> None:
+        """Pre-upgrade cache entries and extractors that report nothing must fall to
+        the encoder, not be guessed into a remux that ffmpeg would then refuse."""
+        assert await self._codec(acodec=None) is None
+
+
 class TestYTStreamCarriedFields:
     """A playing song becomes a QueueObject again — a neutralized prefetch, an
     interjection's resume tail, a stream retry — so anything QueueObject carries and
@@ -1792,6 +1843,7 @@ class TestYTStreamPlaynowFlags:
             executable: str,
             before_options: Optional[str],
             options: Optional[str],
+            codec: Optional[str] = None,
         ) -> None:
             noop_ffmpeg_init(self)
             captured_options["before_options"] = before_options

@@ -523,6 +523,12 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
     span.set_attribute("ytdl.protocol", str(data.get("protocol")))
     audio_only = data.get("vcodec") in (None, "none")
     span.set_attribute("ytdl.audio_only", audio_only)
+    # Whether this serve is eligible for the remux path — attributed here rather
+    # than only at construction, so a guild that stopped getting passthrough
+    # (android_vr degraded to muxed AAC) is visible in the same place as why.
+    span.set_attribute(
+        "ytdl.opus_passthrough", _passthrough_codec(data, 1.0) is not None
+    )
     if not audio_only and format_id not in _DEGRADED_FORMAT_WARNED:
         _DEGRADED_FORMAT_WARNED.add(format_id)
         log.warning(
@@ -531,6 +537,33 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
             "primary audio-only path (android_vr) is degraded and the player is "
             "on the fallback ladder"
         )
+
+
+def _passthrough_codec(data: YTDLVideoMetadata, volume: float) -> Optional[str]:
+    """ "copy" when this song can be remuxed instead of re-encoded, else None (which
+    leaves discord.py's `-c:a libopus` default).
+
+    Discord speaks Opus and ~90% of what YouTube serves here IS Opus (format 251),
+    so the encoder was spending a full lossy generation — 129 kbps opus decoded and
+    re-encoded to 128 kbps — plus the CPU, to arrive at the same thing. discord.py's
+    own route to the copy path is from_probe(), an ffprobe round trip per song; the
+    extraction already told us the codec and it is in the stream cache, so this
+    decides from data we have.
+
+    Both halves of the gate are required. A volume filter has to touch samples, so
+    it forces the encoder — and `-volume` already only applies from the next song,
+    which is what makes this a per-construction decision with no mid-song switch.
+
+    Measured before adopting, because the risk was position math: `read()` counts
+    packets and every position surface is frames x 20ms, so a different packet
+    cadence under copy would silently skew all of them. Copy and libopus produce
+    identical counts (213.10s of packets for a 213s song, both), and copy with the
+    two-pass seek lands within 0.02s of the target. One accepted difference: a mono
+    Opus source stays mono instead of being upmixed by `-ac 2`, which is the honest
+    rendering of it rather than a defect.
+    """
+    acodec = str(data.get("acodec") or "")
+    return "copy" if acodec.startswith("opus") and volume == 1.0 else None
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -723,6 +756,7 @@ class YTDL(discord.FFmpegOpusAudio):
         start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
+        codec: Optional[str] = None,
         user_input: Optional[str] = None,
         persisted: bool = True,
         stream_attempts: int = 0,
@@ -738,8 +772,14 @@ class YTDL(discord.FFmpegOpusAudio):
         np_dedicated: bool = False,
         np_host_ref: Optional[NpHostRef] = None,
     ) -> None:
+        # codec=None keeps discord.py's default (`-c:a libopus`); "copy" selects the
+        # remux path. See yt_stream, which decides which one a song gets.
         super().__init__(
-            url, executable="ffmpeg", before_options=before_options, options=options
+            url,
+            executable="ffmpeg",
+            before_options=before_options,
+            options=options,
+            codec=codec,
         )
 
         self.requester = requester
@@ -1068,6 +1108,7 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
+            codec=_passthrough_codec(data, volume),
             user_input=qo.user_input,
             persisted=qo.persisted,
             stream_attempts=qo.stream_attempts,

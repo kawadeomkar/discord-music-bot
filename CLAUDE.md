@@ -776,9 +776,18 @@ output-side alone downloads and decodes from 0:00 (a 40min-in crash recovery pul
 overstate everywhere and a `-playnow` resume would replay. `-accurate_seek` is already
 the default and does not fix it;
 volume via `-filter:a volume=` (which is why `-volume` applies from the
-next song). `read()` counts frames → `elapsed_secs`/`position_secs` is the single source
+next song). **Opus passthrough**: when the served format is already opus (251/249,
+~90% of serves) AND volume == 1.0, `codec="copy"` remuxes instead of
+decode-and-re-encode — discord.py resolves `codec` to `-c:a copy` only for
+`('opus','libopus','copy')`, and its own route there (`from_probe`) is an ffprobe round
+trip per song we skip, since the extraction already told us `acodec`. Removes one lossy
+generation (YouTube's ~129k opus was being re-encoded to 128k) and most of the per-song
+CPU. A volume filter has to touch samples, so it forces the encoder. `read()` counts
+frames → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, pause confirmation, history,
-interject resume point) and freezes during any pause automatically.
+interject resume point) and freezes during any pause automatically — measured identical
+under copy and libopus (same packet count for the same song), which is what made
+passthrough safe to adopt.
 
 ### Spotify
 
