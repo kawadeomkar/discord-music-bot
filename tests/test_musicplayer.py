@@ -3403,7 +3403,7 @@ class TestEnqueueDepth:
         self, music_player: MusicPlayer, mock_author: MagicMock, mock_vc: MagicMock
     ) -> None:
         """H5. The tail is a rebuild, and YTDL had no user_input at all — so the
-        origin died the moment a song started playing, and `-remove <album link>`
+        origin died the moment a song started playing, and `-remove <playlist link>`
         left the parked track behind while taking every other track."""
         album = "https://open.spotify.com/album/abc123"
         current = MagicMock()

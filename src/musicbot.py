@@ -243,9 +243,13 @@ _NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PlayArgs:
     """`-play`'s argument, split into the placement flag and the query behind it.
+
+    kw_only because `query` and `dash_typo` are adjacent, both `str`-ish, and one of
+    them is echoed straight into an embed: positionally they transpose silently, and
+    the result is the bot asking "did you mean `<the user's whole search>`?".
 
     `dash_typo` is the third state: the leading token is recognisably a misspelt flag
     rather than either a flag or a search, so the command asks instead of guessing. It
@@ -1261,9 +1265,10 @@ class MusicBot(commands.Cog):
             ],
             "note": (
                 "Spotify links are matched to YouTube audio one title at a time, so a "
-                "long playlist takes a few seconds to finish queueing — and one `-play` "
-                "runs at a time per server, so a second one sent while it is still "
-                "queueing is asked to wait rather than cutting the line."
+                "long playlist takes a few seconds to finish queueing — and one plain "
+                "`-play` runs at a time per server, so a second one sent meanwhile is "
+                "declined rather than queued. `--now` and `--next` have their own "
+                "limit, so an urgent request still goes through."
             ),
         },
     )
@@ -1368,9 +1373,9 @@ class MusicBot(commands.Cog):
                     and (vc.is_playing() or vc.is_paused())
                     else None
                 )
-                # Decided BEFORE the resolve, as the separate command was: "nothing
-                # live" is what lets a playlist enqueue whole, while the interject
-                # path collapses it to one track.
+                # Decided BEFORE the resolve, as the separate command was: whether
+                # a song is live is what separates interrupting one from queueing
+                # ahead of it, and the resolve is where that can change.
                 if live_vc is not None:
                     if args.mode is PlayMode.NOW:
                         interjecting = True
@@ -1696,9 +1701,9 @@ class MusicBot(commands.Cog):
         if outcome is None:
             # The song ended during the resolve — nothing left to interrupt. Insert
             # qobj directly rather than re-invoking -play, which would re-parse,
-            # re-resolve and (for a playlist) enqueue all tracks right after the
-            # first-track-only notice above. Front, not append: the user asked for
-            # "now", and this window can be seconds long with songs queued behind.
+            # re-resolve and enqueue every track a second time. Front, not append:
+            # the user asked for "now", and this window can be seconds long with
+            # songs queued behind.
             # It interrupted nothing, so keeping the marker would attribute an
             # interjection that never happened.
             qobj.interjected = False

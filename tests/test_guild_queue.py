@@ -167,7 +167,7 @@ class TestPut:
 class TestRemoveByOriginSurvivesARestart:
     """The end-to-end the origin work exists for, through the one hop that can
     lose it. A Spotify album expands to N unresolved searches whose `ytsearch` is
-    a title this code generated; the album link survives only on the wire, so
+    a title this code generated; the playlist link survives only on the wire, so
     every leg of enqueue → Redis → restart → rehydrate → match has to carry it.
 
     Assembled from real store calls rather than asserted leg by leg: the wire
@@ -182,7 +182,7 @@ class TestRemoveByOriginSurvivesARestart:
         mock_author: MagicMock,
     ) -> None:
         mock_guild.get_member.return_value = mock_author
-        album = "https://open.spotify.com/album/abc123"
+        album = "https://open.spotify.com/playlist/abc123"
         await gq.put(
             [
                 YTSource(ytsearch=f"ytsearch:Track {n}", process=True, user_input=album)
@@ -1241,7 +1241,7 @@ class TestRemoveMatcher:
 
     def test_unresolved_search_entry_matches_on_its_origin(self) -> None:
         """A Spotify-playlist track has no resolved URL yet — the origin is the
-        only thing it can be matched by, and the only place the album link is."""
+        only thing it can be matched by, and the only place that link is."""
         album = "https://open.spotify.com/album/xyz"
         item = YTSource(ytsearch="ytsearch:Track One", user_input=album)
         assert remove_matcher(album)(item) is RemoveMode.ORIGIN
@@ -1523,8 +1523,8 @@ class TestRestoreEntries:
         self, gq: GuildQueue, mock_guild: MagicMock, mock_author: MagicMock
     ) -> None:
         """The song branch already carried user_input; the search branch is the new
-        leg, and it is the one that matters — a Spotify-album track holds the album
-        link nowhere else, so losing it here breaks -remove after a restart."""
+        leg, and it is the one that matters — a lazy Spotify-playlist track holds
+        that link nowhere else, so losing it here breaks -remove after a restart."""
         mock_guild.get_member.return_value = mock_author
         album = "https://open.spotify.com/album/abc123"
         assert (

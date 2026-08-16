@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.11.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.27.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,330 tests plus two opt-in integration tiers (testcontainers): a 74-test `pg` tier and a 41-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,820 tests plus two opt-in integration tiers (testcontainers): a 72-test `pg` tier and a 47-test `redis` tier; coverage gate `fail_under = 80` (actual ~95%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -357,18 +357,31 @@ three separate phases so queueing is instant and songs start with near-zero late
   │ validate_commands: author must be in a usable voice channel
   ▼
 play():
-  ├─ voice client paused + song live? ──► _interject_flow (resume_paused=False):
-  │                                        "-play means play" — see interjection section
+  ├─ split_play_args: strips a LEADING --now / --next off the argument (PlayMode);
+  │        a near-miss like -now becomes a hint, not a search for "now <url>"
+  ├─ _play_bucket: one in flight per guild PER MODE, declined not queued. Two
+  │        buckets, because -playnow used to be its own command and therefore its
+  │        own semaphore — merged, a slow -play blocked every --now for its length
+  ├─ song live? ──► _interject_flow:
+  │      • --now                     → interrupt, park a resume tail (resume_paused=True)
+  │      • plain -play + PAUSED song → same flow, resume_paused=False ("-play means play")
+  │      • --next                    → NOT here: it never interrupts, paused or not
   ├─ parse_input (sources.py): single word → parse_url (youtube/spotify/soundcloud/
   │        any dotted domain → URLSource.OTHER, handed raw to yt-dlp); else ytsearch
-  ├─ bot disconnected? front=True:
+  ├─ placement (Placement enum — the insert position, decided separately from
+  │        cold_start, which also drives the analytics shortcut and the join dance):
+  │      • disconnected              → COLD_FRONT
+  │      • --now / --next with nothing live → NEXT (queue_put_next: it neutralizes
+  │        the prefetch first, or the loop's open claim makes a front insert land SECOND)
+  │      • otherwise                 → TAIL
+  ├─ cold start:
   │      • defer_playback() hold (gate stays shut so a Redis-restored queue head
   │        can't start while this input resolves)
   │      • join launched CONCURRENTLY with queue_source (no data dependency);
   │        any failure cancels join and runs full cleanup() (zombie-loop prevention)
-  │      • wait_for_restore() BEFORE put_front — ordering is load-bearing: put_front
-  │        LPUSHes Redis, restore_entries replays entries already on that list
-  │        in-memory-only; inserting first would double-queue this song
+  ├─ every non-TAIL placement: wait_for_restore() BEFORE the insert — ordering is
+  │        load-bearing: put_front LPUSHes Redis, restore_entries replays entries
+  │        already on that list in-memory-only; inserting first double-queues this song
   ▼
 PHASE 1 — RESOLVE (enqueue time, instant on repeats):
   queue_source → YTDL.yt_source: check ytdl:source:{normalized query} (TTL 1h).
@@ -511,7 +524,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   move with it.
 - `remove()` takes a **predicate**, and `remove_matcher()` beside the class owns the
   policy: resolved yt-dlp URL first, then `user_input`. Links compare literally, text
-  casefolds — folding a link would let one Spotify album's base62 id match another's.
+  casefolds — folding a link would let one Spotify playlist's base62 id match another's.
 
 ### Redis schema and persistence model
 
@@ -829,6 +842,8 @@ Per-guild synchronization primitives and what they protect:
 | Primitive | Protects |
 |---|---|
 | `GuildQueue._mutex` | the deque and its Redis mirror during bulk mutations; dequeue commits |
+| `GuildQueue._wake` (Event) | the pending-item signal a parked `get()` waits on; set iff `_cursor < len(_items)`, and `_sync_wake()` is its ONLY writer — a stale set turns the wait loop into a loop with no suspension point and stops the event loop (measured at 2,000,001 iterations with 0 other loop ticks) |
+| `MusicBot._play_inflight` | one `-play` per guild PER PLACEMENT, declined rather than queued. Not `max_concurrency`: that acquires before `_parse_arguments`, so it cannot see the flag. Two buckets, because `-playnow` was a separate command with its own semaphore and merging it put the urgent path behind a slow `-play` |
 | `_playback_gate` (+ holds) | loop consuming the queue before a real voice connection / while `-play` resolves or `-resume` rejoins |
 | `_restore_complete` | loop dequeuing before restore has injected the crashed head |
 | `play_next` (Event) | song-end handoff from the audio thread |
@@ -841,10 +856,11 @@ Per-guild synchronization primitives and what they protect:
 | claim-then-null on `_prefetch_task` | exactly-one-consumer of a prefetch result (loop vs interject) |
 
 One known, documented, accepted race remains open (ISSUE header in guild_queue.py): a
-bulk mutation can land between `try_commit_dequeue()` releasing the mutex and the start
-transaction's server-side LPOP, drifting memory and Redis by one entry. The sketched fix
-(hold the mutex across the store dispatch) is described there — if you touch this code,
-read that header first.
+bulk mutation OR an insert can land between `try_commit_dequeue()` releasing the mutex and
+the start transaction's server-side LPOP, drifting memory and Redis by one entry. The
+insert direction has three callers (`interject`, the cold-start `-play`, `-play --next`)
+and is the likelier half. Its "cheapest fix" is NOT cheap from where the loop sits — the
+mutex hold would span `vc.play()` — see the header, and read it first if you touch this.
 
 ## Code conventions
 
@@ -1059,12 +1075,22 @@ any guild idle for a day.
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
 parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and `YTDL.from_queue_object` in `src/youtube.py`** — miss these three
-and the field is silently dropped the moment the queue object becomes a playing song,
-which is where every read of it happens → carry it through `_neutralize_prefetch`'s
-rebuild if playback-relevant. If it is a DURABLE property of the play rather than of the
-queue slot, it also needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
-`_TRANSIENT_SONG_FIELDS`, or a crash silently resets it (see `is_resume`/`start_paused`).
+instance assignment, and the `cls(...)` call at the end of `YTDL.yt_stream` in
+`src/youtube.py`** — miss these three and the field is silently dropped the moment the
+queue object becomes a playing song, which is where every read of it happens → then
+**BOTH places a playing song is turned back into a QueueObject**: `_neutralize_prefetch`'s
+rebuild and `MusicPlayer.interject()`'s resume tail. **Not gated on "playback-relevant"** —
+`user_input` and `persisted` are neither, and both were lost through exactly that gap;
+`persisted` reached main missing from `YTDL` entirely, which made every `--now`/`--next`
+over a completed prefetch raise. Both rebuild sites are invisible to pyright unless
+`_prefetch_task` stays parameterized as `asyncio.Task[Optional[YTDL]]`, and invisible to
+the tests while their song fixtures are bare `MagicMock()` — drive the rebuild off a real
+`YTDL` (the `ytdl_instance` fixture takes carried fields as kwargs) so a missing attribute
+raises in the suite rather than in a guild. If it is a DURABLE property of the play rather
+than of the queue slot, it also needs `StateField` + `GuildStateData` +
+`_now_playing_state_mapping` + `_TRANSIENT_SONG_FIELDS` **and `SongQueueEntry.from_song`
+/ `from_crashed_state`**, or a crash silently resets it (see `is_resume`/`start_paused`,
+and `user_input`, which came back `None` on the one song that was playing).
 
 **Add a schema migration**: **while no deployment holds the schema, don't** — edit
 `migrations/0001_play_history.sql` in place (its header explains why: nothing is deployed,

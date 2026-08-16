@@ -496,7 +496,12 @@ same as `-skip` or `-shuffle`.
 play track 1 and discard the rest; it now plays track 1 immediately and queues the whole
 playlist behind it. The song it interrupted therefore does not return until the last
 track — on a long playlist, in practice, never. If that was not what you wanted,
-`-remove <the same link>` takes every track of it back out in one command.
+`-remove <the same link>` takes the queued tracks back out in one command; the one already
+playing is not queued any more, so it needs `-skip`.
+
+The same is true of plain `-play <playlist>` while a song is **paused** — that has always
+interrupted the paused song, and now brings the whole playlist with it rather than one
+track.
 
 ## Upgrading to 2.26.0
 
@@ -516,9 +521,10 @@ alongside it:
 - An interjection is no longer exempt from the "bot is already being used in channel X"
   rule. Queueing into a session running elsewhere still works; **stopping** what that
   channel is hearing now requires being in it.
-- `-play` runs one at a time per server, so a `--now` sent while a long playlist is still
-  queueing is asked to wait rather than cutting the line. Previously the two commands held
-  separate limits and could run at once.
+- `-play` runs one at a time per server **per placement**, and a second one is declined
+  outright rather than queued behind the first. `--now` and `--next` share a limit with
+  each other and have their own, so an urgent request still goes through while a long
+  playlist is queueing — the same as when `-playnow` was a separate command.
 
 ## Upgrading to 2.5.0
 
@@ -927,7 +933,7 @@ src/
 ├── main.py            # entrypoint: MusicBotApp (AutoShardedBot), MusicContext, Redis pool
 ├── musicbot.py        # MusicBot cog — all Discord commands, per-guild player registry
 ├── musicplayer.py     # per-guild playback loop, prefetch, embeds/ETA, presence
-├── guild_queue.py     # GuildQueue — owns the three queue representations
+├── guild_queue.py     # GuildQueue — one deque + a cursor, and the Redis mirror
 ├── guild_history.py   # GuildHistory — play history: capped Redis list + cache
 ├── guild_state.py     # Redis schema: frozen value objects + field constants
 ├── redis_client.py    # connection pool, GuildRedisStore, cache helpers

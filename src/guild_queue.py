@@ -140,7 +140,7 @@ def remove_matcher(needle: str) -> RemoveMatcher:
     tried first, which keeps every removal that worked before working the same way.
 
     Matching an origin removes every item sharing it, which is the point: one
-    album link takes back out exactly the tracks it put in. Links are compared
+    playlist link takes back out exactly the tracks it put in. Links are compared
     literally, so youtu.be/x will not match an entry stored as
     youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
     # Stripped for the resolved leg, which compares literally: consume-rest keeps

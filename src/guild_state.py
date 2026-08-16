@@ -81,7 +81,7 @@ class StateField:
     CURRENT_SONG_UPLOADER: Final[str] = "current_song_uploader"
     CURRENT_SONG_REQUESTER_ID: Final[str] = "current_song_requester_id"
     # "1" when the playing song was queued by an interjection — attribution that
-    # otherwise be lost across a crash mid-interjection.
+    # would otherwise be lost across a crash mid-interjection.
     CURRENT_SONG_INTERJECTED: Final[str] = "current_song_interjected"
     # "1" when the playing song is an interjection's resume tail, and when parked
     # paused. is_resume drives the resume announcement, _remaining_secs' billing and
