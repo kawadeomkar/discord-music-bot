@@ -7,7 +7,7 @@ import dataclasses
 import re
 from zoneinfo import ZoneInfo
 import time
-from typing import Any, Never, cast
+from typing import Any, Never, Optional, cast
 from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Sequence
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -32,6 +32,7 @@ from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
     _BAR_WIDTH,
+    _STREAM_PLAY_ATTEMPTS,
     _build_progress_bar,
     _reached_end,
     _fmt_finish_time,
@@ -93,11 +94,72 @@ def mock_song() -> MagicMock:
     # Unstamped, like a song the loop has not started yet: the loop's or-stamp
     # writes the real clock here, and the epoch clamp raises on a MagicMock.
     song.played_at = 0.0
+    # Carried and retry fields a real YTDL always has. Real values, not MagicMock
+    # attributes: the retry guard compares stream_attempts to an int, and the
+    # rebuild puts user_input/persisted straight onto a QueueObject.
+    song.user_input = None
+    song.persisted = True
+    song.stream_attempts = 0
+    song.failed_format_ids = frozenset()
+    song.data = {"format_id": "251"}
     # Mirror the real YTDL.position_secs property (start_offset + elapsed_secs)
     # so tests that set either attribute get the derived position automatically.
     type(song).position_secs = PropertyMock(
         side_effect=lambda: song.start_offset + song.elapsed_secs
     )
+    return song
+
+
+def _loop_song() -> MagicMock:
+    """A song double for the loop tests: real (str/int/None) values for every field
+    loop() serializes into the Redis start transaction, feeds to HistoryEntry, or
+    compares numerically — MagicMock attributes are not HSET-able and raise under
+    round()/the epoch clamp/the retry guard."""
+    song = MagicMock()
+    song.title = "Loop Test Song"
+    song.webpage_url = "https://yt.com/v=loop1"
+    song.duration_secs = 210
+    song.duration = "0:03:30"
+    song.uploader = "Loop Channel"
+    song.thumbnail = ""
+    song.views = None
+    song.likes = None
+    song.abr = None
+    song.asr = None
+    song.acodec = ""
+    song.requester = None
+    song.start_offset = 0
+    # Real number: loop()'s history step feeds this through
+    # HistoryEntry.from_song, and round(MagicMock) raises.
+    song.position_secs = 195.0
+    # -playnow flags a real YTDL always carries — truthy MagicMock
+    # attributes would trip the loop's start_paused/is_resume gates.
+    song.interjected = False
+    song.is_resume = False
+    song.start_paused = False
+    # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
+    # clamps its fields into the play_history column domain — query_source
+    # too, which the slug clamp regex-matches.
+    song.analytics = ANALYTICS_ZERO
+    song.query_source = ""
+    # Unstamped: the loop's or-stamp writes the real clock here, and the
+    # epoch clamp in HistoryEntry raises on a MagicMock.
+    song.played_at = 0.0
+    # Retry state, as real values: the loop's retry guard compares
+    # stream_attempts to an int, and the rebuild copies the rest verbatim
+    # onto a QueueObject.
+    song.user_input = None
+    song.persisted = True
+    song.stream_attempts = 0
+    song.failed_format_ids = frozenset()
+    song.data = {"format_id": "251"}
+    # The NP-card pointer, zeroed like a song that interrupted nothing. Bare
+    # MagicMocks here reach SongQueueEntry through any rebuild and are not
+    # JSON-serializable, so the Redis mirror write fails with only a warning.
+    song.np_message_id = 0
+    song.np_channel_id = 0
+    song.np_dedicated = False
+    song.np_host_ref = None
     return song
 
 
@@ -5971,37 +6033,7 @@ class TestLoop:
         # Real (str/int/None) values for every field NowPlayingData.from_song()
         # reads — loop() now serializes the song into the Redis start
         # transaction, and MagicMock attribute values are not HSET-able.
-        song = MagicMock()
-        song.title = "Loop Test Song"
-        song.webpage_url = "https://yt.com/v=loop1"
-        song.duration_secs = 210
-        song.duration = "0:03:30"
-        song.uploader = "Loop Channel"
-        song.thumbnail = ""
-        song.views = None
-        song.likes = None
-        song.abr = None
-        song.asr = None
-        song.acodec = ""
-        song.requester = None
-        song.start_offset = 0
-        # Real number: loop()'s history step feeds this through
-        # HistoryEntry.from_song, and round(MagicMock) raises.
-        song.position_secs = 195.0
-        # -playnow flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        return song
+        return _loop_song()
 
     async def test_exits_immediately_when_bot_closed(
         self, music_player: MusicPlayer
@@ -6345,13 +6377,17 @@ class TestLoop:
     ) -> None:
         """Regression: a 403 kills ffmpeg instantly, which discord.py reports exactly
         like a song that finished. The bot then advanced in silence, logged nothing, kept
-        the dead URL cached, and filed the song in history as if it had been heard."""
+        the dead URL cached, and filed the song in history as if it had been heard.
+
+        Pinned to the LAST attempt: an earlier one retries instead of reporting (see
+        TestStreamRetry), and this test is about what the listener is finally told."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
         music_player.bot.loop = asyncio.get_running_loop()
 
         mock_song.produced_audio = False  # ffmpeg never delivered a frame
+        mock_song.stream_attempts = _STREAM_PLAY_ATTEMPTS - 1
 
         await music_player.queue._pending.put(queue_obj)
         music_player.queue._display.append(queue_obj)
@@ -6402,7 +6438,10 @@ class TestLoop:
         """Same dead stream, but on a -playnow resume tail. Zero frames HERE does
         not mean nothing was heard: the offset is audio the interrupted fragment
         played, and that fragment suppressed its own record so this tail would
-        carry it. Dropping it on stream_failed lost the whole play."""
+        carry it. Dropping it on stream_failed lost the whole play.
+
+        On the LAST attempt, since a retried tail defers its record to the retry —
+        the companion test in TestStreamRetry is the other half of that rule."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -6411,6 +6450,7 @@ class TestLoop:
         mock_song.produced_audio = False
         mock_song.is_resume = True
         mock_song.start_offset = 95  # 95s heard under the fragment that parked it
+        mock_song.stream_attempts = _STREAM_PLAY_ATTEMPTS - 1
 
         await music_player.queue._pending.put(queue_obj)
         music_player.queue._display.append(queue_obj)
@@ -7125,6 +7165,302 @@ class TestRestoreStateNowPlaying:
         assert music_player.play_message is None
 
 
+# ── Stream retry ──────────────────────────────────────────────────────────────
+
+
+class TestStreamRetry:
+    """A stream that never opens re-queues the song to play again from the next rung
+    of its audio ladder, instead of reporting a failure and moving on."""
+
+    @pytest.fixture
+    def mock_song(self, mock_author: MagicMock) -> MagicMock:
+        song = _loop_song()
+        # A real requester, unlike the other loop fixtures: the retry rebuilds a
+        # QueueObject that is mirrored to Redis, and a MagicMock requester id is
+        # not JSON-serializable — the mirror write would fail with a warning.
+        song.requester = mock_author
+        return song
+
+    async def _run_failed_iteration(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        song: MagicMock,
+        *,
+        prefetched: Optional[MagicMock] = None,
+        behind: Optional[QueueObject] = None,
+    ) -> AsyncMock:
+        """One loop iteration whose ffmpeg exits with a 403 before any frame.
+        Returns the patched invalidate_stream_cache mock.
+
+        `prefetched` stands in for a COMPLETED prefetch: the stub takes its item
+        off the queue with get_nowait() exactly as the real _prefetch_next_song
+        does, so the neutralize under test settles a real claim."""
+        song.produced_audio = False
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+        if behind is not None:
+            await music_player.queue._pending.put(behind)
+            music_player.queue._display.append(behind)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(
+            side_effect=lambda s, after: after(
+                Exception("FFmpeg exited with code 1. Stderr: HTTP error 403")
+            )
+        )
+        mocked(music_player._guild).voice_client = vc
+        music_player._channel.send = AsyncMock()
+
+        async def song_ends() -> None:
+            # Yield, so the prefetch task actually RUNS before the song ends.
+            # Without this the neutralize under test would only ever cancel a
+            # pending task, never settle a completed one — the case that
+            # bypasses the queue and plays instead of the retry.
+            for _ in range(3):
+                await asyncio.sleep(0)
+
+        music_player.play_next.wait = AsyncMock(side_effect=song_ends)
+
+        async def prefetch_next() -> Optional[MagicMock]:
+            if prefetched is None:
+                return None
+            music_player.queue.get_nowait()
+            return prefetched
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer,
+                "_prefetch_next_song",
+                new=AsyncMock(side_effect=prefetch_next),
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+        return mock_invalidate
+
+    def _front(self, music_player: MusicPlayer) -> QueueObject:
+        head = music_player.queue._display[0]
+        assert isinstance(head, QueueObject)
+        return head
+
+    async def test_a_dead_stream_requeues_the_song_instead_of_giving_up(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The headline behavior: the song comes back at the front, carrying the
+        attempt it just spent and the format that failed."""
+        mock_invalidate = await self._run_failed_iteration(
+            music_player, queue_obj, mock_song
+        )
+
+        # The dead URL must not be replayed by the retry's own resolve.
+        mock_invalidate.assert_awaited_once()
+        retry = self._front(music_player)
+        assert retry.webpage_url == mock_song.webpage_url
+        assert retry.stream_attempts == 1
+        assert retry.failed_format_ids == frozenset({"251"})
+        assert music_player.queue.qsize() == 1
+
+    async def test_the_listener_is_told_a_retry_is_coming(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A silent retry that fails twice is 20+ seconds of unexplained dead air."""
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        send = mocked(music_player._channel.send)
+        send.assert_awaited_once()
+        assert "attempt 2/3" in send.await_args.kwargs["embed"].description
+
+    async def test_the_retry_plays_before_an_already_prefetched_next_song(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The ordering P1. The loop claims _prefetch_task into a local right after
+        the song ends, so a neutralize deferred to the iteration tail reads None,
+        no-ops, and the prefetched next song plays INSTEAD of the retry. The
+        decision therefore runs where stream_failed is computed, while the task
+        attribute is still set."""
+        prefetched = _loop_song()
+        prefetched.webpage_url = "https://yt.com/v=next"
+        prefetched.title = "The Next Song"
+        prefetched.requester = mock_song.requester
+        # The song the prefetch claimed, sitting behind the one about to die.
+        next_obj = QueueObject(
+            "https://yt.com/v=next", "The Next Song", mock_song.requester
+        )
+
+        await self._run_failed_iteration(
+            music_player, queue_obj, mock_song, prefetched=prefetched, behind=next_obj
+        )
+
+        assert music_player._prefetch_task is None
+        head = self._front(music_player)
+        assert head.webpage_url == mock_song.webpage_url, (
+            "the prefetched next song was played instead of the retry — "
+            "_neutralize_prefetch ran too late to take it off the board"
+        )
+        # Neutralized, not discarded: the next song is back in the queue behind
+        # the retry, and its FFmpeg subprocess was killed.
+        assert [
+            cast(QueueObject, item).webpage_url for item in music_player.queue._display
+        ] == [mock_song.webpage_url, prefetched.webpage_url]
+        prefetched.cleanup.assert_called_once()
+
+    async def test_attempts_stop_at_the_cap(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The last attempt reports the failure instead of queueing another."""
+        mock_song.stream_attempts = _STREAM_PLAY_ATTEMPTS - 1
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert music_player.queue.display_size() == 0
+        embed = mocked(music_player._channel.send).await_args.kwargs["embed"]
+        assert "Could not play" in embed.description
+        assert f"{_STREAM_PLAY_ATTEMPTS} attempts" in embed.description
+
+    async def test_the_attempt_before_the_cap_still_retries(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The off-by-one guard: `+ 1 <` and `+ 1 <=` differ only here, and the
+        second spends one attempt fewer than the constant promises."""
+        mock_song.stream_attempts = _STREAM_PLAY_ATTEMPTS - 2
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).stream_attempts == _STREAM_PLAY_ATTEMPTS - 1
+
+    async def test_the_failed_formats_accumulate_across_attempts(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Each attempt adds the format it burned, so the ladder walk keeps
+        narrowing rather than re-trying the first failure on every retry."""
+        mock_song.stream_attempts = 1
+        mock_song.failed_format_ids = frozenset({"251"})
+        mock_song.data = {"format_id": "140"}
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).failed_format_ids == frozenset({"251", "140"})
+
+    async def test_a_retried_resume_tail_records_nothing_yet(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """The history P1. A stream-failed resume tail records what was heard —
+        but only at its TERMINAL attempt: with a retry pending, the fragment would
+        record here and the successful retry would record again. Asserted on the
+        Redis list, because Postgres' (guild_id, played_at, webpage_url) dedup
+        index would collapse the two rows and hide the double write."""
+        mock_song.is_resume = True
+        mock_song.start_offset = 95
+        mock_song.played_at = 1752529000.0
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert len(music_player.history) == 0
+        assert await fake_redis.llen(f"guild:{music_player._guild.id}:history") == 0
+        # The record is deferred, not dropped: the retry still carries the offset
+        # and the original start stamp, so the terminal attempt files one entry.
+        retry = self._front(music_player)
+        assert retry.ts == 95
+        assert retry.played_at == 1752529000.0
+
+    async def test_a_never_heard_retry_carries_no_start_stamp(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """played_at means "audio started", and none did. Left set, -clear would
+        make _flush_played write a 0-second play for a song nobody heard."""
+        mock_song.played_at = 1752529000.0
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).played_at == 0.0
+
+    async def test_the_retry_survives_a_clear_during_the_death(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """-clear never touches the current song, and a song mid-death is still the
+        current song. The retry is queued after the clear drained the queue, so it
+        is the only thing left — chosen behavior, pinned here."""
+        mock_song.produced_audio = False
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(
+            side_effect=lambda s, after: after(Exception("HTTP error 403"))
+        )
+        mocked(music_player._guild).voice_client = vc
+        music_player._channel.send = AsyncMock()
+
+        async def clear_while_dying() -> None:
+            await music_player.queue.clear()
+
+        music_player.play_next.wait = AsyncMock(side_effect=clear_while_dying)
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch("src.musicplayer.invalidate_stream_cache", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert [
+            cast(QueueObject, item).webpage_url for item in music_player.queue._display
+        ] == [mock_song.webpage_url]
+
+    async def test_the_requeue_balances_the_redis_mirror(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        fake_redis: aioredis.Redis,
+    ) -> None:
+        """The failed song was LPOPed by the start transaction; the retry LPUSHes
+        it back, so the mirror ends where it began and the next start transaction
+        has an entry to pop."""
+        key = f"guild:{music_player._guild.id}:queue"
+        assert await fake_redis.llen(key) == 0  # as the start transaction left it
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert await fake_redis.llen(key) == 1
+        entry = orjson.loads(cast(bytes, await fake_redis.lindex(key, 0)))
+        assert entry["webpage_url"] == mock_song.webpage_url
+
+
 # ── loop() additional coverage from main branch ───────────────────────────────
 
 
@@ -7133,37 +7469,7 @@ class TestLoopAdditional:
     def mock_song(self) -> MagicMock:
         # See TestLoop.mock_song — real values so the Redis start transaction
         # in loop() can serialize the song.
-        song = MagicMock()
-        song.title = "Loop Test Song"
-        song.webpage_url = "https://yt.com/v=loop1"
-        song.duration_secs = 210
-        song.duration = "0:03:30"
-        song.uploader = "Loop Channel"
-        song.thumbnail = ""
-        song.views = None
-        song.likes = None
-        song.abr = None
-        song.asr = None
-        song.acodec = ""
-        song.requester = None
-        song.start_offset = 0
-        # Real number: loop()'s history step feeds this through
-        # HistoryEntry.from_song, and round(MagicMock) raises.
-        song.position_secs = 195.0
-        # -playnow flags a real YTDL always carries — truthy MagicMock
-        # attributes would trip the loop's start_paused/is_resume gates.
-        song.interjected = False
-        song.is_resume = False
-        song.start_paused = False
-        # Enqueue analytics: a real (zero) Analytics, since HistoryEntry.from_song
-        # clamps its fields into the play_history column domain — query_source
-        # too, which the slug clamp regex-matches.
-        song.analytics = ANALYTICS_ZERO
-        song.query_source = ""
-        # Unstamped: the loop's or-stamp writes the real clock here, and the
-        # epoch clamp in HistoryEntry raises on a MagicMock.
-        song.played_at = 0.0
-        return song
+        return _loop_song()
 
     async def test_update_activity_called_at_song_start_and_end(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -7424,6 +7730,30 @@ class TestInterject:
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
         assert resume.query_source == "spotify.com"
+
+    async def test_resume_tail_resets_the_retry_budget(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The deliberate exception to "carry every field". This song is producing
+        audio right now, which ends its retry chain — and a format blacklisted at
+        0:00 may well be healthy again by the time a tail queued behind several
+        interjections resolves, so carrying it would degrade quality for nothing.
+        _rebuild_queue_object inherits both; this path resets them."""
+        live_song.elapsed_secs = 42.0
+        live_song.stream_attempts = 2
+        live_song.failed_format_ids = frozenset({"251"})
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        resume = music_player.queue.display_items()[1]
+        assert isinstance(resume, QueueObject)
+        assert resume.stream_attempts == 0
+        assert resume.failed_format_ids == frozenset()
 
     async def test_resume_tail_inherits_the_interrupted_songs_start(
         self,
@@ -8051,6 +8381,43 @@ class TestNeutralizePrefetch:
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
         assert rebuilt.played_at == 1752530000.5
+
+    async def test_completed_task_rebuild_keeps_the_retry_budget(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """A retry entry really can be prefetched: a -playnow landing ahead of it
+        leaves the retry second, so the prefetch resolves it and a second -playnow
+        neutralizes it. The song has not played, so its chain is still live —
+        resetting the counter here grants a dead song a fresh budget and loops it
+        past the cap. This is the inherit half of the asymmetry with interject()'s
+        resume tail, which resets both (see its construction)."""
+        original = QueueObject(
+            "https://yt.com/v=orig",
+            "Retrying Song",
+            mock_author,
+            stream_attempts=2,
+            failed_format_ids=frozenset({"251", "140"}),
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.stream_attempts = 2
+        live_song.failed_format_ids = frozenset({"251", "140"})
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.stream_attempts == 2
+        assert rebuilt.failed_format_ids == frozenset({"251", "140"})
 
     async def test_completed_task_rebuild_keeps_query_source(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock

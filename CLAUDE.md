@@ -406,7 +406,21 @@ code in the repo. Its bookkeeping invariants:
 - Stream-never-opened detection: `stream_failed = not song.produced_audio and
   play_error[0] is not None` — zero frames alone also describes a paused-parked song;
   an error alone also describes a mid-song death that earned its history entry. A dead
-  stream drops the cached URL (`_handle_dead_stream`) and notifies the channel.
+  stream drops the cached URL and gets **`_STREAM_PLAY_ATTEMPTS` (3) plays total**:
+  `_retry_failed_stream` re-queues it at the front carrying `stream_attempts + 1` and
+  the format that failed, so the fresh resolve walks the rest of the ladder first;
+  the terminal failure falls through to `_handle_dead_stream`'s red embed. Two
+  placements in that flow are load-bearing rather than stylistic:
+  - **The retry DECISION and `_neutralize_prefetch()` run where `stream_failed` is
+    computed**, not beside the requeue at the iteration tail. By the tail the loop has
+    claimed `_prefetch_task` into a local, so a neutralize there reads None, no-ops,
+    and the already-resolved next song plays *instead of* the retry.
+  - **The history write gains `and not retrying`**: a retried fragment never records,
+    the terminal attempt records exactly once. Without it a stream-failed resume tail
+    writes twice (`heard_before`, then the successful retry) — and Postgres' dedup
+    index half-masks it while `guild:{id}:history` keeps both.
+  Mid-song death is deliberately NOT retried (it produced audio and earned its entry);
+  retrying it means resuming at the death position, a different feature.
 - Idle disconnect: `queue_get` times out at 300s; the playback gate itself times out at
   300s (a player built by a command that never connects must not leak forever) — unless
   a `defer_playback` hold is outstanding, which means a command is mid-join.
@@ -1027,8 +1041,16 @@ default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable �
 parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
 instance assignment, and `YTDL.from_queue_object` in `src/youtube.py`** — miss these three
 and the field is silently dropped the moment the queue object becomes a playing song,
-which is where every read of it happens → carry it through `_neutralize_prefetch`'s
-rebuild if playback-relevant. If it is a DURABLE property of the play rather than of the
+which is where every read of it happens → then the two places a playing song becomes a
+queue object again: **`MusicPlayer._rebuild_queue_object`** (the shared rebuild behind
+the neutralized prefetch AND the stream retry — carry it) and **`interject()`'s resume
+tail** (a different entry by construction; decide, don't copy). Two fields have already
+been lost between those (`user_input`, `persisted`), and they fail differently — a
+`YTDL` missing the attribute outright *raises* there and strands the prefetch's claim,
+while one that merely defaults reappears wrong. Both are invisible to pyright unless
+`_prefetch_task` stays parameterized as `asyncio.Task[Optional[YTDL]]`, and invisible to
+the tests while their song fixtures are bare `MagicMock()` rather than `spec=YTDL`.
+If it is a DURABLE property of the play rather than of the
 queue slot, it also needs `StateField` + `GuildStateData` + `_now_playing_state_mapping` +
 `_TRANSIENT_SONG_FIELDS`, or a crash silently resets it (see `is_resume`/`start_paused`).
 

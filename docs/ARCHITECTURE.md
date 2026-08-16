@@ -1385,6 +1385,42 @@ bookkeeping:
 Prefetch deliberately probes only the head: walking all three per song would tax every
 play for the rare failure.
 
+**The second failure window is playback time.** A URL revoked in the seconds between
+the probe and ffmpeg's first read reaches the loop as `stream_failed` — zero frames plus
+an ffmpeg error. That song now gets `_STREAM_PLAY_ATTEMPTS` (3) plays in total:
+`_retry_failed_stream` re-queues it at the front carrying the attempt it spent and the
+format that burned, and the fresh resolve deprioritizes that format. Deprioritizes, not
+skips — a single-format video would otherwise have nothing left to try, and the common
+cause here (revocation, not enforcement) is cured by a fresh URL for the same format.
+
+Three placements inside that iteration are load-bearing:
+
+- **The decision, and `_neutralize_prefetch()`, run where `stream_failed` is computed**,
+  not beside the requeue at the iteration tail. By the tail the loop has claimed
+  `_prefetch_task` into a local, so a neutralize there reads `None`, no-ops, and the
+  already-resolved next song plays *instead of* the retry — exactly the failure that
+  call exists to prevent.
+- **The history write is suppressed while a retry is pending.** A retried fragment never
+  records; the terminal attempt records exactly once. Without that, a stream-failed
+  resume tail writes twice — once on `heard_before`, once when the retry succeeds — and
+  Postgres' `(guild_id, played_at, webpage_url)` dedup index collapses the pair while
+  `guild:{id}:history`, the only list `-history` reads, keeps both.
+- **The retry carries no start stamp unless audio was actually heard.** `played_at`
+  means "audio started"; keeping the failed attempt's would also make `_flush_played`
+  write a 0-second play if `-clear` destroyed the retry first.
+
+`stream_attempts`/`failed_format_ids` are runtime-only — never on the Redis wire. A
+crash mid-retry resets the counter, which costs a restarted bot a few more attempts at a
+dead song and saves the whole `QueueEntryField`/parse-path surface. They are inherited
+by `_rebuild_queue_object` (a prefetched retry has not played, so its chain is live) and
+deliberately **reset** by `interject()`'s resume tail (that song is producing audio,
+which ends the chain, and a format blacklisted at 0:00 may be healthy again by the time
+a deeply-stacked tail resolves).
+
+Mid-song death stays out of scope: it produced audio and earned its history entry, and
+retrying it means resuming at the death position — a different feature this machinery
+makes cheap to add later.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:

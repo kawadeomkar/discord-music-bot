@@ -1363,6 +1363,46 @@ class TestCandidateLadderWalk:
         assert raw is not None
         assert orjson.loads(raw)["format_id"] == "140"
 
+    async def test_a_failed_format_is_tried_last_not_skipped(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A format that just 403'd mid-play is suspect, so the retry walks the
+        others first — but it is deprioritized, never removed: a single-format
+        video would otherwise have nothing left to try."""
+        url = "https://yt.com/v=retry"
+        await self._cache(fake_redis, self._laddered(url, "251", "140"))
+        playable_urls.return_value = True
+
+        qobj = QueueObject(
+            url, "Retrying Song", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+
+    async def test_the_only_format_is_still_tried_after_it_failed(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """Filtering instead of reordering would make the retry a guaranteed
+        failure here — and "revoked between the probe and ffmpeg's first read", the
+        common case, is cured by a fresh URL for the same format."""
+        url = "https://yt.com/v=single"
+        await self._cache(fake_redis, self._laddered(url, "251"))
+        playable_urls.return_value = True
+
+        qobj = QueueObject(
+            url, "Single Format", mock_ctx.author, failed_format_ids=frozenset({"251"})
+        )
+        with patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "251"
+
     async def test_entries_cached_before_the_ladder_existed_still_play(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
@@ -1580,6 +1620,61 @@ class TestPrefetchStream:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
         cached = await fake_redis.get("ytdl:stream:https://yt.com/v=pf5")
         assert cached is None
+
+
+class TestYTStreamCarriedFields:
+    """A playing song becomes a QueueObject again — a neutralized prefetch, an
+    interjection's resume tail, a stream retry — so anything QueueObject carries and
+    YTDL does not is silently dropped at that rebuild. `user_input` and `persisted`
+    have each been lost this way before."""
+
+    async def _stream(self, qobj: QueueObject) -> YTDL:
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            return await YTDL.yt_stream(qobj, AsyncMock(spec=discord.TextChannel))
+
+    async def test_user_input_survives(self, mock_ctx: MagicMock) -> None:
+        """The only surviving record of the collection link -remove matches on: a
+        search entry's ytsearch is a title this code generated."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                user_input="https://open.spotify.com/album/abc",
+            )
+        )
+        assert song.user_input == "https://open.spotify.com/album/abc"
+
+    async def test_persisted_survives(self, mock_ctx: MagicMock) -> None:
+        """A crash-recovered song was never RPUSHed to the Redis list. Rebuilt as
+        persisted=True, its next dequeue LPOPs an entry that belongs to an unrelated
+        still-queued song — deleting it, with no error."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                persisted=False,
+            )
+        )
+        assert song.persisted is False
+
+    async def test_retry_state_survives(self, mock_ctx: MagicMock) -> None:
+        """The loop reads both off the PLAYING song to decide whether to retry."""
+        song = await self._stream(
+            QueueObject(
+                "https://www.youtube.com/watch?v=test",
+                "Test Song",
+                mock_ctx.author,
+                stream_attempts=2,
+                failed_format_ids=frozenset({"251"}),
+            )
+        )
+        assert song.stream_attempts == 2
+        assert song.failed_format_ids == frozenset({"251"})
 
 
 class TestYTStreamPlaynowFlags:

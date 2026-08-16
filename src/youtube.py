@@ -674,6 +674,13 @@ class QueueObject:
     # tail INHERITS it, so every fragment of one play records the same start;
     # 0.0 = not played yet, which makes the stamp idempotent across fragments.
     played_at: float = 0.0
+    # ── Stream-retry state, RUNTIME ONLY (never on the Redis wire) ──
+    # Plays already spent on this song whose stream never opened, and the formats
+    # that failed. Deliberately not persisted: a crash resetting the counter only
+    # costs a restarted bot a few more attempts at a dead song, which is not worth
+    # the QueueEntryField/parse-path surface. See MusicPlayer._retry_failed_stream.
+    stream_attempts: int = 0
+    failed_format_ids: frozenset[str] = frozenset()
     # ── The Now Playing card the interrupted fragment left frozen ──
     # Set on a resume tail at the fragment's iteration end (see MusicPlayer's
     # _pending_resume_tail) and consumed when the tail starts. The ids survive a
@@ -716,6 +723,10 @@ class YTDL(discord.FFmpegOpusAudio):
         start_offset: int = 0,
         before_options: Optional[str] = None,
         options: Optional[str] = None,
+        user_input: Optional[str] = None,
+        persisted: bool = True,
+        stream_attempts: int = 0,
+        failed_format_ids: frozenset[str] = frozenset(),
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
@@ -735,6 +746,18 @@ class YTDL(discord.FFmpegOpusAudio):
         self.channel = channel
         # Seconds skipped via FFmpeg -ss; audio position = start_offset + elapsed.
         self.start_offset: int = start_offset
+        # What the user typed, and whether a Redis queue entry backs this song —
+        # both carried from the QueueObject because a playing song can become one
+        # again (a neutralized prefetch, an interjection's resume tail, a stream
+        # retry). Dropping user_input loses the only record of the collection link
+        # -remove matches on; dropping persisted hands a crash-recovered song a
+        # phantom LPOP that deletes an unrelated queued entry.
+        self.user_input: Optional[str] = user_input
+        self.persisted: bool = persisted
+        # Retry state carried from the QueueObject: how many plays this song has
+        # already spent failing to open a stream, and which formats failed.
+        self.stream_attempts: int = stream_attempts
+        self.failed_format_ids: frozenset[str] = failed_format_ids
         # -playnow flags carried through from the QueueObject (see its fields).
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
@@ -870,7 +893,9 @@ class YTDL(discord.FFmpegOpusAudio):
         return [_candidate_shape(cast(dict[str, Any], data))]
 
     @classmethod
-    async def _probe_candidate_ladder(cls, data: YTDLVideoInfo) -> Optional[int]:
+    async def _probe_candidate_ladder(
+        cls, data: YTDLVideoInfo, *, deprioritize: frozenset[str] = frozenset()
+    ) -> Optional[int]:
         """Probe the ladder in order and promote the first URL YouTube will actually
         serve onto `data`, returning its index (None = every rung is dead).
 
@@ -878,23 +903,35 @@ class YTDL(discord.FFmpegOpusAudio):
         everything downstream describes what is really playing. The candidates ahead of
         it are dropped: they are known dead for this extraction, and a caller that
         re-caches the entry must not make the next play re-probe them.
+
+        `deprioritize` names formats that failed a previous play of this song (see
+        MusicPlayer._retry_failed_stream). They are moved to the BACK of the walk, not
+        removed: a single-format video would otherwise have nothing left to try, and
+        the common failure — a URL revoked between the probe and ffmpeg's first read —
+        is cured by a fresh URL for the same format. Sideways first, in place second.
         """
         ladder = cls._candidate_ladder(data)
+        if deprioritize:
+            tainted = [c for c in ladder if str(c.get("format_id")) in deprioritize]
+            ladder = [
+                c for c in ladder if str(c.get("format_id")) not in deprioritize
+            ] + tainted
         span = trace.get_current_span()
         span.set_attribute("ytdl.candidates", len(ladder))
         for index, candidate in enumerate(ladder):
             if not await _stream_url_playable(candidate.get("url", "")):
                 continue
-            if index:
+            if candidate.get("format_id") != data.get("format_id"):
                 log.warning(
                     f"audio format {data.get('format_id')} is not being served for "
                     f"{data.get('webpage_url')} — falling back to "
-                    f"{candidate.get('format_id')} (candidate {index})"
+                    f"{candidate.get('format_id')}"
                 )
                 # cast to plain dict: the checker cannot see that AudioCandidate's
                 # keys are a subset of YTDLVideoInfo's, though _CANDIDATE_FIELDS
                 # makes them so by construction.
                 cast(dict[str, Any], data).update(candidate)
+            if index:
                 data["audio_candidates"] = ladder[index:]
             span.set_attribute("ytdl.candidate_index", index)
             return index
@@ -938,7 +975,9 @@ class YTDL(discord.FFmpegOpusAudio):
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
-            winner = await cls._probe_candidate_ladder(data)
+            winner = await cls._probe_candidate_ladder(
+                data, deprioritize=qo.failed_format_ids
+            )
             if winner is not None:
                 _record_serving_format(data)
                 # A promotion rewrites the entry too: left alone, a cached ladder
@@ -1007,6 +1046,10 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
+            user_input=qo.user_input,
+            persisted=qo.persisted,
+            stream_attempts=qo.stream_attempts,
+            failed_format_ids=qo.failed_format_ids,
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
