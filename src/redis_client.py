@@ -89,9 +89,12 @@ HISTORY_CACHE_LIMIT = 50
 # can't drift by hand-editing one and forgetting the other.
 # ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
 # since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
-# _start_paused in the hash and from_crashed_state can later read a value belonging
-# to a song that finished under the old build. Bounded: this build rewrites all
-# three on every song start. Delete once no rollback target predates them.
+# _start_paused / _user_input in the hash and from_crashed_state can later read a
+# value belonging to a song that finished under the old build. Bounded: this build
+# rewrites all four on every song start, and a stale _user_input makes
+# `-remove <album link>` take out an unrelated recovered song. Keep this list
+# complete: it is where the "delete once no rollback target predates them"
+# condition is computed from.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -104,6 +107,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
+    StateField.CURRENT_SONG_USER_INPUT,
     StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
@@ -783,6 +787,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
+            StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",

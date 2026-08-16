@@ -5997,6 +5997,7 @@ class TestLoop:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
@@ -7159,6 +7160,7 @@ class TestLoopAdditional:
         # clamps its fields into the play_history column domain — query_source
         # too, which the slug clamp regex-matches.
         song.analytics = ANALYTICS_ZERO
+        song.user_input = None
         song.query_source = ""
         # Unstamped: the loop's or-stamp writes the real clock here, and the
         # epoch clamp in HistoryEntry raises on a MagicMock.
