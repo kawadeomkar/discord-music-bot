@@ -27,6 +27,7 @@ from src.ytdlp_pool import (
     RemoteCallError,
     YtdlpPool,
     _picklable_call,
+    _MAX_TASKS_PER_CHILD,
     _warmup_noop,
     _worker_init,
 )
@@ -155,6 +156,7 @@ class TestLazyCreation:
                 max_workers=3,
                 initializer=_worker_init,
                 initargs=(pool._log_queue,),
+                max_tasks_per_child=_MAX_TASKS_PER_CHILD,
             )
             # the real spawn path starts a listener to drain that queue into the parent
             assert pool._log_listener is not None
@@ -653,8 +655,26 @@ class TestRealWorkerProcess:
     a callable crossing a real boundary with a late submit refused; an
     ExtractionError surviving pickling with its fields and cause, which the seam can
     never exercise since it never pickles an exception; a worker log record reaching
-    a parent handler with worker_id and trace_id. Argument picklability stays with
-    TestProcessBoundaryContract."""
+    a parent handler with worker_id and trace_id; and worker recycling, which is a
+    property of the real executor and invisible to the seam. Argument picklability
+    stays with TestProcessBoundaryContract."""
+
+    async def test_a_worker_is_recycled_after_its_task_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """max_tasks_per_child is what turns "a worker grew until the OS killed it"
+        into routine turnover, and only a real executor honours it — the thread-pool
+        seam ignores the argument entirely. Budget of 1 so the test costs one extra
+        spawn rather than 64."""
+        monkeypatch.setattr("src.ytdlp_pool._MAX_TASKS_PER_CHILD", 1)
+        pool = YtdlpPool(max_workers=1)
+        try:
+            first, _ = await pool.run(_double_in_worker, 1)
+            second, _ = await pool.run(_double_in_worker, 2)
+        finally:
+            await pool.aclose()
+
+        assert first != second, "the worker served both tasks — it was never recycled"
 
     async def test_a_real_worker_process_runs_the_submitted_callable(self) -> None:
         pool = YtdlpPool(max_workers=1)

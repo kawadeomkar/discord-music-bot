@@ -726,7 +726,10 @@ decryption, format selection), so it runs on a `ProcessPoolExecutor`
 (`YTDLP_POOL_WORKERS`, default 4; ~80–120 MB RSS each). Lifecycle only — the callable is
 supplied per call, which is the seam tests use. Lazy creation (workers re-import parent
 modules under spawn); `prewarm()` from setup_hook; a `BrokenProcessPool` (e.g. OOM-killed
-worker) is healed by rebuild-and-retry ONCE; worker logs travel a
+worker) is healed by rebuild-and-retry ONCE, and `max_tasks_per_child=64`
+(`_MAX_TASKS_PER_CHILD`) recycles a worker before it grows enough to get there — the
+respawn amortizes to nothing against 3–5s extractions, and needs spawn/forkserver
+(the 3.14 default); worker logs travel a
 multiprocessing Queue → parent `QueueListener` → the parent's handlers (so yt-dlp's
 SABR/PO-token/signature warnings — the early-warning system for YouTube rule changes —
 reach Loki structured, with `worker_id` and propagated `trace_id`). Results are made

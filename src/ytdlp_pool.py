@@ -39,6 +39,14 @@ log = get_logger(__name__)
 T = TypeVar("T")
 
 _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
+
+# Extractions a worker serves before the pool replaces it. yt-dlp accumulates
+# per-process state over days of uptime — player-JS caches, extractor objects — and
+# the BrokenProcessPool heal path below exists because a worker that grows enough
+# eventually gets OOM-killed. Bounded recycling turns that rare crash-and-heal into
+# routine turnover; the ~1s respawn amortized over 64 extractions is invisible beside
+# the 3-5s each of them costs. Needs spawn/forkserver, which is the 3.14 default.
+_MAX_TASKS_PER_CHILD = 64
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30 with
 # retries=10 can outlive any shutdown. Mirrors loop.shutdown_default_executor()'s.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
@@ -184,6 +192,9 @@ class YtdlpPool:
             max_workers=self._max_workers,
             initializer=_worker_init,
             initargs=(self._log_queue,),
+            # A recycled worker re-runs the initializer, so worker logging survives
+            # the turnover (see _MAX_TASKS_PER_CHILD).
+            max_tasks_per_child=_MAX_TASKS_PER_CHILD,
         )
 
     def _stop_log_listener(self) -> None:
