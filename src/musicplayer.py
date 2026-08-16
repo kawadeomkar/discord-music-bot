@@ -426,8 +426,9 @@ class MusicPlayer:
         self.store = (
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
-        # All queue state (asyncio queue, display order, Redis mirror, bulk mutex,
-        # cleared-flag) lives behind this one object — see guild_queue.py.
+        # All queue state (one deque + cursor, Redis mirror, bulk mutex, wake
+        # Event, generation counter) lives behind this one object — see
+        # guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
         # Played-song history (in-memory ring + Redis mirror) — guild_history.py.
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
@@ -700,10 +701,10 @@ class MusicPlayer:
     def _resume_left_off_field(self) -> Optional[tuple[str, str]]:
         """(name, value) for the resume notice's "where the last session got to"
         field, or None when nothing recorded it. Call before the front insertion,
-        while the display head is still the restored one.
+        while the queue head is still the restored one.
 
         The two restores landing here know different things:
-        * A crash re-queues the mid-play song as the display head (persisted=False,
+        * A crash re-queues the mid-play song at the head (persisted=False,
           recovery offset in `ts`). That song is where the session stopped.
         * A `-stop` cancels the loop mid-song before its history bookkeeping, so the
           interrupted song is recorded nowhere and clear_connection() dropped its
@@ -776,7 +777,7 @@ class MusicPlayer:
 
     def build_rejoin_resume_embed(self) -> Optional[discord.Embed]:
         """Heads-up that `-resume` on a disconnected bot rejoined voice and woke a
-        persisted queue. Build while the display head is still the restored one:
+        persisted queue. Build while the queue head is still the restored one:
         once the gate opens the loop would pop that head out from under this.
 
         No song is named, unlike build_resume_notice_embed: nothing was inserted
@@ -1034,7 +1035,7 @@ class MusicPlayer:
     # ── Queue operations ──────────────────────────────────────────────────────
 
     def enqueue_depth(self) -> int:
-        """Songs a new arrival waits behind: the display leg, plus the one playing.
+        """Songs a new arrival waits behind: everything queued, plus the one playing.
 
         Read once at command dispatch, so the loop's continuous dequeuing leaves
         queue_position approximate against the insert.
@@ -1046,8 +1047,9 @@ class MusicPlayer:
         Two accepted ±1 windows:
 
         - OVER by one while the loop resolves a stream, since current_song is
-          assigned before try_commit_dequeue() pops the display head and the play
-          sits in both legs for the length of a probe (100ms-seconds).
+          assigned before try_commit_dequeue() settles the claim, so the play is
+          both current_song and still queued for the length of a probe
+          (100ms-seconds).
         - UNDER by one when the live song has a parked tail from an EARLIER play
           of the same URL (-play X, -playnow Y, -playnow X), which
           has_resume_tail matches by URL."""
@@ -1225,6 +1227,7 @@ class MusicPlayer:
         """Remove every queued item matching `needle` — the resolved yt-dlp URL, or
         what the user originally typed (see remove_matcher). Returns the whole
         outcome, since the command reports the positions and names the mode.
+
         """
         await self._cancel_prefetch()
         outcome = await self.queue.remove(remove_matcher(needle))
@@ -1748,6 +1751,10 @@ class MusicPlayer:
                     uploader=current.uploader,
                     thumbnail=current.thumbnail,
                     is_resume=True,
+                    # The tail is the same play, so a song that was itself a
+                    # -playnow comes back saying so — the span attribute below
+                    # reads it at every level of a stack.
+                    interjected=current.interjected,
                     start_paused=was_paused and resume_paused,
                     # The tail is the same play, so it keeps the interrupted song's
                     # stamps — played_at included, which files the whole play under
@@ -1758,6 +1765,9 @@ class MusicPlayer:
                     # classification is not recoverable from webpage_url — a Spotify
                     # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
+                    # Same reason -remove matches on it: without this the parked
+                    # tail is the one track a playlist link cannot take back out.
+                    user_input=current.user_input,
                 )
 
         # The interjection arrives carrying depth 0 from its own command dispatch
@@ -1849,6 +1859,8 @@ class MusicPlayer:
             start_paused=song.start_paused,
             analytics=song.analytics,
             query_source=song.query_source,
+            user_input=song.user_input,
+            persisted=song.persisted,
             played_at=song.played_at,
             np_message_id=song.np_message_id,
             np_channel_id=song.np_channel_id,
@@ -2153,11 +2165,10 @@ class MusicPlayer:
     async def _prefetch_next_song(self) -> Optional[YTDL]:
         """Pre-resolve and stream the next queued song while the current one plays.
         Runs only when an item is already queued, and accounts for its own dequeue on
-        every non-success path: cancellation returns the item to the front (a bulk
-        mutation is about to drain it with the rest), failure retires it on all three
-        legs (leaving the display/Redis heads would make the next commit retire the
-        wrong entry). On success the dequeue stays open and loop()'s
-        commit/task_done() closes it."""
+        every non-success path: cancellation gives the claim back with the item (a
+        bulk mutation is about to take it with the rest), failure settles it on both
+        legs (leaving the mirror entry would make the next commit retire the wrong
+        one). On success the claim stays open and loop()'s commit settles it."""
         if self.queue.empty():
             return None
         try:
@@ -2219,11 +2230,11 @@ class MusicPlayer:
 
         while not self.bot.is_closed():
             self.play_next.clear()
-            # True while this iteration holds a dequeue not yet balanced with
-            # task_done(), so the outer handler can close the books when a failure
-            # lands between the dequeue and the normal song-end task_done() instead
-            # of drifting the queue's task counter forever.
-            dequeue_owed = False
+            # True while this iteration holds a claim the commit has not settled,
+            # so the outer handler can settle it when a failure lands in that
+            # window. Cleared at the commit, not at song end — the release it
+            # guards deletes an item.
+            claim_outstanding = False
             # Each iteration spans a full song (3–5 min). Expected — the span stays
             # open across play_next.wait().
             with _tracer.start_as_current_span(
@@ -2231,17 +2242,8 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    queue_was_cleared = self.queue.consume_cleared_flag()
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
-                    if prefetched_song is not None and queue_was_cleared:
-                        # Cleared while _prefetch_next_song ran: the completed task
-                        # consumed a get_nowait(), so balance it with task_done()
-                        # and cleanup() the FFmpeg subprocess so discarding the
-                        # result doesn't leak it.
-                        self.queue.task_done()
-                        prefetched_song.cleanup()
-                        prefetched_song = None
                     # Captured where each path takes its item, and handed back to
                     # try_commit_dequeue() below: a clear() in between voids this
                     # dequeue even if a put() has since refilled the display.
@@ -2249,10 +2251,10 @@ class MusicPlayer:
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
                         prefetched_song = None
-                        dequeue_owed = True  # the prefetch's get_nowait() is ours
                         # Prefetched items always came through queue_get(), so they
                         # are real Redis-mirrored entries. source stays None:
                         # redis_pop_for(None) treats the dequeue as persisted.
+                        claim_outstanding = True  # the prefetch's get_nowait() is ours
                         source = None
                         should_pop_queue = True
                     else:
@@ -2260,7 +2262,7 @@ class MusicPlayer:
                         try:
                             async with async_timeout.timeout(300):
                                 source = await self.queue_get()
-                                dequeue_owed = True
+                                claim_outstanding = True
                                 # Re-read: queue_get() can block, and a clear()
                                 # during that wait belongs to the queue this item
                                 # came from, not to the one we sampled above.
@@ -2279,7 +2281,7 @@ class MusicPlayer:
                                 await self._retire_failed_dequeue(
                                     source, context="resolve failure"
                                 )
-                                dequeue_owed = False
+                                claim_outstanding = False
                             raise
                         self.current_song = await self._stream_source(source)
                         should_pop_queue = is_persisted(source)
@@ -2288,7 +2290,7 @@ class MusicPlayer:
                         await self._retire_failed_dequeue(
                             source, context="failed-song pop"
                         )
-                        dequeue_owed = False
+                        claim_outstanding = False
                         failure = self._last_stream_error
                         if failure is not None:
                             message = (
@@ -2311,15 +2313,21 @@ class MusicPlayer:
                     span.set_attribute("song.title", self.current_song.title or "")
 
                     if not await self.queue.try_commit_dequeue(commit_generation):
-                        # Cleared while this song resolved (e.g. Inside yt_stream).
-                        # Discard without playing: task_done() balances the get()
-                        # above, and cleanup() terminates the FFmpeg subprocess
-                        # yt_stream already spawned, which would otherwise leak.
-                        self.queue.task_done()
-                        dequeue_owed = False
+                        # Cleared while this song resolved, or while the prefetch
+                        # that claimed it ran. Discard without playing: the clear()
+                        # reset the cursor, so the claim is settled, and cleanup()
+                        # terminates the FFmpeg subprocess.
+                        claim_outstanding = False
                         self.current_song.cleanup()
                         self.current_song = None
                         continue
+
+                    # The commit settled the claim. Clearing here rather than at
+                    # song end matters: the flag guards a release, and a release
+                    # deletes an item — left standing across the song it would
+                    # settle whatever sits at the head by then, which is the next
+                    # song once the prefetch below claims it.
+                    claim_outstanding = False
 
                     # Safe to assert rather than await readiness: the gate above
                     # opens only once a voice connection is established
@@ -2567,8 +2575,6 @@ class MusicPlayer:
                     if self.store is not None:
                         await self.store.clear_song_end_state()
 
-                    self.queue.task_done()
-                    dequeue_owed = False
                     await self.update_activity(None)
 
                     # Deliberately last: current_song is already cleared, so the
@@ -2588,10 +2594,23 @@ class MusicPlayer:
                         f"Unhandled error in playback loop: {type(e).__name__}: {e}",
                         exc_info=True,
                     )
-                    if dequeue_owed:
-                        self.queue.task_done()
-                    if self._prefetch_task and not self._prefetch_task.done():
-                        self._prefetch_task.cancel()
+                    # A claim reaches here only from the window between the
+                    # dequeue and the commit — every other path settles its own.
+                    # finish_failed_dequeue, not release: release drops the item
+                    # from memory alone, leaving its mirror entry for the next
+                    # LPOP to retire in its place.
+                    if claim_outstanding:
+                        await self.queue.finish_failed_dequeue(
+                            source, context="unhandled loop error"
+                        )
+                    # Awaited, matching _cancel_prefetch: the prefetch returns its
+                    # item through requeue_front, and an unawaited cancel leaves that
+                    # to whatever awaits next. Two live claims settle by POSITION, so
+                    # each would take the other's song. The awaits below happen to
+                    # give the cancelled task its turn, which is why no test can
+                    # tell the two apart — this makes the ordering a guarantee rather
+                    # than a side effect of them.
+                    await cancel_task(self._prefetch_task)
                     self._prefetch_task = None
                     await self._cancel_progress_task()
                     await self._cancel_pause_debounce()
