@@ -48,6 +48,7 @@ from src.util import (
     pluralize,
     record_span_error,
     trace_footer,
+    safe_label,
     truncate,
     truncate_embed_title,
     get_logger,
@@ -630,7 +631,10 @@ class MusicPlayer:
             # Capped for the same reason _field_value is: a -queue page renders
             # ten of these into one 4096-char description, and the "Up next"
             # embed renders one into a block sharing a message-wide budget.
-            title = truncate(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
+            # Sanitized, not just capped: this goes inside a masked link's
+            # LABEL, where an unbalanced "]" from an uploader-chosen title closes
+            # the label early and re-points the link at whatever follows.
+            title = safe_label(item.title, _NEXT_UP_TITLE_MAX) or "Unknown"
             requester = _requester_mention(item.requester)
             dur = fmt_duration(item.duration) if item.duration is not None else "?:??"
             channel = truncate(item.uploader or "", _FIELD_VALUE_MAX) or (
@@ -648,7 +652,10 @@ class MusicPlayer:
             )
             walk = walk.advance(_remaining_secs(item))
         else:
-            search = (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+            search = safe_label(
+                (item.ytsearch or item.url or "?").removeprefix("ytsearch:"),
+                _NEXT_UP_TITLE_MAX,
+            )
             line = f"`{index}` {search} · *resolving...*"
             walk = walk.advance(None)
 

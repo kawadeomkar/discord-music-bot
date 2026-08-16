@@ -9279,3 +9279,38 @@ class TestGuildTimezoneOnRestore:
         music_player.timezone = ZoneInfo("Europe/London")
         rendered = _fmt_finish_time(90, music_player.timezone)
         assert re.match(r"^\d{1,2}:\d{2} (AM|PM) (GMT|BST)$", rendered)
+
+
+class TestQueueLinesCannotForgeALink:
+    """`_format_queue_line` renders the title inside a masked link's LABEL, and
+    yt-dlp titles are uploader-chosen. An unbalanced `]` closes the label early
+    and re-points the link at whatever the title puts after it — under the bot's
+    name, in a message a member only had to get queued to trigger.
+
+    This was the inconsistency the -remove work introduced: its own Songs field
+    escaped, and the queue embed it sends 30ms later did not."""
+
+    def test_a_hostile_title_cannot_close_the_label(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        item = QueueObject(
+            "https://yt.com/v=1",
+            "Song](https://evil.example) [FREE NITRO",
+            mock_author,
+            duration=100,
+        )
+        now, walk = music_player._queue_eta_seed()
+        line, _ = music_player._format_queue_line(item, 1, now, walk)
+        assert "](https://evil.example)" not in line
+        assert "[FREE NITRO" not in line
+        # The real destination is still the one the queue holds.
+        assert "](https://yt.com/v=1)" in line
+
+    def test_an_unresolved_search_is_sanitized_too(
+        self, music_player: MusicPlayer
+    ) -> None:
+        """The resolving line renders user-typed text straight into a description."""
+        item = YTSource(ytsearch="ytsearch:[click](https://evil.example)", process=True)
+        now, walk = music_player._queue_eta_seed()
+        line, _ = music_player._format_queue_line(item, 1, now, walk)
+        assert "[" not in line and "](" not in line

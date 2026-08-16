@@ -40,7 +40,7 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
-from src.guild_queue import RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     unquote_argument,
@@ -71,16 +71,19 @@ from src.ping import run_health_dashboard, send_latency_line
 from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
+    EMBED_FIELD_LIMIT,
     background_typing,
     cancel_task,
     fmt_duration,
     notice_embed,
     pluralize,
     queue_message,
+    safe_label,
     record_span_error,
     send_embed,
     spawn_background,
     trace_footer,
+    truncate,
     get_logger,
 )
 
@@ -188,19 +191,66 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
 
 
+# What a user typed, echoed back into an embed. Discord renders markdown in embed
+# descriptions and field values, so an unescaped needle lets any member make the
+# bot post a styled masked link under its own name. Bounds the SINGLE-needle
+# fields; a field built from a list is clamped again by _field().
+_ECHO_MAX = 200
+
+# One row of a multi-row field. Tighter than _ECHO_MAX because ten of these share
+# the budget one needle gets to itself.
+_ECHO_ROW_MAX = 70
+
+# The most dropped positions worth spelling out. Past this the list is a wall of
+# numbers that answers nothing the count above it did not.
+_MAX_SHOWN_POSITIONS = 60
+
+
+def _echo(text: str, limit: int = _ECHO_MAX) -> str:
+    """A needle safe to put in an embed — see util.safe_label for what each step
+    covers. Kept as a named wrapper because the default bound is this command's
+    (one needle, one field) rather than a property of the sanitizing."""
+    return safe_label(text, limit)
+
+
+def _removed_label(item: QueueItem) -> str:
+    """A removed queue item's name for the reply. Mirrors
+    MusicPlayer.queue_clear's rendering rather than reaching for `.title`:
+    `YTSource` has no title at all, so an unresolved Spotify-playlist track — the
+    exact case the Songs field was added for — rendered as `?` for every row."""
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+
+
+def _field(value: str) -> str:
+    """An embed field value that cannot 400 the send. The last guard before
+    Discord, deliberately dumb: the callers below build from lists whose length
+    is the user's to choose, and the send happens AFTER the queue has already
+    been mutated \u2014 so a field that is merely usually short is not good enough."""
+    return truncate(value, EMBED_FIELD_LIMIT)
+
+
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
-    """How the removal matched, for the reply's "Matched" field. An origin match
-    names which of the user's own inputs did it, since one argument can take out a
-    whole album."""
+    """How the removal matched, for the reply's "Matched" field.
+
+    An origin match is the one that needs explaining: one argument can take out a
+    whole playlist, so the reply names which of the user's own inputs did it. The
+    resolved-URL case reads as it always has.
+    """
+    # Not wrapped in a code span. The needle is escaped, so markdown cannot fire
+    # either way — but INSIDE a span Discord renders the backslashes literally, so
+    # `-remove foo_bar` came back as `foo\_bar`. Outside one they collapse.
+    shown = _echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
-        return f"<{needle}>"
+        return shown
     kinds = {item.query_source for item in outcome.removed if item.query_source}
     # Only when every removed item agrees — a mixed set has no one kind to name.
     kind = kinds.pop() if len(kinds) == 1 else ""
     them = "them" if len(outcome.removed) > 1 else "it"
     if kind == QUERY_SOURCE_SEARCH:
-        return f"`{needle}` — the search you queued {them} with"
-    return f"<{needle}> — the {kind + ' ' if kind else ''}link you queued {them} with"
+        return f"{shown} — the search you queued {them} with"
+    return f"{shown} — the {kind + ' ' if kind else ''}link you queued {them} with"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -793,11 +843,12 @@ class MusicBot(commands.Cog):
                 titles, analytics=analytics, origin=origin
             )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
+            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
             await asyncio.gather(
                 send_embed(
                     ctx,
                     "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -825,11 +876,15 @@ class MusicBot(commands.Cog):
                 if qobj.skipped
                 else ""
             )
+            shown_titles = queue_message(
+                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
                     f"Queued playlist — {count} {pluralize(count, 'song')}",
-                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n{skipped_line}\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
+                    f"{skipped_line}\n{shown_titles}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -1506,7 +1561,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            # Built before the gate opens, while the display head is still the
+            # Built before the gate opens, while the queue head is still the
             # restored one — the loop pops it out from under this.
             embed = mp.build_rejoin_resume_embed()
             if embed is None:
@@ -1675,7 +1730,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message(cleared)
+            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -1698,8 +1753,8 @@ class MusicBot(commands.Cog):
             "queue positions that were dropped, followed by the updated queue.\n\n"
             "Three things match: the YouTube link shown in the **Now Playing** "
             "card, the search text you queued with, and the link you queued with "
-            "— so removing an album or playlist link takes back out every track "
-            "it added. Run it with no argument for a reminder.\n\n"
+            "— so removing a playlist link takes back out every track it added. "
+            "Run it with no argument for a reminder.\n\n"
             "Links are matched as typed, so a `youtu.be` short link will not "
             "match a song queued from a full `youtube.com` one."
         ),
@@ -1708,11 +1763,11 @@ class MusicBot(commands.Cog):
             "examples": [
                 "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                 "-remove never gonna give you up",
-                "-remove https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
             ],
             "note": (
                 "A search term removes what that exact search queued, not "
-                "anything that merely looks similar."
+                "anything that only looks similar."
             ),
         },
     )
@@ -1754,22 +1809,48 @@ class MusicBot(commands.Cog):
                 await send_embed(
                     ctx,
                     "",
-                    f"No queued songs found matching: {needle}",
+                    f"No queued songs found matching: {_echo(needle)}",
                     discord.Color.red(),
                 )
                 return
             count = len(positions)
             noun = pluralize(count, "song")
             pos_label = pluralize(count, "Position")
-            pos_str = ", ".join(str(p) for p in positions)
+            # Capped by COUNT, not just clamped by length: one -remove of a
+            # collection link drops as many positions as the collection had, and
+            # a raw join passes 1024 characters at 227 of them — which 400s the
+            # send AFTER queue_remove() has already mutated memory and Redis, so
+            # the user is told the command failed for a removal that happened.
+            shown = positions[:_MAX_SHOWN_POSITIONS]
+            pos_str = ", ".join(str(p) for p in shown)
+            if len(positions) > len(shown):
+                pos_str += f", …and {len(positions) - len(shown)} more"
             await send_embed(
                 ctx,
                 f"Removed {count} {noun} from the queue",
                 "",
                 discord.Color.orange(),
                 fields=[
-                    ("Matched", _matched_label(outcome, needle), False),
-                    (f"{pos_label} removed", pos_str, False),
+                    ("Matched", _field(_matched_label(outcome, needle)), False),
+                    (f"{pos_label} removed", _field(pos_str), False),
+                    # Titles, like -clear reports: one argument can now take out a
+                    # whole playlist, and a bare count leaves the user unable to
+                    # tell whether it took what they meant. There is no undo.
+                    (
+                        "Songs",
+                        _field(
+                            queue_message(
+                                [
+                                    _echo(_removed_label(i), _ECHO_ROW_MAX)
+                                    # queue_message keeps 10; echoing all of them
+                                    # first escaped a playlist's worth to throw
+                                    # the rest away.
+                                    for i in outcome.removed[:10]
+                                ]
+                            )
+                        ),
+                        False,
+                    ),
                 ],
             )
             await ctx.send(embed=mp.queue_embed())
