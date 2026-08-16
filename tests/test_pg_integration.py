@@ -291,6 +291,39 @@ class TestMigrations:
             await conn.close()
         assert await migrate(raw_pg_dsn) == EXPECTED_SCHEMA_VERSION
 
+        # The version alone proves nothing here: this is exactly the shape a
+        # schema-drifted database has (ledger says migrated, table is missing
+        # columns), and that shape passes the version check while wedging the
+        # drainer. Inserting is what separates "migrated" from "recorded as
+        # migrated".
+        archive = PostgresHistoryArchive(raw_pg_dsn)
+        try:
+            await archive.insert_batch([_entry(1)])
+            [row] = await archive.recent(42, limit=10)
+            assert row.webpage_url == _entry(1).webpage_url
+        finally:
+            await archive.close()
+
+    async def test_the_dedup_key_collapses_fragments_of_one_play(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        """Every fragment of one interrupted play INHERITS played_at, so two
+        writers recording the same play land exactly on
+        (guild_id, played_at, webpage_url). Postgres keeps one row while the Redis
+        list keeps both — which is what made the archive the only place this
+        review's exactly-once defects did NOT show. Pinned so the asymmetry is a
+        known property rather than a surprise during an investigation."""
+        first = _entry(1, played_at=1752530000.0)
+        second = replace(first, played_secs=first.played_secs + 60)
+
+        await archive.insert_batch([first])
+        await archive.insert_batch([second])
+
+        rows = await archive.recent(42, limit=10)
+        assert len(rows) == 1
+        # First writer wins: ON CONFLICT DO NOTHING keeps the row already there.
+        assert rows[0].played_secs == first.played_secs
+
     async def test_archive_refuses_an_unmigrated_database(
         self, raw_pg_dsn: str
     ) -> None:
@@ -537,6 +570,7 @@ class TestSchemaLock:
             ("played_secs", -1, "play_history_played_secs_valid"),
             ("duration_secs", -1, "play_history_duration_valid"),
             ("message_id", -1, "play_history_message_id_valid"),
+            ("channel_id", -1, "play_history_channel_id_valid"),
             ("queue_position", -1, "play_history_queue_position_valid"),
             # The epoch floor -leaderboard's all-time cutoff relies on. Without
             # these CHECKs it is asserted only by the validator, so a pre-epoch
@@ -739,9 +773,9 @@ class TestRejectsTable:
 
 
 class TestMessageIdColumn:
-    """message_id reaches Postgres. The column is `default 0` with a
-    `message_id >= 0` CHECK, so a value dropped between the wire and the INSERT
-    lands cleanly and is indistinguishable from a song that genuinely had no Now
+    """message_id and channel_id reach Postgres. Both are `default 0` with a
+    `>= 0` CHECK, so a value dropped between the wire and the INSERT lands
+    cleanly and is indistinguishable from a song that genuinely had no Now
     Playing host. Only a real round trip catches that; the drainer tests never
     touch SQL."""
 
@@ -761,6 +795,32 @@ class TestMessageIdColumn:
         await archive.insert_batch([_entry(2)])
         (got,) = await archive.recent(42, 10)
         assert got.message_id == 0
+
+    async def test_the_host_pair_survives_the_round_trip_undisturbed(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # Distinct snowflakes: the two columns are adjacent in _INSERT_SQL and in
+        # _entry_to_row's positional tuple, so a transposition would round-trip
+        # perfectly with equal values and produce a pointer into the wrong
+        # channel forever.
+        stamped = replace(
+            _entry(1), message_id=1418765432109876543, channel_id=1330000000000000001
+        )
+        await archive.insert_batch([stamped])
+        (got,) = await archive.recent(42, 10)
+        assert (got.message_id, got.channel_id) == (
+            1418765432109876543,
+            1330000000000000001,
+        )
+
+    async def test_an_unstamped_channel_reads_back_as_zero(
+        self, archive: PostgresHistoryArchive
+    ) -> None:
+        # A row written by a build older than the column: unresolvable, which is
+        # what those rows are — never a pointer into some arbitrary channel.
+        await archive.insert_batch([_entry(3)])
+        (got,) = await archive.recent(42, 10)
+        assert got.channel_id == 0
 
 
 class TestEnqueueStampColumns:

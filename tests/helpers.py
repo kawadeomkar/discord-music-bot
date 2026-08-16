@@ -13,6 +13,7 @@ import discord
 from discord.ext import commands
 from discord.utils import MISSING as _DISCORD_MISSING
 
+from src.guild_queue import GuildQueue, QueueItem
 from src.youtube import QueueObject
 
 
@@ -112,3 +113,13 @@ def bind_loopback_only(container: Any, port: int) -> None:
     hands `.ports` to docker-py, which accepts `(host_ip, host_port)`; `None`
     keeps the random high port. Call before start — that dict is read once."""
     container.ports[port] = ("127.0.0.1", None)
+
+
+def seed_queue(gq: GuildQueue, *items: QueueItem) -> None:
+    """Queue items without touching Redis — `put()` minus the mirror.
+
+    Synchronous, so the sync tests (embeds, ETA) can use it too. Nothing here
+    claims: a test wanting an in-flight head calls `get()`, as production does.
+    """
+    gq._items.extend(items)
+    gq._sync_wake()

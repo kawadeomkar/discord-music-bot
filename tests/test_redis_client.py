@@ -401,6 +401,70 @@ class TestRebuildQueue:
         await broken_store.rebuild_queue([_entry(1)])  # must not raise
 
 
+class TestRemoveQueueEntries:
+    """The LREM path GuildQueue takes for a small removal instead of rewriting
+    the whole list. See tests/test_redis_integration.py for the real server —
+    fakeredis is not authoritative about LREM."""
+
+    async def test_removes_only_the_named_entries(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.rebuild_queue([_entry(n) for n in range(1, 5)])
+        await store.remove_queue_entries([_entry(2), _entry(4)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(1).to_redis(), _entry(3).to_redis()]
+
+    async def test_order_of_the_survivors_is_untouched(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The whole licence for LREM over a rebuild: it leaves the rest where
+        they were, so the queue a user is looking at does not reshuffle."""
+        await store.rebuild_queue([_entry(n) for n in range(1, 7)])
+        await store.remove_queue_entries([_entry(1), _entry(6)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(n).to_redis() for n in (2, 3, 4, 5)]
+
+    async def test_a_duplicate_is_removed_once_per_copy_taken(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """LREM ... 0 would remove every identical entry. Two enqueues of one song
+        usually differ on the wire, but when they do not, removing "all matching"
+        takes out a copy still queued."""
+        await store.rebuild_queue([_entry(1), _entry(1), _entry(1)])
+        await store.remove_queue_entries([_entry(1)])
+        items = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert items == [_entry(1).to_redis(), _entry(1).to_redis()]
+
+    async def test_refreshes_the_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The queue key is TTL'd like every other guild key, and a removal is a
+        write — leaving it to age off its old expiry would expire a live queue."""
+        await store.rebuild_queue([_entry(1), _entry(2)])
+        await fake_redis.persist(store.queue_key())
+        await store.remove_queue_entries([_entry(1)])
+        assert await fake_redis.ttl(store.queue_key()) > 0
+
+    async def test_returns_how_many_were_removed(self, store: GuildRedisStore) -> None:
+        """Exactly the LREM counts — the pipeline's trailing EXPIRE reply is a 1
+        of its own, and summing it in would report a phantom removal."""
+        await store.rebuild_queue([_entry(n) for n in range(1, 5)])
+        assert await store.remove_queue_entries([_entry(2), _entry(4)]) == 2
+
+    async def test_returns_short_when_the_mirror_no_longer_holds_them(
+        self, store: GuildRedisStore
+    ) -> None:
+        """The count is GuildQueue's only signal that the mirror and memory
+        disagree: LREM raises nothing when what it was told to drop is absent."""
+        await store.rebuild_queue([_entry(1)])
+        assert await store.remove_queue_entries([_entry(1), _entry(2)]) == 1
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        # 0 rather than None: it cannot match what the caller asked for, so a
+        # failed LREM routes it to the rebuild like any other short count.
+        assert await broken_store.remove_queue_entries([_entry(1)]) == 0
+
+
 # ── History operations ────────────────────────────────────────────────────────
 
 
@@ -1814,7 +1878,7 @@ class TestGetGuildState:
         self, broken_store: GuildRedisStore
     ) -> None:
         # None (read failed) must be distinguishable from GuildStateData()
-        # (nothing stored) — _restore_guild relies on this to avoid silently
+        # (nothing stored) — restore_guild() relies on this to avoid silently
         # skipping recovery during a Redis outage.
         result = await broken_store.get_guild_state()
         assert result is None
@@ -2367,6 +2431,22 @@ class TestPopQueueAndStartSong:
         assert state[b"current_song_query_source"] == b"spotify.com"
         restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
         assert restored.current_song_query_source == "spotify.com"
+
+    async def test_parks_the_played_at(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        # The LPOP in this very transaction destroys the song's queue-list entry,
+        # so from here until song end the hash holds the only copy of when the
+        # play started. It rides the same MULTI, leaving no window where the song
+        # is playing and its start is unrecorded — and it is NOT play_start_epoch,
+        # which is backdated by the -ss offset.
+        await fake_redis.rpush(store.queue_key(), b"song")
+        await store.pop_queue_and_start_song(_current(played_at=1752530000.5), 990.0)
+        state = await fake_redis.hgetall(store.state_key())
+        assert state[b"current_song_played_at"] == b"1752530000.5"
+        assert state[b"play_start_epoch"] == b"990.0"
+        restored = GuildStateData.from_redis(cast(dict[bytes, bytes], state))
+        assert restored.current_song_played_at == 1752530000.5
 
     async def test_sets_ttl_on_state(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

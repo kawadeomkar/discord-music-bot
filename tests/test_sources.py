@@ -2,7 +2,9 @@
 
 import pytest
 
+from src.guild_state import Analytics
 from src.sources import (
+    unquote_argument,
     QUERY_SOURCE_SEARCH,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
@@ -389,12 +391,16 @@ class TestParseInput:
 # A requester that could not be mistaken for a default, so an assertion that the
 # ID survived the queue cannot pass against a 0 or a None.
 _REQUESTER_ID = 424242424242424242
+_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=3)
+_ORIGIN = "https://open.spotify.com/album/abc123"
 
 
 class TestSpotifyTitlesToYTSearch:
     def test_converts_titles_to_ytsearch(self) -> None:
         titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
-        result = spotify_titles_to_ytsearch(titles, _REQUESTER_ID)
+        result = spotify_titles_to_ytsearch(
+            titles, _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
 
         assert len(result) == 2
         assert all(isinstance(r, YTSource) for r in result)
@@ -403,25 +409,38 @@ class TestSpotifyTitlesToYTSearch:
 
     def test_all_results_have_process_true(self) -> None:
         titles = ["Song A", "Song B", "Song C"]
-        result = spotify_titles_to_ytsearch(titles, _REQUESTER_ID)
+        result = spotify_titles_to_ytsearch(
+            titles, _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert all(r.process is True for r in result)
 
     def test_empty_list_returns_empty(self) -> None:
-        assert spotify_titles_to_ytsearch([], _REQUESTER_ID) == []
+        assert (
+            spotify_titles_to_ytsearch(
+                [], _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+            )
+            == []
+        )
 
     def test_single_title(self) -> None:
-        result = spotify_titles_to_ytsearch(["Only Song Artist"], _REQUESTER_ID)
+        result = spotify_titles_to_ytsearch(
+            ["Only Song Artist"], _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert len(result) == 1
         assert result[0].ytsearch == "ytsearch:Only Song Artist"
 
     def test_url_field_is_none(self) -> None:
-        result = spotify_titles_to_ytsearch(["Song"], _REQUESTER_ID)
+        result = spotify_titles_to_ytsearch(
+            ["Song"], _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert result[0].url is None
 
     def test_stamps_requester_on_every_track(self) -> None:
         """The whole point: a collection's tracks resolve minutes to an hour after
         the command returned, so the requester has to travel with them."""
-        result = spotify_titles_to_ytsearch(["A", "B", "C"], _REQUESTER_ID)
+        result = spotify_titles_to_ytsearch(
+            ["A", "B", "C"], _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert [r.requester_id for r in result] == [_REQUESTER_ID] * 3
 
     def test_requester_is_required(self) -> None:
@@ -429,7 +448,19 @@ class TestSpotifyTitlesToYTSearch:
         is what silently re-attributes a whole album to the last person who typed a
         command. A new call site must be forced to supply one."""
         with pytest.raises(TypeError):
-            spotify_titles_to_ytsearch(["Song"])  # pyright: ignore[reportCallIssue]
+            spotify_titles_to_ytsearch(  # pyright: ignore[reportCallIssue]
+                ["Song"], analytics=_ANALYTICS, origin=_ORIGIN
+            )
+
+    def test_per_track_positions_derive_from_the_head(self) -> None:
+        # The head's analytics fans out: same ask-time queued_at on every track,
+        # positions incrementing from the head's — a playlist behind 3 songs
+        # waits at 3, 4, 5.
+        result = spotify_titles_to_ytsearch(
+            ["a", "b", "c"], _REQUESTER_ID, analytics=_ANALYTICS, origin=_ORIGIN
+        )
+        assert [r.analytics.queue_position for r in result] == [3, 4, 5]
+        assert all(r.analytics.queued_at == 1752530000.5 for r in result)
 
 
 class TestYTSourcePlaylistUrl:
@@ -568,7 +599,12 @@ class TestQuerySource:
     def test_spotify_collection_tracks_are_stamped_spotify(self) -> None:
         """The whole reason the token is captured at parse time: these resolve to
         YouTube URLs at dequeue, so nothing downstream could recover it."""
-        sources = spotify_titles_to_ytsearch(["song one", "song two"], _REQUESTER_ID)
+        sources = spotify_titles_to_ytsearch(
+            ["song one", "song two"],
+            _REQUESTER_ID,
+            analytics=_ANALYTICS,
+            origin=_ORIGIN,
+        )
         assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
 
     def test_uppercase_www_youtube_still_reports_youtube(self) -> None:
@@ -585,3 +621,37 @@ class TestQuerySource:
         """A hand-built source (crash recovery, tests, a future call site) reports
         the unknown sentinel rather than guessing."""
         assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""
+
+
+class TestQuotedArgumentsSurviveConsumeRest:
+    """`-play`/`-playnow` take consume-rest arguments, and discord.py's read_rest
+    does no quote handling where the positional parser's get_quoted_word did. So
+    the quotes started arriving as part of the value."""
+
+    def test_a_quoted_url_still_parses_as_that_url(self) -> None:
+        """parse_url uses re.search, so a quoted URL still matched the domain while
+        dragging the trailing quote into the path — yt-dlp then rejects it."""
+        source = parse_input(
+            '"https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+            '-play "https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+        )
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_a_quoted_search_does_not_keep_its_quotes(self) -> None:
+        """The origin is what -remove matches on, so a quoted search meant the
+        obvious retype (`-remove some song`) matched nothing."""
+        source = parse_input('"some song"', '-play "some song"')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == "ytsearch:some song"
+
+    def test_an_unmatched_quote_is_left_alone(self) -> None:
+        """Only a whole argument wrapped at BOTH ends is a wrapper; anything else
+        is text the user typed."""
+        source = parse_input('say "hello', '-play say "hello')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == 'ytsearch:say "hello'
+
+    def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
+        assert unquote_argument('""') == '""'
+        assert unquote_argument('"') == '"'

@@ -79,16 +79,16 @@ _tracer = get_tracer(__name__)
 _INSERT_SQL = """
 INSERT INTO play_history (guild_id, title, webpage_url, duration_secs,
                           played_secs, requester_id, requester_name,
-                          thumbnail, uploader, played_at, message_id,
+                          thumbnail, uploader, played_at, message_id, channel_id,
                           queued_at, queue_position, query_source)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (guild_id, played_at, webpage_url) DO NOTHING
 """
 
 _RECENT_SQL = """
 SELECT guild_id, title, webpage_url, duration_secs, played_secs,
        requester_id, requester_name, thumbnail, uploader, played_at, message_id,
-       queued_at, queue_position, query_source
+       channel_id, queued_at, queue_position, query_source
 FROM play_history
 WHERE guild_id = $1
 ORDER BY played_at DESC, id DESC
@@ -221,6 +221,7 @@ def _entry_to_row(entry: HistoryEntry) -> tuple:
         entry.uploader,
         datetime.fromtimestamp(entry.played_at, tz=timezone.utc),
         entry.message_id,
+        entry.channel_id,
         datetime.fromtimestamp(entry.queued_at, tz=timezone.utc),
         entry.queue_position,
         entry.query_source,
@@ -240,6 +241,7 @@ def _row_to_entry(row: asyncpg.Record) -> HistoryEntry:
         uploader=row["uploader"],
         played_at=row["played_at"].timestamp(),
         message_id=row["message_id"],
+        channel_id=row["channel_id"],
         queued_at=row["queued_at"].timestamp(),
         queue_position=row["queue_position"],
         query_source=row["query_source"],
@@ -745,8 +747,17 @@ class PostgresHistoryArchive:
 #   CheckViolationError   23514, and not a DataError — both inherit from
 #   NotNullViolationError IntegrityConstraintViolationError; without both arms a
 #                         CHECK violation wedges the drain head permanently
+#   UndefinedColumnError  42703, schema drift — the DATABASE is older than this
+#                         build, which migrate() cannot see (it skips a version
+#                         already in the ledger without reading the file). Left
+#                         transient it fails EVERY insert and redelivers forever
+#                         onto history:outbox, which has no TTL and is exempt from
+#                         eviction, ending in a Redis OOM that rejects all writes
 #
 # Deliberately not here — each would break the drain:
+#   - UndefinedTableError: the isolation path writes to play_history_rejected,
+#     which a build that cannot see play_history usually cannot see either — the
+#     rejection insert raises and nothing settles.
 #   - UniqueViolationError: play_history_dedup is the ON CONFLICT target, so it
 #     cannot surface; catching it hides a genuine index bug.
 #   - bare ValueError / TypeError: asyncpg raises them for whole-statement
@@ -759,6 +770,7 @@ _POISON = (
     asyncpg.exceptions.DataError,
     asyncpg.exceptions.CheckViolationError,
     asyncpg.exceptions.NotNullViolationError,
+    asyncpg.exceptions.UndefinedColumnError,
 )
 
 
@@ -809,16 +821,16 @@ class HistoryOutboxDrainer:
     # (page+1)-th oldest entry and XRANGE has no ID-only form, so the reply
     # carries bodies: uncapped, a 500k backlog would haul the entire overage over
     # the socket in one reply hundreds of MB wide. 10k entries ≈ 5 MB — a typical
-    # YouTube entry serializes to ~455-470 B, of which 49 B is the
+    # YouTube entry serializes to ~455-470 B, of which 45 B is the
     # queued_at/queue_position pair and 18-32 B is query_source.
     #
-    # Resident cost is a STEP, not that wire size: entries pack into listpack
-    # nodes bounded by stream-node-max-bytes (4096), so per-entry memory jumps
-    # whenever a node loses one entry. Measured on redis:7-alpine over 50k
-    # entries, the cliff is at ~440 B of payload — 486.8 B/entry below it, 547.4
-    # above. Adding query_source crossed it, so 256 MB now holds ~491k entries
-    # rather than ~552k (11% less outage runway) for 18 wire bytes. The empty
-    # token pays the same as a full one: the key is on the wire either way.
+    # Resident cost is a STEP, not that wire size: entries pack into listpack nodes
+    # bounded by stream-node-max-bytes (4096), and the step is the ALLOCATOR BIN the
+    # node lands in. Measured on redis:7-alpine at 1-byte resolution: ~548 B/entry
+    # up to 497 B of wire, a SPIKE to ~676 at 498-499 B exactly, then ~626 from
+    # 500 B on — a function of wire size alone, whatever the field values are.
+    # So 256 MB holds ~429k entries, ~397k for a shape on the spike.
+    # See docs/ARCHITECTURE.md#why-query_source-is-stored-rather-than-derived.
     CAP_PAGE: int = 10_000
     _BACKOFF_START: float = 1.0
     _BACKOFF_MAX: float = 60.0

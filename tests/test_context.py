@@ -13,9 +13,10 @@ from discord.ext import commands
 from opentelemetry import trace
 
 from src.config import SpotifyStatus
-from src.debug import RuntimeSampler
+from src.debug import DebugSettings
 from src.main import MusicBotApp, MusicContext
 from src.musicbot import MusicBot
+from src.recovery import VoiceWatchdog
 from tests.helpers import mocked
 
 
@@ -30,18 +31,15 @@ def music_bot_cog(mock_bot: MagicMock) -> MusicBot:
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     cog._active_spans = {}
-    cog._alone_timers = {}
+    cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
     # Off by default: send() asks the cog on every response, so a debug-on cog
     # here would decorate the embeds these attach tests compare.
-    cog._debug_default = False
-    cog._debug_overrides = {}
-    # Same shape __init__ builds: the toggle stamps these so a hydration pass that
-    # read before it cannot apply an older value on top.
-    cog._debug_toggle_seq = 0
-    cog._debug_toggled_at = {}
-    cog._debug_unpersisted = set()
-    cog._runtime_sampler = RuntimeSampler()
+    # Constructed, not hand-assembled: DebugSettings owns its own field set, so a
+    # fixture that listed them would drift the moment one is added — which is
+    # exactly how the cog's old __slots__ fell three attributes behind.
+    cog.debug_settings = DebugSettings()
+    cog.debug_settings._default = False
     return cog
 
 
@@ -236,7 +234,7 @@ class TestDebugDecoration:
 
     @staticmethod
     def _enable(cog: MusicBot, guild_id: int) -> None:
-        cog._debug_overrides[guild_id] = True
+        cog.debug_settings._overrides[guild_id] = True
 
     async def test_off_leaves_embeds_untouched(
         self, mctx: MusicContext, live_mp: MagicMock

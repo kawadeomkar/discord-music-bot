@@ -79,7 +79,7 @@ GUILD_TTL = 86400
 # the equality leaves no headroom, so anything that costs a slot without yielding a
 # renderable play shortens the answer by one — a corrupt entry (get_history drops
 # it) or a duplicate (recent() dedups it; retry_on_error re-sends a non-idempotent
-# LPUSH after the server applied EXEC). Raising it costs ~487 B per entry per guild
+# LPUSH after the server applied EXEC). Raising it costs ~625 B per entry per guild
 # in all three roles at once, permanently, since nothing expires it.
 # See docs/ARCHITECTURE.md#history-read-path.
 HISTORY_CACHE_LIMIT = 50
@@ -87,6 +87,11 @@ HISTORY_CACHE_LIMIT = 50
 # Transient per-song fields and the playback-position fields, cleared together on
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
+# ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
+# since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
+# _start_paused in the hash and from_crashed_state can later read a value belonging
+# to a song that finished under the old build. Bounded: this build rewrites all
+# three on every song start. Delete once no rollback target predates them.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -94,9 +99,13 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_UPLOADER,
     StateField.CURRENT_SONG_REQUESTER_ID,
     StateField.CURRENT_SONG_INTERJECTED,
+    StateField.CURRENT_SONG_IS_RESUME,
+    StateField.CURRENT_SONG_START_PAUSED,
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
+    StateField.CURRENT_SONG_USER_INPUT,
+    StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
@@ -757,8 +766,8 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes with no ack, so a crash after this loses the
-        # song from Redis. Accepted — the in-memory asyncio.Queue is the source of
-        # truth; at-least-once would need a stream and an XACK.
+        # song from Redis. Accepted — GuildQueue's in-memory deque is the source
+        # of truth; at-least-once would need a stream and an XACK.
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(
@@ -778,9 +787,13 @@ class GuildRedisStore:
                 str(current.requester_id) if current.requester_id else ""
             ),
             StateField.CURRENT_SONG_INTERJECTED: ("1" if current.interjected else ""),
+            StateField.CURRENT_SONG_IS_RESUME: ("1" if current.is_resume else ""),
+            StateField.CURRENT_SONG_START_PAUSED: ("1" if current.start_paused else ""),
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
+            StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
+            StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }
@@ -852,6 +865,41 @@ class GuildRedisStore:
         pipe.expire(self.queue_key(), GUILD_TTL)
         await pipe.execute()
 
+    @_guild_op(default=0)
+    async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
+        """LREM the given entries out of the queue list, leaving the rest in place.
+        Returns HOW MANY were actually removed — the caller must check it.
+
+        The alternative to rebuild_queue for a small removal: LREM touches only what
+        goes, while a rebuild rewrites the whole list whatever it drops (measured on
+        redis:7-alpine at depth 1000: 0.96 ms for one entry against ~5.7 ms to
+        rebuild). Far enough up, the per-LREM scans overtake it — GuildQueue owns
+        the threshold and the measurement behind it.
+
+        Matching is by exact serialized bytes, which is an assumption about the rest
+        of the codebase rather than about Redis: a queued object mutated after its
+        entry was written no longer serializes to what is stored, and the LREM then
+        silently matches nothing. Hence the count — a short return means the mirror
+        and memory have diverged and only a rebuild can be trusted. A Redis failure
+        returns 0 through @_guild_op and takes the same path.
+
+        Counted per distinct serialization, never LREM ... 0: two enqueues of one
+        song usually differ on the wire (queue_position, queued_at), but when they
+        do not, removing "all matching" would take out a copy still queued.
+        """
+        counts: dict[bytes, int] = {}
+        for entry in entries:
+            blob = entry.to_redis()
+            counts[blob] = counts.get(blob, 0) + 1
+        pipe = self.redis.pipeline(transaction=True)
+        for blob, count in counts.items():
+            # redis-py's stub types `value` as str; its encoder takes bytes, which
+            # is what every other write on this key passes (decode_responses=False).
+            pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
+        pipe.expire(self.queue_key(), GUILD_TTL)
+        replies = await pipe.execute()
+        return sum(cast(list[int], replies[:-1]))  # the last reply is the EXPIRE
+
     # History operations
 
     # ISSUE: non-evictable keys can exhaust Redis and stall ALL writes.
@@ -867,8 +915,8 @@ class GuildRedisStore:
     # with guild count (~24 KB each), not with runtime. Config is the same shape and far
     # smaller — a fixed handful of fields per guild, tens of bytes, written only by an
     # explicit command and deleted on guild removal. The outbox is near-empty whenever
-    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~547
-    # resident bytes per play — 256mb holds ~491k. That figure is a step, not the wire
+    # the drainer keeps up and grows for the whole duration of a Postgres outage, at ~625
+    # resident bytes per play — 256mb holds ~429k. That figure is a step, not the wire
     # size: see HistoryOutboxDrainer.CAP_PAGE for the listpack-node cliff behind it, which
     # a field of 18 bytes can move. HISTORY_OUTBOX_MAX is the opt-in bound; dropping entries there is
     # real data loss, since a capped list leaves no second copy. A Redis memory/eviction
@@ -995,7 +1043,10 @@ class GuildRedisStore:
 
     @_guild_op(default_factory=list)
     async def get_history(self) -> list[HistoryEntry]:
-        """Return up to HISTORY_CACHE_LIMIT history entries newest-first.
+        """Return up to HISTORY_CACHE_LIMIT history entries, most recently
+        RECORDED first — which is song-end order, not played_at order, since
+        played_at is when a song started and an interrupted one is recorded after
+        everything that cut in front of it. GuildHistory.recent sorts.
         Corrupt entries are dropped (parse_history_entry warns per entry)."""
         raw = await self.redis.lrange(self.history_key(), 0, HISTORY_CACHE_LIMIT - 1)
         return [e for e in map(parse_history_entry, raw) if e is not None]
@@ -1085,7 +1136,7 @@ class GuildRedisStore:
 
         Zero-value GuildStateData when the hash is missing/empty, None when the read
         itself failed — so callers can tell "nothing stored" from "Redis
-        unavailable" (see _restore_guild). Pure read: does not refresh TTL;
+        unavailable" (see recovery.restore_guild). Pure read: does not refresh TTL;
         refresh_ttl() at the end of _restore_state() covers the recovery window.
         """
         # Same decode_responses=False invariant as get_now_playing() above.
@@ -1095,7 +1146,7 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def get_recovery_gate(self) -> Optional[GuildRecoveryGate]:
         """State hash + pending-queue *length* in one pipeline — the lightweight
-        connection/restorable gate for `_restore_guild`.
+        connection/restorable gate for `recovery.restore_guild`.
 
         Transfers no queue contents, now-playing or history: a -stopped guild keeps
         a possibly-long queue by design, and gating on LLEN keeps that payload off

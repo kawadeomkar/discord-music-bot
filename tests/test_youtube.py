@@ -16,6 +16,7 @@ from redis.asyncio import Redis
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
+from src.guild_state import Analytics
 from src.youtube import (
     YTDL,
     YTDL_OPTS,
@@ -39,6 +40,10 @@ from src.youtube import (
     YTDLVideoMetadata,
 )
 from tests.helpers import noop_ffmpeg_init
+
+# Ask-time analytics for direct yt_source/yt_playlist calls — the command paths
+# mint this at dispatch; both params are REQUIRED so a call site cannot forget.
+_ANALYTICS = Analytics(queued_at=1752529000.5, queue_position=0)
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +211,118 @@ class TestYTDLPositionSecs:
         song = ytdl_instance()
         song.start_offset = 90
         assert song.position_secs == 90.0
+
+
+class TestYtStreamCarriesTheQueueObjectsFields:
+    """`YTDL.yt_stream` is the hop where a queue entry becomes a playing song, and
+    CLAUDE.md's queue-entry-field recipe names it as one of the three sites a new
+    field is silently dropped at. `user_input` reached it late: it is what
+    `-remove` matches on, and a -playnow resume tail is rebuilt from the YTDL, so
+    losing it here leaves the parked track un-removable by origin."""
+
+    @staticmethod
+    async def _played(qobj: QueueObject) -> YTDL:
+        channel = AsyncMock(spec=discord.TextChannel)
+        channel.send = AsyncMock()
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            return await YTDL.yt_stream(qobj, channel)
+
+    async def test_user_input_survives_the_hop(self, mock_ctx: MagicMock) -> None:
+        album = "https://open.spotify.com/album/abc123"
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            user_input=album,
+        )
+
+        assert (await self._played(qobj)).user_input == album
+
+    def test_no_queueobject_field_is_silently_left_behind(self) -> None:
+        """Reflective, so a field added to QueueObject tomorrow fails HERE rather
+        than at playback.
+
+        The hand-written list below it enumerates six fields and cannot notice a
+        seventh — which is exactly how `user_input` and then `persisted` reached
+        this hop late, the second as a live AttributeError. Anything genuinely not
+        meant to cross gets named in the allow-list, with the reason."""
+        import dataclasses
+        import inspect
+
+        # Fields that legitimately do not cross into YTDL.
+        not_carried = {
+            # The identity/metadata YTDL rebuilds from the yt-dlp payload itself.
+            "webpage_url",
+            "title",
+            "duration",
+            "uploader",
+            "thumbnail",
+            # Renamed at the boundary: ts -> start_offset (FFmpeg -ss seconds).
+            "ts",
+            # Runtime-only NP handle; a live Message cannot be carried on a source.
+            "np_host_ref",
+        }
+        carried = {f.name for f in dataclasses.fields(QueueObject)} - not_carried
+        params = set(inspect.signature(YTDL.__init__).parameters)
+        missing = sorted(carried - params)
+        assert not missing, (
+            f"QueueObject fields with no YTDL.__init__ keyword: {missing}. "
+            "Add them there, assign them, and pass them from yt_stream — or list "
+            "them in not_carried with a reason."
+        )
+
+    async def test_every_carried_field_arrives(self, mock_ctx: MagicMock) -> None:
+        """A field added to QueueObject and forgotten here dies at playback, where
+        every read of it happens. Asserted together so an omission fails rather
+        than needing to be noticed."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            user_input="typed",
+            query_source="search",
+            interjected=True,
+            is_resume=True,
+            start_paused=True,
+            persisted=False,
+            played_at=12.5,
+        )
+
+        song = await self._played(qobj)
+
+        assert (
+            song.user_input,
+            song.query_source,
+            song.interjected,
+            song.is_resume,
+            song.start_paused,
+            song.persisted,
+            song.played_at,
+        ) == ("typed", "search", True, True, True, False, 12.5)
+
+    async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
+        """`persisted` reached the YTDL last, and its absence was a live crash
+        rather than a silent drop: `_neutralize_prefetch` reads it back off the
+        playing song to rebuild a QueueObject, so every `-playnow` over a
+        COMPLETED prefetch raised AttributeError — failing the command and
+        stranding the prefetch's claim, which the next commit then settled onto
+        the wrong song.
+
+        False is the value that matters. It marks the crash-recovered head, whose
+        entry is NOT on the Redis list; defaulting it to True in the rebuild would
+        write that head into the mirror, where its dequeue never LPOPs and every
+        later entry sits one place out."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test",
+            "Test Song",
+            mock_ctx.author,
+            persisted=False,
+        )
+
+        assert (await self._played(qobj)).persisted is False
 
 
 class TestQueueObject:
@@ -407,7 +524,13 @@ class TestYTSource:
 
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test song")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:test song",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
 
         assert isinstance(result, QueueObject)
         assert result.title == "Extracted Title"
@@ -424,14 +547,26 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test song")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:test song",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
         assert result.thumbnail == "https://img.yt.com/test123.jpg"
 
     async def test_yt_source_raises_when_no_data(self, mock_ctx: MagicMock) -> None:
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = None
             with pytest.raises(Exception, match="Could not find song"):
-                await YTDL.yt_source(mock_ctx.author, "ytsearch:nothing")
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:nothing",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
 
     async def test_yt_source_unsupported_url_gives_friendly_error(
         self, mock_ctx: MagicMock
@@ -452,7 +587,13 @@ class TestYTSource:
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.side_effect = wrapped
             with pytest.raises(Exception, match="isn't from a site I can play"):
-                await YTDL.yt_source(mock_ctx.author, url)
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    url,
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
 
     async def test_yt_source_reraises_non_unsupported_extraction_error(
         self, mock_ctx: MagicMock
@@ -468,7 +609,13 @@ class TestYTSource:
                 "ERROR: unable to download webpage"
             )
             with pytest.raises(ExtractionError) as caught:
-                await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "ytsearch:test",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
         assert caught.value.unsupported is False
         assert "unable to download webpage" in caught.value.message
         assert "isn't from a site I can play" not in str(caught.value)
@@ -492,7 +639,13 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:test",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
 
         assert result.title == "Entry One"
         assert "entry1" in result.webpage_url
@@ -516,7 +669,13 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "ytsearch:test")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "ytsearch:test",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
 
         assert result.title == "Real Video"
 
@@ -530,7 +689,13 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            result = await YTDL.yt_source(mock_ctx.author, "my search query")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "my search query",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
         assert result.user_input == "my search query"
 
     async def test_yt_source_sets_user_input_cache_hit(
@@ -549,7 +714,12 @@ class TestYTSource:
             "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
         )
         result = await YTDL.yt_source(
-            mock_ctx.author, "cached search", redis=fake_redis
+            mock_ctx.author,
+            "cached search",
+            redis=fake_redis,
+            query_source="youtube.com",
+            analytics=_ANALYTICS,
+            user_input=None,
         )
         assert result.user_input == "cached search"
 
@@ -570,7 +740,12 @@ class TestYTSource:
             "ytdl:source:cached search", _orjson.dumps(cached), ex=3600
         )
         result = await YTDL.yt_source(
-            mock_ctx.author, "cached search", redis=fake_redis
+            mock_ctx.author,
+            "cached search",
+            redis=fake_redis,
+            query_source="youtube.com",
+            analytics=_ANALYTICS,
+            user_input=None,
         )
         assert result.thumbnail == "https://img.yt.com/cached.jpg"
 
@@ -585,9 +760,23 @@ class TestYTSource:
         }
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
-            await YTDL.yt_source(mock_ctx.author, "some search", redis=fake_redis)
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "some search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
 
-        result = await YTDL.yt_source(mock_ctx.author, "some search", redis=fake_redis)
+        result = await YTDL.yt_source(
+            mock_ctx.author,
+            "some search",
+            redis=fake_redis,
+            query_source="youtube.com",
+            analytics=_ANALYTICS,
+            user_input=None,
+        )
         assert result.thumbnail == "https://img.yt.com/fresh.jpg"
 
     async def test_yt_source_passes_timestamp(self, mock_ctx: MagicMock) -> None:
@@ -598,7 +787,12 @@ class TestYTSource:
         with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
             mock_cls.return_value.extract_info.return_value = fake_data
             result = await YTDL.yt_source(
-                mock_ctx.author, "https://yt.com/watch?v=ts_test", ts=45
+                mock_ctx.author,
+                "https://yt.com/watch?v=ts_test",
+                ts=45,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert result.ts == 45
@@ -612,12 +806,73 @@ class TestYTSource:
             "src.youtube._ytdlp_extract", return_value=fake_data
         ) as mock_extract:
             result = await YTDL.yt_source(
-                mock_ctx.author, "https://yt.com/v=dl", download=True
+                mock_ctx.author,
+                "https://yt.com/v=dl",
+                download=True,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
             )
         # download rides on the request object, not a positional bool
         req = mock_extract.call_args[0][0]
         assert req.download is True
         assert result.title == "Download Song"
+
+
+class TestYTPlaylistAnalytics:
+    """yt_playlist builds every track complete — one ask time for the command, and
+    a position per track derived from the head's."""
+
+    @staticmethod
+    def _entries(*ids: Optional[str]) -> dict[str, Any]:
+        """One flat playlist reply. None is yt-dlp's deleted/private video; the
+        empty string is an entry that arrives without an id."""
+        return {
+            "entries": [
+                None
+                if i is None
+                else {"title": "no id"}
+                if i == ""
+                else {"id": i, "title": f"T{i}"}
+                for i in ids
+            ]
+        }
+
+    async def test_positions_count_up_from_the_head(self, mock_ctx: MagicMock) -> None:
+        with patch(
+            "src.youtube._ytdlp_extract", return_value=self._entries("a", "b", "c")
+        ):
+            tracks = await YTDL.yt_playlist(
+                "https://yt.com/playlist?list=X",
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=Analytics(queued_at=1752529000.5, queue_position=2),
+                user_input="https://yt.com/playlist?list=PL1",
+            )
+        assert [t.analytics.queue_position for t in tracks] == [2, 3, 4]
+        assert all(t.analytics.queued_at == 1752529000.5 for t in tracks)
+        assert all(t.query_source == "youtube.com" for t in tracks)
+
+    async def test_skipped_entries_leave_no_gap_in_the_positions(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """The offset counts tracks KEPT, not the loop index: yt-dlp emits a null
+        entry for a deleted/private video, and an enumerate-based offset would
+        archive positions nobody ever waited at (and skip a number entirely)."""
+        with patch(
+            "src.youtube._ytdlp_extract",
+            # A deleted video, and one missing its ID — both skipped.
+            return_value=self._entries("a", None, "b", "", "c"),
+        ):
+            tracks = await YTDL.yt_playlist(
+                "https://yt.com/playlist?list=X",
+                mock_ctx.author,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input="https://yt.com/playlist?list=PL1",
+            )
+        assert [t.title for t in tracks] == ["Ta", "Tb", "Tc"]
+        assert [t.analytics.queue_position for t in tracks] == [0, 1, 2]
 
 
 class TestYTSourceUnifiedExtraction:
@@ -635,7 +890,13 @@ class TestYTSourceUnifiedExtraction:
         with patch(
             "src.youtube._ytdlp_extract", return_value=fake_data
         ) as mock_extract:
-            await YTDL.yt_source(mock_ctx.author, "https://yt.com/watch?v=direct")
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "https://yt.com/watch?v=direct",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
         req = mock_extract.call_args[0][0]
         assert req.opts is _YTDL_STREAM_SEARCH_OPTS
         assert req.process is True
@@ -648,7 +909,14 @@ class TestYTSourceUnifiedExtraction:
         is back."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni1")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
-            await YTDL.yt_source(mock_ctx.author, "unified search", redis=fake_redis)
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "unified search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
 
         source_entry = await fake_redis.get("ytdl:source:unified search")
         stream_entry = await fake_redis.get("ytdl:stream:https://yt.com/v=uni1")
@@ -666,7 +934,12 @@ class TestYTSourceUnifiedExtraction:
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni2")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
             qobj = await YTDL.yt_source(
-                mock_ctx.author, "prefetch noop search", redis=fake_redis
+                mock_ctx.author,
+                "prefetch noop search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
             )
         with patch("src.youtube._ytdlp_extract") as mock_extract:
             await YTDL.prefetch_stream(qobj, redis=fake_redis)
@@ -682,7 +955,12 @@ class TestYTSourceUnifiedExtraction:
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni3")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
             result = await YTDL.yt_source(
-                mock_ctx.author, "dead probe search", redis=fake_redis
+                mock_ctx.author,
+                "dead probe search",
+                redis=fake_redis,
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
             )
 
         assert isinstance(result, QueueObject)
@@ -706,6 +984,9 @@ class TestYTSourceUnifiedExtraction:
                 mock_ctx.author,
                 "https://soundcloud.com/artist/track",
                 redis=fake_redis,
+                query_source="soundcloud.com",
+                analytics=_ANALYTICS,
+                user_input=None,
             )
         assert isinstance(result, QueueObject)
         assert (
@@ -721,7 +1002,13 @@ class TestYTSourceUnifiedExtraction:
         be skipped entirely."""
         fake_data = _fake_ytdl_data()
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
-            await YTDL.yt_source(mock_ctx.author, "no redis search")
+            await YTDL.yt_source(
+                mock_ctx.author,
+                "no redis search",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
         playable_urls.assert_not_awaited()
 
     async def test_fresh_extraction_populates_full_metadata(
@@ -731,7 +1018,13 @@ class TestYTSourceUnifiedExtraction:
         back on the first call, no prefetch enrichment needed."""
         fake_data = _fake_ytdl_data(webpage_url="https://yt.com/v=uni4")
         with patch("src.youtube._ytdlp_extract", return_value=fake_data):
-            result = await YTDL.yt_source(mock_ctx.author, "metadata search")
+            result = await YTDL.yt_source(
+                mock_ctx.author,
+                "metadata search",
+                query_source="youtube.com",
+                analytics=_ANALYTICS,
+                user_input=None,
+            )
         assert result.duration == 180
         assert result.uploader == "Test Channel"
         assert result.thumbnail == "https://img.yt.com/test.jpg"
@@ -880,8 +1173,7 @@ class TestYTStream:
             "https://www.youtube.com/watch?v=test",
             "Test Song",
             mock_ctx.author,
-            queued_at=1752529000.5,
-            queue_position=4,
+            analytics=Analytics(queued_at=1752529000.5, queue_position=4),
         )
 
         with (
@@ -890,8 +1182,8 @@ class TestYTStream:
         ):
             result = await YTDL.yt_stream(qobj, channel)
 
-        assert result.queued_at == 1752529000.5
-        assert result.queue_position == 4
+        assert result.analytics.queued_at == 1752529000.5
+        assert result.analytics.queue_position == 4
 
 
 class TestStreamUrlTtl:

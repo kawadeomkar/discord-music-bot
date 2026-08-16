@@ -1,8 +1,9 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, Optional, Union
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.util import get_logger
 
 log = get_logger(__name__)
@@ -63,7 +64,11 @@ class SpotifySource:
     stype: URLSource = URLSource.SPOTIFY
 
 
-@dataclass(frozen=True)
+# slots: one of these is retained per unresolved Spotify-playlist track, so a
+# 1000-track playlist holds 1000 until each is dequeued. Measures 344 B -> 120 B
+# per instance. Keep the class free of __dict__ readers (asdict/vars) and off
+# any pickle path; it crosses to Redis as SearchQueueEntry JSON.
+@dataclass(frozen=True, slots=True)
 class YTSource:
     """A YouTube track or playlist: either a pasted `url` or a `ytsearch:` term in
     `ytsearch`, with an optional `ts` start offset. `list_id` is the playlist ID, set
@@ -81,10 +86,20 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
-    # Enqueue stamps, carried onto the QueueObject this resolves into. Frozen,
-    # so MusicPlayer stamps by building a replace()d copy.
-    queued_at: float = 0.0
-    queue_position: int = 0
+    # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
+    # this resolves into. Parse-layer minting leaves the zero value — the real
+    # one arrives per-track in spotify_titles_to_ytsearch, or rides the
+    # yt_source/yt_playlist call for sources resolved directly.
+    #
+    # CONTRACT: the default is for the PARSE layer, which runs before the mint.
+    # Anything handing a YTSource on to be queued must pass a real value —
+    # nothing re-mints downstream, so an omission persists 0.0/0 to Redis and to
+    # play_history with no error and no log line.
+    analytics: Analytics = ANALYTICS_ZERO
+    # What the user typed, for -remove to match on. Same contract as analytics:
+    # the parse layer leaves None, and an old wire entry rehydrates as None too, so
+    # an omission downstream is silent rather than reported.
+    user_input: Optional[str] = None
     # How the song was asked for, set at parse time (see query_source_of). The one
     # source type that carries it: this covers pasted links, plaintext searches and
     # Spotify-playlist tracks alike, and it is the only one that survives into Redis
@@ -129,11 +144,15 @@ def query_source_of(
     return QUERY_SOURCE_SOUNDCLOUD
 
 
-def spotify_titles_to_ytsearch(titles: list[str], requester_id: int) -> list[YTSource]:
-    """Spotify album or playlist tracks as lazy YouTube searches. The Spotify token
-    and the requester are stamped here because it is the last point that knows where
-    these came from — each resolves to a YouTube URL at dequeue, minutes to an hour
-    after the command that asked for it returned.
+def spotify_titles_to_ytsearch(
+    titles: list[str], requester_id: int, *, analytics: Analytics, origin: str
+) -> list[YTSource]:
+    """Spotify album or playlist tracks as lazy YouTube searches. The Spotify token,
+    the requester, the ask-time analytics and `origin` are set here because it is
+    the last point that knows where these came from — each resolves to a YouTube
+    URL at dequeue, minutes to an hour after the command that asked for it returned.
+    `analytics` is the head's; per-track positions are derived from it, as in
+    yt_playlist. `origin` is the collection link the user pasted.
 
     requester_id is required rather than defaulted on purpose: a caller that omits
     it silently attributes every track to whoever ran a command most recently,
@@ -144,8 +163,10 @@ def spotify_titles_to_ytsearch(titles: list[str], requester_id: int) -> list[YTS
             process=True,
             query_source=QUERY_SOURCE_SPOTIFY,
             requester_id=requester_id,
+            analytics=replace(analytics, queue_position=analytics.queue_position + i),
+            user_input=origin,
         )
-        for title in titles
+        for i, title in enumerate(titles)
     ]
 
 
@@ -271,6 +292,28 @@ def parse_url(
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
+def unquote_argument(text: str) -> str:
+    """Drop one matched pair of surrounding quotes.
+
+    `-play` and `-playnow` take consume-rest arguments, and discord.py's
+    `read_rest()` does no quote handling — where the old positional parser's
+    `get_quoted_word()` consumed them. So `-play "<url>"` began arriving WITH the
+    quotes, and parse_url's `re.search` still matches the domain inside them while
+    dragging the trailing quote into the path, which yt-dlp then rejects. A quoted
+    search fared no better: it stored `"some song"` as the origin, so retyping the
+    obvious `-remove some song` matched nothing.
+
+    Only a whole argument wrapped at both ends, and never down to nothing — a lone
+    quote or an empty pair is text the user typed, not a wrapper. Applied both here
+    and at the command (which stamps `origin` from its own argument, separately
+    from this), so it has to be safe to run twice; it is, for everything but a
+    doubly-wrapped literal nobody types."""
+    for quote in ('"', "'"):
+        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+            return text[1:-1]
+    return text
+
+
 def parse_input(
     user_input: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
@@ -281,10 +324,10 @@ def parse_input(
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:
-            return parse_url(user_input, message)
+            return parse_url(unquote_argument(user_input), message)
         except ValueError:
             pass
-    ytsearch = " ".join(args)
+    ytsearch = unquote_argument(" ".join(args))
     return YTSource(
         ytsearch=f"ytsearch:{ytsearch}",
         process=True,

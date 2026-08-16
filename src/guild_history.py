@@ -12,6 +12,12 @@ recent() never asks Postgres: the list is written synchronously at song end so i
 LEADS the archive, and is capped at exactly the window -history can ask for.
 See docs/ARCHITECTURE.md#history-read-path.
 
+history_embeds() at the bottom renders what recent() returns. Storage and
+rendering share a module the way src/leaderboard.py does it — one feature's data
+and its embed, with the command itself on the MusicBot cog. It was in util.py,
+which made util import guild_state purely to name HistoryEntry; util is imported
+by the yt-dlp worker graph and is better off a leaf.
+
 The wire format belongs to guild_state.py; this class never sees wire bytes.
 """
 
@@ -20,9 +26,11 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from typing import Optional
 
+import discord
+
 from src.guild_state import HistoryEntry
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.util import get_logger
+from src.util import fmt_duration, get_logger, truncate_embed_title
 
 log = get_logger(__name__)
 
@@ -120,11 +128,12 @@ class GuildHistory:
             # embed instead of degrading to the cache.
             take(await self._read_tier("redis", lambda: store.get_history()))
         take(list(reversed(self._entries)))
-        # Both legs are newest-first over the same window, so the concatenation is
-        # nearly ordered — but only nearly: the deque can hold an entry the Redis
-        # read missed. A 0.0 (unknown) timestamp sorting last is CORRECT — the only
-        # way to hold one is to predate played_at. list.sort is stable, so ties keep
-        # leg order.
+        # Both legs are ordered by when a song was RECORDED, which is when it ended,
+        # but played_at is when it started — a -playnow-parked song is recorded
+        # after everything that cut in front of it, so without this sort -history
+        # renders end order under a "newest first" promise. A 0.0 (unknown)
+        # timestamp sorting last is correct — the only way to hold one is to predate
+        # played_at. list.sort is stable, so ties keep leg order.
         merged.sort(key=lambda e: e.played_at, reverse=True)
         return merged[:limit]
 
@@ -165,3 +174,38 @@ class GuildHistory:
 
     def __getitem__(self, index: int) -> HistoryEntry:
         return self._entries[index]
+
+
+def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
+    """One embed per played song, in the given (newest-first) order. Layout: numbered
+    title, raw webpage_url on its own line (Discord auto-links it), then played/duration,
+    requester, and — when known — the played-at timestamp as viewer-local <t:…:f>."""
+    embeds = []
+    for i, entry in enumerate(entries, start=1):
+        lines = []
+        if entry.webpage_url:
+            lines.append(entry.webpage_url)
+        requested_by = (
+            f"<@{entry.requester_id}>"
+            if entry.requester_id
+            else (entry.requester_name or "unknown")
+        )
+        meta = (
+            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
+            f" · requested by {requested_by}"
+        )
+        # played_at == 0 means unknown (absent on the wire); <t:0:f> would render
+        # "1 January 1970", so omit the timestamp instead.
+        if entry.played_at:
+            meta += f" · <t:{int(entry.played_at)}:f>"
+        lines.append(meta)
+        title = truncate_embed_title(f"{i}. {entry.title}")
+        embed = discord.Embed(
+            title=title,
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        if entry.thumbnail:
+            embed.set_thumbnail(url=entry.thumbnail)
+        embeds.append(embed)
+    return embeds

@@ -2,7 +2,7 @@ import copy
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypedDict, Union, cast
 from urllib.parse import parse_qs, urlparse
 
@@ -15,6 +15,7 @@ import redis.asyncio as aioredis
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
 
+from src.guild_state import ANALYTICS_ZERO, Analytics
 from src.redis_client import cache_del, cache_get, cache_set
 from src.telemetry import get_tracer
 from src.util import fmt_duration, get_logger
@@ -199,14 +200,14 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
-    for field in _UNUSED_INFO_COLLECTIONS:
-        info.pop(field, None)
+    for key in _UNUSED_INFO_COLLECTIONS:
+        info.pop(key, None)
     entries = info.get("entries")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
-                for field in _UNUSED_INFO_COLLECTIONS:
-                    entry.pop(field, None)
+                for key in _UNUSED_INFO_COLLECTIONS:
+                    entry.pop(key, None)
     # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
     # conforms, and `grep cast(` is how those assertions are audited.
     return cast(YTDLExtractResult, info)
@@ -524,6 +525,20 @@ async def invalidate_stream_cache(
     await cache_del(redis, _stream_cache_key(webpage_url))
 
 
+@dataclass(frozen=True, slots=True)
+class NpHostRef:
+    """The live Now Playing host an interrupted fragment left behind, so the
+    fragment's resume tail can dispose of that frozen card when it starts.
+
+    Runtime only — a live Message cannot be serialized, and own_embeds cannot be
+    reconstructed from ids, so the wire fields alone can never strip-edit a
+    retirement (see MusicPlayer._retire_np_host)."""
+
+    message: discord.Message
+    own_embeds: list[discord.Embed]
+    dedicated: bool
+
+
 @dataclass
 class QueueObject:
     """Song metadata in a queue before it's processed by YTDL"""
@@ -541,8 +556,8 @@ class QueueObject:
     # so the loop must skip its redis_pop_for(). Read via guild_queue.is_persisted().
     persisted: bool = True
     # ── -playnow interjection flags ──
-    # Queued via -playnow. A later -playnow REPLACES a playing interjection (no
-    # resume entry is built for it) instead of stacking.
+    # Queued via -playnow. Attribution only — interjections stack, so nothing reads
+    # this except the span attribute.
     interjected: bool = False
     # The rebuilt tail of an interrupted song (ts = interrupt position). Drives which
     # notice the loop's start path sends: "Resuming…" for these, "Starting song at
@@ -551,15 +566,28 @@ class QueueObject:
     # The interrupted song was paused at interjection time: the loop re-pauses
     # immediately after vc.play() so it returns parked.
     start_paused: bool = False
-    # ── Enqueue stamps, written once by MusicPlayer and carried thereafter ──
-    # Unix epoch when this song first entered a queue; 0.0 also means "not yet
-    # stamped", which is what makes stamping idempotent across re-queues.
-    queued_at: float = 0.0
-    # Songs ahead of it then, counting the one playing (0 = played immediately).
-    queue_position: int = 0
+    # ── Ask-time analytics, set at construction and carried thereafter ──
+    # queued_at + queue_position in one frozen container (guild_state.Analytics).
+    # yt_source/yt_playlist REQUIRE it, so a QueueObject leaves them complete;
+    # the default exists for rehydration and the carry sites, which always pass
+    # a real value explicitly.
+    analytics: Analytics = ANALYTICS_ZERO
     # How the song was asked for — "search", or the host of the pasted link.
     # Classified by src.sources at parse time and carried from there; "" = unknown.
     query_source: str = ""
+    # Unix epoch when the audio started, stamped by the loop at vc.play(). A resume
+    # tail INHERITS it, so every fragment of one play records the same start;
+    # 0.0 = not played yet, which makes the stamp idempotent across fragments.
+    played_at: float = 0.0
+    # ── The Now Playing card the interrupted fragment left frozen ──
+    # Set on a resume tail at the fragment's iteration end (see MusicPlayer's
+    # _pending_resume_tail) and consumed when the tail starts. The ids survive a
+    # restart; the ref does not, and only the ref can strip-edit a response host.
+    # 0/0/False = nothing to clean up.
+    np_message_id: int = 0
+    np_channel_id: int = 0  # from message.channel.id — NEVER the home channel
+    np_dedicated: bool = False  # a pure NP message (deletable) vs a response
+    np_host_ref: Optional[NpHostRef] = field(default=None, repr=False)
 
 
 def _enrich_queueobject(qo: QueueObject, data: YTDLVideoMetadata) -> None:
@@ -596,9 +624,15 @@ class YTDL(discord.FFmpegOpusAudio):
         interjected: bool = False,
         is_resume: bool = False,
         start_paused: bool = False,
-        queued_at: float = 0.0,
-        queue_position: int = 0,
+        analytics: Analytics = ANALYTICS_ZERO,
         query_source: str = "",
+        user_input: Optional[str] = None,
+        persisted: bool = True,
+        played_at: float = 0.0,
+        np_message_id: int = 0,
+        np_channel_id: int = 0,
+        np_dedicated: bool = False,
+        np_host_ref: Optional[NpHostRef] = None,
     ) -> None:
         super().__init__(
             url, executable="ffmpeg", before_options=before_options, options=options
@@ -612,11 +646,28 @@ class YTDL(discord.FFmpegOpusAudio):
         self.interjected: bool = interjected
         self.is_resume: bool = is_resume
         self.start_paused: bool = start_paused
-        # Enqueue stamps carried from the QueueObject so the history entry this
-        # song produces records where it started, not when it played.
-        self.queued_at: float = queued_at
-        self.queue_position: int = queue_position
+        # Ask-time analytics carried from the QueueObject so the history entry
+        # this song produces records where it started, not when it played.
+        self.analytics: Analytics = analytics
         self.query_source: str = query_source
+        # What the user typed, carried so -remove still matches a song that has
+        # become a playing one — a -playnow resume tail is rebuilt from here.
+        self.user_input: Optional[str] = user_input
+        # Whether this song's entry is still on the Redis list, carried for the
+        # SAME rebuild: _neutralize_prefetch reads it back off the playing song to
+        # reconstruct a QueueObject, and defaulting it to True there would write a
+        # crash-recovered head (persisted=False) into the mirror, where its dequeue
+        # never LPOPs and every later entry sits one place out.
+        self.persisted: bool = persisted
+        # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
+        # which inherits the interrupted song's start (see QueueObject.played_at).
+        self.played_at: float = played_at
+        # The previous fragment's frozen NP card, carried so the loop can dispose
+        # of it once this one is up (see QueueObject's fields).
+        self.np_message_id: int = np_message_id
+        self.np_channel_id: int = np_channel_id
+        self.np_dedicated: bool = np_dedicated
+        self.np_host_ref: Optional[NpHostRef] = np_host_ref
 
         self.data = data
         self.uploader = data.get("uploader")
@@ -823,9 +874,15 @@ class YTDL(discord.FFmpegOpusAudio):
             interjected=qo.interjected,
             is_resume=qo.is_resume,
             start_paused=qo.start_paused,
-            queued_at=qo.queued_at,
-            queue_position=qo.queue_position,
+            analytics=qo.analytics,
             query_source=qo.query_source,
+            user_input=qo.user_input,
+            persisted=qo.persisted,
+            played_at=qo.played_at,
+            np_message_id=qo.np_message_id,
+            np_channel_id=qo.np_channel_id,
+            np_dedicated=qo.np_dedicated,
+            np_host_ref=qo.np_host_ref,
         )
 
     @classmethod
@@ -835,12 +892,25 @@ class YTDL(discord.FFmpegOpusAudio):
         requester: Union[discord.User, discord.Member],
         search: str,
         *,
+        query_source: str,
+        analytics: Analytics,
+        user_input: Optional[str],
         download: bool = False,
         ts: Optional[int] = None,
         redis: Optional[aioredis.Redis] = None,
     ) -> QueueObject:
         """Resolve a search term or URL to a QueueObject via yt-dlp, using the
-        Redis source cache if present."""
+        Redis source cache if present.
+
+        query_source, analytics and user_input are REQUIRED so the QueueObject
+        leaves here complete — a default would let a new call site forget them and
+        write a plausible zero, permanently indistinguishable from a real value.
+
+        user_input is what the user typed; None falls back to `search`, which is the
+        same string only for a direct -play of one song. For an expanded collection
+        `search` is a title this code generated, so the fallback would lose the album
+        link -remove matches on."""
+        origin = user_input if user_input is not None else search
         trace.get_current_span().set_attribute("ytdl.search", search)
         # Normalised so "Destiny" and "destiny " both hit. ts is excluded — a
         # per-request playback offset, not part of the video identity.
@@ -858,10 +928,12 @@ class YTDL(discord.FFmpegOpusAudio):
                     cached["title"],
                     requester,
                     ts=ts,
-                    user_input=search,
+                    user_input=origin,
                     duration=cached.get("duration"),
                     uploader=cached.get("uploader"),
                     thumbnail=cached.get("thumbnail"),
+                    query_source=query_source,
+                    analytics=analytics,
                 )
 
         trace.get_current_span().set_attribute("ytdl.source_cache_hit", False)
@@ -957,10 +1029,12 @@ class YTDL(discord.FFmpegOpusAudio):
             title,
             requester,
             ts=ts,
-            user_input=search,
+            user_input=origin,
             duration=duration,
             uploader=uploader,
             thumbnail=thumbnail,
+            query_source=query_source,
+            analytics=analytics,
         )
 
     @staticmethod
@@ -968,8 +1042,17 @@ class YTDL(discord.FFmpegOpusAudio):
     async def yt_playlist(
         url: str,
         requester: Union[discord.User, discord.Member],
+        *,
+        query_source: str,
+        analytics: Analytics,
+        user_input: str,
     ) -> list[QueueObject]:
-        """Fetch flat entry metadata for every video in a YouTube playlist."""
+        """Fetch flat entry metadata for every video in a YouTube playlist.
+
+        query_source, analytics and user_input are REQUIRED (see yt_source).
+        `analytics` is the head's — track positions are derived per kept track
+        below. `user_input` is the playlist link the user pasted, carried onto every
+        track so -remove can match it."""
         trace.get_current_span().set_attribute("ytdl.url", url)
         data = await _run_extract(ExtractRequest(url=url, opts=_YTDL_PLAYLIST_OPTS))
         if data is None:
@@ -997,5 +1080,20 @@ class YTDL(discord.FFmpegOpusAudio):
             video_url = (
                 entry.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             )
-            qobjs.append(QueueObject(video_url, title, requester))
+            # Offset by tracks KEPT (len(qobjs)), never the enumerate index — the
+            # skipped null entries above must not leave gaps in queue_position.
+            # replace() so a field added to Analytics later is carried here.
+            qobjs.append(
+                QueueObject(
+                    video_url,
+                    title,
+                    requester,
+                    user_input=user_input,
+                    query_source=query_source,
+                    analytics=replace(
+                        analytics,
+                        queue_position=analytics.queue_position + len(qobjs),
+                    ),
+                )
+            )
         return qobjs

@@ -48,12 +48,27 @@ CREATE TABLE IF NOT EXISTS play_history (
     requester_name text        NOT NULL DEFAULT '',
     thumbnail      text        NOT NULL DEFAULT '',
     uploader       text        NOT NULL DEFAULT '',
+    -- When the audio STARTED, one value per PLAY rather than per fragment: every
+    -- -playnow resume tail inherits the played_at of the fragment it continues.
+    -- So rows are not in recording order, and an interrupted play's [played_at,
+    -- played_at + played_secs] interval overlaps the songs that interrupted it —
+    -- "what was playing at time T" has more than one answer here.
     played_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
 
-    -- When the song was first added to the queue (epoch 0 = unknown, the same
-    -- sentinel as played_at) and how many songs were ahead of it then, counting
-    -- the one playing. 0 = played immediately, which is also what an entry
-    -- written before these fields existed parses as.
+    -- When the user ASKED for the song, and how many songs were ahead of it at
+    -- that moment, counting the one playing. Epoch 0 = unknown (the same
+    -- sentinel as played_at), and 0 = played immediately; both are also what an
+    -- entry written before these fields existed parses as.
+    --
+    -- queued_at is the command message's snowflake time, on DISCORD's clock
+    -- while played_at is on the host's, so their difference is cross-clock and
+    -- goes slightly negative under drift. A `played_at >= queued_at` filter
+    -- drops those real plays.
+    --
+    -- queue_position is depth at ASK, left approximate against where the song
+    -- landed by the loop's continuous dequeuing, so it disagrees with played_at
+    -- ordering. Rows imported by `just db-backfill` predate the switch and hold
+    -- the older meaning of both columns: insert time, and position at insert.
     queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0),
     queue_position integer     NOT NULL DEFAULT 0,
 
@@ -71,50 +86,35 @@ CREATE TABLE IF NOT EXISTS play_history (
     query_source   text        NOT NULL DEFAULT '',
 
     -- When the row reached Postgres, as opposed to when the song was played.
-    -- played_at is a client clock captured at song end and can be arbitrarily
-    -- far in the past for backfilled or long-buffered entries, so this is what
-    -- outage forensics and backfill auditing (`WHERE inserted_at > <start>`) can
-    -- ask about. Not in _INSERT_SQL / _RECENT_SQL on purpose: the default fills
-    -- it, and HistoryEntry stays exactly the wire schema.
+    -- played_at is a client clock captured when the audio started and can be
+    -- arbitrarily far in the past for backfilled or long-buffered entries, so
+    -- this is what outage forensics and backfill auditing (`WHERE inserted_at >
+    -- <start>`) can ask about. Not in _INSERT_SQL / _RECENT_SQL on purpose: the
+    -- default fills it, and HistoryEntry stays exactly the wire schema.
     inserted_at    timestamptz NOT NULL DEFAULT now(),
 
-    -- The Discord message id of the Now Playing embed that hosted this song.
+    -- The Now Playing embed that hosted this song, resolvable only as a PAIR:
+    -- discord.py has no guild.fetch_message(id), so resolve via
+    -- `channel.get_partial_message(message_id)`. The persisted text-channel id
+    -- cannot stand in, which is why channel_id exists — set_context reassigns the
+    -- home channel on every command, so it records where the last command ran
+    -- rather than where any card was posted. Both are read off the same message at
+    -- song end, so they are both real or both 0. 0 also covers a failed NP send, a
+    -- host deleted mid-song, and rows predating the columns.
     --
-    -- A CORRELATION TOKEN, not a resolvable pointer. discord.py has no
-    -- guild.fetch_message(id) — resolving a message needs channel.fetch_message,
-    -- and no channel id is stored here. The persisted text-channel id cannot
-    -- stand in either: MusicPlayer.set_context reassigns the home channel on
-    -- every command, so the NP host migrates across text channels within one
-    -- guild and that id only records wherever the last command ran. Match this
-    -- against a log line or a span (song.np_host_id), not against the API. If a
-    -- resolvable pointer is ever wanted, it needs a companion channel_id column
-    -- stamped from the same host — and that should land WITH the archive wiring
-    -- below, not before it, so the wire format does not grow a second field
-    -- nothing reads.
-    --
-    -- Populated by the archive: _INSERT_SQL / _RECENT_SQL / _entry_to_row /
-    -- _row_to_entry in history_archive.py all carry this column. HistoryEntry
-    -- carries the value on the Redis wire — HistoryEntry.from_song stamps it
-    -- from the host the playback loop captured at song end — and the drainer
-    -- writes it through unchanged. 0 is a real recorded value, but an
-    -- ambiguous one: it covers a song whose NP send failed, a host a listener
-    -- deleted mid-song (released on discord.NotFound), and any entry written
-    -- by a build older than the field.
-    --
-    -- Kept out of play_history_dedup, and not a foreign key, for the same
-    -- reason: the NP host is not stable or permanent. It migrates across
-    -- messages during one song (MusicContext.send re-hosts the block on every
-    -- command response in the home channel), and a dedicated NP message is
-    -- DELETED when retired. So two deliveries of one play can disagree on it —
-    -- in the key that would land them as two rows — and the id it holds may
-    -- point at a message that no longer exists.
+    -- Kept out of play_history_dedup, and not foreign keys: the host migrates
+    -- across messages during one song and a dedicated NP message is DELETED when
+    -- retired, so two deliveries of one play can disagree on them and the message
+    -- they point at may no longer exist.
     message_id     bigint      NOT NULL DEFAULT 0,
+    channel_id     bigint      NOT NULL DEFAULT 0,
 
     CONSTRAINT play_history_guild_id_valid    CHECK (guild_id > 0),
     CONSTRAINT play_history_requester_valid   CHECK (requester_id >= 0),
     CONSTRAINT play_history_played_secs_valid CHECK (played_secs >= 0),
     CONSTRAINT play_history_duration_valid    CHECK (duration_secs >= 0),
     CONSTRAINT play_history_message_id_valid  CHECK (message_id >= 0),
+    CONSTRAINT play_history_channel_id_valid  CHECK (channel_id >= 0),
     CONSTRAINT play_history_queue_position_valid CHECK (queue_position >= 0),
 
     -- Both timestamps carry the same domain the wire validator clamps them to
@@ -140,6 +140,20 @@ CREATE TABLE IF NOT EXISTS play_history (
     )
 );
 
+-- CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so on its own
+-- it records this migration as applied over whatever shape it found — a drift the
+-- schema-version machinery cannot see: the ledger says migrated, verify_schema()
+-- agrees, and every insert raises UndefinedColumnError. These make the CREATE
+-- idempotent per column and are no-ops on a correct table, so a new column needs a
+-- line here as well as above. Columns only — Postgres has no ADD CONSTRAINT IF
+-- NOT EXISTS, and the CHECKs are inline in the CREATE.
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS message_id     bigint      NOT NULL DEFAULT 0;
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS channel_id     bigint      NOT NULL DEFAULT 0;
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS queued_at      timestamptz NOT NULL DEFAULT to_timestamp(0);
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS queue_position integer     NOT NULL DEFAULT 0;
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS query_source   text        NOT NULL DEFAULT '';
+ALTER TABLE play_history ADD COLUMN IF NOT EXISTS inserted_at    timestamptz NOT NULL DEFAULT now();
+
 -- Dedup for at-least-once delivery (drainer redelivery) and backfill overlap.
 -- Uniqueness only — it does NOT serve the -history read; play_history_recent
 -- below does.
@@ -149,6 +163,12 @@ CREATE TABLE IF NOT EXISTS play_history (
 -- entries imported by backfill_history, or values the validator clamped).
 -- Accepted: a silent merge of indistinguishable pre-archive rows beats a wider
 -- key that stops deduping the redeliveries this index exists for.
+--
+-- Second edge, cutting the other way: every fragment of one interrupted play
+-- INHERITS played_at (see the column comment), so the key also masks a genuine
+-- double-record. Two writers recording one play land as one row here while the
+-- Redis list keeps both — -history shows the duplicate, the archive does not, and
+-- nothing rejects or logs it.
 CREATE UNIQUE INDEX IF NOT EXISTS play_history_dedup
     ON play_history (guild_id, played_at, webpage_url);
 
