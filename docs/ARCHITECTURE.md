@@ -799,7 +799,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `lock:guild:{id}:recovery` | String | `"1"` (SET NX EX — distributed lock) | 60 s |
-| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
+| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, ~1.3 KB/rung, which takes an entry to ~4–5 KB | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
 | `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
@@ -1344,6 +1344,47 @@ format requires a token, so it costs nothing while `android_vr` is healthy; YouT
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
 
+### Stream-retry ladder
+
+One extraction already contains every URL the bot could want, so the recovery rule is
+**retry sideways before retrying in place**: the next audio format under the same
+extraction, not the same format under a fresh one.
+
+The ladder is mined in the worker (`_mine_audio_candidates`), because `_slim_info`
+drops `formats` and after that the alternative URLs are gone from the process. It keeps
+the top `_STREAM_CANDIDATES` (3) audio-only formats, best first, with candidate 0 being
+the format yt-dlp itself selected — so "candidate 0" and "the URL the probe already
+validated" are always the same thing. Three filters are load-bearing rather than
+cosmetic: storyboards also carry `vcodec: none` (the `acodec` test is what removes
+them), and `-drc` variants and foreign-language dubs would make a fallback quietly
+change what the song *sounds* like. A muxed selection gets no ladder at all — that rung
+already means the audio-only path is degraded, and walking sideways across muxed
+formats is not a recovery worth having.
+
+The ladder rides the existing `ytdl:stream:{webpage_url}` entry (~1.3 KB/rung,
+URL-dominated). That key is TTL'd and evictable, so it carries none of the
+non-evictable-key obligations in [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
+Entries written before the ladder existed parse as a one-rung ladder, so wire-compat
+needs no version field.
+
+At probe time `_probe_candidate_ladder` walks it and **promotes the winner wholesale** —
+URL plus format shape — so `_record_serving_format`, the source's `abr`/`asr`/`acodec`
+and every span attribute describe what is really playing rather than what was
+originally selected. Two consequences follow, and both are behavior rather than
+bookkeeping:
+
+- **A promotion rewrites the cache entry**, with the dead rungs ahead of the winner
+  pruned. Left alone, a cached ladder whose head is dead re-probes that same dead URL
+  on every play until the TTL lapses, re-diagnosing a failure it already knows.
+- **Re-extraction is the last resort, not the first.** A fallback probe costs ~100 ms
+  against a 3–5 s extraction that would re-select the *same* format anyway — which
+  cures a stale URL but does nothing against format-level enforcement (the yt-dlp#16150
+  shape, where the format dies again immediately under a fresh signature). Only when
+  every rung is dead is the entry dropped and re-extracted, then walked once more.
+
+Prefetch deliberately probes only the head: walking all three per song would tax every
+play for the rare failure.
+
 ### yt-dlp process boundary
 
 Four things cross into the worker processes, each with its own contract:
@@ -1355,6 +1396,9 @@ Four things cross into the worker processes, each with its own contract:
   `patch("src.youtube._ytdlp_extract")` in the suite.
 - **The result** — `_slim_info` is what makes it picklable at all; a raw
   `process=True` info dict carries live objects and commonly 100 KB–1 MB nobody reads.
+  It is also the last point at which the *whole* format ladder exists, which is why the
+  fallback audio URLs are mined into `audio_candidates` here rather than anywhere the
+  parent could do it (see [Stream-retry ladder](#stream-retry-ladder)).
 - **The exception** — flattened in the worker by `_classify_ytdlp_error`, where the
   structure still exists (yt-dlp's own exceptions carry live tracebacks and cannot
   cross). **Every field of the flattened error needs a default**: a required

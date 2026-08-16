@@ -378,7 +378,8 @@ PHASE 2 — PREFETCH (background):
     (TTL = min(URL expire − 30min, 30min) — YouTube revokes well before `expire`)
   • every candidate URL is PROBED with a plain no-Range GET (exactly how ffmpeg
     opens it; HEAD and ranged GETs lie about revoked URLs); only proven-playable
-    URLs are cached
+    URLs are cached. Prefetch probes only the ladder head — walking all three
+    per song would tax every play for the rare failure
   ▼
 PHASE 3 — STREAM (playback loop, usually zero extraction):
   loop(): gate open → dequeue → resolve (if YTSource) → yt_stream (cache hit →
@@ -499,7 +500,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `history:outbox` | **stream** | **none, ever** | global write-ahead buffer, written only while the archive is enabled (disabled — the default — the key is never created): every play, all guilds interleaved, one `serialize_history_entry` blob per entry under field `e`, drained oldest-first into Postgres by the `drainers` consumer group. Non-evictable — an evicted entry is a silently lost play |
 | `guild:{id}:config` | hash | **none, ever (PERSISTed)** | durable per-guild preferences (`GuildConfig`). Three fields today: `debug_mode` (`"1"`/`"0"`), `volume`, and `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time so a name the host's tz database cannot resolve degrades to the default instead of raising on a render path). **Absent always means "no choice made"** — for debug that is "follow the host `DEBUG_MODE`", for volume it is "use the default", and keeping it distinct from an explicit `0`/`false` is why every field is Optional. `volume` MOVED here from `:state`, and the legacy field is **dual-written for one release rather than deleted** — deleting it made `just up <older-sha>` silently reset every migrated guild to 100%, since the older build reads only `:state`. Restore reads config-then-legacy and SEEDS config from what it finds (`migrate_volume`, `HSETNX` — never an overwrite, or a snapshot read before a concurrent `-volume` would durably clobber it). Drop the legacy write, `StateField.VOLUME` and `GuildStateData.volume` together after one release. Deliberately not fields on `:state`, which expires in 24h — a durable choice must not evaporate on an idle guild. Excluded from every TTL path; deleted on `on_guild_remove` |
 | `ytdl:source:{query, lowercased}` | string | 1h | search → {webpage_url, title, duration, uploader, thumbnail} |
-| `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata |
+| `ytdl:stream:{webpage_url}` | string | ≤30m (expire-capped) | probed-playable stream URL + `_STREAM_CACHE_FIELDS` metadata, including `audio_candidates` — the mined fallback ladder (~1.3 KB/rung, entry ~4–5 KB) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
@@ -718,6 +719,9 @@ reach Loki structured, with `worker_id` and propagated `trace_id`). Results are 
 picklable and small in the worker: exceptions flattened to `ExtractionError` (yt-dlp's
 own exceptions carry live tracebacks and can't cross), successes `_slim_info`'d
 (sanitize + drop `formats`/`thumbnails`/etc., commonly 100 KB–1 MB nobody reads).
+The one thing kept out of `formats` is the **fallback audio ladder**: `_slim_info`
+mines the top `_STREAM_CANDIDATES` (3) audio-only formats into `audio_candidates`
+first, because after the drop those URLs exist nowhere in the process.
 
 **Client strategy** (comment block above `_EXTRACTOR_ARGS` in youtube.py):
 `android_vr` primary (no PO token needed, audio-only formats), `web_safari` as a
@@ -732,10 +736,18 @@ designed so every rung lands on a previously-working configuration.
 
 **Revoked-URL healing** (`_resolve_playable_stream`): a revoked URL fails in the worst
 way — ffmpeg 403s and exits, discord.py reports "song finished", silence. So every URL
-is probed pre-play; a revoked cached URL is dropped and re-extracted once; a URL revoked
-in the seconds between probe and first read is caught post-hoc by `produced_audio` and
-its cache entry invalidated. `_stream_url_ttl` reads `expire` from both query-string
-(https formats) and path-segment (`/expire/<epoch>/`, HLS) forms, then caps at 30min.
+is probed pre-play, and the probe walks the mined ladder: **sideways before in place.**
+The next format is a ~100 ms probe against a 3–5 s re-extraction that would re-select
+the *same* format anyway — curing a stale URL but not a format YouTube has stopped
+serving. A winning fallback is promoted onto the info-dict wholesale (url + format
+shape, so `_record_serving_format` and the source's abr/asr/acodec describe what is
+really playing) and the entry is **rewritten** with the dead rungs ahead of it pruned;
+without that rewrite a cached ladder re-probes its own dead head every play until the
+TTL lapses. Only when every rung is dead is the entry dropped and re-extracted once.
+A URL revoked in the seconds between probe and first read is caught post-hoc by
+`produced_audio` and its cache entry invalidated. `_stream_url_ttl` reads `expire` from
+both query-string (https formats) and path-segment (`/expire/<epoch>/`, HLS) forms,
+then caps at 30min.
 
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` and `-vn`; `?t=`/interject

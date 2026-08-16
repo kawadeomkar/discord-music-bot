@@ -105,6 +105,22 @@ class _YTDLVideoInfoRequired(TypedDict):
     webpage_url: str
 
 
+class AudioCandidate(TypedDict, total=False):
+    """One rung of a song's audio ladder, mined in the worker before `formats` is
+    dropped. Field-for-field the shape a candidate promotes onto the info-dict it came
+    from (_CANDIDATE_FIELDS), so a fallback URL that wins the probe is indistinguishable
+    downstream from one yt-dlp selected itself.
+    """
+
+    url: str
+    format_id: str
+    acodec: str
+    abr: float
+    asr: int
+    protocol: str
+    vcodec: str
+
+
 class YTDLVideoMetadata(TypedDict, total=False):
     """The descriptive half of an info-dict — everything but the two identity fields.
     Split out because _enrich_queueobject() and _record_serving_format() read only
@@ -133,6 +149,10 @@ class YTDLVideoMetadata(TypedDict, total=False):
     format_id: str
     protocol: str
     vcodec: str
+    # The song's audio ladder, best first, candidate[0] being the format above.
+    # Mined in the worker (_mine_audio_candidates) and walked at probe time, so a
+    # revoked URL costs one sideways probe instead of the song.
+    audio_candidates: list[AudioCandidate]
 
 
 class YTDLVideoInfo(YTDLVideoMetadata, _YTDLVideoInfoRequired, total=False):
@@ -169,6 +189,8 @@ class YTDLExtractResult(YTDLEntry, total=False):
 # fields to the top level: the whole `formats` ladder plus thumbnails/captions/etc.,
 # commonly 100 KB-1 MB pickled worker->parent per extraction, so it is dropped in the
 # worker. `_STREAM_CACHE_FIELDS` is the exhaustive list of what callers do consume.
+# The one thing kept out of `formats` is the fallback audio ladder, mined into
+# `audio_candidates` right before this drop (see _slim_info).
 _UNUSED_INFO_COLLECTIONS = frozenset(
     {
         "formats",
@@ -188,6 +210,68 @@ _UNUSED_INFO_COLLECTIONS = frozenset(
 # otherwise stub out sanitize_info).
 _sanitize_info = youtube_dl.YoutubeDL.sanitize_info
 
+# How many audio URLs one extraction keeps. A YouTube video exposes four audio
+# formats, so three is the ladder minus its worst rung (~49k, a last resort nobody
+# wants). Each candidate costs ~1.3 KB in the stream cache, URL-dominated.
+_STREAM_CANDIDATES = 3
+
+# The per-format fields a candidate carries. Exactly the shape a winner promotes onto
+# the info-dict, which is why the tuple is shared by both directions: everything
+# downstream (_record_serving_format, YTDL's abr/asr/acodec) then describes the URL
+# actually being played rather than the one yt-dlp originally selected.
+_CANDIDATE_FIELDS = ("url", "format_id", "acodec", "abr", "asr", "protocol", "vcodec")
+
+
+def _candidate_shape(fmt: dict[str, Any]) -> AudioCandidate:
+    """Slim one format down to the candidate fields it actually carries. Absent keys
+    stay absent rather than becoming None — the same rule _cache_stream follows, so a
+    promoted candidate never contradicts YTDLVideoInfo's non-optional types."""
+    return cast(
+        AudioCandidate, {k: fmt[k] for k in _CANDIDATE_FIELDS if fmt.get(k) is not None}
+    )
+
+
+def _mine_audio_candidates(node: dict[str, Any]) -> list[AudioCandidate]:
+    """The audio URLs worth trying for one video, best first — mined in the worker
+    because _slim_info drops `formats` and these URLs exist nowhere else afterwards.
+
+    yt-dlp sorts `formats` worst→best, so the walk is reversed. Storyboards also carry
+    `vcodec: none` and are excluded by the acodec test; `-drc` (dynamic-range-compressed)
+    variants and foreign-language dubs are skipped so a fallback never quietly changes
+    what the song sounds like. A muxed selection means the audio-only path is already
+    degraded (see _record_serving_format), so that rung gets no ladder at all.
+
+    See docs/ARCHITECTURE.md#stream-retry-ladder.
+    """
+    formats = node.get("formats")
+    if not isinstance(formats, list) or not node.get("url"):
+        # No format list (extract_flat entries) or no selected stream: nothing to mine.
+        return []
+    selected = _candidate_shape(node)
+    if node.get("vcodec") not in (None, "none"):
+        return [selected]
+    language = node.get("language")
+    ladder: list[AudioCandidate] = []
+    for fmt in reversed(formats):
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        if fmt.get("vcodec") not in (None, "none"):
+            continue
+        if fmt.get("acodec") in (None, "none"):
+            continue
+        if str(fmt.get("format_id") or "").endswith("-drc"):
+            continue
+        if language is not None and fmt.get("language") not in (None, language):
+            continue
+        ladder.append(_candidate_shape(fmt))
+    # candidate[0] must BE the selected format, so "candidate 0" and "the URL the
+    # probe already validated" stay the same thing. Normally the sort agrees; when it
+    # doesn't, the selection wins and its duplicate is dropped from the tail.
+    selected_id = node.get("format_id")
+    if not ladder or ladder[0].get("format_id") != selected_id:
+        ladder = [selected] + [c for c in ladder if c.get("format_id") != selected_id]
+    return ladder[:_STREAM_CANDIDATES]
+
 
 def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     """Make a yt-dlp result cheap and safe to ship back from the worker: sanitize_info()
@@ -195,19 +279,25 @@ def _slim_info(info: Any) -> Optional[YTDLExtractResult]:
     a _YDLLogger, callables) to JSON primitives, without which every extraction fails on
     an opaque pickling error. The large collections it keeps but no caller reads are
     dropped here too, top level and per `entries` element.
+
+    The audio ladder is mined BEFORE that drop and kept as `audio_candidates`: `formats`
+    is one of the dropped collections, so this is the only point in the process where a
+    fallback URL still exists.
     """
     info = _sanitize_info(info)
     if not isinstance(info, dict):
         # extract_info and sanitize_info only ever return a dict or None.
         return None
-    for key in _UNUSED_INFO_COLLECTIONS:
-        info.pop(key, None)
     entries = info.get("entries")
+    nodes = [info]
     if isinstance(entries, list):
-        for entry in entries:
-            if isinstance(entry, dict):
-                for key in _UNUSED_INFO_COLLECTIONS:
-                    entry.pop(key, None)
+        nodes.extend(entry for entry in entries if isinstance(entry, dict))
+    for node in nodes:
+        candidates = _mine_audio_candidates(node)
+        if candidates:
+            node["audio_candidates"] = candidates
+        for key in _UNUSED_INFO_COLLECTIONS:
+            node.pop(key, None)
     # cast, not a bare annotation: the checker cannot verify yt-dlp's untyped dict
     # conforms, and `grep cast(` is how those assertions are audited.
     return cast(YTDLExtractResult, info)
@@ -404,6 +494,11 @@ _STREAM_CACHE_FIELDS = frozenset(
         "format_id",
         "protocol",
         "vcodec",
+        # The mined fallback ladder (~1.3 KB/rung, so an entry grows to ~4-5 KB).
+        # Cached so a revoked URL costs a sideways probe rather than a 3-5s
+        # re-extraction; this key is TTL'd and evictable, so it carries no
+        # golden-rule-12 obligation.
+        "audio_candidates",
     }
 )
 
@@ -762,6 +857,49 @@ class YTDL(discord.FFmpegOpusAudio):
             await _probe_and_cache(redis, cache_key, data)
             _enrich_queueobject(qo, data)
 
+    @staticmethod
+    def _candidate_ladder(data: YTDLVideoInfo) -> list[AudioCandidate]:
+        """The audio URLs to try for this song, best first. Entries cached before the
+        ladder existed, and extractors that expose no format list, yield the one
+        selected URL — so every caller walks a list and none needs the special case."""
+        candidates = data.get("audio_candidates") or []
+        if candidates:
+            return list(candidates)
+        if not data.get("url"):
+            return []
+        return [_candidate_shape(cast(dict[str, Any], data))]
+
+    @classmethod
+    async def _probe_candidate_ladder(cls, data: YTDLVideoInfo) -> Optional[int]:
+        """Probe the ladder in order and promote the first URL YouTube will actually
+        serve onto `data`, returning its index (None = every rung is dead).
+
+        A fallback that wins is hoisted wholesale — url and format shape both — so
+        everything downstream describes what is really playing. The candidates ahead of
+        it are dropped: they are known dead for this extraction, and a caller that
+        re-caches the entry must not make the next play re-probe them.
+        """
+        ladder = cls._candidate_ladder(data)
+        span = trace.get_current_span()
+        span.set_attribute("ytdl.candidates", len(ladder))
+        for index, candidate in enumerate(ladder):
+            if not await _stream_url_playable(candidate.get("url", "")):
+                continue
+            if index:
+                log.warning(
+                    f"audio format {data.get('format_id')} is not being served for "
+                    f"{data.get('webpage_url')} — falling back to "
+                    f"{candidate.get('format_id')} (candidate {index})"
+                )
+                # cast to plain dict: the checker cannot see that AudioCandidate's
+                # keys are a subset of YTDLVideoInfo's, though _CANDIDATE_FIELDS
+                # makes them so by construction.
+                cast(dict[str, Any], data).update(candidate)
+                data["audio_candidates"] = ladder[index:]
+            span.set_attribute("ytdl.candidate_index", index)
+            return index
+        return None
+
     @classmethod
     async def _resolve_playable_stream(
         cls,
@@ -771,8 +909,13 @@ class YTDL(discord.FFmpegOpusAudio):
         """Resolve a song to stream data whose URL YouTube will actually serve. Every URL
         is probed first, because a revoked one fails in the worst way: ffmpeg 403s and
         exits, discord.py reports a completed song, and the player advances in silence
-        with nothing logged. A revoked URL is dropped from the cache and re-extracted
-        once; once is enough.
+        with nothing logged.
+
+        Retry sideways before retrying in place: one extraction already carries the
+        whole audio ladder, so a dead URL costs a ~100ms probe of the next format
+        rather than a 3-5s re-extraction — which would only re-select the same format
+        anyway, curing a stale URL but not a format YouTube has stopped serving. Only
+        when every rung is dead is the entry dropped and re-extracted; once is enough.
         """
         span = trace.get_current_span()
         cache_key = _stream_cache_key(qo.webpage_url)
@@ -795,9 +938,13 @@ class YTDL(discord.FFmpegOpusAudio):
                     raise RuntimeError("Could not extract stream data")
                 extracted_fresh = True
 
-            if await _stream_url_playable(data.get("url", "")):
+            winner = await cls._probe_candidate_ladder(data)
+            if winner is not None:
                 _record_serving_format(data)
-                if extracted_fresh:
+                # A promotion rewrites the entry too: left alone, a cached ladder
+                # whose head is dead re-probes that same dead URL on every play
+                # until the TTL lapses.
+                if extracted_fresh or winner > 0:
                     await _cache_stream(redis, cache_key, data)
                 return data
 
@@ -806,18 +953,18 @@ class YTDL(discord.FFmpegOpusAudio):
                 # Only a cached URL has an entry to drop — a fresh one is cached
                 # exclusively on probe success, above.
                 log.warning(
-                    f"YouTube revoked the cached stream URL for {qo.webpage_url} "
-                    "— dropping it from the cache and re-extracting"
+                    f"YouTube revoked every cached audio URL for {qo.webpage_url} "
+                    "— dropping the entry and re-extracting"
                 )
                 await cache_del(redis, cache_key)
             elif attempt == 0:
                 log.warning(
-                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    f"every freshly extracted audio URL for {qo.webpage_url} probed "
                     "dead — re-extracting once"
                 )
             else:
                 log.warning(
-                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    f"every freshly extracted audio URL for {qo.webpage_url} probed "
                     "dead again — giving up"
                 )
             data = None
