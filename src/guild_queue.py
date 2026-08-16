@@ -63,10 +63,35 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
-# Above this many removed entries, rebuilding the whole list is cheaper than the
-# per-LREM scans. Set below the measured crossover so queue depth, which moves it,
-# has margin. See docs/ARCHITECTURE.md#queue-operations.
-_LREM_MAX_ENTRIES = 200
+# When the pipelined LREMs cost more than rewriting the list.
+# See docs/ARCHITECTURE.md#queue-operations.
+#
+# `LREM key 1 <blob>` scans from the head and stops at its first match, so it is
+# O(position) — NOT O(1). N of them cost O(N x depth), and a rebuild costs
+# O(survivors), which is also O(depth). The depth term CANCELS, so the crossover
+# is a COUNT and carries no ratio: at a fixed N the two curves stay in the same
+# order at every depth. An earlier revision read this backwards ("a RATIO, not a
+# count") and gated on drop <= survivors / 5, which has no depth term at all —
+# so N=200 was admitted whenever the queue held 1000, and stayed admitted as the
+# queue grew. Measured losers it let through: depth 1200 dropping 200 costs
+# 10.0ms against a 6.3ms rebuild.
+#
+# Two independent measurements disagree on where the crossover sits — 18-50 on
+# redis:7-alpine, 50-150 on a native redis 8.10 — so the cap sits below both
+# rather than splitting them. At 16 the LREM path costs LESS than the rebuild it
+# replaces at every depth measured (250: 1.1ms vs 1.8; 1000: 1.7 vs 6.2; 5000:
+# 4.4 vs 31.7; 20000: 15.4 vs 131.2). That bound is the point: the LREMs run
+# inside one MULTI/EXEC, so single-threaded Redis serves NOBODY for their
+# duration — every other guild's song start, every -history read, the outbox
+# drain. Being under the rebuild caps that stall at what the alternative already
+# costs. Being conservative costs only a rebuild slightly slower than an optimal
+# LREM would have been; being wrong the other way stalls the whole server.
+_LREM_MAX_ENTRIES = 16
+
+# Shallow queues rebuild instead: below ~80 survivors a full rewrite is under a
+# millisecond, so there is nothing for the shortcut to win and its exact-bytes
+# assumption (see _write_mirror) is one more thing that can be wrong.
+_LREM_MAX_SHARE = 5
 
 
 class ShuffleOutcome(Enum):
@@ -678,36 +703,76 @@ class GuildQueue:
         self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
     ) -> None:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
-        order.
+        order — by whichever of three writes is right.
 
-        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
-        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
+        Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation
         mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
         predates them. persisted=False items were never RPUSHed — never write them in.
 
-        Empty means DELETE, not skip, or the old list survives for the next restore
-        to find.
+        Empty means DELETE, not skip: a queue whose every persisted entry just went
+        would otherwise leave the old list behind for the next restore to find.
 
-        Only a removal may pass `removed`: LREM assumes the survivors kept their
-        order, which is false for shuffle and for any insert. A short LREM count
-        means the mirror no longer held what it was asked to drop, so this falls
-        through to the rebuild, which restates the whole list from memory.
+        `removed` is the LREM shortcut, and only a removal may pass it: it says the
+        survivors kept their order, which is false for shuffle and for any insert.
+        Worth it because a rebuild rewrites every survivor while LREM touches only
+        what goes — but only up to a COUNT, not a ratio: both sides scale with
+        depth and it cancels, so _LREM_MAX_ENTRIES is the clause that matters and
+        _LREM_MAX_SHARE only keeps shallow queues on the rebuild. See the
+        measurements above the two constants.
+
+        The shortcut is guarded twice, because LREM matches on exact bytes and the
+        rest of the codebase does not promise them. It is skipped outright when a
+        removed blob is byte-identical to a claimed item's — LREM takes the
+        head-most copy, which would be the entry awaiting a commit-time LPOP. And
+        it falls back to the rebuild when fewer entries were removed than asked
+        for, which is what a queued object mutated after its entry was written
+        looks like (a resume tail gaining np_* ids, an enriched duration, a
+        substituted requester). The rebuild cannot be wrong by construction.
         """
         if self._store is None:
             return
-        entries = [_to_entry(s) for s in items if is_persisted(s)]
-        if not entries:
+        survivors = sum(1 for s in items if is_persisted(s))
+        if not survivors:
             await self._store.delete_queue()
             return
         dropped = [_to_entry(s) for s in removed if is_persisted(s)]
-        if dropped and len(dropped) <= _LREM_MAX_ENTRIES:
-            if await self._store.remove_queue_entries(dropped) == len(dropped):
-                return
-            log.warning(
-                f"queue mirror diverged from memory in guild {self._guild.id}; "
-                "rebuilding instead of removing"
-            )
-        await self._store.rebuild_queue(entries)
+        if (
+            dropped
+            and len(dropped) <= _LREM_MAX_ENTRIES
+            and len(dropped) * _LREM_MAX_SHARE <= survivors
+        ):
+            # Serialized here, INSIDE the gate. Above it the count clause has not
+            # run yet, so every removal too big for the shortcut — one -remove of
+            # a collection link is routinely hundreds — paid ~2us an entry to
+            # build blobs the rebuild below never reads (1.1ms at 500, on the
+            # single event loop). remove_queue_entries() re-encodes for its own
+            # pipeline, which is why only the guard is served from here.
+            dropped_blobs = [entry.to_redis() for entry in dropped]
+            if not self._claimed_blobs(dropped_blobs):
+                if await self._store.remove_queue_entries(dropped) == len(dropped):
+                    return
+                log.warning(
+                    f"queue mirror diverged from memory in guild {self._guild.id}; "
+                    "rebuilding instead of removing"
+                )
+        await self._store.rebuild_queue(
+            [_to_entry(s) for s in items if is_persisted(s)]
+        )
+
+    def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
+        """True when any entry about to be LREMed serializes exactly like a CLAIMED
+        item's. remove() never removes a claimed item, but LREM cannot see that rule
+        — it takes the head-most equal element, which is the one awaiting its
+        commit-time LPOP."""
+        if not self._cursor:
+            return False
+        claimed = {
+            _to_entry(s).to_redis()
+            for s in islice(self._items, 0, self._cursor)
+            if is_persisted(s)
+        }
+        return any(blob in claimed for blob in dropped_blobs)
 
     def _rehydrate(
         self,

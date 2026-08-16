@@ -13,8 +13,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.guild_queue import (
-    _LREM_MAX_ENTRIES,
     _to_entry,
+    _LREM_MAX_ENTRIES,
+    _LREM_MAX_SHARE,
     GuildQueue,
     RemoveMode,
     ShuffleOutcome,
@@ -279,6 +280,38 @@ class TestSmallSurfacesThatNothingElseCovers:
         await gq_no_redis.put([QueueObject(url, "Tail", mock_author, is_resume=True)])
         assert gq_no_redis.has_resume_tail(url) is True
 
+    async def test_a_large_removal_from_a_short_queue_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The ratio gate. A rebuild scales with what SURVIVES, so dropping most
+        of a short queue is cheaper to rewrite than to LREM one entry at a time —
+        measured 4.7ms against 0.8ms at depth 250 dropping 200. Under the absolute
+        cap alone this took the LREM path."""
+        album = "https://open.spotify.com/playlist/big"
+        await gq.put(
+            [
+                QueueObject(
+                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                )
+                for n in range(8)
+            ]
+            + [_qobj(99, mock_author)]
+        )
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        outcome = await gq.remove(remove_matcher(album))
+
+        assert len(outcome.positions) == 8  # 8 dropped, 1 survivor
+        assert calls == ["rebuild_queue"]
+
 
 class TestReleaseVsFinishFailedDequeue:
     """The distinction the playback loop's error handler turns on. `release()`
@@ -316,6 +349,236 @@ class TestReleaseVsFinishFailedDequeue:
 
         assert gq.display_size() == 1
         assert len(await fake_redis.lrange(store.queue_key(), 0, -1)) == 1
+
+
+def test_the_lrem_cap_stays_under_the_measured_crossover() -> None:
+    """The cap is a SAFETY bound, not a tuning knob, so its value is pinned and
+    not just its mechanism — the tests around it size their input from the
+    constant, so they move with it and cannot notice it being raised.
+
+    `LREM key 1 <blob>` is O(position), so N of them cost O(N x depth), against a
+    rebuild's O(depth) — the depth cancels and the crossover is a count. Two
+    independent measurements put it at 18-50 (redis:7-alpine) and 50-150 (native
+    redis 8.10); 18 is the lowest either observed. Past the crossover the
+    pipelined LREMs cost MORE than the rebuild they replace while holding one
+    MULTI/EXEC, and single-threaded Redis serves nobody for the duration — so
+    exceeding it stalls every other guild, not just the one running -remove.
+
+    Lowering the constant is always safe and passes. Raising it past the
+    measurement is what this refuses."""
+    assert _LREM_MAX_ENTRIES <= 18
+
+
+class TestLremFallsBackWhenItCannotBeTrusted:
+    """LREM matches on exact serialized bytes, and the rest of the codebase does
+    not promise them. Three production paths mutate a queued object after its
+    mirror entry was written — a resume tail gaining np_* ids, an enriched
+    duration, a substituted requester — so the recomputed blob misses and the
+    mirror silently leads memory forever. The rebuild cannot be wrong, so a
+    shortcut that cannot verify itself must take it."""
+
+    async def test_a_mutated_item_falls_back_to_a_rebuild(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """The C2 case, as production reaches it: musicplayer stamps np_message_id
+        onto a queued resume tail in memory only."""
+        tail = _qobj(1, mock_author)
+        keep = _qobj(2, mock_author)
+        await gq.put([tail, keep])
+        tail.np_message_id = 1234  # mirrored entry now says 0
+
+        outcome = await gq.remove(remove_matcher(tail.webpage_url))
+
+        assert outcome.positions == [1]
+        # The mirror agrees with memory — the LREM missed and the rebuild ran.
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [SongQueueEntry.from_queue_object(keep).to_redis()]
+
+    async def test_a_claimed_items_twin_is_never_lremed(
+        self,
+        gq: GuildQueue,
+        store: GuildRedisStore,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """LREM takes the HEAD-most equal element. remove() never removes a claimed
+        item, but LREM cannot see that rule — so with a byte-identical twin it
+        would eat the entry awaiting a commit-time LPOP.
+
+        The queue is long enough to REACH the guard, and that is the whole point:
+        with only the twin and one other song this passed through the ratio gate
+        (1 * 5 <= 2 is false) and rebuilt for an unrelated reason, so
+        `_claimed_blobs` was never called and its body was uncovered. Both gates
+        have to be satisfied before the guard is the thing deciding.
+
+        Asserted on the store CALLS, not just the resulting mirror. An LREM here
+        removes one entry and reports one removed, so the short-count fallback
+        cannot catch it — the mirror silently loses its head and the divergence
+        only surfaces at the next commit-time LPOP."""
+        first, second = _qobj(1, mock_author), _qobj(1, mock_author)
+        middle = [_qobj(n, mock_author) for n in range(2, 7)]
+        await gq.put([first, *middle, second])
+        await gq.get()  # `first` is claimed and un-removable
+        assert SongQueueEntry.from_queue_object(first).to_redis() == (
+            SongQueueEntry.from_queue_object(second).to_redis()
+        )
+        # Both gates pass, so nothing but _claimed_blobs can refuse the shortcut.
+        assert 1 <= _LREM_MAX_ENTRIES and 1 * _LREM_MAX_SHARE <= len(middle) + 1
+
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        outcome = await gq.remove(remove_matcher(second.webpage_url))
+
+        assert calls == ["rebuild_queue"], "the LREM would have eaten the claimed twin"
+        assert outcome.positions == [7]  # the pending twin, not the claimed one
+        stored = await fake_redis.lrange(store.queue_key(), 0, -1)
+        assert stored == [
+            SongQueueEntry.from_queue_object(item).to_redis()
+            for item in [first, *middle]
+        ]
+
+    async def test_a_clean_removal_still_takes_the_lrem_path(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The fallback must not swallow the optimisation it guards. Enough
+        items that the ratio gate is satisfied: one dropped, the rest survive."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        await gq.remove(remove_matcher("https://yt.com/v=2"))
+
+        assert calls == ["remove_queue_entries"]
+
+    async def test_the_absolute_cap_alone_can_force_the_rebuild(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The count cap is the bound that keeps one guild's -remove from stalling
+        the whole server: the LREMs run inside one MULTI/EXEC, and past this many
+        they cost more than the rebuild they replace.
+
+        Sized so the RATIO gate passes and only the cap can refuse — the existing
+        large-removal test fails both at once, so it would pass with the cap
+        raised to any number and never noticed."""
+        collection = "https://open.spotify.com/playlist/cap"
+        drops = [
+            QueueObject(
+                f"https://yt.com/v=drop{n}",
+                f"Drop {n}",
+                mock_author,
+                user_input=collection,
+            )
+            for n in range(_LREM_MAX_ENTRIES + 1)
+        ]
+        keeps = [
+            _qobj(1000 + n, mock_author)
+            for n in range(_LREM_MAX_ENTRIES * _LREM_MAX_SHARE)
+        ]
+        await gq.put([*keeps, *drops])
+        # The ratio gate is satisfied; the cap is the only clause left to fail.
+        assert len(drops) * _LREM_MAX_SHARE <= len(keeps) + _LREM_MAX_SHARE
+        assert len(drops) > _LREM_MAX_ENTRIES
+
+        calls: list[str] = []
+        for name in ("rebuild_queue", "remove_queue_entries", "delete_queue"):
+            original = getattr(store, name)
+
+            def spy(*a: Any, _n: str = name, _o: Any = original, **k: Any) -> Any:
+                calls.append(_n)
+                return _o(*a, **k)
+
+            setattr(store, name, spy)
+
+        outcome = await gq.remove(remove_matcher(collection))
+
+        assert len(outcome.removed) == len(drops)
+        assert calls == ["rebuild_queue"], (
+            f"{len(drops)} LREMs were admitted; the cap is meant to stop that"
+        )
+
+    async def test_a_redis_failure_during_lrem_rebuilds(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """@_guild_op turns a Redis error into 0 removed, which is short of what was
+        asked for — so it lands on the rebuild rather than reporting success."""
+        await gq.put([_qobj(n, mock_author) for n in range(1, 8)])
+        calls: list[str] = []
+
+        async def boom(*_a: Any, **_k: Any) -> int:
+            calls.append("remove_queue_entries")
+            return 0
+
+        original_rebuild = store.rebuild_queue
+
+        async def spy_rebuild(*a: Any, **k: Any) -> None:
+            calls.append("rebuild_queue")
+            await original_rebuild(*a, **k)
+
+        store.remove_queue_entries = boom
+        store.rebuild_queue = spy_rebuild
+
+        await gq.remove(remove_matcher("https://yt.com/v=2"))
+
+        assert calls == ["remove_queue_entries", "rebuild_queue"]
+
+    async def test_the_rebuild_path_does_not_serialize_what_it_drops(
+        self, gq: GuildQueue, mock_author: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A removal too big for the shortcut must not pay to encode the entries it
+        is about to throw away.
+
+        The blobs exist for the _claimed_blobs guard alone, so they belong INSIDE
+        the count/share gate. Hoisted above it they are built for every removal,
+        and the ones that rebuild — a collection link routinely drops hundreds —
+        pay ~2us an entry of event-loop time for bytes nothing reads."""
+        collection = "https://open.spotify.com/playlist/hoist"
+        drops = [
+            QueueObject(
+                f"https://yt.com/v=drop{n}",
+                f"Drop {n}",
+                mock_author,
+                user_input=collection,
+            )
+            for n in range(_LREM_MAX_ENTRIES + 1)  # one past the cap: rebuild path
+        ]
+        keeps = [_qobj(2000 + n, mock_author) for n in range(4)]
+        await gq.put([*keeps, *drops])
+
+        encoded: list[str] = []
+        original = SongQueueEntry.to_redis
+
+        def counting(self: SongQueueEntry) -> bytes:
+            encoded.append(self.webpage_url)
+            return original(self)
+
+        monkeypatch.setattr(SongQueueEntry, "to_redis", counting)
+        outcome = await gq.remove(remove_matcher(collection))
+
+        assert len(outcome.removed) == len(drops)
+        # Only the survivors are written, and each exactly once — the rebuild's
+        # own RPUSH encoding and nothing else.
+        assert sorted(encoded) == sorted(k.webpage_url for k in keeps), (
+            f"{len(encoded)} entries encoded for a rebuild of {len(keeps)}"
+        )
 
 
 class TestClearWhileAClaimIsOutstanding:
