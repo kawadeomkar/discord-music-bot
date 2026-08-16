@@ -429,6 +429,11 @@ def _plays_after_note(
     """
     current = mp.current_song
     if current is None:
+        # A claim with no current_song is loop() between taking the prefetch result
+        # and starting it — a song IS about to play, and put_front inserts behind
+        # it, so "starts now" would be wrong twice over.
+        if mp.queue.claim_outstanding():
+            return "Plays after the song starting now."
         return "Nothing is playing, so it starts now."
     note = f"Plays after **{current.title or 'the current song'}**."
     if isinstance(voice_client, discord.VoiceClient) and voice_client.is_paused():
@@ -448,8 +453,13 @@ def _front_insert_depth(mp: MusicPlayer) -> int:
     Known ±1, of the same kind enqueue_depth() already documents: two `--next` in a
     row both record 1, though the second pushed the first to 2. The field is an
     ask-time depth by definition, not a promise about playback order.
+
+    An outstanding claim counts as that one song even while current_song is still
+    None: loop() sets it only after taking the prefetch result out of its slot, and
+    a --next landing in that window waits behind the song about to start. Reading
+    current_song alone recorded 0 there — a front insert that waited behind nothing.
     """
-    return 1 if mp.current_song is not None else 0
+    return 1 if mp.current_song is not None or mp.queue.claim_outstanding() else 0
 
 
 def _join_succeeded(ctx: commands.Context) -> bool:
@@ -564,6 +574,8 @@ class MusicBot(commands.Cog):
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
+        # (guild id, placement) of every -play in flight. See _play_bucket.
+        self._play_inflight: set[tuple[int, PlayMode]] = set()
         # id(ctx) → the in-flight command's span, otel token and start time.
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
@@ -1185,11 +1197,9 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # Serialized per guild, like -resume: two concurrent invocations both read a
-    # live current_song and both park a resume tail for it, so one play comes back
-    # twice. wait=False — the second caller is told to wait rather than queued
-    # behind a 1-4s extraction.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    # Serialized per guild PER PLACEMENT by _play_bucket, not by max_concurrency:
+    # the decorator acquires before the argument is parsed, so it cannot see which
+    # placement was asked for.
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
@@ -1200,7 +1210,43 @@ class MusicBot(commands.Cog):
         # is passed here is the whole input as far as everything downstream knows.
         # discord.py already strips a consume-rest argument; this covers the direct
         # callers (tests) that never went through its parser.
-        await self._play(ctx, split_play_args(url.strip()))
+        args = split_play_args(url.strip())
+        async with self._play_bucket(ctx, args.mode):
+            await self._play(ctx, args)
+
+    @contextlib.asynccontextmanager
+    async def _play_bucket(
+        self, ctx: commands.Context, mode: PlayMode
+    ) -> AsyncGenerator[None, None]:
+        """One -play in flight per guild PER PLACEMENT, declining rather than
+        queueing — max_concurrency's contract, with a key it cannot express.
+
+        TWO buckets, because -playnow used to be its own command and therefore had
+        its own semaphore: discord.py attaches a MaxConcurrency instance per
+        Command, so folding it into a flag silently put the urgent path behind the
+        ordinary one. A -play resolving a large playlist holds its bucket for the
+        whole flat extraction — measured at 99.3s on a 5,547-track link — and for
+        all of it `-p --now` was answered "already running" instead of interrupting.
+
+        Sharing one bucket within a placement is the point: two concurrent
+        interjections both read a live current_song and both park a resume tail for
+        it, so one play comes back twice.
+
+        Not max_concurrency itself because prepare() acquires before
+        _parse_arguments, so the flag is not known yet. MaxConcurrencyReached is
+        raised by hand for the same reason it is caught by hand — cog_command_error
+        already renders it, and the user-facing wording should not fork.
+        """
+        key = (ctx.guild.id if ctx.guild else 0, mode)
+        if key in self._play_inflight:
+            raise commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        # No await between the check and the claim, so the pair is atomic on one
+        # event loop and two invocations in the same tick cannot both pass.
+        self._play_inflight.add(key)
+        try:
+            yield
+        finally:
+            self._play_inflight.discard(key)
 
     async def _play(self, ctx: commands.Context, args: PlayArgs) -> None:
         """The body behind -play. Takes the argument already split, so the caller

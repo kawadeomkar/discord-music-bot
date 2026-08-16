@@ -385,6 +385,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._play_inflight = set()
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
@@ -426,6 +427,7 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
+    cog._play_inflight = set()
     cog.spotify = MagicMock()
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot

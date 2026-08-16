@@ -292,6 +292,18 @@ class GuildQueue:
     def empty(self) -> bool:
         return self._cursor >= len(self._items)
 
+    def claim_outstanding(self) -> bool:
+        """Is a consumer holding an item it has not settled yet?
+
+        True across two windows current_song cannot see, both of which end with a
+        song playing: the prefetch's claim, held for the length of the song before
+        it; and loop()'s own, from the moment it takes the prefetch result out of
+        the slot until try_commit_dequeue(). In the second, `_prefetch_task` is
+        already None and `current_song` is not yet set, so a front insert reading
+        either of those alone concludes the queue is idle when a song is about to
+        start — and lands behind it."""
+        return self._cursor > 0
+
     def qsize(self) -> int:
         """PENDING only — what is still waiting to be claimed."""
         return len(self._items) - self._cursor

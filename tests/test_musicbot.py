@@ -35,6 +35,7 @@ from src.musicbot import (
     ResolvedYoutubePlaylist,
     SpotifyDisabledError,
     _check_voice_permissions,
+    _front_insert_depth,
     _join_succeeded,
     _play_takes_the_queue,
     split_play_args,
@@ -2518,7 +2519,7 @@ class TestHistoryCommand:
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
     @pytest.mark.parametrize(
-        "name", ["history", "ping", "leaderboard", "debug", "resume", "play"]
+        "name", ["history", "ping", "leaderboard", "debug", "resume"]
     )
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
@@ -2532,9 +2533,11 @@ class TestHistoryCommand:
         two racing on a disconnected bot both read `voice_client is None`, so
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
-        `-play` for a fifth: two concurrent invocations against a PAUSED song both
-        read it live and both park a resume tail, so one play comes back twice —
-        which is also why folding the interjection command in must not drop the guard.
+        `-play` is guarded for a fifth reason — two concurrent invocations against
+        a PAUSED song both read it live and both park a resume tail, so one play
+        comes back twice — but is NOT in this list: it needs a bucket per
+        PLACEMENT, which the decorator cannot express, because prepare() acquires
+        before the argument is parsed. See TestPlayConcurrencyBuckets.
 
         command_callback() strips decorators everywhere else in this file, so this
         is the only place any of these guards is reachable at all."""
@@ -2815,6 +2818,10 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
     mp.queue_put_next = AsyncMock()
     mp.queue_put = AsyncMock()
     mp.queue.qsize = MagicMock(return_value=qsize)
+    # False, not auto-vivified: an unset Mock is TRUTHY, which would say a consumer
+    # is holding a song on an idle bot — the state that decides both the front-insert
+    # depth and whether the confirmation claims the song starts now.
+    mp.queue.claim_outstanding = MagicMock(return_value=False)
     # A real title, not a Mock: the --next confirmation interpolates it into the
     # embed body, and a Mock renders as its repr there.
     mp.current_song = None
@@ -3132,6 +3139,79 @@ class TestNowFlagRouting:
 
 
 # ── -play argument parsing ────────────────────────────────────────────────────
+
+
+class TestPlayConcurrencyBuckets:
+    """-playnow used to be its own command, and discord.py attaches a
+    MaxConcurrency instance per Command — so two commands meant two independent
+    per-guild semaphores. Folding the interjection into a flag silently put the
+    urgent path behind the ordinary one: a -play resolving a large playlist holds
+    its bucket for the whole flat extraction (99.3s measured on a 5,547-track
+    link), and for every second of it `-p --now` was answered "already running"
+    instead of interrupting. The placement is the bucket key."""
+
+    async def test_a_second_play_in_the_same_placement_is_declined(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._play_inflight.add((mock_ctx.guild.id, PlayMode.NORMAL))
+
+        with pytest.raises(commands.MaxConcurrencyReached):
+            async with music_bot._play_bucket(mock_ctx, PlayMode.NORMAL):
+                pass  # pragma: no cover — the guard raises before the body
+
+    @pytest.mark.parametrize("mode", [PlayMode.NOW, PlayMode.NEXT])
+    async def test_a_flagged_play_runs_behind_a_plain_one(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, mode: PlayMode
+    ) -> None:
+        """The regression itself. On main these were separate commands and the
+        interjection ran; merged into one bucket it was refused for the length of
+        whatever -play was resolving."""
+        music_bot._play_inflight.add((mock_ctx.guild.id, PlayMode.NORMAL))
+
+        async with music_bot._play_bucket(mock_ctx, mode):
+            pass
+
+    async def test_two_interjections_still_share_a_bucket(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Why the guard exists at all: both read a live current_song and both park
+        a resume tail for it, so one play comes back twice."""
+        music_bot._play_inflight.add((mock_ctx.guild.id, PlayMode.NOW))
+
+        with pytest.raises(commands.MaxConcurrencyReached):
+            async with music_bot._play_bucket(mock_ctx, PlayMode.NOW):
+                pass  # pragma: no cover — the guard raises before the body
+
+    async def test_another_guild_is_never_blocked(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot._play_inflight.add((mock_ctx.guild.id + 1, PlayMode.NORMAL))
+
+        async with music_bot._play_bucket(mock_ctx, PlayMode.NORMAL):
+            pass
+
+    async def test_the_bucket_is_released_when_the_body_raises(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Every -play failure path unwinds through here; a leak would decline the
+        # guild's every subsequent -play until restart.
+        with pytest.raises(RuntimeError):
+            async with music_bot._play_bucket(mock_ctx, PlayMode.NEXT):
+                raise RuntimeError("boom")
+
+        assert music_bot._play_inflight == set()
+
+    async def test_the_command_actually_takes_the_bucket(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Wired into -play, not merely available: the decorator this replaced was
+        visible on the command object, and this one is not."""
+        music_bot._play_inflight.add((mock_ctx.guild.id, PlayMode.NORMAL))
+
+        with pytest.raises(commands.MaxConcurrencyReached):
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url="never gonna give you up"
+            )
 
 
 class TestSplitPlayArgs:
@@ -4253,6 +4333,37 @@ class TestEnqueueSingle:
         await music_bot._enqueue_single(mock_ctx, qobj, mp, placement=Placement.NEXT)
 
         assert "starts now" in mock_ctx.send.call_args.kwargs["embed"].description
+
+    async def test_next_during_the_handoff_does_not_claim_to_start_now(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """loop() takes the prefetch result out of its slot and nulls it BEFORE it
+        assigns current_song, and the claim it took stays open until the commit.
+        Across that window nothing to neutralize exists and current_song is None,
+        so put_front lands the song behind the one about to start — while the
+        confirmation, reading current_song alone, told the user it starts now."""
+        qobj = QueueObject("https://yt.com/v=1", "Urgent", mock_ctx.author)
+        mp = _mock_mp()
+        mp.current_song = None
+        mp.queue.claim_outstanding = MagicMock(return_value=True)
+        mock_ctx.message.add_reaction = AsyncMock()
+        mock_ctx.voice_client = _connected_vc()
+
+        await music_bot._enqueue_single(mock_ctx, qobj, mp, placement=Placement.NEXT)
+
+        description = mock_ctx.send.call_args.kwargs["embed"].description
+        assert "starts now" not in description
+        assert "Plays after the song starting now." in description
+
+    def test_the_front_insert_depth_counts_an_open_claim(self) -> None:
+        """Same window, on the number that goes to Postgres forever: the song is
+        queued behind the one about to play, so the ask-time depth is 1. Reading
+        current_song alone recorded 0 — an insert that waited behind nothing."""
+        mp = _mock_mp()
+        mp.current_song = None
+        mp.queue.claim_outstanding = MagicMock(return_value=True)
+
+        assert _front_insert_depth(mp) == 1
 
     async def test_shows_queued_embed_with_eta_when_song_playing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
