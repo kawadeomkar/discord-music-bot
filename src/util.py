@@ -101,7 +101,12 @@ async def send_embed(
     thumbnail: Optional[str] = None,
     fields: Optional[list[tuple[str, str, bool]]] = None,
 ) -> discord.Message:
-    embed = discord.Embed(title=title, description=description, color=color)
+    # Clamped here, the last point before Discord — see EMBED_DESCRIPTION_LIMIT.
+    embed = discord.Embed(
+        title=truncate(title, EMBED_TITLE_LIMIT),
+        description=truncate_escaped(description, EMBED_DESCRIPTION_LIMIT),
+        color=color,
+    )
     if footer:
         embed.set_footer(text=footer)
     if thumbnail:
@@ -165,6 +170,14 @@ FOOTER_LIMIT = 2048
 # after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
+# The same again, for a DESCRIPTION. Enforced in send_embed rather than at each
+# caller for the reason _field exists: the three list-built descriptions (a
+# queued playlist, a queued collection, a cleared queue) are ten escaped rows
+# wide, so nothing but the row-width constant keeps them under this — and the
+# 400 lands after the enqueue or the clear has already committed, telling the
+# user the command failed for work that happened.
+EMBED_DESCRIPTION_LIMIT = 4096
+
 
 # Control characters end a rendered embed line early, hiding whatever follows.
 # Flattened rather than escaped — they have no visible form.
@@ -194,6 +207,22 @@ def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def truncate_escaped(text: str, limit: int) -> str:
+    """truncate(), for text that has already been through escape_markdown.
+
+    A field or description built by joining N escaped rows has a length no single
+    row's cap controls, so this clamp fires. A cut landing between a backslash and
+    the character it escapes leaves an orphan that escapes the ellipsis instead,
+    rendering the clip as a literal character. An ODD trailing run of backslashes
+    is that orphan; an even run is escaped backslashes and is kept."""
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if (len(cut) - len(cut.rstrip("\\"))) % 2:
+        cut = cut[:-1]
+    return cut + "…"
 
 
 def truncate_embed_title(title: str) -> str:

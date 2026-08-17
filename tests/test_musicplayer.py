@@ -1480,6 +1480,51 @@ class TestResumeNoticeEmbed:
             "- (https://www.youtube.com/watch?v=started)"
         )
 
+    def test_a_hostile_title_cannot_forge_a_link_in_any_of_the_three_slots(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """Every yt-dlp title on this embed goes through safe_label.
+
+        Three slots render one: the description names the song being started, and
+        _resume_left_off_field names either the crash-recovered head or the newest
+        history entry. Discord renders markdown in descriptions and field values,
+        so a length cap alone lets a video titled
+        `[FREE NITRO](https://evil.example)` post a live styled link.
+
+        The "Left off on" leg is covered here; its history twin has its own test,
+        since a crashed head wins when one is present."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", hostile, mock_author)
+        crashed = QueueObject(
+            "https://yt.com/v=c", hostile, mock_author, persisted=False, ts=10
+        )
+        seed_queue(music_player.queue, crashed)
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        assert "](https://evil.example)" not in described(embed)
+        left_off = next(f for f in embed.fields if f.name == "Left off on")
+        assert "](https://evil.example)" not in (left_off.value or "")
+
+    def test_a_hostile_history_title_cannot_forge_a_link_either(
+        self, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The other "Left off on" leg — reached after a -stop, where the newest
+        history entry stands in for the interrupted song."""
+        hostile = "[FREE NITRO](https://evil.example)"
+        started = QueueObject("https://yt.com/v=s", "Fine Title", mock_author)
+        seed_queue(
+            music_player.queue, QueueObject("https://yt.com/v=q", "Q", mock_author)
+        )
+        music_player.history.restore([HistoryEntry(title=hostile, played_at=1.0)])
+
+        embed = music_player.build_resume_notice_embed(started)
+
+        assert embed is not None
+        last_played = next(f for f in embed.fields if f.name == "Last played")
+        assert "](https://evil.example)" not in (last_played.value or "")
+
     def test_thumbnail_is_the_started_song_not_the_last_played(
         self, music_player: MusicPlayer, started: QueueObject, queue_obj: QueueObject
     ) -> None:

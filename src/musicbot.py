@@ -83,7 +83,7 @@ from src.util import (
     send_embed,
     spawn_background,
     trace_footer,
-    truncate,
+    truncate_escaped,
     get_logger,
 )
 
@@ -187,11 +187,19 @@ class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
 
 
 # Bound on one echoed needle, which owns a field to itself. Discord renders
-# markdown in field values, so what a user typed goes through safe_label first.
+# markdown in field values, so what a user typed goes through safe_label first;
+# a field built from a list is clamped again by _field().
 _ECHO_MAX = 200
 
 # One row of a multi-row field — ten of these share the budget one needle gets.
 _ECHO_ROW_MAX = 70
+
+# How many rows queue_message() keeps. Slice a list to _ECHO_ROWS + 1 before
+# escaping it: safe_label costs a regex sub, a truncate, three replaces and an
+# escape per title, and a 10,000-track collection measured 96ms of blocked event
+# loop — every guild's progress tick and the outbox drain, not just this one's.
+# The +1 feeds queue_message's own "…" test, which needs more rows than it keeps.
+_ECHO_ROWS = 10
 
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
@@ -215,8 +223,12 @@ def _removed_label(item: QueueItem) -> str:
 def _field(value: str) -> str:
     """An embed field value that cannot 400 the send. The callers below build from
     lists whose length is the user's to choose, and the send happens AFTER the
-    queue has been mutated."""
-    return truncate(value, EMBED_FIELD_LIMIT)
+    queue has been mutated.
+
+    truncate_escaped, because callers join rows that already went through _echo:
+    ten rows capped pre-escape at _ECHO_ROW_MAX reach ~1440 characters once
+    escaped, so this clamp fires and a plain cut can orphan a backslash."""
+    return truncate_escaped(value, EMBED_FIELD_LIMIT)
 
 
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
@@ -827,7 +839,10 @@ class MusicBot(commands.Cog):
                 titles, analytics=analytics, origin=origin
             )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
-            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
+            shown_titles = queue_message(
+                # Sliced before the escape — see _ECHO_ROWS.
+                [safe_label(t, _ECHO_ROW_MAX) for t in islice(titles, _ECHO_ROWS + 1)]
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
@@ -861,7 +876,10 @@ class MusicBot(commands.Cog):
                 else ""
             )
             shown_titles = queue_message(
-                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+                [
+                    safe_label(q.title, _ECHO_ROW_MAX)
+                    for q in islice(tracks, _ECHO_ROWS + 1)
+                ]
             )
             await asyncio.gather(
                 send_embed(
@@ -1731,7 +1749,11 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
+            # Sliced before the escape — see _ECHO_ROWS. -clear returns a title
+            # for every item it dropped, which is the whole queue.
+            description = queue_message(
+                [safe_label(t, _ECHO_ROW_MAX) for t in islice(cleared, _ECHO_ROWS + 1)]
+            )
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -1842,8 +1864,10 @@ class MusicBot(commands.Cog):
                             queue_message(
                                 [
                                     _echo(_removed_label(i), _ECHO_ROW_MAX)
-                                    # Sliced before the echo: queue_message keeps 10.
-                                    for i in outcome.removed[:10]
+                                    # queue_message keeps 10; echoing all of them
+                                    # first escaped a playlist's worth to throw
+                                    # the rest away. See _ECHO_ROWS for the +1.
+                                    for i in outcome.removed[: _ECHO_ROWS + 1]
                                 ]
                             )
                         ),

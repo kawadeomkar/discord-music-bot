@@ -8,7 +8,7 @@ import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
 from typing import Any, Optional, cast
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Generator, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
@@ -20,7 +20,9 @@ from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
+import src.musicbot as musicbot_module
 from src.musicbot import (
+    _ECHO_ROWS,
     RESTORE_WAIT_SECS,
     _echo,
     _removed_label,
@@ -36,7 +38,7 @@ from src.musicbot import (
     _join_succeeded,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
-from src.util import EMBED_FIELD_LIMIT
+from src.util import EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
@@ -3985,6 +3987,126 @@ class TestCommandArgumentBinding:
         call = music_bot.queue_source.await_args
         assert call is not None
         assert call.kwargs["origin"] == expected
+
+
+class TestListBuiltDescriptionsStayCheapAndInsideTheCap:
+    """Three embed descriptions are built from a list the user sizes — a queued
+    playlist, a queued collection, a cleared queue — and each row costs a
+    safe_label.
+
+    So each is bounded twice. Escaping every row to render ten blocks the single
+    event loop for ~96ms on a 10,000-track collection, which is every guild's
+    progress tick and the outbox drain. And ten escaped rows are the whole 4096
+    budget, on a send that lands after the enqueue or the clear has committed."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _counting_safe_label() -> Generator[list[int]]:
+        calls = [0]
+        real = musicbot_module.safe_label
+
+        def counted(text: str, limit: int) -> str:
+            calls[0] += 1
+            return real(text, limit)
+
+        with patch.object(musicbot_module, "safe_label", counted):
+            yield calls
+
+    @staticmethod
+    def _descriptions(mock_ctx: MagicMock) -> list[str]:
+        sent = mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+        return [
+            c.kwargs["embed"].description or ""
+            for c in sent
+            if c.kwargs.get("embed") is not None
+        ]
+
+    async def test_clear_escapes_only_the_rows_it_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=["*" * 5000] * 5000)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with self._counting_safe_label() as calls:
+            await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        assert calls[0] <= _ECHO_ROWS + 1
+        for description in self._descriptions(mock_ctx):
+            assert len(description) <= EMBED_DESCRIPTION_LIMIT
+
+    async def test_the_playlist_embed_escapes_only_the_rows_it_shows(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        source = YTSource(
+            url="https://www.youtube.com/playlist?list=PLtest",
+            type=YTType.PLAYLIST,
+            list_id="PLtest",
+        )
+        tracks = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 5000, mock_ctx.author)
+            for i in range(5000)
+        ]
+        mp = MagicMock()
+        mp.queue_put = AsyncMock()
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with self._counting_safe_label() as calls:
+            await music_bot._enqueue_playlist(
+                mock_ctx,
+                source,
+                ResolvedYoutubePlaylist(tracks=tracks),
+                mp,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+            )
+
+        assert calls[0] <= _ECHO_ROWS + 1
+        for description in self._descriptions(mock_ctx):
+            assert len(description) <= EMBED_DESCRIPTION_LIMIT
+
+    async def test_a_widened_row_cap_cannot_400_the_send(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The clamp, distinct from the slice: ten rows at the current row width
+        fit comfortably, so the slice alone keeps these legal and proves nothing
+        about the boundary.
+
+        Widen _ECHO_ROW_MAX to 700 and ten markdown-heavy rows reach 14,030
+        characters, on a send that lands after the clear has committed — so
+        send_embed clamps, the way _field does for field values."""
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=["*" * 5000] * 50)
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        with patch.object(musicbot_module, "_ECHO_ROW_MAX", 700):
+            await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        descriptions = self._descriptions(mock_ctx)
+        # The unclamped build really is over the cap — otherwise this passes for
+        # the slice's reason and the clamp is untested.
+        assert any(len(d) == EMBED_DESCRIPTION_LIMIT for d in descriptions), [
+            len(d) for d in descriptions
+        ]
+
+    async def test_the_shown_rows_still_say_there_are_more(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The slice is _ECHO_ROWS + 1 because queue_message appends its "…" only
+        when handed more rows than it keeps."""
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_clear = AsyncMock(return_value=[f"Song {i}" for i in range(50)])
+        music_bot.get_mp = MagicMock(return_value=mp)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.clear)(music_bot, mock_ctx)
+
+        assert any(d.endswith("\n...") for d in self._descriptions(mock_ctx))
 
 
 class TestRemoveCommand:

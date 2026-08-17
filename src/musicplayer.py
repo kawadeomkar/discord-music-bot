@@ -51,6 +51,7 @@ from src.util import (
     safe_label,
     truncate,
     truncate_embed_title,
+    EMBED_TITLE_LIMIT,
     get_logger,
 )
 from src.youtube import YTDL, NpHostRef, QueueObject, invalidate_stream_cache
@@ -720,10 +721,14 @@ class MusicPlayer:
           state fields. The newest history entry is the last song that ran to its
           END, which is older than the stop — hence "Last played", not a claim about
           where playback stopped.
+
+        Both titles come from yt-dlp and land in a FIELD VALUE, which Discord
+        renders markdown in — so they go through safe_label, not the embed-title
+        length clamp.
         """
         head = self.queue.peek_next()
         if isinstance(head, QueueObject) and not is_persisted(head) and head.title:
-            value = f"**{truncate_embed_title(head.title)}**"
+            value = f"**{safe_label(head.title, EMBED_TITLE_LIMIT)}**"
             if head.ts:
                 value += f"\n`{fmt_duration(head.ts)}`"
                 if head.duration:
@@ -735,7 +740,7 @@ class MusicPlayer:
         last = self.history.latest
         if last is None or not last.title:
             return None
-        value = f"**{truncate_embed_title(last.title)}**"
+        value = f"**{safe_label(last.title, EMBED_TITLE_LIMIT)}**"
         value += f"\n`{fmt_duration(last.played_secs)}`"
         if last.duration_secs > 0:
             value += f" / `{fmt_duration(last.duration_secs)}`"
@@ -759,7 +764,9 @@ class MusicPlayer:
         embed about a *different* song. It also adds what only the restore knows:
         which song the previous session left off on, and how much queue waits behind
         the one starting now.
-        """
+
+        The title is safe_label'd: it lands in a DESCRIPTION, where a yt-dlp title
+        carrying `[..](..)` renders as a live masked link."""
         items = self.queue.display_items()
         if not items:
             return None
@@ -770,7 +777,8 @@ class MusicPlayer:
         embed = discord.Embed(
             title="❗ Resumed from queue",
             description=(
-                f"Playing now: {started.title} - ({started.webpage_url})\n\n"
+                f"Playing now: {safe_label(started.title, EMBED_TITLE_LIMIT)} - "
+                f"({started.webpage_url})\n\n"
                 f"**{count}** {songs} from the previous session "
                 f"{verb} after it."
             ),
