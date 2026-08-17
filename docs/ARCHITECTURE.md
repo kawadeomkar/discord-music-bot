@@ -799,7 +799,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
 | `lock:guild:{id}:recovery` | String | `"1"` (SET NX EX — distributed lock) | 60 s |
-| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, ~1.3 KB/rung, which takes an entry to ~4–5 KB | `expire − now − 1800s`; not written if < 60 s |
+| `ytdl:stream:{webpage_url}` | String | JSON dict stripped to `_STREAM_CACHE_FIELDS`: identity and display (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`), audio shape (`abr`, `asr`, `acodec`), serve attribution (`format_id`, `protocol`, `vcodec`), and `audio_candidates` — the mined fallback ladder, 1.28 KB/rung measured, taking an entry from 4.66 KB to 8.49 KB of payload and 5.22 KB to 10.34 KB resident (it crosses jemalloc's 8192 size class) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
 | `spotify:playlist:{id}` | String | JSON array of track titles | 1 h (user-editable) |
@@ -1380,8 +1380,10 @@ variants and foreign-language dubs would make a fallback quietly change what the
 already means the audio-only path is degraded, and walking sideways across muxed
 formats is not a recovery worth having.
 
-The ladder rides the existing `ytdl:stream:{webpage_url}` entry (~1.3 KB/rung,
-URL-dominated). That key is TTL'd and evictable, so it carries none of the
+The ladder rides the existing `ytdl:stream:{webpage_url}` entry (1.28 KB/rung
+measured, URL-dominated — which roughly doubles the entry, and slightly more than
+doubles its resident cost, since the result lands just past jemalloc's 8192 size
+class). That key is TTL'd and evictable, so it carries none of the
 non-evictable-key obligations in [`volatile-lru` eviction policy](#volatile-lru-eviction-policy).
 Entries written before the ladder existed parse as a one-rung ladder, so wire-compat
 needs no version field.

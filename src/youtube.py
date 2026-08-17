@@ -513,7 +513,10 @@ _STREAM_CACHE_FIELDS = frozenset(
         "format_id",
         "protocol",
         "vcodec",
-        # The mined fallback ladder (~1.3 KB/rung, so an entry grows to ~4-5 KB).
+        # The mined fallback ladder. Measured on a real 4-format extraction with
+        # 1,151-char URLs: 1.28 KB/rung, taking the entry from 4.66 KB to 8.49 KB of
+        # payload — but 5.22 KB to 10.34 KB RESIDENT, because 8.49 KB lands just past
+        # jemalloc's 8192 size class. Redis memory is a step, not a size.
         # Cached so a revoked URL costs a sideways probe rather than a 3-5s
         # re-extraction; this key is TTL'd and evictable, so it carries no
         # golden-rule-12 obligation.
@@ -597,9 +600,15 @@ def _passthrough_codec(data: YTDLVideoMetadata, volume: float) -> Optional[str]:
 
     Measured before adopting: copy and libopus produce identical packet counts for
     YouTube's 20ms Opus (213.10s of packets for a 213s song, both), and copy with
-    the two-pass seek lands within 0.02s of the target. Two accepted differences —
-    a mono source stays mono rather than being upmixed, and the source's own bitrate
-    is kept instead of being capped at 128k (measured ~30% more egress on a 251).
+    the two-pass seek lands within 0.02s of the target. Three accepted differences,
+    none of which ffmpeg warns about, since no encoder is instantiated to ignore
+    them: a mono source stays mono rather than being upmixed; the source's own
+    bitrate is kept instead of being capped at 128k (measured ~30% more egress on a
+    251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band
+    forward error correction, so packet loss on the voice path produces dropouts
+    libopus used to conceal. YouTube's files carry no FEC of their own, so that last
+    one is a real regression for lossy listeners and the reason to keep this gate
+    narrow rather than widen it.
     """
     if volume != 1.0:
         return None
@@ -659,16 +668,43 @@ async def _stream_url_playable(stream_url: str) -> bool:
         return True
 
 
+async def _entry_ttl(redis: Optional[aioredis.Redis], cache_key: str) -> Optional[int]:
+    """Seconds left on a cache entry, or None when that cannot be established. Its one
+    caller uses it as a ceiling, and None means "no ceiling", so every uncertain answer
+    — no Redis, a key with no expiry, a key already gone, a failed call — maps to None
+    rather than to a number that would shorten a legitimate write."""
+    if redis is None:
+        return None
+    try:
+        ttl = await redis.ttl(cache_key)
+    except Exception as e:
+        log.warning(f"could not read TTL for {cache_key}: {e}")
+        return None
+    return ttl if isinstance(ttl, int) and ttl > 0 else None
+
+
 async def _cache_stream(
-    redis: Optional[aioredis.Redis], cache_key: str, data: YTDLVideoInfo
+    redis: Optional[aioredis.Redis],
+    cache_key: str,
+    data: YTDLVideoInfo,
+    *,
+    max_ttl: Optional[int] = None,
 ) -> bool:
     """Persist a stream URL already probed and found playable. True when an entry was
-    written, False when the URL isn't worth caching (no usable expiry)."""
+    written, False when the URL isn't worth caching (no usable expiry).
+
+    `max_ttl` bounds the write for a caller re-caching URLs it did not just extract
+    (a ladder promotion). _STREAM_URL_MAX_TTL is measured from now, so an unbounded
+    rewrite would hand a 29-minute-old extraction another full 30 minutes and widen
+    exactly the "probe says 200, ffmpeg 403s" window the probe exists to close.
+    """
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
     stripped = {k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None}
     ttl = _stream_url_ttl(data.get("url", ""))
-    if ttl:
+    if ttl is not None and max_ttl is not None:
+        ttl = min(ttl, max_ttl)
+    if ttl and ttl > 0:
         await cache_set(redis, cache_key, stripped, ttl)
         return True
     return False
@@ -1025,7 +1061,13 @@ class YTDL(discord.FFmpegOpusAudio):
             # resolve is always a fresh extraction) makes the next play probe the
             # blacklisted rung first, throwing away what the retry learned and
             # warning about the wrong format for the rest of the TTL.
-            data["audio_candidates"] = ladder[index:]
+            # Rotated, not truncated: the rungs ahead of the winner move to the
+            # BACK. Deleting them made two promotions leave a single ~50kbps rung
+            # pinned for the rest of the TTL with no fallback left — worse than no
+            # cache, which at least re-extracted and restored the top format. A
+            # rung also dies for reasons that pass (a transient 503 from one CDN
+            # host), and demotion lets it recover instead of being written off.
+            data["audio_candidates"] = ladder[index:] + ladder[:index]
             span.set_attribute("ytdl.candidate_index", index)
             return index
         return None
@@ -1052,6 +1094,9 @@ class YTDL(discord.FFmpegOpusAudio):
 
         data: Optional[YTDLVideoInfo] = await cache_get(redis, cache_key)
         span.set_attribute("ytdl.cache_hit", data is not None)
+        # Read BEFORE any promotion rewrites the entry: it is the ceiling a re-cache
+        # of not-freshly-extracted URLs must respect (see _cache_stream's max_ttl).
+        remaining_ttl = await _entry_ttl(redis, cache_key) if data is not None else None
 
         for attempt in range(2):
             extracted_fresh = False
@@ -1077,7 +1122,12 @@ class YTDL(discord.FFmpegOpusAudio):
                 # whose head is dead re-probes that same dead URL on every play
                 # until the TTL lapses.
                 if extracted_fresh or winner > 0:
-                    await _cache_stream(redis, cache_key, data)
+                    await _cache_stream(
+                        redis,
+                        cache_key,
+                        data,
+                        max_ttl=None if extracted_fresh else remaining_ttl,
+                    )
                 return data
 
             span.set_attribute("ytdl.stream_url_revoked", True)
@@ -1274,12 +1324,15 @@ class YTDL(discord.FFmpegOpusAudio):
         # to the result type, and "raw result" vs "chosen entry" are two things.
         selected: YTDLEntry = data
         if "entries" in data:
-            # An entry used to win purely by being the first non-playlist result, so a
-            # result yt-dlp could select no format for was accepted here and only blew
-            # up at stream time, looking unrelated to the search. Prefer one that
-            # actually carries a stream URL; the first non-playlist entry stays the
-            # fallback, so an entry shape this code does not recognise still plays
-            # rather than failing outright.
+            # Prefer an entry that actually carries a stream URL, with the first
+            # non-playlist entry as the fallback so an unrecognised shape still plays.
+            #
+            # Defensive, NOT a fix for the TODO below: every search this bot builds is
+            # a bare `ytsearch:` (sources.py), which yt-dlp maps to _get_n_results(q, 1)
+            # — so `entries` holds exactly one item and there is nothing to choose
+            # between. It earns its keep only for multi-entry shapes (a `ytsearchN:`,
+            # or an extractor that returns several), and asking for N here is not free:
+            # process=True extracts every result, so ytsearch3 triples a 3-5s search.
             playable = [
                 entry
                 for entry in data["entries"]
@@ -1289,6 +1342,16 @@ class YTDL(discord.FFmpegOpusAudio):
                 selected = next(
                     (entry for entry in playable if entry.get("url")), playable[0]
                 )
+        # TODO: Validate that a search result carries a usable audio format.
+        # A result yt-dlp could select no format for is still accepted here and only
+        # fails at stream time, where the error looks unrelated to the search. The
+        # warning below makes it attributable but does not prevent it; the fix is to
+        # reject the entry and search again, which needs more than one candidate.
+        if not selected.get("url"):
+            log.warning(
+                f"search result for {search} carries no stream URL "
+                f"(title={selected.get('title')!r}) — playback will likely fail"
+            )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named (prepare_filename)

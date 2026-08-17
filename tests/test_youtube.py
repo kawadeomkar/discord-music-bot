@@ -1420,8 +1420,35 @@ class TestCandidateLadderWalk:
         assert raw is not None
         cached = orjson.loads(raw)
         assert cached["format_id"] == "140"
-        # The dead rung ahead of the winner is gone; the ones behind it survive.
-        assert [c["format_id"] for c in cached["audio_candidates"]] == ["140", "249"]
+        # The winner leads, and the rung that failed is DEMOTED rather than deleted:
+        # deleting it left two promotions pinning a single worst rung for the rest of
+        # the TTL with nothing to fall back to, and a rung can fail for reasons that
+        # pass (one CDN host 503ing) and deserve a later retry.
+        assert [c["format_id"] for c in cached["audio_candidates"]] == [
+            "140",
+            "249",
+            "251",
+        ]
+
+    async def test_a_promotion_does_not_extend_the_entrys_life(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """A promotion re-caches URLs from an extraction that may be nearly 30 minutes
+        old. _STREAM_URL_MAX_TTL is measured from now, so an unbounded rewrite would
+        hand them another full window — and two promotions ~90 minutes from one
+        extraction — widening exactly the "probe says 200, ffmpeg 403s" gap the probe
+        exists to close."""
+        url = "https://yt.com/v=ttlcap"
+        key = f"ytdl:stream:{url}"
+        await fake_redis.set(
+            key, orjson.dumps(self._laddered(url, "251", "140")), ex=100
+        )
+        playable_urls.side_effect = [False, True]
+
+        await self._play(fake_redis, url, mock_ctx.author)
+
+        ttl = await fake_redis.ttl(key)
+        assert 0 < ttl <= 100, f"the entry's life was extended to {ttl}s"
 
     async def test_a_healthy_head_rewrites_nothing(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -2173,6 +2200,24 @@ class TestAudioCandidateMining:
 
     def test_candidates_are_capped(self) -> None:
         assert len(self._mine()) <= _STREAM_CANDIDATES
+
+    def test_a_field_the_format_lacks_stays_absent(self) -> None:
+        """Absent must not become None. A candidate promotes wholesale via
+        data.update(), so a fabricated `asr: None` would overwrite the real
+        top-level value with nothing — contradicting YTDLVideoInfo's non-optional
+        types and making the NP footer advertise a sample rate the stream lacks.
+
+        Asserting on the KEYS, because an all-None candidate satisfies a
+        set-equality check against _CANDIDATE_FIELDS just as well as a full one.
+        """
+        sparse = _fmt("251", "opus", 129.0, 48000)
+        del sparse["asr"]
+        del sparse["abr"]
+        candidates = self._mine(formats=[sparse], format_id="251", language=None)
+
+        assert "asr" not in candidates[0]
+        assert "abr" not in candidates[0]
+        assert candidates[0]["format_id"] == "251"
 
     def test_only_the_candidate_fields_are_carried(self) -> None:
         """A candidate promotes wholesale onto the info-dict, so a stray key here

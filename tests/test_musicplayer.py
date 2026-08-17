@@ -32,6 +32,7 @@ from src.musicplayer import (
     MusicPlayer,
     StreamFailure,
     _BAR_WIDTH,
+    _STREAM_FAILURE_CIRCUIT,
     _STREAM_PLAY_ATTEMPTS,
     _build_progress_bar,
     _reached_end,
@@ -7263,7 +7264,12 @@ class TestStreamRetry:
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
         """The headline behavior: the song comes back at the front, carrying the
-        attempt it just spent and the format that failed."""
+        attempt it just spent.
+
+        It carries NO blacklisted format yet — the first retry deliberately retries
+        the same format with a fresh URL, since that is what cures the common failure
+        (a URL revoked between the probe and ffmpeg's first read). See
+        _blacklist_after."""
         mock_invalidate = await self._run_failed_iteration(
             music_player, queue_obj, mock_song
         )
@@ -7273,8 +7279,165 @@ class TestStreamRetry:
         retry = self._front(music_player)
         assert retry.webpage_url == mock_song.webpage_url
         assert retry.stream_attempts == 1
-        assert retry.failed_format_ids == frozenset({"251"})
+        assert retry.failed_format_ids == frozenset()
         assert music_player.queue.qsize() == 1
+
+    async def test_a_parked_tail_is_not_also_retried(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A -playnow whose resolve lands in this song's death window parks a resume
+        tail for it, and that tail IS the re-queue. Retrying too put the song on the
+        queue twice and wrote two history rows milliseconds apart — far enough apart
+        that the (guild_id, played_at, webpage_url) dedup index cannot collapse them,
+        so -leaderboard and -history both double-count the play."""
+        tail = QueueObject(
+            mock_song.webpage_url,
+            mock_song.title,
+            mock_song.requester,
+            ts=42,
+            is_resume=True,
+        )
+        music_player._pending_resume_tail = tail
+        music_player._skip_history_for = mock_song
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert music_player.queue.qsize() == 0, "the tail is the re-queue, not a copy"
+        assert len(music_player.history) == 0
+        # interject() builds the tail with a FRESH budget, on the premise that the
+        # song it interrupted was producing audio. It was not, so the tail inherits
+        # the attempt instead — otherwise one -playnow per attempt is an endless chain.
+        assert tail.stream_attempts == 1
+
+    async def test_a_resume_flag_alone_does_not_make_a_retry_inherit_the_stamp(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Both halves of heard_before are required. A tail flagged is_resume that
+        starts at 0:00 covers no audio anyone heard, so keeping played_at would let
+        -clear file a 0-second play through _flush_played."""
+        mock_song.is_resume = True
+        mock_song.start_offset = 0
+        mock_song.played_at = 1752529000.0
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).played_at == 0.0
+
+    async def test_an_offset_alone_does_not_make_a_retry_inherit_the_stamp(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The other half. A `?t=90` link is an offset without a resume: nobody heard
+        the first 90 seconds under this bot, so there is nothing to preserve. A
+        crash-recovered song arrives in exactly this shape (ts set, is_resume false —
+        see guild_state.from_crashed_state's FIXME), which is why the two terms
+        cannot be collapsed into one."""
+        mock_song.is_resume = False
+        mock_song.start_offset = 90
+        mock_song.played_at = 1752529000.0
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).played_at == 0.0
+
+    async def test_a_retry_never_comes_back_paused(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """start_paused is a construction flag nothing resets once the user resumes,
+        so carrying it would park each attempt paused again right after announcing a
+        retry — one -resume per attempt, and the retry reads as a hang."""
+        mock_song.is_resume = True
+        mock_song.start_offset = 95
+        mock_song.start_paused = True
+
+        # start_paused pauses the player thread synchronously at vc.play; the bare
+        # VoiceClient here has no _player to pause.
+        with patch.object(discord.VoiceClient, "pause", new=MagicMock()):
+            await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert self._front(music_player).start_paused is False
+
+    async def test_a_terminal_failure_leaves_a_prefetched_song_alone(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The neutralize is for the RETRY — it exists so the resolved next song does
+        not play instead of the re-queued one. On the terminal attempt there is no
+        re-queue, so killing the prefetch would throw away a fully resolved song and
+        buy 1-4s of extra dead air right after the worst experience."""
+        mock_song.stream_attempts = _STREAM_PLAY_ATTEMPTS - 1
+        prefetched = _loop_song()
+        prefetched.cleanup = MagicMock()
+
+        await self._run_failed_iteration(
+            music_player, queue_obj, mock_song, prefetched=prefetched
+        )
+
+        prefetched.cleanup.assert_not_called()
+
+    async def test_the_budget_is_withdrawn_once_failures_look_systemic(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A 403 is rarely one bad song — PO-token enforcement fails every song, and
+        an unbounded budget turns a 20-song queue into 60 extractions and ~180s of
+        dead air. After _STREAM_FAILURE_CIRCUIT songs have burned their whole budget,
+        the next failure is reported immediately instead."""
+        music_player._consecutive_dead_songs = _STREAM_FAILURE_CIRCUIT
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert music_player.queue.qsize() == 0, "no retry should have been queued"
+        assert music_player._consecutive_dead_songs == _STREAM_FAILURE_CIRCUIT + 1
+
+    async def test_a_song_that_plays_restores_the_budget(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Anything that actually plays proves the pipeline works, so an isolated
+        failure later must not inherit an exhausted circuit."""
+        music_player._consecutive_dead_songs = _STREAM_FAILURE_CIRCUIT
+        mock_song.produced_audio = True
+
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+        await music_player.queue._pending.put(queue_obj)
+        music_player.queue._display.append(queue_obj)
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=lambda s, after: after(None))
+        mocked(music_player._guild).voice_client = vc
+        music_player._channel.send = AsyncMock()
+        music_player.play_next.wait = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+        ):
+            await music_player.loop()
+
+        assert music_player._consecutive_dead_songs == 0
+
+    async def test_the_second_retry_goes_sideways_after_retrying_in_place(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """Sideways is the SECOND move, not the first. Demoting 251 promotes AAC 140,
+        which costs a lossy generation and ~18x the ffmpeg CPU because AAC also fails
+        the passthrough gate — so it is worth doing only once a fresh URL for the same
+        format has already been tried and failed."""
+        mock_song.stream_attempts = 1
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        retry = self._front(music_player)
+        assert retry.stream_attempts == 2
+        assert retry.failed_format_ids == frozenset({"251"})
 
     async def test_the_listener_is_told_a_retry_is_coming(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -8510,6 +8673,39 @@ class TestNeutralizePrefetch:
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
         assert rebuilt.query_source == "spotify.com"
+
+    async def test_clear_settles_a_prefetch_that_already_completed(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """cancel_task() no-ops on a done task and never nulls it, so -clear used to
+        leave a completed prefetch behind while clear() wiped the display entry it was
+        dequeued from. requeue_front's only precondition is "the display leg has not
+        moved", so the next consumer OVERWROTE _display[0] — resurrecting the cleared
+        song and silently discarding whatever had been queued after the clear.
+        """
+        original = QueueObject("https://yt.com/v=n", "Prefetched Song", mock_author)
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player.queue_clear()
+
+        assert music_player._prefetch_task is None
+        live_song.cleanup.assert_called_once()
+
+        # The corruption itself: a song queued AFTER the clear keeps its slot.
+        later = QueueObject("https://yt.com/v=b", "Queued After Clear", mock_author)
+        await music_player.queue.put([later])
+        await music_player._neutralize_prefetch()
+
+        assert music_player.queue.display_items() == [later]
 
     async def test_completed_task_rebuild_keeps_user_input_and_persisted(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
