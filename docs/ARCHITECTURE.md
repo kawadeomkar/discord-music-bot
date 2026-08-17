@@ -1407,14 +1407,12 @@ the failure path a no-op second. See [Queue Operations](#queue-operations) for t
 
 **Why `put_front`'s in-flight branch is not dead code.** `MusicPlayer.interject()`
 neutralizes the prefetch before calling `GuildQueue.put_front()`, which normally means
-no dequeued-but-uncommitted head exists. One interleaving defeats that: the song ends
-naturally, the playback loop claims a *still-running* prefetch task and awaits it (up
-to yt-dlp's socket timeout), and `interject()` runs inside that await — its neutralize
-finds `_prefetch_task` already nulled, so it takes nothing, while the prefetch's
-dequeued item sits uncommitted at the display head. `put_front` must then rebuild the
-Redis mirror rather than LPUSH, because the in-flight item's entry is still at the list
-head awaiting a commit-time LPOP. Delete the branch as "unreachable" and that
-interleaving silently eats the new head.
+no dequeued-but-uncommitted head exists. `MusicBot._interject_flow` reaches it anyway:
+when `interject()` returns no outcome it falls back to `queue_put_front()`, and the
+prefetch's claim is still open there. `put_front` must then rebuild the Redis mirror
+rather than LPUSH, because the in-flight item's entry is still at the list head
+awaiting a commit-time LPOP. Delete the branch as "unreachable" and that path silently
+eats the new head.
 
 Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
 and `-help` both say 3 (tracked by an in-code FIXME).

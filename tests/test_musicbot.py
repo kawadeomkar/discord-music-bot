@@ -3775,17 +3775,16 @@ class TestEchoIsSafeInAnEmbed:
 
     def test_a_masked_link_cannot_form(self) -> None:
         """Asserted on the OUTCOME, not on the escape: what matters is that no
-        `](` pair can survive to pick a link's label and destination. Escaping
-        alone never covered this — brackets are not in escape_markdown's set."""
+        `](` pair survives to pick a link's label and destination. Escaping alone
+        does not cover it — brackets are not in escape_markdown's set."""
         attack = "[Free Discord Nitro](https://evil.example/phish)"
         out = _echo(attack)
         assert "[" not in out and "]" not in out
 
     def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
-        """The regression that shipped: escape_markdown defaults to
-        ignore_links=True, which passes any http(s) URL through UNTOUCHED — so an
-        attack prefixed with a bare link was echoed verbatim, and the earlier
-        bracket test passed only because its attack started at the bracket."""
+        """escape_markdown defaults to ignore_links=True, which passes any http(s)
+        URL through UNTOUCHED — so an attack prefixed with a bare link reaches the
+        embed verbatim unless safe_label overrides that default."""
         attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
         out = _echo(attack)
         assert "[" not in out and "]" not in out
@@ -3816,10 +3815,8 @@ class TestEchoIsSafeInAnEmbed:
     def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
         """Discord 400s the whole send past 1024 chars in a field value, and
         escaping can double the length. The removal has already committed by then,
-        so the user sees "Command failed" for a removal that happened.
-
-        `*`, not `x`: escaping leaves `x` alone, so the old input never exercised
-        the doubling this test's own docstring is about."""
+        so the user sees "Command failed" for a removal that happened. `*`, not
+        `x`: escaping leaves `x` alone and would not exercise the doubling."""
         assert len(_echo("*" * 5000)) <= 1024
 
     def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
@@ -3849,13 +3846,10 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     """Every field of the `-remove` reply is built from a list the USER sizes —
     the removed songs and their positions — and the send happens AFTER
     queue_remove() has already mutated memory and Redis. So an over-length field
-    is not a cosmetic bug: Discord 400s the whole send, `_command_error` reports
+    is not cosmetic: Discord 400s the whole send, `_command_error` reports
     "Command failed", and the user is told nothing happened to a queue that has
-    already been irreversibly changed.
-
-    Asserted on the ASSEMBLED embed rather than on `_echo` alone. The bug these
-    pin shipped past a test that checked one echo against the cap while ten of
-    them shared the same field."""
+    already been irreversibly changed. Asserted on the ASSEMBLED embed, since ten
+    individually-capped echoes still share one field."""
 
     @staticmethod
     def _fields(mock_ctx: MagicMock) -> list[discord.embeds.EmbedProxy]:
@@ -3885,8 +3879,8 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
     async def test_ten_long_titles_fit_the_songs_field(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """99 characters is INSIDE YouTube's own 100-char title limit, so this
-        needs no crafted content — ten ordinary songs used to overflow at 1030."""
+        """99 characters is INSIDE YouTube's own 100-char title limit, so ten
+        ordinary songs overflow the 1024-char field with no crafted content."""
         songs: list[QueueItem] = [
             QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
             for i in range(10)
@@ -3944,16 +3938,12 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
 
 
 class TestCommandArgumentBinding:
-    """`-play`, `-playnow` and `-remove` all consume the rest of the line.
-
-    A positional binds ONE WORD. `-play` stores its argument as the origin
-    `-remove` matches on, so a positional there meant `-play never gonna give you
-    up` recorded `"never"` — the help's own example matched nothing, and
-    `-remove never` became a wildcard over every song starting with that word.
-
-    Asserted on the callback signature rather than through a parsed message,
-    because the binding is a property of the signature and the tests that missed
-    this were the ones that hand-built the value instead."""
+    """`-play`, `-playnow` and `-remove` all consume the rest of the line, because
+    a positional binds ONE WORD: `-play` stores its argument as the origin
+    `-remove` matches on, so `-play never gonna give you up` would record
+    `"never"` and `-remove never` would become a wildcard over every song starting
+    with it. Asserted on the callback signature, since that is where the binding
+    lives."""
 
     @pytest.mark.parametrize("name", ["play", "playnow", "remove"])
     def test_the_argument_consumes_the_rest_of_the_line(self, name: str) -> None:
@@ -4842,14 +4832,10 @@ class TestDebugObservesWithoutCreating:
 
 
 class TestShuffleWaitsForTheRestore:
-    """-shuffle was the one queue-mutating command with no restore wait and no
-    comment saying why.
-
+    """-shuffle waits for the restore like every other queue-mutating command:
     shuffle() REBUILDS the mirror from memory, so running it before
     restore_entries() has replayed the saved queue writes an unrestored deque over
-    it — deleting the persisted entries outright. Alone it merely reported "at
-    least 3 songs" against a queue it could not see; combined with an enqueue past
-    the same window it destroys one."""
+    it and deletes the persisted entries outright."""
 
     async def test_it_refuses_until_the_restore_lands(
         self, music_bot: MusicBot, mock_ctx: MagicMock

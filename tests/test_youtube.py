@@ -243,12 +243,9 @@ class TestYtStreamCarriesTheQueueObjectsFields:
 
     def test_no_queueobject_field_is_silently_left_behind(self) -> None:
         """Reflective, so a field added to QueueObject tomorrow fails HERE rather
-        than at playback.
-
-        The hand-written list below it enumerates six fields and cannot notice a
-        seventh — which is exactly how `user_input` and then `persisted` reached
-        this hop late, the second as a live AttributeError. Anything genuinely not
-        meant to cross gets named in the allow-list, with the reason."""
+        than at playback — the hand-written list below it enumerates six fields and
+        cannot notice a seventh. Anything genuinely not meant to cross gets named
+        in the allow-list, with the reason."""
         import dataclasses
         import inspect
 
@@ -304,17 +301,14 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         ) == ("typed", "search", True, True, True, False, 12.5)
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
-        """`persisted` reached the YTDL last, and its absence was a live crash
-        rather than a silent drop: `_neutralize_prefetch` reads it back off the
-        playing song to rebuild a QueueObject, so every `-playnow` over a
-        COMPLETED prefetch raised AttributeError — failing the command and
-        stranding the prefetch's claim, which the next commit then settled onto
-        the wrong song.
+        """`_neutralize_prefetch` reads `persisted` back off the playing song to
+        rebuild a QueueObject, so a YTDL without it raises AttributeError on every
+        `-playnow` over a COMPLETED prefetch — failing the command and stranding
+        the claim, which the next commit then settles onto the wrong song.
 
-        False is the value that matters. It marks the crash-recovered head, whose
-        entry is NOT on the Redis list; defaulting it to True in the rebuild would
-        write that head into the mirror, where its dequeue never LPOPs and every
-        later entry sits one place out."""
+        False is the value that matters: it marks the crash-recovered head, whose
+        entry is NOT on the Redis list, and a rebuild defaulting to True writes
+        that head into the mirror, where its dequeue never LPOPs."""
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",

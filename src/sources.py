@@ -244,19 +244,14 @@ def parse_url(
 def unquote_argument(text: str) -> str:
     """Drop one matched pair of surrounding quotes.
 
-    `-play` and `-playnow` take consume-rest arguments, and discord.py's
-    `read_rest()` does no quote handling — where the old positional parser's
-    `get_quoted_word()` consumed them. So `-play "<url>"` began arriving WITH the
-    quotes, and parse_url's `re.search` still matches the domain inside them while
-    dragging the trailing quote into the path, which yt-dlp then rejects. A quoted
-    search fared no better: it stored `"some song"` as the origin, so retyping the
-    obvious `-remove some song` matched nothing.
+    `-play`/`-playnow` take consume-rest arguments, which discord.py's `read_rest()`
+    hands through with the quotes: parse_url then drags the trailing one into the
+    path and yt-dlp rejects it, and a quoted search stores `"some song"` as the
+    origin, which `-remove some song` cannot match.
 
     Only a whole argument wrapped at both ends, and never down to nothing — a lone
-    quote or an empty pair is text the user typed, not a wrapper. Applied both here
-    and at the command (which stamps `origin` from its own argument, separately
-    from this), so it has to be safe to run twice; it is, for everything but a
-    doubly-wrapped literal nobody types."""
+    quote or an empty pair is text the user typed. Runs here and at the command,
+    which unquotes the value it stamps `origin` from, so it must be safe twice."""
     for quote in ('"', "'"):
         if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
             return text[1:-1]

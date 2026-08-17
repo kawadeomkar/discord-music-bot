@@ -863,17 +863,14 @@ class GuildRedisStore:
         Returns HOW MANY were actually removed — the caller must check it.
 
         The alternative to rebuild_queue for a small removal: LREM touches only what
-        goes, while a rebuild rewrites the whole list whatever it drops (measured on
-        redis:7-alpine at depth 1000: 0.96 ms for one entry against ~5.7 ms to
-        rebuild). Far enough up, the per-LREM scans overtake it — GuildQueue owns
-        the threshold and the measurement behind it.
+        goes, while a rebuild rewrites the whole list whatever it drops. Far enough
+        up, the per-LREM scans overtake it — GuildQueue owns that threshold.
 
-        Matching is by exact serialized bytes, which is an assumption about the rest
-        of the codebase rather than about Redis: a queued object mutated after its
-        entry was written no longer serializes to what is stored, and the LREM then
-        silently matches nothing. Hence the count — a short return means the mirror
-        and memory have diverged and only a rebuild can be trusted. A Redis failure
-        returns 0 through @_guild_op and takes the same path.
+        Matching is by exact serialized bytes, so a queued object mutated after its
+        entry was written matches nothing. Hence the count: short of what it asked
+        for means the mirror no longer holds what memory does and only a rebuild
+        can be trusted. A Redis failure returns 0 through @_guild_op and takes the
+        same path.
 
         Counted per distinct serialization, never LREM ... 0: two enqueues of one
         song usually differ on the wire (queue_position, queued_at), but when they

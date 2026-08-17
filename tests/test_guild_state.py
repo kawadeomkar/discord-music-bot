@@ -1366,12 +1366,9 @@ class TestHistoryEntryFromQueueObject:
 
 class TestCrashedSongRoundTrip:
     """from_song -> the state hash -> from_crashed_state is a closed loop, and a
-    field missing from EITHER end is lost silently and only after a crash.
-
-    Pinned as a round trip rather than per-leg, because that is how the loss
-    happened: the StateField, the mapping and from_crashed_state all handled
-    is_resume and start_paused correctly, and from_song simply never set them —
-    so every leg looked right in isolation while the value was always False.
+    field missing from EITHER end is lost silently and only after a crash. Pinned
+    as a round trip rather than per-leg: every leg can look right in isolation
+    while one of them never sets the value.
     """
 
     @staticmethod

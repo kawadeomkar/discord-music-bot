@@ -653,11 +653,10 @@ class YTDL(discord.FFmpegOpusAudio):
         # What the user typed, carried so -remove still matches a song that has
         # become a playing one — a -playnow resume tail is rebuilt from here.
         self.user_input: Optional[str] = user_input
-        # Whether this song's entry is still on the Redis list, carried for the
-        # SAME rebuild: _neutralize_prefetch reads it back off the playing song to
-        # reconstruct a QueueObject, and defaulting it to True there would write a
-        # crash-recovered head (persisted=False) into the mirror, where its dequeue
-        # never LPOPs and every later entry sits one place out.
+        # Whether this song's entry is still on the Redis list. Carried for the
+        # same rebuild, and read by the playback loop to decide whether settling
+        # its claim LPOPs: a crash-recovered head defaulted to True here retires
+        # an entry that was never its own.
         self.persisted: bool = persisted
         # 0.0 until the loop stamps it at vc.play(); nonzero on a resume tail,
         # which inherits the interrupted song's start (see QueueObject.played_at).
