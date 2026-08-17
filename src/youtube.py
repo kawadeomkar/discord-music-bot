@@ -923,8 +923,10 @@ class YTDL(discord.FFmpegOpusAudio):
         # both carried from the QueueObject because a playing song can become one
         # again (a neutralized prefetch, an interjection's resume tail, a stream
         # retry). Dropping user_input loses the only record of the collection link
-        # -remove matches on; dropping persisted hands a crash-recovered song a
-        # phantom LPOP that deletes an unrelated queued entry.
+        # -remove matches on. persisted is read by the playback loop to decide
+        # whether settling this song's claim LPOPs: a crash-recovered head, which
+        # was never on the Redis list, defaulted to True here retires an entry that
+        # was never its own.
         self.user_input: Optional[str] = user_input
         self.persisted: bool = persisted
         # Retry state carried from the QueueObject: how many plays this song has

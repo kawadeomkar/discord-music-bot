@@ -4,6 +4,7 @@ import pytest
 
 from src.guild_state import Analytics
 from src.sources import (
+    unquote_argument,
     QUERY_SOURCE_SEARCH,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
@@ -490,3 +491,37 @@ class TestQuerySource:
         """A hand-built source (crash recovery, tests, a future call site) reports
         the unknown sentinel rather than guessing."""
         assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""
+
+
+class TestQuotedArgumentsSurviveConsumeRest:
+    """`-play`/`-playnow` take consume-rest arguments, and discord.py's read_rest
+    does no quote handling where the positional parser's get_quoted_word did. So
+    the quotes started arriving as part of the value."""
+
+    def test_a_quoted_url_still_parses_as_that_url(self) -> None:
+        """parse_url uses re.search, so a quoted URL still matched the domain while
+        dragging the trailing quote into the path — yt-dlp then rejects it."""
+        source = parse_input(
+            '"https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+            '-play "https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+        )
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_a_quoted_search_does_not_keep_its_quotes(self) -> None:
+        """The origin is what -remove matches on, so a quoted search meant the
+        obvious retype (`-remove some song`) matched nothing."""
+        source = parse_input('"some song"', '-play "some song"')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == "ytsearch:some song"
+
+    def test_an_unmatched_quote_is_left_alone(self) -> None:
+        """Only a whole argument wrapped at BOTH ends is a wrapper; anything else
+        is text the user typed."""
+        source = parse_input('say "hello', '-play say "hello')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == 'ytsearch:say "hello'
+
+    def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
+        assert unquote_argument('""') == '""'
+        assert unquote_argument('"') == '"'

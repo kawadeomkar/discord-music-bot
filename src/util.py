@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
-from typing import Any, Optional
+import re
+from typing import Any, Final, Optional
 from collections.abc import AsyncGenerator, Coroutine
 
 import discord
@@ -158,6 +159,34 @@ EMBED_TITLE_LIMIT = 256
 # The same, for footer text. Lives here, not in debug.py: ping.py writes footers too
 # and debug.py already imports ping.py, so importing it back closes a hard cycle.
 FOOTER_LIMIT = 2048
+
+# The same again, for a field VALUE. A field built from a list the user can grow
+# (removed songs, dropped positions) has no natural ceiling, and the 400 lands
+# after the command has already mutated state.
+EMBED_FIELD_LIMIT = 1024
+
+
+# Control characters end a rendered embed line early, hiding whatever follows.
+# Flattened rather than escaped — they have no visible form.
+_LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_label(text: str, limit: int) -> str:
+    """Attacker-influenceable text — a user's search term, a yt-dlp title, an
+    uploader name — rendered into an embed without being able to style it or
+    forge a link.
+
+    Three neutralizations before the escape, because `escape_markdown` covers none
+    of them: `[`/`]` are not in its set and are what picks a masked link's label; a
+    backtick closes any code span the caller wrapped this in; and `ignore_links`
+    defaults to TRUE, passing a whole http(s) token through untouched.
+
+    Cap BEFORE escaping: cutting after can split an escape pair and leave a
+    trailing backslash that eats the next character."""
+    flattened = _LABEL_UNSAFE.sub(" ", text)
+    clipped = truncate(flattened, limit)
+    neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")
+    return discord.utils.escape_markdown(neutralized, ignore_links=False)
 
 
 def truncate(text: str, limit: int) -> str:

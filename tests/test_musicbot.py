@@ -21,7 +21,9 @@ from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
-    DEPTH_RESTORE_WAIT_SECS,
+    RESTORE_WAIT_SECS,
+    _echo,
+    _removed_label,
     HISTORY_MAX_LIMIT,
     EmptyPlaylistError,
     HistoryFlags,
@@ -34,6 +36,7 @@ from src.musicbot import (
     _join_succeeded,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
+from src.util import EMBED_FIELD_LIMIT
 from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
@@ -1951,7 +1954,7 @@ class TestResumeCommand:
         with _no_typing():
             await command_callback(MusicBot.resume)(music_bot, mock_ctx)
 
-        # join last: the embed describes the display head, and the head is gone
+        # join last: the embed describes the queue head, and the head is gone
         # once the gate opens behind the join.
         assert calls == ["restore", "build", "join"]
 
@@ -2705,7 +2708,7 @@ class TestPlayCommand:
             _no_typing(),
             patch("asyncio.create_task", side_effect=fake_create_task) as mock_create,
         ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mock_create.assert_called_once()
         music_bot.queue_source.assert_awaited_once()
@@ -2723,7 +2726,7 @@ class TestPlayCommand:
         music_bot.get_mp = MagicMock(return_value=_mock_mp())
 
         with _no_typing(), patch("asyncio.create_task") as mock_create:
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mock_create.assert_not_called()
         music_bot.queue_source.assert_awaited_once()
@@ -2751,7 +2754,7 @@ class TestPlayCommand:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2781,7 +2784,7 @@ class TestPlayCommand:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_not_called()  # already done, nothing to cancel
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2808,7 +2811,7 @@ class TestPlayCommand:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         cancel_spy.assert_called_once()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -2836,7 +2839,7 @@ class TestPlayAnalytics:
         music_bot._enqueue_single = AsyncMock()
 
         with _no_typing():
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
         analytics = spy.await_args.kwargs["analytics"]
@@ -2870,7 +2873,7 @@ class TestPlayAnalytics:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
         analytics = spy.await_args.kwargs["analytics"]
@@ -2882,7 +2885,7 @@ class TestPlayAnalytics:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """Crash recovery reconnects voice BEFORE restore_entries() replays the
-        queue into _display. Reading the depth in that window records 0 behind a
+        queue. Reading the depth in that window records 0 behind a
         queue about to reappear, so the read waits the restore out."""
         mock_ctx.voice_client = _playing_vc()
         mp = _mock_mp()
@@ -2894,7 +2897,7 @@ class TestPlayAnalytics:
             return True
 
         mp.wait_for_restore = AsyncMock(side_effect=_land_the_restore)
-        # What the real display leg answers on either side of the restore.
+        # What the real queue answers on either side of the restore.
         mp.enqueue_depth = MagicMock(side_effect=lambda: 12 if restored else 0)
         music_bot.get_mp = MagicMock(return_value=mp)
         spy = AsyncMock(
@@ -2904,7 +2907,7 @@ class TestPlayAnalytics:
         music_bot._enqueue_single = AsyncMock()
 
         with _no_typing():
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert spy.await_args is not None
         assert spy.await_args.kwargs["analytics"].queue_position == 12
@@ -2941,7 +2944,7 @@ class TestPlayWhilePaused:
         mock_ctx.message.add_reaction = AsyncMock()
 
         with _no_typing(), patch.object(YTDL, "prefetch_stream", new=AsyncMock()):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_awaited_once()
         assert mp.interject.await_args.kwargs["resume_paused"] is False
@@ -2962,7 +2965,7 @@ class TestPlayWhilePaused:
         mock_ctx.message.add_reaction = AsyncMock()
 
         with _no_typing(), patch.object(YTDL, "prefetch_stream", new=AsyncMock()):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         embed = mock_ctx.send.await_args.kwargs["embed"]
         assert "Paused Song" in embed.description
@@ -2983,7 +2986,7 @@ class TestPlayWhilePaused:
         music_bot._enqueue_single = AsyncMock()
 
         with _no_typing(), patch("asyncio.create_task"):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
         music_bot._enqueue_single.assert_awaited_once()
@@ -3003,7 +3006,7 @@ class TestPlayWhilePaused:
         music_bot._enqueue_single = AsyncMock()
 
         with _no_typing(), patch("asyncio.create_task"):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
         music_bot._enqueue_single.assert_awaited_once()
@@ -3033,7 +3036,7 @@ class TestPlayWhilePaused:
                 YTDL, "prefetch_stream", new=AsyncMock(side_effect=_resolve_then_resume)
             ),
         ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
         music_bot._enqueue_single.assert_awaited_once()
@@ -3054,7 +3057,7 @@ class TestPlayWhilePaused:
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
         with _no_typing():
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.interject.assert_not_awaited()
         vc.stop.assert_not_called()
@@ -3094,7 +3097,7 @@ class TestPlayWhilePaused:
             patch.object(YTDL, "prefetch_stream", new=AsyncMock()),
             patch.object(YTDL, "yt_playlist", new=AsyncMock(return_value=tracks)),
         ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, url)
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
 
         mp.interject.assert_awaited_once()
         assert mp.interject.await_args.args[0] is tracks[0]
@@ -3132,7 +3135,7 @@ class TestPlayFrontInsertion:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
@@ -3164,7 +3167,7 @@ class TestPlayFrontInsertion:
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
         ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         music_bot._enqueue_single.assert_not_awaited()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -3196,7 +3199,7 @@ class TestPlayFrontInsertion:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         music_bot._enqueue_single.assert_not_awaited()
         music_bot.cleanup.assert_awaited_once_with(mock_ctx.guild)
@@ -3227,7 +3230,7 @@ class TestPlayFrontInsertion:
                 "asyncio.create_task", side_effect=lambda c: (c.close(), join_task)[1]
             ),
         ):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert calls == ["cleanup", "repark"]
 
@@ -3244,19 +3247,19 @@ class TestPlayFrontInsertion:
         music_bot.get_mp = MagicMock(return_value=mp)
 
         with _no_typing(), patch("asyncio.create_task"):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
         assert single_call.kwargs["front"] is False
-        # No playback hold on the warm path — the gate is already open. (It DOES
-        # wait on the restore, but only to read a meaningful queue depth, and on
-        # the short bound; see test_warm_path_reads_the_depth_after_the_restore.)
+        # No playback hold on the warm path — the gate is already open. It DOES
+        # wait on the restore, on the SAME bound as every other queue-mutating
+        # command: enqueueing ahead of entries restore_entries has not replayed
+        # yet misaligns every later LPOP, so this is not just an analytics read.
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
-            and mp.wait_for_restore.await_args.kwargs["timeout"]
-            == DEPTH_RESTORE_WAIT_SECS
+            and mp.wait_for_restore.await_args.kwargs["timeout"] == RESTORE_WAIT_SECS
         )
 
     async def test_cold_path_waits_for_restore_before_enqueueing(
@@ -3292,7 +3295,7 @@ class TestPlayFrontInsertion:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         assert calls == ["restore", "enqueue"]
 
@@ -3320,7 +3323,7 @@ class TestPlayFrontInsertion:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         mp.defer_playback.assert_called_once()
 
@@ -3410,7 +3413,7 @@ class TestPlayFrontInsertion:
             return join_task
 
         with _no_typing(), patch("asyncio.create_task", side_effect=fake_create_task):
-            await command_callback(MusicBot.play)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="test")
 
         music_bot._enqueue_single.assert_not_awaited()
         pl_call = music_bot._enqueue_playlist.await_args
@@ -3764,6 +3767,226 @@ def _removed_song(n: int, query_source: str = "") -> QueueObject:
     )
 
 
+class TestEchoIsSafeInAnEmbed:
+    """`-remove`'s argument is user text echoed back into an embed, and Discord
+    renders markdown in descriptions and field values. Escaping it is not
+    cosmetic: unescaped, any member can make the bot post a styled masked link
+    under its own name, with no queue state required."""
+
+    def test_a_masked_link_cannot_form(self) -> None:
+        """Asserted on the OUTCOME, not on the escape: what matters is that no
+        `](` pair survives to pick a link's label and destination. Escaping alone
+        does not cover it — brackets are not in escape_markdown's set."""
+        attack = "[Free Discord Nitro](https://evil.example/phish)"
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
+
+    def test_markdown_riding_behind_a_url_is_neutralized(self) -> None:
+        """escape_markdown defaults to ignore_links=True, which passes any http(s)
+        URL through UNTOUCHED — so an attack prefixed with a bare link reaches the
+        embed verbatim unless safe_label overrides that default."""
+        attack = "https://x.com/`[FREE NITRO](https://evil.example/phish)"
+        out = _echo(attack)
+        assert "[" not in out and "]" not in out
+        assert "`" not in out
+
+    def test_emphasis_behind_a_url_is_escaped(self) -> None:
+        """What `ignore_links=False` still buys, now that the brackets are
+        neutralized outright: escape_markdown's URL exemption covers the WHOLE
+        token, so emphasis after a scheme renders styled unless the flag is off.
+        Pinned separately because the masked-link tests above pass either way."""
+        out = _echo("https://x.com/**bold**_em_")
+        assert "\\*\\*" in out
+        assert "\\_" in out
+
+    def test_a_backtick_cannot_close_the_code_span(self) -> None:
+        """Two call sites wrap this in a code span, and Discord gives a backslash
+        NO meaning inside one — so an ESCAPED backtick still closes the span and
+        renders everything after it. The backtick has to go, not be escaped."""
+        out = _echo("foo` **bold** `bar")
+        assert "`" not in out
+        assert "\\*\\*" in out
+
+    def test_control_characters_cannot_end_the_line_early(self) -> None:
+        """A control character truncates the rendered line, hiding whatever the
+        needle put after it."""
+        assert _echo("a\x00b\x1fc\x7fd") == "a b c d"
+
+    def test_the_echo_is_bounded_well_inside_the_field_cap(self) -> None:
+        """Discord 400s the whole send past 1024 chars in a field value, and
+        escaping can double the length. The removal has already committed by then,
+        so the user sees "Command failed" for a removal that happened. `*`, not
+        `x`: escaping leaves `x` alone and would not exercise the doubling."""
+        assert len(_echo("*" * 5000)) <= 1024
+
+    def test_an_ordinary_needle_is_unchanged_apart_from_the_span(self) -> None:
+        assert _echo("never gonna give you up") == "never gonna give you up"
+
+
+class TestRemovedLabelNamesEveryItemType:
+    """The Songs field exists because one argument can now take out a whole
+    playlist and there is no undo. `YTSource` has no `.title` at all, so reaching
+    for it rendered every unresolved Spotify-playlist track as `?` — the exact
+    case the field was added for, and the one the -remove help now advertises."""
+
+    def test_a_resolved_song_uses_its_title(self, mock_author: MagicMock) -> None:
+        item = QueueObject("https://yt.com/v=1", "Real Title", mock_author)
+        assert _removed_label(item) == "Real Title"
+
+    def test_an_unresolved_search_uses_its_search_text(self) -> None:
+        item = YTSource(ytsearch="ytsearch:Artist - Song", process=True)
+        assert _removed_label(item) == "Artist - Song"
+
+    def test_an_unresolved_link_falls_back_to_the_url(self) -> None:
+        item = YTSource(url="https://yt.com/v=2", process=True)
+        assert _removed_label(item) == "https://yt.com/v=2"
+
+
+class TestRemoveReplyStaysInsideDiscordsCaps:
+    """Every field of the `-remove` reply is built from a list the USER sizes —
+    the removed songs and their positions — and the send happens AFTER
+    queue_remove() has already mutated memory and Redis. So an over-length field
+    is not cosmetic: Discord 400s the whole send, `_command_error` reports
+    "Command failed", and the user is told nothing happened to a queue that has
+    already been irreversibly changed. Asserted on the ASSEMBLED embed, since ten
+    individually-capped echoes still share one field."""
+
+    @staticmethod
+    def _fields(mock_ctx: MagicMock) -> list[discord.embeds.EmbedProxy]:
+        return list(mock_ctx.send.await_args_list[0][1]["embed"].fields)
+
+    async def _run(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        *,
+        removed: list[QueueItem],
+        positions: list[int],
+    ) -> None:
+        mp = MagicMock()
+        mp.queue_remove = AsyncMock(
+            return_value=RemoveOutcome(
+                removed=removed, positions=positions, mode=RemoveMode.RESOLVED
+            )
+        )
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_embed = MagicMock(return_value=discord.Embed(title="Queue"))
+        music_bot.get_mp = MagicMock(return_value=mp)
+        await command_callback(MusicBot.remove)(
+            music_bot, mock_ctx, needle="https://yt.com/v=0"
+        )
+
+    async def test_ten_long_titles_fit_the_songs_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """99 characters is INSIDE YouTube's own 100-char title limit, so ten
+        ordinary songs overflow the 1024-char field with no crafted content."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "A" * 99, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_markdown_heavy_title_cannot_blow_the_field(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Escaping roughly doubles a title of pure markdown characters, which is
+        the shape a hostile uploader picks."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(10)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 11))
+        )
+        for field in self._fields(mock_ctx):
+            assert len(field.value or "") <= EMBED_FIELD_LIMIT, field.name
+
+    async def test_a_playlists_worth_of_positions_fits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """One `-remove <playlist link>` drops every track the link added. A raw
+        join passes 1024 characters at 227 positions — well inside what a real
+        playlist holds."""
+        songs: list[QueueItem] = [_removed_song(i) for i in range(240)]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        fields = {f.name: f.value or "" for f in self._fields(mock_ctx)}
+        positions_field = next(v for k, v in fields.items() if k and "removed" in k)
+        assert len(positions_field) <= EMBED_FIELD_LIMIT
+        # The count is still honest about what went, even though the list is cut.
+        assert "180 more" in positions_field
+
+    async def test_the_whole_embed_stays_under_the_total_cap(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Discord caps an embed at 6000 characters across every part, so three
+        fields each legal on their own can still fail together."""
+        songs: list[QueueItem] = [
+            QueueObject(f"https://yt.com/v={i}", "*" * 200, MagicMock())
+            for i in range(240)
+        ]
+        await self._run(
+            music_bot, mock_ctx, removed=songs, positions=list(range(1, 241))
+        )
+        assert len(mock_ctx.send.await_args_list[0][1]["embed"]) <= 6000
+
+
+class TestCommandArgumentBinding:
+    """`-play`, `-playnow` and `-remove` all consume the rest of the line, because
+    a positional binds ONE WORD: `-play` stores its argument as the origin
+    `-remove` matches on, so `-play never gonna give you up` would record
+    `"never"` and `-remove never` would become a wildcard over every song starting
+    with it. Asserted on the callback signature, since that is where the binding
+    lives."""
+
+    @pytest.mark.parametrize("name", ["play", "playnow", "remove"])
+    def test_the_argument_consumes_the_rest_of_the_line(self, name: str) -> None:
+        import inspect
+
+        callback = getattr(MusicBot, name).callback
+        param = list(inspect.signature(callback).parameters.values())[2]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"-{name}'s {param.name} is positional; discord.py will bind one word"
+        )
+
+    @pytest.mark.parametrize(
+        "typed,expected",
+        [
+            ("never gonna give you up", "never gonna give you up"),
+            ("some song   ", "some song"),  # read_rest keeps trailing whitespace
+        ],
+    )
+    async def test_what_the_user_typed_reaches_queue_source_whole(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        typed: str,
+        expected: str,
+    ) -> None:
+        """The end-to-end C1 guards: the origin -remove matches on is the whole
+        line, stripped. Previously it was the first word."""
+        mock_ctx.message.content = f"-play {typed}"
+        mock_ctx.voice_client = _connected_vc()
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot._enqueue_single = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=_mock_mp())
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=typed)
+
+        call = music_bot.queue_source.await_args
+        assert call is not None
+        assert call.kwargs["origin"] == expected
+
+
 class TestRemoveCommand:
     async def test_a_failure_becomes_a_command_error(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3914,8 +4137,7 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert (
-            fields["Matched"]
-            == f"<{album}> — the spotify.com link you queued them with"
+            fields["Matched"] == f"{album} — the spotify.com link you queued them with"
         )
 
     async def test_a_search_match_is_quoted_not_linked(
@@ -3942,7 +4164,7 @@ class TestRemoveCommand:
             f.name: f.value for f in mock_ctx.send.await_args_list[0][1]["embed"].fields
         }
         assert fields["Matched"] == (
-            "`never gonna give you up` — the search you queued it with"
+            "never gonna give you up — the search you queued it with"
         )
 
     async def test_removal_embed_names_what_it_matched(
@@ -3965,8 +4187,10 @@ class TestRemoveCommand:
 
         removal_embed = mock_ctx.send.await_args_list[0][1]["embed"]
         fields = {f.name: f.value for f in removal_embed.fields}
-        # A resolved-URL match reads as it always has: the link, nothing more.
-        assert fields["Matched"] == f"<{url}>"
+        # Escaped, and deliberately NOT wrapped in a code span: escaping inside
+        # one renders the backslashes literally, and a bare URL auto-links —
+        # which the angle-bracket form this replaced also did.
+        assert fields["Matched"] == url
 
     async def test_removal_embed_shows_positions(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -4049,7 +4273,7 @@ class TestPlaynow:
         music_bot.get_mp = MagicMock(return_value=mp)
         mock_ctx.invoke = AsyncMock()
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
 
@@ -4060,7 +4284,7 @@ class TestPlaynow:
         mock_ctx.voice_client = None
         mock_ctx.invoke = AsyncMock()
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
 
@@ -4077,7 +4301,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         assert qobj.interjected is True
         # The origin reaches the song through yt_source's required user_input, not
@@ -4121,7 +4345,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "return paused" in embed.description
@@ -4151,7 +4375,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Almost Done" in embed.description
@@ -4183,7 +4407,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Old Interjection" in embed.description
@@ -4209,7 +4433,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         mock_ctx.invoke.assert_not_awaited()
         # The player's wrapper, not queue.put_front directly — same plumbing as
@@ -4245,7 +4469,7 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
         ) as ys:
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url)
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
 
         music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
         ys.assert_awaited_once()
@@ -4277,7 +4501,7 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[first, second])
         ):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url)
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
 
         live_mp.interject.assert_awaited_once()
         assert live_mp.interject.call_args.args[0] is first
@@ -4293,7 +4517,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
@@ -4330,7 +4554,7 @@ class TestPlaynow:
         live_mp.interject = AsyncMock(side_effect=_interject_effect)
 
         with patch("src.musicbot.YTDL.prefetch_stream", new=prefetch):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, "test")
+            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]
@@ -4605,3 +4829,37 @@ class TestDebugObservesWithoutCreating:
         inputs = await music_bot._debug_inputs(mock_ctx)
         assert inputs.player is None
         assert inputs.players == 0
+
+
+class TestShuffleWaitsForTheRestore:
+    """-shuffle waits for the restore like every other queue-mutating command:
+    shuffle() REBUILDS the mirror from memory, so running it before
+    restore_entries() has replayed the saved queue writes an unrestored deque over
+    it and deletes the persisted entries outright."""
+
+    async def test_it_refuses_until_the_restore_lands(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=False)
+        mp.queue_shuffle = AsyncMock()
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_not_awaited()
+        assert "Still loading" in mock_ctx.send.await_args.kwargs["embed"].description
+
+    async def test_it_shuffles_once_the_restore_has_landed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = MagicMock()
+        mp.wait_for_restore = AsyncMock(return_value=True)
+        mp.queue_shuffle = AsyncMock(return_value="Shuffled!")
+        music_bot.get_mp = MagicMock(return_value=mp)
+
+        with _no_typing():
+            await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
+
+        mp.queue_shuffle.assert_awaited_once()

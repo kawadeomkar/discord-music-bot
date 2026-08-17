@@ -144,7 +144,7 @@ def spotify_playlist_to_ytsearch(
     ask-time analytics and `origin` are set here because it is the last point that
     knows where these came from — each resolves to a YouTube URL at dequeue.
     `analytics` is the head's; per-track positions are derived from it, as in
-    yt_playlist. `origin` is the album/playlist link the user pasted."""
+    yt_playlist. `origin` is the collection link the user pasted."""
     return [
         YTSource(
             ytsearch=f"ytsearch:{title}",
@@ -241,6 +241,23 @@ def parse_url(
         raise ValueError(f"Not a recognised URL: {url!r}")
 
 
+def unquote_argument(text: str) -> str:
+    """Drop one matched pair of surrounding quotes.
+
+    `-play`/`-playnow` take consume-rest arguments, which discord.py's `read_rest()`
+    hands through with the quotes: parse_url then drags the trailing one into the
+    path and yt-dlp rejects it, and a quoted search stores `"some song"` as the
+    origin, which `-remove some song` cannot match.
+
+    Only a whole argument wrapped at both ends, and never down to nothing — a lone
+    quote or an empty pair is text the user typed. Runs here and at the command,
+    which unquotes the value it stamps `origin` from, so it must be safe twice."""
+    for quote in ('"', "'"):
+        if len(text) > 2 and text.startswith(quote) and text.endswith(quote):
+            return text[1:-1]
+    return text
+
+
 def parse_input(
     user_input: str, message: str
 ) -> Union[SpotifySource, YTSource, SoundcloudSource]:
@@ -251,10 +268,10 @@ def parse_input(
     args = message.split(" ")[1:]
     if len(args) == 1:
         try:
-            return parse_url(user_input, message)
+            return parse_url(unquote_argument(user_input), message)
         except ValueError:
             pass
-    ytsearch = " ".join(args)
+    ytsearch = unquote_argument(" ".join(args))
     return YTSource(
         ytsearch=f"ytsearch:{ytsearch}",
         process=True,
