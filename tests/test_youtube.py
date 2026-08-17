@@ -1342,6 +1342,51 @@ class TestCandidateLadderWalk:
         assert song.data.get("format_id") == "140"
         assert song.url == song.data["url"]
 
+    async def test_a_deprioritized_promotion_still_rewrites_the_ladder(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The retry path's cache coherence, and it is the COMMON path rather than an
+        edge case: _retry_failed_stream invalidates the entry first, so every retry
+        resolves fresh, walks with the failed format deprioritized, and re-caches.
+
+        The reorder means the winner can land at index 0 while still differing from
+        the format the entry was built around — so a rewrite gated on a non-zero
+        index would persist `format_id: 140` over a ladder still headed by 251, and
+        the next play would probe the blacklisted rung first, discard what the retry
+        learned, and warn about the wrong format until the TTL lapsed.
+        """
+        url = "https://yt.com/v=retryladder"
+        playable_urls.side_effect = [True]  # 140, walked first, is healthy
+
+        qobj = QueueObject(
+            url,
+            "Laddered Song",
+            mock_ctx.author,
+            failed_format_ids=frozenset({"251"}),
+        )
+        with (
+            patch(
+                "src.youtube._ytdlp_extract",
+                return_value=self._laddered(url, "251", "140", "249"),
+            ),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=noop_ffmpeg_init),
+        ):
+            song = await YTDL.yt_stream(
+                qobj, AsyncMock(spec=discord.TextChannel), redis=fake_redis
+            )
+
+        assert song.data.get("format_id") == "140"
+        raw = await fake_redis.get(f"ytdl:stream:{url}")
+        assert raw is not None, "the promotion must have re-cached the entry"
+        cached = orjson.loads(cast(bytes, raw))
+        assert cached["format_id"] == "140"
+        assert cached["audio_candidates"][0]["format_id"] == "140", (
+            "the cached ladder head must be the URL the probe validated"
+        )
+        # 251 is not dropped — it is demoted, since the usual cause is a URL revoked
+        # between probe and first read, which a fresh extraction cures.
+        assert "251" in [c["format_id"] for c in cached["audio_candidates"]]
+
     async def test_the_winner_is_promoted_wholesale(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
