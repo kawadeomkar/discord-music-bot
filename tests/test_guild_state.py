@@ -10,9 +10,11 @@ import orjson
 from zoneinfo import ZoneInfo
 
 import pytest
+from unittest.mock import MagicMock
 
 from src import guild_state
 
+from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.youtube import YTDL, QueueObject
 from src.guild_state import (
@@ -1360,6 +1362,64 @@ class TestHistoryEntryFromQueueObject:
         # insertable, so a forgotten stamp would write rows Postgres refuses.
         with pytest.raises(TypeError):
             HistoryEntry.from_queue_object(_played_tail())  # pyright: ignore[reportCallIssue]
+
+
+class TestCrashedSongRoundTrip:
+    """from_song -> the state hash -> from_crashed_state is a closed loop, and a
+    field missing from EITHER end is lost silently and only after a crash. Pinned
+    as a round trip rather than per-leg: every leg can look right in isolation
+    while one of them never sets the value.
+    """
+
+    @staticmethod
+    def _song(**over: object) -> MagicMock:
+        song = MagicMock()
+        song.webpage_url = "https://yt.com/v=tail"
+        song.title = "Interrupted Song"
+        song.requester = MagicMock()
+        song.requester.id = 7
+        song.duration_secs = 200
+        song.uploader = "Chan"
+        song.interjected = False
+        song.is_resume = True
+        song.start_paused = True
+        song.user_input = "https://open.spotify.com/playlist/xyz"
+        song.query_source = "spotify.com"
+        song.played_at = 1234.5
+        song.analytics = Analytics(queued_at=99.0, queue_position=3)
+        for k, v in over.items():
+            setattr(song, k, v)
+        return song
+
+    def test_from_song_carries_the_fields_the_crash_path_reads(self) -> None:
+        entry = SongQueueEntry.from_song(self._song())
+        assert (entry.is_resume, entry.start_paused, entry.user_input) == (
+            True,
+            True,
+            "https://open.spotify.com/playlist/xyz",
+        )
+
+    def test_the_loop_closes_through_the_state_hash(self) -> None:
+        """A -playnow resume tail crashing mid-play comes back as a resume tail,
+        still paused, still removable by the link that queued it. Losing any of
+        the three reclassifies it as a fresh song: no resume announcement,
+        _remaining_secs billing the whole duration, a paused stack coming back
+        playing, and the collection link short one track."""
+        entry = SongQueueEntry.from_song(self._song())
+        # The write side's own mapping, so a field this test adds cannot pass by
+        # being spelled differently here than in the store.
+        mapping = GuildRedisStore._now_playing_state_mapping(
+            cast(GuildRedisStore, None), entry, play_start_epoch=1000.0
+        )
+        raw = {k.encode(): v.encode() for k, v in mapping.items()}
+        recovered = SongQueueEntry.from_crashed_state(
+            GuildStateData.from_redis(raw), position=42
+        )
+
+        assert recovered is not None
+        assert (recovered.is_resume, recovered.start_paused) == (True, True)
+        assert recovered.user_input == "https://open.spotify.com/playlist/xyz"
+        assert recovered.persisted is False  # its LPOP committed in the crashed run
 
 
 class TestFromCrashedState:

@@ -104,6 +104,7 @@ _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_QUEUED_AT,
     StateField.CURRENT_SONG_QUEUE_POSITION,
     StateField.CURRENT_SONG_QUERY_SOURCE,
+    StateField.CURRENT_SONG_USER_INPUT,
     StateField.CURRENT_SONG_PLAYED_AT,
 )
 _PLAYBACK_POSITION_FIELDS = (
@@ -757,8 +758,8 @@ class GuildRedisStore:
     @_guild_op(default=None)
     async def pop_queue(self) -> None:
         # At-most-once: LPOP removes with no ack, so a crash after this loses the
-        # song from Redis. Accepted — the in-memory asyncio.Queue is the source of
-        # truth; at-least-once would need a stream and an XACK.
+        # song from Redis. Accepted — GuildQueue's in-memory deque is the source
+        # of truth; at-least-once would need a stream and an XACK.
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(
@@ -783,6 +784,7 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_QUEUED_AT: str(current.queued_at),
             StateField.CURRENT_SONG_QUEUE_POSITION: str(current.queue_position),
             StateField.CURRENT_SONG_QUERY_SOURCE: current.query_source,
+            StateField.CURRENT_SONG_USER_INPUT: current.user_input or "",
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
@@ -858,12 +860,17 @@ class GuildRedisStore:
     @_guild_op(default=0)
     async def remove_queue_entries(self, entries: Sequence[QueueEntry]) -> int:
         """LREM the given entries out of the queue list, leaving the rest in place.
-        Returns how many were actually removed, which the caller must check: short
-        of what it asked for means the mirror no longer holds what memory does.
+        Returns HOW MANY were actually removed — the caller must check it.
 
         The alternative to rebuild_queue for a small removal: LREM touches only what
         goes, while a rebuild rewrites the whole list whatever it drops. Far enough
         up, the per-LREM scans overtake it — GuildQueue owns that threshold.
+
+        Matching is by exact serialized bytes, so a queued object mutated after its
+        entry was written matches nothing. Hence the count: short of what it asked
+        for means the mirror no longer holds what memory does and only a rebuild
+        can be trusted. A Redis failure returns 0 through @_guild_op and takes the
+        same path.
 
         Counted per distinct serialization, never LREM ... 0: two enqueues of one
         song usually differ on the wire (queue_position, queued_at), but when they
@@ -880,8 +887,7 @@ class GuildRedisStore:
             pipe.lrem(self.queue_key(), count, blob)  # pyright: ignore[reportArgumentType]
         pipe.expire(self.queue_key(), GUILD_TTL)
         replies = await pipe.execute()
-        # The trailing reply is the EXPIRE, not an LREM count.
-        return sum(cast(list[int], replies[:-1]))
+        return sum(cast(list[int], replies[:-1]))  # the last reply is the EXPIRE
 
     # History operations
 
