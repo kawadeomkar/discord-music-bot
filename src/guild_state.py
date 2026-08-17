@@ -95,9 +95,8 @@ class StateField:
     # Same reason: without it a song recovered after a crash archives as unknown,
     # silently and only for crashed plays.
     CURRENT_SONG_QUERY_SOURCE: Final[str] = "current_song_query_source"
-    # What the user typed. Same reason again, for -remove rather than the archive:
-    # this is the only leg where the origin can go missing, and a crash-recovered
-    # head without it is the one track a collection link cannot take back out.
+    # What the user typed. Carried for -remove rather than the archive: without it
+    # a crash-recovered head is the one track a collection link cannot take out.
     CURRENT_SONG_USER_INPUT: Final[str] = "current_song_user_input"
     # When the audio started. Not PLAY_START_EPOCH below, which is backdated by the
     # -ss offset, and not derivable from this run's clock at all — a resume tail
@@ -343,8 +342,8 @@ class GuildStateData:
     current_song_queued_at: float = 0.0
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
-    # None, not "": absent means a pre-migration entry, which is not the same as a
-    # song genuinely queued without an origin. parse_queue_entry draws the same line.
+    # None, not "": absent means a pre-migration entry, not a song genuinely queued
+    # without an origin. parse_queue_entry draws the same line.
     current_song_user_input: str | None = None
     current_song_played_at: float = 0.0
     play_start_epoch: float | None = None
@@ -666,12 +665,10 @@ class SongQueueEntry:
             duration=song.duration_secs or None,
             uploader=song.uploader,
             interjected=song.interjected,
-            # Carried, not defaulted. These three round-trip through the state hash
-            # and back out of from_crashed_state(), so dropping them here is a
-            # silent loss visible only after a crash: a resume tail comes back
-            # announcing itself as a fresh song and billing the whole duration,
-            # a paused stack comes back playing, and the origin -remove matches
-            # on is gone.
+            # These three round-trip through the state hash and back out of
+            # from_crashed_state(), so a default here is a loss visible only after
+            # a crash: a resume tail returns as a fresh song billing the whole
+            # duration, a paused stack returns playing, and -remove loses the origin.
             is_resume=song.is_resume,
             start_paused=song.start_paused,
             user_input=song.user_input,
@@ -694,14 +691,13 @@ class SongQueueEntry:
         caller-computed resume offset (crashed_position_at() plus its duration cap),
         passed in so this stays a pure field mapping.
 
-        FIXME: A FRESH song recovered mid-play is a resume in everything but the
-        flag. A song that WAS a -playnow tail is fine — from_song() carries
-        is_resume and it round-trips the state hash. But an ordinary song
-        interrupted by the crash comes back with `ts` holding the interrupt
-        position and is_resume false, so the loop announces "Starting song at 137
-        seconds" rather than resuming, and _remaining_secs bills the whole
-        duration instead of the tail, skewing every ETA behind it. Synthesizing
-        the flag from `ts > 0` would also move the queue display and the -playnow
+        FIXME: A song interrupted mid-play by the crash is a resume in everything
+        but the flag — `ts` holds the interrupt position while is_resume stays
+        false, so the loop announces "Starting song at 137 seconds" rather than
+        resuming, and _remaining_secs bills the whole duration instead of the
+        tail, skewing every ETA behind it. A song that WAS a -playnow tail is
+        fine: from_song() carries is_resume through the hash. Synthesizing the
+        flag from `ts > 0` would also move the queue display and the -playnow
         wording, so it wants its own change.
         """
         if not state.has_crashed_song:

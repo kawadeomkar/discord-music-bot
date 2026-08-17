@@ -17,10 +17,8 @@ bulk-mutation mutex across its memory AND mirror writes. The dequeue commit
 extends that hold over the caller's Redis write (see commit_dequeue).
 Invalidation is carried by the generation counter and the cursor (see clear()).
 
-Two counters, adjacent names, different sets: qsize() is PENDING
-(len - cursor), display_size() is pending PLUS in-flight (len). They are one
-term apart and display_size() is the sole input to a Postgres column, so read
-the docstrings before touching either.
+Two counters, adjacent names, different sets: qsize() is PENDING (len - cursor),
+display_size() is pending PLUS in-flight (len).
 
 Not known here:
 - stream prefetch — MusicPlayer cancels its prefetch task before
@@ -57,34 +55,15 @@ log = get_logger(__name__)
 # guild_state.QueueEntry; this class converts between the two internally.
 QueueItem = Union[QueueObject, YTSource]
 
-# When the pipelined LREMs cost more than rewriting the list.
-# See docs/ARCHITECTURE.md#queue-operations.
-#
-# `LREM key 1 <blob>` scans from the head and stops at its first match, so it is
-# O(position) — NOT O(1). N of them cost O(N x depth), and a rebuild costs
-# O(survivors), which is also O(depth). The depth term CANCELS, so the crossover
-# is a COUNT and carries no ratio: at a fixed N the two curves stay in the same
-# order at every depth. An earlier revision read this backwards ("a RATIO, not a
-# count") and gated on drop <= survivors / 5, which has no depth term at all —
-# so N=200 was admitted whenever the queue held 1000, and stayed admitted as the
-# queue grew. Measured losers it let through: depth 1200 dropping 200 costs
-# 10.0ms against a 6.3ms rebuild.
-#
-# Two independent measurements disagree on where the crossover sits — 18-50 on
-# redis:7-alpine, 50-150 on a native redis 8.10 — so the cap sits below both
-# rather than splitting them. At 16 the LREM path costs LESS than the rebuild it
-# replaces at every depth measured (250: 1.1ms vs 1.8; 1000: 1.7 vs 6.2; 5000:
-# 4.4 vs 31.7; 20000: 15.4 vs 131.2). That bound is the point: the LREMs run
-# inside one MULTI/EXEC, so single-threaded Redis serves NOBODY for their
-# duration — every other guild's song start, every -history read, the outbox
-# drain. Being under the rebuild caps that stall at what the alternative already
-# costs. Being conservative costs only a rebuild slightly slower than an optimal
-# LREM would have been; being wrong the other way stalls the whole server.
+# When the pipelined LREMs cost more than rewriting the list. `LREM key 1 <blob>`
+# is O(position), so N of them cost O(N x depth) against a rebuild's O(depth):
+# the depth cancels and the crossover is a COUNT. The LREMs share one MULTI/EXEC,
+# so this bound is what caps how long Redis serves nobody.
+# See docs/ARCHITECTURE.md#queue-operations for the measurements.
 _LREM_MAX_ENTRIES = 16
 
 # Shallow queues rebuild instead: below ~80 survivors a full rewrite is under a
-# millisecond, so there is nothing for the shortcut to win and its exact-bytes
-# assumption (see _write_mirror) is one more thing that can be wrong.
+# millisecond, so the shortcut has nothing to win.
 _LREM_MAX_SHARE = 5
 
 
@@ -106,8 +85,7 @@ RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
 
 
 # A link, for folding purposes: a scheme, or a bare dotted host that parse_url
-# also accepts (`-play youtu.be/X` is an ordinary input). Angle brackets are
-# stripped first because Discord adds them when suppressing an embed.
+# also accepts (`-play youtu.be/X` is an ordinary input).
 _LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
 
 
@@ -115,43 +93,27 @@ def _normalize(s: str) -> str:
     """Fold a needle for comparison: collapse whitespace, and casefold anything
     that is not a link. Links keep their case because IDs inside them are
     case-sensitive — a casefolded Spotify base62 id would let ".../playlist/AbC"
-    match a different playlist's ".../playlist/abc".
-
-    Free text folds under casefold(), which maps some distinct strings together
-    (strasse/straße, U+212A/k). Two searches differing only that way remove each
-    other; accepted, because the alternative is a fold that fails on ordinary
-    case differences, which is what people actually retype."""
+    match a different playlist's ".../playlist/abc"."""
     s = " ".join(s.split()).strip("<>")
     return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
 
 def remove_matcher(needle: str) -> RemoveMatcher:
-    """Match a queue item against one `-remove` argument, by resolved URL or by
-    what the user typed, whichever hits.
-
-    The union rather than a mode flag: the two are disjoint in practice — a
-    resolved yt-dlp URL is not something anyone types to queue with — so
-    `-remove <anything>` does the right thing with no syntax to learn. RESOLVED is
-    tried first, which keeps every removal that worked before working the same way.
-
-    Matching an origin removes every item sharing it, which is the point: one
-    album or playlist link takes back out exactly the tracks it put in. Links are
-    compared literally, so youtu.be/x will not match an entry stored as
-    youtube.com/watch?v=x — see the deferred canonicalisation note in -help."""
-    # Angle brackets go for BOTH legs, not just the fold: Discord adds them when a
-    # user suppresses a link's embed, so `-remove <https://youtu.be/x>` is an
-    # ordinary thing to paste — and without this the resolved leg compared the
-    # bracketed form literally and could only ever match by origin.
-    # The strip() is belt-and-braces: Command.transform already strips a
-    # consume-rest argument, but this is reachable from tests and other callers.
+    """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
+    first, then what the user typed. An origin match takes out every item sharing
+    it, so one album or playlist link removes exactly the tracks it queued. Links
+    are compared literally — youtu.be/x does not match an entry stored as
+    youtube.com/watch?v=x."""
+    # Stripped for BOTH legs, not just the fold: Discord wraps a link in angle
+    # brackets when a user suppresses its embed, and the resolved leg compares
+    # literally.
     needle = needle.strip().strip("<>")
     folded = _normalize(needle)
 
     def match(item: QueueItem) -> Optional[RemoveMode]:
         if not needle:
             # An unresolved search has url=None, which an empty needle would match
-            # as "" and take out every Spotify-playlist track. Unreachable through
-            # discord.py today, one parser change from live.
+            # as "" and take out every Spotify-playlist track.
             return None
         resolved = (
             item.webpage_url if isinstance(item, QueueObject) else (item.url or "")
@@ -174,9 +136,8 @@ class RemoveOutcome:
 
     removed: list[QueueItem]
     positions: list[int]  # 1-indexed, as the queue embed numbers them
-    # ORIGIN when anything matched on what the user typed rather than the resolved
-    # URL — the case where one argument removes many songs, so the reply says so.
-    # None when nothing matched.
+    # ORIGIN when anything matched on what the user typed — the case where one
+    # argument removes many songs, so the reply says so. None when nothing did.
     mode: Optional[RemoveMode] = None
 
 
@@ -237,12 +198,10 @@ class GuildQueue:
     # ── Wake discipline ───────────────────────────────────────────────────────
 
     def _sync_wake(self) -> None:
-        """Restore I3: _wake is set iff something is pending.
-
-        The one writer of _wake. A method that sets or clears it by hand states a
-        conclusion, and a wrong one does not degrade — Event.wait() returns without
-        yielding when already set, so a stale set turns the future get()'s wait loop
-        into a loop with no suspension point and the whole event loop stops."""
+        """Restore I3: _wake is set iff something is pending, and the only writer
+        of it. A stale set does not degrade — Event.wait() returns without
+        yielding when already set, so get()'s wait loop loses its suspension
+        point and the whole event loop stops."""
         if self._cursor < len(self._items):
             self._wake.set()
         else:
@@ -253,16 +212,10 @@ class GuildQueue:
     async def get(self) -> QueueItem:
         """Claim the next pending item, waiting for one if the queue is drained.
 
-        `while`, never `if`. Two things depend on the re-test, and dropping it
-        breaks both: a getter cancelled after being woken leaves _wake set with
-        nobody having claimed, and Event.wait() wakes EVERY waiter, so a second
-        consumer would take the item this one was woken for. Re-testing the
-        condition is what makes both harmless — this is the condition-variable
-        pattern, and _sync_wake() is what keeps the condition and the Event
-        honest with each other.
-
-        No await between the claim and the return, so a cancellation lands either
-        side of it and never inside — a claim is atomic on the event loop."""
+        `while`, never `if`: Event.wait() wakes EVERY waiter and the prefetch's
+        get_nowait() is a second consumer, so a woken getter can find the item
+        already taken. No await between the claim and the return, so a claim is
+        atomic on the event loop."""
         while self._cursor >= len(self._items):
             await self._wake.wait()
         item = self._items[self._cursor]
@@ -287,10 +240,9 @@ class GuildQueue:
         `item` may be the RESOLVED form of what was claimed (YTSource →
         QueueObject), so the slot is rewritten onto it: a later rebuild serializes
         from the deque, and a stale YTSource there would persist a search over an
-        entry that had already resolved — re-running the ytsearch after a crash,
-        free to rank a different video."""
-        # Guarded like every other cursor decrement: unguarded, _cursor == 0 would
-        # go negative and _items[-1] = item would clobber the TAIL.
+        entry that had already resolved."""
+        # Guarded like every other cursor decrement: unguarded, _cursor == 0 goes
+        # negative and _items[-1] = item clobbers the TAIL.
         if self._cursor > 0:
             self._cursor -= 1
             self._items[self._cursor] = item
@@ -306,12 +258,10 @@ class GuildQueue:
     def display_size(self) -> int:
         """Pending PLUS in-flight — what a new arrival actually waits behind.
 
-        NOT qsize(), and the two are now one term apart over the same two fields,
-        so a swap compiles and type-checks. It is the sole input to
-        play_history.queue_position (MusicPlayer.enqueue_depth), and a claimed item
-        is still ahead of an arrival — so qsize() here would undercount by one
-        exactly when a -play lands during another song's resolve, and write a
-        plausible wrong number to Postgres with nothing to detect it."""
+        NOT qsize(), which is one term apart over the same two fields. This is the
+        sole input to play_history.queue_position (MusicPlayer.enqueue_depth), and
+        a claimed item is still ahead of an arrival, so qsize() here would write a
+        plausible wrong number to Postgres."""
         return len(self._items)
 
     @property
@@ -415,10 +365,9 @@ class GuildQueue:
             self._sync_wake()
             if self._store is None or not queued:
                 return queued
-            # Filtered like every other mirror write. No caller enqueues a
-            # persisted=False item today, but one written here would never be
-            # LPOPed at its dequeue (redis_pop_for skips them), leaving the mirror
-            # a permanent entry ahead.
+            # Filtered like every other mirror write: a persisted=False entry
+            # written here would never be LPOPed at its dequeue (redis_pop_for
+            # skips them), leaving the mirror a permanent entry ahead.
             entries = [_to_entry(item) for item in queued if is_persisted(item)]
             if not entries:
                 return queued
@@ -443,12 +392,8 @@ class GuildQueue:
         entry still sits at the list head awaiting a commit-time LPOP, so an LPUSH
         in front of it would make that LPOP eat the new head.
 
-        That branch is reachable, despite looking unused. Not by the interleaving
-        an earlier revision described (the loop awaiting a still-running prefetch
-        while interject() runs inside that await) — interject() returns early
-        there, because the loop clears current_song before it reads the prefetch
-        task. It is reached from _interject_flow's outcome-is-None fallback, which
-        calls queue_put_front with the prefetch's claim still open.
+        That branch is reachable despite looking unused: _interject_flow's
+        outcome-is-None fallback calls this with the prefetch's claim still open.
 
         expected_generation: same compare-and-put contract as put(), used by the
         buffered front=True collection path and refused (None, no leg touched)
@@ -463,7 +408,7 @@ class GuildQueue:
             ):
                 return None
             new_items = list(items)
-            # Inserting at _cursor IS inserting behind the in-flight head, which is
+            # Inserting at _cursor IS inserting behind the in-flight head.
             # reversed(), or a multi-track insert lands backwards.
             for item in reversed(new_items):
                 self._items.insert(self._cursor, item)
@@ -472,9 +417,9 @@ class GuildQueue:
             if self._cursor:
                 await self._write_mirror(self._items)
             elif self._store is not None:
-                # An LPUSH of just the new items, not a replacement — so
-                # deliberately not _write_mirror's job. Reachable only with no
-                # in-flight head, where nothing ahead of them needs preserving.
+                # An LPUSH of just the new items, not a replacement — so not
+                # _write_mirror's job. Reachable only with no in-flight head,
+                # where nothing ahead of them needs preserving.
                 entries = [_to_entry(s) for s in new_items if is_persisted(s)]
                 if entries:
                     await self._store.push_queue_front(entries)
@@ -488,9 +433,8 @@ class GuildQueue:
 
     async def clear(self) -> list[QueueItem]:
         """Empty the queue, returning everything that was on it — the claimed
-        prefix included. The caller records these (MusicPlayer._flush_played), so
-        returning only what was pending would drop a parked -playnow tail's
-        play_history row with no error.
+        prefix included, because the caller records these
+        (MusicPlayer._flush_played) and a parked -playnow tail is in it.
 
         Bumps the generation under the mutex before draining: a dequeue already in
         flight — including one a prefetch claimed a song ago — captured the old
@@ -518,23 +462,17 @@ class GuildQueue:
         # 4, matching -help and the refusal message. Three items have only two
         # orderings that are not the input, which reads as a no-op.
         async with self._mutex:
-            # Inside the lock, not before it: acquiring suspends, and a clear() or
-            # remove() completing in that gap left this shuffling 0-1 items while
-            # still reporting "Shuffled!" and still issuing a full mirror rebuild.
+            # Counted inside the lock: acquiring suspends, and a clear() or
+            # remove() completing in that gap leaves nothing to shuffle.
             if self.qsize() < 4:
                 return ShuffleOutcome.TOO_FEW_SONGS
-            # A list round-trip, not an in-place shuffle: deque has no slicing,
-            # and Fisher-Yates over one measures 434us against 268 for this.
+            # A list round-trip because deque has no slicing.
             head = list(islice(self._items, 0, self._cursor))
             tail = list(islice(self._items, self._cursor, None))
             random.shuffle(tail)
             self._items = deque(head + tail)
             self._sync_wake()
 
-            # Was a skip rather than a DELETE when nothing persisted survived —
-            # unreachable (that needs 4+ crash-recovered items and restore_crashed
-            # makes one), and the DELETE is the safer of the two anyway: it heals a
-            # mirror holding entries memory no longer has.
             if tail:
                 await self._write_mirror(self._items)
 
@@ -546,20 +484,17 @@ class GuildQueue:
         a removed entry can be the last record of a song that already played. An
         in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset.
-
-        A predicate rather than a URL: the matching policy is remove_matcher's, and
-        keeping it out here is what lets it be tested without a queue."""
+        the numbering offset. The matching policy is remove_matcher's."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []
         modes: list[RemoveMode] = []
 
         async with self._mutex:
-            # One pass, and this enumerate IS the position contract: the queue
-            # embed numbers every item from 1 including the in-flight head, so a
-            # pending item sits at _cursor + 1 and up. Skipping `pos <= _cursor`
-            # is what keeps a claimed song un-removable while still counted.
+            # This enumerate IS the position contract: the queue embed numbers
+            # every item from 1 including the in-flight head, so a pending item
+            # sits at _cursor + 1 and up, and skipping `pos <= _cursor` keeps a
+            # claimed song un-removable while still counted.
             for pos, item in enumerate(self._items, start=1):
                 if pos <= self._cursor:
                     kept.append(item)
@@ -572,8 +507,7 @@ class GuildQueue:
                 else:
                     kept.append(item)
 
-            # Nothing matched: no structural mutation, so no mirror write and no
-            # legs to rebuild.
+            # Nothing matched: no mutation, so no mirror write.
             if not removed_positions:
                 return RemoveOutcome(removed=[], positions=[], mode=None)
 
@@ -584,9 +518,8 @@ class GuildQueue:
         return RemoveOutcome(
             removed=removed_items,
             positions=removed_positions,
-            # ORIGIN if it is anywhere in the run: a mixed match means the argument
-            # reached items the resolved URL alone would not have, which is the
-            # thing the reply has to explain.
+            # ORIGIN if it is anywhere in the run: the argument reached items the
+            # resolved URL alone would not have.
             mode=RemoveMode.ORIGIN
             if RemoveMode.ORIGIN in modes
             else RemoveMode.RESOLVED,
@@ -603,8 +536,7 @@ class GuildQueue:
         """Re-queue the crash-recovered "current song".
 
         APPENDS, and is the front only because its one caller (_restore_state)
-        runs it on an empty deque and calls restore_entries() after — nothing here
-        enforces that, so a second caller gets silently wrong ordering.
+        runs it on an empty deque and calls restore_entries() after.
         In memory only: the entry is persisted=False — its LPOP already
         committed, so it is not on the Redis list and the loop must not LPOP for it
         (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
@@ -649,12 +581,8 @@ class GuildQueue:
         same song answers True for the current one. Its one caller
         (MusicPlayer.enqueue_depth) then under-counts by one; accepted there.
 
-        O(len(_items)), and it only early-exits when a tail EXISTS — the common
-        no-interjection case is a full scan (measured 90us at 1000 entries,
-        synchronous, at -play dispatch). Left alone deliberately: a maintained
-        tail counter would be a second thing every bulk mutation has to keep in
-        step with the deque, which is the failure this class was rebuilt to end.
-        90us behind a 1-4s extraction does not buy that risk."""
+        O(len(_items)), early-exiting only when a tail exists: 90us at 1000
+        entries, synchronous, at -play dispatch."""
         return any(
             isinstance(item, QueueObject)
             and item.is_resume
@@ -671,8 +599,7 @@ class GuildQueue:
         The interjected song is not always at index 0 — put_front inserts behind a
         dequeued-but-uncommitted item — so the run starts after the claimed prefix,
         which _cursor names directly."""
-        # islice, not list(...)[start:]: two full copies to read a run that is
-        # almost always 1-3 long measured 46.7us at n=5000 against 0.29us flat.
+        # islice, not a slice copy: the run read here is almost always 1-3 long.
         depth = 0
         for item in islice(self._items, self._cursor + 1, None):
             if not (isinstance(item, QueueObject) and item.is_resume):
@@ -716,17 +643,15 @@ class GuildQueue:
         every loop failure path shares. `context` labels the nothing-claimed
         warning. The mutex spans the settle and the LPOP so a bulk mutation cannot
         rebuild the mirror between them and have the LPOP hit the new head.
+        `persisted` overrides what `item` says about itself — see redis_pop_for.
 
         `persisted` overrides what `item` says about itself, and exists for the one
         caller holding a claim it cannot describe with a QueueItem — see
         redis_pop_for.
 
-        The LPOP is GATED on the settle, and the two must not drift apart: nothing
-        claimed means a clear() already retired this item and reset the cursor, so
-        the mirror holds only whatever was queued afterwards. Popping it anyway
-        deletes a song this failure had nothing to do with — at-most-once, so the
-        entry is simply gone, and the warning below names the memory leg rather
-        than the deletion."""
+        The LPOP is GATED on the settle: nothing claimed means a clear() already
+        retired this item and reset the cursor, so the mirror holds only what was
+        queued afterwards and popping it deletes an unrelated song."""
         async with self._mutex:
             if not self.try_release():
                 log.warning(
@@ -786,13 +711,10 @@ class GuildQueue:
         delete an unrelated, still-queued song.
 
         `persisted` is for a caller whose claim is not a QueueItem it can hand
-        over: the playback loop settles a claim it took as a prefetched YTDL, and
-        the answer lives on that object rather than on anything passed here. It is
-        NOT a convenience — item=None defaults to popping, and a prefetch really
-        can hold an unpersisted claim (a cold-start -play front-inserts at cursor
-        0, which is AHEAD of a crash-recovered head, so the prefetch behind it
-        takes that head), so the default is wrong for exactly that case and only
-        an explicit False says so."""
+        over: the playback loop settles a claim it took as a prefetched YTDL. That
+        claim can be unpersisted — a cold-start -play front-inserts at cursor 0,
+        AHEAD of a crash-recovered head, so the prefetch behind it takes that head
+        — and item=None defaults to popping, so only an explicit False says so."""
         if persisted is None:
             persisted = is_persisted(item)
         if self._store is not None and persisted:
@@ -804,32 +726,24 @@ class GuildQueue:
         self, items: Sequence[QueueItem], *, removed: Sequence[QueueItem] = ()
     ) -> None:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
-        order — by whichever of three writes is right.
+        order — by whichever of DELETE, LREM or rebuild is right.
 
-        Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
-        where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation
+        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
         mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
         predates them. persisted=False items were never RPUSHed — never write them in.
 
-        Empty means DELETE, not skip: a queue whose every persisted entry just went
-        would otherwise leave the old list behind for the next restore to find.
+        Empty means DELETE, not skip, or the old list survives for the next restore
+        to find.
 
-        `removed` is the LREM shortcut, and only a removal may pass it: it says the
-        survivors kept their order, which is false for shuffle and for any insert.
-        Worth it because a rebuild rewrites every survivor while LREM touches only
-        what goes — but only up to a COUNT, not a ratio: both sides scale with
-        depth and it cancels, so _LREM_MAX_ENTRIES is the clause that matters and
-        _LREM_MAX_SHARE only keeps shallow queues on the rebuild. See the
-        measurements above the two constants.
-
-        The shortcut is guarded twice, because LREM matches on exact bytes and the
-        rest of the codebase does not promise them. It is skipped outright when a
-        removed blob is byte-identical to a claimed item's — LREM takes the
-        head-most copy, which would be the entry awaiting a commit-time LPOP. And
-        it falls back to the rebuild when fewer entries were removed than asked
-        for, which is what a queued object mutated after its entry was written
-        looks like (a resume tail gaining np_* ids, an enriched duration, a
-        substituted requester). The rebuild cannot be wrong by construction.
+        `removed` is the LREM shortcut, and only a removal may pass it: LREM assumes
+        the survivors kept their order, which is false for shuffle and for any
+        insert. It is capped by COUNT (see _LREM_MAX_ENTRIES) and guarded twice more,
+        because LREM matches on exact bytes: skipped outright when a removed blob is
+        byte-identical to a claimed item's, since LREM takes the head-most copy —
+        the entry awaiting a commit-time LPOP — and falling through to the rebuild
+        on a short count, which is what a queue object mutated after its entry was
+        written looks like.
         """
         if self._store is None:
             return
@@ -863,9 +777,8 @@ class GuildQueue:
 
     def _claimed_blobs(self, dropped_blobs: Sequence[bytes]) -> bool:
         """True when any entry about to be LREMed serializes exactly like a CLAIMED
-        item's. remove() never removes a claimed item, but LREM cannot see that rule
-        — it takes the head-most equal element, which is the one awaiting its
-        commit-time LPOP."""
+        item's. LREM takes the head-most equal element, which would be the entry
+        awaiting its commit-time LPOP."""
         if not self._cursor:
             return False
         claimed = {

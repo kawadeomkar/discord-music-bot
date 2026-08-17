@@ -336,17 +336,14 @@ class TestYtStreamCarriesTheQueueObjectsFields:
         assert not mismatched, f"dropped between QueueObject and YTDL: {mismatched}"
 
     async def test_persisted_survives_the_hop(self, mock_ctx: MagicMock) -> None:
-        """`persisted` reached the YTDL last, and its absence was a live crash
-        rather than a silent drop: `_neutralize_prefetch` reads it back off the
-        playing song to rebuild a QueueObject, so every `-playnow` over a
-        COMPLETED prefetch raised AttributeError — failing the command and
-        stranding the prefetch's claim, which the next commit then settled onto
-        the wrong song.
+        """`_neutralize_prefetch` reads `persisted` back off the playing song to
+        rebuild a QueueObject, so a YTDL without it raises AttributeError on every
+        `-playnow` over a COMPLETED prefetch — failing the command and stranding
+        the claim, which the next commit then settles onto the wrong song.
 
-        False is the value that matters. It marks the crash-recovered head, whose
-        entry is NOT on the Redis list; defaulting it to True in the rebuild would
-        write that head into the mirror, where its dequeue never LPOPs and every
-        later entry sits one place out."""
+        False is the value that matters: it marks the crash-recovered head, whose
+        entry is NOT on the Redis list, and a rebuild defaulting to True writes
+        that head into the mirror, where its dequeue never LPOPs."""
         qobj = QueueObject(
             "https://www.youtube.com/watch?v=test",
             "Test Song",

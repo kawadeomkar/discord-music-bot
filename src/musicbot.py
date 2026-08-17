@@ -227,14 +227,12 @@ _ENQUEUE_MAX_WAITERS = 5
 # Timing out keeps what arrived. See docs/ARCHITECTURE.md#queue-invariant.
 _COLLECTION_DRAIN_TIMEOUT_SECS = 45.0
 
-# What a user typed, echoed back into an embed. Discord renders markdown in embed
-# descriptions and field values, so an unescaped needle lets any member make the
-# bot post a styled masked link under its own name. Bounds the SINGLE-needle
-# fields; a field built from a list is clamped again by _field().
+# Bound on one echoed needle, which owns a field to itself. Discord renders
+# markdown in field values, so what a user typed goes through safe_label first;
+# a field built from a list is clamped again by _field().
 _ECHO_MAX = 200
 
-# One row of a multi-row field. Tighter than _ECHO_MAX because ten of these share
-# the budget one needle gets to itself.
+# One row of a multi-row field — ten of these share the budget one needle gets.
 _ECHO_ROW_MAX = 70
 
 # How many rows queue_message() keeps. Slice a list to _ECHO_ROWS + 1 before
@@ -244,33 +242,29 @@ _ECHO_ROW_MAX = 70
 # The +1 feeds queue_message's own "…" test, which needs more rows than it keeps.
 _ECHO_ROWS = 10
 
-# The most dropped positions worth spelling out. Past this the list is a wall of
-# numbers that answers nothing the count above it did not.
+# The most dropped positions worth spelling out; past this the list says nothing
+# the count above it did not.
 _MAX_SHOWN_POSITIONS = 60
 
 
 def _echo(text: str, limit: int = _ECHO_MAX) -> str:
-    """A needle safe to put in an embed — see util.safe_label for what each step
-    covers. Kept as a named wrapper because the default bound is this command's
-    (one needle, one field) rather than a property of the sanitizing."""
+    """A needle safe to put in an embed — see util.safe_label."""
     return safe_label(text, limit)
 
 
 def _removed_label(item: QueueItem) -> str:
-    """A removed queue item's name for the reply. Mirrors
-    MusicPlayer.queue_clear's rendering rather than reaching for `.title`:
-    `YTSource` has no title at all, so an unresolved Spotify-playlist track — the
-    exact case the Songs field was added for — rendered as `?` for every row."""
+    """A removed queue item's name for the reply, as MusicPlayer.queue_clear
+    renders it: `YTSource` has no title, so an unresolved Spotify-playlist track
+    would otherwise show as `?`."""
     if isinstance(item, QueueObject):
         return item.title or "?"
     return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def _field(value: str) -> str:
-    """An embed field value that cannot 400 the send. The last guard before
-    Discord, deliberately dumb: the callers below build from lists whose length
-    is the user's to choose, and the send happens AFTER the queue has already
-    been mutated \u2014 so a field that is merely usually short is not good enough.
+    """An embed field value that cannot 400 the send. The callers below build from
+    lists whose length is the user's to choose, and the send happens AFTER the
+    queue has been mutated.
 
     truncate_escaped, because callers join rows that already went through _echo:
     ten rows capped pre-escape at _ECHO_ROW_MAX reach ~1440 characters once
@@ -279,16 +273,11 @@ def _field(value: str) -> str:
 
 
 def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
-    """How the removal matched, for the reply's "Matched" field.
-
-    An origin match is the one that needs explaining: one argument can take out a
-    whole album or playlist, so the reply names which of the user's own inputs did
-    it. The
-    resolved-URL case reads as it always has.
-    """
-    # Not wrapped in a code span. The needle is escaped, so markdown cannot fire
-    # either way — but INSIDE a span Discord renders the backslashes literally, so
-    # `-remove foo_bar` came back as `foo\_bar`. Outside one they collapse.
+    """How the removal matched, for the reply's "Matched" field. An origin match
+    names which of the user's own inputs did it, since one argument can take out a
+    whole album or playlist."""
+    # Not wrapped in a code span: inside one Discord renders safe_label's
+    # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
     shown = _echo(needle)
     if outcome.mode is not RemoveMode.ORIGIN:
         return shown
@@ -1671,13 +1660,10 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
-        # Consume-rest, so a multi-word search arrives whole. It is what -remove
-        # matches on, and a positional would bind only "never" out of "never gonna
-        # give you up" — making that removable by a prefix nobody typed.
-        # parse_input reads the search off the message either way; only the origin
-        # changes. Unquoted because read_rest, unlike the positional parser it
-        # replaced, hands the quotes through — and `origin` is stamped from this
-        # value, so a quoted one is what -remove would then have to match.
+        # Consume-rest, so a multi-word search arrives whole: this value is what
+        # `origin` is stamped from, and -remove matches on that. read_rest hands
+        # the quotes through, hence the unquote — a quoted origin is one -remove
+        # would have to match literally.
         url = unquote_argument(url.strip())
         async with background_typing(ctx):
             try:
@@ -2713,11 +2699,10 @@ class MusicBot(commands.Cog):
             count = len(positions)
             noun = pluralize(count, "song")
             pos_label = pluralize(count, "Position")
-            # Capped by COUNT, not just clamped by length: one -remove of a
-            # collection link drops as many positions as the collection had, and
-            # a raw join passes 1024 characters at 227 of them — which 400s the
-            # send AFTER queue_remove() has already mutated memory and Redis, so
-            # the user is told the command failed for a removal that happened.
+            # Capped by count: one -remove of a collection link drops as many
+            # positions as the collection had, and a raw join passes the 1024-char
+            # field limit at 227 of them — a 400 for a removal that already
+            # happened.
             shown = positions[:_MAX_SHOWN_POSITIONS]
             pos_str = ", ".join(str(p) for p in shown)
             if len(positions) > len(shown):
@@ -2730,9 +2715,9 @@ class MusicBot(commands.Cog):
                 fields=[
                     ("Matched", _field(_matched_label(outcome, needle)), False),
                     (f"{pos_label} removed", _field(pos_str), False),
-                    # Titles, like -clear reports: one argument can now take out a
-                    # whole playlist, and a bare count leaves the user unable to
-                    # tell whether it took what they meant. There is no undo.
+                    # Titles, like -clear reports: one argument can take out a whole
+                    # playlist, and there is no undo, so a bare count is not enough
+                    # to tell whether it took what the user meant.
                     (
                         "Songs",
                         _field(

@@ -167,8 +167,7 @@ FOOTER_LIMIT = 2048
 
 # The same again, for a field VALUE. A field built from a list the user can grow
 # (removed songs, dropped positions) has no natural ceiling, and the 400 lands
-# after the command has already mutated state — so clamp at the boundary rather
-# than trusting the caller's arithmetic about how long its inputs can get.
+# after the command has already mutated state.
 EMBED_FIELD_LIMIT = 1024
 
 # The same again, for a DESCRIPTION. Enforced in send_embed rather than at each
@@ -180,8 +179,8 @@ EMBED_FIELD_LIMIT = 1024
 EMBED_DESCRIPTION_LIMIT = 4096
 
 
-# Control characters end a rendered embed line early, which is how text can hide
-# whatever follows it. Flattened rather than escaped — they have no visible form.
+# Control characters end a rendered embed line early, hiding whatever follows.
+# Flattened rather than escaped — they have no visible form.
 _LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -190,14 +189,13 @@ def safe_label(text: str, limit: int) -> str:
     uploader name — rendered into an embed without being able to style it or
     forge a link.
 
-    Three neutralizations, then the escape, because `escape_markdown` covers none
-    of them: `[` and `]` are not in its set at all and are the half of a masked
-    link that picks the label; a backtick closes any code span the caller wrapped
-    this in, where a backslash means nothing; and `ignore_links` defaults to TRUE,
-    passing an entire http(s) token through untouched.
+    Three neutralizations before the escape, because `escape_markdown` covers none
+    of them: `[`/`]` are not in its set and are what picks a masked link's label; a
+    backtick closes any code span the caller wrapped this in; and `ignore_links`
+    defaults to TRUE, passing a whole http(s) token through untouched.
 
-    Cap BEFORE escaping — escaping first and cutting after can split an escape
-    pair and leave a trailing backslash that eats the next character."""
+    Cap BEFORE escaping: cutting after can split an escape pair and leave a
+    trailing backslash that eats the next character."""
     flattened = _LABEL_UNSAFE.sub(" ", text)
     clipped = truncate(flattened, limit)
     neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")

@@ -804,14 +804,11 @@ class TestQueueClearFlushesPlayedSongs:
     async def test_only_the_generation_refuses_when_the_refill_is_claimed(
         self, music_player: MusicPlayer, mock_author: MagicMock
     ) -> None:
-        """The test above no longer reaches the generation check. Under the single
-        deque, clear() resets the cursor, so try_release() refuses on its own and
-        the check is never consulted — it passed for a different reason than it
-        used to, and deleting the check left the suite green.
-
-        A SECOND consumer is what reaches the state only the generation can refuse:
-        the prefetch claims the refill, so there IS a claim to settle, and without
-        the check the stale commit would settle the new song's."""
+        """The test above does not reach the generation check: clear() resets the
+        cursor, so try_release() refuses on its own. A SECOND consumer reaches the
+        state only the generation can refuse — the prefetch claims the refill, so
+        there IS a claim to settle, and without the check the stale commit would
+        settle the new song's."""
         first = QueueObject("https://yt.com/v=first", "First", mock_author)
         await music_player.queue_put(first)
         assert music_player.queue.get_nowait() is first  # the loop claims
@@ -6382,8 +6379,8 @@ class TestLoopClaimAccounting:
         )
         refill = QueueObject("https://yt.com/v=refill", "Refill", mock_author)
         # No voice client, so a commit that wrongly SUCCEEDS falls straight into
-        # the outer handler instead of hanging on play_next — the mutation should
-        # fail by assertion, not by timeout.
+        # the outer handler instead of hanging on play_next: this fails by
+        # assertion rather than by timeout.
         mocked(music_player._guild).voice_client = None
 
         async def clear_refill_and_claim(_self: MusicPlayer, source: Any) -> MagicMock:
@@ -6414,14 +6411,11 @@ class TestLoopClaimAccounting:
     async def test_a_raise_after_the_commit_does_not_eat_the_next_song(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """C3. try_commit_dequeue settles the claim, so the flag guarding the
-        handler's release must be cleared there — not at song end, 253 lines later.
-        Left standing across the song, the release pops index 0, which by then is
-        the NEXT song once the prefetch claims it.
-
-        _send_now_playing is the raiser because it is awaited inline after the
-        commit; the prefetch is spawned as a task, so a raise there never reaches
-        this handler."""
+        """try_commit_dequeue settles the claim, so the flag guarding the handler's
+        release is cleared there rather than at song end: left standing across the
+        song, the release pops index 0, which by then is the NEXT song once the
+        prefetch claims it. _send_now_playing is the raiser because it is awaited
+        inline after the commit."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -8508,15 +8502,11 @@ async def _raising_commit() -> AsyncGenerator[bool]:
 
 
 class TestPrefetchedHeadRespectsPersistence:
-    """The prefetched branch of loop() used to hardcode `should_pop_queue = True`,
-    on the reasoning that a prefetched item always came through queue_get() and is
-    therefore mirrored. A crash-recovered head is not.
-
-    Reachable without a crash of its own: `-play` on a DISCONNECTED bot inserts at
-    cursor 0, which is AHEAD of the head `_restore_state` appended, so the prefetch
-    that follows claims that head. LPOPing for an entry that was never on the list
-    deletes the next real one instead — silently, at-most-once, surfacing only as a
-    queue one song short after the next restart.
+    """A prefetched claim can be a crash-recovered head, which is on no Redis list:
+    `-play` on a DISCONNECTED bot inserts at cursor 0, AHEAD of the head
+    `_restore_state` appended, so the prefetch behind it claims that head. LPOPing
+    for an entry that was never on the list deletes the next real one instead —
+    at-most-once, surfacing only as a queue one song short after the next restart.
 
     Driven through two real loop iterations, because that is the only way into the
     branch: iteration 1 spawns the prefetch, iteration 2 consumes its result."""
@@ -8603,13 +8593,10 @@ class TestPrefetchedHeadRespectsPersistence:
 
 class TestFailedPrefetchedClaimRespectsPersistence:
     """The same rule on the FAILURE leg. The start path reads `persisted` off the
-    song; the outer handler used to re-derive it from `source`, which the
-    prefetched branch leaves None — and None defaults to popping.
-
-    So an exception between the claim and the commit retired a real Redis entry
-    for a crash-recovered head that never had one, deleting the next queued song.
-    `claim_persisted` is carried from the claim to the handler so neither end has
-    to guess."""
+    song, and the outer handler cannot re-derive it from `source`, which the
+    prefetched branch leaves None — and None defaults to popping, which would
+    retire a real entry for a head that never had one. `claim_persisted` is
+    carried from the claim to the handler so neither end has to guess."""
 
     async def _run_until_it_breaks(
         self,
@@ -8875,9 +8862,7 @@ class TestNeutralizePrefetch:
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
     ) -> None:
         """The rebuild is one of two places a playing song becomes a queue object
-        again, and both fields below have already been lost here.
-
-        `user_input` is what -remove matches on, so dropping it leaves the
+        again. `user_input` is what -remove matches on, so dropping it leaves the
         neutralized track the one entry its own collection link cannot take back
         out. `persisted` decides whether the dequeue LPOPs: defaulted to True on a
         crash-recovered head it writes an entry into the mirror that was never on

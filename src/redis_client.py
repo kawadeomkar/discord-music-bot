@@ -886,6 +886,12 @@ class GuildRedisStore:
         and memory have diverged and only a rebuild can be trusted. A Redis failure
         returns 0 through @_guild_op and takes the same path.
 
+        Matching is by exact serialized bytes, so a queued object mutated after its
+        entry was written matches nothing. Hence the count: short of what it asked
+        for means the mirror no longer holds what memory does and only a rebuild
+        can be trusted. A Redis failure returns 0 through @_guild_op and takes the
+        same path.
+
         Counted per distinct serialization, never LREM ... 0: two enqueues of one
         song usually differ on the wire (queue_position, queued_at), but when they
         do not, removing "all matching" would take out a copy still queued.
