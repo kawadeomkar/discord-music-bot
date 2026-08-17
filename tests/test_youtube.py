@@ -28,6 +28,7 @@ from src.youtube import (
     _STREAM_CANDIDATES,
     _UNUSED_INFO_COLLECTIONS,
     _mine_audio_candidates,
+    select_search_entry,
     _YTDL_PLAYLIST_OPTS,
     _YTDL_STREAM_OPTS,
     _YTDL_STREAM_SEARCH_OPTS,
@@ -1082,6 +1083,37 @@ class TestYTStream:
         assert "volume=0.5" in captured_options["options"]
         assert "volume" not in captured_options["before_options"]
 
+    async def test_a_zero_timestamp_is_not_a_seek(self, mock_ctx: MagicMock) -> None:
+        """`?t=0` is a real input (sources.py int()s it), and "start at the start" is
+        what no seek already does. Taking the seek path for it shipped a two-pass -ss
+        that costs an Opus pre-skip packet for nothing, and made "no seek" and "seek
+        to zero" two different code paths."""
+        qobj = QueueObject(
+            "https://www.youtube.com/watch?v=test", "Test Song", mock_ctx.author, ts=0
+        )
+        captured: dict[str, str] = {}
+
+        def capture_init(
+            self: Any,
+            url: str,
+            *,
+            before_options: str,
+            options: str,
+            **kwargs: Any,
+        ) -> None:
+            noop_ffmpeg_init(self)
+            captured["before_options"] = before_options
+            captured["options"] = options
+
+        with (
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data()),
+            patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
+        ):
+            await YTDL.yt_stream(qobj, AsyncMock(spec=discord.TextChannel))
+
+        assert "-ss" not in captured["before_options"]
+        assert "-ss" not in captured["options"]
+
     async def test_yt_stream_carries_ts_as_start_offset(
         self, mock_ctx: MagicMock
     ) -> None:
@@ -1436,6 +1468,27 @@ class TestCandidateLadderWalk:
         # nothing to fall back to, and a rung can fail for reasons that pass (one CDN
         # host 503ing) and deserve a later retry.
         assert [c["format_id"] for c in cached["audio_candidates"]] == ["249", "251"]
+
+    async def test_a_promotion_clears_the_dead_formats_metadata(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
+    ) -> None:
+        """The promotion REPLACES the format shape rather than merging over it.
+        _candidate_shape omits keys a format does not carry, so a merge left the dead
+        format's abr/asr in place and the Now Playing footer advertised a bitrate the
+        stream was not using."""
+        url = "https://yt.com/v=stale"
+        data = self._laddered(url, "251", "140")
+        alternative = cast(dict[str, Any], data)["audio_candidates"][0]
+        del alternative["abr"]
+        del alternative["asr"]
+        await self._cache(fake_redis, data)
+        playable_urls.side_effect = [False, True]
+
+        song = await self._play(fake_redis, url, mock_ctx.author)
+
+        assert song.data.get("format_id") == "140"
+        assert song.abr is None
+        assert song.asr is None
 
     async def test_a_promotion_does_not_extend_the_entrys_life(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -2239,6 +2292,35 @@ class TestAudioCandidateMining:
         is also a cached field, or a promotion would not survive the round trip."""
         assert set(self._mine()[0]) == set(_CANDIDATE_FIELDS)
         assert set(_CANDIDATE_FIELDS) <= set(_STREAM_CACHE_FIELDS)
+
+
+class TestSearchEntryPicker:
+    """One rule, two callers: yt_source picks the entry to play and `just
+    ytdl-formats` reports on it. Two copies would drift, and the diagnostic built to
+    answer "what would the bot play?" would then answer for a different song."""
+
+    def test_an_entry_with_a_stream_url_wins(self) -> None:
+        entries = [
+            {"_type": "url", "id": "a"},
+            {"_type": "video", "id": "b", "url": "https://b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "b"
+
+    def test_the_first_non_playlist_entry_is_the_fallback(self) -> None:
+        """No entry carries a URL — an unrecognised shape still plays rather than
+        failing outright, which is why this is not `next(..., None)`."""
+        entries = [
+            {"_type": "playlist", "id": "p"},
+            {"_type": "video", "id": "a"},
+            {"_type": "video", "id": "b"},
+        ]
+        chosen = select_search_entry(cast(Any, entries))
+        assert chosen is not None and chosen.get("id") == "a"
+
+    def test_nothing_playable_is_none_not_an_index_error(self) -> None:
+        """An all-playlist result used to IndexError inside the diagnostic."""
+        assert select_search_entry(cast(Any, [{"_type": "playlist"}, None])) is None
 
 
 class TestSlimInfoReturnContract:

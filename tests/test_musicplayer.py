@@ -7339,6 +7339,30 @@ class TestStreamRetry:
 
         assert self._front(music_player).played_at == 0.0
 
+    async def test_a_retry_drops_the_np_card_it_already_consumed(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The pointer is a one-shot: a resume tail disposes of its predecessor's
+        frozen card as it starts, and this song started. Carried, every further
+        attempt would delete a message the first one already removed and re-announce
+        "Resuming…" beside the retry notice — three notices for one play.
+
+        The neutralized-prefetch rebuild, which shares this helper, deliberately KEEPS
+        it: that song never started, so the disposal is still owed."""
+        mock_song.is_resume = True
+        mock_song.start_offset = 95
+        mock_song.np_message_id = 777777777777777777
+        mock_song.np_channel_id = 888888888888888888
+        mock_song.np_dedicated = True
+
+        await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        retry = self._front(music_player)
+        assert retry.np_message_id == 0
+        assert retry.np_channel_id == 0
+        assert retry.np_dedicated is False
+        assert retry.np_host_ref is None
+
     async def test_a_retry_never_comes_back_paused(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
