@@ -89,9 +89,12 @@ HISTORY_CACHE_LIMIT = 50
 # can't drift by hand-editing one and forgetting the other.
 # ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
 # since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
-# _start_paused in the hash and from_crashed_state can later read a value belonging
-# to a song that finished under the old build. Bounded: this build rewrites all
-# three on every song start. Delete once no rollback target predates them.
+# _start_paused / _user_input in the hash and from_crashed_state can later read a
+# value belonging to a song that finished under the old build. Bounded: this build
+# rewrites all four on every song start, and a stale _user_input makes
+# `-remove <album link>` take out an unrelated recovered song. Keep this list
+# complete: it is where the "delete once no rollback target predates them"
+# condition is computed from.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -863,14 +866,17 @@ class GuildRedisStore:
         Returns HOW MANY were actually removed — the caller must check it.
 
         The alternative to rebuild_queue for a small removal: LREM touches only what
-        goes, while a rebuild rewrites the whole list whatever it drops. Far enough
-        up, the per-LREM scans overtake it — GuildQueue owns that threshold.
+        goes, while a rebuild rewrites the whole list whatever it drops (measured on
+        redis:7-alpine at depth 1000: 0.96 ms for one entry against ~5.7 ms to
+        rebuild). Far enough up, the per-LREM scans overtake it — GuildQueue owns
+        the threshold and the measurement behind it.
 
-        Matching is by exact serialized bytes, so a queued object mutated after its
-        entry was written matches nothing. Hence the count: short of what it asked
-        for means the mirror no longer holds what memory does and only a rebuild
-        can be trusted. A Redis failure returns 0 through @_guild_op and takes the
-        same path.
+        Matching is by exact serialized bytes, which is an assumption about the rest
+        of the codebase rather than about Redis: a queued object mutated after its
+        entry was written no longer serializes to what is stored, and the LREM then
+        silently matches nothing. Hence the count — a short return means the mirror
+        and memory have diverged and only a rebuild can be trusted. A Redis failure
+        returns 0 through @_guild_op and takes the same path.
 
         Counted per distinct serialization, never LREM ... 0: two enqueues of one
         song usually differ on the wire (queue_position, queued_at), but when they
