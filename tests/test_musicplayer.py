@@ -7383,6 +7383,46 @@ class TestStreamRetry:
         assert retry.ts == 95
         assert retry.played_at == 1752529000.0
 
+    async def test_a_retried_resume_tail_stays_claimable_until_it_is_queued(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+    ) -> None:
+        """The other half of deferring that write. Between the history gate and
+        put_front the song exists ONLY as the loop's local — not in the queue, not in
+        Redis, not in the state hash — across a cache-invalidation round trip. A -stop
+        or an idle disconnect landing there would lose audio the guild actually heard,
+        with no row and no log line, because claim_current_song_for_history() declines
+        anything that produced no frames.
+
+        So a resume tail stays claimable for exactly that gap, and stops being
+        claimable the moment the retry is on the queue, where _flush_played covers it.
+        """
+        mock_song.is_resume = True
+        mock_song.start_offset = 95
+        mock_song.played_at = 1752529000.0
+        claimed: list[Any] = []
+        # Patched on the CLASS: MusicPlayer defines __slots__, so an instance
+        # attribute cannot be replaced.
+        original = MusicPlayer._retry_failed_stream
+
+        async def _spy(player: MusicPlayer, song: Any) -> None:
+            claimed.append(player.claim_current_song_for_history())
+            # The claim takes _skip_history_for; undo it so the real path runs
+            # exactly as it would have.
+            player._skip_history_for = None
+            await original(player, song)
+
+        with patch.object(MusicPlayer, "_retry_failed_stream", new=_spy):
+            await self._run_failed_iteration(music_player, queue_obj, mock_song)
+
+        assert claimed[0] is not None, "the heard audio was unclaimable mid-retry"
+        assert claimed[0].webpage_url == mock_song.webpage_url
+        # At least the offset that was heard under the fragment which parked it.
+        assert claimed[0].played_secs >= 95
+        assert music_player.claim_current_song_for_history() is None
+
     async def test_a_never_heard_retry_carries_no_start_stamp(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
@@ -7730,6 +7770,28 @@ class TestInterject:
         resume = music_player.queue.display_items()[1]
         assert isinstance(resume, QueueObject)
         assert resume.query_source == "spotify.com"
+
+    async def test_resume_tail_inherits_the_user_input(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """The tail is the same ask, so -remove still matches it by what the user
+        typed. Pinned with a non-default value: `user_input=None` is both the double's
+        default and a QueueObject's, so dropping the field here is invisible to any
+        test that does not set it to something real first.
+        """
+        live_song.elapsed_secs = 42.0
+        live_song.user_input = "https://open.spotify.com/album/abc123"
+        music_player.current_song = live_song
+
+        await music_player.interject(playnow_obj, mock_vc)
+
+        resume = music_player.queue.display_items()[1]
+        assert isinstance(resume, QueueObject)
+        assert resume.user_input == "https://open.spotify.com/album/abc123"
 
     async def test_resume_tail_resets_the_retry_budget(
         self,
@@ -8448,6 +8510,47 @@ class TestNeutralizePrefetch:
         rebuilt = music_player.queue.get_nowait()
         assert isinstance(rebuilt, QueueObject)
         assert rebuilt.query_source == "spotify.com"
+
+    async def test_completed_task_rebuild_keeps_user_input_and_persisted(
+        self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock
+    ) -> None:
+        """The two fields this rebuild has silently lost before, pinned with
+        NON-DEFAULT values — the whole reason they were droppable unnoticed is that
+        the song doubles carry `user_input=None` and `persisted=True`, which are
+        exactly what a QueueObject built without them defaults to.
+
+        `user_input` is the only surviving record of the collection link -remove
+        matches on. `persisted=False` means the entry was never RPUSHed (a
+        crash-recovered head), so rebuilding it as True makes its next dequeue LPOP
+        an unrelated song's entry.
+        """
+        original = QueueObject(
+            "https://yt.com/v=orig",
+            "Recovered Song",
+            mock_author,
+            user_input="https://open.spotify.com/album/abc123",
+            persisted=False,
+        )
+        await music_player.queue.put([original])
+        assert music_player.queue.get_nowait() is original
+
+        live_song.user_input = "https://open.spotify.com/album/abc123"
+        live_song.persisted = False
+        live_song.cleanup = MagicMock()
+
+        async def _done() -> MagicMock:
+            return live_song
+
+        task = asyncio.create_task(_done())
+        await task
+        music_player._prefetch_task = task
+
+        await music_player._neutralize_prefetch()
+
+        rebuilt = music_player.queue.get_nowait()
+        assert isinstance(rebuilt, QueueObject)
+        assert rebuilt.user_input == "https://open.spotify.com/album/abc123"
+        assert rebuilt.persisted is False
 
     async def test_completed_task_rebuild_keeps_interjected_flag(
         self, music_player: MusicPlayer, live_song: MagicMock, mock_author: MagicMock

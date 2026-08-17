@@ -6,6 +6,7 @@ no worker process: the class owns lifecycle, not extraction, and its logic is ab
 exception — it spawns for real; see its docstring."""
 
 import asyncio
+import multiprocessing
 import os
 import pickle
 import threading
@@ -18,7 +19,7 @@ from concurrent.futures import (
 )
 from concurrent.futures.process import BrokenProcessPool
 from logging.handlers import QueueListener
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -28,6 +29,7 @@ from src.ytdlp_pool import (
     YtdlpPool,
     _picklable_call,
     _MAX_TASKS_PER_CHILD,
+    _pool_context,
     _warmup_noop,
     _worker_init,
 )
@@ -157,11 +159,30 @@ class TestLazyCreation:
                 initializer=_worker_init,
                 initargs=(pool._log_queue,),
                 max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+                mp_context=ANY,
+            )
+            # The context is passed EXPLICITLY, and it is the platform's own default.
+            # Omit it and CPython silently forces spawn wherever a task budget is set,
+            # which on Linux replaces 3.14's forkserver default and measured 23-30x
+            # slower worker startup — invisible on macOS, where spawn is the default
+            # anyway, so only an assertion on the passed value can catch it.
+            assert (
+                ctor.call_args.kwargs["mp_context"].get_start_method()
+                == multiprocessing.get_start_method()
             )
             # the real spawn path starts a listener to drain that queue into the parent
             assert pool._log_listener is not None
         finally:
             pool.shutdown(wait=False)
+
+    def test_the_pool_context_never_uses_fork(self) -> None:
+        """`fork` is rejected outright by max_tasks_per_child, and forking a
+        multi-threaded asyncio process is unsafe regardless — so a host whose default
+        is fork falls to forkserver rather than failing to build a pool at all."""
+        with patch(
+            "src.ytdlp_pool.multiprocessing.get_start_method", return_value="fork"
+        ):
+            assert _pool_context().get_start_method() in ("forkserver", "spawn")
 
     def test_generation_increments_per_executor_built(self) -> None:
         """Rebuild bumps the counter so logs from either side of a break are

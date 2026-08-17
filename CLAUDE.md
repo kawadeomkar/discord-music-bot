@@ -726,10 +726,14 @@ decryption, format selection), so it runs on a `ProcessPoolExecutor`
 (`YTDLP_POOL_WORKERS`, default 4; ~80–120 MB RSS each). Lifecycle only — the callable is
 supplied per call, which is the seam tests use. Lazy creation (workers re-import parent
 modules under spawn); `prewarm()` from setup_hook; a `BrokenProcessPool` (e.g. OOM-killed
-worker) is healed by rebuild-and-retry ONCE, and `max_tasks_per_child=64`
+worker) is healed by rebuild-and-retry ONCE, and `max_tasks_per_child=16`
 (`_MAX_TASKS_PER_CHILD`) recycles a worker before it grows enough to get there — the
-respawn amortizes to nothing against 3–5s extractions, and needs spawn/forkserver
-(the 3.14 default); worker logs travel a
+budget is measured, not chosen (RSS holds ~+5MB/extraction from task 12 to 24, so 16
+caps a worker near 300MB where 64 would have reached ~500MB and the pool ~2GB). The
+start method is passed EXPLICITLY (`_pool_context`): setting a task budget with no
+`mp_context` makes CPython force `spawn`, which on Linux silently replaces 3.14's
+forkserver default and measured 23–30× slower worker startup (0.040s → 0.933s for
+four cold workers). Do not drop that argument; worker logs travel a
 multiprocessing Queue → parent `QueueListener` → the parent's handlers (so yt-dlp's
 SABR/PO-token/signature warnings — the early-warning system for YouTube rule changes —
 reach Loki structured, with `worker_id` and propagated `trace_id`). Results are made
@@ -776,18 +780,28 @@ output-side alone downloads and decodes from 0:00 (a 40min-in crash recovery pul
 overstate everywhere and a `-playnow` resume would replay. `-accurate_seek` is already
 the default and does not fix it;
 volume via `-filter:a volume=` (which is why `-volume` applies from the
-next song). **Opus passthrough**: when the served format is already opus (251/249,
-~90% of serves) AND volume == 1.0, `codec="copy"` remuxes instead of
+next song). **Opus passthrough**: `codec="copy"` remuxes instead of
 decode-and-re-encode — discord.py resolves `codec` to `-c:a copy` only for
 `('opus','libopus','copy')`, and its own route there (`from_probe`) is an ffprobe round
-trip per song we skip, since the extraction already told us `acodec`. Removes one lossy
-generation (YouTube's ~129k opus was being re-encoded to 128k) and most of the per-song
-CPU. A volume filter has to touch samples, so it forces the encoder. `read()` counts
+trip per song we skip, since the extraction already told us the format. Removes one
+lossy generation (YouTube's ~129k opus was being re-encoded to 128k) and most of the
+per-song CPU. `_passthrough_codec` is the gate and **all four clauses are required**,
+because `-c:a copy` also discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always
+emits: `acodec` opus; `volume == 1.0` (ffmpeg REFUSES copy alongside a filtergraph —
+exit 234, zero bytes — so `yt_stream` derives the filter from this same call rather
+than re-testing volume in a second place); `audio_channels in (1,2)` (a 5.1 serve
+copied verbatim reaches Discord as 6-channel multistream and clients decode only the
+front pair — and yt-dlp ranks `channels` ABOVE `acodec`, so `bestaudio` really does
+pick itag 338 where it exists; absent means re-encode); and `format_id` in
+`{249,250,251}` (packet duration — `read()` counts frames × 20ms, but Opus may legally
+be 60ms-framed, which plays at 3× speed and reads a third of its true position, and
+the info-dict reports no frame duration, so the known-20ms itags are named explicitly;
+SoundCloud's `http_opus` is the case this excludes). `read()` counts
 frames → `elapsed_secs`/`position_secs` is the single source
 of truth for every position surface (bar, presence, pause confirmation, history,
 interject resume point) and freezes during any pause automatically — measured identical
-under copy and libopus (same packet count for the same song), which is what made
-passthrough safe to adopt.
+under copy and libopus for YouTube's 20ms opus (same packet count for the same song),
+which is what made passthrough safe to adopt on that allowlist.
 
 ### Spotify
 

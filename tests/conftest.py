@@ -167,6 +167,11 @@ def mock_author() -> MagicMock:
     member = MagicMock(spec=discord.Member)
     member.id = 222222222222222222
     member.name = "testuser"
+    # A real string, not left to the spec: HistoryEntry.requester_name reads this,
+    # and orjson refuses a MagicMock — so every push_history in the suite would fail
+    # to serialize and any assertion on guild:{id}:history would pass vacuously,
+    # whether or not the write it means to pin was ever attempted.
+    member.display_name = "testuser"
     member.mention = "<@222222222222222222>"
     member.voice = MagicMock()
     member.voice.channel = MagicMock(spec=discord.VoiceChannel)

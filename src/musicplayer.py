@@ -851,8 +851,13 @@ class MusicPlayer:
             # An interjection parked this song's tail, and a teardown leaves the
             # queue intact under its 24h TTL — so -resume plays it and records it.
             return None
-        if not song.produced_audio:
+        if not song.produced_audio and not (song.is_resume and song.start_offset > 0):
             # ffmpeg exited without a frame: nobody heard it (see produced_audio).
+            # A resume tail is the exception, and it is the same exception the loop's
+            # `heard_before` makes: its offset is audio heard under the fragment that
+            # parked it, so a tail that dies at zero frames still has something to
+            # record. Without this a tail whose stream failed and is waiting on a
+            # retry loses that audio outright at -stop or the idle disconnect.
             return None
         # Captured before cleanup()'s retire_np_host_on_stop() disposes of it.
         host = self._np_host_message
@@ -2678,8 +2683,14 @@ class MusicPlayer:
                         )
 
                     # Written, or deliberately not — either way a teardown from here
-                    # has nothing left to claim.
-                    self._ended_song = None
+                    # has nothing left to claim. One exception: a retried resume
+                    # tail deferred its heard_before write to the attempt that
+                    # succeeds, and until put_front lands the song exists ONLY as
+                    # this local — not in the queue, not in Redis, not in the state
+                    # hash. Staying claimable across that gap is what keeps a -stop
+                    # or an idle disconnect there from losing the audio silently.
+                    if not (retrying and heard_before):
+                        self._ended_song = None
 
                     if self.store is not None:
                         await self.store.clear_song_end_state()
@@ -2696,6 +2707,9 @@ class MusicPlayer:
                     if stream_failed:
                         if retrying:
                             await self._retry_failed_stream(song)
+                            # Now a queue object, so _flush_played covers it and a
+                            # teardown must not claim it a second time.
+                            self._ended_song = None
                         else:
                             await self._handle_dead_stream(song)
                 except asyncio.CancelledError:

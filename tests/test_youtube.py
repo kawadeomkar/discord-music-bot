@@ -1693,22 +1693,39 @@ class TestOpusPassthrough:
     ('opus', 'libopus', 'copy') and to 'libopus' for everything else, INCLUDING None
     — so the gate is a plain codec string, and None is today's behavior."""
 
-    async def _codec(self, **data_overrides: Any) -> Optional[str]:
-        """The codec yt_stream hands FFmpegOpusAudio for this serve."""
-        captured: dict[str, Optional[str]] = {}
+    async def _ffmpeg_args(self, **data_overrides: Any) -> tuple[Optional[str], str]:
+        """The codec AND the output options yt_stream hands FFmpegOpusAudio.
+
+        Both, together, because they encode one invariant across two code paths:
+        ffmpeg REFUSES `-c:a copy` alongside any filtergraph. Capturing only the
+        codec is what let a mutation that always appends the volume filter survive
+        the whole suite.
+        """
+        captured: dict[str, Any] = {}
 
         def capture_init(
-            self: Any, url: str, *, codec: Optional[str] = None, **kwargs: Any
+            self: Any,
+            url: str,
+            *,
+            codec: Optional[str] = None,
+            options: Optional[str] = None,
+            **kwargs: Any,
         ) -> None:
             noop_ffmpeg_init(self)
             captured["codec"] = codec
+            captured["options"] = options or ""
 
         volume = data_overrides.pop("volume", 1.0)
+        # A remuxable YouTube serve, spelled out: opus, stereo, and one of the itags
+        # known to be 20ms-framed. Every clause of the gate is defeatable per test.
+        data: dict[str, Any] = {
+            "acodec": "opus",
+            "audio_channels": 2,
+            "format_id": "251",
+        }
+        data.update(data_overrides)
         with (
-            patch(
-                "src.youtube._ytdlp_extract",
-                return_value=_fake_ytdl_data(**data_overrides),
-            ),
+            patch("src.youtube._ytdlp_extract", return_value=_fake_ytdl_data(**data)),
             patch.object(discord.FFmpegOpusAudio, "__init__", new=capture_init),
         ):
             await YTDL.yt_stream(
@@ -1716,23 +1733,68 @@ class TestOpusPassthrough:
                 AsyncMock(spec=discord.TextChannel),
                 volume=volume,
             )
-        return captured["codec"]
+        return captured["codec"], captured["options"]
+
+    async def _codec(self, **data_overrides: Any) -> Optional[str]:
+        """The codec yt_stream hands FFmpegOpusAudio for this serve."""
+        codec, _ = await self._ffmpeg_args(**data_overrides)
+        return codec
 
     async def test_an_opus_serve_is_remuxed(self) -> None:
-        assert await self._codec(acodec="opus") == "copy"
+        assert await self._codec() == "copy"
 
     async def test_an_aac_serve_is_still_encoded(self) -> None:
         """The muxed fallback rungs (itag 18, HLS 91-96) carry AAC."""
-        assert await self._codec(acodec="mp4a.40.2") is None
+        assert await self._codec(acodec="mp4a.40.2", format_id="18") is None
 
     async def test_a_volume_filter_forces_the_encoder(self) -> None:
         """A filter has to touch samples, so it cannot ride the copy path."""
-        assert await self._codec(acodec="opus", volume=0.5) is None
+        assert await self._codec(volume=0.5) is None
 
     async def test_a_missing_codec_is_not_assumed_to_be_opus(self) -> None:
         """Pre-upgrade cache entries and extractors that report nothing must fall to
         the encoder, not be guessed into a remux that ffmpeg would then refuse."""
         assert await self._codec(acodec=None) is None
+
+    async def test_a_surround_serve_is_never_remuxed(self) -> None:
+        """`-c:a copy` copies OpusHead too, so a 5.1 stream reaches Discord as
+        6-channel multistream and clients decode only the front pair — centre-channel
+        vocals silently vanish. yt-dlp sorts `channels` ABOVE `acodec`, so bestaudio
+        really does select itag 338 on videos that carry it; `-ac 2` used to downmix.
+        """
+        assert await self._codec(audio_channels=6, format_id="338") is None
+
+    async def test_an_unknown_channel_count_is_not_assumed_to_be_stereo(self) -> None:
+        """Not every extractor populates audio_channels, and the safe reading of
+        absent is "re-encode" — the encoder path is correct for every input."""
+        assert await self._codec(audio_channels=None) is None
+
+    async def test_a_mono_serve_is_remuxed(self) -> None:
+        """Mono stays mono rather than being upmixed by `-ac 2`, which is the honest
+        rendering of the source and decodes correctly at the client."""
+        assert await self._codec(audio_channels=1) == "copy"
+
+    async def test_an_opus_format_outside_the_allowlist_is_encoded(self) -> None:
+        """Packet duration is the reason. `read()` counts packets and every position
+        surface is frames x 20ms, but Opus may legally be 60ms-framed — which plays
+        at 3x speed and reads a third of its true position. yt-dlp reports no frame
+        duration, so anything but YouTube's known-20ms itags takes the encoder.
+        SoundCloud's http_opus is exactly this case.
+        """
+        assert await self._codec(format_id="http_opus_0_0") is None
+
+    async def test_the_volume_filter_and_the_copy_codec_are_mutually_exclusive(
+        self,
+    ) -> None:
+        """The invariant, asserted directly rather than inferred from two separate
+        tests: ffmpeg exits 234 with zero bytes on `-c:a copy` plus `-filter:a`, and
+        the player would blame YouTube and burn the whole retry budget for it.
+        """
+        for volume in (1.0, 0.5, 2.0):
+            codec, options = await self._ffmpeg_args(volume=volume)
+            assert codec != "copy" or "-filter:a" not in options, (
+                f"volume={volume} produced codec={codec!r} options={options!r}"
+            )
 
 
 class TestYTStreamCarriedFields:
@@ -1923,6 +1985,7 @@ def _realistic_raw_info(**overrides: Any) -> dict[str, Any]:
         "abr": 128,
         "asr": 44100,
         "acodec": "opus",
+        "audio_channels": 2,
         "format_id": "251",
         "protocol": "https",
         "vcodec": "none",
@@ -1971,6 +2034,7 @@ def _fmt(
         "abr": abr,
         "asr": asr,
         "protocol": "https",
+        "audio_channels": 2,
         **extra,
     }
 
@@ -2015,6 +2079,36 @@ class TestAudioCandidateMining:
         ids = [c["format_id"] for c in self._mine()]
         assert "sb0" not in ids and "137" not in ids
         assert "251-drc" not in ids and "251-1" not in ids
+
+    def test_a_storyboard_is_excluded_by_the_filter_and_not_by_the_cap(self) -> None:
+        """Deliberately fewer real audio formats than _STREAM_CANDIDATES, so the slice
+        cannot be what drops the storyboard — only the acodec test can.
+
+        yt-dlp writes the STRING "none" here, not None, so narrowing that check to an
+        identity test against None removes the only branch that ever fires in
+        production. A storyboard promoted as audio would probe 200 (it is a real
+        JPEG mosaic) and be served to the voice channel as the song.
+        """
+        candidates = self._mine(
+            formats=[
+                {
+                    "format_id": "sb0",
+                    "url": "https://sb0",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                {
+                    "format_id": "sb1",
+                    "url": "https://sb1",
+                    "vcodec": "none",
+                    "acodec": "none",
+                },
+                _fmt("251", "opus", 129.0, 48000),
+            ],
+            language=None,
+        )
+        assert [c["format_id"] for c in candidates] == ["251"]
+        assert len(candidates) < _STREAM_CANDIDATES
 
     def test_language_less_formats_survive_a_language_selection(self) -> None:
         """Absent language means "the only track", not "a different one"."""
@@ -2101,6 +2195,54 @@ class TestSlimInfoReturnContract:
             for field in _UNUSED_INFO_COLLECTIONS:
                 assert field not in entry
         pickle.loads(pickle.dumps(slim))  # the whole wrapper still round-trips
+
+    def test_slimming_mines_the_audio_ladder_before_dropping_formats(self) -> None:
+        """The ONE integration point of the whole retry ladder.
+
+        `formats` is dropped in the same pass, so if the ladder is not attached here
+        it exists nowhere afterwards and every fallback URL is gone for good. Nothing
+        else in the suite covers it — the mining tests hand-build `audio_candidates`
+        into a fixture, and every extraction test patches out _slim_info's caller — so
+        without this the entire feature can be deleted with the suite still green.
+        """
+        raw = _realistic_raw_info(
+            formats=_audio_ladder(), format_id="251", language="en"
+        )
+        slim = cast(dict[str, Any], _slim_info(raw))
+        assert [c["format_id"] for c in slim["audio_candidates"]] == [
+            "251",
+            "140",
+            "249",
+        ]
+        assert "formats" not in slim
+        # Cheap enough to ship, and picklable — it crosses the boundary every time.
+        pickle.loads(pickle.dumps(slim))
+
+    def test_each_search_entry_is_mined_too(self) -> None:
+        """yt_source narrows to an entry, so an unmined one reaches playback with no
+        ladder and silently falls back to single-URL behaviour."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [
+                _realistic_raw_info(
+                    formats=_audio_ladder(), format_id="251", language="en"
+                )
+            ],
+        }
+        slim = cast(dict[str, Any], _slim_info(wrapper))
+        entry = slim["entries"][0]
+        assert [c["format_id"] for c in entry["audio_candidates"]] == [
+            "251",
+            "140",
+            "249",
+        ]
+        assert "formats" not in entry
+
+    def test_an_entry_with_no_formats_gets_no_ladder_key(self) -> None:
+        """extract_flat playlist entries carry no `formats`, and must not gain an
+        empty key — _candidate_ladder's legacy path is what serves them."""
+        slim = cast(dict[str, Any], _slim_info({"url": "https://x", "title": "t"}))
+        assert "audio_candidates" not in slim
 
     def test_slim_info_passes_none_through(self) -> None:
         """A failed extract_info returns None; callers branch on `data is None`, so

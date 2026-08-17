@@ -26,6 +26,7 @@ from concurrent.futures import BrokenExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import partial
 from logging.handlers import QueueListener
+from multiprocessing.context import BaseContext
 from typing import Any, Optional, TypeVar
 
 import structlog
@@ -44,12 +45,41 @@ _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
 # per-process state over days of uptime — player-JS caches, extractor objects — and
 # the BrokenProcessPool heal path below exists because a worker that grows enough
 # eventually gets OOM-killed. Bounded recycling turns that rare crash-and-heal into
-# routine turnover; the ~1s respawn amortized over 64 extractions is invisible beside
-# the 3-5s each of them costs. Needs spawn/forkserver, which is the 3.14 default.
-_MAX_TASKS_PER_CHILD = 64
+# routine turnover.
+#
+# The number is measured, not chosen: resident growth across repeated extractions
+# decelerates but does not flatten, holding ~+5MB/extraction from task 12 to task 24
+# (83 MB at import, 281 MB by 12, 347 MB by 24). A budget of 16 caps a worker near
+# 300 MB, so four of them stay well inside a container that would otherwise OOM-kill
+# one; 64 would have let a worker reach ~500 MB and the pool ~2 GB, which is the
+# scenario this recycling exists to prevent. Respawn cost is ~27ms on the platform
+# default context (see _pool_context), so a smaller budget is close to free.
+_MAX_TASKS_PER_CHILD = 16
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30 with
 # retries=10 can outlive any shutdown. Mirrors loop.shutdown_default_executor()'s.
 _SHUTDOWN_TIMEOUT_SECS = 10.0
+
+
+def _pool_context() -> BaseContext:
+    """The start method the pool spawns workers with.
+
+    Passing max_tasks_per_child makes ProcessPoolExecutor FORCE the spawn context
+    whenever no mp_context is supplied. On Linux that silently replaces 3.14's
+    forkserver default, and it is not free: four cold workers ready plus their first
+    task measured 0.040s under forkserver against 0.933s under spawn, and per-task
+    latency across a respawn 27ms against 807ms. That cost lands on prewarm(), on
+    every recycle, and on the BrokenProcessPool heal — which is on the critical path
+    of the very extraction that tripped it.
+
+    So the context is passed explicitly: whatever the platform would have chosen on
+    its own, unless that is `fork`, which a task budget rejects outright (and which
+    is unsafe to fork a multi-threaded asyncio process from regardless).
+    """
+    method = multiprocessing.get_start_method()
+    if method == "fork":
+        available = multiprocessing.get_all_start_methods()
+        method = "forkserver" if "forkserver" in available else "spawn"
+    return multiprocessing.get_context(method)
 
 
 def _warmup_noop() -> None:
@@ -195,6 +225,7 @@ class YtdlpPool:
             # A recycled worker re-runs the initializer, so worker logging survives
             # the turnover (see _MAX_TASKS_PER_CHILD).
             max_tasks_per_child=_MAX_TASKS_PER_CHILD,
+            mp_context=_pool_context(),
         )
 
     def _stop_log_listener(self) -> None:

@@ -119,6 +119,7 @@ class AudioCandidate(TypedDict, total=False):
     asr: int
     protocol: str
     vcodec: str
+    audio_channels: int
 
 
 class YTDLVideoMetadata(TypedDict, total=False):
@@ -143,6 +144,10 @@ class YTDLVideoMetadata(TypedDict, total=False):
     abr: float
     asr: int
     acodec: str
+    # Channel count of the served format. Read by _passthrough_codec, which must
+    # refuse a >2-channel serve: `-c:a copy` also copies OpusHead, so a 5.1 stream
+    # reaches Discord as 6-channel multistream and clients decode only the front pair.
+    audio_channels: int
     # Format-shape fields, mirroring the trio in _STREAM_CACHE_FIELDS — what
     # _record_serving_format reads to tell a healthy audio-only serve from a
     # degraded muxed/HLS one.
@@ -219,7 +224,16 @@ _STREAM_CANDIDATES = 3
 # the info-dict, which is why the tuple is shared by both directions: everything
 # downstream (_record_serving_format, YTDL's abr/asr/acodec) then describes the URL
 # actually being played rather than the one yt-dlp originally selected.
-_CANDIDATE_FIELDS = ("url", "format_id", "acodec", "abr", "asr", "protocol", "vcodec")
+_CANDIDATE_FIELDS = (
+    "url",
+    "format_id",
+    "acodec",
+    "abr",
+    "asr",
+    "protocol",
+    "vcodec",
+    "audio_channels",
+)
 
 
 def _candidate_shape(fmt: dict[str, Any]) -> AudioCandidate:
@@ -489,6 +503,11 @@ _STREAM_CACHE_FIELDS = frozenset(
         "abr",
         "asr",
         "acodec",
+        # Cached because _passthrough_codec refuses a >2-channel serve, and a cache
+        # hit must reach that decision with the same information a fresh extraction
+        # had — absent means re-encode, so dropping it here would silently disable
+        # passthrough rather than fail loudly.
+        "audio_channels",
         # Format-shape fields — how _record_serving_format tells a healthy audio-only
         # serve from a degraded muxed/HLS one; kept so cache hits stay attributable.
         "format_id",
@@ -539,6 +558,13 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
         )
 
 
+# The only formats this bot remuxes rather than re-encodes: YouTube's Opus itags,
+# which are 20ms-framed stereo. The allowlist IS the frame-duration check — yt-dlp
+# exposes no frame duration in the info-dict, so there is nothing to test at runtime
+# and "opus" alone cannot be trusted to mean 20ms (see _passthrough_codec).
+_PASSTHROUGH_FORMAT_IDS = frozenset({"249", "250", "251"})
+
+
 def _passthrough_codec(data: YTDLVideoMetadata, volume: float) -> Optional[str]:
     """ "copy" when this song can be remuxed instead of re-encoded, else None (which
     leaves discord.py's `-c:a libopus` default).
@@ -550,20 +576,40 @@ def _passthrough_codec(data: YTDLVideoMetadata, volume: float) -> Optional[str]:
     extraction already told us the codec and it is in the stream cache, so this
     decides from data we have.
 
-    Both halves of the gate are required. A volume filter has to touch samples, so
-    it forces the encoder — and `-volume` already only applies from the next song,
-    which is what makes this a per-construction decision with no mid-song switch.
+    Every clause is load-bearing, and three of them exist because `-c:a copy` also
+    discards the `-ac 2 -ar 48000 -b:a 128k` discord.py always passes:
 
-    Measured before adopting, because the risk was position math: `read()` counts
-    packets and every position surface is frames x 20ms, so a different packet
-    cadence under copy would silently skew all of them. Copy and libopus produce
-    identical counts (213.10s of packets for a 213s song, both), and copy with the
-    two-pass seek lands within 0.02s of the target. One accepted difference: a mono
-    Opus source stays mono instead of being upmixed by `-ac 2`, which is the honest
-    rendering of it rather than a defect.
+      volume        a volume filter has to touch samples, so it forces the encoder.
+                    ffmpeg REFUSES `-c:a copy` alongside `-filter:a` outright (exit
+                    234, zero bytes), so this is not a preference — yt_stream derives
+                    the filter from this same call to keep the two from ever drifting.
+      audio_channels  a 5.1 serve copied verbatim reaches Discord as 6-channel
+                    multistream Opus (OpusHead mapping_family=1) and clients decode
+                    only the front pair, silently losing centre-channel vocals.
+                    yt-dlp ranks `channels` ABOVE `acodec` when sorting formats, so
+                    `bestaudio` really does select itag 338 on videos that carry it.
+                    Absent must mean re-encode: not every extractor populates it.
+      format_id     packet duration. `read()` counts packets and every position
+                    surface is frames x 20ms, so a 60ms-framed Opus source (legal,
+                    and what SoundCloud's http_opus can be) plays at 3x speed and
+                    reads a third of its true position. Nothing in the info-dict
+                    reports frame duration, so the safe set is named explicitly.
+
+    Measured before adopting: copy and libopus produce identical packet counts for
+    YouTube's 20ms Opus (213.10s of packets for a 213s song, both), and copy with
+    the two-pass seek lands within 0.02s of the target. Two accepted differences —
+    a mono source stays mono rather than being upmixed, and the source's own bitrate
+    is kept instead of being capped at 128k (measured ~30% more egress on a 251).
     """
-    acodec = str(data.get("acodec") or "")
-    return "copy" if acodec.startswith("opus") and volume == 1.0 else None
+    if volume != 1.0:
+        return None
+    if not str(data.get("acodec") or "").startswith("opus"):
+        return None
+    if data.get("audio_channels") not in (1, 2):
+        return None
+    if str(data.get("format_id") or "") not in _PASSTHROUGH_FORMAT_IDS:
+        return None
+    return "copy"
 
 
 def _stream_cache_key(webpage_url: str) -> str:
@@ -971,8 +1017,15 @@ class YTDL(discord.FFmpegOpusAudio):
                 # keys are a subset of YTDLVideoInfo's, though _CANDIDATE_FIELDS
                 # makes them so by construction.
                 cast(dict[str, Any], data).update(candidate)
-            if index:
-                data["audio_candidates"] = ladder[index:]
+            # Unconditional, NOT `if index:`. The walk is reordered when
+            # `deprioritize` is non-empty, so a promotion can land at index 0 —
+            # and then the entry would carry the winner's url/format_id over a
+            # ladder still headed by the format that just failed. A caller that
+            # re-caches that (every retry does: it invalidates first, so the
+            # resolve is always a fresh extraction) makes the next play probe the
+            # blacklisted rung first, throwing away what the retry learned and
+            # warning about the wrong format for the rest of the TTL.
+            data["audio_candidates"] = ladder[index:]
             span.set_attribute("ytdl.candidate_index", index)
             return index
         return None
@@ -1097,7 +1150,13 @@ class YTDL(discord.FFmpegOpusAudio):
             # while the previous song is still playing, so announcing "Starting song
             # at Xs" from here fired at the wrong moment. MusicPlayer's start path
             # announces it — alongside "Resuming…", which was already moved there.
-        if volume != 1.0:
+        # One decision, two consequences. ffmpeg refuses `-c:a copy` alongside any
+        # filtergraph (exit 234, zero bytes, and the player would report it as
+        # "YouTube refused the stream" and burn the whole retry budget on a purely
+        # local bug), so the filter is gated on the codec rather than re-deriving
+        # the same volume test in a second place that could drift from the first.
+        codec = _passthrough_codec(data, volume)
+        if codec is None and volume != 1.0:
             ffmpeg_opts["options"] += f" -filter:a volume={volume}"
 
         return cls(
@@ -1108,7 +1167,7 @@ class YTDL(discord.FFmpegOpusAudio):
             start_offset=qo.ts or 0,
             before_options=ffmpeg_opts["before_options"],
             options=ffmpeg_opts["options"],
-            codec=_passthrough_codec(data, volume),
+            codec=codec,
             user_input=qo.user_input,
             persisted=qo.persisted,
             stream_attempts=qo.stream_attempts,
