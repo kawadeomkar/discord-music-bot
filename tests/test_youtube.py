@@ -24,6 +24,7 @@ from src.youtube import (
     _CANDIDATE_FIELDS,
     _DEGRADED_FORMAT_WARNED,
     _STREAM_CACHE_FIELDS,
+    _OGG_HEADER_PACKETS,
     _STREAM_CANDIDATES,
     _UNUSED_INFO_COLLECTIONS,
     _mine_audio_candidates,
@@ -145,7 +146,11 @@ class TestYTDLElapsedSecs:
     """Elapsed-time tracking by counting YTDL.read() calls — deterministic, no
     time-mocking. Patches the parent FFmpegOpusAudio.read() (what super().read()
     resolves to) rather than the real _packet_iter, which noop_ffmpeg_init
-    never sets up."""
+    never sets up.
+
+    Every count here is offset by _OGG_HEADER_PACKETS: the first two packets of any
+    Ogg Opus stream are OpusHead and OpusTags, which discord.py yields like audio and
+    YTDL deliberately does not count."""
 
     def test_zero_before_any_read(self, ytdl_instance: Callable[..., Any]) -> None:
         song = ytdl_instance()
@@ -156,7 +161,8 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            song.read()
+            for _ in range(_OGG_HEADER_PACKETS + 1):
+                song.read()
         assert song.elapsed_secs == pytest.approx(0.02)
 
     def test_accumulates_across_multiple_reads(
@@ -164,7 +170,7 @@ class TestYTDLElapsedSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.elapsed_secs == pytest.approx(0.10)
 
@@ -196,7 +202,7 @@ class TestYTDLPositionSecs:
     ) -> None:
         song = ytdl_instance()
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == song.elapsed_secs == pytest.approx(0.10)
 
@@ -204,7 +210,7 @@ class TestYTDLPositionSecs:
         song = ytdl_instance()
         song.start_offset = 90
         with patch.object(discord.FFmpegOpusAudio, "read", return_value=b"opus-frame"):
-            for _ in range(5):
+            for _ in range(_OGG_HEADER_PACKETS + 5):
                 song.read()
         assert song.position_secs == pytest.approx(90.10)
 
@@ -1304,12 +1310,13 @@ class TestCandidateLadderWalk:
     walks sideways first: next format, ~100ms probe, same extraction."""
 
     def _laddered(self, webpage_url: str, *format_ids: str) -> YTDLVideoInfo:
-        """Stream data whose ladder is the given formats, best first, with the head
-        hoisted as the selected format — the shape _cache_stream persists."""
+        """Stream data whose ladder is the given formats, best first: the head is the
+        selected format at the top level, and only the ALTERNATIVES are stored under
+        audio_candidates — the shape _cache_stream persists."""
         ladder = [_fmt(fid, "opus", 129.0, 48000) for fid in format_ids]
         return _fake_ytdl_data(
             webpage_url=webpage_url,
-            audio_candidates=ladder,
+            audio_candidates=ladder[1:],
             **{k: ladder[0][k] for k in _CANDIDATE_FIELDS},
         )
 
@@ -1380,12 +1387,15 @@ class TestCandidateLadderWalk:
         assert raw is not None, "the promotion must have re-cached the entry"
         cached = orjson.loads(cast(bytes, raw))
         assert cached["format_id"] == "140"
-        assert cached["audio_candidates"][0]["format_id"] == "140", (
-            "the cached ladder head must be the URL the probe validated"
-        )
+        # Asserted through the reconstruction, which is the only thing a later play
+        # walks: rung 0 must be the URL this probe validated. Storing the head
+        # separately is what USED to let the two disagree.
+        ladder = YTDL._candidate_ladder(cast(YTDLVideoInfo, cached))
+        ids = [c.get("format_id") for c in ladder]
+        assert ids[0] == "140"
         # 251 is not dropped — it is demoted, since the usual cause is a URL revoked
         # between probe and first read, which a fresh extraction cures.
-        assert "251" in [c["format_id"] for c in cached["audio_candidates"]]
+        assert "251" in ids
 
     async def test_the_winner_is_promoted_wholesale(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -1394,7 +1404,7 @@ class TestCandidateLadderWalk:
         YTDL's abr/asr/acodec describe what is actually playing."""
         url = "https://yt.com/v=promote"
         data = self._laddered(url, "251", "140")
-        cast(dict[str, Any], data)["audio_candidates"][1].update(
+        cast(dict[str, Any], data)["audio_candidates"][0].update(
             acodec="mp4a.40.2", abr=130.0, asr=44100
         )
         await self._cache(fake_redis, data)
@@ -1420,15 +1430,12 @@ class TestCandidateLadderWalk:
         assert raw is not None
         cached = orjson.loads(raw)
         assert cached["format_id"] == "140"
-        # The winner leads, and the rung that failed is DEMOTED rather than deleted:
-        # deleting it left two promotions pinning a single worst rung for the rest of
-        # the TTL with nothing to fall back to, and a rung can fail for reasons that
-        # pass (one CDN host 503ing) and deserve a later retry.
-        assert [c["format_id"] for c in cached["audio_candidates"]] == [
-            "140",
-            "249",
-            "251",
-        ]
+        # The winner is the top-level format now, so what is STORED is what follows
+        # it — and the rung that failed is DEMOTED rather than deleted: deleting it
+        # left two promotions pinning a single worst rung for the rest of the TTL with
+        # nothing to fall back to, and a rung can fail for reasons that pass (one CDN
+        # host 503ing) and deserve a later retry.
+        assert [c["format_id"] for c in cached["audio_candidates"]] == ["249", "251"]
 
     async def test_a_promotion_does_not_extend_the_entrys_life(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -2128,21 +2135,22 @@ class TestAudioCandidateMining:
         )
 
     def test_keeps_the_top_rungs_best_first(self) -> None:
-        """yt-dlp sorts worst→best, so the ladder is walked in reverse: the selected
-        format leads, then the next-best real audio formats."""
-        assert [c["format_id"] for c in self._mine()] == ["251", "140", "249"]
+        """yt-dlp sorts worst→best, so the ladder is walked in reverse. What is KEPT
+        is the alternatives behind the selection — 251 is the selection here, and it
+        is not stored because _candidate_ladder synthesizes it from the top level."""
+        assert [c["format_id"] for c in self._mine()] == ["140", "249"]
 
-    def test_candidate_zero_is_the_selected_format(self) -> None:
-        """Candidate 0 and the URL the probe already validated must be the same
-        thing, or a promotion would be recorded for a URL nothing moved to."""
-        candidates = self._mine()
-        assert candidates[0]["format_id"] == "251"
-        assert candidates[0]["acodec"] == "opus"
+    def test_the_selected_format_is_never_stored_twice(self) -> None:
+        """Rung 0 is the selected format, and it already exists at the top level of
+        the dict this list rides on. Storing it again duplicated a ~1.1 KB signed URL
+        byte for byte — and made "rung 0 is the selection" an invariant to maintain
+        rather than one that cannot be violated."""
+        assert "251" not in [c["format_id"] for c in self._mine()]
 
-    def test_selection_leads_even_when_the_sort_disagrees(self) -> None:
-        """Selection wins over sort order, and never appears twice."""
-        candidates = self._mine(format_id="140")
-        assert [c["format_id"] for c in candidates] == ["140", "251", "249"]
+    def test_the_selection_is_dropped_wherever_the_sort_put_it(self) -> None:
+        """The selected format is excluded even when it is not the best-sorted one,
+        so it cannot reappear as its own fallback."""
+        assert [c["format_id"] for c in self._mine(format_id="140")] == ["251", "249"]
 
     def test_storyboards_and_drc_and_dubs_are_excluded(self) -> None:
         """Storyboards carry `vcodec: none` too (the acodec test is what removes
@@ -2175,23 +2183,25 @@ class TestAudioCandidateMining:
                     "vcodec": "none",
                     "acodec": "none",
                 },
+                _fmt("249", "opus", 46.0, 48000),
                 _fmt("251", "opus", 129.0, 48000),
             ],
             language=None,
         )
-        assert [c["format_id"] for c in candidates] == ["251"]
-        assert len(candidates) < _STREAM_CANDIDATES
+        # 251 is the selection, so 249 is the only alternative — and the storyboards
+        # can only have been removed by the acodec test, not by the cap.
+        assert [c["format_id"] for c in candidates] == ["249"]
+        assert len(candidates) < _STREAM_CANDIDATES - 1
 
     def test_language_less_formats_survive_a_language_selection(self) -> None:
         """Absent language means "the only track", not "a different one"."""
         assert "140" in [c["format_id"] for c in self._mine()]
 
-    def test_muxed_selection_gets_no_ladder(self) -> None:
+    def test_muxed_selection_gets_no_alternatives(self) -> None:
         """The muxed rung already means the audio-only path is degraded; walking
-        sideways across muxed formats is not a recovery worth having."""
-        candidates = self._mine(format_id="18", vcodec="avc1.42001E")
-        assert len(candidates) == 1
-        assert candidates[0]["format_id"] == "18"
+        sideways across muxed formats is not a recovery worth having. It still plays,
+        via the rung 0 _candidate_ladder synthesizes from the top level."""
+        assert self._mine(format_id="18", vcodec="avc1.42001E") == []
 
     def test_no_format_list_mines_nothing(self) -> None:
         """extract_flat playlist entries carry no formats and no stream URL."""
@@ -2210,14 +2220,18 @@ class TestAudioCandidateMining:
         Asserting on the KEYS, because an all-None candidate satisfies a
         set-equality check against _CANDIDATE_FIELDS just as well as a full one.
         """
-        sparse = _fmt("251", "opus", 129.0, 48000)
+        sparse = _fmt("249", "opus", 46.0, 48000)
         del sparse["asr"]
         del sparse["abr"]
-        candidates = self._mine(formats=[sparse], format_id="251", language=None)
+        candidates = self._mine(
+            formats=[sparse, _fmt("251", "opus", 129.0, 48000)],
+            format_id="251",
+            language=None,
+        )
 
         assert "asr" not in candidates[0]
         assert "abr" not in candidates[0]
-        assert candidates[0]["format_id"] == "251"
+        assert candidates[0]["format_id"] == "249"
 
     def test_only_the_candidate_fields_are_carried(self) -> None:
         """A candidate promotes wholesale onto the info-dict, so a stray key here
@@ -2299,11 +2313,8 @@ class TestSlimInfoReturnContract:
             formats=_audio_ladder(), format_id="251", language="en"
         )
         slim = cast(dict[str, Any], _slim_info(raw))
-        assert [c["format_id"] for c in slim["audio_candidates"]] == [
-            "251",
-            "140",
-            "249",
-        ]
+        assert [c["format_id"] for c in slim["audio_candidates"]] == ["140", "249"]
+        assert slim["format_id"] == "251"  # rung 0, carried at the top level
         assert "formats" not in slim
         # Cheap enough to ship, and picklable — it crosses the boundary every time.
         pickle.loads(pickle.dumps(slim))
@@ -2321,11 +2332,7 @@ class TestSlimInfoReturnContract:
         }
         slim = cast(dict[str, Any], _slim_info(wrapper))
         entry = slim["entries"][0]
-        assert [c["format_id"] for c in entry["audio_candidates"]] == [
-            "251",
-            "140",
-            "249",
-        ]
+        assert [c["format_id"] for c in entry["audio_candidates"]] == ["140", "249"]
         assert "formats" not in entry
 
     def test_an_entry_with_no_formats_gets_no_ladder_key(self) -> None:

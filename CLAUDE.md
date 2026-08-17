@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,330 tests plus two opt-in integration tiers (testcontainers): a 74-test `pg` tier and a 41-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2566 tests plus two opt-in integration tiers (testcontainers): a 74-test `pg` tier and a 41-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -171,7 +171,7 @@ just fmt            # ruff format + autofix (REWRITES files)     ~0.1s
 just fmt-justfile   # `just --fmt --check` on the justfile        ~0.01s
 just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
-just pins           # assert the six duplicated version/name pins ~0.02s
+just pins           # assert the seven duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
 just test           # pytest with coverage (fail_under=80)        ~27s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
@@ -202,6 +202,9 @@ just image                 # build runtime image :latest and :<git-sha> (no test
 just up [sha]              # deploy an already-built image (never builds; refuses unknown tags)
 just down / restart / logs / ps
 just test-image-rebuild    # required after changing pyproject.toml/poetry.lock
+
+# Diagnostics (host venv, live network — no DOCKER=1 variant)
+just ytdl-formats URL      # what format yt-dlp selects + the ladder the retry walks
 ```
 
 `DOCKER=1 just check` (prefix must come BEFORE the recipe) runs any of
@@ -234,6 +237,8 @@ src/
 ├── leaderboard.py    # -leaderboard tunables, Redis result-cache codec, embed renderer (pure;
 │                     # the command itself stays on the cog)
 ├── db_migrate.py     # SQL migration runner (`python -m src.db_migrate`, EXPECTED_SCHEMA_VERSION)
+├── ytdl_formats.py   # `just ytdl-formats <url>`: what format yt-dlp selects and what
+│                     # fallback ladder the retry would walk. Run at every yt-dlp bump
 ├── backfill_history.py # ONE-SHOT operator script: pre-archive Redis history → Postgres, direct
 │                     # (not via the outbox). Run BEFORE deploying this build — see below
 ├── guild_state.py    # Pure Redis schema: frozen value objects, field constants, orjson wire formats
@@ -1072,7 +1077,8 @@ any guild idle for a day.
 default → `from_queue_object`/`from_song`/`from_crashed_state` as applicable →
 `to_redis` table → `parse_queue_entry` with `.get(..., default)` (old wire entries must
 parse) → `QueueObject` + `GuildQueue._rehydrate` → **`YTDL.__init__`'s keyword, its
-instance assignment, and `YTDL.from_queue_object` in `src/youtube.py`** — miss these three
+instance assignment, and the `YTDL(...)` construction at the end of `YTDL.yt_stream`
+in `src/youtube.py`** — miss these three
 and the field is silently dropped the moment the queue object becomes a playing song,
 which is where every read of it happens → then the two places a playing song becomes a
 queue object again: **`MusicPlayer._rebuild_queue_object`** (the shared rebuild behind
@@ -1138,7 +1144,11 @@ and run `just test-redis` — the unit tier cannot see three of these.
 
 **Bump yt-dlp**: it is exact-pinned; if `bgutil-ytdlp-pot-provider` moves too, bump the
 compose image tag in the same commit. After any dependency change, `just
-test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
+test-image-rebuild` before `DOCKER=1` recipes. Then run **`just ytdl-formats <url>`**
+against a real video and reconcile what it prints with the format claims in
+`src/youtube.py` (the client ladder, `_STREAM_CANDIDATES`, the passthrough itag
+allowlist) — those claims are empirical and both YouTube and yt-dlp move under them.
+Watch `_record_serving_format` warnings
 and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
 YouTube-side changes.
 

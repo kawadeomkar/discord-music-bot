@@ -75,7 +75,8 @@ class TestRender:
         assert "MUXED <=360p fallback rung: 1" in report
 
     def test_says_so_when_nothing_can_be_mined(self) -> None:
-        """A flat playlist entry has no formats — an empty section would read like
-        a mining bug rather than the wrong input."""
+        """A flat playlist entry has no formats. Rung 0 still exists (it is the
+        top-level URL), so what is missing is the fallbacks — and saying so beats an
+        empty section, which reads like a mining bug rather than the wrong input."""
         report = "\n".join(render({"format_id": "x", "url": "https://x"}))
-        assert "(none — no format list, or no stream URL)" in report
+        assert "(no alternatives — no format list, or no stream URL)" in report

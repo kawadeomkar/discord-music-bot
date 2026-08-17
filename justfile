@@ -535,10 +535,13 @@ services:
 # selected format, the ladder it chose from, and the fallback candidates the retry
 # would walk. Run it at every yt-dlp bump: the repo's claims about format selection
 # are empirical, and both YouTube and yt-dlp move under them.
+# Host venv only: it makes a live network call, so there is nothing DOCKER=1 would
+# buy, and depending on `_tools` would trigger a test-image rebuild before running
+# the local interpreter anyway.
 [doc('Print the format yt-dlp selects and the fallback ladder for a URL')]
 [group('dev')]
-ytdl-formats URL: (_tools 'python')
-    {{ VENV_BIN }}/python -m src.ytdl_formats {{ quote(URL) }}
+ytdl-formats URL:
+    {{ quote(VENV_BIN / 'python') }} -m src.ytdl_formats {{ quote(URL) }}
 
 # Escape hatch for compose commands this file does not wrap, with the archive
 # profile resolved from the flag: `just compose ps`, `just compose logs postgres`.

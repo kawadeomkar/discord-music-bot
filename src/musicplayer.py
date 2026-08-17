@@ -163,10 +163,15 @@ _RESUME_EOF_MARGIN_SECS = 10
 
 # ── Stream retry ─────────────────────────────────
 # How many plays one song gets before a stream that never opens is reported as a
-# failure. Each retry walks to the next rung of the song's audio ladder, so three
-# covers a format YouTube stopped serving plus a URL revoked between the probe and
-# ffmpeg's first read. Costs ~2-6s of dead air per attempt, which is why it is a
-# small number and not a knob.
+# failure. Three covers a URL revoked between the probe and ffmpeg's first read (cured
+# in place, on attempt 2) plus a format YouTube stopped serving (walked past, on
+# attempt 3 — see _blacklist_after).
+#
+# The cost is NOT one probe: _retry_failed_stream drops the cache entry first, so each
+# attempt pays a full re-extraction. Measured components — ffmpeg 403-and-exit 0.14s,
+# extraction ~3.9s, ladder probes 0.1-0.3s, embed ~0.2s — put a genuinely dead song at
+# ~4.5s per attempt and ~14s of dead air across three, which is why this is a small
+# number and not a knob, and why _STREAM_FAILURE_CIRCUIT bounds it further.
 _STREAM_PLAY_ATTEMPTS = 3
 
 # Consecutive songs that may burn their whole retry budget before the budget is
@@ -2051,6 +2056,12 @@ class MusicPlayer:
         rather than replay the URL that just died, and the failed format rides the
         entry so the fresh walk tries the others first (YTDL._probe_candidate_ladder).
         """
+        # A crash-recovered head is persisted=False, so _rebuild_queue_object keeps it
+        # that way and put_front writes nothing to Redis for it: the retry then exists
+        # only in this process. That is the correct reading of persisted (the entry was
+        # never RPUSHed, so an LPOP would consume an unrelated song's), but it does mean
+        # the orange notice below promises a retry a restart in the next few seconds
+        # would silently drop. Accepted: without it the song was simply reported dead.
         attempts_used = song.stream_attempts + 1
         log.warning(
             f"stream produced no audio for {song.webpage_url} "
@@ -2077,6 +2088,17 @@ class MusicPlayer:
             # attempt. Correct for _neutralize_prefetch's caller (that song never
             # started); wrong for this one.
             start_paused=False,
+            # Dropped, unlike the neutralized-prefetch rebuild that shares this
+            # helper. The pointer is a one-shot: a resume tail disposes of its
+            # predecessor's frozen card as it starts, and this song started. Carrying
+            # it would make every further attempt delete a message the first one
+            # already removed and re-announce "Resuming…" alongside the retry notice —
+            # three notices for one play. A prefetched tail never started, so there it
+            # is still owed.
+            np_message_id=0,
+            np_channel_id=0,
+            np_dedicated=False,
+            np_host_ref=None,
         )
         await self.queue.put_front([retry])
         embed = self._notice(
@@ -2598,14 +2620,20 @@ class MusicPlayer:
                         and self._consecutive_dead_songs < _STREAM_FAILURE_CIRCUIT
                     )
                     span.set_attribute("song.stream_retrying", retrying)
-                    if retrying:
-                        await self._neutralize_prefetch()
 
                     # Must fully retire before the next iteration's
                     # _send_now_playing(), or an in-flight edit for this song could
-                    # resolve concurrently with the new message being sent.
+                    # resolve concurrently with the new message being sent. Retired
+                    # BEFORE the neutralize below, which cancels a prefetch that may
+                    # be parked inside run_in_executor and can therefore sit for the
+                    # yt-dlp socket timeout — for all of which the 3s updater would
+                    # otherwise keep advancing the bar of a song that produced no
+                    # audio and is about to be retired. Neither cancel touches
+                    # _prefetch_task, so the order is free.
                     await self._cancel_progress_task()
                     await self._cancel_pause_debounce()
+                    if retrying:
+                        await self._neutralize_prefetch()
 
                     # Song has ended (naturally or via -skip): capture the host,
                     # release it (the finished bar stays behind as a record, so the

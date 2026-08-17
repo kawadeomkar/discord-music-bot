@@ -18,7 +18,12 @@ from typing import Any, cast
 
 import yt_dlp
 
-from src.youtube import _mine_audio_candidates, _YTDL_STREAM_OPTS
+from src.youtube import (
+    YTDL,
+    _mine_audio_candidates,
+    _YTDL_STREAM_OPTS,
+    select_search_entry,
+)
 
 
 def _row(fmt: dict[str, Any]) -> str:
@@ -52,13 +57,22 @@ def render(info: dict[str, Any]) -> list[str]:
         "",
         "MINED CANDIDATES (the retry ladder, best first)",
     ]
-    candidates = _mine_audio_candidates(info)
+    # Mine, then reconstruct — exactly the two steps production takes, so the ladder
+    # printed here is the one the retry walks. Mining alone would omit rung 0: the
+    # selected format is carried at the top level rather than stored (_candidate_ladder).
+    mined = dict(info)
+    alternatives = _mine_audio_candidates(info)
+    if alternatives:
+        mined["audio_candidates"] = alternatives
+    candidates = YTDL._candidate_ladder(cast(Any, mined))
     lines.extend(
         f"  {i}. {c.get('format_id')}  {c.get('acodec')}  {c.get('abr')}k"
         for i, c in enumerate(candidates)
     )
-    if not candidates:
-        lines.append("  (none — no format list, or no stream URL)")
+    if len(candidates) <= 1:
+        # Rung 0 always exists for anything with a stream URL, so what can be missing
+        # is the fallbacks — which is the interesting answer for this tool.
+        lines.append("  (no alternatives — no format list, or no stream URL)")
     lines += [
         "",
         f"MUXED <=360p fallback rung: {len(muxed)}",
@@ -85,8 +99,13 @@ def main() -> int:
         return 1
     info = cast(dict[str, Any], raw)
     if "entries" in info:  # a search result — report the entry that would be played
-        entries = [e for e in info["entries"] if e and e.get("_type") != "playlist"]
-        info = next((e for e in entries if e.get("url")), entries[0])
+        # yt_source's own picker, not a copy of its rule: a second copy would drift and
+        # this tool would then answer for a song the bot does not choose.
+        chosen = select_search_entry(cast(Any, info["entries"]))
+        if chosen is None:
+            print("search returned no playable entry", file=sys.stderr)
+            return 1
+        info = cast(dict[str, Any], chosen)
     print("\n".join(render(info)))
     return 0
 
