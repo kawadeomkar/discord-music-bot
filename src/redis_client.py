@@ -724,6 +724,14 @@ class GuildRedisStore:
     # Queue operations
 
     @_guild_op(default=None)
+    async def queue_length(self) -> Optional[int]:
+        """LLEN of the queue mirror. None ⇒ Redis unavailable — callers must
+        distinguish that from 0 (truly empty): GuildQueue.has_restored_backlog
+        treats None as "assume non-empty" because guessing empty routes a
+        collection enqueue onto the append path behind possible ghosts."""
+        return await self.redis.llen(self.queue_key())
+
+    @_guild_op(default=None)
     async def push_queue(self, entry: QueueEntry) -> None:
         """RPUSH one queue entry and refresh TTL on all guild keys."""
         pipe = self.redis.pipeline()

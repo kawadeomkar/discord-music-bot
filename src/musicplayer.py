@@ -433,8 +433,10 @@ class MusicPlayer:
         )
         # All queue state (one deque + cursor, Redis mirror, bulk mutex, wake
         # Event, generation counter) lives behind this one object — see
-        # guild_queue.py.
-        self.queue = GuildQueue(guild, self.store)
+        # guild_queue.py. bot.get_user is the second requester leg its restore
+        # path resolves through; _resolve_requester below is the same lookup for
+        # the entries that resolve later.
+        self.queue = GuildQueue(guild, self.store, user_lookup=bot.get_user)
         # Played-song history (in-memory ring + Redis mirror) — guild_history.py.
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
         # Postgres back. It lives on the app, one per process, present exactly when
@@ -601,6 +603,24 @@ class MusicPlayer:
                 "bot member nor the guild owner is cached"
             )
         return self._last_author
+
+    def _resolve_requester(
+        self, requester_id: Optional[int]
+    ) -> Union[discord.User, discord.Member]:
+        """The requester a lazy search was queued by, else the fallback.
+
+        Entries written before YTSource carried an ID have None and must keep
+        landing on _last_author — that is what they have always resolved to. A
+        member who left the guild still resolves through the user cache, so
+        leaving mid-queue does not reassign their plays; the archived
+        requester_name is their global name rather than their nickname there."""
+        if requester_id is not None:
+            who = self._guild.get_member(requester_id) or self.bot.get_user(
+                requester_id
+            )
+            if who is not None:
+                return who
+        return self._require_requester()
 
     def _queue_eta_seed(self) -> tuple[datetime.datetime, EtaWalk]:
         """Seed state for walking ETAs across queued songs: (now_pst, walk).
@@ -1081,48 +1101,70 @@ class MusicPlayer:
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Enqueue and, optionally, kick off stream prefetch. prefetch=False for bulk
         playlist enqueues: the mirror is written in one batch round-trip and no
         per-item tasks spawn, since N concurrent prefetches saturate the pool and
         mint stream URLs that expire before playback reaches them.
-        _prefetch_next_song covers one-ahead prefetch as songs play."""
+        _prefetch_next_song covers one-ahead prefetch as songs play.
+
+        expected_generation forwards GuildQueue.put's compare-and-put for streamed
+        collection pages. A refused put returns False having touched nothing —
+        including spawning no prefetch tasks for songs that were never queued.
+        Generation-blind callers ignore the return value.
+        """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put(items, batch=not prefetch)
+        queued = await self.queue.put(
+            items, batch=not prefetch, expected_generation=expected_generation
+        )
+        if queued is None:
+            return False
         if prefetch and self.store is not None:
-            for item in items:
+            for item in queued:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_put_front(
         self,
         obj: Union[QueueItem, Sequence[QueueItem]],
         *,
         prefetch: bool = True,
-    ) -> None:
+        expected_generation: Optional[int] = None,
+    ) -> bool:
         """Insert at the front of the queue, then optionally prefetch. Same contract
         as queue_put(), used when -play runs on a disconnected bot with a persisted
         queue: the requested song plays now, the persisted entries resume behind it.
-        Playlists insert in full and in order, with prefetch=False for the same
-        reason as queue_put()."""
+        Playlists insert in full and in order (put_front preserves the order it is
+        handed), with prefetch=False for the same reason as queue_put().
+
+        expected_generation: same compare-and-put forwarding as queue_put(), for the
+        buffered front=True collection path.
+        """
         items: list[QueueItem]
         if isinstance(obj, (QueueObject, YTSource)):
             items = [obj]
         else:
             items = list(obj)
-        items = await self.queue.put_front(items)
+        queued = await self.queue.put_front(
+            items, expected_generation=expected_generation
+        )
+        if queued is None:
+            return False
         if prefetch and self.store is not None:
-            for item in items:
+            for item in queued:
                 if isinstance(item, QueueObject):
                     self._spawn_background(
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
+        return True
 
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()
@@ -1836,8 +1878,10 @@ class MusicPlayer:
           the pending front, exactly as bulk mutations rely on.
         - completed → rebuild an equivalent QueueObject, return it to the front, kill
           its FFmpeg subprocess. Neither the deque slot nor the mirror moved, so
-          requeue_front() rewrites the slot with the resolved form. The rebuild must
-          carry EVERY field — a dropped one is silently gone from the queue entry.
+          requeue_front() rewrites the slot with the resolved form. Carry every
+          field: this is one of the two places a playing song becomes a queue
+          object again, and both have already lost one. See
+          docs/ARCHITECTURE.md#queue-entry-field-plumbing.
         - completed-with-None → the prefetch already retired its own dequeue.
         """
         task = self._prefetch_task
@@ -1933,7 +1977,7 @@ class MusicPlayer:
     async def _resolve_source(self, source: QueueItem) -> QueueObject:
         if isinstance(source, YTSource):
             return await YTDL.yt_source(
-                self._require_requester(),
+                self._resolve_requester(source.requester_id),
                 source.ytsearch or "",
                 redis=self.store.redis if self.store is not None else None,
                 query_source=source.query_source,

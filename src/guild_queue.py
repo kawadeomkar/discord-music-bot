@@ -101,8 +101,8 @@ def _normalize(s: str) -> str:
 def remove_matcher(needle: str) -> RemoveMatcher:
     """Match a queue item against one `-remove` argument: the resolved yt-dlp URL
     first, then what the user typed. An origin match takes out every item sharing
-    it, so one playlist link removes exactly the tracks it queued. Links are
-    compared literally — youtu.be/x does not match an entry stored as
+    it, so one album or playlist link removes exactly the tracks it queued. Links
+    are compared literally — youtu.be/x does not match an entry stored as
     youtube.com/watch?v=x."""
     # Stripped for BOTH legs, not just the fold: Discord wraps a link in angle
     # brackets when a user suppresses its embed, and the resolved leg compares
@@ -172,11 +172,20 @@ class GuildQueue:
         "_wake",
         "_mutex",
         "_generation",
+        "_user_lookup",
     )
 
-    def __init__(self, guild: discord.Guild, store: Optional[GuildRedisStore]) -> None:
+    def __init__(
+        self,
+        guild: discord.Guild,
+        store: Optional[GuildRedisStore],
+        *,
+        user_lookup: Optional[Callable[[int], Optional[discord.User]]] = None,
+    ) -> None:
         self._guild = guild
         self._store = store
+        # Bot.get_user: the second leg _rehydrate resolves a requester through.
+        self._user_lookup = user_lookup
         # The queue, and the boundary through it. _items[:_cursor] are claimed
         # but not yet settled; _items[_cursor:] are pending. See I1-I6 in
         # docs/ARCHITECTURE.md#queue-invariant.
@@ -258,28 +267,68 @@ class GuildQueue:
     @property
     def generation(self) -> int:
         """Monotonic counter of queue invalidations, bumped by clear() and by
-        bump_generation(). A dequeue captures it when it takes its item and hands
-        it back to try_commit_dequeue(), which refuses to commit across a bump —
-        see that method for why emptiness alone cannot answer this."""
+        bump_generation(). Two readers, one counter:
+
+        A dequeue captures it when it takes its item and hands it back to
+        try_commit_dequeue(), which refuses to commit across a bump — see that
+        method for why emptiness alone cannot answer this.
+
+        A streamed collection enqueue snapshots it before its first page and
+        passes it back via put(..., expected_generation=...), so every later page
+        is refused instead of refilling a queue the user just emptied (or a guild
+        being torn down). The check happens inside put()'s mutex hold — reading
+        this property and then calling put() without expected_generation is a
+        TOCTOU bug, not an alternative. See docs/ARCHITECTURE.md#queue-invariant."""
         return self._generation
 
     def bump_generation(self) -> None:
-        """Invalidate in-flight dequeues without clearing the queue.
+        """Invalidate in-flight streamed enqueues without clearing the queue.
 
-        Synchronous, and takes no lock: this is a teardown step that runs ahead
-        of the voice disconnect, and the mutex is held across Redis round trips
-        the pool sets no socket_timeout for. Safe unlocked because put/put_front
+        Synchronous, and takes no lock: this is cleanup()'s first step, ahead of
+        the voice disconnect, and the mutex is held across Redis round trips the
+        pool sets no socket_timeout for. Safe unlocked because put/put_front
         check-then-mutate with no await between, so a bump that cannot suspend
         cannot land inside that window. Keep it awaitless.
 
+        Called by MusicBot.cleanup() — the single teardown choke point: -stop,
+        a kick (on_voice_state_update), the alone-disconnect timer, the 300s
+        playback-gate timeout (MusicPlayer.stop() delegates to cleanup()), and
+        play's own error path all funnel through it. Without this, an orphaned
+        collection drain (which runs in a *command* task cleanup never cancels)
+        keeps RPUSHing this guild's Redis mirror after teardown; a follow-up
+        -play then restores that mirror mid-drain and the deque desyncs from
+        Redis — the ghost-head failure put_front's docstring describes, reached
+        through a different door.
+
         A claim outstanding when this lands is refused by try_commit_dequeue()
-        and never settled here: the caller is tearing the player down, so the
-        whole queue goes with it.
+        and never settled here: cleanup() pops the player, so the whole queue
+        goes with it. Nothing else may call this.
 
         clear() does not call this — it bumps inline under the same mutex hold
-        that drains the deque, so nothing can land between the drain and the
+        that drains the deque, so no page can land between the drain and the
         bump."""
         self._generation += 1
+
+    async def has_restored_backlog(self) -> bool:
+        """True when anything is queued in memory OR on the Redis mirror.
+
+        The front=True streamed-enqueue path uses this to decide
+        append-vs-buffer: "append to an empty queue is front insertion" is only
+        true when the MIRROR is empty too. qsize() alone lies here — two paths
+        leave Redis longer than memory (parse_queue_entry drops a corrupt entry
+        but the raw entry stays on the list; restore_entries drops entries whose
+        requester can't be resolved), and appending behind such a ghost puts the
+        collection where the next commit-time LPOP retires the wrong entry.
+        Conservative on a failed read (None → True): the buffered put_front path
+        is always correct, just slower."""
+        if self.qsize() > 0:
+            return True
+        if self._store is None:
+            return False  # nothing persists at all — append IS front insertion
+        length = await self._store.queue_length()
+        if length is None:
+            return True  # Redis unreadable — take the safe path
+        return length > 0
 
     # ── Enqueue ───────────────────────────────────────────────────────────────
 
@@ -288,14 +337,29 @@ class GuildQueue:
         items: Sequence[QueueItem],
         *,
         batch: bool = False,
-    ) -> list[QueueItem]:
+        expected_generation: Optional[int] = None,
+    ) -> Optional[list[QueueItem]]:
         """Enqueue on the deque first, then the mirror. Under
         the bulk-mutation mutex because the Redis pushes suspend: a clear()/
         shuffle() interleaving there drains/rebuilds the mirror before the pushes
         land, resurrecting them as ghosts the next dequeue LPOPs instead of its own
         entry. batch=True pushes every entry in one round-trip (bulk playlist);
-        batch=False one RPUSH per entry."""
+        batch=False one RPUSH per entry.
+
+        expected_generation is the compare-and-put for streamed collection
+        enqueues: the put refuses (None, no leg touched) if a clear()/
+        bump_generation() landed since the snapshot. The check shares this mutex
+        hold with the enqueue — checked outside, an entire clear() fits between
+        check and put and a full page lands after the clear it should have
+        respected. Generation-blind callers omit it and are never refused.
+        Refusal is None, not the empty list: an empty `items` enqueues nothing
+        and still succeeds."""
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return None
             queued = list(items)
             self._items.extend(queued)
             self._sync_wake()
@@ -314,7 +378,12 @@ class GuildQueue:
                     await self._store.push_queue(entry)
             return queued
 
-    async def put_front(self, items: Sequence[QueueItem]) -> list[QueueItem]:
+    async def put_front(
+        self,
+        items: Sequence[QueueItem],
+        *,
+        expected_generation: Optional[int] = None,
+    ) -> Optional[list[QueueItem]]:
         """Insert items at the front of the queue — the -playnow interjection path.
         Under the bulk-mutation mutex, like every multi-leg mutation.
 
@@ -325,10 +394,19 @@ class GuildQueue:
 
         That branch is reachable despite looking unused: _interject_flow's
         outcome-is-None fallback calls this with the prefetch's claim still open.
+
+        expected_generation: same compare-and-put contract as put(), used by the
+        buffered front=True collection path and refused (None, no leg touched)
+        when a clear()/teardown landed after the snapshot.
         """
         if not items:
             return []
         async with self._mutex:
+            if (
+                expected_generation is not None
+                and expected_generation != self._generation
+            ):
+                return None
             new_items = list(items)
             # Inserting at _cursor IS inserting behind the in-flight head.
             # reversed(), or a multi-track insert lands backwards.
@@ -717,8 +795,18 @@ class GuildQueue:
     ) -> Optional[QueueItem]:
         """At-rest entry → live queue item: the one construction path for
         everything coming back from Redis (pending entries and the crashed head).
-        SongQueueEntry needs a requester resolved from the guild: the persisted
-        member ID, else requester_fallback (default guild.owner), else dropped."""
+        SongQueueEntry needs a requester resolved here and now: the persisted
+        member ID, then the process-wide user cache, else requester_fallback
+        (default guild.owner), else dropped. A SearchQueueEntry carries its
+        requester as an ID all the way to the resolve at dequeue, which is the
+        only place a member can be looked up without this method's
+        drop-on-failure contract losing the song.
+
+        The user-cache leg mirrors MusicPlayer._resolve_requester's, and the two
+        must agree: a member who left the guild resolves through it either way, so
+        one restored snapshot cannot archive the same person's songs and searches
+        as two different requesters. Without it every song of a departed member
+        archived as guild.owner — permanently, and inflating their -leaderboard."""
         if isinstance(entry, SearchQueueEntry):
             return YTSource(
                 ytsearch=entry.ytsearch,
@@ -731,10 +819,13 @@ class GuildQueue:
                 ),
                 user_input=entry.user_input,
                 query_source=entry.query_source,
+                requester_id=entry.requester_id,
             )
         requester: Union[discord.Member, discord.User, None] = None
         if entry.requester_id is not None:
             requester = self._guild.get_member(entry.requester_id)
+            if requester is None and self._user_lookup is not None:
+                requester = self._user_lookup(entry.requester_id)
         if requester is None:
             requester = (
                 requester_fallback

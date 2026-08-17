@@ -1,5 +1,6 @@
 """Shared fixtures for the discord-music-bot test suite."""
 
+import asyncio
 import re
 import sys
 import time
@@ -145,6 +146,27 @@ def reset_structlog_contextvars() -> Iterator[None]:
     structlog.contextvars.clear_contextvars()
     yield
     structlog.contextvars.clear_contextvars()
+
+
+@pytest.fixture(autouse=True)
+def fresh_spotify_request_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rebind spotify's module-scope request semaphore per test.
+
+    asyncio primitives are not loop-agnostic — 3.10 removed the `loop`
+    parameter, but _LoopBoundMixin still pins the semaphore to the first loop
+    that CONTENDS it (>= _MAX_CONCURRENT_REQUESTS in-flight acquires) and
+    raises "bound to a different event loop" on any other. Each test runs on
+    a fresh loop (asyncio_default_fixture_loop_scope = "function"), so a
+    second contending test would inherit a semaphore pinned to a dead loop
+    and fail in a way that reads as a Spotify bug rather than a fixture one.
+    """
+    import src.spotify as spotify_module
+
+    monkeypatch.setattr(
+        spotify_module,
+        "_request_slots",
+        asyncio.Semaphore(spotify_module._MAX_CONCURRENT_REQUESTS),
+    )
 
 
 @pytest.fixture
@@ -388,6 +410,7 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog._active_spans = {}
     cog.voice_watchdog = VoiceWatchdog(cog)
     cog._restore_tasks = set()
+    cog._enqueue_locks = {}
     # Off, matching the ship default and the DEBUG_MODE scrub above: with debug
     # mode on, every embed grows a footer and the suite's embed assertions would be
     # asserting against decorated output everywhere. The mock cog used by player

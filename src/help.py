@@ -53,8 +53,9 @@ SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
     "A `?t=` / `?ts=` timestamp starts the song at that offset, and a playlist "
     "link's `&index=` starts the queue at that position.\n"
-    "**Spotify** — track and playlist links. Each title is matched to its "
-    "YouTube audio, so a playlist may take a moment to queue.\n"
+    "**Spotify** — track, album and playlist links. Each title is matched to "
+    "its YouTube audio; albums and playlists start playing after their first "
+    "page loads and keep queueing in the background.\n"
     "**SoundCloud** — track links."
 )
 
