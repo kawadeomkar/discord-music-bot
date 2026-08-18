@@ -1,8 +1,31 @@
-"""Tests for src/config.py — the Spotify feature toggle."""
+"""Tests for src/config.py — the Spotify toggle, the Postgres knobs, and the
+default-credential detector."""
+
+import importlib
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from collections.abc import Iterator
+from types import ModuleType
 
 import pytest
 
-from src.config import SPOTIFY_TEST_TRACK_ID, SpotifyStatus, spotify_enabled
+import src.config
+from src.config import (
+    DEFAULT_POSTGRES_PASSWORD,
+    SPOTIFY_TEST_TRACK_ID,
+    SpotifyStatus,
+    _float_env,
+    _int_env,
+    debug_mode_default,
+    debug_prometheus_url,
+    history_archive_enabled,
+    postgres_url,
+    spotify_enabled,
+    using_default_postgres_password,
+)
 
 
 class TestSpotifyEnabled:
@@ -62,3 +85,948 @@ class TestSpotifyConfigConstants:
 
     def test_status_has_three_distinct_states(self) -> None:
         assert {s.value for s in SpotifyStatus} == {"disabled", "invalid", "enabled"}
+
+
+class TestPostgresUrl:
+    def test_returns_none_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert postgres_url() is None
+
+    def test_returns_the_dsn_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
+        assert postgres_url() == "postgresql://u@h/db"
+
+    def test_empty_string_counts_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exported-but-empty `POSTGRES_URL=` must read as absent, same rule as
+        the Spotify credentials above: `""` is not None, so without the guard the
+        Optional[str] return type is a lie and catching an empty DSN depends on
+        each caller spelling its check as truthiness rather than `is None`."""
+        monkeypatch.setenv("POSTGRES_URL", "")
+        assert postgres_url() is None
+
+    def test_read_at_call_time_not_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert postgres_url() is None
+        monkeypatch.setenv("POSTGRES_URL", "postgresql://u@h/db")
+        assert postgres_url() == "postgresql://u@h/db"
+
+
+class TestHistoryArchiveEnabled:
+    """The consent gate for long-term storage. Fail-closed: absence of a choice
+    must mean no collection, so unset and empty are False. Strict parse: a
+    lenient anything-but-true-is-False rule turns a typo into an operator who
+    believes archiving is on while every play goes unrecorded, so garbage raises.
+    """
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "True", "1", "yes", "YES"])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "False", "0", "no", "NO"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_unset_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`HISTORY_ARCHIVE_ENABLED=` is the bare KEY= shape .env.example
+        models for POSTGRES_PASSWORD — same tolerance rule as _int_env."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        assert history_archive_enabled() is False
+
+    def test_surrounding_whitespace_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "  true  ")
+        assert history_archive_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "ture", "2", "y", "t"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Includes near-misses an operator would plausibly type (`on`, `y`,
+        `enabled`): every one silently disables archiving under a lenient
+        parser, which is the failure the strict parse exists to prevent."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", raw)
+        with pytest.raises(ValueError, match="HISTORY_ARCHIVE_ENABLED"):
+            history_archive_enabled()
+
+    def test_read_at_call_time_not_cached(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HISTORY_ARCHIVE_ENABLED", raising=False)
+        assert history_archive_enabled() is False
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "true")
+        assert history_archive_enabled() is True
+
+
+class TestDebugModeDefault:
+    """The process-wide default behind debug mode. Shares history_archive_enabled's
+    strict grammar, so the failure direction is the same: a typo raises rather than
+    reading as off and leaving an operator waiting for footers that never come."""
+
+    @pytest.mark.parametrize("raw", ["true", "TRUE", "1", "yes", "  true  "])
+    def test_truthy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is True
+
+    @pytest.mark.parametrize("raw", ["false", "FALSE", "0", "no"])
+    def test_falsy_spellings(self, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_unset_or_empty_is_false(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DEBUG_MODE", raising=False)
+        assert debug_mode_default() is False
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        assert debug_mode_default() is False
+
+    @pytest.mark.parametrize("raw", ["on", "enabled", "y", "2"])
+    def test_garbage_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The message must name DEBUG_MODE: MusicBot.__init__ is the only reader,
+        so this surfaces as a load_extension failure at startup, where the variable
+        name is the whole diagnosis."""
+        monkeypatch.setenv("DEBUG_MODE", raw)
+        with pytest.raises(ValueError, match="DEBUG_MODE"):
+            debug_mode_default()
+
+
+class TestIntEnv:
+    """The parser behind both archive tunables.
+
+    It runs at import, before structlog or OTel exist, so its failures are stderr
+    tracebacks in a compose restart loop — hence empty is tolerated, garbage is not.
+    """
+
+    def test_unset_returns_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KNOB", raising=False)
+        assert _int_env("KNOB", 7) == 7
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`KNOB=` is the bare shape .env.example already models for
+        POSTGRES_PASSWORD. Raising here would crash-loop the bot before any log
+        pipeline exists — same rule postgres_url() applies to a blank DSN."""
+        monkeypatch.setenv("KNOB", raw)
+        assert _int_env("KNOB", 7) == 7
+
+    def test_parses_a_set_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KNOB", "5000")
+        assert _int_env("KNOB", 0) == 5000
+
+    def test_negative_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """-1 is the universal "no limit" idiom, so it is what an operator reaches
+        for to spell out HISTORY_OUTBOX_MAX's default. Downstream it means the
+        opposite: the drainer treats it as an active cap, computes
+        dropped = depth + 1, and trims the outbox to empty every cycle."""
+        monkeypatch.setenv("KNOB", "-1")
+        with pytest.raises(ValueError, match="KNOB must be >= 0"):
+            _int_env("KNOB", 0)
+
+    @pytest.mark.parametrize("raw", ["abc", "100mb", "1e6", "0x10", "3.5"])
+    def test_malformed_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A bare "invalid literal for int() with base 10" does not say which of
+        # the environment's variables is at fault, and there is no logger
+        # attached at import to add that context.
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be an integer"):
+            _int_env("KNOB", 0)
+
+
+class TestFloatEnv:
+    """The parser behind the four live-dashboard knobs. Same import-time constraints
+    as _int_env, plus two failure shapes int() cannot express."""
+
+    def test_unset_returns_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("KNOB", raising=False)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    @pytest.mark.parametrize("raw", ["", "   "])
+    def test_empty_reads_as_unset(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        assert _float_env("KNOB", 1.5, minimum=0.05) == 1.5
+
+    def test_parses_a_set_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("KNOB", "2.5")
+        assert _float_env("KNOB", 1.0, minimum=0.05) == 2.5
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "0.001"])
+    def test_below_the_floor_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tick of 0 makes the dashboard's timed wait return instantly forever —
+        a hot loop for the whole deadline, on the loop carrying voice heartbeats."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be >= 0.05"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
+    def test_non_finite_is_refused(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """float() accepts all of these. A deadline of inf never expires, so the
+        command holds its max_concurrency slot forever and every later run in that
+        guild answers "already running" — a floor alone would not catch it."""
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a finite number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+    @pytest.mark.parametrize("raw", ["abc", "1.0s", "half"])
+    def test_malformed_raises_naming_the_variable(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KNOB", raw)
+        with pytest.raises(ValueError, match="KNOB must be a number"):
+            _float_env("KNOB", 1.0, minimum=0.05)
+
+
+class TestArchiveTunables:
+    """The env -> constant path, which asserting the defaults alone cannot pin.
+
+    `assert HISTORY_OUTBOX_MAX == 0` passes even if the constant stops reading its
+    variable (a plain literal is also 0), and fails wherever that variable happens
+    to be exported. Reloading under a controlled environment fixes both.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_config_module(self) -> Iterator[None]:
+        # Snapshot rather than rely on monkeypatch teardown ordering: the module
+        # must be left holding the constants the rest of the session imported.
+        original = os.environ.copy()
+        yield
+        os.environ.clear()
+        os.environ.update(original)
+        importlib.reload(src.config)
+
+    @staticmethod
+    def _reload(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+        # Pin ENVIRONMENT so the reload never shells out to git, and never trips
+        # config's detached-HEAD RuntimeWarning that pytest promotes to an error.
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        return importlib.reload(src.config)
+
+    @pytest.mark.parametrize(
+        ("name", "default", "override", "expected"),
+        [
+            # 0 is the durability contract: an entry only leaves the outbox once
+            # Postgres has it. A non-zero default would silently discard plays.
+            ("HISTORY_OUTBOX_MAX", 0, "5000", 5000),
+            # Matches asyncpg's own default; 0 is the PgBouncer setting.
+            ("POSTGRES_STATEMENT_CACHE", 100, "0", 0),
+        ],
+    )
+    def test_default_and_override(
+        self,
+        name: str,
+        default: int,
+        override: str,
+        expected: int,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(name, raising=False)
+        assert getattr(self._reload(monkeypatch), name) == default
+        monkeypatch.setenv(name, override)
+        assert getattr(self._reload(monkeypatch), name) == expected
+
+    def test_a_negative_cap_fails_at_import(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Startup refusal is the point: the alternative is a drainer that wipes
+        the outbox every cycle while the bot reports healthy."""
+        monkeypatch.setenv("HISTORY_OUTBOX_MAX", "-1")
+        with pytest.raises(ValueError, match="HISTORY_OUTBOX_MAX must be >= 0"):
+            self._reload(monkeypatch)
+
+
+class TestDefaultPostgresPassword:
+    """compose defaults POSTGRES_PASSWORD so `docker compose up` works with only a
+    Discord token, and the bot has to be able to tell that it did.
+
+    Scoped to the DSNs this project's tooling assembles from `.env`, the only
+    supported place the password is set — shapes asyncpg accepts but compose and
+    `just run` cannot emit are deliberately undetected (see the function).
+    """
+
+    def test_true_when_the_dsn_carries_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL",
+            f"postgresql://musicbot:{DEFAULT_POSTGRES_PASSWORD}@127.0.0.1:5432/musicbot",
+        )
+        assert using_default_postgres_password() is True
+
+    def test_false_for_a_real_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        assert using_default_postgres_password() is False
+
+    def test_false_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Nothing configured is not the same as configured badly — and the
+        # missing-URL case has its own, louder failure in setup_hook.
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert using_default_postgres_password() is False
+
+    def test_reads_the_dsn_not_the_password_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The bot only ever sees the assembled DSN: compose builds it and the
+        # password variable is usually absent from the bot's own environment.
+        # A check that read POSTGRES_PASSWORD would report "fine" for a stack
+        # that is in fact running on the default.
+        monkeypatch.setenv("POSTGRES_PASSWORD", "a-real-secret")
+        monkeypatch.setenv(
+            "POSTGRES_URL",
+            f"postgresql://musicbot:{DEFAULT_POSTGRES_PASSWORD}@127.0.0.1:5432/musicbot",
+        )
+        assert using_default_postgres_password() is True
+
+    def test_url_encoded_default_is_still_recognised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # asyncpg unquotes the netloc password, so an escaped form is the same
+        # credential and must not slip past. The detector has to unquote it
+        # ITSELF: SplitResult.password does not percent-decode.
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:%70assword@127.0.0.1:5432/musicbot"
+        )
+        assert using_default_postgres_password() is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "not-a-url",
+            "postgresql://",
+            "postgresql://user@host/db",
+            "://[bad",
+            # The one that actually reaches the except arm: urlsplit only raises
+            # on a malformed IPv6 literal in the NETLOC, and every other case
+            # above returns normally. Without it the `except ValueError` branch
+            # was dead — deleting it, and making it `return True`, both passed.
+            "postgresql://[::1@h/db",
+        ],
+    )
+    def test_never_raises_on_a_malformed_dsn(
+        self, monkeypatch: pytest.MonkeyPatch, url: str
+    ) -> None:
+        # It feeds a startup warning and a -ping row; a malformed DSN is the
+        # archive's problem to report, not this function's.
+        monkeypatch.setenv("POSTGRES_URL", url)
+        assert using_default_postgres_password() is False
+
+
+# ── The compose contract ──────────────────────────────────────────────────────
+#
+# Nothing else in CI or tests/ reads docker-compose.yml, which is how a missed
+# `${POSTGRES_PASSWORD:?}` on db-backfill shipped: it broke `docker compose up`
+# for a token-only stack while every test, ruff and pyright stayed green.
+_COMPOSE = Path(__file__).resolve().parent.parent / "docker-compose.yml"
+
+
+def _compose_directives() -> str:
+    """docker-compose.yml with comment lines removed.
+
+    The file DESCRIBES the old mandatory form (`${VAR:?}`) in comments, so a naive
+    scan of the raw text reports a violation that does not exist. Whole-line
+    stripping is enough — Compose has no inline-comment-after-value form here.
+    """
+    return "\n".join(
+        line
+        for line in _COMPOSE.read_text().splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def _service_block(name: str) -> str:
+    """The directive lines of one top-level compose service (comments already
+    stripped). Regex, not a YAML parser, on the same terms as everything else
+    in this file: nothing in the repo's dependency set reads YAML, and adding
+    a parser for a contract test would be the tail wagging the dog."""
+    match = re.search(
+        rf"^  {re.escape(name)}:\n(.*?)(?=^  \S|\Z)",
+        _compose_directives(),
+        re.S | re.M,
+    )
+    assert match is not None, f"service {name} not found in docker-compose.yml"
+    return match.group(1)
+
+
+def _building_services() -> dict[str, str]:
+    """name → block, for every top-level service that declares a `build:`. Named
+    rather than listed so a fourth build block has to satisfy the same contract
+    as the three that exist."""
+    # Scoped to the `services:` mapping: the top-level `volumes:` names sit at the
+    # same indent and would otherwise be looked up as services and not found.
+    section = re.search(
+        r"^services:\n(.*?)(?=^\S|\Z)", _compose_directives(), re.S | re.M
+    )
+    assert section is not None, "docker-compose.yml has no services: mapping"
+    blocks = {
+        name: _service_block(name)
+        for name in re.findall(r"^  (\S+):$", section.group(1), re.M)
+    }
+    return {n: b for n, b in blocks.items() if re.search(r"^    build:$", b, re.M)}
+
+
+class TestComposeArchiveProfile:
+    """The deployment half of the opt-in archive: postgres and db-migrate exist in
+    the model only while the `archive` profile is active, so a token-only
+    `docker compose up` deploys no long-term storage. Nothing in CI parses
+    compose, so the contract is asserted against the real file."""
+
+    def test_postgres_and_db_migrate_are_archive_profiled(self) -> None:
+        # The profile is the deployment gate: without it, a default `up`
+        # deploys a database nobody opted in to and the consent story is
+        # app-side only.
+        for service in ("postgres", "db-migrate"):
+            assert 'profiles: ["archive"]' in _service_block(service), service
+
+    def test_the_bot_does_not_depend_on_the_profiled_services(self) -> None:
+        """regression guard: an un-profiled service with depends_on on a profiled
+        one makes the whole project invalid while the profile is inactive — even
+        `docker compose config` fails ("depends on undefined service") — so
+        re-adding either dependency breaks token-only `up` outright."""
+        bot = _service_block("discord-music-bot")
+        depends = re.search(r"depends_on:\n((?:      .*\n)*)", bot)
+        assert depends is not None
+        assert "postgres" not in depends.group(1)
+        assert "db-migrate" not in depends.group(1)
+        # redis stays: it is un-profiled, so the rule does not apply to it.
+        assert "redis:" in depends.group(1)
+
+    def test_db_backfill_stays_on_ops_not_archive(self) -> None:
+        """`up` starts every service of an active profile, so db-backfill joining
+        `archive` would run a full Redis keyspace walk on every enabled `up`. Its
+        own profile means it runs only when explicitly targeted (`docker compose
+        run` auto-activates a target's own profiles)."""
+        backfill = _service_block("db-backfill")
+        assert 'profiles: ["ops"]' in backfill
+        assert "archive" not in backfill
+
+    # `just down` must pass --profile archive or it leaves a running postgres
+    # behind; that is pinned by the exact-string assertion in
+    # TestComposeMetricsProfile::test_just_down_also_stops_it below, which covers
+    # both profiles of the one `down` recipe. A second, weaker copy lived here.
+
+
+class TestComposeMetricsProfile:
+    """The docker-socket sidecar is opt-in for the same reason the archive tier is:
+    `:ro` restricts the socket INODE, not the Docker API, so anything holding it can
+    create a privileged container. That is not a cost to add to every deploy."""
+
+    def test_otelcol_metrics_is_profiled(self) -> None:
+        assert 'profiles: ["metrics"]' in _service_block("otelcol-metrics")
+
+    def test_it_is_the_only_service_mounting_the_docker_socket(self) -> None:
+        """If a second service ever mounts it, this profile stops being the gate
+        and the reasoning above quietly becomes false."""
+        directives = _compose_directives()
+        mounts = [ln for ln in directives.splitlines() if "docker.sock" in ln]
+        assert len(mounts) == 1, mounts
+
+    def test_just_down_also_stops_it(self) -> None:
+        """A `down` that leaves the socket-mounted container running is the one
+        that matters most to get right."""
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        assert "--profile archive --profile metrics down" in justfile
+
+
+class TestComposeBakesTheCommit:
+    """`-debug` reports the commit it is running by reading the GIT_SHA ENV baked
+    into the image — the OCI label the Dockerfile also stamps is invisible from
+    inside a container. compose's build blocks passed no `args:` at all, so
+    anything built through compose answered `unknown` while wearing a SHA tag."""
+
+    def test_every_service_that_builds_passes_the_commit(self) -> None:
+        """The three build blocks tag ONE image name, so `docker compose build`
+        builds that name three times and the last write wins: a block missing the
+        arg silently retags the bot's image from a GIT_SHA-less build."""
+        building = _building_services()
+        # Non-empty guard: a helper that matched nothing passes the loop.
+        assert len(building) >= 3, building
+        for name, block in building.items():
+            assert "image: discord-music-bot:" in block, name
+            assert "GIT_SHA: ${GIT_SHA:-unknown}" in block, name
+
+    def test_the_fallback_is_readable_rather_than_empty_or_mandatory(self) -> None:
+        """A bare `${GIT_SHA}` bakes an empty string, which -debug renders as a
+        blank commit; `:?` would fail `up` for everyone who builds outside the
+        deploy scripts. The image TAG's own `:-latest` is a different question —
+        a tag has to name something pullable."""
+        fallbacks = set(
+            re.findall(r"GIT_SHA: \$\{GIT_SHA([^}]*)\}", _compose_directives())
+        )
+        assert fallbacks == {":-unknown"}
+
+    def test_the_deploy_script_bakes_the_same_fallback(self) -> None:
+        """compose and build_common.sh are two independent paths onto one image
+        name, and neither can read the other's default. Drift means the same
+        unbuilt-from-a-deploy image reports two different things."""
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert 'GIT_SHA="${GIT_SHA:-unknown}"' in preflight
+
+
+class TestComposeDebugPrometheusUrl:
+    """A VALUED `environment:` entry beats env_file AND the process environment, so
+    a bare literal here would silently override the .env setting .env.example tells
+    operators to use. That is how the knob shipped inert."""
+
+    def test_the_url_is_interpolated_not_hardcoded(self) -> None:
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${DEBUG_PROMETHEUS_URL" in line, line
+
+    def test_it_defaults_rather_than_requiring_the_variable(self) -> None:
+        """`:-` not `:?`: unset must degrade that one -debug row to `n/a`, never
+        fail the whole `up`."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert ":-" in line and ":?" not in line
+
+    def test_the_published_port_is_a_variable_and_loopback_only(self) -> None:
+        """9090 is exactly the port an already-installed local Prometheus owns, and
+        a collision fails the entire `up` — same reasoning as POSTGRES_HOST_PORT."""
+        lgtm = _service_block("otel-lgtm")
+        line = next(ln for ln in lgtm.splitlines() if ":9090" in ln)
+        assert "127.0.0.1:" in line
+        assert "${PROMETHEUS_HOST_PORT" in line
+
+    def test_the_default_url_follows_the_published_port(self) -> None:
+        """Two knobs that must agree: moving the port without moving the URL points
+        the bot at a port nothing listens on."""
+        bot = _service_block("discord-music-bot")
+        line = next(ln for ln in bot.splitlines() if "DEBUG_PROMETHEUS_URL" in ln)
+        assert "${PROMETHEUS_HOST_PORT:-9090}" in line
+
+
+class TestComposeMatchesTheDefault:
+    """The two halves of the first-run promise, asserted against the real file:
+    `docker compose up` must work with nothing configured but DISCORD_TOKEN, and
+    the password it falls back to must be the one the bot warns about. Both are
+    invisible to every other check in the repo.
+    """
+
+    def test_no_postgres_password_interpolation_is_mandatory(self) -> None:
+        """regression: db-backfill kept `:?` when the other three services moved.
+        Compose interpolates the whole document before profile filtering, so an
+        `ops`-profiled service with a mandatory variable fails `up`, `ps`, `logs`
+        and `config` alike.
+        """
+        mandatory = re.findall(
+            r"\$\{POSTGRES_PASSWORD:\?[^}]*\}", _compose_directives()
+        )
+        assert mandatory == []
+
+    def test_every_fallback_is_the_password_the_bot_warns_about(self) -> None:
+        """The drift check. DEFAULT_POSTGRES_PASSWORD is duplicated across
+        config.py, build_common.sh and three compose services with nothing holding
+        them together, and drift fails open: change compose's fallback alone and
+        the detector goes permanently silent on a known credential.
+        """
+        fallbacks = set(
+            re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", _compose_directives())
+        )
+        # Non-empty guard: a regex that matched nothing would make the equality
+        # below trivially true, which is how this kind of test rots.
+        assert len(fallbacks) >= 1
+        assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
+
+    def test_the_build_preflight_checks_for_the_same_password(self) -> None:
+        """build_common.sh hardcodes the literal too — the fifth copy. Drifting
+        compose's fallback would leave the build-time warning checking for a value
+        no deployment uses, silently and fail-open. A shell script cannot import
+        config.py, so the coupling is asserted here instead of enforced there.
+        """
+        preflight = (
+            Path(__file__).resolve().parent.parent / "build_common.sh"
+        ).read_text()
+        assert f'= "{DEFAULT_POSTGRES_PASSWORD}"' in preflight
+
+    def test_the_justfile_dsn_uses_the_same_default(self) -> None:
+        """The SIXTH copy, and the only one nothing held: `_dotenv`'s
+        `${POSTGRES_PASSWORD:-password}` states the coupling in a comment with
+        nothing enforcing it. Rotate the default in the three copies the tests
+        above cover and every test stays green while `just run`/`db-*` build a
+        DSN the database rejects — surfacing later as a drainer backoff loop.
+        """
+        justfile = (Path(__file__).resolve().parent.parent / "justfile").read_text()
+        fallbacks = set(re.findall(r"\$\{POSTGRES_PASSWORD:-([^}]*)\}", justfile))
+        assert len(fallbacks) >= 1  # non-empty guard, as above
+        assert fallbacks == {DEFAULT_POSTGRES_PASSWORD}
+
+    def test_the_bot_and_the_migration_tiers_all_carry_a_default(self) -> None:
+        # Count rather than merely "none mandatory": a service whose
+        # POSTGRES_URL was deleted outright would also pass the first test.
+        # Four interpolations = the bot, the postgres service, and the two
+        # one-shots' DSNs.
+        assert len(re.findall(r"\$\{POSTGRES_PASSWORD:", _compose_directives())) >= 4
+
+
+class TestArchiveProfileDerivation:
+    """`HISTORY_ARCHIVE_ENABLED` is the ONLY switch: build_common.sh's
+    resolve_archive_profile turns it into compose's `archive` profile on every
+    deploy path, so opting in never means editing a tracked file.
+
+    Run rather than grepped. The parser duplicates
+    config.parse_history_archive_enabled in shell — a language that cannot import
+    it — and the failure mode of a wrong answer is silent in both directions: a
+    truthy spelling that resolves to no profile gives an archive-enabled bot no
+    database, and a falsy one that resolves to `archive` deploys long-term
+    storage nobody opted in to.
+    """
+
+    @staticmethod
+    def _resolve(
+        tmp_path: Path, dotenv: str = "", **env: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run resolve_archive_profile against a throwaway .env and report what it
+        exported. Deliberately NOT inheriting os.environ: this machine's own
+        shell exports POSTGRES_* and could export the flag too, which would make
+        the cases below assert against the developer's environment."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        return subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source ./build_common.sh; resolve_archive_profile; printf "%s" "$COMPOSE_PROFILES"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+        )
+
+    @pytest.mark.parametrize("value", ["true", "TRUE", "True", "1", "yes", " true "])
+    def test_truthy_spellings_activate_the_profile(
+        self, value: str, tmp_path: Path
+    ) -> None:
+        # Every spelling config.py accepts, or the deploy silently disagrees with
+        # the bot it is deploying.
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", ""])
+    def test_falsy_spellings_deactivate_it(self, value: str, tmp_path: Path) -> None:
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED=value)
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_unset_is_the_off_default(self, tmp_path: Path) -> None:
+        # Fail-closed, matching the bot: absence of a choice means no collection
+        # and therefore no database.
+        assert self._resolve(tmp_path).stdout == ""
+
+    def test_the_flag_is_read_from_dotenv(self, tmp_path: Path) -> None:
+        # The operator sets it in .env and runs a deploy script; nothing exports
+        # it into that script's environment.
+        assert (
+            self._resolve(tmp_path, dotenv="HISTORY_ARCHIVE_ENABLED=true\n").stdout
+            == "archive"
+        )
+
+    def test_the_environment_wins_over_dotenv(self, tmp_path: Path) -> None:
+        # Compose's own precedence, and the same order warn_default_postgres_password
+        # uses. The bot agrees: the compose file passes HISTORY_ARCHIVE_ENABLED
+        # through valuelessly, so a set one overrides env_file for the container too.
+        result = self._resolve(
+            tmp_path,
+            dotenv="HISTORY_ARCHIVE_ENABLED=true\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == ""
+
+    def test_garbage_refuses_the_deploy(self, tmp_path: Path) -> None:
+        """setup_hook raises on `on`/`maybe` rather than picking a side, so the
+        deploy must too — deploying a database for a bot that will refuse to
+        start is worse than failing here, where the message is on screen."""
+        result = self._resolve(tmp_path, HISTORY_ARCHIVE_ENABLED="on")
+        assert result.returncode == 1
+        assert "HISTORY_ARCHIVE_ENABLED" in result.stderr
+
+    def test_other_profiles_survive(self, tmp_path: Path) -> None:
+        # Only the `archive` element is owned here. Clobbering the list would
+        # silently drop an operator's own profile on every deploy.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="true", COMPOSE_PROFILES="ops"
+        )
+        assert result.stdout == "ops,archive"
+
+    def test_a_stale_archive_entry_is_removed_when_the_flag_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """The migration path: installs that predate the derivation carry
+        COMPOSE_PROFILES=archive in .env. Flipping the flag to false has to
+        override it, which works only because the export happens even when the
+        resulting list is EMPTY — the process environment beats .env in compose,
+        an unset variable does not."""
+        result = self._resolve(
+            tmp_path,
+            dotenv="COMPOSE_PROFILES=ops,archive\n",
+            HISTORY_ARCHIVE_ENABLED="false",
+        )
+        assert result.stdout == "ops"
+
+    def test_the_profile_is_not_duplicated(self, tmp_path: Path) -> None:
+        # Runs on every deploy, and build_docker.sh resolves before exec'ing
+        # deploy_docker.sh, which resolves again over the exported result.
+        result = self._resolve(
+            tmp_path, HISTORY_ARCHIVE_ENABLED="1", COMPOSE_PROFILES="archive"
+        )
+        assert result.stdout == "archive"
+
+    @pytest.mark.parametrize("script", ["deploy_docker.sh", "build_docker.sh"])
+    def test_both_pipelines_resolve_the_profile(self, script: str) -> None:
+        """deploy_docker.sh is the only script that starts containers, so a
+        missing call there is the whole feature missing; build_docker.sh calls it
+        early so a garbage flag fails before the gate and the image build."""
+        text = (Path(__file__).resolve().parent.parent / script).read_text()
+        assert "resolve_archive_profile" in text
+
+    def test_the_deploy_resolves_before_it_starts_containers(self) -> None:
+        # Order, not presence: an export after `docker compose up` is a no-op.
+        # Anchored for the reason the migration-ordering test spells out — the
+        # file quotes this command inside comments too, and matching one of
+        # those checks an ordering nobody cares about.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        up = re.search(r"^docker compose up -d", text, re.M)
+        assert up is not None
+        assert text.index("resolve_archive_profile") < up.start()
+
+    def test_the_bot_receives_the_same_flag_it_deploys_on(self) -> None:
+        """The compose file must pass HISTORY_ARCHIVE_ENABLED through VALUELESSLY.
+        Written with a value it would ignore .env; omitted entirely, an exported
+        flag would steer the profile while the container still read .env — the
+        two-switch drift this whole mechanism exists to remove, reintroduced
+        between the deploy shell and the bot."""
+        assert re.search(r"^\s*- HISTORY_ARCHIVE_ENABLED$", _compose_directives(), re.M)
+
+    def test_an_external_postgres_needs_no_tracked_file_edit(self) -> None:
+        """The BOT's DSN is ${POSTGRES_URL:-<parts>}, so a URL in .env wins. The
+        old instruction was to comment out that line, which conflicted on every
+        `git pull`.
+
+        Exactly one service, and that is the invariant. The bot has host
+        networking, so .env's loopback DSN is right for it. The two compose-network
+        one-shots must NOT take it: 127.0.0.1 inside them is themselves, and
+        giving them .env's URL broke the migration with connection refused
+        against a healthy database. They address postgres by service name, and
+        the deploy passes a genuinely external DSN in explicitly.
+        """
+        overridable = re.findall(
+            r"- POSTGRES_URL=\$\{POSTGRES_URL:-", _compose_directives()
+        )
+        assert len(overridable) == 1
+        for service in ("db-migrate", "db-backfill"):
+            block = _service_block(service)
+            assert "POSTGRES_URL=${POSTGRES_URL" not in block, service
+            assert "@postgres:5432" in block, service
+
+    def test_every_deploy_migrates_before_it_starts_the_new_bot(self) -> None:
+        """A `git pull` can bring new migrations with new code, so the deploy
+        applies them — and BEFORE `up`, because the bot refuses to archive
+        against a schema older than its build. Recreating the bot first would
+        leave it archiving nothing until someone read the logs."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        # The `up` anchored to the start of a line is the COMMAND; the file also
+        # quotes `docker compose up -d` inside comments, and matching one of
+        # those instead made this pass on ordering it never checked.
+        up = re.search(r"^docker compose up -d", text, re.M)
+        migrate = re.search(r"docker compose run --rm -T .*db-migrate", text)
+        assert up is not None and migrate is not None
+        assert migrate.start() < up.start()
+
+    def test_the_migration_step_is_gated_on_the_archive_being_enabled(self) -> None:
+        # No archive, no database, nothing to migrate — the step must sit inside
+        # the ARCHIVE_ENABLED branch, not run unconditionally.
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        branch = re.search(
+            r'if \[ "\$ARCHIVE_ENABLED" -eq 1 \]; then\n(.*?)\nfi\n', text, re.S
+        )
+        assert branch is not None
+        assert "db-migrate" in branch.group(1)
+
+    def test_a_failed_migration_stops_the_deploy(self) -> None:
+        """The gate is the point: `run --rm` reports the runner's exit status,
+        and a non-zero one must leave the running bot untouched rather than
+        deploy code against a schema that was not applied."""
+        text = (Path(__file__).resolve().parent.parent / "deploy_docker.sh").read_text()
+        assert re.search(
+            r"if ! docker compose run --rm -T .*db-migrate; then(?:.|\n)*?exit 1", text
+        )
+
+    @staticmethod
+    def _external_env(tmp_path: Path, dotenv: str = "", **env: str) -> str:
+        """What resolve_external_postgres_env would add to a `docker compose run`."""
+        root = Path(__file__).resolve().parent.parent
+        shutil.copy(root / "build_common.sh", tmp_path / "build_common.sh")
+        (tmp_path / ".env").write_text(dotenv)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                "source ./build_common.sh; resolve_external_postgres_env; "
+                'printf "%s" "${EXTERNAL_PG_ENV[*]-}"',
+            ],
+            cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", "")} | env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://u:p@127.0.0.1:5432/db",
+            "postgresql://u:p@localhost:5432/db",
+            "postgres://u:p@127.0.0.1/db",
+            "postgresql://u:p@[::1]:5432/db",
+            "postgresql://127.0.0.1:5432/db",
+            # A literal `@` in the password: credentials are stripped to the LAST
+            # one, or the host reads as `ss@127.0.0.1` and this misfires in the
+            # only direction that breaks a working deployment.
+            "postgresql://u:p@ss@127.0.0.1:5432/db",
+        ],
+    )
+    def test_a_loopback_dsn_is_never_handed_to_a_container(
+        self, url: str, tmp_path: Path
+    ) -> None:
+        """This is the regression. .env holds the HOST-form DSN — the
+        host-networked bot needs one, and `just run` derives one — and passing it
+        into a compose-network container points that container at itself. The
+        symptom was the migration failing with connection refused while postgres
+        was healthy, which reads as a database problem and is not one."""
+        assert self._external_env(tmp_path, POSTGRES_URL=url) == ""
+
+    @pytest.mark.parametrize(
+        "url",
+        ["postgresql://u:p@db.example.com:5432/hist", "postgresql://u:p@10.0.0.5/hist"],
+    )
+    def test_an_external_dsn_is_passed_through(self, url: str, tmp_path: Path) -> None:
+        # Otherwise the deploy's migration gate silently migrates the BUNDLED
+        # database while the bot runs against the external one — the schema
+        # error surfaces later, at runtime, as a refusal to archive.
+        assert (
+            self._external_env(tmp_path, POSTGRES_URL=url) == f"-e POSTGRES_URL={url}"
+        )
+
+    def test_no_url_means_the_service_default_stands(self, tmp_path: Path) -> None:
+        # The bundled stack, which is the common case: the compose file's own
+        # service-name DSN is correct and nothing should override it.
+        assert self._external_env(tmp_path) == ""
+
+    def test_the_url_is_read_from_dotenv_too(self, tmp_path: Path) -> None:
+        assert (
+            self._external_env(
+                tmp_path, dotenv="POSTGRES_URL=postgresql://u:p@db.example.com/hist\n"
+            )
+            == "-e POSTGRES_URL=postgresql://u:p@db.example.com/hist"
+        )
+
+    @pytest.mark.parametrize(
+        ("path", "command"),
+        [
+            ("deploy_docker.sh", "docker compose run --rm -T"),
+            ("justfile", "docker compose run --rm"),
+        ],
+    )
+    def test_both_container_one_shots_resolve_the_external_dsn(
+        self, path: str, command: str
+    ) -> None:
+        """db-migrate (deploy) and db-backfill (recipe) are the two commands that
+        run this image against the archive from inside the compose network."""
+        text = (Path(__file__).resolve().parent.parent / path).read_text()
+        assert "resolve_external_postgres_env" in text
+        assert f'{command} ${{EXTERNAL_PG_ENV[@]+"${{EXTERNAL_PG_ENV[@]}}"}}' in text
+
+    def test_the_docs_no_longer_ship_a_second_switch(self) -> None:
+        """`.env.example` is copied verbatim into .env by setup_env.sh, so a
+        commented-out COMPOSE_PROFILES line there is an invitation to uncomment
+        one — recreating the pair the derivation replaced."""
+        example = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+        assert not re.search(r"^#?\s*COMPOSE_PROFILES=", example, re.M)
+
+
+class TestSetupEnvTightensTheEnvFile:
+    """setup_env.sh is the escape hatch from the shared default, so the file it
+    writes the replacement into must not be world-readable.
+
+    Run rather than grepped, unlike the drift checks above: the behaviour is an
+    interaction between `stat`, `chmod` and `mv` across two platforms' stat
+    spellings, which no source-text assertion pins. Copied into a tmpdir first —
+    the script `cd`s to its own directory and would otherwise rewrite the real .env.
+    """
+
+    @staticmethod
+    def _run(mode: int, tmp_path: Path) -> int:
+        root = Path(__file__).resolve().parent.parent
+        for name in ("setup_env.sh", "build_common.sh", ".env.example"):
+            shutil.copy(root / name, tmp_path / name)
+        env = tmp_path / ".env"
+        env.write_text("DISCORD_TOKEN=x\n")
+        env.chmod(mode)
+        subprocess.run(
+            ["bash", str(tmp_path / "setup_env.sh"), "--force"],
+            check=True,
+            capture_output=True,
+        )
+        assert "POSTGRES_PASSWORD=" in env.read_text()
+        return env.stat().st_mode & 0o777
+
+    def test_a_hand_made_world_readable_env_is_narrowed(self, tmp_path: Path) -> None:
+        # `cp .env.example .env` by hand lands at 644 under the usual umask, and
+        # this script is what then writes a freshly generated credential into it.
+        assert self._run(0o644, tmp_path) == 0o600
+
+    def test_a_stricter_mode_survives(self, tmp_path: Path) -> None:
+        # Narrowing only: go-rwx clears bits and never sets them, so an operator
+        # who chose 400 keeps 400.
+        assert self._run(0o400, tmp_path) == 0o400
+
+
+class TestDebugPrometheusUrl:
+    """The opt-in knob behind -debug's container-metrics row. Unset is the
+    feature being off, not a misconfiguration."""
+
+    def test_unset_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DEBUG_PROMETHEUS_URL", raising=False)
+        assert debug_prometheus_url() is None
+
+    def test_empty_reads_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bare `KEY=` shape .env models elsewhere, and compose interpolates
+        an unset variable to exactly that."""
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", "   ")
+        assert debug_prometheus_url() is None
+
+    def test_returns_the_configured_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEBUG_PROMETHEUS_URL", " http://localhost:9090 ")
+        assert debug_prometheus_url() == "http://localhost:9090"

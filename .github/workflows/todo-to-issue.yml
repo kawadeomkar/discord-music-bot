@@ -1,7 +1,7 @@
 name: TODO to Issue
 
 # Opens a GitHub issue for every TODO/FIXME/ISSUE/HACK comment added to main.
-# The severity ladder these identifiers encode is documented in docs/CLAUDE.md.
+# The severity ladder these identifiers encode is documented in CLAUDE.md.
 #
 # Diff-based: the action only sees trigger comments on ADDED lines in the push diff.
 # Comments already on main when this workflow landed are invisible to it forever — to
@@ -23,7 +23,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history — the action diffs the push against its parent commit.
           fetch-depth: 0

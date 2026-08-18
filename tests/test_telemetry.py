@@ -1,13 +1,10 @@
 """Tests for src/telemetry.py — OTel setup, the gateway sampler, and structlog wiring.
 
-This module was the least-covered in the project (30%), and the uncovered part
-was the setup path — code that only ever runs at process start and only fails in
-production. The tests below exercise it against real SDK objects and an in-memory
-exporter rather than mocking the SDK, so they check that spans actually come out
-the other end.
-
-Everything here mutates process-global state (root logger handlers, the module's
-provider globals, structlog's configuration), so every test restores it.
+The setup path runs only at process start and fails only in production, so it is
+exercised against real SDK objects and an in-memory exporter rather than mocks —
+the assertions reach an actually-emitted span. Everything here mutates
+process-global state (root logger handlers, the module's provider globals,
+structlog's configuration), so every test restores it.
 """
 
 import logging
@@ -118,9 +115,7 @@ class TestSetupTelemetry:
     def test_second_call_is_a_noop_when_sdk_is_disabled(
         self, clean_setup: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The guard used to key off _tracer_provider, which stays None in this
-        path — so the docstring's "a second call is a no-op" was only true with
-        the SDK enabled."""
+        """Disabled path: no provider is built, so the guard cannot key off one."""
         monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
         telemetry.setup_telemetry()
 
@@ -234,11 +229,9 @@ class TestSetupTraces:
 
 class TestSetupLogs:
     # opentelemetry-sdk deprecated LoggingHandler in favour of the one in
-    # opentelemetry-instrumentation-logging, so _setup_logs() emits a
-    # DeprecationWarning — which pyproject's `filterwarnings = ["error"]` turns
-    # into a failure here. Suppressed rather than worked around because the
-    # warning is REAL: production emits it at startup today. Migrating handlers
-    # is a dependency change, tracked separately; delete this marker then.
+    # opentelemetry-instrumentation-logging, and `filterwarnings = ["error"]` turns
+    # the resulting DeprecationWarning into a failure. Production emits it too;
+    # delete this marker once the handler migration lands.
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_bridges_the_root_logger_to_otel(self, clean_setup: None) -> None:
         with patch(
