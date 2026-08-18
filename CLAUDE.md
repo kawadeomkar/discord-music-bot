@@ -183,7 +183,7 @@ just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
 just pins           # assert the six duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
-just test           # pytest with coverage (fail_under=80)        ~27s
+just test           # full suite, coverage gated (fail_under=80)  ~27s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~35s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
@@ -191,7 +191,10 @@ just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     
 just container-test # build test image, run suite inside it       ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
-# Test selection (args forward to pytest)
+# Test selection (args forward to pytest). ANY argument means a subset run, so
+# coverage is skipped — fail_under is a PROJECT floor and one file measures ~26%,
+# which used to fail a green run with exit 1. The gate rides the no-args form, which
+# is what `just check`, the pre-push hook and CI's `test-report` all invoke.
 just test tests/test_youtube.py
 just test -k spotify
 just test --maxfail=1
