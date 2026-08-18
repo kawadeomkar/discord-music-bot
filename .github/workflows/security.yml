@@ -1,10 +1,27 @@
 name: Security
 
 on:
+  # Was a bare `push:` — every push to every branch ran a full audit whose result
+  # is a function of poetry.lock alone, so parallel task branches sharing a lock
+  # re-ran an identical scan. main + PRs + the weekly cron covers the same ground:
+  # nothing reaches main without passing through one of them, and the cron catches
+  # advisories published after a lock stops changing.
   push:
+    branches: [main]
+  pull_request:
   schedule:
     - cron: '0 8 * * 1'  # Every Monday at 08:00 UTC
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default — see the same block in ci.yml. Auditing a lockfile
+# needs to read the repository and nothing more, but the org default hands out a
+# write-all token to any workflow that does not say otherwise.
+permissions:
+  contents: read
 
 jobs:
   pip-audit:
@@ -13,18 +30,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v6
+      # install: false — `poetry export` reads poetry.lock and never touches a
+      # virtualenv, so this job used to build the full lint environment (pyright plus
+      # its bundled Node runtime) on every push and PR to produce a text file.
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
+          cache-prefix: audit
+          install: 'false'
+          poetry-plugins: poetry-plugin-export
 
-      - name: Install Poetry
-        run: pip install poetry==2.1.3 poetry-plugin-export
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
-          poetry install --only=main,test,lint --no-root
-
+      # `--with=test,lint` is load-bearing now that those groups are optional in
+      # pyproject.toml — without it the audit would silently cover runtime
+      # dependencies only. (While the groups were non-optional this flag was a no-op
+      # that happened to describe what poetry did anyway.)
       - name: Export requirements for pip-audit
         run: poetry export --without-hashes --with=test,lint -f requirements.txt -o requirements-audit.txt
 

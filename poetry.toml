@@ -1,2 +1,8 @@
 [virtualenvs]
 create = true
+# CI caches `path: .venv` and the Dockerfile copies /app/.venv, so the venv must
+# land in the project rather than poetry's global cache dir. Note this loses to
+# an already-activated environment: with pyenv-virtualenv auto-activating from
+# .python-version, local `poetry install` still goes to the pyenv env. The
+# justfile follows $VIRTUAL_ENV for exactly that reason.
+in-project = true

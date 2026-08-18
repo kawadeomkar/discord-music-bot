@@ -1,23 +1,16 @@
 """Man-page-styled embed help command.
 
-discord.py ships two built-in implementations (DefaultHelpCommand,
-MinimalHelpCommand); both format through a Paginator into plain text, so an
-embed-only bot has to subclass HelpCommand directly. Only the dispatch methods
-are overridden — command_callback still does the resolution, which means
-`-help p` (an alias) and `-help MusicBot` (the cog) keep working for free.
-
-The layout borrows from man(1): caps section headers (NAME, SYNOPSIS,
-DESCRIPTION, EXAMPLES, NOTES) and a command list of hanging-indent entries —
-every form of a command on one line, its summary indented beneath — rather
-than a column-aligned table, whose grid read poorly at Discord widths.
-
-Per-command copy lives on the commands themselves (brief/help/usage/extras in
-src/musicbot.py) rather than in a table here, so a new command shows up in the
-help output as soon as it is declared.
+Both built-ins format through a Paginator into plain text, so an embed-only bot must
+subclass HelpCommand directly; only the dispatch methods are overridden, so
+command_callback still resolves `-help p` (alias) and `-help MusicBot` (cog) for free.
+Layout borrows from man(1) — caps section headers, hanging-indent entries — because a
+column-aligned table's grid read poorly at Discord widths. Per-command copy lives on
+the commands themselves (brief/help/usage/extras in src/musicbot.py).
 """
 
 import textwrap
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Optional
+from collections.abc import Mapping, Sequence
 
 import discord
 from discord.ext import commands
@@ -26,13 +19,21 @@ from src.util import notice_embed
 
 HELP_COLOR = discord.Color.blurple()
 
-# The command list, in display order: categories as rendered, and within each
-# category the commands by importance/frequency of use — the daily verbs first,
-# housekeeping last — not alphabetically, which put `pause` above `play`.
+# Display order: categories as rendered, and within each by frequency of use (daily
+# verbs first, housekeeping last) — not alphabetically, which put `pause` above `play`.
 CATEGORY_COMMANDS: dict[str, tuple[str, ...]] = {
     "Playback": ("play", "playnow", "pause", "resume", "skip", "stop", "volume"),
-    "Queue": ("queue", "now", "history", "shuffle", "remove", "clear", "jump"),
-    "Utility": ("help", "join", "ping"),
+    "Queue": (
+        "queue",
+        "now",
+        "history",
+        "leaderboard",
+        "shuffle",
+        "remove",
+        "clear",
+        "jump",
+    ),
+    "Utility": ("help", "join", "ping", "debug"),
 }
 CATEGORY_ORDER: tuple[str, ...] = tuple(CATEGORY_COMMANDS)
 UNCATEGORISED = "Other"
@@ -40,19 +41,18 @@ UNCATEGORISED = "Other"
 # Discord's hard cap on an embed field value.
 _FIELD_LIMIT = 1024
 
-# Command entries live in code blocks — the only construct Discord renders in
-# a monospace grid, and so the only place a hanging indent survives. But
-# Discord soft-wraps code blocks at the embed's rendered width (roughly 54
-# monospace characters on desktop, less on mobile), and its wrap restarts at
-# column 0 — destroying the indent. Hard-wrapping narrower than any common
-# embed width keeps the wrapping ours, so continuations stay indented.
+# Entries live in code blocks — the only construct Discord renders monospace, so the
+# only place a hanging indent survives. But Discord soft-wraps code blocks at the embed
+# width (~54 chars on desktop, less on mobile) and restarts at column 0, so hard-wrapping
+# narrower than any common width keeps the wrapping ours.
 _WIDTH = 48
 _INDENT = "    "
 _FENCE = "```"
 
 SOURCES = (
     "**YouTube** — video links, playlist links, or plain words to search with. "
-    "A `?t=` / `?ts=` timestamp starts the song at that offset.\n"
+    "A `?t=` / `?ts=` timestamp starts the song at that offset, and a playlist "
+    "link's `&index=` starts the queue at that position.\n"
     "**Spotify** — track and playlist links. Each title is matched to its "
     "YouTube audio, so a playlist may take a moment to queue.\n"
     "**SoundCloud** — track links."
@@ -66,7 +66,7 @@ TIPS = (
     "• The **Now Playing** card re-anchors itself to the bottom of the channel "
     "so its live progress bar is never buried by other messages.\n"
     "• Queue, history and volume are saved per server and restored if the bot "
-    "restarts mid-song.\n"
+    "restarts mid-song — or when `-resume` brings it back after a `-stop`.\n"
     "• A volume change applies from the **next** song onwards."
 )
 
@@ -96,19 +96,10 @@ class MusicHelpCommand(commands.HelpCommand):
             **options,
         )
 
-    # Every send below goes through self.context, never self.get_destination():
-    # the inherited get_destination() returns context.channel, whose bare send()
-    # would bury the Now Playing host message mid-song. MusicContext.send keeps
-    # the NP block glued to the bottom of the channel (see
-    # docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md), and routing help output through
-    # ctx.send is the same rule the rest of the bot follows.
-    #
-    # Overriding get_destination() to return the Context would be the natural
-    # hook, but its base signature promises a MessageableChannel and a Context
-    # is not one — only Messageable, which is all a caller here needs. Rather
-    # than override it incompatibly, we leave it alone: this class overrides
-    # every send_* method the base defines, so the base's own call to it (in
-    # send_error_message) never runs.
+    # Every send goes through self.context, never self.get_destination(): the inherited
+    # one returns context.channel, whose bare send() would bury the Now Playing host
+    # mid-song. Overriding get_destination() would be the natural hook, but its base
+    # promises a MessageableChannel and a Context is only Messageable.
 
     # ── formatting helpers ────────────────────────────────────────────────────
 
@@ -117,17 +108,14 @@ class MusicHelpCommand(commands.HelpCommand):
         return self.context.clean_prefix
 
     def get_command_signature(self, command: commands.Command, /) -> str:
-        """`-play <url|search>` — the canonical form only.
-
-        The base implementation inlines aliases into the name as
-        `-[play|p|sing] …`; here each alias is instead its own SYNOPSIS line
-        (per-command help) or joins the comma list heading the command's list
-        entry, the way man pages write `-h, --help`. Command.signature returns
-        the `usage=` kwarg verbatim when one is set.
+        """`-play <url|search>` — the canonical form only. The base inlines aliases as
+        `-[play|p|sing] …`; here each alias gets its own SYNOPSIS line, or joins the
+        comma list heading a list entry, the way man pages write `-h, --help`.
+        Command.signature returns the `usage=` kwarg verbatim when one is set.
         """
         return f"{self.prefix}{command.qualified_name} {command.signature}".strip()
 
-    def _extras(self, command: commands.Command) -> dict:
+    def _extras(self, command: commands.Command) -> dict[str, Any]:
         return command.extras or {}
 
     def _category(self, command: commands.Command) -> str:
@@ -143,23 +131,21 @@ class MusicHelpCommand(commands.HelpCommand):
         except ValueError:
             return (len(order), command.qualified_name)
 
-    def _forms(self, command: commands.Command) -> List[str]:
+    def _forms(self, command: commands.Command) -> list[str]:
         """Every way to invoke the command, canonical name first."""
         return [
             f"{self.prefix}{name}"
             for name in (command.qualified_name, *command.aliases)
         ]
 
-    def _entry_lines(self, command: commands.Command) -> List[str]:
+    def _entry_lines(self, command: commands.Command) -> list[str]:
         """One command as a hanging-indent entry, the way man(1) lists options:
 
             -play, -p, -sing <url|search>
                 queue a song and start playing
 
-        Cells that overflow the width budget wrap rather than truncate — an
-        entry may grow a line, but it never silently loses text. A wrapped
-        heading continues two spaces past the summary indent so the two can't
-        be mistaken for each other.
+        Overflow wraps rather than truncates, and a wrapped heading continues two spaces
+        past the summary indent so the two can't be confused.
         """
         heading = f"{', '.join(self._forms(command))} {command.signature}".strip()
         summary = command.brief or command.short_doc or "no description"
@@ -170,19 +156,18 @@ class MusicHelpCommand(commands.HelpCommand):
         )
 
     def _add_entries_field(
-        self, embed: discord.Embed, name: str, entries: Sequence[List[str]]
+        self, embed: discord.Embed, name: str, entries: Sequence[list[str]]
     ) -> None:
-        """Add one section of entries (blank line between them), continuing into
-        "(cont.)" fields rather than letting Discord reject an over-long value
-        (>1024 chars)."""
-        # The fences and their newlines are part of the field value Discord measures.
+        """Add one section of entries (blank line between them), spilling into
+        "(cont.)" fields rather than letting Discord reject a >1024-char value."""
+        # The fences and their newlines count toward the value Discord measures.
         budget = _FIELD_LIMIT - (2 * len(_FENCE) + 2)
 
         def size(lines: Sequence[str]) -> int:
             return sum(len(line) + 1 for line in lines)
 
         field_name = name
-        chunk: List[str] = []
+        chunk: list[str] = []
         for lines in entries:
             spaced = lines if not chunk else ["", *lines]
             if chunk and size(chunk) + size(spaced) > budget:
@@ -200,7 +185,7 @@ class MusicHelpCommand(commands.HelpCommand):
     # ── dispatch ──────────────────────────────────────────────────────────────
 
     async def send_bot_help(
-        self, mapping: Mapping[Optional[commands.Cog], List[commands.Command]], /
+        self, mapping: Mapping[Optional[commands.Cog], list[commands.Command]], /
     ) -> None:
         prefix = self.prefix
         everything = [cmd for cmds in mapping.values() for cmd in cmds]
@@ -222,7 +207,7 @@ class MusicHelpCommand(commands.HelpCommand):
             inline=False,
         )
 
-        buckets: dict[str, List[commands.Command]] = {}
+        buckets: dict[str, list[commands.Command]] = {}
         for command in visible:
             buckets.setdefault(self._category(command), []).append(command)
         ordered = [c for c in CATEGORY_ORDER if c in buckets]
@@ -245,8 +230,7 @@ class MusicHelpCommand(commands.HelpCommand):
         await self.context.send(embed=embed)
 
     async def send_cog_help(self, cog: commands.Cog, /) -> None:
-        # Every command lives in the single MusicBot cog, so `-help MusicBot` is
-        # just the full list — no separate, near-identical rendering.
+        # One cog holds every command, so `-help MusicBot` is just the full list.
         await self.send_bot_help(self.get_bot_mapping())
 
     async def send_command_help(self, command: commands.Command, /) -> None:
@@ -256,7 +240,7 @@ class MusicHelpCommand(commands.HelpCommand):
 
         embed = discord.Embed(
             title=f"{prefix}{command.qualified_name}(1)",
-            # The NAME section, as man(1) writes it: name — one-line summary.
+            # The name section, as man(1) writes it: name — one-line summary.
             description=(
                 f"**{command.qualified_name}** — "
                 f"{command.brief or command.short_doc or 'no description'}"
@@ -265,8 +249,7 @@ class MusicHelpCommand(commands.HelpCommand):
         )
         embed.add_field(
             name="SYNOPSIS",
-            # One line per invocable form, aliases included — how a man page's
-            # SYNOPSIS lists every spelling of a command.
+            # One line per invocable form, aliases included, as a man SYNOPSIS.
             value=self._fence(
                 [f"{form} {command.signature}".strip() for form in self._forms(command)]
             ),
@@ -277,7 +260,7 @@ class MusicHelpCommand(commands.HelpCommand):
             value=command.help or command.brief or "no description",
             inline=False,
         )
-        examples: List[str] = extras.get("examples", [])
+        examples: list[str] = extras.get("examples", [])
         if examples:
             embed.add_field(name="EXAMPLES", value=self._fence(examples), inline=False)
         note: Optional[str] = extras.get("note")
@@ -287,8 +270,8 @@ class MusicHelpCommand(commands.HelpCommand):
         await self.context.send(embed=embed)
 
     async def send_group_help(self, group: commands.Group, /) -> None:
-        # No command groups exist today; degrade to the single-command embed
-        # rather than falling back to the base class's plaintext output.
+        # No groups exist today; degrade to the single-command embed rather than
+        # falling back to the base class's plaintext output.
         await self.send_command_help(group)
 
     async def send_error_message(self, error: str, /) -> None:
