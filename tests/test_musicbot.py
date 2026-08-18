@@ -798,6 +798,60 @@ class TestQuerySourceClassification:
             await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
         assert self._passed_query_source(spy) == "spotify.com"
 
+    async def test_playnow_pages_past_an_empty_first_page(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An empty page does not mean an empty playlist.
+
+        Removed and local tracks arrive as null and podcast episodes carry no
+        artists, so a playlist whose first 100 items are all of those yields a
+        page with no titles and `next` still set. Reading page 1 alone answered
+        "The playlist has no queueable tracks" — for a playlist -play queues
+        without complaint, because its drain streams on through exactly this.
+        """
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pidskip")
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.PLAYLIST, total=150)
+        music_bot.spotify.playlist_stream = MagicMock(
+            return_value=_sgen(
+                [
+                    _spage(col, [], is_last=False),  # 100 episodes, all skipped
+                    _spage(col, ["Real Song A", "Real Song B"], is_last=True),
+                ]
+            )
+        )
+        fake_qobj = QueueObject("https://yt.com/v=1", "Real Song A", mock_ctx.author)
+        spy = AsyncMock(return_value=fake_qobj)
+        with patch("src.musicbot.YTDL.yt_source", new=spy):
+            result = await music_bot._resolve_playnow_source(
+                mock_ctx, source, origin=_ORIGIN
+            )
+
+        assert result is fake_qobj
+        # The FIRST real track, taken from the page that actually had one.
+        assert spy.await_args is not None
+        assert "Real Song A" in spy.await_args.args[1]
+
+    async def test_playnow_reports_a_collection_that_is_empty_all_the_way_down(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The other side of the walk: paging on must still end. A collection
+        whose every page is empty has nothing to interject, and that answer is
+        accurate rather than premature."""
+        source = SpotifySource(type=SpotifyType.PLAYLIST, id="pidempty")
+        assert music_bot.spotify is not None
+        col = _scollection(SpotifyType.PLAYLIST, total=200)
+        music_bot.spotify.playlist_stream = MagicMock(
+            return_value=_sgen(
+                [
+                    _spage(col, [], is_last=False),
+                    _spage(col, [], is_last=True),
+                ]
+            )
+        )
+        with pytest.raises(ValueError, match="no queueable tracks"):
+            await music_bot._resolve_playnow_source(mock_ctx, source, origin=_ORIGIN)
+
     async def test_playnow_spotify_page1_is_bounded(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -7258,6 +7312,11 @@ class TestDrainCollectionTail:
         assert any("taking too long" in (d or "") for d in notices), notices
         # The completion notice must not also fire — the drain did not complete.
         assert not any("finished queueing" in (d or "") for d in notices), notices
+        # And it must not promise a re-run adds only the remainder: no cache is
+        # written for a partial drain and nothing skips what is already queued,
+        # so a re-run enqueues the whole collection over the top of this one.
+        assert not any("add the remainder" in (d or "") for d in notices), notices
+        assert any("will re-add" in (d or "") for d in notices), notices
         await resolved.aclose()
 
     async def test_deadline_never_cancels_a_queue_put(
