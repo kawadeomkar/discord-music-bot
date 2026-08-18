@@ -64,7 +64,7 @@ async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
         gate = await store.get_recovery_gate()
         if gate is None:
             # Read failed — do not treat as "nothing to restore". Skip this
-            # attempt; the lock expires in 60s and the next on_ready retries.
+            # attempt; the lock expires on its TTL and the next on_ready retries.
             log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
             return
         guild_state = gate.state

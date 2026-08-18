@@ -525,7 +525,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
-| `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
+| `lock:guild:{id}:recovery` | string | 180s | SET NX EX distributed recovery lock. The value is a per-acquisition random token, and release is a WATCH/MULTI compare-and-delete — an unconditional DEL would let a holder whose lock expired mid-recovery delete its successor's |
 
 Postgres holds two tables — `play_history`, and `play_history_rejected` (rows the server
 refused; expected to stay empty forever, since `HistoryEntry.__post_init__` clamps every
@@ -580,7 +580,7 @@ stamps the real id from the Redis key, the only place that information still exi
 on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is None)
   └─ per guild: _restore_guild (background task)
        ├─ skip if guild already in mps
-       ├─ acquire lock:guild:{id}:recovery (SET NX EX 60) — rolling-restart safety
+       ├─ acquire lock:guild:{id}:recovery (SET NX EX 180, random token) — rolling-restart safety
        ├─ get_recovery_gate(): ONE pipeline = state hash + queue LLEN (contents stay
        │    off the wire on the common nothing-to-do path; a -stopped guild keeps a
        │    possibly-long persisted queue by design)
