@@ -28,6 +28,7 @@ from src.musicbot import MusicBot as MusicBotCog
 from src.util import spawn_background
 from tests.helpers import command_callback
 from src.musicplayer import MusicPlayer
+from src.youtube import QueueObject
 from src.debug import (
     DebugAction,
     DebugInputs,
@@ -364,6 +365,36 @@ class TestGuildBlock:
         assert "player       yes" in lines
         assert "queue        0 queued" in lines
         assert "volume       50%" in lines
+
+    async def test_the_queue_row_counts_a_claimed_but_unstarted_song(
+        self, mock_guild: MagicMock, music_player: MusicPlayer, mock_author: MagicMock
+    ) -> None:
+        """The row is display_size(), not qsize().
+
+        They differ by exactly the in-flight head — the song the loop has
+        claimed and is still resolving — and they are one token apart over the
+        same two fields, so a swap back compiles, type-checks, and reads as
+        `0 queued` to a user whose song is being resolved right now. On an empty
+        queue the two agree, which is the only state the sibling above covers.
+        """
+        mock_guild.voice_client = None
+        await music_player.queue.put(
+            [
+                QueueObject("https://yt.com/v=1", "One", mock_author),
+                QueueObject("https://yt.com/v=2", "Two", mock_author),
+            ]
+        )
+        await music_player.queue.get()  # the loop claims the head, unsettled
+        assert music_player.queue.qsize() == 1  # what the swapped-back call reads
+
+        lines = "\n".join(
+            guild_lines(
+                mock_guild,
+                self._inputs(player=cast(Optional[MusicPlayer], music_player)),
+                source="saved here",
+            )
+        )
+        assert "queue        2 queued" in lines
 
     @pytest.mark.parametrize(
         "name",

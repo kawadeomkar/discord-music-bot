@@ -7,7 +7,7 @@ import dataclasses
 import re
 from zoneinfo import ZoneInfo
 import time
-from typing import Any, Never, cast
+from typing import Any, Never, Optional, cast
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
@@ -63,8 +63,7 @@ def _stub_prefetch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(youtube.YTDL, "prefetch_stream", AsyncMock())
 
 
-@pytest.fixture
-def mock_song() -> MagicMock:
+def _make_song() -> MagicMock:
     """A mock YTDL-like song object with all metadata attributes."""
     song = MagicMock()
     song.title = "Test Song Title"
@@ -108,6 +107,11 @@ def mock_song() -> MagicMock:
         side_effect=lambda: song.start_offset + song.elapsed_secs
     )
     return song
+
+
+@pytest.fixture
+def mock_song() -> MagicMock:
+    return _make_song()
 
 
 @pytest.fixture
@@ -7830,9 +7834,14 @@ class TestLoopAdditional:
         mocked(music_player._guild).voice_client = vc
         music_player.play_next.wait = AsyncMock()
 
-        prefetched = MagicMock()
-        prefetched.cleanup = MagicMock()
-        prefetched.persisted = True
+        # Built like the song it stands in for, not bare: a MagicMock's
+        # start_paused reads truthy, so vc.pause() raised on the prefetched
+        # iteration and the whole thing finished through loop()'s except
+        # Exception handler — green, while the start transaction, the NP send
+        # and the history bookkeeping it claims to cover never ran at all.
+        prefetched = _make_song()
+        prefetched.title = "Prefetched Song"
+        prefetched.webpage_url = "https://yt.com/watch?v=prefetched"
 
         gets: list[int] = []
 
@@ -7846,8 +7855,15 @@ class TestLoopAdditional:
             seed_queue(music_player.queue, queue_obj, queue_obj2)
             return await music_player.queue.get()
 
-        async def _prefetch_after_the_clear(_self: Any) -> MagicMock:
-            music_player.queue.get_nowait()
+        async def _prefetch_after_the_clear(_self: Any) -> Optional[MagicMock]:
+            # Only the first prefetch claims. The real one returns None on an
+            # empty queue; claiming unconditionally raises QueueEmpty on the
+            # iteration after the prefetched song plays, which the loop reports
+            # as a playback error and would mask the one asserted below.
+            try:
+                music_player.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return None
             return prefetched
 
         async def _stop_noop(_self: Any) -> None:
@@ -7876,6 +7892,17 @@ class TestLoopAdditional:
         assert vc.play.call_args_list[1].args[0] is prefetched
         # And the claim it arrived with was settled, not leaked.
         assert music_player.queue._cursor == 0
+        # It PLAYED, rather than reaching vc.play and then unwinding through the
+        # loop's exception handler — which sends this notice, and leaves the
+        # start transaction, the NP send and the history bookkeeping unrun while
+        # every assertion above still passes.
+        errors = [
+            c.kwargs["embed"].title
+            for c in mocked(music_player._channel).send.call_args_list
+            if c.kwargs.get("embed") is not None
+            and "Playback error" in str(c.kwargs["embed"].title)
+        ]
+        assert not errors, errors
 
     async def test_discards_song_and_calls_cleanup_when_song_queue_cleared_mid_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock

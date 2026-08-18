@@ -2484,28 +2484,29 @@ class TestGenerationCounter:
         loop, so the whole queue is discarded. A second call site would strand a
         claim on a queue that keeps running: _cursor stays advanced, and the next
         commit-time LPOP retires an entry the loop never claimed. Adding one means
-        settling the claim in the loop's refused-commit branch first."""
-        import inspect
-        import re as _re
+        settling the claim in the loop's refused-commit branch first.
 
-        import src.musicbot as musicbot_module
-        import src.musicplayer as musicplayer_module
+        The scan covers EVERY module under src/, derived rather than listed: the
+        invariant is repo-wide, and a hardcoded pair let recovery.py — which holds
+        players too, and is the likeliest next site — add a caller unnoticed."""
+        import re as _re
+        from pathlib import Path
+
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        modules = sorted(p for p in src_dir.glob("*.py") if p.name != "guild_queue.py")
+        assert len(modules) >= 15, modules  # the glob really found the package
 
         callers = []
-        for module in (musicbot_module, musicplayer_module):
-            for i, ln in enumerate(inspect.getsource(module).split("\n"), start=1):
-                # Comments stripped: both modules describe this rule in prose
+        for path in modules:
+            for i, ln in enumerate(path.read_text().split("\n"), start=1):
+                # Comments stripped: several modules describe this rule in prose
                 # right beside the code, and an unstripped scan would count those.
                 if "bump_generation(" in _re.sub(r"#.*$", "", ln):
-                    callers.append((module.__name__, i, ln.strip()))
-        assert callers == [
-            (
-                "src.musicbot",
-                callers[0][1] if callers else 0,
-                # Not awaited: cleanup() runs it ahead of the disconnect, so it
-                # must not be able to suspend on the mutex a stalled Redis holds.
-                "mp.queue.bump_generation()",
-            )
+                    callers.append((path.name, i, ln.strip()))
+        assert [(name, line) for name, _, line in callers] == [
+            # Not awaited: cleanup() runs it ahead of the disconnect, so it
+            # must not be able to suspend on the mutex a stalled Redis holds.
+            ("musicbot.py", "mp.queue.bump_generation()")
         ], callers
 
     async def test_clear_bumps_generation(
