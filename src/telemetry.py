@@ -37,6 +37,9 @@ _OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317
 
 _tracer_provider: Optional["TracerProvider"] = None
 _log_provider: Optional["LoggerProvider"] = None
+# Separate from _tracer_provider: with OTEL_SDK_DISABLED=true no provider is ever
+# built, so that global cannot serve as the double-call guard on the disabled path.
+_setup_done = False
 
 # discord.py makes these startup HTTP calls with no user-visible parent; suppress
 # them so Tempo isn't cluttered with orphaned root spans. Confirmed from live traces.
@@ -78,12 +81,13 @@ class _DiscordGatewayFilter(Sampler):
 
 def setup_telemetry() -> None:
     """Initialize OTel SDK and structlog. No-op when OTEL_SDK_DISABLED=true. A second
-    call is a no-op too: it would add a second root LoggingHandler (duplicate Loki
-    records) and orphan the first TracerProvider's exporter.
+    call is a no-op too, on either path: it would add a second root LoggingHandler
+    (duplicate Loki records) and orphan the first TracerProvider's exporter.
     """
-    global _tracer_provider
-    if _tracer_provider is not None:
+    global _setup_done
+    if _setup_done:
         return
+    _setup_done = True
     _configure_structlog()
     if os.getenv("OTEL_SDK_DISABLED", "false").lower() == "true":
         return
