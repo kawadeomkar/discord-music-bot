@@ -384,7 +384,7 @@ jobs:
       # GITHUB_TOKEN cannot be granted packages: write.
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
