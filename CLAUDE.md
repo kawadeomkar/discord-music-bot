@@ -880,7 +880,7 @@ carry as an accepted ISSUE: with the lock released between them, a `put_front` s
 in that tick read a cursor of 0, LPUSHed ahead of the entry the pending LPOP was about to
 retire, and the LPOP ate the new song. Cost is one ~1ms Redis round trip under the mutex
 per song start. The body of that `async with` must stay short and must never touch
-Discord; `try_commit_dequeue()` remains for the one caller with no Redis write to make.
+Discord; `try_commit_dequeue()` remains as the primitive `commit_dequeue()` wraps, driven directly by the queue's own tests; every production commit makes a Redis write and takes the context manager.
 
 ## Code conventions
 

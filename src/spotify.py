@@ -35,9 +35,9 @@ _ALBUM_TTL = 86400  # 24h — albums are immutable once released
 # GET /v1/albums/{id} and later pages follow its embedded `next` cursor
 # verbatim, so the album stride is always Spotify's own choice, never assumed.
 _PLAYLIST_PAGE_LIMIT = 100
-# `type` is in the mask so the unwrap can reject podcast episodes by name;
-# `next`/`total` are what the shipped mask omitted — the omission was the
-# entire >100-track truncation bug.
+# `type` is in the mask so the unwrap can reject podcast episodes by name.
+# `next` MUST stay in it: the cursor is what pages a playlist past its first
+# 100 tracks, and a mask without it makes the rest of the playlist invisible.
 _PLAYLIST_FIELDS = "next,total,items(track(type,name,artists(name)))"
 # aiohttp's default is ClientTimeout(total=300) — one hung page would hold the
 # per-guild collection lock for five minutes. Bounds one request, not a stream;
@@ -92,15 +92,11 @@ def _track_search_title(track: dict[str, Any]) -> str:
 class SpotifyCollection:
     """Identity of a paged collection — what the enqueue embed renders.
 
-    name/artists/thumbnail/release_date are Optional/empty because the PLAYLIST
-    path does not currently fill them: playlist_stream opens at
-    /v1/playlists/{id}/tracks, which returns the paging object and carries no
-    playlist identity under any `fields` mask. That is a choice of entry point,
-    not a cost: GET /v1/playlists/{id} returns name, images and a `tracks`
-    paging object holding the first page — the same shape album_stream already
-    exploits — so filling them is one request either way. Deliberately deferred;
-    the consequence is that playlist embeds render without a title or cover art
-    while album embeds get both.
+    name/artists/thumbnail/release_date stay Optional/empty on the PLAYLIST
+    path: playlist_stream opens at /v1/playlists/{id}/tracks, which carries no
+    playlist identity under any `fields` mask, so playlist embeds render without
+    a title or cover art while album embeds get both. See
+    docs/ARCHITECTURE.md#playlist-identity-is-unfilled.
     """
 
     kind: SpotifyType
@@ -216,9 +212,9 @@ class SpotifyAuthError(Exception):
 class SpotifyRequestError(Exception):
     """A non-2xx Spotify response that is neither a credential rejection nor a
     429. The args carry the endpoint and params for the log and the span; only
-    user_message is safe to show, the same split ExtractionError uses. Before
-    this existed the raw text was the error embed, so a failed page told the
-    user the request URL and its offset."""
+    user_message is safe to show, the same split ExtractionError uses — the raw
+    text names the request URL and its offset, which is log detail, not something
+    to put in a channel."""
 
     def __init__(self, status: int, endpoint: str, params: Any = None) -> None:
         self.status = status
@@ -545,9 +541,8 @@ class Spotify:
         are mutable: an edit landing between two offset requests shifts every
         later offset and silently duplicates or drops tracks. `next`
         carries the fields mask forward, so following it needs no
-        re-parameterisation. Following it at all is the fix for the
-        >100-track silent-truncation bug: the old mask omitted `next`
-        entirely, so the cursor was invisible.
+        re-parameterisation. It is also the only thing that reaches a playlist's
+        tracks past the first page — see _PLAYLIST_FIELDS.
 
         Skipped items are real (removed/local tracks arrive as null,
         episodes without artists), so collection.total is an upper bound —

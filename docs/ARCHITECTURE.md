@@ -660,7 +660,7 @@ The shortcut is guarded twice more, because LREM matches on **exact serialized b
 
 Counted per distinct serialization, never `LREM … 0`: two enqueues of one song usually differ on the wire (`queue_position`, `queued_at`), but when they do not, removing "all matching" would take out a copy still queued.
 
-**No residual window between commit and LPOP**: the loop settles its claim through `commit_dequeue()`, the async context manager that holds the bulk mutex across the caller's own store dispatch, so the in-memory settle and the start transaction's server-side LPOP land under one hold. This closed the window `try_commit_dequeue()` → `pop_queue_and_start_song()` used to leave open, where a bulk mutation scheduled in that event-loop tick raced the LPOP server-side. `try_commit_dequeue()` remains for the one caller with no Redis write to make.
+**No residual window between commit and LPOP**: the loop settles its claim through `commit_dequeue()`, the async context manager that holds the bulk mutex across the caller's own store dispatch, so the in-memory settle and the start transaction's server-side LPOP land under one hold. This closed the window `try_commit_dequeue()` → `pop_queue_and_start_song()` used to leave open, where a bulk mutation scheduled in that event-loop tick raced the LPOP server-side. `try_commit_dequeue()` remains as the primitive `commit_dequeue()` wraps, driven directly by the queue's own tests; every production commit makes a Redis write and takes the context manager.
 
 ---
 
@@ -911,6 +911,26 @@ flowchart TD
 | `mps.pop()` atomic gate | `MusicBot.cleanup` | Concurrent cleanup calls (stop racing voice-state event) |
 | `HistoryOutboxDrainer._wake: asyncio.Event` | drainer | Outbox-push notify → drain wakeup (clear-after-wait ordering makes a racing push never lost) |
 | `PostgresHistoryArchive._init_lock: asyncio.Lock` | `PostgresHistoryArchive` | Double-checked lazy pool creation + migration run (first successful `acquire()` wins) |
+| `MusicBot._enqueue_locks[guild]: _GuildEnqueueLock` | `MusicBot` (the cog, not the player) | One streamed collection enqueue per guild; `-shuffle` and `-remove` take it too, since both rebuild the mirror from memory. See below |
+
+<a id="why-the-enqueue-slot-is-not-max-concurrency"></a>
+
+### Why the enqueue slot is a plain `asyncio.Lock`
+
+The slot lives on the **cog**, not `MusicPlayer`: `cleanup()` destroys players, and a lock
+destroyed mid-wait orphans its waiters. It is bounded on both sides — `_ENQUEUE_WAIT_SECS`
+(60 s, which must stay under `_PLAYBACK_GATE_TIMEOUT`) and `_ENQUEUE_MAX_WAITERS`.
+
+`asyncio.Lock` specifically, because it is documented fair ("thread always waits its
+turn"), so waiting collections land in arrival order. discord.py's `max_concurrency`
+semaphore cannot do this job, and the reasons are three separate walls rather than a
+preference:
+
+- its buckets are **per-Command**, so it cannot serialize `-play` against `-shuffle`;
+- `ctx.invoke` bypasses `prepare()`, so the `-playnow`→`play` delegation escapes it
+  entirely;
+- its acquire fast-path barges past just-woken waiters, which loses the arrival order the
+  fairness above exists to keep.
 
 ---
 
@@ -1521,6 +1541,18 @@ the queue. A drained album is cached only when its title count equals the album'
 for 24h would be served as the whole album with no error anywhere. (Playlists carry no
 such equality: episode/null items are legitimately skipped, so their `total` is an
 upper bound.)
+
+<a id="playlist-identity-is-unfilled"></a>
+
+**Playlist identity is unfilled, and that is an entry-point choice rather than a cost.**
+`playlist_stream` opens at `/v1/playlists/{id}/tracks`, which returns the paging object
+and carries no name, images or owner under any `fields` mask — so `SpotifyCollection`'s
+`name`/`artists`/`thumbnail`/`release_date` stay empty for playlists and their enqueue
+embeds render without a title or cover art. `GET /v1/playlists/{id}` would return all of
+it *plus* a `tracks` paging object holding the first page, the same shape `album_stream`
+already exploits, so filling them costs no extra request. Deferred, not rejected: what
+blocks it is that the album path's page-1-rides-identity flow would have to be
+generalized over both kinds.
 
 **Cache discipline.** `spotify:{album,playlist}_tracks:{id}` is written only when the
 consumer iterates *past* the final page — i.e. the generator resumes after its last yield.

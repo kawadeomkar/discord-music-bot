@@ -265,8 +265,8 @@ def parse_url(
                 f"Spotify {kind!r} links aren't supported — try a {supported} link"
             ) from None
         if len(path) < 2 or not path[1]:
-            # A bare /album or /intl-de/track: the type without an id. The
-            # IndexError this used to raise rendered as a stack trace.
+            # A bare /album or /intl-de/track: the type without an id, which
+            # must reach the user as a message rather than an IndexError.
             raise UnsupportedSpotifyLinkError(
                 f"That Spotify {kind} link has no id — copy the full link"
             ) from None

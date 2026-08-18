@@ -308,12 +308,10 @@ class ActiveCommand:
 class _GuildEnqueueLock:
     """A guild's collection-enqueue slot: the lock plus its waiter count.
 
-    asyncio.Lock specifically — it is documented fair ("thread always waits
-    its turn"), so waiting collections land in arrival order. discord.py's
-    max_concurrency semaphore was rejected for this job: per-Command buckets
-    can't serialize play against shuffle, ctx.invoke bypasses prepare() (the
-    -playnow→play delegation would escape it), and its acquire fast-path
-    barges past just-woken waiters.
+    asyncio.Lock specifically — it is documented fair ("thread always waits its
+    turn"), so waiting collections land in arrival order. Do not swap it for a
+    max_concurrency bucket: see
+    docs/ARCHITECTURE.md#why-the-enqueue-slot-is-not-max-concurrency.
     """
 
     __slots__ = ("lock", "waiters")
@@ -327,10 +325,7 @@ class _GuildEnqueueLock:
 class SpotifyCollectionPager:
     """A Spotify collection resolving page-by-page — LAZILY: constructing one
     performs no I/O, and page 1 is fetched by _begin_collection_enqueue under
-    its own drain budget. (An eager page-1 task that overlapped the voice-join
-    handshake was removed as review simplification S2: it bought ~200ms on the
-    cold-cache front path only, and cost a hand-managed task lifecycle —
-    cancel-on-abandon, exception retrieval, capture-before-join.)
+    its own drain budget.
 
     A STARTED pager must still be closed exactly once — aclose() or a full
     drain, never neither. Abandoning a started generator defers finalization
@@ -602,7 +597,7 @@ class MusicBot(commands.Cog):
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
-        # Only collection enqueues and -shuffle take these; singles never wait.
+        # Taken by collection enqueues, -shuffle and -remove; singles never wait.
         # On the cog, not MusicPlayer: cleanup() destroys players, and a lock
         # destroyed mid-wait orphans its waiters. Never pruned — an entry with
         # live waiters cannot be popped safely (~100B per guild).
@@ -1094,7 +1089,7 @@ class MusicBot(commands.Cog):
     async def _acquire_enqueue_slot(
         self, ctx: commands.Context
     ) -> Optional[_GuildEnqueueLock]:
-        """Serialize collection enqueues (and -shuffle) per guild.
+        """Serialize collection enqueues, -shuffle and -remove per guild.
 
         Returns the held slot on success — the caller must release
         `slot.lock` in a finally — or None when declined, in which case the
@@ -1319,7 +1314,7 @@ class MusicBot(commands.Cog):
             origin=origin,
             # Albums report collection.total upfront (exact — items are never
             # skipped); a multi-page playlist's real count is only known once
-            # drained, so it gets a completion notice (L6/G5).
+            # drained, so it gets a completion notice.
             completion_notice=not is_album and not page1.is_last,
         )
         # Built before the notification, which cannot abort it: page 1 is already
@@ -1674,9 +1669,9 @@ class MusicBot(commands.Cog):
                 "-play never gonna give you up",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
                 "-play https://www.youtube.com/playlist?list=PLabc&index=4",
-                # A real album; the old playlist example was an editorial
-                # (37i9…) playlist, which Spotify 404s for third-party apps —
-                # a documented example that could never work.
+                # Keep these two reachable: Spotify 404s its own editorial
+                # (37i9…) playlists for third-party apps, so one as an example
+                # would document a link that cannot work.
                 "-play https://open.spotify.com/album/6WgSCcRfaXuBVfM2TpV0Kl",
                 "-play https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n",
                 "-p https://soundcloud.com/artist/track",
@@ -1850,9 +1845,9 @@ class MusicBot(commands.Cog):
                     # data dependency. For single tracks and searches that
                     # overlap covers the extraction; a Spotify collection's
                     # queue_source is pure construction (the pager is lazy),
-                    # so its page 1 is fetched after the join instead — the
-                    # deliberate S2 trade: ~200ms of cold-cache front-path
-                    # latency for not managing an eager task's lifecycle.
+                    # so its page 1 is fetched after the join instead, costing
+                    # ~200ms on the cold-cache front path and keeping the pager's
+                    # lifecycle to one close on one path.
                     # Awaiting join_task after queue_source guarantees the
                     # voice client is ready before queue_put fires.
                     join_task = asyncio.create_task(ctx.invoke(self.join))

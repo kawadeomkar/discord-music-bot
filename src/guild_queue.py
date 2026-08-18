@@ -609,8 +609,10 @@ class GuildQueue:
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
-    # Settle through finish_failed_dequeue() or try_commit_dequeue(), never
-    # try_release() alone: those two carry the mirror leg with them.
+    # Never settle through try_release() alone: it moves memory only. A failure
+    # path settles through finish_failed_dequeue(), which carries the LPOP; a
+    # commit goes through commit_dequeue(), which holds the mutex across the
+    # caller's own Redis write.
 
     def try_release(self) -> bool:
         """Settle one claim: drop the head and step the cursor back, which leaves
@@ -674,8 +676,9 @@ class GuildQueue:
         resolved to, so head and item are legitimately different objects for one
         slot.
 
-        For a caller with no Redis write to make. One that follows the commit
-        with the start transaction's LPOP uses commit_dequeue() instead."""
+        The primitive commit_dequeue() wraps, and what the queue's own tests drive
+        directly. Every production commit follows the settle with a Redis write and
+        so goes through commit_dequeue(), which holds the mutex across both."""
         async with self._mutex:
             if generation != self._generation:
                 return False
