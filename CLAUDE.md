@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,730 tests plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 47-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,740 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 47-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -403,7 +403,7 @@ code in the repo. Its bookkeeping invariants:
 
 - `claim_outstanding` tracks an unsettled `queue.get()` so the outer exception handler can
   settle the claim, so `_cursor` never drifts.
-- `try_commit_dequeue()` (under the queue mutex) detects "queue cleared while this song
+- `commit_dequeue()` (under the queue mutex) detects "queue cleared while this song
   resolved" — the song is discarded and its FFmpeg subprocess `cleanup()`ed (leak
   otherwise).
 - The Redis start write is `pop_queue_and_start_song` (MULTI/EXEC: LPOP + state HSET +
@@ -475,7 +475,7 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
 - Every multi-leg mutation (`put`, `put_front`, `clear`, `shuffle`, `remove`,
   `finish_failed_dequeue`) runs under one bulk-mutation mutex.
 - A dequeue is **two-phase**: `get()` advances `_cursor`; the item and the Redis LPOP
-  settle later via `try_commit_dequeue()` / `redis_pop_for()` (or are undone via
+  settle later via `commit_dequeue()` / `redis_pop_for()` (or are undone via
   `requeue_front()` / retired via `finish_failed_dequeue()`). `put_front` inserts at
   `_cursor`, which IS inserting behind the in-flight head.
 - **`_sync_wake()` is the only writer of `_wake`.** A stale set
@@ -491,11 +491,15 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   the same two fields, so a swap compiles and type-checks; `display_size()` is the sole
   input to `play_history.queue_position`, so a swap writes a plausible wrong number to
   Postgres forever.
-- Callers with a prefetch task must `_cancel_prefetch()` BEFORE clear/shuffle/remove so
-  the prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
+- Callers with a prefetch task must settle it BEFORE clear/shuffle/remove so the
+  prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
+  `-clear`/`-remove` use `_cancel_prefetch()`; **`-shuffle` uses
+  `_neutralize_prefetch()`**, because `cancel_task()` no-ops on a COMPLETED prefetch
+  and its surviving claim would pin that song to the front of the reorder and leave
+  the too-few guard counting one short of what `-queue` shows.
 - `clear()` invalidates in-flight work through the generation counter and the cursor
   reset ALONE — a prefetched song the loop is holding is discarded because
-  `try_commit_dequeue` refuses (nothing is claimed once the cursor is 0). There was once
+  `commit_dequeue` refuses (nothing is claimed once the cursor is 0). There was once
   a cleared-flag beside them; it was read once per loop iteration, so a `clear()` landing
   after that read survived an entire song and destroyed a song claimed long after it,
   leaking the claim. Do not reintroduce a level flag here.
@@ -843,9 +847,14 @@ via `GuildQueue.commit_dequeue()` — the async context manager the playback loo
 around `vc.play()` and the store dispatch. This closes the race guild_queue.py used to
 carry as an accepted ISSUE: with the lock released between them, a `put_front` scheduled
 in that tick read a cursor of 0, LPUSHed ahead of the entry the pending LPOP was about to
-retire, and the LPOP ate the new song. Cost is one ~1ms Redis round trip under the mutex
-per song start. The body of that `async with` must stay short and must never touch
-Discord; `try_commit_dequeue()` remains for the one caller with no Redis write to make.
+retire, and the LPOP ate the new song. Cost is one Redis round trip under the mutex per
+song start (p50 ~0.3ms, p99 ~6ms), **bounded by `_START_WRITE_TIMEOUT` (5s)** — the pool
+sets no `socket_timeout`, so an unbounded write parks `-play`/`-clear`/`-shuffle`/
+`-remove` for that guild for as long as Redis stalls, measured past 20s against one that
+accepts and then stops answering. Cancelling leaves the LPOP outcome unknown, which is
+the state a crash there leaves and restore already replays from. The body of that
+`async with` must stay short and must never touch Discord; a caller with no Redis
+write to make passes an empty body.
 
 ## Code conventions
 

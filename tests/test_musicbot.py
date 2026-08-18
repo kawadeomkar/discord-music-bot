@@ -4,6 +4,8 @@ from src.musicplayer import MusicPlayer
 import redis.asyncio as aioredis
 import asyncio
 import contextlib
+import inspect
+import re
 import orjson
 from types import SimpleNamespace
 from contextlib import AbstractContextManager
@@ -2373,7 +2375,17 @@ class TestHistoryCommand:
         assert HISTORY_MAX_LIMIT <= HISTORY_CACHE_LIMIT
 
     @pytest.mark.parametrize(
-        "name", ["history", "ping", "leaderboard", "debug", "resume"]
+        "name",
+        [
+            "history",
+            "ping",
+            "leaderboard",
+            "debug",
+            "resume",
+            "shuffle",
+            "clear",
+            "remove",
+        ],
     )
     def test_the_command_is_capped_at_one_render_per_guild(self, name: str) -> None:
         """`-history` is the heaviest send in the bot (up to 8 song embeds plus the
@@ -2388,6 +2400,12 @@ class TestHistoryCommand:
         validate_commands' "already being used in channel X" check cannot fire for
         either — both join, and the second MOVES the bot to its own author's channel.
 
+        `-shuffle`/`-clear`/`-remove` for a fifth: all three park on the queue's
+        bulk mutex, which the playback loop holds across the start transaction. A
+        Redis that stalls there wedges them, and every repeat while wedged parks
+        another coroutine holding an OTel span `cog_after_invoke` never closes —
+        plus, for `-shuffle`, a typing keepalive POSTing for the duration.
+
         command_callback() strips decorators everywhere else in this file, so this
         is the only place any of these guards is reachable at all."""
         guard = getattr(MusicBot, name)._max_concurrency
@@ -2395,6 +2413,20 @@ class TestHistoryCommand:
         assert guard.number == 1
         assert guard.per is commands.BucketType.guild
         assert guard.wait is False
+
+    def test_the_shuffle_copy_and_the_refusal_quote_the_same_number(self) -> None:
+        """The FIXME this closed was exactly this drift: the code refused at one
+        number while -help promised another, so a user meeting the stated
+        requirement was turned away. Nothing else reads both strings."""
+        help_text = MusicBot.shuffle.help
+        assert help_text is not None
+        promised = re.search(r"at least (\d+) ", help_text)
+        refused = re.search(
+            r"There must be at least (\d+) songs",
+            inspect.getsource(MusicPlayer.queue_shuffle),
+        )
+        assert promised is not None and refused is not None
+        assert promised.group(1) == refused.group(1)
 
     def test_help_copy_states_the_real_retention_window(self) -> None:
         """The user-facing copy must name the window the command actually keeps: 50

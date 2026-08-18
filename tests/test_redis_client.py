@@ -2314,9 +2314,23 @@ class TestPopQueueAndStartSong:
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
         await fake_redis.rpush(store.queue_key(), b"first", b"second")
-        await store.pop_queue_and_start_song(_current(), 1000.0)
+        assert await store.pop_queue_and_start_song(_current(), 1000.0) is True
         remaining = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert remaining == [b"second"]
+
+    async def test_a_swallowed_failure_reports_that_the_lpop_did_not_land(
+        self,
+    ) -> None:
+        """@_guild_op logs and returns the default, so this return value is the
+        caller's ONLY signal. Defaulted to True it reads as success, the loop skips
+        its resync, and the mirror keeps an entry memory already dropped — the next
+        start retires the wrong one and a crash inside the drift records a song
+        twice."""
+        bad_redis = MagicMock()
+        bad_redis.pipeline = MagicMock(side_effect=ConnectionError("down"))
+        bad_store = GuildRedisStore(cast(aioredis.Redis, bad_redis), guild_id=1)
+
+        assert await bad_store.pop_queue_and_start_song(_current(), 1000.0) is False
 
     async def test_writes_now_playing_fields_atomically(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis

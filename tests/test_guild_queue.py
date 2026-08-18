@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 from dataclasses import replace
 from typing import Any
 import asyncio
+import contextlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -381,7 +382,7 @@ async def test_a_rebuilding_removal_serializes_only_the_survivors(
 
     The gate needs only a count, so a removal too big for it — one -remove of a
     collection link is routinely hundreds — serializes nothing but the survivors
-    the rebuild writes. `_to_entry` costs ~2.4us an entry on the single event
+    the rebuild writes. Building 500 entries measured 2.5ms on the single event
     loop."""
     collection = "https://open.spotify.com/playlist/big"
     drops = [
@@ -675,7 +676,8 @@ class TestClearWhileAClaimIsOutstanding:
 
         await gq.clear()
 
-        assert await gq.try_commit_dequeue(generation) is False
+        async with gq.commit_dequeue(generation) as committed:
+            assert committed is False
         assert gq._cursor == 0
 
 
@@ -865,7 +867,8 @@ class TestTheTwoCounters:
         await gq.get()
         assert (gq.qsize(), gq.display_size()) == (1, 2)
 
-        assert await gq.try_commit_dequeue(gq.generation) is True
+        async with gq.commit_dequeue(gq.generation) as committed:
+            assert committed is True
 
         assert (gq.qsize(), gq.display_size()) == (1, 1)
 
@@ -1222,21 +1225,23 @@ class TestClear:
         """The generation is the ONLY signal clear() leaves behind, and it is level
         against a captured value rather than a flag someone must consume in time.
 
-        clear() once also set a read-and-reset cleared-flag; a consumer that read it
-        before the clear landed then read it a whole song late, and acted on it
-        against a dequeue taken after the clear. A captured generation cannot go
-        stale that way: it names the queue the item came from."""
+        A read-and-reset flag beside it cannot do this job: a consumer that reads it
+        before the clear lands reads it a whole song late, and then acts on it
+        against a dequeue taken after the clear. A captured generation names the
+        queue the item came from, so it cannot go stale that way."""
         await gq.put([_qobj(1, mock_author)])
         captured = gq.generation
         await gq.get()
         await gq.clear()
         assert gq.generation != captured
-        assert await gq.try_commit_dequeue(captured) is False
+        async with gq.commit_dequeue(captured) as committed:
+            assert committed is False
         # A dequeue taken AFTER the clear captures the new value and commits.
         await gq.put([_qobj(2, mock_author)])
         fresh = gq.generation
         await gq.get()
-        assert await gq.try_commit_dequeue(fresh) is True
+        async with gq.commit_dequeue(fresh) as committed:
+            assert committed is True
 
     async def test_clear_settles_an_outstanding_claim(
         self, gq: GuildQueue, mock_author: MagicMock
@@ -1310,6 +1315,20 @@ class TestShuffle:
         assert await gq.shuffle() is ShuffleOutcome.TOO_FEW_SONGS
         assert gq.display_items() == items
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == before
+
+    async def test_a_claimed_head_counts_toward_the_threshold(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """-queue and -debug both render display_size(), so counting pending alone
+        refuses "at least 4" to a user looking at exactly four songs — which is
+        every mid-song -shuffle, since the loop or a prefetch holds one claim."""
+        items = [_qobj(n, mock_author) for n in range(1, 5)]
+        await gq.put(items)
+        await gq.get()
+
+        assert gq.display_size() == 4
+        assert gq.qsize() == 3
+        assert await gq.shuffle() is ShuffleOutcome.SHUFFLED
 
     async def test_shuffle_preserves_item_set(
         self,
@@ -1957,7 +1976,7 @@ class TestDequeueBookkeeping:
     async def test_commit_dequeue_shares_the_bulk_mutation_lock(
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """try_commit_dequeue() and the bulk ops really do serialize on one
+        """commit_dequeue() and the bulk ops really do serialize on one
         lock — a held lock blocks clear() until released. (Whitebox: the lock
         is deliberately not part of the public API since Phase 5.)"""
         await gq.put([_qobj(1, mock_author)])
@@ -2000,15 +2019,17 @@ class TestDequeueBookkeeping:
         redis_items = await fake_redis.lrange(store.queue_key(), 0, -1)
         assert len(redis_items) == 1  # persisted entry untouched
 
-    async def test_try_commit_dequeue_true_then_false_after_clear(
+    async def test_commit_dequeue_true_then_false_after_clear(
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
         await gq.put([_qobj(1, mock_author)])
         await gq.get()  # the claim the first commit settles
         generation = gq.generation
-        assert await gq.try_commit_dequeue(generation) is True
+        async with gq.commit_dequeue(generation) as committed:
+            assert committed is True
         await gq.clear()
-        assert await gq.try_commit_dequeue(generation) is False
+        async with gq.commit_dequeue(generation) as committed:
+            assert committed is False
 
 
 # ── requeue_front ─────────────────────────────────────────────────────────────
@@ -2092,7 +2113,8 @@ class TestShuffleWithInFlightDequeue:
 
         # The loop finishes resolving and commits, exactly as musicplayer
         # does: display pop + the start transaction's LPOP.
-        assert await gq.try_commit_dequeue(gq.generation) is True
+        async with gq.commit_dequeue(gq.generation) as committed:
+            assert committed is True
         await store.pop_queue()
         await _assert_mirror_matches(gq, fake_redis, store)
         redis_after = await fake_redis.lrange(store.queue_key(), 0, -1)
@@ -2158,6 +2180,31 @@ class TestMirrorWriteChoice:
 
         await gq.remove(remove_matcher("https://yt.com/v=3"))
 
+        assert calls == ["remove_queue_entries"]
+
+    async def test_exactly_the_cap_still_takes_the_shortcut(
+        self, gq: GuildQueue, store: GuildRedisStore, mock_author: MagicMock
+    ) -> None:
+        """The boundary the constant names. Tests either side of it leave `<=` and
+        `<` indistinguishable, and this is a measured crossover a maintainer is
+        expected to move — an off-by-one sends a qualifying removal to the rebuild
+        and no test notices."""
+        album = "https://open.spotify.com/album/exact"
+        survivors = [_qobj(900 + n, mock_author) for n in range(_LREM_MAX_ENTRIES * 5)]
+        await gq.put(
+            [
+                QueueObject(
+                    f"https://yt.com/v={n}", f"T{n}", mock_author, user_input=album
+                )
+                for n in range(_LREM_MAX_ENTRIES)
+            ]
+            + survivors
+        )
+        calls = self._spy(store)
+
+        outcome = await gq.remove(remove_matcher(album))
+
+        assert len(outcome.positions) == _LREM_MAX_ENTRIES
         assert calls == ["remove_queue_entries"]
 
     async def test_a_large_removal_rebuilds(
@@ -2256,7 +2303,8 @@ class TestRemoveWithInFlightDequeue:
             queue_object(in_flight)
         )
 
-        assert await gq.try_commit_dequeue(gq.generation) is True
+        async with gq.commit_dequeue(gq.generation) as committed:
+            assert committed is True
         await store.pop_queue()
         await _assert_mirror_matches(gq, fake_redis, store)
 
@@ -2330,7 +2378,7 @@ class TestPutClearMutualExclusion:
 class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
     """The commit and the LPOP that retires its entry settle under one mutex hold.
 
-    Released between them, a put_front() reads `_cursor == 0`, takes the LPUSH
+    Without that, a put_front() reads `_cursor == 0` between them, takes the LPUSH
     branch, and prepends ahead of the entry the pending LPOP removes — so the LPOP
     eats the inserted song, and memory and Redis drift by one until the next
     rebuild."""
@@ -2349,7 +2397,7 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
 
         async with gq.commit_dequeue(generation) as committed:
             assert committed
-            # -playnow, scheduled in the window the old commit left open.
+            # -playnow, scheduled into the window the hold has to close.
             racer = asyncio.create_task(gq.put_front([interjected]))
             await asyncio.sleep(0)
             assert not racer.done(), (
@@ -2383,11 +2431,53 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
         assert await gq.put([_qobj(2, mock_author)]) is not None
 
 
+class TestCommitDequeueUnwinds:
+    """The body is no longer trivial — it carries vc.play(), an assert and the
+    store dispatch — and a stranded asyncio.Lock has no timeout, so every later
+    put/put_front/clear/shuffle/remove for that guild would park forever."""
+
+    async def test_a_raising_body_releases_the_mutex(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        await gq.get()
+
+        with pytest.raises(RuntimeError):
+            async with gq.commit_dequeue(gq.generation) as committed:
+                assert committed is True
+                raise RuntimeError("vc.play blew up inside the hold")
+
+        assert not gq._mutex.locked()
+        await gq.put([_qobj(2, mock_author)])
+
+    async def test_a_cancelled_body_releases_the_mutex(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        await gq.get()
+        inside = asyncio.Event()
+
+        async def _hold() -> None:
+            async with gq.commit_dequeue(gq.generation):
+                inside.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(_hold())
+        await inside.wait()
+        assert gq._mutex.locked()
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled()
+        assert not gq._mutex.locked()
+        await gq.put([_qobj(2, mock_author)])
+
+
 class TestGenerationCounter:
-    async def test_starts_at_zero_and_bump_increments(self, gq: GuildQueue) -> None:
+    async def test_starts_at_zero(self, gq: GuildQueue) -> None:
         assert gq.generation == 0
-        gq.bump_generation()
-        assert gq.generation == 1
 
     async def test_clear_bumps_generation(
         self, gq: GuildQueue, mock_author: MagicMock

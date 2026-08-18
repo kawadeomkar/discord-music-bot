@@ -88,13 +88,13 @@ HISTORY_CACHE_LIMIT = 50
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
 # ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
-# since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
-# _start_paused / _user_input in the hash and from_crashed_state can later read a
-# value belonging to a song that finished under the old build. Bounded: this build
-# rewrites all four on every song start, and a stale _user_input makes
-# `-remove <album link>` take out an unrelated recovered song. Keep this list
-# complete: it is where the "delete once no rollback target predates them"
-# condition is computed from.
+# since, so `just up <older-sha>` leaves them in the hash and from_crashed_state can
+# read a value belonging to a song that finished under the old build — a stale
+# _user_input makes `-remove <album link>` take out an unrelated recovered song.
+# Relative to 2026-08-03: _query_source, _queued_at, _queue_position, then
+# _played_at / _is_resume / _start_paused (08-12) and _user_input (08-15). Rewritten
+# on every song start, so the exposure is the restore read that precedes the first
+# one. Name the horizon when adding to this list, or "complete" is uncheckable.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
@@ -793,13 +793,13 @@ class GuildRedisStore:
             StateField.TOTAL_PAUSE_SECONDS: "0",
         }
 
-    @_guild_op(default=None)
+    @_guild_op(default=False)
     async def pop_queue_and_start_song(
         self,
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
-    ) -> None:
+    ) -> bool:
         """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
         MULTI/EXEC leaves the song in one of two consistent states — still queued
@@ -807,6 +807,10 @@ class GuildRedisStore:
         closing the crash window where it was absent from both. `now_playing` rides
         the same transaction, so a crash can never leave state pointing at song B
         while the snapshot still shows song A.
+
+        Returns whether the LPOP landed, and THE CALLER MUST CHECK: the in-memory
+        settle already happened, so a swallowed failure leaves the list holding an
+        entry memory does not, and the next start retires the wrong one.
         """
         mapping = self._now_playing_state_mapping(current, play_start_epoch)
         pipe = self.redis.pipeline(transaction=True)
@@ -821,6 +825,7 @@ class GuildRedisStore:
             )
             pipe.expire(self.now_playing_key(), GUILD_TTL)
         await pipe.execute()
+        return True
 
     @_guild_op(default=None)
     async def set_current_song_state(
@@ -866,10 +871,10 @@ class GuildRedisStore:
         Returns HOW MANY were actually removed — the caller must check it.
 
         The alternative to rebuild_queue for a small removal: LREM touches only what
-        goes, while a rebuild rewrites the whole list whatever it drops (measured on
-        redis:7-alpine at depth 1000: 0.96 ms for one entry against ~5.7 ms to
-        rebuild). Far enough up, the per-LREM scans overtake it — GuildQueue owns
-        the threshold and the measurement behind it.
+        goes, while a rebuild rewrites the whole list whatever it drops (one host,
+        redis:7-alpine, depth 1000: 0.96 ms for one entry against ~5.7 ms to
+        rebuild — indicative, not a budget; nothing checks it). Far enough up the
+        per-LREM scans overtake it, and GuildQueue owns that threshold.
 
         Matching is by exact serialized bytes, which is an assumption about the rest
         of the codebase rather than about Redis: a queued object mutated after its
