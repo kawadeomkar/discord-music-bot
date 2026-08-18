@@ -852,15 +852,18 @@ read that header first.
 
 ## Testing
 
-- Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
-  exception — it has no test file; `test_leaderboard.py` also owns the cog command
-  that drives it, since splitting the renderer's tests from the command's would make
-  a reader check two files to learn what one board looks like; `test_debug.py`
-  likewise owns `MusicBot._debug_suffix` and the `-debug` card's end-to-end
-  assertions, for the same reason — what the footer says and what puts it there are
-  one behavior), plus `conftest.py` (shared fixtures/seams),
-  `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
-  `telemetry.py` are the two intentionally-least-covered modules.
+- Layout: one `tests/test_<module>.py` per src module (`test_leaderboard.py` also owns
+  the cog command that drives it, since splitting the renderer's tests from the
+  command's would make a reader check two files to learn what one board looks like;
+  `test_debug.py` likewise owns `MusicBot._debug_suffix` and the `-debug` card's
+  end-to-end assertions, for the same reason — what the footer says and what puts it
+  there are one behavior), plus `conftest.py` (shared fixtures/seams),
+  `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` is
+  the intentionally-least-covered module.
+  `test_telemetry.py` restores structlog's PROCESS-wide configuration itself, because
+  conftest's `configure_structlog_for_tests` is session-scoped and `setup_telemetry()`
+  reconfigures structlog for real — without that restore the production JSON chain
+  would stand for every test that runs after it.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs
   extraction on an in-process ThreadPoolExecutor-backed `YtdlpPool`, because tests patch
   `src.youtube._ytdlp_extract` with MagicMocks that could never be pickled to a real
