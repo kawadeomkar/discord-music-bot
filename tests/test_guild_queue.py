@@ -2439,6 +2439,35 @@ class TestCommitDequeueHoldsTheMutexAcrossTheWrite:
         assert not gq._mutex.locked()
         assert await gq.put([_qobj(2, mock_author)]) is not None
 
+    async def test_a_raising_body_still_releases_the_mutex(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """The body is vc.play() plus the start transaction, and vc.play() raises
+        on a real failure — ClientException when the audio thread is already
+        playing, or an ffmpeg that would not spawn.
+
+        The release rests entirely on @asynccontextmanager converting the raise
+        at the yield; there is no try/finally to read. Acquiring the mutex by
+        hand and releasing it only on the normal exits passes every other test in
+        this suite, and in production strands the guild: the next enqueue, clear,
+        shuffle, remove and the loop's own commit all park forever on a mutex
+        nothing will release, while the logged traceback names vc.play().
+        """
+        await gq.put([_qobj(1, mock_author)])
+        await gq.get()
+        generation = gq.generation
+
+        with pytest.raises(RuntimeError, match="vc.play failed"):
+            async with gq.commit_dequeue(generation) as committed:
+                assert committed
+                raise RuntimeError("vc.play failed")
+
+        assert not gq._mutex.locked()
+        # Bounded: a held mutex makes this hang rather than fail, and the
+        # suite-wide timeout would report it as a cancellation somewhere else.
+        async with asyncio.timeout(5):
+            assert await gq.put([_qobj(2, mock_author)]) is not None
+
 
 class TestGenerationCounter:
     async def test_starts_at_zero_and_bump_increments(self, gq: GuildQueue) -> None:
