@@ -385,6 +385,19 @@ class _CollectionDrain:
     origin: str
 
 
+@dataclass(slots=True)
+class _EnqueueProgress:
+    """Whether -play has committed anything to the queue yet.
+
+    Mutable and threaded down because the fact becomes true inside the enqueue
+    helpers while its reader is play()'s finally, which also runs for a raise
+    that unwound past their return. A paused guild is resumed only once this is
+    set — a resolve that failed before the first put leaves playback untouched.
+    """
+
+    committed: bool = False
+
+
 def _apply_playlist_index(
     tracks: list[QueueObject],
     index: Optional[int],
@@ -1024,6 +1037,7 @@ class MusicBot(commands.Cog):
         *,
         front: bool = False,
         expected_generation: Optional[int] = None,
+        progress: Optional[_EnqueueProgress] = None,
     ) -> None:
         """Queue a resolved YouTube playlist in one batch and notify the channel.
         Spotify collections stream page-by-page via _begin_collection_enqueue instead.
@@ -1064,6 +1078,8 @@ class MusicBot(commands.Cog):
             log.info("yt playlist enqueue abandoned: queue invalidated")
             await _send_queueing_stopped(ctx, "playlist")
             return
+        if progress is not None:
+            progress.committed = True
         await asyncio.gather(
             send_embed(
                 ctx,
@@ -1144,6 +1160,7 @@ class MusicBot(commands.Cog):
         analytics: Analytics,
         origin: str,
         front: bool,
+        progress: Optional[_EnqueueProgress] = None,
     ) -> Optional[_CollectionDrain]:
         """Enqueue a Spotify collection's page 1 (or, on the buffered path,
         all of it) and send the enqueue embed. Runs inside play's
@@ -1255,6 +1272,8 @@ class MusicBot(commands.Cog):
                 # silently swallowed -play reads as a dead bot.
                 await _send_queueing_stopped(ctx, noun)
                 return None
+            if progress is not None:
+                progress.committed = True
             await self._notify_collection_enqueued(
                 ctx, resolved.kind, collection, titles, enqueued=len(titles)
             )
@@ -1288,6 +1307,8 @@ class MusicBot(commands.Cog):
             log.info("collection enqueue abandoned before page 1: queue invalidated")
             await _send_queueing_stopped(ctx, noun)
             return None
+        if progress is not None:
+            progress.committed = True
         exact = len(page1.titles) if page1.is_last else None
         drain = _CollectionDrain(
             resolved=resolved,
@@ -1310,22 +1331,34 @@ class MusicBot(commands.Cog):
         )
         return drain
 
-    async def _resume_after_collection(self, ctx: commands.Context) -> None:
-        """Resume a player that was paused when -play queued a collection.
+    async def _resume_after_collection(
+        self, ctx: commands.Context, paused_mp: MusicPlayer
+    ) -> None:
+        """Resume the player that was paused when -play queued a collection.
 
         Mirrors the -resume command's guard rather than calling it, so a
         -resume that landed while the collection was queueing is a no-op here
         instead of a second resume.
+
+        Takes the player bound at dispatch and refuses once the registry stops
+        naming it, like -shuffle and -remove: cleanup() pops the player and then
+        awaits (task cancellation, then the NP host) before disconnecting, so a
+        drain unwinding in that window still sees a live paused voice client. A
+        creating lookup there would start a fresh player for a guild being torn
+        down and un-pause the audio -stop is silencing.
         """
+        assert ctx.guild is not None
+        if self.mps.get(ctx.guild.id) is not paused_mp:
+            log.info("resume after collection skipped: player replaced or torn down")
+            return
         vc = ctx.voice_client
         if (
             isinstance(vc, discord.VoiceClient)
             and not vc.is_playing()
             and vc.is_paused()
         ):
-            mp = self.get_mp(ctx)
-            await mp.resume(vc)
-            await mp.rehost_np_after_resume()
+            await paused_mp.resume(vc)
+            await paused_mp.rehost_np_after_resume()
 
     async def _notify_collection_enqueued(
         self,
@@ -1680,13 +1713,16 @@ class MusicBot(commands.Cog):
                     if isinstance(vc_now, discord.VoiceClient) and vc_now.is_paused()
                     else None
                 )
+                # Bound here so the finally resumes the player this command was
+                # dispatched against, never one built after a teardown.
+                paused_mp = self.get_mp(ctx) if paused_vc is not None else None
 
                 # Paused → interject, not append, so the request is not buried
                 # behind a paused song; the interrupted song returns playing,
                 # unlike -playnow. Collections are exempt: interjection resolves to
                 # one song, so they queue in full below and resume afterwards.
                 if paused_vc is not None and not is_collection:
-                    paused_mp = self.get_mp(ctx)
+                    assert paused_mp is not None
                     if paused_mp.current_song is not None:
                         return await self._interject_flow(
                             ctx,
@@ -1707,27 +1743,28 @@ class MusicBot(commands.Cog):
                     if slot is None:
                         return  # declined — the user has been told why
 
+                progress = _EnqueueProgress()
                 try:
-                    await self._play_resolved(ctx, url, source)
+                    await self._play_resolved(ctx, url, source, progress=progress)
                 finally:
                     if slot is not None:
                         slot.lock.release()
 
-                    if paused_vc is not None and is_collection:
+                    if paused_mp is not None and is_collection and progress.committed:
                         # After the enqueue, never before: resuming first would
                         # restart the paused song only for a failed resolve to
                         # leave the user with playback they did not ask to change.
                         # The state is re-read because a -resume may have landed
                         # during the drain.
                         #
-                        # Inside the finally: the enqueue commits well before
-                        # _play_resolved can raise — a page 503ing mid-drain, or
-                        # the gather hitting Forbidden on Add Reactions — and a
-                        # raise past this leaves the guild paused forever with the
-                        # collection queued behind a song nothing restarts. The
-                        # guard re-reads the voice state, so it is idempotent.
+                        # Inside the finally, gated on progress: a raise AFTER the
+                        # first page committed — a later page 503ing, or the gather
+                        # hitting Forbidden on Add Reactions — would otherwise leave
+                        # the guild paused forever with the collection queued behind
+                        # a song nothing restarts. A raise BEFORE it queued nothing,
+                        # so playback must stay exactly as the command found it.
                         try:
-                            await self._resume_after_collection(ctx)
+                            await self._resume_after_collection(ctx, paused_mp)
                         except Exception as resume_error:
                             # Never replace the error already unwinding: that one
                             # says why the enqueue failed. On the success path the
@@ -1747,11 +1784,16 @@ class MusicBot(commands.Cog):
         ctx: commands.Context,
         url: str,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        progress: Optional[_EnqueueProgress] = None,
     ) -> None:
         """The body of -play after parse + lock admission: resolve, enqueue,
         and — for a streamed collection — drain the tail inline. Split out of
         play() so the collection-lock release wraps exactly this much and the
-        error handler stays in play()."""
+        error handler stays in play().
+
+        `progress` is marked the moment a put lands, so play's finally can tell a
+        failure that queued something from one that queued nothing."""
         pager: Optional[SpotifyCollectionPager] = None
         drain: Optional[_CollectionDrain] = None
         try:
@@ -1876,7 +1918,13 @@ class MusicBot(commands.Cog):
                     await self._enqueue_single(ctx, qobj, mp, front=front)
                 elif isinstance(qobj, SpotifyCollectionPager):
                     drain = await self._begin_collection_enqueue(
-                        ctx, qobj, mp, analytics=analytics, origin=url, front=front
+                        ctx,
+                        qobj,
+                        mp,
+                        analytics=analytics,
+                        origin=url,
+                        front=front,
+                        progress=progress,
                     )
                 else:
                     await self._enqueue_playlist(
@@ -1885,6 +1933,7 @@ class MusicBot(commands.Cog):
                         mp,
                         front=front,
                         expected_generation=playlist_generation,
+                        progress=progress,
                     )
 
             # Stack exited: the gate is open and the first song is starting.

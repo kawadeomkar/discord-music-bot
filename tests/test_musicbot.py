@@ -3315,7 +3315,14 @@ class TestPlayWhilePaused:
     . Appending would leave the bot silent
         with the request buried behind a paused song."""
 
-    def _paused_mp(self) -> MagicMock:
+    def _paused_mp(self, bot: MusicBot, ctx: MagicMock) -> MagicMock:
+        """A paused player, bound BOTH ways: get_mp returns it and mps names it.
+
+        Registration is not optional — the collection resume re-checks that the
+        registry still holds the player it was dispatched against, so a mock
+        reachable only through get_mp reads as a torn-down guild and every
+        assertion passes over a resume that never ran.
+        """
         mp = _mock_mp()
         mp.current_song = MagicMock(title="Paused Song")
         mp.interject = AsyncMock(
@@ -3329,6 +3336,8 @@ class TestPlayWhilePaused:
         # The collection path resumes instead of interjecting.
         mp.resume = AsyncMock()
         mp.rehost_np_after_resume = AsyncMock()
+        bot.get_mp = MagicMock(return_value=mp)
+        bot.mps[ctx.guild.id] = mp
         return mp
 
     async def test_interjects_with_resume_paused_false(
@@ -3336,8 +3345,7 @@ class TestPlayWhilePaused:
     ) -> None:
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
         qobj = QueueObject("https://yt.com/v=new", "New Song", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
         music_bot._enqueue_single = AsyncMock()
@@ -3358,7 +3366,7 @@ class TestPlayWhilePaused:
         paused" would be wrong. This is why returns_paused exists separately
         from was_paused."""
         mock_ctx.voice_client = _paused_vc()
-        music_bot.get_mp = MagicMock(return_value=self._paused_mp())
+        self._paused_mp(music_bot, mock_ctx)
         music_bot.queue_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
         )
@@ -3378,8 +3386,7 @@ class TestPlayWhilePaused:
     ) -> None:
         """Regression guard: -play on a *playing* bot still appends."""
         mock_ctx.voice_client = _playing_vc()
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
         music_bot.queue_source = AsyncMock(
             return_value=QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
         )
@@ -3397,7 +3404,7 @@ class TestPlayWhilePaused:
         """Nothing to interrupt — take the ordinary append path rather than
         building an interjection around a song that isn't there."""
         mock_ctx.voice_client = _paused_vc()
-        mp = self._paused_mp()
+        mp = self._paused_mp(music_bot, mock_ctx)
         mp.current_song = None
         music_bot.get_mp = MagicMock(return_value=mp)
         music_bot.queue_source = AsyncMock(
@@ -3419,7 +3426,7 @@ class TestPlayWhilePaused:
         song the user just chose to keep playing."""
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
+        mp = self._paused_mp(music_bot, mock_ctx)
         mp.enqueue_depth = MagicMock(return_value=9)
         music_bot.get_mp = MagicMock(return_value=mp)
         qobj = QueueObject("https://yt.com/v=new", "New", mock_ctx.author)
@@ -3452,8 +3459,7 @@ class TestPlayWhilePaused:
         the paused song."""
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
         with _no_typing():
@@ -3476,8 +3482,7 @@ class TestPlayWhilePaused:
         """
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
             for i in range(3)
@@ -3531,8 +3536,7 @@ class TestPlayWhilePaused:
         """
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
             for i in range(3)
@@ -3559,6 +3563,86 @@ class TestPlayWhilePaused:
         mp.resume.assert_awaited_once_with(vc)
         assert order == ["enqueue", "resume"]
 
+    @pytest.mark.parametrize(
+        "failure",
+        ["resolve", "page_one"],
+        ids=["resolve_raises", "page_one_raises"],
+    )
+    async def test_a_collection_that_fails_before_the_enqueue_stays_paused(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, failure: str
+    ) -> None:
+        """The mirror of the sibling above, and the case it did not cover.
+
+        Not every raise reaches the resume with songs on the queue: Spotify
+        disabled or rate-limited, an empty or deleted collection, and a page-1
+        timeout all raise with nothing enqueued at all. Resuming there restarts
+        the paused song for a command that queued nothing and then reports
+        failure — playback the user never asked to change, from a -play they
+        watched fail.
+
+        Both variants are pre-enqueue: one raises during the resolve, the other
+        after it, inside the page-1 fetch that the collection path moved out of
+        queue_source.
+        """
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp(music_bot, mock_ctx)
+        url = "https://open.spotify.com/album/1PULmKbHeOqlkIwcMgtvxA"
+        mock_ctx.message.content = f"-play {url}"
+
+        col = _scollection(SpotifyType.ALBUM, total=1)
+        if failure == "resolve":
+            # Spotify unconfigured: _require_spotify raises inside queue_source,
+            # before the pager exists.
+            music_bot.queue_source = AsyncMock(
+                side_effect=SpotifyDisabledError(SpotifyStatus.DISABLED)
+            )
+        else:
+            # The pager is built, and its page-1 anext is what fails.
+            music_bot.queue_source = AsyncMock(
+                return_value=SpotifyCollectionPager(
+                    SpotifyType.ALBUM,
+                    _sgen([_spage(col, ["T0 A"], is_last=True)], fail_at=0),
+                )
+            )
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        mp.queue_put.assert_not_awaited()
+        mp.queue_put_front.assert_not_awaited()
+        mp.resume.assert_not_awaited()
+        mp.rehost_np_after_resume.assert_not_awaited()
+        vc.resume.assert_not_called()
+        # The user is still told the command failed.
+        sent = mock_ctx.send.await_args_list + mock_ctx.send.call_args_list
+        assert any(c.kwargs.get("embed") is not None for c in sent)
+
+    async def test_the_resume_refuses_a_player_the_registry_no_longer_names(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """cleanup() pops the player, then awaits before it disconnects.
+
+        A drain unwinding in that window still sees a live, still-paused voice
+        client. Resuming through a creating get_mp there builds and starts a
+        fresh player for a guild being torn down, un-pauses the audio -stop is
+        silencing, and writes pause epochs into a hash clear_connection is about
+        to scrub. The registry check is what refuses it — mirroring -shuffle and
+        -remove, which carry the same guard.
+        """
+        vc = _paused_vc()
+        mock_ctx.voice_client = vc
+        mp = self._paused_mp(music_bot, mock_ctx)
+        # The teardown: popped from the registry, everything else still live.
+        del music_bot.mps[mock_ctx.guild.id]
+
+        await music_bot._resume_after_collection(mock_ctx, mp)
+
+        mp.resume.assert_not_awaited()
+        mp.rehost_np_after_resume.assert_not_awaited()
+        # And nothing was built to take its place.
+        assert mock_ctx.guild.id not in music_bot.mps
+
     @pytest.mark.parametrize("still_paused", [False, True])
     async def test_resume_skipped_when_a_resume_already_landed(
         self, music_bot: MusicBot, mock_ctx: MagicMock, still_paused: bool
@@ -3573,8 +3657,7 @@ class TestPlayWhilePaused:
         as the defensive term it is."""
         vc = _paused_vc()
         mock_ctx.voice_client = vc
-        mp = self._paused_mp()
-        music_bot.get_mp = MagicMock(return_value=mp)
+        mp = self._paused_mp(music_bot, mock_ctx)
 
         def _user_resumed_mid_drain(*a: Any, **k: Any) -> bool:
             # The -resume lands during the enqueue: by the time

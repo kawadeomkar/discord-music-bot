@@ -728,7 +728,13 @@ interrupted song back where it was":
 Collections are exempt: interjection resolves to exactly one song, so an album or
 playlist queues in full instead and playback resumes afterward
 (`_resume_after_collection`, which re-reads the paused state so a `-resume` that landed
-mid-drain is not doubled). `-playnow` restores the exact paused state (`start_paused`
+mid-drain is not doubled). That resume is gated on `_EnqueueProgress.committed` and
+takes the player bound at dispatch: a raise AFTER the first page landed must still
+resume (the collection is queued behind a song nothing else restarts), while one
+BEFORE it queued nothing and must leave playback untouched — Spotify disabled, an
+empty or deleted collection and a page-1 timeout all raise there. The registry
+re-check is `-shuffle`'s, for the window where `cleanup()` has popped the player but
+not yet disconnected. `-playnow` restores the exact paused state (`start_paused`
 re-pauses the player thread synchronously at `vc.play`, before any await, leaking at
 most a frame or two). Playlists collapse to their first track for `-playnow`; plain
 `-play` front-inserts a playlist in full (nothing is playing to keep waiting).
