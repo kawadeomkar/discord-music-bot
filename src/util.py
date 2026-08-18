@@ -1,13 +1,13 @@
 import asyncio
 import contextlib
-from typing import Any, Optional
-from collections.abc import Coroutine
+import re
+from typing import Any, Final, Optional
+from collections.abc import AsyncGenerator, Coroutine
 
 import discord
 import structlog
+from discord.ext import commands
 from opentelemetry.trace import Span, StatusCode
-
-from src.guild_state import HistoryEntry
 
 
 def queue_message(songs: list[str]) -> str:
@@ -18,10 +18,18 @@ def queue_message(songs: list[str]) -> str:
     return msg
 
 
+def trace_id_of(span: Span) -> str:
+    """The span's trace id as 32 hex chars, or "" when the span is not recording. Empty
+    string rather than None: every consumer stores this in a column or log field that is
+    text, so an absent trace and an unset one should not be two cases downstream."""
+    span_ctx = span.get_span_context()
+    return format(span_ctx.trace_id, "032x") if span_ctx.is_valid else ""
+
+
 def trace_footer(span: Span) -> Optional[str]:
     """Return an embed-footer string identifying the current trace, or None if untraced."""
-    span_ctx = span.get_span_context()
-    return f"trace: {format(span_ctx.trace_id, '032x')}" if span_ctx.is_valid else None
+    trace_id = trace_id_of(span)
+    return f"trace: {trace_id}" if trace_id else None
 
 
 async def cancel_task(task: Optional[asyncio.Task]) -> None:
@@ -41,20 +49,34 @@ def spawn_background(
     return task
 
 
+async def _typing_keepalive(ctx: commands.Context) -> None:
+    try:
+        async with ctx.typing():
+            await asyncio.sleep(3600)  # held open until cancelled
+    # Exception only, not CancelledError: background_typing() cancels this on the way
+    # out, and letting that propagate is what marks the task genuinely cancelled
+    # rather than completed. Swallowing it would stop a shutdown at this frame.
+    except Exception:
+        pass  # cosmetic — never let typing failures surface
+
+
+@contextlib.asynccontextmanager
+async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
+    """Non-blocking ctx.typing(): the first POST /typing runs in a background task so
+    the command body starts immediately, and the keepalive is cancelled when the body
+    finishes. The whole CM lives inside the task — never enter/exit Typing manually
+    across tasks."""
+    task = asyncio.create_task(_typing_keepalive(ctx))
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
 def record_span_error(span: Span, e: Exception) -> None:
     """Record an exception on a span and mark its status as ERROR."""
     span.record_exception(e)
     span.set_status(StatusCode.ERROR, f"{type(e).__name__}: {e}")
-
-
-def latency_color(ms: float) -> discord.Color:
-    if ms <= 50:
-        return discord.Color(0x44FF44)
-    if ms <= 100:
-        return discord.Color(0xFFD000)
-    if ms <= 200:
-        return discord.Color(0xFF6600)
-    return discord.Color(0x990000)
 
 
 def notice_embed(
@@ -63,16 +85,10 @@ def notice_embed(
     *,
     title: Optional[str] = None,
 ) -> discord.Embed:
-    """Build a lightweight single-message embed for short status/notice replies.
-
-    The one place that turns a plain status string ("Shuffled!", "Volume set…",
-    validation errors) into an embed. Every command response must be an embed
-    now that MusicContext.send funnels responses and prepends the Now Playing
-    block: a bare `content` string would render as loose text above the block,
-    breaking the uniform embed stack. Pairs with the richer send_embed (which
-    forces a title/description split) for the one-liner case where a body-only
-    embed reads best.
-    """
+    """Turn a plain status string ("Shuffled!", validation errors) into an embed. Every
+    command response must be an embed: MusicContext.send prepends the Now Playing block,
+    and a bare `content` string would render as loose text above it. send_embed is the
+    pair for anything needing a title/description split."""
     return discord.Embed(title=title, description=message, color=color)
 
 
@@ -95,6 +111,32 @@ async def send_embed(
     return await destination.send(embed=embed)
 
 
+def first_sendable_channel(
+    guild: discord.Guild,
+) -> Optional[discord.TextChannel]:
+    """A text channel in `guild` the bot may post in — the system channel when it
+    qualifies, else the first that does. For notices with no channel of their own,
+    e.g. telling a guild that the channels it was playing in were deleted.
+
+    None when the bot is not in the guild's member cache or can post nowhere; the
+    caller stays silent rather than raising, since these messages are advisory."""
+    if guild.me is None:
+        return None
+    if (
+        guild.system_channel is not None
+        and guild.system_channel.permissions_for(guild.me).send_messages
+    ):
+        return guild.system_channel
+    return next(
+        (
+            ch
+            for ch in guild.text_channels
+            if ch.permissions_for(guild.me).send_messages
+        ),
+        None,
+    )
+
+
 def fmt_duration(secs: int) -> str:
     """Compact clock rendering: 225 → "3:45", 3725 → "1:02:05"."""
     m, s = divmod(max(0, secs), 60)
@@ -103,66 +145,60 @@ def fmt_duration(secs: int) -> str:
 
 
 def pluralize(count: int, singular: str, plural: Optional[str] = None) -> str:
-    """The noun form matching `count`: `pluralize(1, "song")` → "song",
-    `pluralize(3, "song")` → "songs". `plural` overrides the default `+ "s"`
-    for irregulars. Collapses the `"song" if n == 1 else "songs"` /
-    `f"song{'s' if n != 1 else ''}"` idioms scattered across the command and
-    embed builders into one spelling."""
+    """The noun form matching `count`: pluralize(1, "song") → "song",
+    pluralize(3, "song") → "songs". `plural` overrides the default `+ "s"`."""
     if count == 1:
         return singular
     return plural if plural is not None else singular + "s"
 
 
-# Discord's hard limit on an embed title is 256 characters; an over-length
-# title makes the whole send() 400 — silently no-opping -history, or failing
-# the now-playing send/edit outright.
+# Discord's hard embed-title limit. An over-length title 400s the whole send(),
+# silently no-opping -history or failing the now-playing send/edit.
 EMBED_TITLE_LIMIT = 256
+
+# The same, for footer text. Lives here, not in debug.py: ping.py writes footers too
+# and debug.py already imports ping.py, so importing it back closes a hard cycle.
+FOOTER_LIMIT = 2048
+
+# The same again, for a field VALUE. A field built from a list the user can grow
+# (removed songs, dropped positions) has no natural ceiling, and the 400 lands
+# after the command has already mutated state.
+EMBED_FIELD_LIMIT = 1024
+
+
+# Control characters end a rendered embed line early, hiding whatever follows.
+# Flattened rather than escaped — they have no visible form.
+_LABEL_UNSAFE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_label(text: str, limit: int) -> str:
+    """Attacker-influenceable text — a user's search term, a yt-dlp title, an
+    uploader name — rendered into an embed without being able to style it or
+    forge a link.
+
+    Three neutralizations before the escape, because `escape_markdown` covers none
+    of them: `[`/`]` are not in its set and are what picks a masked link's label; a
+    backtick closes any code span the caller wrapped this in; and `ignore_links`
+    defaults to TRUE, passing a whole http(s) token through untouched.
+
+    Cap BEFORE escaping: cutting after can split an escape pair and leave a
+    trailing backslash that eats the next character."""
+    flattened = _LABEL_UNSAFE.sub(" ", text)
+    clipped = truncate(flattened, limit)
+    neutralized = clipped.replace("[", "(").replace("]", ")").replace("`", "'")
+    return discord.utils.escape_markdown(neutralized, ignore_links=False)
+
+
+def truncate(text: str, limit: int) -> str:
+    """Clip to `limit` characters, ellipsizing if clipped."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def truncate_embed_title(title: str) -> str:
     """Clip a title to Discord's embed-title limit, ellipsizing if clipped."""
-    if len(title) <= EMBED_TITLE_LIMIT:
-        return title
-    return title[: EMBED_TITLE_LIMIT - 1] + "…"
-
-
-def history_embeds(entries: list[HistoryEntry]) -> list[discord.Embed]:
-    """One embed per played song, in the given (newest-first) order.
-
-    Layout (docs/HISTORY_OVERHAUL_PLAN.md §6): numbered title, then the raw
-    webpage_url on its own line (Discord auto-links it), then one line with
-    played/duration, requester, and — when known — the absolute played-at
-    timestamp (<t:…:f> — viewer-local absolute date/time).
-    """
-    embeds = []
-    for i, entry in enumerate(entries, start=1):
-        lines = []
-        if entry.webpage_url:
-            lines.append(entry.webpage_url)
-        requested_by = (
-            f"<@{entry.requester_id}>"
-            if entry.requester_id
-            else (entry.requester_name or "unknown")
-        )
-        meta = (
-            f"{fmt_duration(entry.played_secs)} / {fmt_duration(entry.duration_secs)}"
-            f" · requested by {requested_by}"
-        )
-        # played_at == 0 means "unknown" (absent on the wire); rendering
-        # <t:0:f> would show "1 January 1970", so omit the timestamp instead.
-        if entry.played_at:
-            meta += f" · <t:{int(entry.played_at)}:f>"
-        lines.append(meta)
-        title = truncate_embed_title(f"{i}. {entry.title}")
-        embed = discord.Embed(
-            title=title,
-            description="\n".join(lines),
-            color=discord.Color.blue(),
-        )
-        if entry.thumbnail:
-            embed.set_thumbnail(url=entry.thumbnail)
-        embeds.append(embed)
-    return embeds
+    return truncate(title, EMBED_TITLE_LIMIT)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
