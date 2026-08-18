@@ -35,6 +35,8 @@ from src.guild_state import (
     DEFAULT_TIMEZONE,
     HistoryEntry,
     NowPlayingData,
+    QueueEntry,
+    SearchQueueEntry,
     SongQueueEntry,
 )
 from src.redis_client import GuildRedisStore, cache_get
@@ -215,6 +217,29 @@ def _reached_end(song: YTDL) -> bool:
     if song.duration_secs <= 0:
         return False
     return song.position_secs >= song.duration_secs - _SONG_COMPLETE_MARGIN_SECS
+
+
+def _trailing_collection_run(entries: Sequence[QueueEntry]) -> tuple[str, int]:
+    """The collection link a restored queue ENDS in, and how many of its tracks
+    are there. ("", 0) when the tail is not one.
+
+    A streamed collection persists pages as they land, but its drain state is
+    memory-only, so a crash mid-drain leaves pages 1..k on the list and nothing
+    anywhere recording that k+1..n were never fetched. Every live interruption
+    of the same drain tells the guild what it queued; a crash is the one that
+    cannot, and this is what lets the restore say so in the log. Search entries
+    are the signature — a collection's tracks stay unresolved until dequeue, and
+    they all carry the collection link as user_input."""
+    link = ""
+    count = 0
+    for entry in reversed(entries):
+        if not isinstance(entry, SearchQueueEntry) or not entry.user_input:
+            break
+        if link and entry.user_input != link:
+            break
+        link = entry.user_input
+        count += 1
+    return (link, count) if count else ("", 0)
 
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
@@ -1022,6 +1047,16 @@ class MusicPlayer:
                         log.info(
                             f"Restored {count} queued songs for guild {self._guild.id}"
                         )
+                        link, run = _trailing_collection_run(snapshot.queue)
+                        if link:
+                            # Not an error and not a user notice: a complete
+                            # collection ends this way too, so this only narrows
+                            # where to look when a guild reports a short album.
+                            log.info(
+                                f"Restored queue for guild {self._guild.id} ends in "
+                                f"{run} unresolved tracks from {link} — if the bot "
+                                f"stopped mid-drain, the rest was never queued"
+                            )
 
                     # Corrupt entries were already dropped at parse time.
                     self.history.restore(snapshot.history)

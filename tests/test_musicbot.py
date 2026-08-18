@@ -63,6 +63,7 @@ from src.musicplayer import InterjectOutcome, _PLAYBACK_GATE_TIMEOUT
 from src.spotify import (
     SpotifyAuthError,
     SpotifyCollection,
+    SpotifyCollectionAbandoned,
     SpotifyRateLimitError,
     SpotifyRequestError,
     TrackPage,
@@ -116,17 +117,22 @@ async def _sgen(
     pages: list[TrackPage],
     *,
     fail_at: Optional[int] = None,
+    abandon: bool = False,
     yielded: Optional[list[int]] = None,
 ) -> AsyncGenerator[TrackPage]:
     """An async generator of TrackPages. fail_at=i raises before yielding
-    pages[i] (a mid-drain page-fetch failure); `yielded` records indices as
-    they go out, so a test can prove the drain stopped consuming."""
+    pages[i] (a mid-drain page-fetch failure); abandon=True raises the page-cap
+    abandonment after the last page, which is what a stuck cursor does; and
+    `yielded` records indices as they go out, so a test can prove the drain
+    stopped consuming."""
     for i, page in enumerate(pages):
         if fail_at is not None and i == fail_at:
             raise SpotifyAuthError(401, "page fetch failed mid-drain")
         if yielded is not None:
             yielded.append(i)
         yield page
+    if abandon:
+        raise SpotifyCollectionAbandoned("playlist", "plstuck", len(pages), 0)
 
 
 def _collection_mp(
@@ -3070,6 +3076,52 @@ class TestPlayCommand:
         mock_create.assert_called_once()
         music_bot.queue_source.assert_awaited_once()
         music_bot._enqueue_single.assert_awaited_once()
+
+    async def test_a_cold_collection_whose_page_one_fails_abandons_the_join(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A cold -play must not leave the bot playing the previous queue.
+
+        For a collection, queue_source only CONSTRUCTS the pager — the page-1
+        fetch happens in _begin_collection_enqueue, past the region that guards
+        the join. So a rate-limited or timed-out page 1 unwound out of the exit
+        stack, released the playback-gate hold on a bot that had joined
+        successfully, and started whatever a previous -stop left persisted in
+        Redis: the leftovers the front path exists to jump ahead of. The user
+        meanwhile reads "Failed to queue song".
+        """
+        mock_ctx.voice_client = None
+        mp = _mock_mp()
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
+        music_bot.queue_source = AsyncMock(
+            return_value=SpotifyCollectionPager(SpotifyType.ALBUM, _sgen([]))
+        )
+        music_bot._begin_collection_enqueue = AsyncMock(
+            side_effect=ValueError("Spotify took too long loading the album")
+        )
+        music_bot._abandon_cold_start = AsyncMock()
+
+        loop = asyncio.get_event_loop()
+        join_task = loop.create_future()
+        join_task.set_result(None)
+
+        def fake_create_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Future:
+            coro.close()
+            mock_ctx.voice_client = _connected_vc()  # the join really succeeded
+            return join_task
+
+        url = "https://open.spotify.com/album/1PULmKbHeOqlkIwcMgtvxA"
+        mock_ctx.message.content = f"-play {url}"
+        with (
+            _no_typing(),
+            patch("asyncio.create_task", side_effect=fake_create_task),
+        ):
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url=url)
+
+        music_bot._abandon_cold_start.assert_awaited_once()
+        call = music_bot._abandon_cold_start.await_args
+        assert call is not None and call.args[1] is mp
 
     async def test_warm_path_skips_join_task(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -6784,6 +6836,12 @@ class TestBeginCollectionEnqueue:
             if c.kwargs.get("embed") is not None
         ]
         assert any("stopped loading partway" in (d or "") for d in notices), notices
+        # Honest about what a re-run does. No cache is written for a partial
+        # drain and nothing skips what is already queued, so "run it again to
+        # add the rest" produced a queue holding the first N twice — and
+        # -remove by the link then takes both copies.
+        assert not any("add the rest" in (d or "") for d in notices), notices
+        assert any("will re-add" in (d or "") for d in notices), notices
         await resolved.aclose()
 
     async def test_buffered_drain_reraises_when_nothing_arrived(
@@ -7059,9 +7117,48 @@ class TestDrainCollectionTail:
             assert call.kwargs["prefetch"] is False
             assert call.kwargs["expected_generation"] == 4
         assert drain.enqueued == 250
-        # Multi-page playlist → completion notice with the REAL count (G5/L6).
+        # Multi-page playlist → completion notice with the REAL count.
         final = mock_ctx.send.call_args_list[-1].kwargs["embed"].description
         assert "finished queueing — 250 songs" in final
+
+    async def test_an_abandoned_drain_reports_what_it_reached_not_success(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A stuck cursor (or a `total` under-reporting past the cap's slack)
+        ends the walk with tracks unfetched.
+
+        The pager signals that by raising rather than returning: a bare return
+        reaches the consumer as StopAsyncIteration, indistinguishable from a
+        full drain, so the guild was told the playlist "finished queueing" for a
+        tail that was never requested — and in the stuck-cursor case, after
+        duplicate pages had already been enqueued.
+        """
+        col = _scollection(SpotifyType.PLAYLIST, total=500)
+        pages = [
+            _spage(col, [f"T{i} A" for i in range(100)], is_last=False),
+            _spage(col, [f"T{i} A" for i in range(100, 200)], is_last=False),
+        ]
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST, _sgen(pages, abandon=True)
+        )
+        mp = _collection_mp(music_bot, mock_ctx)
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        drain = await music_bot._begin_collection_enqueue(
+            mock_ctx, resolved, mp, analytics=_ANALYTICS, origin=_ORIGIN, front=False
+        )
+        assert drain is not None
+        await music_bot._drain_collection_tail(mock_ctx, mp, drain)
+
+        # Both pages are queued and correct — abandonment is about the tail.
+        assert drain.enqueued == 200
+        notices = [
+            c.kwargs["embed"].description
+            for c in mock_ctx.send.call_args_list + mock_ctx.send.await_args_list
+            if c.kwargs.get("embed") is not None
+        ]
+        assert not any("finished queueing" in (d or "") for d in notices), notices
+        assert any("Queued 200 of ~500" in (d or "") for d in notices), notices
 
     async def test_album_tail_sends_no_completion_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock

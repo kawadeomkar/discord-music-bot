@@ -209,6 +209,26 @@ class SpotifyAuthError(Exception):
         )
 
 
+class SpotifyCollectionAbandoned(Exception):
+    """A collection stream stopped at its page cap with the cursor still live.
+
+    Raised from inside the generator rather than returning, because the consumer
+    cannot otherwise tell an abandoned drain from an exhausted one: both end in
+    StopAsyncIteration, so a bare return had the bot announce "finished
+    queueing" for a collection whose tail it never fetched. Pages already
+    yielded stay queued — this reports what was NOT reached.
+    """
+
+    def __init__(self, kind: str, cid: str, pages_seen: int, enqueued: int) -> None:
+        self.kind = kind
+        self.pages_seen = pages_seen
+        self.enqueued = enqueued
+        super().__init__(
+            f"{kind} {cid}: cursor still live after {pages_seen} pages; "
+            f"abandoned with {enqueued} titles yielded"
+        )
+
+
 class SpotifyRequestError(Exception):
     """A non-2xx Spotify response that is neither a credential rejection nor a
     429. The args carry the endpoint and params for the log and the span; only
@@ -518,7 +538,9 @@ class Spotify:
                     f"album {aid}: cursor still live after {pages_seen} pages "
                     f"(total={total}); abandoning drain"
                 )
-                return
+                raise SpotifyCollectionAbandoned(
+                    "album", aid, pages_seen, len(all_titles)
+                )
             page = await self._collection_page(next_url)
         # Reached only on a full drain, and guarded twice: an empty result is
         # never cached (immutability makes a real empty album safe, but not a
@@ -598,7 +620,9 @@ class Spotify:
                     f"playlist {pid}: cursor still live after {pages_seen} "
                     f"pages (total={collection.total}); abandoning drain"
                 )
-                return
+                raise SpotifyCollectionAbandoned(
+                    "playlist", pid, pages_seen, len(all_titles)
+                )
             resp = await self._collection_page(next_url)
         if not all_titles:
             # Never cache "empty": _PLAYLIST_TTL is 1h because playlists are

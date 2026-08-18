@@ -31,6 +31,7 @@ from src.guild_state import (
     GuildStateData,
     HistoryEntry,
     NowPlayingData,
+    SearchQueueEntry,
     SongQueueEntry,
     parse_queue_entry,
 )
@@ -43,6 +44,7 @@ from src.musicplayer import (
     _fmt_finish_time,
     _fmt_total_duration,
     _requester_mention,
+    _trailing_collection_run,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT
 from src.sources import YTSource, spotify_titles_to_ytsearch
@@ -10330,3 +10332,49 @@ class TestQueueLinesCannotForgeALink:
         now, walk = music_player._queue_eta_seed()
         line, _ = music_player._format_queue_line(item, 1, now, walk)
         assert "[" not in line and "](" not in line
+
+
+class TestTrailingCollectionRun:
+    """A crash mid-drain leaves pages 1..k persisted and nothing recording that
+    k+1..n were never fetched — every LIVE interruption of the same drain sends
+    a "Queued N of ~M" notice, and a crash is the one that cannot."""
+
+    def _search(self, i: int, link: str) -> SearchQueueEntry:
+        return SearchQueueEntry(ytsearch=f"ytsearch:T{i}", user_input=link)
+
+    def _song(self, i: int) -> SongQueueEntry:
+        return SongQueueEntry(
+            webpage_url=f"https://yt.com/v={i}",
+            title=f"Song {i}",
+            requester_id=1,
+        )
+
+    def test_a_tail_of_one_collection_is_reported(self) -> None:
+        link = "https://open.spotify.com/playlist/abc"
+        entries = [self._song(0), *(self._search(i, link) for i in range(3))]
+        assert _trailing_collection_run(entries) == (link, 3)
+
+    def test_a_resolved_tail_is_not_a_collection(self) -> None:
+        """A queue of ordinary songs ends every restore; only unresolved search
+        entries carry a collection's link this far."""
+        assert _trailing_collection_run([self._song(0), self._song(1)]) == ("", 0)
+
+    def test_the_run_stops_at_a_different_link(self) -> None:
+        """Two collections queued back to back: only the last one can be the
+        truncated one, because the drain that crashed was the one still running."""
+        first = "https://open.spotify.com/album/one"
+        second = "https://open.spotify.com/album/two"
+        entries = [
+            *(self._search(i, first) for i in range(2)),
+            *(self._search(i, second) for i in range(4)),
+        ]
+        assert _trailing_collection_run(entries) == (second, 4)
+
+    def test_an_empty_queue_reports_nothing(self) -> None:
+        assert _trailing_collection_run([]) == ("", 0)
+
+    def test_a_search_entry_without_an_origin_is_not_a_collection(self) -> None:
+        """A bare -play search also lands as a search entry; without the link
+        there is no collection to name."""
+        entries = [SearchQueueEntry(ytsearch="ytsearch:some song", user_input=None)]
+        assert _trailing_collection_run(entries) == ("", 0)

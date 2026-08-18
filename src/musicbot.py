@@ -58,6 +58,7 @@ from src.spotify import (
     Spotify,
     SpotifyAuthError,
     SpotifyCollection,
+    SpotifyCollectionAbandoned,
     SpotifyRateLimitError,
     SpotifyRequestError,
     TrackPage,
@@ -1237,6 +1238,14 @@ class MusicBot(commands.Cog):
                         f"{_COLLECTION_DRAIN_TIMEOUT_SECS:.0f}s; queueing "
                         f"{len(titles)} of ~{collection.total}"
                     )
+                except SpotifyCollectionAbandoned:
+                    # Keep what arrived, like the timeout below: the pages that
+                    # did land are correct, and nothing was cached.
+                    truncated_reason = "stopped paging partway"
+                    log.warning(
+                        f"buffered {noun} drain abandoned at the page cap with "
+                        f"{len(titles)} titles"
+                    )
                 except (
                     SpotifyRateLimitError,
                     SpotifyRequestError,
@@ -1278,8 +1287,8 @@ class MusicBot(commands.Cog):
                         embed=notice_embed(
                             f"The {noun} {truncated_reason} — queued "
                             f"the first {len(titles)} "
-                            f"{pluralize(len(titles), 'song')}. Run the command "
-                            f"again to add the rest.",
+                            f"{pluralize(len(titles), 'song')}. Re-running the "
+                            f"command will re-add those {len(titles)}.",
                             discord.Color.orange(),
                         )
                     )
@@ -1531,6 +1540,21 @@ class MusicBot(commands.Cog):
                             )
                         return
                     drain.enqueued += len(page.titles)
+        except SpotifyCollectionAbandoned:
+            # The cursor stopped advancing (or `total` under-reported by more
+            # than the cap's slack). Pages 1..k are queued and correct; what
+            # follows them was never fetched, so this must not fall through to
+            # the completion notice below.
+            with contextlib.suppress(Exception):
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Queued {drain.enqueued} of ~{drain.total} "
+                        f"{pluralize(drain.total, 'song')} — Spotify stopped "
+                        f"paging through this one, so the rest wasn't loaded.",
+                        discord.Color.orange(),
+                    )
+                )
+            return
         except TimeoutError:
             # Budget spent. What is queued stays queued and the command ends
             # here rather than holding the enqueue lock any longer — every
@@ -1544,8 +1568,8 @@ class MusicBot(commands.Cog):
                     embed=notice_embed(
                         f"Queued {drain.enqueued} of ~{drain.total} "
                         f"{pluralize(drain.total, 'song')} — the rest was taking "
-                        f"too long to load. Run the command again to add the "
-                        f"remainder.",
+                        f"too long to load. Re-running the command will re-add "
+                        f"the first {drain.enqueued}.",
                         discord.Color.orange(),
                     )
                 )
@@ -1780,7 +1804,7 @@ class MusicBot(commands.Cog):
         url: str,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
-        progress: Optional[_EnqueueProgress] = None,
+        progress: _EnqueueProgress,
     ) -> None:
         """The body of -play after parse + lock admission: resolve, enqueue,
         and — for a streamed collection — drain the tail inline. Split out of
@@ -1909,27 +1933,38 @@ class MusicBot(commands.Cog):
                         )
                         return
 
-                if isinstance(qobj, QueueObject):
-                    await self._enqueue_single(ctx, qobj, mp, front=front)
-                elif isinstance(qobj, SpotifyCollectionPager):
-                    drain = await self._begin_collection_enqueue(
-                        ctx,
-                        qobj,
-                        mp,
-                        analytics=analytics,
-                        origin=url,
-                        front=front,
-                        progress=progress,
-                    )
-                else:
-                    await self._enqueue_playlist(
-                        ctx,
-                        qobj,
-                        mp,
-                        front=front,
-                        expected_generation=playlist_generation,
-                        progress=progress,
-                    )
+                try:
+                    if isinstance(qobj, QueueObject):
+                        await self._enqueue_single(ctx, qobj, mp, front=front)
+                    elif isinstance(qobj, SpotifyCollectionPager):
+                        drain = await self._begin_collection_enqueue(
+                            ctx,
+                            qobj,
+                            mp,
+                            analytics=analytics,
+                            origin=url,
+                            front=front,
+                            progress=progress,
+                        )
+                    else:
+                        await self._enqueue_playlist(
+                            ctx,
+                            qobj,
+                            mp,
+                            front=front,
+                            expected_generation=playlist_generation,
+                            progress=progress,
+                        )
+                except BaseException:
+                    # A collection's page-1 fetch happens HERE, not in
+                    # queue_source, so the guarded region around the join no
+                    # longer covers the network call that most often fails.
+                    # Unwinding past it releases the gate hold on a bot that did
+                    # join, which starts the queue a previous -stop persisted —
+                    # the leftovers the front path exists to jump ahead of.
+                    if front and not progress.committed:
+                        await self._abandon_cold_start(ctx, mp)
+                    raise
 
             # Stack exited: the gate is open and the first song is starting.
             # The tail still runs inside this command — no background task, no
@@ -1990,12 +2025,27 @@ class MusicBot(commands.Cog):
                     # http_call's whole ladder (~150s) while holding -playnow's
                     # max_concurrency slot and a typing indicator.
                     async with asyncio.timeout(_COLLECTION_DRAIN_TIMEOUT_SECS):
-                        page1 = await anext(pages, None)
+                        # Pages until one carries a title, because a page can be
+                        # legitimately empty without the collection being: a
+                        # playlist whose first 100 items are all episodes or
+                        # removed tracks yields exactly that, and -play streams
+                        # on through it. One shared budget for the whole walk,
+                        # and still no cache write — the pagers cache only on a
+                        # full drain.
+                        titles: list[str] = []
+                        async for page in pages:
+                            if page.titles:
+                                titles = page.titles
+                                break
                 except TimeoutError:
                     raise ValueError(
                         f"Spotify took too long loading the {noun} — try again shortly"
                     ) from None
-            titles = page1.titles if page1 is not None else []
+                except SpotifyCollectionAbandoned:
+                    # Every page the cap allowed was empty, so there is nothing
+                    # to interject; the "no queueable tracks" answer below is
+                    # accurate here rather than premature.
+                    pass
             if not titles:
                 raise ValueError(f"The {noun} has no queueable tracks")
             await ctx.send(

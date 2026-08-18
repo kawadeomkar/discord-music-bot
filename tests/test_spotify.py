@@ -22,6 +22,7 @@ from src.spotify import (
     _cursor_page_cap,
     Spotify,
     SpotifyAuthError,
+    SpotifyCollectionAbandoned,
     SpotifyRateLimitError,
     SpotifyRequestError,
     TrackPage,
@@ -761,6 +762,23 @@ async def _drain(gen: Any) -> list[TrackPage]:
         return [page async for page in pages]
 
 
+async def _drain_abandoned(
+    gen: Any,
+) -> tuple[list[TrackPage], SpotifyCollectionAbandoned]:
+    """Collect the pages a capped walk yields, plus the abandonment it ends in.
+
+    The cap raises rather than returning, so the consumer can tell an abandoned
+    drain from an exhausted one — a bare return is indistinguishable from
+    success, and had the bot announce a collection finished queueing when its
+    tail was never fetched."""
+    pages: list[TrackPage] = []
+    with pytest.raises(SpotifyCollectionAbandoned) as excinfo:
+        async with contextlib.aclosing(gen) as gen_pages:
+            async for page in gen_pages:
+                pages.append(page)
+    return pages, excinfo.value
+
+
 class TestCollectionFromCache:
     """The cache-read wire discipline: a wrong-TYPED field means garbage and
     the whole entry is a miss (re-fetched, never rendered), while MISSING
@@ -946,11 +964,13 @@ class TestAlbumStream:
             return resp
 
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=stuck)):
-            pages = await _drain(spotify.album_stream("albstuck"))
+            pages, abandoned = await _drain_abandoned(spotify.album_stream("albstuck"))
 
         # cap = ceil(100/50) + 2 = 4 pages, then abandoned — finite, honest.
         assert len(pages) == _cursor_page_cap(100, 50) == 4
         assert not pages[-1].is_last
+        assert abandoned.pages_seen == 4
+        assert abandoned.enqueued == sum(len(p.titles) for p in pages)
         assert await fake_redis.get("spotify:album_tracks:albstuck") is None
 
     async def test_a_malformed_empty_page_one_cannot_divide_by_zero(
@@ -981,7 +1001,7 @@ class TestAlbumStream:
             return {"items": [_album_track(0)], "next": nxt}
 
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=malformed)):
-            pages = await _drain(spotify.album_stream("albz"))
+            pages, _abandoned = await _drain_abandoned(spotify.album_stream("albz"))
 
         assert len(pages) == _cursor_page_cap(10, 50)  # finite, not a crash
         assert await fake_redis.get("spotify:album_tracks:albz") is None
@@ -1139,11 +1159,14 @@ class TestPlaylistStream:
             return resp
 
         with patch.object(spotify, "http_call", new=AsyncMock(side_effect=stuck)):
-            pages = await _drain(spotify.playlist_stream("plstuck"))
+            pages, abandoned = await _drain_abandoned(
+                spotify.playlist_stream("plstuck")
+            )
 
         # cap = ceil(100/100) + 2 = 3 pages, then abandoned; nothing cached.
         assert len(pages) == _cursor_page_cap(100, 100) == 3
         assert not pages[-1].is_last
+        assert abandoned.pages_seen == 3
         assert await fake_redis.get("spotify:playlist_tracks:plstuck") is None
 
     async def test_first_request_targets_playlist_tracks_endpoint(
