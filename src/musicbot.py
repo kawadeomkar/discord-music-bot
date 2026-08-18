@@ -1274,8 +1274,11 @@ class MusicBot(commands.Cog):
         # Streaming path: page 1 in now, tail after the gate opens. prefetch
         # =False on every page — the default would RPUSH one entry per item
         # (a 100-item page = 100 round-trips) and spawn N prefetch tasks.
+        # Minted in chunks like the buffered path: a cache hit yields the whole
+        # collection as page 1, so this is a 10,000-title pass whenever the
+        # link has been drained once before.
         ok = await mp.queue_put(
-            spotify_titles_to_ytsearch(
+            await _mint_collection_entries(
                 page1.titles, ctx.author.id, analytics=analytics, origin=origin
             ),
             prefetch=False,

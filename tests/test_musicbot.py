@@ -6624,6 +6624,51 @@ class TestBeginCollectionEnqueue:
         ]
         await resolved.aclose()
 
+    async def test_the_streamed_page_one_mint_yields_too(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Page 1 is not bounded by Spotify's 100-item page size.
+
+        A drained collection is cached whole, and the cache-hit branch of both
+        pagers yields all of it as a single is_last page — so the streaming path
+        mints up to 10,000 titles here, the same size the buffered path chunks
+        for. Measured at 39ms of uninterrupted event loop before this yielded."""
+        n = _MINT_CHUNK * 2 + 7
+        col = _scollection(SpotifyType.PLAYLIST, total=n)
+        resolved = SpotifyCollectionPager(
+            SpotifyType.PLAYLIST,
+            _sgen([_spage(col, [f"T{i} A" for i in range(n)], is_last=True)]),
+        )
+        mp = _collection_mp(music_bot, mock_ctx)  # no backlog ⇒ streaming path
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        yields = 0
+        real_sleep = asyncio.sleep
+
+        async def counting_sleep(delay: float, *a: Any, **k: Any) -> Any:
+            nonlocal yields
+            if delay == 0:
+                yields += 1
+            return await real_sleep(delay, *a, **k)
+
+        with patch("src.musicbot.asyncio.sleep", new=counting_sleep):
+            await music_bot._begin_collection_enqueue(
+                mock_ctx,
+                resolved,
+                mp,
+                analytics=_ANALYTICS,
+                origin=_ORIGIN,
+                front=False,
+            )
+
+        assert yields >= 3  # one per chunk: 500, 500, 7
+        queued = mp.queue_put.await_args.args[0]
+        assert len(queued) == n
+        assert [y.analytics.queue_position for y in queued] == [
+            _ANALYTICS.queue_position + i for i in range(n)
+        ]
+        await resolved.aclose()
+
     async def test_buffered_drain_keeps_what_arrived_when_spotify_fails(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
