@@ -28,7 +28,7 @@ jobs:
     name: Python Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # install: false — `poetry export` reads poetry.lock and never touches a
       # virtualenv, so this job used to build the full lint environment (pyright plus
