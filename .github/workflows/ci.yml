@@ -6,18 +6,82 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Supersedes three pushes to a PR racing three full pipelines. Never supersede on
+# main: a dropped main run means no image was published for that commit.
+#
+# `cancel-in-progress: false` alone does NOT achieve that. It protects a run that has
+# already started; a run still PENDING in the same group is cancelled regardless when
+# a newer one arrives. Three merges inside ten minutes therefore silently dropped the
+# middle commit's build — and a cancelled run reports as cancelled, not failed, so
+# nothing went red and `sha-<middle>` simply never reached GHCR.
+#
+# Including github.sha for push events puts every main commit in its own group, so
+# they queue instead of evicting each other. PRs keep one group per ref, which is the
+# whole point of superseding there.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'shared' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege by default. This repository's org setting grants workflows a
+# write-all GITHUB_TOKEN, which `container-test` in particular should never hold:
+# it runs `docker run` on code from the PR branch, so any test file would execute
+# beside a token that can push to main, delete workflow runs, or publish packages.
+# The two jobs that genuinely need more (`test` comments on PRs, `build` pushes to
+# GHCR) declare it themselves below, and a job-level block replaces this one
+# wholesale rather than adding to it.
+permissions:
+  contents: read
+
 jobs:
   resolve-env:
     name: Resolve Environment
     runs-on: ubuntu-latest
+    # The shared-facts job: values other jobs need computed once so they cannot
+    # drift between copies. `name` gates the build environment; `version` is the
+    # single source of truth for both the image tag (`build`) and the release tag
+    # (`release`), read here so those two never disagree about what this commit is.
     outputs:
       name: ${{ steps.env_name.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
     steps:
+      # Needed only for the version step below — the env-name step reads context,
+      # not the tree. Cheap enough that a second facts-only job to avoid it would
+      # cost more than it saves.
+      - uses: actions/checkout@v4
+
       - name: Compute environment name
         id: env_name
+        # Via env:, never `${{ }}` inside run:. A branch name is attacker-chosen
+        # text — git accepts `a";id;#`, `a$(id)b` and backticks in a ref — and
+        # ${{ }} is substituted before bash parses the line, so interpolating it
+        # directly makes any PR author's branch name executable here. Through env:
+        # it arrives as data that bash never re-parses.
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
-          BRANCH="${{ github.head_ref || github.ref_name }}"
-          [ "$BRANCH" = "main" ] && echo "name=production" >> $GITHUB_OUTPUT || echo "name=$BRANCH" >> $GITHUB_OUTPUT
+          [ "$BRANCH" = "main" ] && echo "name=production" >> "$GITHUB_OUTPUT" || echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Read version from pyproject.toml
+        id: version
+        # tomllib, not grep: `version` is only unambiguous as the value under
+        # [tool.poetry], and a line match would also catch a `version =` under some
+        # future [tool.*] table. The runner's system python is 3.12, so tomllib
+        # (stdlib since 3.11) needs no install. Read at RUNTIME so the value always
+        # reflects the file AT THIS COMMIT — the number is never hardcoded here.
+        #
+        # Validated once, here, for every build. A malformed version is caught on the
+        # PR that introduced it rather than after merge, and both consumers — the
+        # image tag and the permanent release tag — are spared a garbage value. This
+        # is stricter than `just pins`, which checks names agree, not that the version
+        # string is releasable.
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["tool"]["poetry"]["version"])')"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+.].+)?$ ]]; then
+            echo "::error::pyproject.toml version '$version' is not semver" >&2
+            exit 1
+          fi
+          echo "Resolved version $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   lint:
     name: Lint & Type Check
@@ -25,47 +89,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
-
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          # Key on poetry.lock — only invalidates when dependency versions change.
-          # The installed group set is part of the key: keying on poetry.lock
-          # alone would restore a venv built from a different --only= list and
-          # never re-save it (actions/cache skips saving on an exact key hit),
-          # re-installing the difference on every run.
-          key: venv-lint-${{ runner.os }}-py3.14-main-lint-test-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-lint-${{ runner.os }}-py3.14-main-lint-test-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
           # `test` is here for pyright, not to run tests: it type-checks tests/,
-          # which imports pytest and fakeredis. Without them every such import
-          # is an unresolved-import error.
-          poetry install --only=main,lint,test --no-root
+          # which imports pytest and fakeredis. Without them every such import is
+          # an unresolved-import error.
+          groups: main,lint,test,dev
+          cache-prefix: lint
 
-      - name: compile (syntax check)
-        run: poetry run python -m compileall src/
+      # The task file has a canonical format; keep it that way. `make` had no
+      # equivalent. ~0.01s.
+      - name: justfile format
+        run: .venv/bin/just --fmt --check
+
+      # Expands the `check` recipe tree without running anything (~0.01s), so a
+      # typo in a recipe `check` depends on fails here rather than six minutes in.
+      # It does NOT reach recipes outside that tree — `just --evaluate`, in the
+      # failure-diagnostic step below, is what resolves every variable.
+      - name: justfile parses
+        run: .venv/bin/just -n check
+
+      # These steps ARE `just check`'s dependency list, run by CI instead of by
+      # `just` so a failure names the tool rather than "check". They are not a
+      # second copy of it -- that is the whole point of calling the recipes.
+      #
+      # `pins` belongs here specifically because of Dependabot: it asserts that the
+      # ruff version in pyproject.toml matches .pre-commit-config.yaml's hook rev,
+      # and the `pip` and `pre-commit` ecosystems open SEPARATE PRs that each move
+      # one half. Those PRs are validated by CI and never by a local `just check`,
+      # so enforcing this only locally would miss the one case it exists for.
+      - name: version pins agree
+        run: .venv/bin/just pins
+
+      # The tracked JSON — the 2354-line Grafana dashboard — is parsed by nothing
+      # else here, and a truncated one first fails at Grafana's provisioning step
+      # inside a container. `.pre-commit-config.yaml`'s check-json covers it for a
+      # clone with hooks installed; this is the enforcement copy, same split ruff
+      # already has. stdlib json, like resolve-env's tomllib: nothing to install,
+      # and `-t` names the file that failed.
+      - name: JSON files parse
+        run: git ls-files -z '*.json' | xargs -0 -r -t -I{} python3 -m json.tool {} /dev/null
 
       - name: ruff format --check
-        run: poetry run ruff format --check src/ tests/
+        run: .venv/bin/just fmt-check
 
       - name: ruff check
-        run: poetry run ruff check src/ tests/
+        run: .venv/bin/just lint
 
-      # No path argument: check src/ AND tests/, matching black above and the
-      # bare `pyright` developers run locally. Checking only src/ is what let
-      # tests/ accumulate 67 type errors unnoticed.
+      # `just types` passes --pythonpath explicitly, which `poetry run pyright`
+      # did not: pyright resolves imports from the interpreter it is TOLD about.
+      # CI was the one caller not naming the interpreter it meant.
       - name: pyright
-        run: poetry run pyright
+        run: .venv/bin/just types
+
+      # Costs nothing unless something already failed. Dumps every resolved
+      # variable -- VENV_BIN above all -- so the construction layer is visible in
+      # the log instead of being guessed at.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
 
   test:
     name: Test Suite
@@ -79,39 +161,157 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v7
+      - uses: ./.github/actions/setup-python-env
         with:
-          python-version: '3.14'
+          groups: main,test,dev
+          cache-prefix: test
 
-      - name: Install Poetry
-        run: pip install poetry==2.1.3
-
-      - name: Cache virtualenv
-        uses: actions/cache@v6
-        with:
-          path: .venv
-          key: venv-test-${{ runner.os }}-py3.14-${{ hashFiles('poetry.lock') }}
-          restore-keys: venv-test-${{ runner.os }}-py3.14-
-
-      - name: Install dependencies
-        run: |
-          poetry config virtualenvs.in-project true
-          poetry install --only=main,test --no-root
-
+      # `test-report` is `test` plus the reporting flags the coverage comment
+      # below consumes -- it invokes the same recipe, so the gate has one
+      # definition. `set -o pipefail` lives in the recipe now, where it cannot be
+      # forgotten; without it `tee` masks a failing suite.
       - name: Run tests with coverage
-        run: |
-          set -o pipefail
-          poetry run pytest --tb=short -q --cov-report=xml --junitxml=pytest.xml | tee pytest-coverage.txt
+        run: .venv/bin/just test-report
 
+      # Mirrors the lint job's step. It lived only there until a real failure
+      # landed in THIS job and the diagnostic was not where it was needed.
+      # Placed before the coverage comment so a failing suite shows the resolved
+      # variables and then stops, exactly as it did before.
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
+
+      # Pinned by commit SHA, not by `@main` as this previously was. The step runs
+      # with contents:write + pull-requests:write (the action posts commit comments
+      # on push events, so the write scope is genuinely required), after the suite,
+      # with the full workspace readable. A mutable branch ref there means a single
+      # upstream commit — this is a one-maintainer repository — executes here with
+      # no review, no version bump and no PR. Dependabot cannot cover the gap
+      # either: it does not bump branch refs, only tags and SHAs. Bump deliberately.
       - name: Coverage comment
         id: coverage_comment
-        uses: MishaKav/pytest-coverage-comment@main
+        uses: MishaKav/pytest-coverage-comment@09c28b6767e12a048e0b23e821ed03133ee48a1a # v1.11.0
         with:
           pytest-coverage-path: ./pytest-coverage.txt
           junitxml-path: ./pytest.xml
           title: Test Coverage Report
           badge-title: Coverage
 
+  # The Postgres tier the default suite skips. A separate job, not a service
+  # container bolted onto `test`: that job runs 1200+ tests that never touch
+  # Postgres behind a coverage gate and a PR comment, and this one runs the pg
+  # tests, with --no-cov. (Not a count — one drifts every time a case is added
+  # and then documents nothing.) Splitting them keeps a Postgres failure
+  # legible as a Postgres failure, and costs no wall-clock time because the
+  # jobs run in parallel.
+  #
+  # Postgres is a REQUIRED tier for this bot (MusicBotApp.setup_hook refuses to
+  # start without POSTGRES_URL), so leaving its SQL validated only by a local
+  # opt-in run meant the one thing CI could not see was the thing that must
+  # always work.
+  pg-integration:
+    name: Postgres Integration
+    runs-on: ubuntu-latest
+    needs: resolve-env
+    env:
+      ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+      # Points the tier at the service container below instead of letting
+      # testcontainers start its own. Setting this is ALSO what enables the tier
+      # (tests/test_pg_integration.py), so this job cannot half-configure itself
+      # into skipping every test and still reporting green.
+      #
+      # localhost, not the `postgres` hostname: steps run on the runner host, not
+      # inside a job container, so the service is reachable only via its published
+      # port. The hostname form works exclusively for container-based jobs.
+      POSTGRES_TEST_URL: postgresql://test:test@localhost:5432/test
+    services:
+      postgres:
+        # `just pins` asserts this matches _PG_IMAGE in tests/test_pg_integration.py.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        # Without a health check the runner considers the service ready as soon
+        # as the container is created, and the first asyncpg connect races
+        # Postgres' own init — which restarts the server partway through, so it
+        # is not even a fixed sleep away. GitHub gates the job's first step on
+        # these probes instead, which is why no retry logic is needed in the
+        # fixtures.
+        options: >-
+          --health-cmd "pg_isready -U test -d test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-python-env
+        with:
+          # Same group set AND same cache-prefix as the `test` job, deliberately:
+          # identical groups produce an identical venv, so sharing the key means
+          # this job restores the cache that job already paid for instead of
+          # building and storing a byte-identical second copy.
+          groups: main,test,dev
+          cache-prefix: test
+
+      # Via the recipe, like every other CI step here, so "how to run the pg
+      # tier" has one definition that local runs and CI share.
+      - name: Run Postgres integration tier
+        run: .venv/bin/just test-pg
+
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
+
+  redis-integration:
+    name: Redis Integration
+    runs-on: ubuntu-latest
+    needs: resolve-env
+    env:
+      ENVIRONMENT: ${{ needs.resolve-env.outputs.name }}
+      # Points the tier at the service container below instead of letting
+      # testcontainers start its own. Setting this is ALSO what enables the tier
+      # (tests/test_redis_integration.py), so this job cannot half-configure
+      # itself into skipping every test and still reporting green.
+      #
+      # localhost, not the `redis` hostname: steps run on the runner host, not
+      # inside a job container, so the service is reachable only via its
+      # published port.
+      REDIS_TEST_URL: redis://localhost:6379/0
+    services:
+      redis:
+        # `just pins` asserts this matches _REDIS_IMAGE in
+        # tests/test_redis_integration.py AND the compose service.
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-python-env
+        with:
+          # Same group set AND cache-prefix as the `test` job, so this restores
+          # the venv that job already paid for rather than storing a
+          # byte-identical second copy.
+          groups: main,test,dev
+          cache-prefix: test
+
+      # Via the recipe, like every other CI step here, so "how to run the redis
+      # tier" has one definition that local runs and CI share.
+      - name: Run Redis integration tier
+        run: .venv/bin/just test-redis
+
+      - name: Dump resolved justfile variables
+        if: failure()
+        run: .venv/bin/just --evaluate
 
   container-test:
     name: Container Test
@@ -132,8 +332,182 @@ jobs:
           tags: discord-music-bot:test
           build-args: |
             ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Scoped, because both this job and `build` export a GHA cache and an
+          # unscoped export writes the same default key. They build different
+          # targets, so each run's export replaced the other's and the next run
+          # restored a manifest missing its own layers. Cost, not correctness.
+          cache-from: type=gha,scope=test
+          cache-to: type=gha,mode=max,scope=test
 
       - name: Run tests in container
         run: docker run --rm discord-music-bot:test
+
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    needs: [resolve-env, lint, test, pg-integration, redis-integration, container-test]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # One definition of "is this a publish?", read by the login step's `if:` and
+      # by `push:` below. The job itself runs on EVERY commit: `container-test`
+      # builds the `test` stage, so without this nothing exercised the `runtime`
+      # stage until after merge, and a runtime-only breakage (a missing system
+      # package, a COPY that resolves differently) would land on main unseen.
+      # Building always and pushing only from main means the image published at
+      # merge is produced by the same steps that validated every commit before it.
+      # workflow_dispatch is included so an image can be re-published for a commit
+      # that is already on main — after a GHCR incident, or a registry-side failure
+      # that has nothing to do with the code. Without it the only way to republish
+      # was an empty commit. It still requires being ON main, so a manual run from a
+      # branch publishes nothing.
+      PUBLISH: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+
+    # This job used to live in a separate build.yml triggered by `workflow_run`.
+    # That was a provenance hole: for the workflow_run event GITHUB_SHA is
+    # documented as "last commit on default branch", NOT the commit whose CI just
+    # passed — so a bare `actions/checkout` plus metadata-action's `type=sha`
+    # could publish an image tagged with a SHA whose contents it did not contain,
+    # any time a second merge landed during the first one's run. As a job here it
+    # inherits the correct SHA, reuses the BuildKit cache container-test just
+    # warmed, and is testable from a PR at all (workflow_run always executes the
+    # DEFAULT branch's copy of the workflow file).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Only needed to push. Skipped on branches, where nothing leaves the runner —
+      # which also keeps the commit-level build working for a fork PR, whose
+      # GITHUB_TOKEN cannot be granted packages: write.
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # Three tags, three questions: `sha-<...>` is the immutable "this exact
+          # commit" (never gated — provenance is meaningful on every build); `latest`
+          # is the moving "newest published"; and the bare pyproject version is the
+          # human "which release". The version carries NO `v` prefix — that is the git
+          # tag's convention (release job), not the image's (`python:3.12`, not
+          # `:v3.12`).
+          #
+          # `latest` and the version are gated to the default branch explicitly. The
+          # `push:` guard below already stops a branch build publishing anything, but
+          # a tag that is only safe because of a second setting elsewhere is one
+          # refactor away from being wrong.
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.resolve-env.outputs.version }},enable={{is_default_branch}}
+
+      - name: Build runtime image (push only from main)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          # False on branches: the image is built, loaded into the local BuildKit
+          # cache, and discarded. The validation is that it BUILDS.
+          push: ${{ env.PUBLISH }}
+          # build.yml never passed this. It changes nothing today — the job only
+          # runs on main, where the resolved name and the Dockerfile's runtime
+          # default are both "production" — but relying on two independent
+          # defaults agreeing is not a property worth depending on.
+          # GIT_SHA is baked in as an ENV (and an OCI revision label) so the running
+          # bot can report its own commit. github.sha is the commit this job checked
+          # out — the same one metadata-action's `type=sha` tags the image with.
+          build-args: |
+            ENVIRONMENT=${{ needs.resolve-env.outputs.name }}
+            GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Dead config removed: `cache-to` only ever wrote `type=gha`, so
+          # `:buildcache` was never populated by this workflow or by the build.yml
+          # it replaced — the registry import always missed. On a branch build it
+          # would also be an unauthenticated pull, since the login step above is
+          # skipped.
+          #
+          # scope=runtime pairs with container-test's scope=test: this job builds the
+          # runtime target, that one builds test, and sharing the default scope meant
+          # each overwrote the other's export between runs.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
+  release:
+    name: Tag & Release
+    runs-on: ubuntu-latest
+    # After build, not beside it: a version tag is a permanent, outward-facing claim
+    # that this commit is a release, so it must not be minted until the commit has
+    # passed every gate AND its image actually published. `build` pulls in
+    # lint/test/container-test transitively, and its publish step is what puts the
+    # image on GHCR — tag only what shipped. resolve-env is named directly (not just
+    # via build) because outputs are only visible from a job's OWN needs; that is
+    # where the version comes from, so the git tag and the image tag are the same
+    # string by construction rather than by two extractions agreeing.
+    needs: [resolve-env, build]
+    # Real merges to main only. `needs` does NOT inherit build's publish gate — build
+    # runs on branches and PRs too (to prove the runtime image still builds), so
+    # without this line a branch push would fall straight through and cut a release
+    # off a feature branch. Mirrors the PUBLISH predicate, minus workflow_dispatch:
+    # re-publishing an image for an existing commit must never re-cut its release, and
+    # the idempotency guard below would no-op it anyway.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      # A release is a tag ref plus a release object — both writes to repository
+      # contents, and the only scope this job needs. The top-level block is
+      # contents:read; a job-level block replaces it wholesale rather than adding.
+      contents: write
+    steps:
+      # No checkout: the version is a resolve-env output and `gh` talks to the API,
+      # so this job never touches the tree. That makes GH_REPO mandatory — see below.
+      - name: Create release if the version is new
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `gh` resolves which repo to act on from the checked-out git remote, or
+          # from GH_REPO — it does NOT read GITHUB_REPOSITORY. With no checkout and
+          # no GH_REPO it has neither, and every gh call dies with "failed to run
+          # git: fatal: not a git repository" (which is how v1.2.0 went untagged).
+          # Setting it here keeps the no-checkout design instead of paying a clone
+          # just to give gh a remote to look at.
+          GH_REPO: ${{ github.repository }}
+          # `v` prefix here, bare in the image tag: git tags conventionally carry it,
+          # image tags conventionally do not. Same version string, one source.
+          TAG: v${{ needs.resolve-env.outputs.version }}
+          # github.sha is the merge commit CI ran against, so the release's tag points
+          # at exactly the validated, published commit and never at whatever the
+          # default branch has drifted to since.
+          SHA: ${{ github.sha }}
+        # CI runs on every merge to main; the version in pyproject.toml bumps on only
+        # some (SemVer, per-PR). An existing release for this version is therefore the
+        # normal no-bump case, not an error — skip it. Creating the release is what
+        # creates the tag, and --generate-notes writes the changelog from the PRs
+        # merged since the previous release. A tag push does not re-enter this
+        # workflow (no `tags:` trigger, and GITHUB_TOKEN-authored refs don't fan out),
+        # so there is no recursion to guard against.
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already released — nothing to do."
+            exit 0
+          fi
+          # Two same-version merges landing together each get their own concurrency
+          # group (github.sha is in the key), so they can overlap and both pass the
+          # check above; the loser's create then 422s on the now-existing tag.
+          # Re-check and treat that as success rather than failing a merge over a race
+          # whose outcome — the release exists — is exactly what we wanted.
+          if ! gh release create "$TAG" --target "$SHA" --title "$TAG" --generate-notes; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "$TAG was created concurrently — treating as success."
+              exit 0
+            fi
+            exit 1
+          fi

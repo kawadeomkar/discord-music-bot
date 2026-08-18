@@ -1,11 +1,17 @@
 # Ignore
 pyproject.bak.toml
-docs/
+# docs/ is local-only working material (plans, reviews, proposals) EXCEPT
+# ARCHITECTURE.md, which source comments link to for the long-form context they
+# no longer carry inline. Those links must resolve for anyone who clones, so the
+# file is tracked. Negation needs `docs/*`, not `docs/` — git cannot re-include a
+# file whose parent directory is excluded.
+docs/*
+!docs/ARCHITECTURE.md
 
-# Claude Code
+# Claude Code. CLAUDE.md is deliberately NOT ignored — it is the working guide to
+# this codebase and has to reach anyone who clones, same as docs/ARCHITECTURE.md.
+# .claude/ stays local: it holds per-developer settings and session state.
 .claude/
-CLAUDE.md
-/CLAUDE.md
 
 # PyCharm and misc
 .idea
@@ -67,6 +73,14 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Written by `just test-report`, which CI runs and anyone can run locally.
+# coverage.xml is already covered above; these two were only ever generated on a
+# runner before the recipe existed.
+pytest.xml
+pytest-coverage.txt
+# Written by security.yml's `poetry export`. Same reasoning: reproducing the audit
+# locally used to leave an untracked file behind.
+requirements-audit.txt
 
 # Translations
 *.mo
@@ -144,3 +158,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macOS Finder metadata and the JSON coverage report `just test-report` writes.
+# Both were tracked before this line existed.
+.DS_Store
+coverage.json
+backups/
