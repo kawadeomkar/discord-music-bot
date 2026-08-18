@@ -182,10 +182,7 @@ class TestSpotifyRefreshToken:
         mock_session.post.assert_awaited_once()
 
     def test_str_never_exposes_the_bearer_token(self, spotify: Spotify) -> None:
-        """__str__ used to return the token verbatim, so one f-string in a log
-        line would ship a live credential to Loki, where it is indexed and
-        retained. Both dunders are covered: an exception repr reaches __repr__,
-        not __str__."""
+        """Both dunders, since an exception repr reaches __repr__, not __str__."""
         spotify.auth_token = "super_secret_bearer_token"
         assert "super_secret_bearer_token" not in str(spotify)
         assert "super_secret_bearer_token" not in repr(spotify)
@@ -203,8 +200,7 @@ class TestSpotifyRefreshToken:
     def test_str_identifies_the_client_without_the_secret(
         self, spotify: Spotify
     ) -> None:
-        """A truncated client_id is enough to tell two configs apart; the
-        secret is never rendered at all."""
+        """A truncated client_id tells two configs apart; the secret never renders."""
         assert "test_i" in str(spotify)
         assert spotify.client_secret is not None
         assert spotify.client_secret not in str(spotify)
