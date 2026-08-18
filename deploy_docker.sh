@@ -16,6 +16,27 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./build_common.sh
 
 resolve_environment
+# Turns HISTORY_ARCHIVE_ENABLED into the `archive` compose profile, so the flag
+# in .env is the only thing an operator sets and no tracked file is ever edited.
+# Before the preflight below, which reports on the resolved state.
+resolve_archive_profile
+# This script is the one that STARTS containers, so it is the one that has to
+# carry the credential preflight. build_docker.sh also calls it, but only
+# build_docker.sh — and `just up`, a rollback, and the README's own enable and
+# disable procedures (`docker compose up -d`) all reach a running Postgres
+# without ever passing through it. That left the drift case — `archive` profile
+# active, HISTORY_ARCHIVE_ENABLED off — with no warning anywhere at all: the
+# bot's startup ERROR and its -ping row are both gated on the flag, so a
+# default-credential database holding the full play archive ran silently, which
+# is precisely the case build_common.sh's wider OR-gate was written to catch.
+#
+# Deliberately NOT deduplicated against build_docker.sh's earlier call. That one
+# fires before ~24s of checks and a full image build so the operator learns
+# early; by the time those have scrolled past, this one puts the warning back on
+# screen immediately before the containers start. Same text, two moments that
+# both matter. It only warns — see build_common.sh for why refusing would be
+# wrong — so repeating it costs nothing but a line.
+warn_default_postgres_password
 
 # Default matches what build_docker.sh / `just image` actually tagged, `-dirty`
 # suffix included — otherwise `just up` after a dirty build looks for a clean-SHA
@@ -66,7 +87,7 @@ if ! docker image inspect "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-# NOTE (merge-time, docs/CICD_PIPELINE_RESTRUCTURE_PLAN.md §8.3): when the k8s
+# NOTE (merge-time): when the k8s
 # stack lands, its "is a bot pod already live in a cluster?" guard belongs HERE,
 # immediately below — one Discord token means one live process, and this is the
 # line that starts one. It currently sits in that branch's build_docker.sh, which
@@ -74,7 +95,44 @@ fi
 # Putting it here rather than in build_docker.sh also covers rollbacks, which the
 # branch's version does not.
 
+# Deactivating a profile does not stop what it already started: compose leaves a
+# running postgres alone and `down` without the profile cannot see it either. So
+# say so — the operator who just turned the archive off expects the database to
+# go away, and silence here looks like it did.
+if [ "$ARCHIVE_ENABLED" -eq 0 ] \
+    && [ -n "$(docker ps -q --filter 'name=^discord-postgres$' 2>/dev/null)" ]; then
+    echo "WARNING: the archive is disabled but discord-postgres is still running" >&2
+    echo "         from an earlier enabled deploy. This deploy leaves it up." >&2
+    echo "         Stop it with: just down   (then re-run this deploy)" >&2
+    echo "         Archived rows survive in the postgres-data volume either way." >&2
+fi
+
+# Migrate BEFORE the bot is recreated, and gate the deploy on it: a `git pull`
+# brings migrations with the code, and the bot refuses to archive against a
+# schema older than its build, so starting it first archives nothing until
+# someone reads the logs. Idempotent — versions are recorded with their DDL and
+# skipped thereafter, and a database newer than this image exits 0 (rollbacks).
+#
+# `run --rm`, not `up`: only `run` reports the runner's exit status, which is
+# what makes this a gate. depends_on waits for postgres to be healthy first.
+if [ "$ARCHIVE_ENABLED" -eq 1 ]; then
+    echo "Applying play-history migrations from $TAG"
+    # Empty unless POSTGRES_URL names a database off this host — the compose
+    # service's own DSN addresses postgres by service name, and .env's is the
+    # host form, which is unreachable from inside the container.
+    resolve_external_postgres_env
+    if ! docker compose run --rm -T ${EXTERNAL_PG_ENV[@]+"${EXTERNAL_PG_ENV[@]}"} db-migrate; then
+        echo "Migration failed — NOT deploying $TAG." >&2
+        echo "The running bot is untouched. Fix the database, then re-run this." >&2
+        echo "Inspect with: just compose logs postgres" >&2
+        exit 1
+    fi
+fi
+
 echo "Deploying $TAG (ENVIRONMENT=$ENVIRONMENT)"
 # Only the bot's own container is recreated — Redis, the POT sidecar and
 # otel-lgtm are unchanged by a new bot tag, so compose leaves them running.
+# With the archive enabled this also starts postgres and the db-migrate service;
+# the migration above has already run, so that one is a no-op second pass. It is
+# left in the model deliberately, for operators who drive compose directly.
 docker compose up -d
