@@ -27,9 +27,16 @@ import src.telemetry as telemetry
 
 @pytest.fixture(autouse=True)
 def restore_global_state() -> Iterator[None]:
-    """Save and restore everything setup_telemetry() reaches into."""
+    """Save and restore everything setup_telemetry() reaches into.
+
+    structlog included: _configure_structlog() reconfigures it PROCESS-wide, and
+    conftest's configure_structlog_for_tests is session-scoped, so without this the
+    production JSON chain (and cache_logger_on_first_use) stands for every test that
+    runs after this file.
+    """
     handlers = list(logging.root.handlers)
     level = logging.root.level
+    structlog_config = structlog.get_config()
     saved = (
         telemetry._tracer_provider,
         telemetry._log_provider,
@@ -38,6 +45,7 @@ def restore_global_state() -> Iterator[None]:
     yield
     logging.root.handlers = handlers
     logging.root.setLevel(level)
+    structlog.configure(**structlog_config)
     (
         telemetry._tracer_provider,
         telemetry._log_provider,
