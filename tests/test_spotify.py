@@ -181,9 +181,33 @@ class TestSpotifyRefreshToken:
         assert spotify.auth_token == "test_access_token_xyz"  # fresh, not cached
         mock_session.post.assert_awaited_once()
 
-    def test_str_returns_auth_token(self, spotify: Spotify) -> None:
-        spotify.auth_token = "my_token"
-        assert str(spotify) == "my_token"
+    def test_str_never_exposes_the_bearer_token(self, spotify: Spotify) -> None:
+        """Both dunders, since an exception repr reaches __repr__, not __str__."""
+        spotify.auth_token = "super_secret_bearer_token"
+        assert "super_secret_bearer_token" not in str(spotify)
+        assert "super_secret_bearer_token" not in repr(spotify)
+        assert "super_secret_bearer_token" not in f"{spotify}"
+        assert "super_secret_bearer_token" not in f"{spotify!r}"
+
+    def test_str_reports_token_presence_without_the_value(
+        self, spotify: Spotify
+    ) -> None:
+        spotify.auth_token = ""
+        assert "token=unset" in str(spotify)
+        spotify.auth_token = "anything"
+        assert "token=set" in str(spotify)
+
+    def test_str_identifies_the_client_without_the_secret(
+        self, spotify: Spotify
+    ) -> None:
+        """A truncated client_id tells two configs apart; the secret never renders."""
+        assert "test_i" in str(spotify)
+        assert spotify.client_secret is not None
+        assert spotify.client_secret not in str(spotify)
+
+    def test_str_handles_missing_client_id(self, spotify: Spotify) -> None:
+        spotify.client_id = None
+        assert "unset" in str(spotify)  # must not raise on None
 
 
 def _make_split_session(post_resp: AsyncMock, request_resp: AsyncMock) -> MagicMock:

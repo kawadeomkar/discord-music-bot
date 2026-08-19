@@ -950,3 +950,80 @@ class TestLremRemovalPath:
         await store.remove_queue_entries([self._entry(1)])
 
         assert await redis.exists(store.queue_key()) == 0
+
+
+class TestRecoveryLockCompareAndDelete:
+    """`release_recovery_lock` — WATCH/MULTI compare-and-delete against a real
+    server. This is the tier the WATCH-over-Lua choice was made for: fakeredis
+    accepts the commands, but only a real server settles whether a WATCH is
+    actually invalidated by a write from another connection, which is the entire
+    guarantee. Deleting a lease this store no longer owns admits a second
+    restore of the same guild."""
+
+    async def test_release_deletes_only_the_lease_this_store_acquired(
+        self, redis: aioredis.Redis
+    ) -> None:
+        first = GuildRedisStore(redis, guild_id=7)
+        assert await first.acquire_recovery_lock() is True
+
+        # The lease elapses mid-restore and the next attempt takes it.
+        await redis.delete(first._recovery_lock_key())
+        second = GuildRedisStore(redis, guild_id=7)
+        assert await second.acquire_recovery_lock() is True
+        token = second._recovery_lock_token
+        assert token is not None
+
+        await first.release_recovery_lock()  # the late release
+
+        assert await redis.get(first._recovery_lock_key()) == token.encode()
+
+    async def test_exec_aborts_when_the_key_changes_hands_after_the_watch(
+        self,
+        redis: aioredis.Redis,
+        redis_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The window the compare alone cannot close: the value still matches at
+        GET and is stolen before EXEC. WATCH is per-CONNECTION, so the steal has
+        to come from a second client — a same-connection write would not
+        invalidate anything and would prove nothing."""
+        store = GuildRedisStore(redis, guild_id=8)
+        assert await store.acquire_recovery_lock() is True
+        key = store._recovery_lock_key()
+
+        thief = aioredis.Redis.from_url(redis_url, decode_responses=False)
+        real_pipeline = redis.pipeline
+
+        class _StealAfterGet:
+            """Pipeline wrapper that lets a second client take the key between
+            this pipeline's GET and its EXEC."""
+
+            def __init__(self, pipe: Any) -> None:
+                self._pipe = pipe
+
+            async def __aenter__(self) -> "_StealAfterGet":
+                await self._pipe.__aenter__()
+                return self
+
+            async def __aexit__(self, *exc: Any) -> Any:
+                return await self._pipe.__aexit__(*exc)
+
+            async def get(self, name: Any) -> Any:
+                value = await self._pipe.get(name)
+                await thief.set(key, b"the-next-attempts-token", ex=60)
+                return value
+
+            def __getattr__(self, attr: str) -> Any:
+                return getattr(self._pipe, attr)
+
+        try:
+            monkeypatch.setattr(
+                redis,
+                "pipeline",
+                lambda *a, **k: _StealAfterGet(real_pipeline(*a, **k)),
+            )
+            await store.release_recovery_lock()  # must not raise
+
+            assert await redis.get(key) == b"the-next-attempts-token"
+        finally:
+            await thief.aclose()

@@ -13,7 +13,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from src.main import EXTENSIONS, MusicBotApp
+from src.main import EXTENSIONS, MusicBotApp, intents
 from src.musicbot import MusicBot
 from src.redis_client import HISTORY_OUTBOX_KEY
 from tests.helpers import mocked
@@ -869,3 +869,37 @@ class TestOnReady:
         await app.on_ready()
         call_kwargs = mocked(app.change_presence).call_args[1]
         assert call_kwargs["status"] == discord.Status.online
+
+
+class TestIntents:
+    """The declared gateway contract. Each assertion matches code that stops
+    working if the flag is dropped, and none of it fails anywhere but at
+    runtime, against Discord."""
+
+    def test_only_the_needed_intents_are_requested(self) -> None:
+        assert {f for f, v in intents if v} == {
+            "guilds",
+            "voice_states",
+            "guild_messages",
+            "dm_messages",
+            "message_content",
+            "members",
+        }
+
+    def test_presences_is_not_requested(self) -> None:
+        """Privileged, and blocks verification past 100 guilds. Sending our own
+        presence through change_presence() needs no intent, so nothing here
+        wants it."""
+        assert intents.presences is False
+
+    def test_message_events_are_received(self) -> None:
+        """message_content alone is NOT enough: without guild_messages the
+        events never arrive and no prefix command works at all."""
+        assert intents.guild_messages is True
+        assert intents.message_content is True
+
+    def test_dm_messages_are_received(self) -> None:
+        """-help renders a DM-safe embed and -debug has a reply written for the
+        no-guild case (test_debug.py: "-debug is DM-reachable"). Dropping this
+        leaves both unreachable in production with every test still green."""
+        assert intents.dm_messages is True

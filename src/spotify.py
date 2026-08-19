@@ -145,7 +145,16 @@ class Spotify:
         self._session_factory = session_factory or aiohttp.ClientSession
 
     def __str__(self) -> str:
-        return self.auth_token
+        # Never the bearer token: one f-string would put a live credential into
+        # logs that ship to Loki, where they are indexed and retained. __repr__
+        # is aliased below so an exception repr cannot leak it either.
+        client = self.client_id or "unset"
+        return (
+            f"Spotify(client_id={client[:6]}…, "
+            f"token={'set' if self.auth_token else 'unset'})"
+        )
+
+    __repr__ = __str__
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import wraps
@@ -14,6 +15,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import WatchError
 from redis.asyncio.retry import Retry
 from redis.typing import EncodableT, FieldT
 
@@ -685,6 +687,10 @@ class GuildRedisStore:
     def __init__(self, redis: aioredis.Redis, guild_id: int) -> None:
         self.redis = redis
         self.guild_id = guild_id
+        # Set by acquire_recovery_lock, consumed by release_recovery_lock — the
+        # acquire/release scope is one store object, which is what restore_guild
+        # builds per attempt. A release from a different one finds None and declines.
+        self._recovery_lock_token: Optional[str] = None
 
     # Key helpers
 
@@ -1369,8 +1375,12 @@ class GuildRedisStore:
         pipe.delete(self.now_playing_key())
         await pipe.execute()
 
-    # Recovery lock (distributed, for rolling-restart safety)
+    # Recovery lock — one restore_guild per guild at a time
 
+    # Must outlast the guarded section: _restore_guild's voice connect is capped at
+    # 30s TOTAL (one wait_for wraps discord.py's whole retry loop), plus a few Redis
+    # reads. Expiry is safe — release compares before deleting — so the only cost of
+    # an early one is duplicate work, against a dead holder blocking recovery this long.
     _RECOVERY_LOCK_TTL = 60  # seconds
 
     def _recovery_lock_key(self) -> str:
@@ -1378,12 +1388,52 @@ class GuildRedisStore:
 
     @_guild_op(default=False)
     async def acquire_recovery_lock(self) -> bool:
-        """SET NX EX — True if this instance won the lock, False if another holds it."""
+        """SET NX EX — True if this store won the lock, False if it is already held.
+
+        The value is a per-acquisition random token, so the release below can prove
+        the lock it deletes is still the one this store acquired.
+        """
+        token = secrets.token_hex(16)
         result = await self.redis.set(
-            self._recovery_lock_key(), "1", nx=True, ex=self._RECOVERY_LOCK_TTL
+            self._recovery_lock_key(), token, nx=True, ex=self._RECOVERY_LOCK_TTL
         )
-        return result is True
+        if result is True:
+            self._recovery_lock_token = token
+            return True
+        return False
 
     @_guild_op(default=None)
     async def release_recovery_lock(self) -> None:
-        await self.redis.delete(self._recovery_lock_key())
+        """Delete the lock only if this store still owns it (compare-and-delete).
+
+        A lock that can expire must never be deleted blind: a holder whose lock
+        expired mid-recovery would DEL the lock its successor now owns, admitting a
+        third restore and the double-restore the lock exists to prevent.
+
+        WATCH/MULTI, not a Lua CAS — EXEC aborts if the value changed after WATCH,
+        and fakeredis has no Lua interpreter, so this path stays covered by real
+        tests rather than mocks. Do not "simplify" it to EVAL.
+
+        The compare is against bytes: the pool is decode_responses=False.
+        """
+        token = self._recovery_lock_token
+        if token is None:
+            # Never held it (or a different store object acquired it) — deleting
+            # would be exactly the foreign-lock delete this method exists to stop.
+            return
+        self._recovery_lock_token = None
+        key = self._recovery_lock_key()
+        async with self.redis.pipeline() as pipe:
+            try:
+                await pipe.watch(key)
+                if await pipe.get(key) != token.encode():
+                    # Expired, or already re-acquired by someone else. Not ours
+                    # to delete; leave it alone and let its owner or its TTL end it.
+                    await pipe.unwatch()
+                    return
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+            except WatchError:
+                # Changed hands between the read and EXEC — same conclusion.
+                pass

@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,740 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 47-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,790 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -550,7 +550,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | string | 60s | orjson aggregate cache for `-leaderboard`, one entry per requested window (`:0` = all-time). Keyed by row limit and codec version too, so neither can decode stale. TTL'd, so eviction-safe |
 | `spotify:auth:token` | string | expires_in − 30s | raw bearer token (NOT orjson — deliberate) |
 | `spotify:{track,playlist,artist,album}:{id}` | string | 24h/1h/24h/24h | cached lookups |
-| `lock:guild:{id}:recovery` | string | 60s | SET NX EX distributed recovery lock |
+| `lock:guild:{id}:recovery` | string | 60s | SET NX EX recovery lock, one restore per guild at a time. The value is a per-acquisition random token, and release is a WATCH/MULTI compare-and-delete — an unconditional DEL would let a holder whose lock expired mid-recovery delete its successor's |
 
 Postgres holds two tables — `play_history`, and `play_history_rejected` (rows the server
 refused; expected to stay empty forever, since `HistoryEntry.__post_init__` clamps every
@@ -605,7 +605,7 @@ stamps the real id from the Redis key, the only place that information still exi
 on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is None)
   └─ per guild: _restore_guild (background task)
        ├─ skip if guild already in mps
-       ├─ acquire lock:guild:{id}:recovery (SET NX EX 60) — rolling-restart safety
+       ├─ acquire lock:guild:{id}:recovery (SET NX EX 60, random token) — one restore per guild
        ├─ get_recovery_gate(): ONE pipeline = state hash + queue LLEN (contents stay
        │    off the wire on the common nothing-to-do path; a -stopped guild keeps a
        │    possibly-long persisted queue by design)
@@ -888,15 +888,18 @@ write to make passes an empty body.
 
 ## Testing
 
-- Layout: one `tests/test_<module>.py` per src module (`telemetry.py` is the sole
-  exception — it has no test file; `test_leaderboard.py` also owns the cog command
-  that drives it, since splitting the renderer's tests from the command's would make
-  a reader check two files to learn what one board looks like; `test_debug.py`
-  likewise owns `MusicBot._debug_suffix` and the `-debug` card's end-to-end
-  assertions, for the same reason — what the footer says and what puts it there are
-  one behavior), plus `conftest.py` (shared fixtures/seams),
-  `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` and
-  `telemetry.py` are the two intentionally-least-covered modules.
+- Layout: one `tests/test_<module>.py` per src module (`test_leaderboard.py` also owns
+  the cog command that drives it, since splitting the renderer's tests from the
+  command's would make a reader check two files to learn what one board looks like;
+  `test_debug.py` likewise owns `MusicBot._debug_suffix` and the `-debug` card's
+  end-to-end assertions, for the same reason — what the footer says and what puts it
+  there are one behavior), plus `conftest.py` (shared fixtures/seams),
+  `helpers.py` (builders), `test_context.py` (Discord context doubles). `config.py` is
+  the intentionally-least-covered module.
+  `test_telemetry.py` restores structlog's PROCESS-wide configuration itself, because
+  conftest's `configure_structlog_for_tests` is session-scoped and `setup_telemetry()`
+  reconfigures structlog for real — without that restore the production JSON chain
+  would stand for every test that runs after it.
 - **The yt-dlp seam** (autouse fixture `use_thread_ytdlp_pool`): every test runs
   extraction on an in-process ThreadPoolExecutor-backed `YtdlpPool`, because tests patch
   `src.youtube._ytdlp_extract` with MagicMocks that could never be pickled to a real
