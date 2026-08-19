@@ -721,7 +721,7 @@ sequenceDiagram
     participant VC as Discord Voice
     participant MP as MusicPlayer
 
-    MusicBot->>Redis: acquire_recovery_lock() [SET NX EX 60]
+    MusicBot->>Redis: acquire_recovery_lock() [SET NX EX 60, random token]
     Note over Redis: lock:guild:{id}:recovery — prevents two instances racing
     MusicBot->>Redis: get_recovery_gate() [pipelined: state hash + LLEN queue]
     Note over MusicBot: gate is None (Redis read failed) → skip with warning,<br/>retried on next on_ready. Queue *contents* deliberately not read here.
@@ -746,7 +746,7 @@ Key properties:
 
 - **Lightweight gate**: `get_recovery_gate()` reads only the state hash and the queue **length** (LLEN). A `-stop`ped guild keeps its (possibly long) queue list, so gating on LLEN keeps that payload off the wire on every `on_ready`. The full payload is read once by `_restore_state` after a successful connect.
 - **At-most-once crashed song**: `current_song_url` is written when a song starts and cleared on normal end. On recovery the crashed song is rebuilt, injected in-memory only (`persisted=False` — it was never on the Redis queue list), and `current_song_url` is cleared immediately, even when the requester is unresolvable.
-- **Failure isolation**: a failed snapshot read aborts the whole restore rather than fabricating partial state; the lock's 60 s TTL auto-expires if the holder crashes.
+- **Failure isolation**: a failed snapshot read aborts the whole restore rather than fabricating partial state; the lock's 60 s TTL auto-expires if the holder crashes, and release compare-and-deletes so an expired holder cannot delete its successor's lock.
 - **Intentional stop vs crash**: `cleanup()` calls `clear_connection()`, which empties the channel-ID fields — `on_ready` then skips that guild.
 
 ---
@@ -817,7 +817,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 | `guild:{id}:config` | Hash | 3 fields → `GuildConfig`, a guild's DURABLE choices: `debug_mode` (`"1"`/`"0"`), `volume`, `timezone` (an IANA name, resolved by `GuildConfig.tzinfo()` at read time). Every field is `Optional` and **absent means "no choice made"** — distinct from an explicit `0`/`false`, which is why it cannot be a plain `bool`. Deliberately NOT fields on `:state`: that hash expires in 24 h, so a choice stored there reverts on any guild idle for a day. Written only by an explicit command, PERSISTed, deleted on `on_guild_remove` | **none, ever** |
 | `history:outbox` | Stream | Global (all guilds) write-ahead buffer for the Postgres archive, drained by the `drainers` consumer group — same `HistoryEntry` wire bytes under field `e`, each carrying `guild_id`. Near-empty in steady state; grows only while Postgres is down. Written only while `HISTORY_ARCHIVE_ENABLED` is true | **None — deliberately persistent** (holds not-yet-durable entries; never an eviction candidate under `volatile-lru`) |
 | `leaderboard:v{n}:{guild_id}:{days}:{top_n}` | String | orjson aggregate cache for `-leaderboard` — one entry per requested window (`:0` = all-time). TTL'd, so it is a legitimate `volatile-lru` eviction candidate: losing it costs one re-query | 60 s |
-| `lock:guild:{id}:recovery` | String | `"1"` (SET NX EX — distributed lock) | 60 s |
+| `lock:guild:{id}:recovery` | String | random token (SET NX EX — one restore per guild) | 60 s |
 | `ytdl:stream:{webpage_url}` | String | JSON dict stripped to 16 fields (`url`, `webpage_url`, `title`, `uploader`, `uploader_url`, `upload_date`, `thumbnail`, `description`, `duration`, `tags`, `view_count`, `like_count`, `dislike_count`, `abr`, `asr`, `acodec`) | `expire − now − 1800s`; not written if < 60 s |
 | `ytdl:source:{normalized search}` | String | `(webpage_url, title)` resolution of a search query | 1 h |
 | `spotify:track:{id}` | String | `"Title Artist"` search string | 24 h |
@@ -1544,7 +1544,11 @@ Every `GuildRedisStore` method catches and logs Redis exceptions internally. Red
 
 ### Distributed recovery lock
 
-`lock:guild:{id}:recovery` (`SET NX EX 60`) prevents two bot instances (e.g., a rolling restart) from both reconnecting to the same guild. The 60 s TTL auto-expires if the holder crashes before releasing.
+`lock:guild:{id}:recovery` (`SET NX EX 60`) admits one restore per guild at a time. Its contention is mostly *not* cross-instance — `AutoShardedBot` puts every shard in one process, and Discord routes a guild to exactly one shard, so even multi-process sharding gives a guild exactly one restorer. What it does contend with is repetition inside one process: `on_ready` re-dispatches on any reconnect that fails to RESUME, and `restore_guild`'s `guild.id in cog.mps` early-out does not cover the window, because `mps[guild.id]` is assigned only *after* the voice connect. Two processes overlap only when their shard assignments do — a surge-style rolling deploy, or a second bot started by hand against the same Redis.
+
+The lock is not the last line of defence there. `abc.Connectable.connect` registers the voice client via `state._add_voice_client(...)` **before** its first await, so a second concurrent `restore_guild` in the same process raises `ClientException` and never reaches `MusicPlayer(...)`. The lock's job is to stop the duplicated work and the duplicated user-facing notice ahead of that.
+
+The 60 s TTL auto-expires if the holder crashes before releasing. The value is a per-acquisition random token so release can compare-and-delete under WATCH/MULTI: a holder whose lock expired mid-recovery must not delete the lock its successor now owns, which would admit a third restore and produce exactly the double-restore the lock prevents.
 
 ### `AutoShardedBot`
 
