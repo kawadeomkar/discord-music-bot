@@ -17,6 +17,7 @@ from redis.backoff import ExponentialBackoff, NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import OutOfMemoryError
 from redis.exceptions import TimeoutError as RedisTimeoutError
+from redis.exceptions import WatchError
 
 import src.redis_client as redis_client
 from src.guild_state import (
@@ -2220,12 +2221,13 @@ class TestRecoveryLock:
         await store.acquire_recovery_lock()
         assert store._recovery_lock_token != first
 
-    async def test_release_does_not_delete_another_instances_lock(
+    async def test_release_does_not_delete_a_lock_another_acquirer_holds(
         self, store: GuildRedisStore, fake_redis: aioredis.Redis
     ) -> None:
-        """A acquires; A's lock expires mid-recovery; B acquires; A finishes and
-        releases. A must NOT delete B's lock — that would let C acquire while B is
-        still restoring, which is the double-restore the lock exists to prevent."""
+        """Attempt #1 acquires; its lease expires mid-recovery; #2 acquires; #1
+        finishes and releases. #1 must NOT delete #2's lock — that would let a #3
+        acquire while #2 is still restoring, which is the double restore the lock
+        exists to prevent. Both are restore_guild tasks, not separate processes."""
         store_a = store
         assert await store_a.acquire_recovery_lock() is True
 
@@ -2276,6 +2278,30 @@ class TestRecoveryLock:
         assert await store.acquire_recovery_lock() is True
         await fake_redis.delete(store._recovery_lock_key())  # TTL elapsed
         await store.release_recovery_lock()  # must not raise
+
+    async def test_release_leaves_the_key_when_exec_aborts(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """The compare passed but the key changed hands before EXEC, so the
+        transaction aborts and the delete never lands. Driven here by raising
+        WatchError directly: whether fakeredis invalidates a WATCH across
+        connections is not something to rely on — the real-server proof of this
+        path is in the redis tier."""
+        assert await store.acquire_recovery_lock() is True
+        token = store._recovery_lock_token
+        assert token is not None
+
+        real_pipeline = fake_redis.pipeline
+
+        def _aborting_pipeline(*args: Any, **kwargs: Any) -> Any:
+            pipe = real_pipeline(*args, **kwargs)
+            pipe.execute = AsyncMock(side_effect=WatchError("changed hands"))
+            return pipe
+
+        with patch.object(fake_redis, "pipeline", _aborting_pipeline):
+            await store.release_recovery_lock()  # must not raise
+
+        assert await fake_redis.get(store._recovery_lock_key()) == token.encode()
 
     async def test_release_swallows_redis_error(
         self, broken_store: GuildRedisStore

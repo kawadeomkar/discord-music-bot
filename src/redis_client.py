@@ -685,8 +685,8 @@ class GuildRedisStore:
         self.redis = redis
         self.guild_id = guild_id
         # Set by acquire_recovery_lock, consumed by release_recovery_lock — the
-        # acquire/release scope is one store instance, which is what _restore_guild
-        # builds. A release from a different instance finds None and declines.
+        # acquire/release scope is one store object, which is what restore_guild
+        # builds per attempt. A release from a different one finds None and declines.
         self._recovery_lock_token: Optional[str] = None
 
     # Key helpers
@@ -1364,7 +1364,7 @@ class GuildRedisStore:
         pipe.delete(self.now_playing_key())
         await pipe.execute()
 
-    # Recovery lock (distributed, for rolling-restart safety)
+    # Recovery lock — one restore_guild per guild at a time
 
     # Must outlast the guarded section: _restore_guild's voice connect is capped at
     # 30s TOTAL (one wait_for wraps discord.py's whole retry loop), plus a few Redis
@@ -1377,7 +1377,7 @@ class GuildRedisStore:
 
     @_guild_op(default=False)
     async def acquire_recovery_lock(self) -> bool:
-        """SET NX EX — True if this instance won the lock, False if another holds it.
+        """SET NX EX — True if this store won the lock, False if it is already held.
 
         The value is a per-acquisition random token, so the release below can prove
         the lock it deletes is still the one this store acquired.
@@ -1397,16 +1397,18 @@ class GuildRedisStore:
 
         A lock that can expire must never be deleted blind: a holder whose lock
         expired mid-recovery would DEL the lock its successor now owns, admitting a
-        third instance and the double-restore the lock exists to prevent.
+        third restore and the double-restore the lock exists to prevent.
 
         WATCH/MULTI, not a Lua CAS — EXEC aborts if the value changed after WATCH,
         and fakeredis has no Lua interpreter, so this path stays covered by real
         tests rather than mocks. Do not "simplify" it to EVAL.
+
+        The compare is against bytes: the pool is decode_responses=False.
         """
         token = self._recovery_lock_token
         if token is None:
-            # Never held it (or a different store instance acquired it) — deleting
-            # would be exactly the cross-instance delete this method exists to stop.
+            # Never held it (or a different store object acquired it) — deleting
+            # would be exactly the foreign-lock delete this method exists to stop.
             return
         self._recovery_lock_token = None
         key = self._recovery_lock_key()
