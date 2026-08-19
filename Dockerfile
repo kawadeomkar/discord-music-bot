@@ -114,7 +114,9 @@ RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
  && mkdir -p /home/app/.cache/yt-dlp \
  && chown -R app:app /home/app
-USER app
+# Numeric, not `app`: kubelet checks runAsNonRoot against the image's USER and
+# cannot resolve a name, failing the pod with "image has non-numeric user".
+USER 10001:10001
 
 ARG ENVIRONMENT=production
 # The commit this image was built from. GIT_SHA existed only as an image TAG, so a
@@ -135,10 +137,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # `restart: always` only covers the process exiting; a wedged event loop leaves
 # the container up while it answers nothing. The bot touches LIVENESS_FILE from a
 # loop-resident task, so a stale mtime means the loop stopped turning. Not a
-# dependency probe: a Redis blip must not restart the container.
+# dependency probe: a Redis blip must not mark the bot dead.
 #
-# start-period covers login and extension load. interval x retries gives a wedged
-# loop ~90s before a restart, above the 15s touch cadence.
+# This REPORTS, it does not act. The engine takes no action on an unhealthy
+# container — only Swarm, Kubernetes or an autoheal sidecar restarts one — so
+# under plain compose the effect is a status `docker ps` and monitoring can see.
+#
+# start-period covers login and extension load. interval x retries marks it
+# unhealthy after ~90s, above the 15s touch cadence.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
