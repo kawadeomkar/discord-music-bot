@@ -204,20 +204,18 @@ class MusicBotApp(commands.AutoShardedBot):
     async def _liveness_heartbeat(self) -> None:
         """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
 
-        Deliberately trivial and dependency-free: the question it answers is
-        "is the event loop still turning?", which `restart: always` cannot ask
-        (that only sees the process exit). A wedged loop stops touching the
-        file, its mtime goes stale, and the healthcheck fails. Checking Redis
-        or Discord here would turn a dependency blip into a container restart
-        loop, which is the opposite of useful.
+        Answers one question: is the event loop still turning. A wedged loop
+        stops touching the file and the healthcheck fails on the stale mtime.
+        Probing Redis or Discord here would restart the container on a
+        dependency blip, so this stays dependency-free.
         """
         path = Path(config.LIVENESS_FILE)
         while True:
             try:
                 path.touch()
             except OSError as e:
-                # An unwritable path must not kill the bot — degrade to "no
-                # liveness signal" and let the healthcheck fail loudly instead.
+                # An unwritable path degrades to no liveness signal; the
+                # healthcheck then fails on its own rather than the bot dying here.
                 log.warning(f"Liveness touch failed for {path}: {e}")
             await asyncio.sleep(config.LIVENESS_INTERVAL_SECS)
 
@@ -228,8 +226,7 @@ class MusicBotApp(commands.AutoShardedBot):
         # song. Startup is the only place the signal can be loud.
         archive_enabled = config.history_archive_enabled()
         # Ahead of the pool and the extensions so the file exists early in the
-        # HEALTHCHECK's start-period, but after the flag read above, which must
-        # stay the first thing this method does.
+        # HEALTHCHECK's start-period, and after the flag read, which stays first.
         if config.LIVENESS_FILE:
             self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
@@ -436,9 +433,9 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
-        # First, and getattr for the same reason as the rest: a close() from run()'s
-        # finally can land before __init__ finished. Cancelled here rather than left
-        # to the loop so a slow teardown stops reporting itself alive.
+        # getattr for the same reason as the rest: a close() from run()'s finally
+        # can land before __init__ finished. First in the sequence so a slow
+        # teardown stops reporting itself alive.
         liveness = getattr(self, "_liveness_task", None)
         if liveness is not None:
             liveness.cancel()

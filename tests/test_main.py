@@ -874,9 +874,9 @@ class TestOnReady:
 
 
 class TestLivenessHeartbeat:
-    """`restart: always` only sees the process EXIT. A bot whose event loop has
-    wedged stays "up" forever while answering nothing — a loop-resident touch
-    is what makes that visible to the container HEALTHCHECK."""
+    """`restart: always` only sees the process exit, so a wedged event loop
+    stays "up" while answering nothing. The touch is what makes that visible to
+    the container HEALTHCHECK."""
 
     async def test_touches_the_file_on_each_tick(
         self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
@@ -896,8 +896,8 @@ class TestLivenessHeartbeat:
     async def test_unwritable_path_does_not_kill_the_bot(
         self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Degrade to "no liveness signal" and let the healthcheck fail loudly,
-        rather than taking the process down over a touch."""
+        """An unwritable path degrades to no liveness signal; the healthcheck
+        fails on its own rather than the process dying over a touch."""
         monkeypatch.setattr(
             config, "LIVENESS_FILE", str(tmp_path / "nonexistent-dir" / "f")
         )
@@ -912,7 +912,7 @@ class TestLivenessHeartbeat:
     async def test_setup_hook_skips_the_task_when_unconfigured(
         self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Unset outside Docker — nothing reads the file there. Driven through
+        """Unset outside Docker; nothing reads the file there. Driven through
         the disabled arm so this stays a liveness test rather than a second
         assertion about the archive's Postgres requirement."""
         monkeypatch.setattr(config, "LIVENESS_FILE", "")

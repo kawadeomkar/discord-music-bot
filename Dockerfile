@@ -106,13 +106,10 @@ COPY pyproject.toml ./
 # never be different versions.
 COPY migrations/ ./migrations/
 
-# Non-root: nothing here needs privilege, ffmpeg and the venv both run fine
-# without it. The uid/gid are fixed rather than distro-assigned so volume
-# ownership survives rebuilds and base-image bumps.
-#
-# HOME is set explicitly below because yt-dlp derives its cache directory from
-# it, and docker-compose.yml mounts ytdlp-cache at that path — the two move
-# together or the cache lands somewhere this user cannot write.
+# Non-root: ffmpeg and the venv need no privilege. The uid/gid are fixed rather
+# than distro-assigned so volume ownership survives rebuilds and base-image bumps.
+# HOME is set below because yt-dlp derives its cache directory from it, and
+# docker-compose.yml mounts ytdlp-cache at that path.
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
  && mkdir -p /home/app/.cache/yt-dlp \
@@ -135,13 +132,13 @@ ENV PATH="/app/.venv/bin:$PATH" \
     GIT_SHA="${GIT_SHA}" \
     LIVENESS_FILE="/tmp/bot-alive"
 
-# `restart: always` only covers the process EXITING. A wedged event loop leaves
-# the container "up" while it answers nothing, so liveness is a file the bot
-# touches from a loop-resident task: a stale mtime means the loop stopped
-# turning. Not a dependency probe — a Redis blip must not restart the container.
+# `restart: always` only covers the process exiting; a wedged event loop leaves
+# the container up while it answers nothing. The bot touches LIVENESS_FILE from a
+# loop-resident task, so a stale mtime means the loop stopped turning. Not a
+# dependency probe: a Redis blip must not restart the container.
 #
-# start-period covers login + extension load; interval x retries gives a wedged
-# loop ~90s before a restart, well above the 15s touch cadence.
+# start-period covers login and extension load. interval x retries gives a wedged
+# loop ~90s before a restart, above the 15s touch cadence.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
