@@ -53,6 +53,28 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# The migration runner discovers .sql files at run time, and a test asserts the
+# directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
+# them present, not just the module.
+COPY migrations/ ./migrations/
+# Same reason, different file: `just outbox` hardcodes the outbox key and consumer
+# group because a shell recipe cannot import them, and a test reads this file back
+# to prove the two have not drifted. Without it that guard fails in the container
+# tier with FileNotFoundError while passing everywhere else — which is how a check
+# ends up skipped instead of fixed.
+COPY justfile ./
+# And the same again for the default-password coupling. The literal lives in four
+# places no Python import can reach — compose, the build preflight, the env
+# template and the generator — so the tests read those files to prove they have
+# not drifted, and setup_env.sh is executed against a temp copy to prove it
+# tightens .env's mode. All four have to be in the image or those guards are
+# container-tier failures rather than assertions.
+COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
+# The two deploy entry points, for the same reason once more: the archive's
+# opt-in is a shell parser (resolve_archive_profile) and an ordering — migrate,
+# then `up` — that only these files record, so the tests read them back. Absent,
+# those seven guards fail with FileNotFoundError in the container tier alone.
+COPY deploy_docker.sh build_docker.sh ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
@@ -79,16 +101,18 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/
 COPY pyproject.toml ./
+# Required by the compose `db-migrate` one-shot, which runs `python -m
+# src.db_migrate` out of THIS image so the runner and the schema it applies can
+# never be different versions.
+COPY migrations/ ./migrations/
 
-# Run as a non-root user. Nothing here needs privilege — ffmpeg and the venv
-# both run fine unprivileged — so root was pure blast radius. A fixed uid/gid
-# (not a distro-assigned one) keeps volume ownership stable across rebuilds and
-# base-image bumps.
+# Non-root: nothing here needs privilege, ffmpeg and the venv both run fine
+# without it. The uid/gid are fixed rather than distro-assigned so volume
+# ownership survives rebuilds and base-image bumps.
 #
-# HOME is set explicitly because yt-dlp derives its cache directory from it:
-# the cache lived at /root/.cache/yt-dlp, and without this the volume would
-# mount to a path the process can no longer write. docker-compose.yml mounts
-# the new path — the two must be changed together.
+# HOME is set explicitly below because yt-dlp derives its cache directory from
+# it, and docker-compose.yml mounts ytdlp-cache at that path — the two move
+# together or the cache lands somewhere this user cannot write.
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
  && mkdir -p /home/app/.cache/yt-dlp \
@@ -96,22 +120,28 @@ RUN groupadd --gid 10001 app \
 USER app
 
 ARG ENVIRONMENT=production
+# The commit this image was built from. GIT_SHA existed only as an image TAG, so a
+# running bot could not report its own commit — `just up <sha>` deploys by tag and
+# the process never saw it. Both forms are needed: the LABEL is the OCI-standard
+# annotation external tooling reads, but labels are invisible from inside the
+# container, so -debug reads the ENV. Dirty builds pass `<sha>-dirty.<digest>`
+# through unchanged, so the bot reports exactly the tag that was deployed.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
     HOME="/home/app" \
     ENVIRONMENT="${ENVIRONMENT}" \
+    GIT_SHA="${GIT_SHA}" \
     LIVENESS_FILE="/tmp/bot-alive"
 
-# `restart: always` only covers the process EXITING. A bot whose event loop has
-# wedged — a deadlock, a blocked call starving the loop — stays "up" forever
-# while answering nothing. The bot touches LIVENESS_FILE from a loop-resident
-# task, so a stale mtime means the loop stopped turning even though the process
-# is alive. Deliberately not a dependency probe: a Redis blip must not restart
-# the container (which is also why src/healthz.py stays a K8s-plan concern —
-# see src/ping.py's module docstring).
+# `restart: always` only covers the process EXITING. A wedged event loop leaves
+# the container "up" while it answers nothing, so liveness is a file the bot
+# touches from a loop-resident task: a stale mtime means the loop stopped
+# turning. Not a dependency probe — a Redis blip must not restart the container.
 #
-# start-period covers login + extension load; interval/retries give a wedged
-# loop ~90s before a restart, comfortably above the 15s touch cadence.
+# start-period covers login + extension load; interval x retries gives a wedged
+# loop ~90s before a restart, well above the 15s touch cadence.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 

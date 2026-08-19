@@ -5,6 +5,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into the image as an ENV so the running bot can report the commit
+        # it is on (-debug); the OCI label is invisible from inside a container.
+        # `unknown` rather than empty, exactly as build_common.sh's
+        # build_runtime_image defaults it — the TAG below falls back to `latest`
+        # instead, because a tag has to name something pullable.
+        GIT_SHA: ${GIT_SHA:-unknown}
     image: discord-music-bot:${GIT_SHA:-latest}
     restart: always
     # Linux-only: network_mode: host is a no-op on Docker Desktop for macOS and
@@ -17,34 +24,132 @@ services:
     - .env
     environment:
       - ENVIRONMENT
+      # Valueless on purpose, exactly like ENVIRONMENT above: an unset variable
+      # here leaves env_file's value intact, a set one wins. That is the same
+      # precedence resolve_archive_profile applies when deriving the compose
+      # profile, so the bot and the deployment can never disagree about the flag.
+      - HISTORY_ARCHIVE_ENABLED
       - OTEL_SERVICE_NAME=discord-music-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
       # Set OTEL_SDK_DISABLED=true in .env to disable tracing in local dev
+      #
+      # Where `-debug` reads the postgres CONTAINER's cpu/memory from: the bot
+      # cannot see another container's cgroup, and Postgres reports no OS metrics
+      # over SQL. The series come from otelcol-metrics' docker_stats receiver,
+      # which this stack's otelcol-metrics sidecar collects. localhost because the
+      # bot uses host networking; unset it and the row degrades to `n/a (no metrics
+      # source)` with nothing else affected.
+      #
+      # Interpolated, not a bare literal: a valued `environment:` entry beats both
+      # env_file and the process environment, so hardcoding it here would silently
+      # override the .env setting that .env.example tells operators to use when the
+      # metrics stack lives on another host.
+      - DEBUG_PROMETHEUS_URL=${DEBUG_PROMETHEUS_URL:-http://localhost:${PROMETHEUS_HOST_PORT:-9090}}
+      # Off by default; `true` starts every server with debug mode on. This is the
+      # default for servers that have NEVER run `-debug --enable`/`--disable` —
+      # that choice is per server, persisted to guild:{id}:config, and wins over
+      # this value across restarts.
+      - DEBUG_MODE
+      #
+      # Built from the same POSTGRES_* vars as the postgres service below, so
+      # the password lives in exactly one place (.env). Pointing at an EXTERNAL
+      # Postgres needs no edit here: POSTGRES_URL from .env (or the environment)
+      # wins, and the parts-built DSN is only the fallback. Editing this tracked
+      # line was the old instruction and it conflicted on every `git pull`.
+      #
+      # Interpolated EVEN when the archive is disabled: Compose interpolates
+      # the whole document before profile filtering, so the bot receives this
+      # DSN whether or not the `archive` profile deploys postgres behind it.
+      # The bot ignores it unless HISTORY_ARCHIVE_ENABLED=true and logs one
+      # INFO saying so — enablement is the flag, never URL presence.
+      #
+      # `${POSTGRES_PASSWORD:-password}` deliberately DOES default. This used to
+      # be Compose's mandatory `${VAR:?}` form, which failed `up` outright — a
+      # correct instinct that made the very first command in the README unusable
+      # until you had run a setup script, for a bot whose database is bound to
+      # loopback. The default trades that cliff for a credential nobody chose,
+      # and pays for it with noise rather than silence: the bot logs an ERROR at
+      # startup and renders a warning embed on every -ping for as long as the
+      # default is in use (src/config.using_default_postgres_password).
+      #
+      # That trade holds ONLY while the published port stays bound to 127.0.0.1
+      # (see the postgres service below). If you ever widen that binding, remove
+      # this fallback in the same change — a default credential on a
+      # network-reachable database is not a warning-level problem.
+      #
+      # The host port is a variable because the bot runs on the HOST network
+      # namespace, so it reaches Postgres through the published port rather
+      # than the compose network — and 5432 is exactly the port a
+      # already-installed local Postgres occupies. POSTGRES_HOST_PORT lets that
+      # developer move ours without editing tracked files.
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@127.0.0.1:${POSTGRES_HOST_PORT:-5432}/${POSTGRES_DB:-musicbot}}
     volumes:
       # yt-dlp's disk cache: player JS + EJS-solved sig/n challenges. Without it a
       # container restart re-pays the player fetch + challenge solve on the first song.
       # Path follows HOME for the non-root `app` user in the Dockerfile — the two
-      # must move together, and the old /root path is unwritable now.
+      # must move together.
+      #
+      # An existing ytdlp-cache volume is NOT re-owned by this: Docker seeds
+      # ownership only into an EMPTY volume, so one populated under the old root
+      # path stays root:root and uid 10001 cannot write it. Measured symptom is a
+      # yt-dlp `PermissionError: [Errno 13]` WARNING per store and nothing
+      # persisting — the challenge solve is re-paid every restart, no crash. The
+      # contents are a cache, so the fix is to discard it once:
+      #   docker compose down && docker volume rm discord-music-bot_ytdlp-cache
       - ytdlp-cache:/home/app/.cache/yt-dlp
     depends_on:
       redis:
         condition: service_healthy
+      # postgres / db-migrate are deliberately NOT here, and cannot be: both
+      # live behind the `archive` profile, and Compose rejects the ENTIRE
+      # project — even `docker compose config` — when an un-profiled service
+      # depends_on a profiled one while the profile is inactive. Re-adding
+      # either breaks token-only `docker compose up` outright; a
+      # compose-contract test in tests/test_config.py pins this. The
+      # dependency was never load-bearing for correctness anyway — the asyncpg
+      # pool is lazy and the drainer backs off with an actionable
+      # SchemaVersionError — so an enabled cold `up` merely opens with a brief
+      # burst of connection-refused/backoff logging while postgres and the
+      # migration one-shot come up. `just db-migrate` remains the way to see
+      # migration failures directly.
       # otel-lgtm is intentionally NOT in depends_on.
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
       # bgutil-pot-provider is intentionally NOT in depends_on either: the bot is
       # fully functional without it (web_safari degrades to token-less, android_vr
-      # is untouched — see docs/PO_TOKEN_SIDECAR_PLAN.md §3.3).
+      # is untouched).
 
   redis:
     image: redis:7-alpine
     container_name: discord-redis
     restart: always
-    # volatile-lru, NOT allkeys-lru: guild:{id}:history keys are persistent
-    # (no TTL — unbounded full-history retention, docs/HISTORY_OVERHAUL_PLAN.md
-    # §4) and must never be eviction candidates. Every cache key (ytdl:*,
-    # spotify:*) and the other guild:* keys carry TTLs, so volatile-lru
-    # preserves the existing cache-eviction behavior for them.
+    # volatile-lru, NOT allkeys-lru. Three kinds of key deliberately carry NO TTL
+    # and must never become eviction candidates:
+    #
+    #   history:outbox      plays written but not yet durable in Postgres.
+    #                       Evicting one loses that play silently — no error, no
+    #                       play_history_rejected row, no log line. It is
+    #                       normally near-empty and grows during a Postgres
+    #                       outage, i.e. when eviction pressure is highest.
+    #                       Written only while HISTORY_ARCHIVE_ENABLED; disabled,
+    #                       the key is never created, but the policy must still
+    #                       protect a leftover from an earlier enabled run.
+    #   guild:{id}:history  the per-guild display window, capped at 50 entries
+    #                       and PERSISTed. The ONLY source -history reads, so
+    #                       evicting one answers a guild with silence despite a
+    #                       full archive behind it. Bounded by length, never by
+    #                       time: ~24 KB per guild, permanently.
+    #   guild:{id}:config   a guild's DURABLE choices — debug mode, volume,
+    #                       timezone. Evicting one silently reverts a setting the
+    #                       guild chose, with no log line and no error, which is
+    #                       exactly the failure moving these out of the 24h-TTL
+    #                       state hash was meant to fix. A handful of fields per
+    #                       guild (~160 B), written only by an explicit command
+    #                       and deleted on guild removal, so it scales with guild
+    #                       count and not with runtime.
+    #
+    # Every cache key (ytdl:*, spotify:*) and the other guild:* keys carry TTLs,
+    # so volatile-lru preserves cache-eviction behavior for them.
     command: >
       redis-server
       --appendonly yes
@@ -61,9 +166,174 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    # Durable home of play history. OPT-IN: this service is in the model only
+    # while the `archive` profile is active, and build_common.sh's
+    # resolve_archive_profile derives that from HISTORY_ARCHIVE_ENABLED on every
+    # deploy path — one flag in .env is the whole opt-in.
+    #
+    # Compose never reads that flag (profiles activate only from
+    # COMPOSE_PROFILES or --profile), so a raw `docker compose up` deploys no
+    # Postgres. Naming the services or setting COMPOSE_PROFILES by hand still
+    # works. See docs/ARCHITECTURE.md#history-archive-tier.
+    profiles: ["archive"]
+    image: postgres:18-alpine
+    container_name: discord-postgres
+    restart: always
+    environment:
+      # Interpolated from the project .env at compose parse time (NOT env_file —
+      # that would spray the bot's other secrets into this container). The
+      # bot's POSTGRES_URL above is built from these same three values.
+      #
+      # The password FALLS BACK to a known default so `docker compose up` works
+      # with nothing configured but DISCORD_TOKEN. That is a first-run
+      # convenience and a liability afterwards, so the bot detects it and warns
+      # at startup and on every -ping (src/config.using_default_postgres_password).
+      # It is only defensible because the published port below is bound to
+      # 127.0.0.1; do not widen that binding without also removing this default.
+      - POSTGRES_USER=${POSTGRES_USER:-musicbot}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=${POSTGRES_DB:-musicbot}
+    ports:
+      # Loopback-bound, and the host side is overridable: the bot uses host
+      # networking, so it connects through this published port, and 5432 is the
+      # port a developer's own local Postgres already holds. Set
+      # POSTGRES_HOST_PORT in .env to move it — the bot's POSTGRES_URL above
+      # reads the same variable, so the two cannot drift.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # 18+ image layout: the declared volume moved to /var/lib/postgresql
+      # (PGDATA is version-specific beneath it). Mounting the old .../data
+      # path would silently store the cluster OUTSIDE the volume.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # $$ escapes compose interpolation so the container's own env expands at
+      # runtime — keeps the check correct if the user/db are customized in .env.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  db-migrate:
+    # One-shot schema migration for the opt-in archive — `archive` profile,
+    # same as postgres above: no archive, no schema to migrate.
+    #
+    # deploy_docker.sh runs this with `run --rm` before recreating the bot and
+    # gates on the exit status; this entry keeps `docker compose up` applying
+    # them too. Running twice is a no-op — versions are recorded in
+    # schema_migrations and skipped thereafter.
+    #
+    # The bot image, not a postgres client image: the runner is src/db_migrate.py
+    # and the migrations ship in that image, so there is exactly one definition
+    # of "what schema this build expects" and no way for a sidecar image to
+    # drift from it.
+    #
+    # `restart: "no"` is explicit and load-bearing — the default here would
+    # inherit nothing, but a copy-paste of `restart: always` from the services
+    # above would turn a successful one-shot into a crash loop of successful
+    # exits, and depends_on: service_completed_successfully would never settle.
+    profiles: ["archive"]
+    image: discord-music-bot:${GIT_SHA:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Not optional here: this service shares the bot's `image:` name, so a
+        # build without the arg retags that image from a GIT_SHA-less build and
+        # -debug reports `unknown` for a commit it knows.
+        GIT_SHA: ${GIT_SHA:-unknown}
+    container_name: discord-postgres-migrate
+    restart: "no"
+    command: ["python", "-m", "src.db_migrate"]
+    environment:
+      # Container networking here (not 127.0.0.1): unlike the bot, this service
+      # is on the compose network, so it addresses postgres by service name and
+      # is unaffected by POSTGRES_HOST_PORT.
+      #
+      # NOT `${POSTGRES_URL:-…}` like the bot's: .env holds the HOST-form DSN,
+      # and 127.0.0.1 inside this container is this container — the migration
+      # died with connection refused against a healthy database. The deploy
+      # passes a genuinely external DSN in instead
+      # (resolve_external_postgres_env, build_common.sh).
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  db-backfill:
+    # One-shot migration of pre-archive Redis history into Postgres, run BY HAND:
+    #
+    #   just db-backfill-docker --dry-run
+    #   just db-backfill-docker
+    #
+    # Without `just`, activate the archive profile explicitly — `depends_on:
+    # postgres` below is unresolvable without it (`no such service: postgres`):
+    #
+    #   COMPOSE_PROFILES=archive docker compose run --rm db-backfill --dry-run
+    #
+    # Exists because the justfile recipe needs a local venv, and the production
+    # host this README describes has only Docker — which left the one mandatory
+    # pre-deploy step impossible to run there. Every other db-* operation
+    # already has a container path (db-migrate is a service; db-rejects/backup/
+    # restore go through `docker compose exec postgres`).
+    #
+    # `profiles:` is what keeps it out of `docker compose up`. Unlike db-migrate
+    # this must NEVER run automatically: it is a once-per-deployment operator
+    # decision immediately before an irreversible step, not a startup task. A
+    # service without a profile would run on every `up` — harmless today because
+    # the insert is idempotent, but it would put a full keyspace walk on the
+    # startup path of every deploy.
+    #
+    # `ops`, deliberately NOT `archive`: `up` starts EVERY service of an active
+    # profile, so joining `archive` would run the backfill on every enabled
+    # `up` — the exact thing this comment forbids.
+    #
+    # `docker compose run` auto-activates only the TARGET's own profiles, so
+    # `ops` alone leaves this service's postgres dependency undefined. The
+    # recipe resolves `archive` from HISTORY_ARCHIVE_ENABLED and supplies it;
+    # with the archive disabled it refuses up front, because a backfill into a
+    # database that isn't deployed is meaningless.
+    profiles: ["ops"]
+    image: discord-music-bot:${GIT_SHA:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Same image name as the bot and db-migrate, so the same arg — see the
+        # db-migrate build above.
+        GIT_SHA: ${GIT_SHA:-unknown}
+    restart: "no"
+    # No `container_name`: `docker compose run` generates its own, and a fixed
+    # one makes a second invocation collide with the first's stopped container.
+    entrypoint: ["python", "-m", "src.backfill_history"]
+    environment:
+      # Both tiers by service name — same reasoning as db-migrate above. REDIS_URL
+      # matters more here than anywhere else: this is the only tool that treats
+      # Redis as the SOURCE, so pointing it at the wrong one reports "0 entries
+      # scanned" and exits 0, which reads as "nothing to migrate".
+      #
+      # `:-password` like every other service, and this one was MISSED when the
+      # default landed — it kept `:?`, and because Compose interpolates the whole
+      # document before profile filtering, an `ops`-profiled service broke every
+      # command in the file. `docker compose up` failed with only a
+      # DISCORD_TOKEN, which is the exact cliff the default exists to remove.
+      # A test now parses this file and asserts no POSTGRES_PASSWORD
+      # interpolation is mandatory, because nothing else in CI reads compose.
+      #
+      # Service name, not ${POSTGRES_URL:-…} — same loopback trap as db-migrate
+      # above; `just db-backfill-docker` supplies an external DSN when there is
+      # one.
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-musicbot}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-musicbot}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
   bgutil-pot-provider:
     # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
-    # client (docs/PO_TOKEN_SIDECAR_PLAN.md). Version must match the
+    # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
     # released in lockstep; bump both together.
     image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
@@ -83,17 +353,52 @@ services:
       retries: 3
 
   otel-lgtm:
-    image: grafana/otel-lgtm:latest
+    # Pinned (was :latest): the two grafana/ bind mounts below reach into
+    # image-internal paths (/otel-lgtm/grafana/conf/provisioning/...), so an
+    # unwatched image bump could move them out from under us. On every bump,
+    # re-verify the provisioning root and the four datasource UIDs
+    # (loki/prometheus/tempo/pyroscope) — docs/GRAFANA_DASHBOARD_PLAN.md has
+    # the check commands.
+    image: grafana/otel-lgtm:0.30.0
     container_name: discord-otel-lgtm
     restart: unless-stopped
     ports:
       - "127.0.0.1:3014:3000"    # Grafana UI (localhost only)
       - "127.0.0.1:4317:4317"    # OTLP gRPC receiver
       - "127.0.0.1:4318:4318"    # OTLP HTTP receiver
+      # Prometheus query API, for `-debug`'s Postgres container CPU/memory row. The
+      # bot runs with HOST networking, so a compose-internal address would not
+      # resolve for it — publishing here is what makes DEBUG_PROMETHEUS_URL reachable
+      # at all. Loopback-only like every other port here: this API is unauthenticated
+      # and exposes every metric the stack holds. The host side is a variable for the
+      # same reason POSTGRES_HOST_PORT is — 9090 is exactly the port an
+      # already-installed local Prometheus occupies, and a collision fails the whole
+      # `up`, not just this row. DEBUG_PROMETHEUS_URL above defaults to follow it.
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:
       - otel-grafana:/var/lib/grafana
-      - otel-tempo:/tmp/tempo
-      - otel-loki:/tmp/loki
+      # /data, not /tmp: same class of trap as the postgres 18 volume note
+      # below. This image's Tempo and Loki write under /data/tempo and
+      # /data/loki (see its tempo-config.yaml / loki-config.yaml); the old
+      # /tmp/* mount points were stale, so every container recreate silently
+      # destroyed all trace and log history while the volumes stayed empty.
+      # Discovered when a recreate during dashboard verification wiped Loki.
+      - otel-tempo:/data/tempo
+      - otel-loki:/data/loki
+      # Prometheus too (run-prometheus.sh: --storage.tsdb.path=/data/prometheus).
+      # It was the one store left off when the /tmp/* mounts were fixed, so every
+      # recreate wiped ALL span-metrics history while trace/log history survived —
+      # a dashboard full of "No data" stat panels next to healthy Loki panels.
+      - otel-prometheus:/data/prometheus
+      # Dashboard config-as-code. Both are SINGLE-FILE mounts on purpose:
+      # bind-mounting a directory over provisioning/dashboards/ (or
+      # datasources/) hides the image's own YAML there — Grafana comes up with
+      # no datasources / no stock dashboards and nothing says why. The JSON
+      # directory mounts OUTSIDE the provisioning tree; the provider file
+      # points at it and file-watches, so dashboard edits land without a
+      # container restart. See docs/GRAFANA_CONFIG_AS_CODE_PLAN.md.
+      - ./grafana/dashboards/discord-provider.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/discord-provider.yaml:ro
+      - ./grafana/dashboards/json:/var/lib/grafana/dashboards/discord:ro
     environment:
       # Dev credentials for a dev stack. Acceptable ONLY because this service is
       # not published beyond the host — anyone deploying otel-lgtm somewhere
@@ -101,14 +406,58 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      # curl, not wget: the 0.30.0 image (ubi9-micro base) ships no wget, so
+      # the old wget probe failed on every tick and the container sat
+      # permanently "unhealthy". Nothing depends_on this service, so the only
+      # symptom was a misleading status column.
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  otelcol-metrics:
+    # Metrics sidecar: docker_stats (per-container CPU/mem/net/IO) + redis
+    # server metrics, pushed as OTLP into otel-lgtm's collector — the bot
+    # itself exports traces and logs only, and otel-lgtm's embedded collector
+    # is a pure pass-through, so without this service Prometheus holds nothing
+    # but Tempo's span-derived metrics. Config: grafana/otelcol-metrics.yaml.
+    #
+    # Version matches the otelcol-contrib build inside grafana/otel-lgtm:0.30.0
+    # — not one of `just pins`' enforced pairs; check by hand when bumping
+    # either image (like the bgutil sidecar pair).
+    #
+    # OPT-IN (`metrics` profile), for the same reason the archive tier is: this
+    # mounts the docker socket, and `:ro` restricts the INODE, not the API — any
+    # process that can talk to that socket can create a privileged container and
+    # own the host. That is not a cost to add to every deploy silently, so it is a
+    # choice the operator makes. Without it the stack still runs; the dashboard's
+    # container panels and `-debug`'s postgres cpu/mem row read `n/a`.
+    #
+    # The hardening below is defence in depth, NOT the mitigation — nothing the
+    # container drops takes away what the socket grants. Keep this collector free
+    # of receivers that listen on the network: a pull-based receiver added to
+    # grafana/otelcol-metrics.yaml would turn a config edit into host root.
+    #
+    # NOT in the bot's depends_on, same reasoning as otel-lgtm: the OTLP
+    # exporter retries until the stack is up.
+    image: otel/opentelemetry-collector-contrib:0.157.0
+    container_name: discord-otelcol-metrics
+    profiles: ["metrics"]
+    restart: unless-stopped
+    user: "0"
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    command: ["--config", "/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./grafana/otelcol-metrics.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
 volumes:
   redis-data:
+  postgres-data:
   ytdlp-cache:
   otel-grafana:
   otel-tempo:
   otel-loki:
+  otel-prometheus:
