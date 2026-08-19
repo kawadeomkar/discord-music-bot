@@ -41,8 +41,36 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-intents = discord.Intents.all()
-intents.message_content = True
+
+def _build_intents() -> discord.Intents:
+    """The gateway events this bot subscribes to.
+
+    `presences` is deliberately absent: it is privileged — which blocks bot
+    verification past 100 guilds — and nothing here reads a presence update.
+    `change_presence()` SENDS our own and needs no intent for it.
+    """
+    intents = discord.Intents.none()
+    # Guild/channel/voice-client cache. Everything else assumes it.
+    intents.guilds = True
+    # on_voice_state_update, plus the VoiceChannel.members behind the
+    # alone-in-channel disconnect timer.
+    intents.voice_states = True
+    # Prefix commands dispatch from on_message, so the events have to arrive at
+    # all — message_content alone does not deliver them.
+    intents.guild_messages = True
+    # -help renders in a DM and -debug answers one; both are pinned by tests.
+    intents.dm_messages = True
+    # Privileged. Without it every message arrives with empty content and no
+    # command ever matches.
+    intents.message_content = True
+    # Privileged. guild.get_member() rehydrates a queue entry's requester and
+    # backs VoiceChannel.members; the event-driven cache alone goes patchy
+    # across a restart.
+    intents.members = True
+    return intents
+
+
+intents = _build_intents()
 EXTENSIONS = ("src.musicbot",)
 
 
