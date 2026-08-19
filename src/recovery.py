@@ -48,13 +48,14 @@ async def restore_guild(cog: "MusicBot", guild: discord.Guild) -> None:
     store = GuildRedisStore(cog.redis, guild.id)
 
     trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
-    # Distributed lock so two bot instances can't race on the same guild.
-    # Acquired inside the span so the SET NX EX is a child span.
+    # One restore per guild at a time. on_ready re-fires on any reconnect that
+    # fails to RESUME, and the mps check above cannot cover that window because
+    # mps[guild.id] is set only after the connect below. Acquired inside the span
+    # so the SET NX EX is a child span.
+    # See docs/ARCHITECTURE.md#distributed-recovery-lock
     if not await store.acquire_recovery_lock():
         trace.get_current_span().set_attribute("restore.skipped_lock", True)
-        log.info(
-            f"Recovery lock held by another instance for guild {guild.id}, skipping"
-        )
+        log.info(f"Recovery already in progress for guild {guild.id}, skipping")
         return
     try:
         # One pipelined read serves both gates below: connection (state hash) and

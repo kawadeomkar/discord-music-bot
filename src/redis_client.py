@@ -1366,11 +1366,11 @@ class GuildRedisStore:
 
     # Recovery lock (distributed, for rolling-restart safety)
 
-    # Sized against the critical section, not a round trip: _restore_guild does a
-    # 30s voice connect plus channel notifications and several Redis reads. Long
-    # enough to outlast that, short enough that an instance dying while it holds
-    # the lock does not block that guild's recovery for long.
-    _RECOVERY_LOCK_TTL = 180  # seconds
+    # Must outlast the guarded section: _restore_guild's voice connect is capped at
+    # 30s TOTAL (one wait_for wraps discord.py's whole retry loop), plus a few Redis
+    # reads. Expiry is safe — release compares before deleting — so the only cost of
+    # an early one is duplicate work, against a dead holder blocking recovery this long.
+    _RECOVERY_LOCK_TTL = 60  # seconds
 
     def _recovery_lock_key(self) -> str:
         return f"lock:guild:{self.guild_id}:recovery"
