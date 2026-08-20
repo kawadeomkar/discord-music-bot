@@ -102,9 +102,9 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    failing. The compose legs are anchored to the named service, not `head -1`, so a
    second postgres or redis service cannot silently shift what is compared.
    The eighth is the **yt-dlp version** (pyproject) ↔ the copies quoted in prose by
-   `CLAUDE.md` and `docs/ARCHITECTURE.md`: those docs describe the client strategy for a
-   specific version, Dependabot can move pyproject + `poetry.lock` in a PR touching
-   neither, and main already carried a stale `2026.7.4` in both for exactly that reason.
+   `CLAUDE.md` and `docs/ARCHITECTURE.md`, which describe the client strategy for a
+   specific version: Dependabot moves pyproject + `poetry.lock` without touching either,
+   and main has carried a stale copy for exactly that reason.
    **Three pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
@@ -412,16 +412,14 @@ code in the repo. Its bookkeeping invariants:
   an error alone also describes a mid-song death that earned its history entry. A dead
   stream drops the cached URL (`_handle_dead_stream`) and notifies the channel.
   discord.py **does** report a failing ffmpeg — `FFmpegOpusAudio.read()` calls
-  `_check_process_returncode()` on an empty packet, which sets `FFmpegProcessError`,
-  which `AudioPlayer` forwards to `after` (measured: 40 of 40 refused connections). So
-  `stream_failed` is the main path and `_handle_dead_stream` owns it. The one window
-  that check declines to judge is `poll()` returning None — a child that closed stdout
-  but has not been reaped — and `_drop_unplayable_stream_cache` is the backstop for
-  exactly that, guarded by `note_deliberate_stop()` (a stop we initiate ends the player
-  thread without another `read()`, so it also arrives as `error=None`) and by
-  `start_paused` (a parked song torn down before it played). Cache only, on purpose: a
-  false positive costs one re-extraction, while widening `stream_failed` on the same
-  evidence would eat a real history entry.
+  `_check_process_returncode()` on an empty packet, which reaches `after` as
+  `FFmpegProcessError`. So `stream_failed` is the main path and `_handle_dead_stream`
+  owns it. The one window that check declines to judge is `poll()` returning None — a
+  child that closed stdout but has not been reaped — and `_drop_unplayable_stream_cache`
+  is the backstop for it, guarded by `note_deliberate_stop()` (a stop we initiate ends
+  the player thread without another `read()`, so it also arrives as `error=None`) and by
+  `start_paused`. Cache only: a false positive costs one re-extraction, while widening
+  `stream_failed` would eat a real history entry.
 - Idle disconnect: `queue_get` times out at 300s; the playback gate itself times out at
   300s (a player built by a command that never connects must not leak forever) — unless
   a `defer_playback` hold is outstanding, which means a command is mid-join.
@@ -758,8 +756,7 @@ own exceptions carry live tracebacks and can't cross), successes `_slim_info`'d
 
 **Client strategy** (comment block above `_EXTRACTOR_ARGS` in youtube.py):
 the config names **no client** — it passes `default`, yt-dlp's own list, which is
-`visionos,web` today (README: "By default, `visionos,web` is used") and was
-`android_vr`-led before. Tracking upstream's default IS the strategy: yt-dlp moves it
+`visionos,web` today and was `android_vr`-led before. Tracking upstream's default IS the strategy: yt-dlp moves it
 when YouTube breaks a client. Any client name in these docs is a record of what
 `default` resolved to at the time — **re-verify on every yt-dlp bump**. `visionos`
 carries playback (no PO token, no JS player, audio-only 251/opus over https); `web` is
@@ -767,8 +764,7 @@ the fallback, and both extras exist to keep it usable — yt-dlp DROPS `web` fro
 `default` when no JS runtime is present, so Deno (`deno` extra) + yt-dlp-ejs (`default`
 extra) is what keeps a fallback at all, and the **bgutil PO-token sidecar** (compose
 service on :4416, plugin pin hand-checked in lockstep — NOT covered by `just pins`, see
-rule 6a) mints the GVS token `web`'s formats need. Measured: `web` alone often resolves
-no usable format without that token, so `visionos` is load-bearing in practice. Format ladder
+rule 6a) mints the GVS token `web`'s formats need. Format ladder
 `bestaudio/best[height<=360]/best` — the 360p cap matters: on the muxed fallback rung,
 plain `best` would stream ~120 MB of 1080p video per song just for ffmpeg's `-vn` to
 discard. `_record_serving_format` warns once per format_id when serves degrade to
@@ -783,20 +779,16 @@ its cache entry invalidated. The probe is **tri-state** (`StreamProbe`), and the
 value is load-bearing: a probe that never completed is `UNCONFIRMED`, not `DEAD` and not
 `PLAYABLE`. Read as `DEAD` it would fail songs over a blocked probe; read as `PLAYABLE`
 the URL gets **cached**, which is how one unreachable CDN edge made a single song
-unplayable for a full 30-minute TTL — every replay hit the same entry, timed out
-identically, and never reached the `DEAD`-gated re-extract. So an unconfirmed URL still plays
-(ffmpeg judges it) and is cached for `_UNCONFIRMED_STREAM_TTL` (120s) rather than the
-usual ceiling — refusing to cache it at all stopped the cache repopulating for as long as
-probes kept failing, which multiplied extraction load against YouTube. An unconfirmed
-**cached** URL is dropped and re-extracted for a freshly signed one — measured, that
-lands on the SAME edge and format, so it cures an early revocation and not an
-unreachable edge — but that drop is FREE (never charged against
-`_MAX_STREAM_EXTRACTIONS`, which is **1** for the same measurement's sake: a second
-identical mint varies neither edge, format, client nor IP, so it only doubled
-time-to-error while the bot was already failing), is suppressed once
+unplayable for a full 30-minute TTL. So an unconfirmed URL still plays (ffmpeg judges
+it) and is cached for `_UNCONFIRMED_STREAM_TTL` (120s) — probe failures are
+process-wide, so declining the write would stop anything repopulating the cache. An
+unconfirmed **cached** URL is dropped and re-extracted for a freshly signed one, which
+lands on the same edge and format and so cures an early revocation; that drop is FREE
+(never charged against `_MAX_STREAM_EXTRACTIONS`, which is **1**), is suppressed once
 `probe_path_looks_broken()` says the probe rather than the URL is at fault, and is
 declined by the background prefetch (`allow_reextract=False`), whose cancellation every
 bulk mutation waits on. HTTP 429/5xx are UNCONFIRMED, not DEAD.
+See `docs/ARCHITECTURE.md#yt-dlp-client-strategy` for the measurements behind both.
 `_stream_url_ttl` reads `expire` from both query-string
 (https formats) and path-segment (`/expire/<epoch>/`, HLS) forms, then caps at 30min.
 
@@ -1149,9 +1141,8 @@ and run `just test-redis` — the unit tier cannot see three of these.
 compose image tag in the same commit. The pin is currently a **nightly** (`.dev0`,
 `allow-prereleases = true`) because the newest stable, 2026.7.4, 403s on the media fetch
 for nearly every video under YouTube's current GVS enforcement — extraction succeeds, so
-the client ladder never degrades and the song dies at ffmpeg with the stream refused
-(measured 6 of 7 videos failing on 2026.7.4, 7 of 7 fetching on the nightly, same host
-and extractor args). **Check for a stable newer than 2026.7.4 before assuming a nightly
+the client ladder never degrades and the song dies at ffmpeg with the stream refused.
+**Check for a stable newer than 2026.7.4 before assuming a nightly
 is still required**, and move back to one when it ships — `security.yml`'s weekly
 `ytdlp-stable-watch` job warns when PyPI has one, since nothing else notices a nightly
 quietly becoming permanent. **Rolling the image back reinstates the broken stable**: the
