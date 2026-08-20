@@ -1,5 +1,5 @@
 [tool.poetry]
-version = "2.25.5"
+version = "2.26.0"
 requires-poetry = '>=2.0'
 
 packages = [
@@ -16,8 +16,15 @@ pynacl = "1.6.2"
 davey = "^0.1.5"
 # `default` brings yt-dlp-ejs (JS challenge solver scripts, exact-pinned by yt-dlp);
 # `deno` brings the Deno binary as a PyPI wheel, discovered via the venv scripts dir —
-# together they make web_safari a working fallback client behind android_vr.
-yt-dlp = { version = "2026.7.4", extras = ["default", "deno"] }
+# together they keep yt-dlp's fallback client usable: it drops `web` from `default`
+# without a JS runtime, and that client's formats need the bgutil PO token.
+#
+# A NIGHTLY (.dev0), deliberately — the only pin here that is not a stable release.
+# 2026.7.4 is the newest stable and 403s on the media fetch for nearly every video
+# under YouTube's current GVS enforcement. Move back to a stable pin as soon as one
+# ships newer than 2026.7.4.
+# allow-prereleases is what makes the .dev0 resolvable.
+yt-dlp = { version = "2026.8.18.122307.dev0", extras = ["default", "deno"], allow-prereleases = true }
 # Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in
 # docker-compose.yml are released in lockstep — bump both together.
 bgutil-ytdlp-pot-provider = "1.3.1"

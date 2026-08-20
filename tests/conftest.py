@@ -66,6 +66,21 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def reset_probe_streak() -> Iterator[None]:
+    """Zero the process-wide unconfirmed-probe streak between tests.
+
+    The streak is deliberately module-global (the condition it detects is
+    process-wide), so without this one test's unconfirmed probes change how the NEXT
+    test's cached URL is handled — order-dependent and silent.
+    """
+    import src.youtube as youtube
+
+    youtube._unconfirmed_streak = 0
+    yield
+    youtube._unconfirmed_streak = 0
+
+
+@pytest.fixture(autouse=True)
 def use_thread_ytdlp_pool(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Run yt-dlp extraction on an in-process ThreadPoolExecutor.
 

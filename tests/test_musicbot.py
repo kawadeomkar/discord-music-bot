@@ -1561,6 +1561,51 @@ class TestSkipCommand:
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
         vc.stop.assert_called_once()
 
+    async def test_marks_the_stop_as_deliberate_before_stopping(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """A skip inside ffmpeg's startup window is byte for byte what a stream whose
+        host never answered looks like; without the marker the player drops the cached
+        URL of a perfectly good song. Marked BEFORE vc.stop(), which fires `after`
+        immediately."""
+        order: list[str] = []
+        # spec'd: a bare MagicMock invents note_deliberate_stop, so renaming the real
+        # method would leave this green while -skip silently stopped marking.
+        mp = MagicMock(spec=MusicPlayer)
+        mp.note_deliberate_stop = MagicMock(side_effect=lambda: order.append("mark"))
+        music_bot.mps[mock_ctx.guild.id] = mp
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock(side_effect=lambda: order.append("stop"))
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        assert order == ["mark", "stop"]
+
+    async def test_skip_without_a_player_still_stops(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """Read from mps, never get_mp(): constructing a player here would start a
+        playback loop as a side effect of stopping a song."""
+        music_bot.mps.pop(mock_ctx.guild.id, None)
+        vc = object.__new__(discord.VoiceClient)
+        vc.is_playing = MagicMock(return_value=True)
+        vc.is_paused = MagicMock(return_value=False)
+        vc.stop = MagicMock()
+        mock_ctx.invoked_parents = []
+        mock_ctx.voice_client = vc
+        mock_ctx.message.add_reaction = AsyncMock()
+
+        await command_callback(MusicBot.skip)(music_bot, mock_ctx)
+
+        vc.stop.assert_called_once()
+        assert mock_ctx.guild.id not in music_bot.mps
+
     async def test_playing_skip_sends_no_notice(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
@@ -1623,9 +1668,11 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        # Registered, not patched onto get_mp: skip reads the player it already has
+        # and must never construct one.
+        music_bot.mps[mock_ctx.guild.id] = mp
 
         await command_callback(MusicBot.skip)(music_bot, mock_ctx)
 
@@ -1709,9 +1756,9 @@ class TestSkipCommand:
         mock_ctx.voice_client = vc
         mock_ctx.message.add_reaction = AsyncMock()
 
-        mp = MagicMock()
+        mp = MagicMock(spec=MusicPlayer)
         mp.current_song = MagicMock(title="Paused Song", position_secs=83.4)
-        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.mps[mock_ctx.guild.id] = mp
         # Simulate the playback loop racing ahead the instant we stop.
         vc.stop = MagicMock(side_effect=lambda: setattr(mp, "current_song", None))
 
