@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import discord
@@ -189,6 +190,7 @@ class MusicBotApp(commands.AutoShardedBot):
         )
         self._redis_pool = None
         self.redis = None
+        self._liveness_task: Optional[asyncio.Task] = None
         # Postgres play-history archive + its outbox drainer, built in setup_hook while
         # HISTORY_ARCHIVE_ENABLED (the opt-in consent gate for long-term storage). None
         # is the disabled shape — the default — and every consumer handles it:
@@ -199,12 +201,34 @@ class MusicBotApp(commands.AutoShardedBot):
         # discord.py or a signal handler calls close().
         self._teardown_started = False
 
+    async def _liveness_heartbeat(self) -> None:
+        """Touch LIVENESS_FILE on a fixed cadence for the container HEALTHCHECK.
+
+        Answers one question: is the event loop still turning. A wedged loop
+        stops touching the file and the healthcheck fails on the stale mtime.
+        Probing Redis or Discord here would report the bot dead over a
+        dependency blip, so this stays dependency-free.
+        """
+        path = Path(config.LIVENESS_FILE)
+        while True:
+            try:
+                path.touch()
+            except OSError as e:
+                # An unwritable path degrades to no liveness signal; the
+                # healthcheck then fails on its own rather than the bot dying here.
+                log.warning(f"Liveness touch failed for {path}: {e}")
+            await asyncio.sleep(config.LIVENESS_INTERVAL_SECS)
+
     async def setup_hook(self) -> None:
         # The archive flag is read first, before anything else can consume it: the
         # parser raises on garbage and the next reader would be push_history, which is
         # @_guild_op-wrapped and would swallow that ValueError into one warning per
         # song. Startup is the only place the signal can be loud.
         archive_enabled = config.history_archive_enabled()
+        # Ahead of the pool and the extensions so the file exists early in the
+        # HEALTHCHECK's start-period, and after the flag read, which stays first.
+        if config.LIVENESS_FILE:
+            self._liveness_task = asyncio.create_task(self._liveness_heartbeat())
         self._redis_pool = create_redis_pool()
         self.redis = get_redis(self._redis_pool)
         if archive_enabled:
@@ -409,6 +433,13 @@ class MusicBotApp(commands.AutoShardedBot):
             await super().close()
             return
         self._teardown_started = True
+        # getattr for the same reason as the rest: a close() from run()'s finally
+        # can land before __init__ finished. First in the sequence so a slow
+        # teardown stops reporting itself alive.
+        liveness = getattr(self, "_liveness_task", None)
+        if liveness is not None:
+            liveness.cancel()
+            self._liveness_task = None
         # Two ordering constraints, on different pairs, so they compose:
         #   drainer before archive and Redis — its final drain reads the outbox and
         #     writes Postgres, so both have to still be alive for it.

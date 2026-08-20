@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Iterator
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import discord
@@ -13,6 +13,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
+from src import config
 from src.main import EXTENSIONS, MusicBotApp, intents
 from src.musicbot import MusicBot
 from src.redis_client import HISTORY_OUTBOX_KEY
@@ -25,9 +26,10 @@ def app() -> MusicBotApp:
     instance = MusicBotApp.__new__(MusicBotApp)
     instance._redis_pool = None
     instance.redis = None
-    # history_archive / history_drainer are deliberately left UNSET: __new__
-    # bypasses __init__ and setup_hook is what assigns them, so unset is exactly
-    # the pre-setup_hook state close()'s getattr guard exists to survive.
+    # history_archive / history_drainer / _liveness_task are deliberately left
+    # UNSET: __new__ bypasses __init__ and setup_hook is what assigns them, so
+    # unset is exactly the pre-setup_hook state close()'s getattr guard exists
+    # to survive.
     # BotBase stores cogs in a name-mangled private dict; initialize it so the
     # property works. Set via setattr: the mangled name is deliberately not part
     # of BotBase's declared surface, so it is invisible to the type checker.
@@ -869,6 +871,76 @@ class TestOnReady:
         await app.on_ready()
         call_kwargs = mocked(app.change_presence).call_args[1]
         assert call_kwargs["status"] == discord.Status.online
+
+
+class TestLivenessHeartbeat:
+    """`restart: always` only sees the process exit, so a wedged event loop
+    stays "up" while answering nothing. The touch is what makes that visible to
+    the container HEALTHCHECK."""
+
+    async def test_touches_the_file_on_each_tick(
+        self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "bot-alive"
+        monkeypatch.setattr(config, "LIVENESS_FILE", str(target))
+
+        async def _sleep(_s: Any) -> None:
+            raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await app._liveness_heartbeat()
+
+        assert target.exists()
+
+    async def test_unwritable_path_does_not_kill_the_bot(
+        self, app: MusicBotApp, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unwritable path degrades to no liveness signal; the healthcheck
+        fails on its own rather than the process dying over a touch."""
+        monkeypatch.setattr(
+            config, "LIVENESS_FILE", str(tmp_path / "nonexistent-dir" / "f")
+        )
+
+        async def _sleep(_s: Any) -> None:
+            raise asyncio.CancelledError()
+
+        with patch("asyncio.sleep", new=_sleep):
+            with pytest.raises(asyncio.CancelledError):
+                await app._liveness_heartbeat()  # must not raise OSError
+
+    async def test_setup_hook_skips_the_task_when_unconfigured(
+        self, app: MusicBotApp, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset outside Docker; nothing reads the file there. Driven through
+        the disabled arm so this stays a liveness test rather than a second
+        assertion about the archive's Postgres requirement."""
+        monkeypatch.setattr(config, "LIVENESS_FILE", "")
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        with (
+            patch("src.main.create_redis_pool", return_value=MagicMock()),
+            patch("src.main.get_redis", return_value=MagicMock()),
+            patch("src.main.outbox_depth", new=AsyncMock(return_value=0)),
+            patch.object(app, "load_extension", new=AsyncMock()),
+        ):
+            await app.setup_hook()
+        assert getattr(app, "_liveness_task", None) is None
+
+    async def test_close_cancels_the_task(self, app: MusicBotApp) -> None:
+        async def _forever() -> None:
+            await asyncio.sleep(3600)
+
+        task = asyncio.create_task(_forever())
+        app._liveness_task = task
+        app._redis_pool = None
+        with (
+            patch("src.telemetry.shutdown_telemetry"),
+            patch.object(commands.AutoShardedBot, "close", new=AsyncMock()),
+        ):
+            await app.close()
+        assert task.cancelled() or task.cancelling()
+        assert app._liveness_task is None
 
 
 class TestIntents:
