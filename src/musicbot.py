@@ -1377,13 +1377,23 @@ class MusicBot(commands.Cog):
             # Primitives, not the object — the player thread calls cleanup() on it.
             skipped_title: Optional[str] = None
             skipped_position = ""
-            if vc.is_paused():
-                song = self.get_mp(ctx).current_song
+            assert ctx.guild is not None  # validate_commands rejects DMs before this
+            # One lookup for both uses. mps, not get_mp(): this must not build a
+            # player, and taking it once keeps the mark and the paused read on the
+            # same object — cog_before_invoke can rebuild a player mid-command, so a
+            # second lookup can return one that never played this song.
+            mp_for_stop = self.mps.get(ctx.guild.id)
+            if vc.is_paused() and mp_for_stop is not None:
+                song = mp_for_stop.current_song
                 if song is not None:
                     skipped_title = song.title
                     # position_secs is frozen while paused: the exact leave point.
                     skipped_position = fmt_duration(int(song.position_secs))
 
+            # Before vc.stop(): a skip inside ffmpeg's startup window otherwise looks
+            # exactly like a stream that never opened.
+            if mp_for_stop is not None:
+                mp_for_stop.note_deliberate_stop()
             vc.stop()
 
             coros: list[Coroutine[Any, Any, Any]] = []

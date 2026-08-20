@@ -411,6 +411,17 @@ code in the repo. Its bookkeeping invariants:
   play_error[0] is not None` — zero frames alone also describes a paused-parked song;
   an error alone also describes a mid-song death that earned its history entry. A dead
   stream drops the cached URL (`_handle_dead_stream`) and notifies the channel.
+  discord.py **does** report a failing ffmpeg — `FFmpegOpusAudio.read()` calls
+  `_check_process_returncode()` on an empty packet, which sets `FFmpegProcessError`,
+  which `AudioPlayer` forwards to `after` (measured: 40 of 40 refused connections). So
+  `stream_failed` is the main path and `_handle_dead_stream` owns it. The one window
+  that check declines to judge is `poll()` returning None — a child that closed stdout
+  but has not been reaped — and `_drop_unplayable_stream_cache` is the backstop for
+  exactly that, guarded by `note_deliberate_stop()` (a stop we initiate ends the player
+  thread without another `read()`, so it also arrives as `error=None`) and by
+  `start_paused` (a parked song torn down before it played). Cache only, on purpose: a
+  false positive costs one re-extraction, while widening `stream_failed` on the same
+  evidence would eat a real history entry.
 - Idle disconnect: `queue_get` times out at 300s; the playback gate itself times out at
   300s (a player built by a command that never connects must not leak forever) — unless
   a `defer_playback` hold is outstanding, which means a command is mid-join.
