@@ -1929,7 +1929,9 @@ class MusicPlayer:
             )
         return source
 
-    async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
+    async def _stream_source(
+        self, source: QueueObject, *, allow_reextract: bool = True
+    ) -> Optional[YTDL]:
         self._last_stream_error = None
         try:
             return await YTDL.yt_stream(
@@ -1937,6 +1939,7 @@ class MusicPlayer:
                 self._channel,
                 volume=self.volume,
                 redis=self.store.redis if self.store is not None else None,
+                allow_reextract=allow_reextract,
             )
         except Exception as e:
             ctx = trace.get_current_span().get_span_context()
@@ -2181,7 +2184,10 @@ class MusicPlayer:
         trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
         try:
             source = await self._resolve_source(source)
-            song = await self._stream_source(source)
+            # No re-extraction here: _cancel_prefetch() awaits this task, and an
+            # executor job cannot be interrupted, so every bulk mutation would wait
+            # on it. The play-time resolve decides instead.
+            song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
             self.queue.requeue_front(source)
             raise

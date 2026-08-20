@@ -768,7 +768,25 @@ designed so every rung lands on a previously-working configuration.
 way — ffmpeg 403s and exits, discord.py reports "song finished", silence. So every URL
 is probed pre-play; a revoked cached URL is dropped and re-extracted once; a URL revoked
 in the seconds between probe and first read is caught post-hoc by `produced_audio` and
-its cache entry invalidated. `_stream_url_ttl` reads `expire` from both query-string
+its cache entry invalidated. The probe is **tri-state** (`StreamProbe`), and the third
+value is load-bearing: a probe that never completed is `UNCONFIRMED`, not `DEAD` and not
+`PLAYABLE`. Read as `DEAD` it would fail songs over a blocked probe; read as `PLAYABLE`
+the URL gets **cached**, which is how one unreachable CDN edge made a single song
+unplayable for a full 30-minute TTL — every replay hit the same entry, timed out
+identically, and never reached the `DEAD`-gated re-extract. So an unconfirmed URL still plays
+(ffmpeg judges it) and is cached for `_UNCONFIRMED_STREAM_TTL` (120s) rather than the
+usual ceiling — refusing to cache it at all stopped the cache repopulating for as long as
+probes kept failing, which multiplied extraction load against YouTube. An unconfirmed
+**cached** URL is dropped and re-extracted for a freshly signed one — measured, that
+lands on the SAME edge and format, so it cures an early revocation and not an
+unreachable edge — but that drop is FREE (never charged against
+`_MAX_STREAM_EXTRACTIONS`, which is **1** for the same measurement's sake: a second
+identical mint varies neither edge, format, client nor IP, so it only doubled
+time-to-error while the bot was already failing), is suppressed once
+`probe_path_looks_broken()` says the probe rather than the URL is at fault, and is
+declined by the background prefetch (`allow_reextract=False`), whose cancellation every
+bulk mutation waits on. HTTP 429/5xx are UNCONFIRMED, not DEAD.
+`_stream_url_ttl` reads `expire` from both query-string
 (https formats) and path-segment (`/expire/<epoch>/`, HLS) forms, then caps at 30min.
 
 **FFmpeg**: `YTDL(discord.FFmpegOpusAudio)` with
@@ -989,6 +1007,7 @@ duplicated.
 | `GIT_SHA` | — | the deploy tag, baked into the runtime image as an `ENV` (and a label). The ENV is the one the process can read, which is what lets `-debug` report the commit it is running; outside a container `-debug` shells out to `git rev-parse` instead |
 | `POT_PROVIDER_URL` | `http://127.0.0.1:4416` | bgutil PO-token sidecar base URL |
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
+| `STREAM_PROBE_TIMEOUT_SECS` | `2.0` | Cap on the pre-playback stream-URL probe. Short because a single resolve can pay it twice and exceeding it now costs a **cache entry**, not just a verdict — an unconfirmed URL still plays, so firing early is cheap. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
 | `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (the Postgres probe brackets a 2s sampling window between two stats queries, plus a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried — keep the deadline comfortably above that ~2.2s floor. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
