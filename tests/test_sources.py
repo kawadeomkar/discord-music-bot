@@ -2,16 +2,24 @@
 
 import pytest
 
+from src.guild_state import Analytics
 from src.sources import (
+    unquote_argument,
+    QUERY_SOURCE_SEARCH,
+    QUERY_SOURCE_SOUNDCLOUD,
+    QUERY_SOURCE_SPOTIFY,
+    QUERY_SOURCE_YOUTUBE,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
     URLSource,
     YTSource,
     YTType,
+    normalize_query_host,
     parse_input,
     parse_timestamp,
     parse_url,
+    query_source_of,
     spotify_playlist_to_ytsearch,
 )
 
@@ -134,6 +142,47 @@ class TestParseUrlYouTube:
         assert result.type == YTType.PLAYLIST
         assert result.list_id == "PLtest"
         assert result.ts == 30
+
+
+class TestParseUrlPlaylistIndex:
+    """`index=` is YouTube's 1-based position of the video the link was copied
+    at. Parsed only on the playlist branch and never allowed to raise — a
+    ValueError out of parse_url means "not a URL" and searches for the link text.
+    """
+
+    def test_index_is_parsed_from_a_watch_url(self) -> None:
+        url = "https://www.youtube.com/watch?v=abc&list=PLtest&index=4"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.index == 4
+        assert result.video_id == "abc"
+
+    def test_index_is_none_when_absent(self) -> None:
+        url = "https://www.youtube.com/playlist?list=PLtest"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.index is None
+        assert result.video_id is None
+
+    def test_index_is_not_carried_by_a_bare_track(self) -> None:
+        """No list, no playlist — the index has nothing to index into."""
+        url = "https://www.youtube.com/watch?v=abc&index=4"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.TRACK
+        assert result.index is None
+
+    @pytest.mark.parametrize("raw", ["0", "-2", "abc", "4.5"])
+    def test_unusable_index_parses_as_none_not_an_error(self, raw: str) -> None:
+        """A malformed index degrades to "no index" instead of raising: the
+        alternative sends the whole link to ytsearch as plain text."""
+        url = f"https://www.youtube.com/watch?v=abc&list=PLtest&index={raw}"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.type == YTType.PLAYLIST
+        assert result.list_id == "PLtest"
+        assert result.index is None
 
 
 class TestParseUrlSpotify:
@@ -281,10 +330,16 @@ class TestParseInput:
         assert result.url == url
 
 
+_ANALYTICS = Analytics(queued_at=1752530000.5, queue_position=3)
+_ORIGIN = "https://open.spotify.com/album/abc123"
+
+
 class TestSpotifyPlaylistToYTSearch:
     def test_converts_titles_to_ytsearch(self) -> None:
         titles = ["Never Gonna Give You Up Rick Astley", "Bohemian Rhapsody Queen"]
-        result = spotify_playlist_to_ytsearch(titles)
+        result = spotify_playlist_to_ytsearch(
+            titles, analytics=_ANALYTICS, origin=_ORIGIN
+        )
 
         assert len(result) == 2
         assert all(isinstance(r, YTSource) for r in result)
@@ -293,20 +348,38 @@ class TestSpotifyPlaylistToYTSearch:
 
     def test_all_results_have_process_true(self) -> None:
         titles = ["Song A", "Song B", "Song C"]
-        result = spotify_playlist_to_ytsearch(titles)
+        result = spotify_playlist_to_ytsearch(
+            titles, analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert all(r.process is True for r in result)
 
     def test_empty_list_returns_empty(self) -> None:
-        assert spotify_playlist_to_ytsearch([]) == []
+        assert (
+            spotify_playlist_to_ytsearch([], analytics=_ANALYTICS, origin=_ORIGIN) == []
+        )
 
     def test_single_title(self) -> None:
-        result = spotify_playlist_to_ytsearch(["Only Song Artist"])
+        result = spotify_playlist_to_ytsearch(
+            ["Only Song Artist"], analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert len(result) == 1
         assert result[0].ytsearch == "ytsearch:Only Song Artist"
 
     def test_url_field_is_none(self) -> None:
-        result = spotify_playlist_to_ytsearch(["Song"])
+        result = spotify_playlist_to_ytsearch(
+            ["Song"], analytics=_ANALYTICS, origin=_ORIGIN
+        )
         assert result[0].url is None
+
+    def test_per_track_positions_derive_from_the_head(self) -> None:
+        # The head's analytics fans out: same ask-time queued_at on every track,
+        # positions incrementing from the head's — a playlist behind 3 songs
+        # waits at 3, 4, 5.
+        result = spotify_playlist_to_ytsearch(
+            ["a", "b", "c"], analytics=_ANALYTICS, origin=_ORIGIN
+        )
+        assert [r.analytics.queue_position for r in result] == [3, 4, 5]
+        assert all(r.analytics.queued_at == 1752530000.5 for r in result)
 
 
 class TestYTSourcePlaylistUrl:
@@ -334,19 +407,17 @@ class TestYTSourcePlaylistUrl:
         assert src.playlist_url == "https://www.youtube.com/playlist?list=PLtest"
 
     def test_property_is_not_gated_on_playlist_type(self) -> None:
-        """Documents that the property does NOT assert type == PLAYLIST: a TRACK
+        """Documents that the property does not assert type == PLAYLIST: a TRACK
         source with a url returns it unchanged. Callers are responsible for only
         reading this on playlist sources."""
         src = YTSource(url="https://yt.com/watch?v=one", type=YTType.TRACK)
         assert src.playlist_url == "https://yt.com/watch?v=one"
 
     def test_no_url_and_no_list_id_stringifies_none(self) -> None:
-        """Unguarded edge, pinned deliberately rather than endorsed: with both
-        fields unset the f-string interpolates the literal "None", producing
-        `...playlist?list=None`. Reachable only by constructing a PLAYLIST
-        source without a list_id, which parse_url never does. If a guard is
-        ever added, this test should change with it — it exists so that becomes
-        a deliberate decision instead of a silent one."""
+        """Unguarded edge, pinned rather than endorsed: with both fields unset the
+        f-string interpolates the literal "None". Reachable only by hand-building a
+        PLAYLIST source without a list_id, which parse_url never does; adding a
+        guard should change this test, so the change stays deliberate."""
         src = YTSource(type=YTType.PLAYLIST)
         assert src.playlist_url == "https://www.youtube.com/playlist?list=None"
 
@@ -419,3 +490,147 @@ class TestDomainRegex:
         result = parse_input("you+tube|com/watch", "-play you+tube|com/watch")
         assert isinstance(result, YTSource)
         assert result.ytsearch == "ytsearch:you+tube|com/watch"
+
+    def test_hyphenated_hosts_are_not_truncated(self) -> None:
+        """`-` has to be in the class: re.search otherwise starts matching after
+        the hyphen, so "my-site.com" parses as the host "site.com" and the
+        archive records a query_source for a domain nobody linked."""
+        result = parse_url("https://my-site.com/watch?v=x")
+        assert query_source_of(result) == "my-site.com"
+
+
+class TestNormalizeQueryHost:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("tiktok.com", "tiktok.com"),
+            ("www.tiktok.com", "tiktok.com"),
+            ("WWW.TikTok.com", "tiktok.com"),
+            ("  vimeo.com  ", "vimeo.com"),
+            ("music.example.co.uk", "music.example.co.uk"),
+            ("xn--80ak6aa92e.com", "xn--80ak6aa92e.com"),
+            ("192.168.1.10", "192.168.1.10"),
+            # `_` is in `\w`, so bad_host.com really does reach the normalizer —
+            # it filters, it does not merely format. `|` and `+` no longer can:
+            # parse_url's domain group is `[\w.]+` and they fall through to
+            # search (TestDomainRegex). Kept as direct coverage of the filter.
+            ("bad_host.com", ""),
+            ("bad|host.com", ""),
+            ("bad+host.com", ""),
+            ("", ""),
+            # 64 characters exactly, then one over the column domain.
+            ("a" * 60 + ".com", "a" * 60 + ".com"),
+            ("a" * 61 + ".com", ""),
+        ],
+    )
+    def test_domain(self, raw: str, expected: str) -> None:
+        assert normalize_query_host(raw) == expected
+
+
+class TestQuerySource:
+    """The persisted "how was this asked for" token. The archive cannot recover it
+    from webpage_url: Spotify links and plaintext searches both resolve to a
+    YouTube watch URL and are indistinguishable once played."""
+
+    def test_plaintext_search(self) -> None:
+        result = parse_input("never gonna give you up", "-play never gonna give you up")
+        assert result.stype == URLSource.SEARCH
+        assert query_source_of(result) == QUERY_SOURCE_SEARCH
+
+    def test_youtube_watch_url(self) -> None:
+        url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
+
+    def test_youtu_be_collapses_onto_the_service(self) -> None:
+        """A shortener is not a different service."""
+        url = "https://youtu.be/dQw4w9WgXcQ"
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
+
+    def test_youtube_playlist(self) -> None:
+        url = "https://www.youtube.com/playlist?list=PLrEnWoR732-BHrPp"
+        assert query_source_of(parse_url(url)) == QUERY_SOURCE_YOUTUBE
+
+    def test_spotify_track_link(self) -> None:
+        url = "https://open.spotify.com/track/5WZD6jHtgSSAGK97diNG7y"
+        result = parse_url(url)
+        assert isinstance(result, SpotifySource)
+        assert query_source_of(result) == QUERY_SOURCE_SPOTIFY
+
+    def test_soundcloud_link(self) -> None:
+        url = "https://soundcloud.com/artist/track"
+        result = parse_url(url)
+        assert isinstance(result, SoundcloudSource)
+        assert query_source_of(result) == QUERY_SOURCE_SOUNDCLOUD
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://www.tiktok.com/@user/video/1234567890", "tiktok.com"),
+            ("https://vimeo.com/12345678", "vimeo.com"),
+            ("https://artist.bandcamp.com/track/song", "artist.bandcamp.com"),
+        ],
+    )
+    def test_generic_hosts_keep_their_own_host(self, url: str, expected: str) -> None:
+        """The point of the open tail: tiktok and vimeo are distinguishable
+        without a dataclass apiece."""
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert query_source_of(result) == expected
+
+    def test_spotify_playlist_tracks_are_stamped_spotify(self) -> None:
+        """The whole reason the token is captured at parse time: these resolve to
+        YouTube URLs at dequeue, so nothing downstream could recover it."""
+        sources = spotify_playlist_to_ytsearch(
+            ["song one", "song two"], analytics=_ANALYTICS, origin=_ORIGIN
+        )
+        assert [query_source_of(s) for s in sources] == [QUERY_SOURCE_SPOTIFY] * 2
+
+    def test_uppercase_www_youtube_still_reports_youtube(self) -> None:
+        """parse_url's `www\\.` group is case-sensitive, so this misses the
+        YouTube branch and lands on the generic one — the normalizer still names
+        the service correctly."""
+        url = "https://WWW.youtube.com/watch?v=dQw4w9WgXcQ"
+        result = parse_url(url)
+        assert isinstance(result, YTSource)
+        assert result.stype == URLSource.OTHER
+        assert query_source_of(result) == QUERY_SOURCE_YOUTUBE
+
+    def test_unstamped_ytsource_is_unknown(self) -> None:
+        """A hand-built source (crash recovery, tests, a future call site) reports
+        the unknown sentinel rather than guessing."""
+        assert query_source_of(YTSource(ytsearch="ytsearch:x")) == ""
+
+
+class TestQuotedArgumentsSurviveConsumeRest:
+    """`-play`/`-playnow` take consume-rest arguments, and discord.py's read_rest
+    does no quote handling where the positional parser's get_quoted_word did. So
+    the quotes started arriving as part of the value."""
+
+    def test_a_quoted_url_still_parses_as_that_url(self) -> None:
+        """parse_url uses re.search, so a quoted URL still matched the domain while
+        dragging the trailing quote into the path — yt-dlp then rejects it."""
+        source = parse_input(
+            '"https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+            '-play "https://www.youtube.com/watch?v=dQw4w9WgXcQ"',
+        )
+        assert isinstance(source, YTSource)
+        assert source.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+    def test_a_quoted_search_does_not_keep_its_quotes(self) -> None:
+        """The origin is what -remove matches on, so a quoted search meant the
+        obvious retype (`-remove some song`) matched nothing."""
+        source = parse_input('"some song"', '-play "some song"')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == "ytsearch:some song"
+
+    def test_an_unmatched_quote_is_left_alone(self) -> None:
+        """Only a whole argument wrapped at BOTH ends is a wrapper; anything else
+        is text the user typed."""
+        source = parse_input('say "hello', '-play say "hello')
+        assert isinstance(source, YTSource)
+        assert source.ytsearch == 'ytsearch:say "hello'
+
+    def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
+        assert unquote_argument('""') == '""'
+        assert unquote_argument('"') == '"'
