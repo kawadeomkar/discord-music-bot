@@ -206,7 +206,7 @@ class MusicBotApp(commands.AutoShardedBot):
 
         Answers one question: is the event loop still turning. A wedged loop
         stops touching the file and the healthcheck fails on the stale mtime.
-        Probing Redis or Discord here would restart the container on a
+        Probing Redis or Discord here would report the bot dead over a
         dependency blip, so this stays dependency-free.
         """
         path = Path(config.LIVENESS_FILE)
