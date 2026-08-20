@@ -293,8 +293,7 @@ _YTDLP_LOGGER = _YtdlpLogger()
 # visionos carries playback (no PO token, no JS player, audio-only opus). The deno +
 # yt-dlp-ejs extras and the bgutil sidecar exist only to keep `web` usable as a
 # fallback: yt-dlp drops `web` without a JS runtime, and its formats are withheld
-# without a GVS token — measured, `web` alone often resolves no usable format, so
-# visionos is load-bearing. The bgutil pin tracks the compose image tag by hand.
+# without a GVS token. The bgutil pin tracks the compose image tag by hand.
 # Revoked URLs are separate: _resolve_playable_stream()'s probe-and-re-extract.
 # See docs/ARCHITECTURE.md#yt-dlp-client-strategy.
 #
@@ -372,36 +371,27 @@ _YT_SOURCE_TTL = 3600  # 1 hour
 # replayed: re-extracting costs seconds, serving a revoked URL costs the song.
 _STREAM_URL_MAX_TTL = 1800  # 30 minutes
 
-# Cap on the pre-playback URL probe. Kept short because a resolve can pay it TWICE
-# (cached entry, then the URL that replaces it) and exceeding it now costs a cache
-# entry rather than only a verdict — at the old 5s a blocked probe added ~15s per song
-# across the three probe sites. An unconfirmed URL still plays, so a timeout that fires
-# early is cheap; one that fires late is not.
+# Cap on the pre-playback URL probe. Short because a resolve can pay it TWICE (cached
+# entry, then the URL that replaces it) and exceeding it costs a cache entry rather
+# than only a verdict. An unconfirmed URL still plays, so firing early is cheap.
 _STREAM_PROBE_TIMEOUT = float(os.environ.get("STREAM_PROBE_TIMEOUT_SECS", "2.0"))
 
-# How many consecutive UNCONFIRMED verdicts before we stop believing the probe is
-# telling us about URLs at all. Its failure modes (blocked egress, DNS, a stalled loop)
-# are process-wide, not per-URL, so past this the cached-entry drop is suppressed and a
-# cached URL is served as-is: when the probe is the broken component, trusting the cache
-# is strictly better than deleting every entry and re-extracting behind it.
+# Consecutive UNCONFIRMED verdicts before the probe itself, rather than the URLs, is
+# treated as the fault. Its failure modes (blocked egress, DNS, a stalled loop) are
+# process-wide, so past this the cached-entry drop is suppressed and cached URLs are
+# served as-is.
 _UNCONFIRMED_STREAK_LIMIT = 3
 
-# Ceiling on how long an UNCONFIRMED URL may be cached. Short on purpose: not caching it
-# at all stops the cache repopulating for as long as probes keep failing, which turns a
-# per-URL problem into a process-wide one and multiplies extraction load against
-# YouTube. A wrong entry costs two minutes here instead of thirty.
+# Ceiling on how long an UNCONFIRMED URL may be cached. It is cached at all because
+# probe failures are process-wide: declining the write would stop anything repopulating
+# the cache and put every song through a fresh extraction. This bounds a wrong entry.
 _UNCONFIRMED_STREAM_TTL = 120  # 2 minutes
 
-# Fresh extractions one resolve may spend. ONE, because a second identical call cannot
-# change anything that matters: measured over six re-extractions each of two videos, the
-# CDN host and the format were identical every time and only the signature and `expire`
-# differed. So a re-mint cures a REVOKED url and nothing else — a url minted a second ago
-# that already probes dead is being refused systemically (GVS, PO token, format, IP),
-# which the same call cannot fix, and yt-dlp has already retried the player API three
-# times internally (`extractor_retries`). At 2 it fired only while the bot was already
-# failing, doubling time-to-error for every song. The cached-entry drop is NOT charged
-# against this: charging it would leave a resolve that dropped one entry with no
-# extraction at all.
+# Fresh extractions one resolve may spend. A re-mint returns the same CDN host and the
+# same format, so it cures a revoked signature and nothing else: a url that probes dead
+# seconds after minting is refused for a reason an identical call cannot vary, and
+# yt-dlp has already retried the player API internally (`extractor_retries`). The
+# cached-entry drop is deliberately NOT charged against this.
 _MAX_STREAM_EXTRACTIONS = 1
 
 # Fields to persist in the stream URL cache — strips ephemeral/large fields.
@@ -467,9 +457,9 @@ def _stream_cache_key(webpage_url: str) -> str:
 
 def _stream_url_ttl(stream_url: str) -> Optional[int]:
     """How long a stream URL may be cached, or None when it isn't worth caching.
-    `expire` advertises a 6-hour window but YouTube revokes long before it (observed: a
-    403 within the hour with five hours still claimed), so _STREAM_URL_MAX_TTL is what
-    bounds this in practice. `expire` is a query param on https formats but a path
+    `expire` advertises a 6-hour window but YouTube revokes long before it, so
+    _STREAM_URL_MAX_TTL is what bounds this in practice. `expire` is a query param on
+    https formats but a path
     segment (`/expire/<epoch>/`) on the HLS manifests the muxed rung serves; missing either
     leaves that rung re-extracting 3-5s on every play, so both forms are read.
     """
@@ -539,22 +529,16 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
     try:
         timeout = aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # read_bufsize=0 + close(), not release(): only the status line matters, and
-            # aiohttp otherwise fills its StreamReader from the moment headers land
-            # until the transport is paused — measured at 67 KB when the probing task
-            # was 10 ms late back on the loop, 540 KB at 100 ms. That is audio we throw
-            # away, up to three times per song. close() aborts instead of draining;
-            # nothing is lost, since a probe never reuses its connection anyway (the
-            # unread body means aiohttp cannot pool it).
+            # read_bufsize=0 + close(), not release(): only the status line matters,
+            # and aiohttp otherwise fills its StreamReader from the moment headers land
+            # until the transport is paused — audio we pay for and discard. Nothing is
+            # lost: an unread body means the connection could not be pooled anyway.
             async with session.get(stream_url, read_bufsize=0) as response:
                 # Only a definite client-side refusal is DEAD. 429 and 5xx say "not
                 # right now" exactly as a timeout does, and routing them to DEAD would
                 # delete the cache entry and refuse a song ffmpeg's own -reconnect
                 # would very likely have played.
                 status = response.status
-                # Abort rather than release: the body is never read, so aiohttp cannot
-                # pool the connection anyway, and closing here stops it filling the
-                # StreamReader while this task waits its turn on the loop.
                 response.close()
                 if status < 400:
                     return _record_probe_outcome(StreamProbe.PLAYABLE)
@@ -580,9 +564,8 @@ async def _cache_stream(
     max_ttl: Optional[int] = None,
 ) -> bool:
     """Persist a probed stream URL. True when an entry was written, False when the URL
-    isn't worth caching (no usable expiry). `max_ttl` caps the lifetime below the
-    URL's own — used for a URL that could not be confirmed, so a wrong entry expires
-    in minutes instead of the full half hour."""
+    isn't worth caching (no usable expiry). `max_ttl` caps the lifetime below the URL's
+    own — used for a URL that could not be confirmed."""
     # Absent keys are dropped, not written as None: `{"title": None}` would contradict
     # YTDLVideoInfo, which types title as str and treats absent fields as *missing*.
     stripped = {k: data[k] for k in _STREAM_CACHE_FIELDS if data.get(k) is not None}
@@ -602,11 +585,9 @@ async def _probe_and_cache(
     format, probe the URL, cache it. True when an entry was written. Shared by
     prefetch_stream and yt_source so both write identical entries.
 
-    A DEAD URL is never cached. An UNCONFIRMED one is, but only for
-    _UNCONFIRMED_STREAM_TTL: refusing it outright means nothing repopulates the cache
-    for as long as probes keep failing, and since those failures are process-wide
-    rather than per-URL, that turns one bad edge into every song re-extracting — the
-    same yt_source-then-prefetch work twice per play, against YouTube, from one IP."""
+    A DEAD URL is never cached. An UNCONFIRMED one is, for _UNCONFIRMED_STREAM_TTL
+    only: probe failures are process-wide, so declining the write would stop anything
+    repopulating the cache and put every play through a fresh extraction."""
     span = trace.get_current_span()
     _record_serving_format(data)
     if _stream_url_ttl(data.get("url", "")) is None:
@@ -897,17 +878,14 @@ class YTDL(discord.FFmpegOpusAudio):
         with nothing logged. A revoked URL is dropped from the cache and re-extracted
         once; once is enough.
 
-        UNCONFIRMED is not DEAD: the URL still plays (ffmpeg is the judge) and is cached
-        only briefly. A cached one is dropped and re-extracted for a freshly signed URL —
-        the same CDN edge and format, measured, so this cures an early revocation rather
-        than an unreachable edge — but that drop is FREE, never charged against
-        _MAX_STREAM_EXTRACTIONS, because charging it would leave the resolve with no
-        extraction at all.
+        UNCONFIRMED is not DEAD: the URL still plays (ffmpeg is the judge) and is
+        cached only briefly. A cached one is dropped and re-extracted for a freshly
+        signed URL on the same edge and format, which cures an early revocation. That
+        drop is FREE, never charged against _MAX_STREAM_EXTRACTIONS.
 
-        Two brakes stop that drop becoming self-inflicted load: once the probe path
-        looks broken process-wide the cached URL is served untouched, and
-        `allow_reextract=False` (the background prefetch) declines to re-extract at all,
-        leaving the decision to the play-time resolve that actually needs it.
+        Two brakes stop it becoming self-inflicted load: once the probe path looks
+        broken process-wide the cached URL is served untouched, and
+        `allow_reextract=False` (the background prefetch) declines to re-extract.
         """
         span = trace.get_current_span()
         cache_key = _stream_cache_key(qo.webpage_url)
@@ -971,11 +949,9 @@ class YTDL(discord.FFmpegOpusAudio):
                 continue
 
             if probe is not StreamProbe.DEAD:
-                # Unreachable today, and deliberately loud rather than silent: with a
-                # bool there were two exhaustive outcomes and a bare else was safe. An
-                # enum makes the last branch a catch-all, so a fourth member would
-                # inherit "YouTube revoked this URL" — deleting cache entries and
-                # mislabelling spans, with no type error and no failing test.
+                # Deliberately loud: the enum makes the last branch a catch-all, so a
+                # fourth member would silently inherit "YouTube revoked this URL",
+                # deleting cache entries with no type error and no failing test.
                 raise AssertionError(f"unhandled stream probe verdict: {probe}")
 
             if not extracted_fresh:
@@ -993,9 +969,8 @@ class YTDL(discord.FFmpegOpusAudio):
                 )
             else:
                 log.warning(
-                    f"freshly extracted stream URL for {qo.webpage_url} probed dead "
-                    "— giving up, since a re-extraction returns the same edge and "
-                    "format and only a fresh signature could differ"
+                    f"freshly extracted stream URL for {qo.webpage_url} probed "
+                    "dead — giving up"
                 )
             data = None
 

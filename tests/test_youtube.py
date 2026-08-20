@@ -1428,9 +1428,8 @@ class TestRevokedStreamUrl:
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
         """A probe that never completed is not evidence, so dropping the entry it
-        describes must be free. At a budget of one, charging it is fatal in a way it was
-        not at two: the resolve leaves the loop having never asked yt-dlp anything, and
-        refuses a song a cold cache would have played."""
+        describes must be free. Charged against the budget, the resolve would leave the
+        loop having never asked yt-dlp anything."""
         webpage_url = "https://yt.com/v=budget"
         await self._cache(fake_redis, webpage_url)
         playable_urls.side_effect = [
@@ -1457,16 +1456,15 @@ class TestRevokedStreamUrl:
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
         """The budget is extractions, not loop turns, and one dead FRESH url is the
-        ceiling: re-minting was measured to return the same edge and the same format, so
-        whatever refused that url is not something an identical call can vary."""
+        ceiling: a re-mint returns the same edge and format, so whatever refused that
+        url is not something an identical call can vary."""
         webpage_url = "https://yt.com/v=budget_exhausted"
         await self._cache(fake_redis, webpage_url)
         playable_urls.side_effect = [
             StreamProbe.UNCONFIRMED,  # cached entry: free drop, no budget spent
             StreamProbe.DEAD,  # the one real extraction
-            StreamProbe.DEAD,  # never consumed at budget 1 — present so that raising
-            # the budget fails this on the call-count assertion rather than on an
-            # exhausted mock, which reads like a broken test instead of a caught change
+            StreamProbe.DEAD,  # unused at budget 1; keeps a raised budget failing on
+            # the call-count assertion rather than on an exhausted mock
         ]
         qobj = QueueObject(webpage_url, "Exhausted", mock_ctx.author)
 

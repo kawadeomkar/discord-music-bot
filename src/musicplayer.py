@@ -1962,41 +1962,33 @@ class MusicPlayer:
 
     def note_deliberate_stop(self) -> None:
         """Record that the live song is about to be stopped by us, not by ffmpeg.
-        Call BEFORE vc.stop(); the loop clears it at each vc.play(). Needed because a
-        stop we initiate ends the player thread without another source.read(), so
-        discord.py never runs its returncode check and `after` gets error=None —
-        indistinguishable, on frame count alone, from a stream that never opened."""
+        Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we initiate
+        ends the player thread without another source.read(), so `after` gets
+        error=None — indistinguishable, on frame count alone, from a dead stream."""
         self._stopped_deliberately = True
 
     async def _drop_unplayable_stream_cache(self, song: YTDL) -> None:
         """Drop the cached stream URL of a song that ended with no frame, no error, and
         no deliberate stop.
 
-        A BACKSTOP, not the main path. discord.py 2.7.1 does report a failing ffmpeg:
-        FFmpegOpusAudio.read() calls _check_process_returncode() on an empty packet,
-        which sets FFmpegProcessError, which AudioPlayer forwards to `after`. That is
-        the `stream_failed` path, and _handle_dead_stream already owns it. What reaches
-        HERE is the window that check declines to judge — it returns early while
-        `self._process.poll()` is still None, so a child that has closed stdout but not
-        yet been reaped loses its error. Rare: measured 0 of 40 trials.
+        A BACKSTOP, not the main path. discord.py reports a failing ffmpeg through
+        `after` (read() -> _check_process_returncode), which is the `stream_failed` path
+        _handle_dead_stream owns. What reaches HERE is the window that check declines to
+        judge: it returns early while `self._process.poll()` is still None, so a child
+        that closed stdout but has not been reaped loses its error.
 
         Cache only, on purpose: being wrong costs one re-extraction, while widening
         `stream_failed` on the same evidence would suppress a real history entry.
 
-        On that history entry: a zero-frame song reaching the loop's iteration end IS
-        recorded, at played_secs=0, and that is deliberate — a queued song that never
-        sounded is still a record of what was asked for. `claim_current_song_for_history`
-        takes the opposite line for a song abandoned MID-PLAY, because there the play is
-        being torn down rather than completing, and a 0s row would be indistinguishable
-        from this one. The two rules differ on purpose; do not "align" them without
-        deciding which record the archive is supposed to hold."""
+        A zero-frame song reaching the loop's iteration end IS still recorded, at
+        played_secs=0, while `claim_current_song_for_history` refuses one for a song
+        abandoned MID-PLAY. The two rules differ on purpose — do not "align" them
+        without deciding which record the archive is supposed to hold."""
         if self.store is None or not song.webpage_url:
             return
         dropped = await invalidate_stream_cache(self.store.redis, song.webpage_url)
-        # Report the outcome, not the intent. The common case here has nothing cached
-        # (an unconfirmed URL is only cached briefly, and a bad edge often had its
-        # entry dropped at resolve time), so announcing a deletion unconditionally put
-        # phantom evictions on the channel operators read as a YouTube early warning.
+        # Report the outcome, not the intent: the common case here has nothing cached,
+        # and a deletion announced unconditionally reads as a YouTube early warning.
         if dropped:
             log.warning(
                 "stream ended with no audio and no error, dropped its cached URL: "
@@ -2517,10 +2509,8 @@ class MusicPlayer:
                     # that delivered real audio and earns its history entry.
                     # A THIRD case joins these below: zero frames, no error, and no
                     # deliberate stop. discord.py surfaces a failing ffmpeg as an
-                    # error (FFmpegOpusAudio.read -> _check_process_returncode), so
-                    # that case is NOT the normal dead stream — it is the narrow
-                    # window where the child had not been reaped yet. It only drops a
-                    # cache entry; see _drop_unplayable_stream_cache.
+                    # error, so that case is the narrow window where the child had not
+                    # been reaped yet — see _drop_unplayable_stream_cache.
                     stream_failed = (
                         not song.produced_audio and play_error[0] is not None
                     )
@@ -2685,12 +2675,7 @@ class MusicPlayer:
                         # Zero frames, no error, nobody stopped it. start_paused is
                         # the one other ending that looks identical and says nothing
                         # about the URL: a song parked at vc.pause() and torn down
-                        # before it ever played. That also covers the realistic
-                        # shutdown case, since close() disconnects voice and a song
-                        # far enough along to have frames would fail the first test
-                        # anyway — a shutdown inside ffmpeg's startup window still
-                        # slips through, and costs exactly the one re-extraction this
-                        # branch already budgets for.
+                        # before it ever played.
                         await self._drop_unplayable_stream_cache(song)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)

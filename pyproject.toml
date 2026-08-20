@@ -21,8 +21,8 @@ davey = "^0.1.5"
 #
 # A NIGHTLY (.dev0), deliberately — the only pin here that is not a stable release.
 # 2026.7.4 is the newest stable and 403s on the media fetch for nearly every video
-# under YouTube's current GVS enforcement (measured: 6 of 7 failed, 7 of 7 on this
-# build). Move back to a stable pin as soon as one ships newer than 2026.7.4.
+# under YouTube's current GVS enforcement. Move back to a stable pin as soon as one
+# ships newer than 2026.7.4.
 # allow-prereleases is what makes the .dev0 resolvable.
 yt-dlp = { version = "2026.8.18.122307.dev0", extras = ["default", "deno"], allow-prereleases = true }
 # Exact pin: the pip plugin and the bgutil-pot-provider sidecar image in

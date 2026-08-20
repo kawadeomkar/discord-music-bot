@@ -380,12 +380,10 @@ pins:
         fail=1
     fi
 
-    # The yt-dlp version is quoted in prose by both tracked docs, and those copies
-    # are what a reader trusts when deciding whether the client strategy described
-    # there still applies. Nothing else compares them: Dependabot moves pyproject
-    # and poetry.lock together in a PR that touches neither file and stays green,
-    # and main already carried a stale 2026.7.4 in both for exactly that reason.
-    # Mechanical, so it is enforced here rather than left on rule 6's hand-check list.
+    # Both tracked docs quote the yt-dlp version, and a reader trusts those copies
+    # when deciding whether the client strategy described there still applies.
+    # Nothing else compares them: Dependabot moves pyproject and poetry.lock in a PR
+    # that touches neither file and stays green, and main has carried a stale one.
     want_ytdlp="$(sed -n 's/^yt-dlp = { version = "\([^"]*\)".*$/\1/p' pyproject.toml)"
     for doc in CLAUDE.md docs/ARCHITECTURE.md; do
         if ! grep -qF "$want_ytdlp" "$doc"; then

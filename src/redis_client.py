@@ -203,9 +203,8 @@ async def cache_set(
 async def cache_del(redis: Optional[aioredis.Redis], key: str) -> bool:
     """Drop a cached value. No-ops when redis is None; silently ignores errors.
 
-    Returns whether an entry was actually removed, so a caller can say what happened
-    rather than announcing a deletion that did not occur — DEL answers 0 just as
-    quietly for "already gone" as for "never cached". False on a no-op or an error."""
+    Returns whether an entry was actually removed, so a caller can report what happened
+    rather than announce a deletion that did not occur. False on a no-op or an error."""
     if redis is None:
         return False
     try:

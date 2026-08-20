@@ -69,10 +69,9 @@ def pytest_collection_modifyitems(
 def reset_probe_streak() -> Iterator[None]:
     """Zero the process-wide unconfirmed-probe streak between tests.
 
-    src.youtube tracks consecutive UNCONFIRMED verdicts to decide the probe path is
-    unhealthy. It is deliberately module-global (the condition is process-wide), which
-    means one test's unconfirmed probes would otherwise change how the NEXT test's
-    cached URL is handled — order-dependent and silent.
+    The streak is deliberately module-global (the condition it detects is
+    process-wide), so without this one test's unconfirmed probes change how the NEXT
+    test's cached URL is handled — order-dependent and silent.
     """
     import src.youtube as youtube
 

@@ -1378,10 +1378,9 @@ class MusicBot(commands.Cog):
             skipped_title: Optional[str] = None
             skipped_position = ""
             assert ctx.guild is not None  # validate_commands rejects DMs before this
-            # One lookup for both uses. mps, not get_mp(): this must not build a
-            # player, and taking it once keeps the mark and the paused read on the
-            # same object — cog_before_invoke can rebuild a player mid-command, so a
-            # second lookup can return one that never played this song.
+            # mps, not get_mp(): this must not build a player, and one lookup keeps
+            # the mark and the paused read on the same object — cog_before_invoke can
+            # rebuild a player mid-command.
             mp_for_stop = self.mps.get(ctx.guild.id)
             if vc.is_paused() and mp_for_stop is not None:
                 song = mp_for_stop.current_song
