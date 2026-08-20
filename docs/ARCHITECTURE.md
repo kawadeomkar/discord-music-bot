@@ -87,8 +87,8 @@ graph TD
 |---|---|---|
 | Runtime | Python 3.14 (`requires-python >=3.14,<4.0`) | Asyncio event loop |
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
-| Audio extraction | `yt-dlp` 2026.7.4 (pinned, `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so `web_safari` works as a fallback client |
-| PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so `web_safari` can serve audio-only formats |
+| Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
+| PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
 | Codec | FFmpeg (system, installed in the runtime image) | Decode + re-encode to Opus for Discord |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
@@ -113,7 +113,7 @@ Five containers are defined in [docker-compose.yml](../docker-compose.yml):
 | `discord-music-bot` | Local build (tagged with git SHA) | `restart: always`, `network_mode: host`, `depends_on: service_healthy` on Redis, named volume for yt-dlp's disk cache (player JS + solved challenges survive restarts) |
 | `discord-redis` | `redis:7-alpine` | AOF persistence, 256 MB `volatile-lru` eviction, healthcheck |
 | `discord-postgres` | `postgres:18-alpine` | The durable tier (`play_history`). On the `archive` profile, which the deploy tooling activates from `HISTORY_ARCHIVE_ENABLED` — Compose never reads that flag itself, so a raw `docker compose up` deploys no Postgres; NOT in `depends_on` — the outbox buffers in Redis until it comes up. Volume target is `/var/lib/postgresql` (the 18+ image layout — the old `.../data` path would store the cluster outside the volume) plus a `postgres-backups` volume at `/backups` for `pg_backup.sh`'s nightly dumps |
-| `discord-pot-provider` | `brainicism/bgutil-ytdlp-pot-provider:1.3.1` (tag locked to the pip plugin pin) | GVS Proof-of-Origin token minting for the `web_safari` fallback client, `127.0.0.1:4416`; NOT in `depends_on` — the bot degrades gracefully without it (see [PO_TOKEN_SIDECAR_PLAN.md](PO_TOKEN_SIDECAR_PLAN.md)) |
+| `discord-pot-provider` | `brainicism/bgutil-ytdlp-pot-provider:1.3.1` (tag locked to the pip plugin pin) | GVS Proof-of-Origin token minting for yt-dlp's fallback client, `127.0.0.1:4416`; NOT in `depends_on` — the bot degrades gracefully without it (see [PO_TOKEN_SIDECAR_PLAN.md](PO_TOKEN_SIDECAR_PLAN.md)) |
 | `discord-otel-lgtm` | `grafana/otel-lgtm` | All-in-one Grafana (UI `:3000`) + Tempo + Loki + Mimir, OTLP gRPC on `:4317` |
 
 `network_mode: host` is used because the bot makes only outbound connections — no inbound ports are needed.
@@ -558,6 +558,8 @@ flowchart LR
 **Stream URL properties:**
 - YouTube CDN URLs have a 6-hour expiry window and are IP-bound (the `ip` field is inside the HMAC-signed `sparams`) — they cannot be reused from a different host
 - Cache TTL formula: `min(expire − now − 1800s, _STREAM_URL_MAX_TTL=1800s)`; not written if the result is under 60 s. YouTube revokes URLs well before their advertised `expire`, so the 1800 s cap — not `expire` — is what bounds a fresh extraction's TTL in practice
+- Cache lifetime follows the probe verdict. `_probe_stream_url` returns `StreamProbe.PLAYABLE` / `DEAD` / `UNCONFIRMED`; only `PLAYABLE` earns the full ceiling, `DEAD` is never cached, and `UNCONFIRMED` (the probe itself never completed — timeout, DNS, connection refused; also HTTP 429 and 5xx, which say "not right now" exactly as a timeout does) gets `_UNCONFIRMED_STREAM_TTL` = 120 s. That third state is deliberately neither of the others: treated as `DEAD` it would fail songs whenever the probe is blocked, and treated as `PLAYABLE` it writes an unverified URL into a 30-minute entry — not hypothetical, an ISP-embedded CDN edge that accepted no connections made one song unplayable for the entry's whole TTL. It is still cached, because the probe's failure modes are process-wide rather than per-URL: declining the write would stop *anything* repopulating the cache, putting every song through the yt-dlp-then-prefetch extraction twice. 120 s keeps the cache working through a blip while capping a wrong entry at minutes
+- An unconfirmed **cached** URL is dropped and re-extracted for a freshly signed one, subject to three brakes. It is **not** re-extracted onto a different edge: measured over six identical re-extractions each of two videos, the CDN host (`rrN---sn-…`) and the selected format (251) came back byte-identical every time, and only the signature and `expire` changed — the `sn-` component is the ISP-local Google Global Cache node and is structurally sticky to the host's network. So the drop cures an early revocation, never an unreachable edge, which is also why `_MAX_STREAM_EXTRACTIONS` is **1**: a url minted a second ago that already probes dead is being refused for a reason an identical call cannot vary (GVS enforcement, PO token, format, IP), and yt-dlp has already retried the player API three times internally via `extractor_retries`. The drop is **free** — never charged against that budget, so a resolve that discards one entry still has its extraction in hand. It is **suppressed** once `probe_path_looks_broken()` (`_UNCONFIRMED_STREAK_LIMIT` consecutive unconfirmed verdicts) says the probe rather than the URL is the broken component, since deleting every entry then is self-inflicted load. And the **background prefetch declines it** (`allow_reextract=False`): `_cancel_prefetch()` awaits that task, an executor job cannot be interrupted, so a re-extraction there would sit in front of every `-clear`/`-shuffle`/`-remove`
 
 ---
 
@@ -1343,24 +1345,43 @@ counting attempts against a real connect distinguishes them. Without an explicit
 
 ### yt-dlp client strategy
 
-`android_vr` is primary because it needs no PO token and offers audio-only formats;
-`web_safari` is a *working* fallback only because the image ships Deno plus yt-dlp-ejs
-(for JS challenges) and the bgutil PO-token sidecar. The plugin pin in `pyproject.toml`
-and the sidecar image tag in `docker-compose.yml` **move in lockstep** — `just pins`
-checks this and CI runs it.
+The bot names **no client**: `_EXTRACTOR_ARGS` passes `default`, which is yt-dlp's own
+list. That is the strategy, not an omission — upstream moves its default when YouTube
+breaks a client, and a hardcoded name pins us to one nobody is defending. Today
+`default` is `visionos,web` (yt-dlp README: "By default, `visionos,web` is used"); it
+was `android_vr`-led in an earlier release, so **treat every client name in this section
+as a snapshot to re-verify on each yt-dlp bump.**
+
+`visionos` carries playback: no PO token, no JS player, audio-only https (251/opus).
+`web` is the fallback, and it only exists because the image ships Deno plus yt-dlp-ejs —
+yt-dlp drops `web` from `default` outright when no JS runtime is available — with the
+bgutil sidecar minting the GVS PO token its formats require. The plugin pin in
+`pyproject.toml` and the sidecar image tag in `docker-compose.yml` **move in lockstep,
+and nothing enforces it**: `just pins` does not cover this pair, so it is a hand check
+(see CLAUDE.md rule 6a).
+
+The pin is a **nightly** because the newest stable, 2026.7.4, 403s on the media fetch
+under current GVS enforcement: 6 of 7 videos failed on it against 7 of 7 on the nightly,
+same host and extractor args. Extraction succeeds either way, so the ladder above never
+degrades and nothing warns — the song simply dies at ffmpeg. `security.yml`'s
+`ytdlp-stable-watch` job warns when PyPI carries a stable newer than the pinned base.
 
 The degradation ladder is designed so every rung lands on a previously-working
-configuration: `android_vr` healthy → audio-only; `android_vr` out → `web_safari`
-muxed audio, warned once per format by `_record_serving_format`; sidecar down →
-`web_safari` still works until PO-token enforcement lands; Deno broken → yt-dlp
-reverts to the JS-less default, which is `android_vr` alone. Those warnings are the
-early-warning system for YouTube-side changes; watch them after any yt-dlp bump.
+configuration: `visionos` healthy → audio-only 251/opus; `visionos` out → `web` muxed or
+SABR, warned once per format by `_record_serving_format` (yt-dlp's `tv_downgraded` /
+`web_embedded` clients are **not** a rung here: they live in `_DEFAULT_AUTHED_CLIENTS`,
+selected only `if self.is_authenticated`, and this bot sends no cookies or
+credentials); sidecar down → `web`'s formats are withheld without a GVS
+token, and `web` alone frequently resolves no usable format at all, so this rung is
+thinner than it reads; Deno broken → `web` leaves `default` entirely and
+`visionos` is all that remains. Those warnings are the early-warning system for
+YouTube-side changes; watch them after any yt-dlp bump.
 
 Two facts that constrain deployment rather than extraction: YouTube signs `ip` inside
 the `sparams` HMAC of every stream URL, so a URL is bound to the host that extracted
 it and can never be replayed from another machine — relevant to any multi-host or
 sharded deployment. And `fetch_pot=auto` consults the sidecar only when a selected
-format requires a token, so it costs nothing while `android_vr` is healthy; YouTube's
+format requires a token, so it costs nothing while `visionos` is healthy; YouTube's
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
 

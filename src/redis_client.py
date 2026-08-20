@@ -200,14 +200,18 @@ async def cache_set(
         log.warning(f"cache_set failed [{key}]: {e}")
 
 
-async def cache_del(redis: Optional[aioredis.Redis], key: str) -> None:
-    """Drop a cached value. No-ops when redis is None; silently ignores errors."""
+async def cache_del(redis: Optional[aioredis.Redis], key: str) -> bool:
+    """Drop a cached value. No-ops when redis is None; silently ignores errors.
+
+    Returns whether an entry was actually removed, so a caller can report what happened
+    rather than announce a deletion that did not occur. False on a no-op or an error."""
     if redis is None:
-        return
+        return False
     try:
-        await redis.delete(key)
+        return bool(await redis.delete(key))
     except Exception as e:
         log.warning(f"cache_del failed [{key}]: {e}")
+        return False
 
 
 # ── Spotify auth token cache ──────────────────────────────────────────────────

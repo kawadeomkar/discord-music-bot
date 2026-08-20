@@ -39,7 +39,7 @@ and FFmpeg, with Redis for playback state, caching, and crash recovery.
 - **Timestamp seeks** — a YouTube link with `?t=90` starts playback at 1:30
 - **Rich `-help`** — a custom man-page-style help command with aliases, examples,
   and per-command notes
-- **Resilient YouTube extraction** — PO-token sidecar support makes `web_safari` a
+- **Resilient YouTube extraction** — PO-token sidecar support makes yt-dlp's fallback client a
   working fallback client when the primary client is throttled or blocked
 - **Observability** — OpenTelemetry tracing and structured logging (structlog), with a
   bundled Grafana LGTM stack in Docker Compose
@@ -386,7 +386,7 @@ The Compose stack runs the bot plus its supporting services:
 | `postgres` | Postgres 18 — the durable play-history archive. **Opt-in**: on the `archive` profile, which the deploy tooling activates when `HISTORY_ARCHIVE_ENABLED=true` |
 | `db-migrate` | One-shot schema migration for the archive — same `archive` profile. Every deploy runs it before recreating the bot, and `docker compose up` runs it too; re-running applies nothing |
 | `db-backfill` | One-shot copy of pre-archive Redis history into Postgres, run by hand ([procedure](#backfilling-history-that-predates-the-archive)). On the `ops` profile, **not** `archive`, so it is never started by `up` — only by `just db-backfill-docker` |
-| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so the `web_safari` fallback client works; optional — the bot degrades gracefully without it |
+| `bgutil-pot-provider` | Mints YouTube Proof-of-Origin tokens so yt-dlp's fallback client works; optional — the bot degrades gracefully without it |
 | `otel-lgtm` | Grafana LGTM observability stack — UI at [localhost:3014](http://localhost:3014) (admin/admin); optional |
 
 ```bash

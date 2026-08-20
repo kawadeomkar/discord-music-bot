@@ -6690,10 +6690,10 @@ class TestLoop:
     async def test_song_stopped_before_first_frame_is_not_a_dead_stream(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
-        """Zero frames without an ffmpeg error is a deliberate stop — a -skip or
-        interject inside ffmpeg's startup window, or a resume entry parked at
-        vc.pause(). The stream was never refused, so the cached URL survives, no
-        failure notice is posted, and the song keeps its history entry."""
+        """Zero frames and no ffmpeg error, when the stop was OURS: the stream was
+        never refused, so the cached URL survives, no notice is posted, and the song
+        keeps its history entry. The marker is the only thing separating this from a
+        host that never answered, which MUST drop its cache — see the sibling test."""
         music_player._restore_complete.set()
         music_player.bot.wait_until_ready = AsyncMock()
         mocked(music_player.bot.is_closed).side_effect = [False, True]
@@ -6704,8 +6704,14 @@ class TestLoop:
         seed_queue(music_player.queue, queue_obj)
 
         vc = object.__new__(discord.VoiceClient)
-        # After fires with no error, exactly how discord.py reports a vc.stop().
-        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+
+        # Marked between vc.play() and `after`, where a real skip lands: the loop
+        # clears the marker immediately before vc.play(), so anything earlier is wiped.
+        def _play(song: object, after: object) -> None:
+            music_player.note_deliberate_stop()
+            cast(Any, after)(None)
+
+        vc.play = MagicMock(side_effect=_play)
         mocked(music_player._guild).voice_client = vc
         music_player.play_next.wait = AsyncMock()
         music_player._channel.send = AsyncMock()
@@ -6731,6 +6737,145 @@ class TestLoop:
         mock_invalidate.assert_not_awaited()
         music_player._channel.send.assert_not_awaited()
         assert len(music_player.history) == 1
+
+    async def test_stream_that_never_opened_drops_its_cached_url(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """The backstop: zero frames, no error, no deliberate stop. discord.py DOES
+        report a failing ffmpeg (read() -> _check_process_returncode -> `after`), so
+        this is not the ordinary dead stream — it is the window that check declines to
+        judge, where the child closed stdout but poll() has not reaped it yet. The
+        cached URL must not survive: left in place, every replay reads it and fails the
+        same way for the entry's whole TTL. Cache only — history and the absent notice
+        stay as in the deliberate-stop case.
+
+        The marker is set BEFORE the loop runs: it must be cleared by the reset that
+        precedes vc.play(), or a single earlier -skip would disable this branch for the
+        player's whole life."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False  # ffmpeg never opened the input
+        mock_song.webpage_url = "https://yt.com/v=blackholed"
+        mock_song.start_paused = (
+            False  # not a parked song; explicit, not MagicMock-truthy
+        )
+
+        # A stale mark from an earlier song. Kills the mutation that deletes the
+        # reset before vc.play(): without it this leaks in and suppresses the drop.
+        music_player.note_deliberate_stop()
+
+        seed_queue(music_player.queue, queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        # No note_deliberate_stop(): this stop came from ffmpeg dying, not from us.
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+
+        mock_invalidate.assert_awaited_once()
+        assert cast(Any, mock_invalidate.await_args).args[1] == (
+            "https://yt.com/v=blackholed"
+        )
+        # Cache only: no red notice, and the play still earns its history entry.
+        music_player._channel.send.assert_not_awaited()
+        assert len(music_player.history) == 1
+
+    async def test_drop_unplayable_stream_cache_noops_without_a_store(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """Golden rule 5: the in-memory bot keeps working. Without the store guard this
+        raises AttributeError on self.store.redis at every zero-frame song end, and the
+        loop's outer handler turns it into a misleading "Unhandled error in playback
+        loop" — a Redis-less deployment reporting a playback bug."""
+        music_player.store = None
+        mock_song.webpage_url = "https://yt.com/v=nostore"
+
+        with patch(
+            "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+        ) as mock_invalidate:
+            await music_player._drop_unplayable_stream_cache(mock_song)
+
+        mock_invalidate.assert_not_awaited()
+
+    async def test_drop_unplayable_stream_cache_noops_without_a_url(
+        self, music_player: MusicPlayer, mock_song: MagicMock
+    ) -> None:
+        """An info-dict can omit webpage_url; deleting `ytdl:stream:` (the bare prefix)
+        would be a write against a key no song owns."""
+        mock_song.webpage_url = ""
+
+        with patch(
+            "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+        ) as mock_invalidate:
+            await music_player._drop_unplayable_stream_cache(mock_song)
+
+        mock_invalidate.assert_not_awaited()
+
+    async def test_parked_paused_song_keeps_its_cached_url(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """A resume tail parked at vc.pause() and torn down before it played has zero
+        frames and no error — identical, on those two facts alone, to a stream that
+        never opened. It says nothing about the URL, so the entry must survive."""
+        music_player._restore_complete.set()
+        music_player.bot.wait_until_ready = AsyncMock()
+        mocked(music_player.bot.is_closed).side_effect = [False, True]
+        music_player.bot.loop = asyncio.get_running_loop()
+
+        mock_song.produced_audio = False
+        mock_song.webpage_url = "https://yt.com/v=parked"
+        mock_song.start_paused = True  # the distinguishing fact
+
+        seed_queue(music_player.queue, queue_obj)
+
+        vc = object.__new__(discord.VoiceClient)
+        vc.play = MagicMock(side_effect=lambda song, after: after(None))
+        vc.pause = MagicMock()
+        mocked(music_player._guild).voice_client = vc
+        music_player.play_next.wait = AsyncMock()
+        music_player._channel.send = AsyncMock()
+
+        with (
+            patch.object(
+                MusicPlayer, "_resolve_source", new=AsyncMock(return_value=queue_obj)
+            ),
+            patch.object(
+                MusicPlayer, "_stream_source", new=AsyncMock(return_value=mock_song)
+            ),
+            patch.object(MusicPlayer, "_send_now_playing", new=AsyncMock()),
+            patch.object(
+                MusicPlayer, "_prefetch_next_song", new=AsyncMock(return_value=None)
+            ),
+            patch.object(MusicPlayer, "update_activity", new=AsyncMock()),
+            patch(
+                "src.musicplayer.invalidate_stream_cache", new=AsyncMock()
+            ) as mock_invalidate,
+        ):
+            await music_player.loop()
+
+        mock_invalidate.assert_not_awaited()
 
     async def test_dead_stream_retires_np_host_instead_of_finalizing_bar(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
@@ -8050,6 +8195,32 @@ class TestInterject:
 
         assert attrs["interject.depth"] == 1
         assert attrs["interject.over_interjection"] is True
+
+    async def test_interject_marks_the_stop_as_deliberate_before_stopping(
+        self,
+        music_player: MusicPlayer,
+        live_song: MagicMock,
+        playnow_obj: QueueObject,
+        mock_vc: MagicMock,
+    ) -> None:
+        """An interjection stops the live song, so the loop must not read that as a
+        stream that never opened — inside ffmpeg's startup window the two are identical
+        apart from this marker, and the song would lose its still-good cached URL.
+        Ordered: marked BEFORE vc.stop(), since `after` can fire the moment it lands."""
+        live_song.elapsed_secs = 30.0
+        live_song.produced_audio = False  # stopped inside ffmpeg's startup window
+        music_player.current_song = live_song
+        order: list[str] = []
+        mock_vc.stop = MagicMock(side_effect=lambda: order.append("stop"))
+
+        with patch.object(
+            MusicPlayer,
+            "note_deliberate_stop",
+            side_effect=lambda: order.append("mark"),
+        ):
+            await music_player.interject(playnow_obj, mock_vc)
+
+        assert order == ["mark", "stop"]
 
     async def test_the_marker_is_taken_before_the_insert_await(
         self,
