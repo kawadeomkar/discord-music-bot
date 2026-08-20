@@ -101,7 +101,7 @@ services:
       # The OTLP BatchSpanProcessor retries silently if otel-lgtm is slow to start,
       # so a hard dependency would break `docker compose up discord-music-bot redis`.
       # bgutil-pot-provider is intentionally NOT in depends_on either: the bot is
-      # fully functional without it (web_safari degrades to token-less, android_vr
+      # fully functional without it (the fallback client degrades to token-less, the primary
       # is untouched).
 
   redis:
@@ -317,7 +317,7 @@ services:
         condition: service_started
 
   bgutil-pot-provider:
-    # Mints GVS Proof-of-Origin tokens so web_safari can serve audio as a fallback
+    # Mints GVS Proof-of-Origin tokens so yt-dlp's fallback client can serve audio
     # client. Version must match the
     # bgutil-ytdlp-pot-provider pin in pyproject.toml — plugin and server are
     # released in lockstep; bump both together.

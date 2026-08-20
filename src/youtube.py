@@ -285,20 +285,15 @@ _YTDLP_LOGGER = _YtdlpLogger()
 
 # Client strategy. Relevant when bumping yt-dlp.
 #
-# android_vr is primary: it needs no PO token and serves audio-only formats. yt-dlp
-# resolves `default` by JS-runtime availability, so shipping Deno (yt-dlp's `deno`
-# extra, landing where yt-dlp looks first) plus yt-dlp-ejs turns ('android_vr',) into
-# ('android_vr', 'web_safari') and makes the fallback's signature/n challenges solvable.
-# web_safari serves *muxed* formats only (HLS 91-96, https 18) — the `/best` leg picks
-# one and ffmpeg's -vn drops the video. The bgutil-pot-provider sidecar mints PO tokens
-# via the bgutil-ytdlp-pot-provider plugin, whose pyproject pin must move in lockstep
-# with that compose image tag.
+# We pick NO client: `default` is yt-dlp's own list, and tracking it is the point —
+# upstream moves it when YouTube breaks a client. Names here are what `default`
+# resolved to, not configuration: RE-VERIFY ON EVERY BUMP. Today, `visionos,web`.
 #
-# Degradation ladder — every rung lands on a previously-working configuration:
-#   android_vr healthy → audio-only (e.g. 251/opus)
-#   android_vr out     → web_safari muxed audio; WARNING via _record_serving_format
-#   sidecar down       → plugin warns; web_safari works until POT enforcement lands
-#   Deno broken        → yt-dlp reverts to the JS-less default (android_vr only)
+# visionos carries playback (no PO token, no JS player, audio-only opus). The deno +
+# yt-dlp-ejs extras and the bgutil sidecar exist only to keep `web` usable as a
+# fallback: yt-dlp drops `web` without a JS runtime, and its formats are withheld
+# without a GVS token — measured, `web` alone often resolves no usable format, so
+# visionos is load-bearing. The bgutil pin tracks the compose image tag by hand.
 # Revoked URLs are separate: _resolve_playable_stream()'s probe-and-re-extract.
 # See docs/ARCHITECTURE.md#yt-dlp-client-strategy.
 #
@@ -408,9 +403,8 @@ _STREAM_CACHE_FIELDS = frozenset(
 )
 
 
-# format_ids already warned about — once per format per process, so a real
-# android_vr outage doesn't warn on every song. Optional[str] because an info-dict
-# can omit format_id; that case gets its own dedupe slot rather than being dropped.
+# Once per format per process, so a real outage doesn't warn on every song.
+# Optional[str] because an info-dict can omit format_id — that gets its own slot.
 _DEGRADED_FORMAT_WARNED: set[Optional[str]] = set()
 
 
@@ -418,9 +412,10 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
     """Record the shape of the format a song will play from. yt-dlp strips per-format
     client attribution (`__yt_dlp_client`) before formats leave the extractor, so the
     format shape is the signal instead: audio-only (vcodec "none") is healthy, while
-    muxed or HLS means android_vr degraded (yt-dlp#16150) or web_safari took over — one
-    warning, since playback continues and nothing else surfaces it. A missing vcodec
-    (pre-upgrade cache entries) counts as healthy.
+    muxed or HLS means the audio-only primary stopped serving and a fallback took over
+    — one warning, since playback continues and nothing else surfaces it. A missing
+    vcodec (pre-upgrade cache entries) counts as healthy. Phrased by SHAPE, never by
+    client name, so it survives yt-dlp changing what `default` resolves to.
     """
     span = trace.get_current_span()
     format_id = data.get("format_id")
@@ -433,8 +428,7 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
         log.warning(
             f"songs are being served a muxed A/V format "
             f"(format_id={format_id}, protocol={data.get('protocol')}) — the "
-            "primary audio-only path (android_vr) is degraded and the player is "
-            "on the fallback ladder"
+            "audio-only primary is degraded and the player is on the fallback ladder"
         )
 
 
@@ -447,7 +441,7 @@ def _stream_url_ttl(stream_url: str) -> Optional[int]:
     `expire` advertises a 6-hour window but YouTube revokes long before it (observed: a
     403 within the hour with five hours still claimed), so _STREAM_URL_MAX_TTL is what
     bounds this in practice. `expire` is a query param on https formats but a path
-    segment (`/expire/<epoch>/`) on the HLS manifests web_safari serves; missing either
+    segment (`/expire/<epoch>/`) on the HLS manifests the muxed rung serves; missing either
     leaves that rung re-extracting 3-5s on every play, so both forms are read.
     """
     try:

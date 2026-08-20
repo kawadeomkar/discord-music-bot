@@ -380,6 +380,21 @@ pins:
         fail=1
     fi
 
+    # The yt-dlp version is quoted in prose by both tracked docs, and those copies
+    # are what a reader trusts when deciding whether the client strategy described
+    # there still applies. Nothing else compares them: Dependabot moves pyproject
+    # and poetry.lock together in a PR that touches neither file and stays green,
+    # and main already carried a stale 2026.7.4 in both for exactly that reason.
+    # Mechanical, so it is enforced here rather than left on rule 6's hand-check list.
+    want_ytdlp="$(sed -n 's/^yt-dlp = { version = "\([^"]*\)".*$/\1/p' pyproject.toml)"
+    for doc in CLAUDE.md docs/ARCHITECTURE.md; do
+        if ! grep -qF "$want_ytdlp" "$doc"; then
+            echo "yt-dlp pin drift: pyproject.toml=[$want_ytdlp] not found in $doc" >&2
+            echo "  That file describes the client strategy for a version it no longer names." >&2
+            fail=1
+        fi
+    done
+
     exit "$fail"
 
 # What CI's lint and test jobs run — run this before pushing

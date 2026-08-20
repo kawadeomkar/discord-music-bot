@@ -31,7 +31,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Package manager | Poetry 2.x (`poetry.toml`, in-project venv) |
 | Task runner | `just` (justfile is the index of every dev command) |
 | Discord | discord.py 2.7.1 (exact pin), prefix commands (`-`), voice via PyNaCl/FFmpeg |
-| Extraction | yt-dlp 2026.7.4 (exact pin, extras `[default, deno]`) in a **ProcessPoolExecutor** |
+| Extraction | yt-dlp 2026.8.18.122307.dev0 (exact pin, a **nightly** — see the note on the pin; extras `[default, deno]`) in a **ProcessPoolExecutor** |
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
@@ -88,10 +88,10 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    never creates the group, and a mis-shaped key is inert — downgraded to a startup
    warning by the leftover-outbox probe.)
 6. **Version pins move in lockstep.** Bump both halves in the same commit. `just pins`
-   enforces seven pairs — it is a dep of `check` and CI also runs it as its own step,
+   enforces eight pairs — it is a dep of `check` and CI also runs it as its own step,
    deliberately: Dependabot's `pip` and `pre-commit` ecosystems open SEPARATE PRs that
    each move one half, and those PRs are validated by CI and never by a local `check`.
-   The seven: the ruff pin (pyproject) ↔ the ruff hook `rev` in
+   The eight: the ruff pin (pyproject) ↔ the ruff hook `rev` in
    `.pre-commit-config.yaml`; the image name (justfile `IMAGE` ↔ `build_common.sh`
    `IMAGE_NAME`); and `postgres:18-alpine` / `redis:7-alpine` each across three files —
    the integration tier's `_PG_IMAGE`/`_REDIS_IMAGE`, `ci.yml`'s service container, and
@@ -101,6 +101,10 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
    `-debug`'s cpu/mem row reading `n/a (no metrics source)` forever rather than
    failing. The compose legs are anchored to the named service, not `head -1`, so a
    second postgres or redis service cannot silently shift what is compared.
+   The eighth is the **yt-dlp version** (pyproject) ↔ the copies quoted in prose by
+   `CLAUDE.md` and `docs/ARCHITECTURE.md`: those docs describe the client strategy for a
+   specific version, Dependabot can move pyproject + `poetry.lock` in a PR touching
+   neither, and main already carried a stale `2026.7.4` in both for exactly that reason.
    **Three pairs are NOT enforced — this list is what a maintainer checks by hand,
    so keep it complete:**
    (a) `bgutil-ytdlp-pot-provider` (pyproject) ↔ the
@@ -171,7 +175,7 @@ just fmt            # ruff format + autofix (REWRITES files)     ~0.1s
 just fmt-justfile   # `just --fmt --check` on the justfile        ~0.01s
 just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
-just pins           # assert the six duplicated version/name pins ~0.02s
+just pins           # assert the eight duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
 just test           # pytest with coverage (fail_under=80)        ~27s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
@@ -742,10 +746,18 @@ own exceptions carry live tracebacks and can't cross), successes `_slim_info`'d
 (sanitize + drop `formats`/`thumbnails`/etc., commonly 100 KB–1 MB nobody reads).
 
 **Client strategy** (comment block above `_EXTRACTOR_ARGS` in youtube.py):
-`android_vr` primary (no PO token needed, audio-only formats), `web_safari` as a
-*working* fallback — enabled by shipping Deno (`deno` extra) + yt-dlp-ejs (`default`
-extra) for JS challenges, and the **bgutil PO-token sidecar** (compose service on :4416,
-plugin pin in lockstep) for when YouTube enforces tokens on muxed formats. Format ladder
+the config names **no client** — it passes `default`, yt-dlp's own list, which is
+`visionos,web` today (README: "By default, `visionos,web` is used") and was
+`android_vr`-led before. Tracking upstream's default IS the strategy: yt-dlp moves it
+when YouTube breaks a client. Any client name in these docs is a record of what
+`default` resolved to at the time — **re-verify on every yt-dlp bump**. `visionos`
+carries playback (no PO token, no JS player, audio-only 251/opus over https); `web` is
+the fallback, and both extras exist to keep it usable — yt-dlp DROPS `web` from
+`default` when no JS runtime is present, so Deno (`deno` extra) + yt-dlp-ejs (`default`
+extra) is what keeps a fallback at all, and the **bgutil PO-token sidecar** (compose
+service on :4416, plugin pin hand-checked in lockstep — NOT covered by `just pins`, see
+rule 6a) mints the GVS token `web`'s formats need. Measured: `web` alone often resolves
+no usable format without that token, so `visionos` is load-bearing in practice. Format ladder
 `bestaudio/best[height<=360]/best` — the 360p cap matters: on the muxed fallback rung,
 plain `best` would stream ~120 MB of 1080p video per song just for ffmpeg's `-vn` to
 discard. `_record_serving_format` warns once per format_id when serves degrade to
@@ -1104,7 +1116,18 @@ of `redis_client.py` and `HistoryOutboxDrainer._enforce_cap` before changing any
 and run `just test-redis` — the unit tier cannot see three of these.
 
 **Bump yt-dlp**: it is exact-pinned; if `bgutil-ytdlp-pot-provider` moves too, bump the
-compose image tag in the same commit. After any dependency change, `just
+compose image tag in the same commit. The pin is currently a **nightly** (`.dev0`,
+`allow-prereleases = true`) because the newest stable, 2026.7.4, 403s on the media fetch
+for nearly every video under YouTube's current GVS enforcement — extraction succeeds, so
+the client ladder never degrades and the song dies at ffmpeg with the stream refused
+(measured 6 of 7 videos failing on 2026.7.4, 7 of 7 fetching on the nightly, same host
+and extractor args). **Check for a stable newer than 2026.7.4 before assuming a nightly
+is still required**, and move back to one when it ships — `security.yml`'s weekly
+`ytdlp-stable-watch` job warns when PyPI has one, since nothing else notices a nightly
+quietly becoming permanent. **Rolling the image back reinstates the broken stable**: the
+change is data-safe (nothing new is persisted; both caches are TTL'd and self-heal within
+the hour) but rolling back restores the outage this pin exists to fix, so never do it to
+chase an unrelated symptom. After any dependency change, `just
 test-image-rebuild` before `DOCKER=1` recipes. Watch `_record_serving_format` warnings
 and the `_YtdlpLogger` warnings after deploy — they are the early-warning system for
 YouTube-side changes.

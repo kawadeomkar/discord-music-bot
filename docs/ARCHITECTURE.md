@@ -87,8 +87,8 @@ graph TD
 |---|---|---|
 | Runtime | Python 3.14 (`requires-python >=3.14,<4.0`) | Asyncio event loop |
 | Discord client | `discord.py` 2.7.1 | Gateway, voice, commands framework |
-| Audio extraction | `yt-dlp` 2026.7.4 (pinned, `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so `web_safari` works as a fallback client |
-| PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so `web_safari` can serve audio-only formats |
+| Audio extraction | `yt-dlp` 2026.8.18.122307.dev0 (pinned to a **nightly**; `[default, deno]` extras) | YouTube / SoundCloud metadata and stream URLs; extras ship `yt-dlp-ejs` (JS challenge solver) + the Deno runtime so yt-dlp's fallback client stays available |
+| PO token provider | `bgutil-ytdlp-pot-provider` 1.3.1 (pip plugin, pinned to the sidecar image tag) | Mints GVS Proof-of-Origin tokens via the `discord-pot-provider` sidecar so the fallback client's formats are served at all |
 | Codec | FFmpeg (system, installed in the runtime image) | Decode + re-encode to Opus for Discord |
 | State / cache | `redis` 8.x (`redis.asyncio` client; constraint `>=5.0.0`) | Runtime queue/state, yt-dlp URL cache, Spotify cache, `history:outbox` buffer |
 | Durable tier | `asyncpg` (Postgres 18) | `play_history` archive: outbox drain writes, `-leaderboard` reads, in-app SQL migration runner (`src/db_migrate.py`) |
@@ -113,7 +113,7 @@ Five containers are defined in [docker-compose.yml](../docker-compose.yml):
 | `discord-music-bot` | Local build (tagged with git SHA) | `restart: always`, `network_mode: host`, `depends_on: service_healthy` on Redis, named volume for yt-dlp's disk cache (player JS + solved challenges survive restarts) |
 | `discord-redis` | `redis:7-alpine` | AOF persistence, 256 MB `volatile-lru` eviction, healthcheck |
 | `discord-postgres` | `postgres:18-alpine` | The durable tier (`play_history`). On the `archive` profile, which the deploy tooling activates from `HISTORY_ARCHIVE_ENABLED` — Compose never reads that flag itself, so a raw `docker compose up` deploys no Postgres; NOT in `depends_on` — the outbox buffers in Redis until it comes up. Volume target is `/var/lib/postgresql` (the 18+ image layout — the old `.../data` path would store the cluster outside the volume) plus a `postgres-backups` volume at `/backups` for `pg_backup.sh`'s nightly dumps |
-| `discord-pot-provider` | `brainicism/bgutil-ytdlp-pot-provider:1.3.1` (tag locked to the pip plugin pin) | GVS Proof-of-Origin token minting for the `web_safari` fallback client, `127.0.0.1:4416`; NOT in `depends_on` — the bot degrades gracefully without it (see [PO_TOKEN_SIDECAR_PLAN.md](PO_TOKEN_SIDECAR_PLAN.md)) |
+| `discord-pot-provider` | `brainicism/bgutil-ytdlp-pot-provider:1.3.1` (tag locked to the pip plugin pin) | GVS Proof-of-Origin token minting for yt-dlp's fallback client, `127.0.0.1:4416`; NOT in `depends_on` — the bot degrades gracefully without it (see [PO_TOKEN_SIDECAR_PLAN.md](PO_TOKEN_SIDECAR_PLAN.md)) |
 | `discord-otel-lgtm` | `grafana/otel-lgtm` | All-in-one Grafana (UI `:3000`) + Tempo + Loki + Mimir, OTLP gRPC on `:4317` |
 
 `network_mode: host` is used because the bot makes only outbound connections — no inbound ports are needed.
@@ -1343,24 +1343,37 @@ counting attempts against a real connect distinguishes them. Without an explicit
 
 ### yt-dlp client strategy
 
-`android_vr` is primary because it needs no PO token and offers audio-only formats;
-`web_safari` is a *working* fallback only because the image ships Deno plus yt-dlp-ejs
-(for JS challenges) and the bgutil PO-token sidecar. The plugin pin in `pyproject.toml`
-and the sidecar image tag in `docker-compose.yml` **move in lockstep** — `just pins`
-checks this and CI runs it.
+The bot names **no client**: `_EXTRACTOR_ARGS` passes `default`, which is yt-dlp's own
+list. That is the strategy, not an omission — upstream moves its default when YouTube
+breaks a client, and a hardcoded name pins us to one nobody is defending. Today
+`default` is `visionos,web` (yt-dlp README: "By default, `visionos,web` is used"); it
+was `android_vr`-led in an earlier release, so **treat every client name in this section
+as a snapshot to re-verify on each yt-dlp bump.**
+
+`visionos` carries playback: no PO token, no JS player, audio-only https (251/opus).
+`web` is the fallback, and it only exists because the image ships Deno plus yt-dlp-ejs —
+yt-dlp drops `web` from `default` outright when no JS runtime is available — with the
+bgutil sidecar minting the GVS PO token its formats require. The plugin pin in
+`pyproject.toml` and the sidecar image tag in `docker-compose.yml` **move in lockstep,
+and nothing enforces it**: `just pins` does not cover this pair, so it is a hand check
+(see CLAUDE.md rule 6a).
 
 The degradation ladder is designed so every rung lands on a previously-working
-configuration: `android_vr` healthy → audio-only; `android_vr` out → `web_safari`
-muxed audio, warned once per format by `_record_serving_format`; sidecar down →
-`web_safari` still works until PO-token enforcement lands; Deno broken → yt-dlp
-reverts to the JS-less default, which is `android_vr` alone. Those warnings are the
-early-warning system for YouTube-side changes; watch them after any yt-dlp bump.
+configuration: `visionos` healthy → audio-only 251/opus; `visionos` out → `web` muxed or
+SABR, warned once per format by `_record_serving_format` (yt-dlp's `tv_downgraded` /
+`web_embedded` clients are **not** a rung here: they live in `_DEFAULT_AUTHED_CLIENTS`,
+selected only `if self.is_authenticated`, and this bot sends no cookies or
+credentials); sidecar down → `web`'s formats are withheld without a GVS
+token, and measurement shows `web` alone frequently resolves no usable format at all, so
+this rung is thinner than it reads; Deno broken → `web` leaves `default` entirely and
+`visionos` is all that remains. Those warnings are the early-warning system for
+YouTube-side changes; watch them after any yt-dlp bump.
 
 Two facts that constrain deployment rather than extraction: YouTube signs `ip` inside
 the `sparams` HMAC of every stream URL, so a URL is bound to the host that extracted
 it and can never be replayed from another machine — relevant to any multi-host or
 sharded deployment. And `fetch_pot=auto` consults the sidecar only when a selected
-format requires a token, so it costs nothing while `android_vr` is healthy; YouTube's
+format requires a token, so it costs nothing while `visionos` is healthy; YouTube's
 PO-Token guide lists HLS as exempt "currently", which is why the sidecar is
 provisioned ahead of enforcement rather than after it.
 
