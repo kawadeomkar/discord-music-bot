@@ -367,6 +367,7 @@ class MusicPlayer:
         "_restore_task",
         "_restore_complete",
         "_restore_read_failed",
+        "_stopped_deliberately",
         "_playback_gate",
         "_playback_holds",
         "_background_tasks",
@@ -403,6 +404,7 @@ class MusicPlayer:
     _restore_task: Optional[asyncio.Task]
     _restore_complete: asyncio.Event
     _restore_read_failed: bool
+    _stopped_deliberately: bool
     _playback_gate: asyncio.Event
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
@@ -476,6 +478,10 @@ class MusicPlayer:
         # ambiguous — nothing saved vs nothing readable — and a command reporting the
         # first when it means the second tells a guild its queue is gone.
         self._restore_read_failed = False
+        # Set by whoever calls vc.stop() on the live song, cleared at each vc.play().
+        # Zero frames alone cannot tell a stream that never opened from one we stopped
+        # before its first frame; this is the half that says which.
+        self._stopped_deliberately = False
         # Restore and *play* are separate concerns: the gate stays shut until a
         # command establishes a voice connection, so a player built by a command that
         # never connects — every command that reaches the cog hook builds one, and
@@ -1836,6 +1842,7 @@ class MusicPlayer:
         # Only if the song we measured is still playing: if the loop moved on, the
         # inserted entries play next anyway and stopping would kill the NEXT song.
         if self.current_song is current:
+            self.note_deliberate_stop()
             vc.stop()
 
         # After the insert, so the tail just built is counted.
@@ -1985,7 +1992,9 @@ class MusicPlayer:
             )
         return source
 
-    async def _stream_source(self, source: QueueObject) -> Optional[YTDL]:
+    async def _stream_source(
+        self, source: QueueObject, *, allow_reextract: bool = True
+    ) -> Optional[YTDL]:
         self._last_stream_error = None
         try:
             return await YTDL.yt_stream(
@@ -1993,6 +2002,7 @@ class MusicPlayer:
                 self._channel,
                 volume=self.volume,
                 redis=self.store.redis if self.store is not None else None,
+                allow_reextract=allow_reextract,
             )
         except Exception as e:
             ctx = trace.get_current_span().get_span_context()
@@ -2089,6 +2099,48 @@ class MusicPlayer:
         except Exception as e:
             log.warning(
                 f"Failed to send stream-retry notice in guild {self._guild.id}: {e}"
+            )
+
+    def note_deliberate_stop(self) -> None:
+        """Record that the live song is about to be stopped by us, not by ffmpeg.
+        Call BEFORE vc.stop(); the loop clears it at each vc.play(). A stop we initiate
+        ends the player thread without another source.read(), so `after` gets
+        error=None — indistinguishable, on frame count alone, from a dead stream."""
+        self._stopped_deliberately = True
+
+    async def _drop_unplayable_stream_cache(self, song: YTDL) -> None:
+        """Drop the cached stream URL of a song that ended with no frame, no error, and
+        no deliberate stop.
+
+        A BACKSTOP, not the main path. discord.py reports a failing ffmpeg through
+        `after` (read() -> _check_process_returncode), which is the `stream_failed` path
+        _handle_dead_stream owns. What reaches HERE is the window that check declines to
+        judge: it returns early while `self._process.poll()` is still None, so a child
+        that closed stdout but has not been reaped loses its error.
+
+        Cache only, on purpose: being wrong costs one re-extraction, while widening
+        `stream_failed` on the same evidence would suppress a real history entry.
+
+        A zero-frame song reaching the loop's iteration end IS still recorded, at
+        played_secs=0, while `claim_current_song_for_history` refuses one. That lone
+        disagreement is about FRAMES, not about teardown: a song a teardown abandons
+        mid-play is recorded at its true position whenever it produced audio. The two
+        rules differ on purpose — do not "align" them without deciding which record
+        the archive is supposed to hold."""
+        if self.store is None or not song.webpage_url:
+            return
+        dropped = await invalidate_stream_cache(self.store.redis, song.webpage_url)
+        # Report the outcome, not the intent: the common case here has nothing cached,
+        # and a deletion announced unconditionally reads as a YouTube early warning.
+        if dropped:
+            log.warning(
+                "stream ended with no audio and no error, dropped its cached URL: "
+                f"{song.webpage_url}"
+            )
+        else:
+            log.info(
+                "stream ended with no audio and no error; nothing was cached for "
+                f"{song.webpage_url}"
             )
 
     async def _handle_dead_stream(self, song: YTDL) -> None:
@@ -2324,7 +2376,10 @@ class MusicPlayer:
         trace.get_current_span().set_attribute("discord.guild_id", str(self._guild.id))
         try:
             source = await self._resolve_source(source)
-            song = await self._stream_source(source)
+            # No re-extraction here: _cancel_prefetch() awaits this task, and an
+            # executor job cannot be interrupted, so every bulk mutation would wait
+            # on it. The play-time resolve decides instead.
+            song = await self._stream_source(source, allow_reextract=False)
         except asyncio.CancelledError:
             self.queue.requeue_front(source)
             raise
@@ -2527,6 +2582,7 @@ class MusicPlayer:
                             log.error(f"playback error for {_title}: {error}")
                         self.bot.loop.call_soon_threadsafe(self.play_next.set)
 
+                    self._stopped_deliberately = False
                     vc.play(song, after=_after_play)
                     if song.start_paused:
                         # Park the player thread SYNCHRONOUSLY, before any await, so
@@ -2596,6 +2652,10 @@ class MusicPlayer:
                     # -playnow or stopped the instant it started (vc.stop() reports
                     # no error), and an error alone also describes a mid-song death
                     # that delivered real audio and earns its history entry.
+                    # A THIRD case joins these below: zero frames, no error, and no
+                    # deliberate stop. discord.py surfaces a failing ffmpeg as an
+                    # error, so that case is the narrow window where the child had not
+                    # been reaped yet — see _drop_unplayable_stream_cache.
                     stream_failed = (
                         not song.produced_audio and play_error[0] is not None
                     )
@@ -2832,6 +2892,16 @@ class MusicPlayer:
                         # Anything that actually played proves the pipeline works, so
                         # the next failure starts from a full budget again.
                         self._consecutive_dead_songs = 0
+                    elif (
+                        not song.produced_audio
+                        and not self._stopped_deliberately
+                        and not song.start_paused
+                    ):
+                        # Zero frames, no error, nobody stopped it. start_paused is
+                        # the one other ending that looks identical and says nothing
+                        # about the URL: a song parked at vc.pause() and torn down
+                        # before it ever played.
+                        await self._drop_unplayable_stream_cache(song)
                 except asyncio.CancelledError:
                     span.set_attribute("loop.cancelled", True)
                     await self._cancel_progress_task()

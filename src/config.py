@@ -46,6 +46,12 @@ def _parse() -> str:
 
 ENVIRONMENT: str = _parse()
 
+# Touched by a loop-resident task so the container HEALTHCHECK can tell a wedged
+# event loop from a healthy one. Unset — the default outside Docker — skips the
+# task; nothing reads the file there.
+LIVENESS_FILE: str = os.environ.get("LIVENESS_FILE", "")
+LIVENESS_INTERVAL_SECS: float = float(os.environ.get("LIVENESS_INTERVAL_SECS", "15.0"))
+
 NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
