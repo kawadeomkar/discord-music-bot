@@ -1981,9 +1981,11 @@ class MusicPlayer:
         `stream_failed` on the same evidence would suppress a real history entry.
 
         A zero-frame song reaching the loop's iteration end IS still recorded, at
-        played_secs=0, while `claim_current_song_for_history` refuses one for a song
-        abandoned MID-PLAY. The two rules differ on purpose — do not "align" them
-        without deciding which record the archive is supposed to hold."""
+        played_secs=0, while `claim_current_song_for_history` refuses one. That lone
+        disagreement is about FRAMES, not about teardown: a song a teardown abandons
+        mid-play is recorded at its true position whenever it produced audio. The two
+        rules differ on purpose — do not "align" them without deciding which record
+        the archive is supposed to hold."""
         if self.store is None or not song.webpage_url:
             return
         dropped = await invalidate_stream_cache(self.store.redis, song.webpage_url)
