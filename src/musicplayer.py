@@ -389,11 +389,9 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
-    # Last payload actually pushed, and the host it went to — the
-    # no-op-edit guard in _push_np_edit. Reset whenever the host changes.
-    # `list[Any]`, not `list[dict]`: Embed.to_dict() returns a TypedDict, and
-    # list is invariant, so the narrower annotation rejects the assignment.
-    # The value is opaque here — it is only ever compared for equality.
+    # Last payload pushed and the host it went to, for the no-op-edit guard in
+    # _push_np_edit. Compared only for equality; Embed.to_dict() is a TypedDict
+    # and list is invariant, so the element type stays Any.
     _np_last_rendered: Optional[list[Any]]
     _np_last_id: Optional[int]
     _np_host_message: Optional[discord.Message]
@@ -1559,9 +1557,8 @@ class MusicPlayer:
         self._np_host_message = None
         self._np_host_own_embeds = []
         self._np_host_dedicated = False
-        # Drop the no-op-edit cache with the host. Retiring can strip-edit the
-        # message by a path that never goes through _push_np_edit, so a stale
-        # entry could suppress a genuinely needed edit later.
+        # Retiring can strip-edit the message outside _push_np_edit, so the cache
+        # goes with the host or a stale entry suppresses a needed edit.
         self._np_last_rendered = None
         self._np_last_id = None
 
@@ -2117,22 +2114,10 @@ class MusicPlayer:
             # here if a next-up embed appears later. Drop the own-embeds tail, never
             # the block (parity with MusicContext.send's guard; unreachable today).
             embeds = embeds[:10]
-            # Skip the PATCH when nothing rendered differently. The bar advances
-            # one cell at a time, so at a 3s tick most ticks re-render an
-            # identical payload: a 4-minute song costs ~80 edits to display a
-            # bar that only changes ~10 times. Per channel that is inside
-            # Discord's edit budget, but per *bot* this is the dominant REST
-            # rate-limit cost and the thing that bounds concurrent-guild scale.
-            #
-            # Keyed on the rendered payload rather than on position, so every
-            # reason an embed can change (pause state, next-up, volume, a
-            # swapped-in own embed) is covered without enumerating them. Same
-            # approach as ping.py's _ping_embed_changed.
-            #
-            # A guild with debug mode on saves nothing here: the footer carries
-            # the runtime snapshot, which resamples on the same cadence as this
-            # tick, so the payload differs every time. That is the footer doing
-            # its job — debug is opt-in and off by default.
+            # Skip the PATCH when the payload is identical to the last one pushed
+            # to this host. The bar changes ~10 times in a 4-minute song while the
+            # 3s tick fires ~80, so most edits carry nothing new.
+            # See docs/ARCHITECTURE.md#now-playing-host-model
             rendered = [e.to_dict() for e in embeds]
             if rendered == self._np_last_rendered and message.id == self._np_last_id:
                 return True

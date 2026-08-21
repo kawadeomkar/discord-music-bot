@@ -679,6 +679,24 @@ Mechanics:
 
 **Progress bar**: `_progress_updater` edits the host's NP embed every `NOW_PLAYING_UPDATE_INTERVAL_SECS` (default 3 s). Position comes from the audio itself: `YTDL.read()` counts frames (`elapsed_secs = frames × 20 ms`), and `position_secs = start_offset + elapsed_secs`. Because discord.py's `AudioPlayer` simply doesn't call `read()` while paused, the counter freezes automatically for explicit pauses **and** involuntary stalls (voice reconnects) with zero bookkeeping. `position_secs` is the single source of truth for every position surface (bar, presence tooltip, pause confirmation).
 
+**Identical re-renders are not pushed.** `_push_np_edit` compares the rendered payload
+(`[e.to_dict() for e in embeds]`) and the host id against the last pair it sent
+successfully, and returns without a PATCH when both match. The bar has ten segments, so a
+four-minute song's display changes ~10 times while the 3 s tick fires ~80: roughly seven
+in eight edits carried nothing new, one request each from a bucket shared across every
+concurrently-playing guild. Keying on the payload rather than on playback position covers
+pause state, next-up, volume and a swapped-in own embed without enumerating them — the
+same approach `dashboard.py` uses for `-ping` and `-debug`. The pair is recorded only
+after a successful edit, so a failure cannot suppress its own retry, and
+`_release_np_host` clears it because retirement can strip-edit the message by a path that
+never reaches `_push_np_edit`.
+
+A guild with **debug mode** enabled saves nothing here: the footer carries the runtime
+snapshot, which `RuntimeSampler` resamples at
+`max(1.0, min(5.0, NOW_PLAYING_UPDATE_INTERVAL_SECS))` — the same 3 s cadence as the tick
+— so the payload differs every time. That is the footer reporting live values; debug mode
+is opt-in per guild and off by default.
+
 **Presence**: `update_activity(song)` sets a "Listening to *title · uploader*" activity with `timestamps` derived from `position_secs` (backdated `start`, computed `end`). While paused, `timestamps` is empty — Discord's Activity schema has no "frozen" representation. On song end it resets to "Playing music", but only when **no other guild** is still playing.
 
 ---
