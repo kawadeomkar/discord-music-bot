@@ -43,6 +43,7 @@ from src.redis_client import (
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
+    TIMESTAMP_FORMATS,
     unquote_argument,
     SoundcloudSource,
     SpotifySource,
@@ -192,6 +193,27 @@ _ECHO_MAX = 200
 
 # One row of a multi-row field — ten of these share the budget one needle gets.
 _ECHO_ROW_MAX = 70
+# The unparseable `t=` echoed back. Short: it is quoted inside a sentence, and a
+# pasted URL fragment can be arbitrarily long.
+_TIMESTAMP_ECHO_MAX = 40
+
+
+def timestamp_warning(
+    source: Union[SpotifySource, YTSource, SoundcloudSource],
+) -> Optional[str]:
+    """One line naming a `t=` value that did not parse, or None.
+
+    Stated rather than silent, for the reason the playlist branch reports its
+    skipped count: something the user wrote in their own URL changed where the
+    song starts, and nothing else in the response accounts for it."""
+    if not isinstance(source, YTSource) or source.bad_timestamp is None:
+        return None
+    shown = safe_label(source.bad_timestamp, _TIMESTAMP_ECHO_MAX)
+    return (
+        f"⚠️ Couldn't read the timestamp `{shown}` in that link — starting from "
+        f"the beginning. YouTube's `t=` takes {TIMESTAMP_FORMATS}."
+    )
+
 
 # The most dropped positions worth spelling out; past this the list says nothing
 # the count above it did not.
@@ -821,6 +843,8 @@ class MusicBot(commands.Cog):
         # collapses it to the first track to bound how long an interrupted song
         # waits. Nothing is playing to interrupt on this path.
         enqueue = mp.queue_put_front if front else mp.queue_put
+        warning = timestamp_warning(source)
+        warning_line = f"\n\n{warning}" if warning else ""
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(
@@ -832,7 +856,8 @@ class MusicBot(commands.Cog):
                 send_embed(
                     ctx,
                     "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}",
+                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
+                    f"{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -868,7 +893,7 @@ class MusicBot(commands.Cog):
                     ctx,
                     f"Queued playlist — {count} {pluralize(count, 'song')}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
-                    f"{skipped_line}\n{shown_titles}",
+                    f"{skipped_line}\n{shown_titles}{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -883,7 +908,13 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         front: bool = False,
+        warning: Optional[str] = None,
     ) -> None:
+        """`warning` rides the confirmation embed when there is one. Every exit
+        below sends it either way: the embed is conditional (a song that starts
+        immediately gets none) and the warning is about what the user typed, so
+        losing it on the quietest path would hide it in the common case of
+        queueing the first song."""
         vc = ctx.voice_client
         if front:
             # The "Est. playing at" embed below would be wrong: a restored queue is
@@ -898,6 +929,10 @@ class MusicBot(commands.Cog):
             ]
             if resume_notice is not None:
                 coros.append(ctx.send(embed=resume_notice))
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
             await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
@@ -910,6 +945,7 @@ class MusicBot(commands.Cog):
             ctx.message.add_reaction("👍"),
         ]
         if should_show_queued:
+            warning_line = f"\n\n{warning}" if warning else ""
             coros.append(
                 send_embed(
                     ctx,
@@ -918,11 +954,16 @@ class MusicBot(commands.Cog):
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
                         f"Est. playing at {mp.estimated_playing_at()}"
+                        f"{warning_line}"
                     ),
                     discord.Color.blue(),
                     thumbnail=qobj.thumbnail,
                 )
             )
+        elif warning is not None:
+            # Nothing else is being sent on this path — the song starts now and
+            # the NP card speaks for it — so the warning needs its own message.
+            coros.append(ctx.send(embed=notice_embed(warning, discord.Color.orange())))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
@@ -1091,7 +1132,13 @@ class MusicBot(commands.Cog):
                             return
 
                     if isinstance(qobj, QueueObject):
-                        await self._enqueue_single(ctx, qobj, mp, front=front)
+                        await self._enqueue_single(
+                            ctx,
+                            qobj,
+                            mp,
+                            front=front,
+                            warning=timestamp_warning(source),
+                        )
                     else:
                         await self._enqueue_playlist(
                             ctx,
@@ -1276,7 +1323,7 @@ class MusicBot(commands.Cog):
             # minted for the interjection. Read here: the queue moved during the
             # resolve.
             qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
-            await self._enqueue_single(ctx, qobj, mp)
+            await self._enqueue_single(ctx, qobj, mp, warning=timestamp_warning(source))
             return
 
         outcome = await mp.interject(qobj, vc, resume_paused=resume_paused)

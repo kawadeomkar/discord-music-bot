@@ -21,6 +21,7 @@ from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.guild_state import Analytics, HistoryEntry
 from src.musicbot import (
+    timestamp_warning,
     RESTORE_WAIT_SECS,
     _echo,
     _removed_label,
@@ -37,7 +38,15 @@ from src.musicbot import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import EMBED_FIELD_LIMIT
-from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
+from src.sources import (
+    TIMESTAMP_FORMATS,
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+    parse_url,
+)
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
@@ -4910,3 +4919,82 @@ class TestShuffleWaitsForTheRestore:
             await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
 
         mp.queue_shuffle.assert_awaited_once()
+
+
+class TestTimestampWarning:
+    """A `t=` that does not parse changes where the song starts, so the response
+    has to say so — the seek is otherwise dropped with nothing on screen."""
+
+    def test_none_when_the_timestamp_parsed(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=1m30s")) is None
+
+    def test_none_for_a_link_with_no_timestamp(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a")) is None
+
+    def test_none_for_a_source_that_cannot_carry_one(self) -> None:
+        """Spotify and SoundCloud have no `t=`; the helper takes the union type,
+        so the isinstance narrowing is what keeps this from raising."""
+        assert timestamp_warning(parse_url("https://soundcloud.com/a/b")) is None
+
+    def test_names_the_value_and_the_accepted_forms(self) -> None:
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=1h30"))
+        assert warning is not None
+        assert "1h30" in warning
+        assert TIMESTAMP_FORMATS in warning
+
+    def test_a_good_second_timestamp_suppresses_it(self) -> None:
+        """`?t=bad&ts=90` does start where the user asked, so warning about it
+        would be wrong."""
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=bad&ts=90")) is None
+
+    def test_the_echoed_value_cannot_break_out_of_its_code_span(self) -> None:
+        """The raw value is attacker-influenceable and is rendered inside
+        backticks, so safe_label's backtick neutralization is load-bearing."""
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=`x`[y](z)"))
+        assert warning is not None
+        assert "`x`" not in warning
+        assert "[y](z)" not in warning
+
+
+class TestTimestampWarningReachesTheUser:
+    @staticmethod
+    def _bad_ts_source() -> Any:
+        return parse_url("https://youtu.be/a?t=bogus")
+
+    async def test_it_rides_the_queued_song_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        assert send.await_args is not None
+        description = send.await_args[0][2]
+        assert "bogus" in description
+        assert "Est. playing at" in description  # folded in, not replacing it
+
+    async def test_it_gets_its_own_message_when_no_embed_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An idle bot plays the first song immediately and sends no "Queued
+        song" embed at all. Riding that embed alone would drop the warning in
+        the most ordinary case there is."""
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=0)
+        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        send.assert_not_awaited()
+        sent = [c.kwargs["embed"] for c in mock_ctx.send.await_args_list]
+        assert any("bogus" in (e.description or "") for e in sent)

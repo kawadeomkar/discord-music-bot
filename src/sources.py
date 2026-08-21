@@ -14,6 +14,10 @@ log = get_logger(__name__)
 # emits it, and old messages are re-pasted for years.
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
+# Quoted back to the user when their timestamp does not parse. Lives beside the
+# regex so the accepted shapes have one definition.
+TIMESTAMP_FORMATS: Final = "`90`, `90s`, `1m30s`, `2h30m15s`"
+
 
 def parse_timestamp(raw: str) -> Optional[int]:
     """Seconds from a YouTube `t`/`ts` value, or None if it isn't one.
@@ -115,6 +119,11 @@ class YTSource:
     list_id: Optional[str] = None
     index: Optional[int] = None
     video_id: Optional[str] = None
+    # The raw `t`/`ts` value that failed to parse, set only when no usable
+    # timestamp was found. Read once at the command layer to warn the requester
+    # and never persisted, so it carries none of the propagation contracts the
+    # fields below do.
+    bad_timestamp: Optional[str] = None
     # Ask-time analytics (guild_state.Analytics), carried onto the QueueObject
     # this resolves into. Parse-layer minting leaves the zero value — the real
     # one arrives per-track in spotify_playlist_to_ytsearch, or rides the
@@ -234,6 +243,7 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
         list_id: Optional[str] = None
         # `t` and `ts` are the same parameter under two names; `ts` wins if a URL
         # somehow carries both.
+        unparsed: list[str] = []
         for key in ("t", "ts"):
             for raw in args.get(key, []):
                 parsed = parse_timestamp(raw)
@@ -242,8 +252,12 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
                     # must not raise: parse_url's ValueError means "not a URL",
                     # which sends parse_input to search for the link's own text.
                     log.info(f"Ignoring unparseable timestamp {raw!r} in {url!r}")
+                    unparsed.append(raw)
                 else:
                     ts = parsed
+        # Only worth reporting when nothing usable was found: a URL carrying both
+        # a bad `t` and a good `ts` does start where the user asked.
+        bad_timestamp = unparsed[-1] if ts is None and unparsed else None
         list_id = _last(args, "list")
         raw_index = _last(args, "index")
         index: Optional[int] = (
@@ -259,9 +273,16 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
                 list_id=list_id,
                 index=index,
                 video_id=video_id,
+                bad_timestamp=bad_timestamp,
                 query_source=QUERY_SOURCE_YOUTUBE,
             )
-        return YTSource(url, ts=ts, process=False, query_source=QUERY_SOURCE_YOUTUBE)
+        return YTSource(
+            url,
+            ts=ts,
+            process=False,
+            bad_timestamp=bad_timestamp,
+            query_source=QUERY_SOURCE_YOUTUBE,
+        )
     elif domain in ("open.spotify.com", "spotify.com"):
         path = domain_match.group(4).split("/")
         try:
