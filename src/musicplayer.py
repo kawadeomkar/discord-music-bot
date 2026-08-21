@@ -351,6 +351,8 @@ class MusicPlayer:
         "_playback_holds",
         "_background_tasks",
         "_progress_task",
+        "_np_last_rendered",
+        "_np_last_id",
         "_np_host_message",
         "_np_host_own_embeds",
         "_np_host_dedicated",
@@ -387,6 +389,11 @@ class MusicPlayer:
     _playback_holds: int
     _background_tasks: set[asyncio.Task[Any]]
     _progress_task: Optional[asyncio.Task]
+    # Last payload pushed and the host it went to, for the no-op-edit guard in
+    # _push_np_edit. Compared only for equality; Embed.to_dict() is a TypedDict
+    # and list is invariant, so the element type stays Any.
+    _np_last_rendered: Optional[list[Any]]
+    _np_last_id: Optional[int]
     _np_host_message: Optional[discord.Message]
     _np_host_own_embeds: list[discord.Embed]
     _np_host_dedicated: bool
@@ -470,6 +477,8 @@ class MusicPlayer:
         self._playback_holds = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
+        self._np_last_rendered: Optional[list[Any]] = None
+        self._np_last_id: Optional[int] = None
         # NP host state: the message carrying the block, its own cached embeds that
         # follow it, and whether it is a dedicated NP message (deleted on retire) or
         # a command response (strip-edited).
@@ -1495,7 +1504,7 @@ class MusicPlayer:
         only the ids survive and own_embeds cannot be reconstructed from them, so
         the by-id delete is gated to DEDICATED cards. Never a re-adopt: the live bar
         belongs at the channel bottom. See
-        docs/ARCHITECTURE.md#now-playing-host-model.
+        docs/ARCHITECTURE.md#now-playing-host-invariants.
         """
         ref = song.np_host_ref
         if ref is not None:
@@ -1548,6 +1557,10 @@ class MusicPlayer:
         self._np_host_message = None
         self._np_host_own_embeds = []
         self._np_host_dedicated = False
+        # Retiring can strip-edit the message outside _push_np_edit, so the cache
+        # goes with the host or a stale entry suppresses a needed edit.
+        self._np_last_rendered = None
+        self._np_last_id = None
 
     async def retire_np_host_on_stop(self) -> None:
         """-stop / alone-disconnect teardown: dispose of the host so no message keeps
@@ -2101,7 +2114,18 @@ class MusicPlayer:
             # here if a next-up embed appears later. Drop the own-embeds tail, never
             # the block (parity with MusicContext.send's guard; unreachable today).
             embeds = embeds[:10]
+            # Skip the PATCH when the payload is identical to the last one pushed
+            # to this host. The bar changes ~10 times in a 4-minute song while the
+            # 3s tick fires ~80, so most edits carry nothing new.
+            # See docs/ARCHITECTURE.md#now-playing-host-model
+            rendered = [e.to_dict() for e in embeds]
+            if rendered == self._np_last_rendered and message.id == self._np_last_id:
+                return True
             await message.edit(embeds=embeds)
+            # Recorded only after a successful edit: caching a payload we failed
+            # to push would suppress the retry that fixes it.
+            self._np_last_rendered = rendered
+            self._np_last_id = message.id
             return True
         except discord.NotFound:
             return False
