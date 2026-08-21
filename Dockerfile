@@ -53,6 +53,28 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY src/ ./src/
 COPY tests/ ./tests/
+# The migration runner discovers .sql files at run time, and a test asserts the
+# directory's contents agree with EXPECTED_SCHEMA_VERSION — so the suite needs
+# them present, not just the module.
+COPY migrations/ ./migrations/
+# Same reason, different file: `just outbox` hardcodes the outbox key and consumer
+# group because a shell recipe cannot import them, and a test reads this file back
+# to prove the two have not drifted. Without it that guard fails in the container
+# tier with FileNotFoundError while passing everywhere else — which is how a check
+# ends up skipped instead of fixed.
+COPY justfile ./
+# And the same again for the default-password coupling. The literal lives in four
+# places no Python import can reach — compose, the build preflight, the env
+# template and the generator — so the tests read those files to prove they have
+# not drifted, and setup_env.sh is executed against a temp copy to prove it
+# tightens .env's mode. All four have to be in the image or those guards are
+# container-tier failures rather than assertions.
+COPY docker-compose.yml build_common.sh setup_env.sh .env.example ./
+# The two deploy entry points, for the same reason once more: the archive's
+# opt-in is a shell parser (resolve_archive_profile) and an ordering — migrate,
+# then `up` — that only these files record, so the tests read them back. Absent,
+# those seven guards fail with FileNotFoundError in the container tier alone.
+COPY deploy_docker.sh build_docker.sh ./
 
 ARG ENVIRONMENT=development
 # RUFF_CACHE_DIR is under /tmp so it stays writable when the container runs as
@@ -79,10 +101,51 @@ COPY --from=builder /app/.venv /app/.venv
 # Copy source last — most frequently changed, should be the last layer.
 COPY src/ ./src/
 COPY pyproject.toml ./
+# Required by the compose `db-migrate` one-shot, which runs `python -m
+# src.db_migrate` out of THIS image so the runner and the schema it applies can
+# never be different versions.
+COPY migrations/ ./migrations/
+
+# Non-root: ffmpeg and the venv need no privilege. The uid/gid are fixed rather
+# than distro-assigned so volume ownership survives rebuilds and base-image bumps.
+# HOME is set below because yt-dlp derives its cache directory from it, and
+# docker-compose.yml mounts ytdlp-cache at that path.
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid 10001 --home-dir /home/app --create-home app \
+ && mkdir -p /home/app/.cache/yt-dlp \
+ && chown -R app:app /home/app
+# Numeric, not `app`: kubelet checks runAsNonRoot against the image's USER and
+# cannot resolve a name, failing the pod with "image has non-numeric user".
+USER 10001:10001
 
 ARG ENVIRONMENT=production
+# The commit this image was built from. GIT_SHA existed only as an image TAG, so a
+# running bot could not report its own commit — `just up <sha>` deploys by tag and
+# the process never saw it. Both forms are needed: the LABEL is the OCI-standard
+# annotation external tooling reads, but labels are invisible from inside the
+# container, so -debug reads the ENV. Dirty builds pass `<sha>-dirty.<digest>`
+# through unchanged, so the bot reports exactly the tag that was deployed.
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="." \
-    ENVIRONMENT="${ENVIRONMENT}"
+    HOME="/home/app" \
+    ENVIRONMENT="${ENVIRONMENT}" \
+    GIT_SHA="${GIT_SHA}" \
+    LIVENESS_FILE="/tmp/bot-alive"
+
+# `restart: always` only covers the process exiting; a wedged event loop leaves
+# the container up while it answers nothing. The bot touches LIVENESS_FILE from a
+# loop-resident task, so a stale mtime means the loop stopped turning. Not a
+# dependency probe: a Redis blip must not mark the bot dead.
+#
+# This REPORTS, it does not act. The engine takes no action on an unhealthy
+# container — only Swarm, Kubernetes or an autoheal sidecar restarts one — so
+# under plain compose the effect is a status `docker ps` and monitoring can see.
+#
+# start-period covers login and extension load. interval x retries marks it
+# unhealthy after ~90s, above the 15s touch cadence.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; f=os.environ['LIVENESS_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 90 else 1)"
 
 CMD ["python", "-m", "src.main"]

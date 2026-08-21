@@ -14,9 +14,16 @@ from opentelemetry import trace
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from src import ping, telemetry
+from src import dashboard, ping, telemetry
+from src.debug import RuntimeSnapshot
 from src.config import SpotifyStatus
-from src.ping import ProbeResult, ProbeState, render_ping_embed
+from src.ping import (
+    ProbeResult,
+    ProbeState,
+    default_password_embed,
+    latency_color,
+    render_ping_embed,
+)
 from src.musicbot import MusicBot
 from tests.helpers import command_callback, mocked
 
@@ -65,6 +72,13 @@ def _ping_message(mock_ctx: MagicMock) -> MagicMock:
     return message
 
 
+def _health_embed(call: Any) -> discord.Embed:
+    """The health card out of a send/edit call. The dashboard sends a list (a
+    default-password advisory can ride in front of the card), and the health card
+    is always last — which is also what _safe_edit returns to the diffing loop."""
+    return call.kwargs["embeds"][-1]
+
+
 def _latency_field(embed: discord.Embed) -> str:
     return next(f.value for f in embed.fields if f.name == "Latency") or ""
 
@@ -88,8 +102,32 @@ class TestPingCommand:
         with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
         mock_ctx.channel.send.assert_awaited_once()
-        assert "embed" in mock_ctx.channel.send.call_args.kwargs
+        assert "embeds" in mock_ctx.channel.send.call_args.kwargs
         mock_ctx.send.assert_not_awaited()
+
+    async def test_a_probe_that_raises_costs_its_row_not_the_whole_board(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """_timed guards a probe's BODY, not everything a probe does — probe_otel
+        parses a URL first. A settle callback runs on the driver's own task, so an
+        unguarded raise there took the board down before it was ever sent.
+        """
+        message = _ping_message(mock_ctx)
+
+        async def exploding() -> ping.ProbeResult:
+            raise ValueError("port could not be cast")
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 1.0)),
+            patch("src.ping.probe_otel", exploding),
+        ):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        mock_ctx.channel.send.assert_awaited_once()  # the board still exists
+        call = message.edit.await_args or mock_ctx.channel.send.await_args
+        rendered = str(_health_embed(call).to_dict())
+        assert "OTEL collector" in rendered
+        assert ProbeState.FAILED.value in rendered
 
     async def test_all_resolved_settles_in_the_send_embed(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -104,7 +142,7 @@ class TestPingCommand:
             otel=_probe(ProbeState.OK, 3.0),
         ):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        sent = _health_embed(mock_ctx.channel.send.await_args)
         latency = _latency_field(sent)
         assert "120 ms" in latency and "pending" not in latency
         message.edit.assert_not_awaited()
@@ -112,12 +150,12 @@ class TestPingCommand:
     async def test_skeleton_prefills_na_and_off_not_pending(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """D2: unconfigured/disabled deps must never flash 'pending…' — the
-        pre-drain lands them in the skeleton send."""
+        """Unconfigured/disabled deps must never flash 'pending…' — the pre-drain
+        lands them in the skeleton send."""
         _ping_message(mock_ctx)
         with _patch_probes(otel=_probe(ProbeState.OFF)):  # redis None → NA on music_bot
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        latency = _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        latency = _latency_field(_health_embed(mock_ctx.channel.send.await_args))
         assert "n/a" in latency and "off" in latency and "pending" not in latency
 
     async def test_deadline_marks_straggler_failed(
@@ -143,7 +181,7 @@ class TestPingCommand:
                 await command_callback(MusicBot.ping)(music_bot, mock_ctx)
 
         message.edit.assert_awaited()  # the deadline edit
-        assert "failed" in _latency_field(message.edit.await_args.kwargs["embed"])
+        assert "failed" in _latency_field(_health_embed(message.edit.await_args))
 
     async def test_probe_resolving_mid_loop_edits_in_place(
         self,
@@ -151,7 +189,7 @@ class TestPingCommand:
         mock_ctx: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The headline behavior: a probe that returns AFTER the skeleton send is
+        """The headline behavior: a probe that returns after the skeleton send is
         folded in on a tick and the message is edited from pending → its latency."""
         message = _ping_message(mock_ctx)
         monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
@@ -170,14 +208,14 @@ class TestPingCommand:
                 )
                 await _until(lambda: mock_ctx.channel.send.await_count == 1)
                 # skeleton: Spotify still pending, nothing edited yet
-                skeleton = mock_ctx.channel.send.await_args.kwargs["embed"]
+                skeleton = _health_embed(mock_ctx.channel.send.await_args)
                 assert "pending" in _latency_field(skeleton)
                 message.edit.assert_not_awaited()
                 gate.set()  # Spotify returns → next tick must edit
                 await task
 
         message.edit.assert_awaited()
-        final = _latency_field(message.edit.await_args.kwargs["embed"])
+        final = _latency_field(_health_embed(message.edit.await_args))
         assert "42 ms" in final and "pending" not in final
 
     async def test_edit_on_deleted_message_is_tolerated(
@@ -216,15 +254,15 @@ class TestPingCommand:
         mocked(music_bot.bot).latency = float("nan")
         with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        sent = mock_ctx.channel.send.await_args.kwargs["embed"]
+        sent = _health_embed(mock_ctx.channel.send.await_args)
         assert sent.color is not None and sent.color.value == 0x990000
         assert "down" in _latency_field(sent)  # gateway row, not a crash
 
     async def test_join_uses_latency_line_not_the_dashboard(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Regression for §2.3 / C1: -join must post the cheap latency line and
-        must NOT run the dependency probes."""
+        """Regression: -join must post the cheap latency line and
+        must not run the dependency probes."""
         mock_ctx.voice_client = MagicMock(spec=discord.VoiceClient)
         mock_ctx.voice_client.channel = mock_ctx.author.voice.channel
         mock_ctx.guild.change_voice_state = AsyncMock()
@@ -247,11 +285,8 @@ class TestPingCommand:
 class TestPingReportsSpotifySource:
     """End-to-end: the Spotify row reports the *source's* startup state — never
     configured, configured-but-rejected, or live — so a user can see why Spotify
-    links are being declined without anyone reading the bot's logs.
-
-    Unlike the tests above, these leave probe_spotify unpatched: the cog's
-    _spotify_status is exactly what is under test here.
-    """
+    links are declined without reading the logs. probe_spotify is left unpatched
+    here: the cog's _spotify_status is what is under test."""
 
     def _patch_everything_but_spotify(self) -> Any:
         async def _make(res: ProbeResult) -> ProbeResult:
@@ -275,7 +310,7 @@ class TestPingReportsSpotifySource:
         _ping_message(mock_ctx)
         with self._patch_everything_but_spotify():
             await command_callback(MusicBot.ping)(music_bot, mock_ctx)
-        return _latency_field(mock_ctx.channel.send.await_args.kwargs["embed"])
+        return _latency_field(_health_embed(mock_ctx.channel.send.await_args))
 
     async def test_no_credentials_row_says_not_configured(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -303,6 +338,169 @@ class TestPingReportsSpotifySource:
         latency = await self._run(music_bot, mock_ctx)
         assert "ms" in latency
         assert "rejected" not in latency and "not configured" not in latency
+
+
+class TestPingReportsPostgres:
+    """End-to-end for the Postgres row, probe_postgres left UNPATCHED: the wiring
+    from the cog's history_archive through the dashboard to health_check is what
+    is under test. The probe once read a `pg_pool` attribute nothing ever set, so
+    the row was a permanent "n/a" while every unit test of it passed."""
+
+    def _patch_everything_but_postgres(self) -> Any:
+        async def _make(res: ProbeResult) -> ProbeResult:
+            return res
+
+        async def _versions() -> dict[str, str]:
+            await asyncio.sleep(0)  # yield so the immediate probes settle
+            return dict.fromkeys(
+                ["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x"
+            )
+
+        return patch.multiple(
+            "src.ping",
+            probe_redis=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_spotify=lambda *a, **k: _make(_probe(ProbeState.NA)),
+            probe_otel=lambda *a, **k: _make(_probe(ProbeState.OFF)),
+            collect_versions=_versions,
+        )
+
+    async def _run(self, music_bot: MusicBot, mock_ctx: MagicMock) -> str:
+        """The Postgres ROW, not the whole latency field: the other probes are
+        patched to n/a/off, so a field-wide `"n/a" not in ...` would match their
+        rows and never fail no matter what Postgres reported."""
+        _ping_message(mock_ctx)
+        with self._patch_everything_but_postgres():
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        field = _latency_field(_health_embed(mock_ctx.channel.send.await_args))
+        return next(line for line in field.splitlines() if "Postgres" in line)
+
+    async def test_healthy_archive_row_is_a_live_latency(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock()
+        music_bot.history_archive = archive
+        row = await self._run(music_bot, mock_ctx)
+        assert "ms" in row
+        assert "n/a" not in row and "down" not in row
+        archive.health_check.assert_awaited_once_with()
+
+    async def test_unreachable_archive_row_is_down(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock(side_effect=OSError("connection refused"))
+        music_bot.history_archive = archive
+        row = await self._run(music_bot, mock_ctx)
+        assert "down (OSError)" in row
+
+    async def test_no_archive_row_is_na(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Only reachable outside a real MusicBotApp — setup_hook refuses to start
+        # without POSTGRES_URL — but it is what keeps the probe renderable.
+        music_bot.history_archive = None
+        row = await self._run(music_bot, mock_ctx)
+        assert "n/a" in row
+
+    async def test_the_disabled_archive_row_explains_itself(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ship default, asserted on the RENDERED row. probe_postgres sets
+        detail="archive disabled", but _ping_value once appended a detail only for
+        DOWN and NA, so the row read as a bare "off". Asserting the detail on the
+        ProbeResult instead pins something no user can see."""
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        music_bot.history_archive = None
+        row = await self._run(music_bot, mock_ctx)
+        assert "off (archive disabled)" in row
+
+
+class TestDebugFooterOnTheBoard:
+    """-ping bypasses both decoration seams — it replies through channel.send and
+    then edits — so the cog pre-renders a suffix and threads it in."""
+
+    @staticmethod
+    def _versions() -> dict[str, str]:
+        return dict.fromkeys(["bot", "yt-dlp", "ffmpeg", "python", "discord.py"], "x")
+
+    def test_the_suffix_lands_after_the_environment_line(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+            debug_suffix="🐞 shard 0 · cpu 9%",
+        )
+        footer = embed.footer.text or ""
+        assert footer.startswith("environment:")
+        assert footer.endswith("🐞 shard 0 · cpu 9%")
+
+    def test_no_suffix_leaves_the_footer_alone(self) -> None:
+        embed = render_ping_embed(
+            {"Redis": _probe(ProbeState.OK, 1.0)},
+            self._versions(),
+            42.0,
+            trace.get_current_span(),
+        )
+        assert "🐞" not in (embed.footer.text or "")
+
+    def test_the_password_advisory_carries_it_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It has no footer of its own, and rides in front of the card on the same
+        message."""
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        embed = default_password_embed(debug_suffix="🐞 shard 0")
+        assert embed is not None
+        assert embed.footer.text == "🐞 shard 0"
+
+    async def test_the_command_decorates_when_the_guild_enabled_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
+        mocked(mock_ctx.guild).shard_id = 2
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 2.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        footer = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+        assert "🐞" in footer and "shard 2" in footer
+
+    async def test_the_suffix_never_changes_across_edits(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The driver only edits when the render differs, so changing the snapshot
+        mid-flight must not reach an in-progress board's footer."""
+        music_bot.debug_settings._overrides[mocked(mock_ctx.guild).id] = True
+        message = _ping_message(mock_ctx)
+        gate: asyncio.Event = asyncio.Event()
+
+        async def _slow() -> ProbeResult:
+            await gate.wait()
+            return _probe(ProbeState.OK, 5.0)
+
+        with (
+            _patch_probes(redis=_probe(ProbeState.OK, 2.0)),
+            patch("src.ping.probe_otel", _slow),
+        ):
+            task = asyncio.create_task(
+                command_callback(MusicBot.ping)(music_bot, mock_ctx)
+            )
+            await _until(lambda: mock_ctx.channel.send.await_args is not None)
+            first = _health_embed(mock_ctx.channel.send.await_args).footer.text or ""
+            # A live sampler tick between the skeleton and the final edit.
+            music_bot.debug_settings._sampler._snapshot = RuntimeSnapshot(
+                cpu_percent=99.0, mem_percent=1.0, lag_ms=1.0, tasks=1, pool_workers=1
+            )
+            gate.set()
+            await task
+
+        last = _health_embed(message.edit.await_args).footer.text or ""
+        assert "🐞" in first
+        assert last.split("🐞")[1] == first.split("🐞")[1]
+        assert "cpu 99%" not in last
 
 
 class TestDownReasonRendering:
@@ -399,7 +597,7 @@ class TestProbeSpotify:
         assert r.state is ProbeState.NA
 
     async def test_disabled_status_is_na_without_calling_the_api(self) -> None:
-        """DISABLED wins even if a client object is somehow present: no API call."""
+        """disabled wins even if a client object is somehow present: no API call."""
         http_call = AsyncMock()
         r = await ping.probe_spotify(self._spotify(http_call), SpotifyStatus.DISABLED)  # type: ignore[arg-type]
         assert r.state is ProbeState.NA
@@ -429,21 +627,52 @@ class TestProbeSpotify:
 
 
 class TestProbePostgres:
-    async def test_none_is_na(self) -> None:
+    async def test_none_with_the_flag_on_is_na(self) -> None:
+        # The suite default pins HISTORY_ARCHIVE_ENABLED=true, so a None
+        # archive here means "constructed without an archive" (tests, a cog
+        # built outside MusicBotApp) — NA, not OFF.
         r = await ping.probe_postgres(None)
         assert r.state is ProbeState.NA
 
-    async def test_live_pool_is_ok(self) -> None:
-        conn = MagicMock()
-        conn.execute = AsyncMock()
-        acquire_cm = MagicMock()
-        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
-        acquire_cm.__aexit__ = AsyncMock(return_value=None)
-        pool = MagicMock()
-        pool.acquire = MagicMock(return_value=acquire_cm)
-        r = await ping.probe_postgres(pool)
+    async def test_none_with_the_archive_disabled_is_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ship default. OFF is "deliberately disabled" (the OTEL row's
+        # state): the operator's choice must read as a choice on the
+        # dashboard, not as a fault or a shrug.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        r = await ping.probe_postgres(None)
+        assert r.state is ProbeState.OFF
+        assert r.detail == "archive disabled"
+
+    async def test_healthy_archive_is_ok(self) -> None:
+        archive = MagicMock()
+        archive.health_check = AsyncMock()
+        r = await ping.probe_postgres(archive)
         assert r.state is ProbeState.OK
-        conn.execute.assert_awaited_once_with("SELECT 1")
+        assert r.latency_ms is not None
+        archive.health_check.assert_awaited_once_with()
+
+    async def test_unreachable_archive_is_down_with_reason(self) -> None:
+        # Why the probe asks the archive rather than a pool: a bot whose
+        # Postgres is unreachable reports DOWN, not the "n/a (not configured)"
+        # that a lazily-absent pool would have produced.
+        archive = MagicMock()
+        archive.health_check = AsyncMock(
+            side_effect=ConnectionRefusedError("no server")
+        )
+        r = await ping.probe_postgres(archive)
+        assert r.state is ProbeState.DOWN
+        assert r.detail == "ConnectionRefusedError"
+
+    async def test_cancellation_propagates(self) -> None:
+        # _timed re-raises CancelledError so the dashboard's deadline can flip a
+        # straggling probe to FAILED itself. A first connect can outlast that
+        # deadline, so Postgres is the probe most likely to take this path.
+        archive = MagicMock()
+        archive.health_check = AsyncMock(side_effect=asyncio.CancelledError)
+        with pytest.raises(asyncio.CancelledError):
+            await ping.probe_postgres(archive)
 
 
 # ── OTEL ───────────────────────────────────────────────────────────────────────
@@ -454,6 +683,26 @@ class TestProbeOtel:
         monkeypatch.setattr(telemetry, "_tracer_provider", None)
         r = await ping.probe_otel()
         assert r.state is ProbeState.OFF
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "grpc://collector:4317 ",  # a trailing space in .env
+            "http://collector:99999",  # out of range
+        ],
+    )
+    async def test_an_unparseable_port_fails_the_row_not_the_board(
+        self, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ) -> None:
+        """urlparse().port is LAZY — it accepts these and raises on dereference. That
+        read sits outside _timed, so before the guard a stray character in .env raised
+        through _settle and out of the dashboard driver BEFORE the skeleton send, and
+        -ping answered with a bare error embed and no board at all.
+        """
+        monkeypatch.setattr(telemetry, "_tracer_provider", object())
+        monkeypatch.setattr(telemetry, "_OTLP_ENDPOINT", endpoint)
+        r = await ping.probe_otel()
+        assert r.state is ProbeState.FAILED
 
     async def test_reachable_is_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(telemetry, "_tracer_provider", object())
@@ -544,7 +793,7 @@ class TestVersions:
         completed = MagicMock(stdout="ffmpeg version 7.1 Copyright (c) 2000-2024\n")
         with patch("src.ping.subprocess.run", return_value=completed) as run:
             assert ping.ffmpeg_version() == "7.1"
-            # second call is cached — no second subprocess
+            # Second call is cached — no second subprocess
             assert ping.ffmpeg_version() == "7.1"
             run.assert_called_once()
 
@@ -554,7 +803,7 @@ class TestVersions:
             assert ping.ffmpeg_version() == "unknown"
 
     def test_bot_version_reads_pyproject(self) -> None:
-        # Must match [tool.poetry].version in pyproject.toml — NOT installed dist
+        # Must match [tool.poetry].version in pyproject.toml — not installed dist
         # metadata (the container installs --no-root, so none exists).
         ping._bot_version_cache = None
         with ping._PYPROJECT.open("rb") as f:
@@ -581,3 +830,292 @@ class TestVersions:
             versions = await ping.collect_versions()
         assert set(versions) == {"bot", "yt-dlp", "ffmpeg", "python", "discord.py"}
         assert all(versions.values())
+
+
+class TestDefaultPasswordEmbed:
+    """The standing advisory. Rendered on every -ping rather than once at
+    startup: the startup log is seen once, usually by whoever already knows,
+    while -ping is the surface an operator returns to."""
+
+    def test_none_when_the_password_is_real(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        assert default_password_embed() is None
+
+    def test_none_when_postgres_is_unconfigured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_URL", raising=False)
+        assert default_password_embed() is None
+
+    def test_none_when_the_archive_is_disabled_even_with_the_default_dsn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Compose interpolates POSTGRES_URL into the bot's environment whether or
+        # not the archive profile is active, so a disabled bot can hold this DSN
+        # with no Postgres behind it. Warning about a database that isn't there
+        # trains operators to ignore warnings — same gate as setup_hook's ERROR.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        assert default_password_embed() is None
+
+    def test_warns_and_says_how_to_fix_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        embed = default_password_embed()
+        assert embed is not None
+        assert "Default database password" in (embed.title or "")
+        body = (embed.description or "") + "".join(f.value or "" for f in embed.fields)
+        assert "setup_env.sh" in body
+        assert "ALTER USER" in body
+        assert "up -d" in body  # the container recreate the old remedy omitted
+
+        # Order, not just presence. The detector reads the bot's DSN, so running
+        # `setup_env.sh --force` first clears the warning while Postgres still
+        # accepts the old password — an unwarned exposure. The server change has
+        # to come first and the embed has to say so.
+        assert body.index("ALTER USER") < body.index("setup_env.sh")
+        assert "order is the point" in body
+        # By STEP NUMBER too: relabelling the steps without moving them would
+        # leave the text order intact while telling the operator to do the
+        # silencing step first.
+        assert body.index("1.") < body.index("ALTER USER") < body.index("2.")
+
+    def test_is_static_so_the_edit_loop_still_diffs_only_health(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # run_health_dashboard computes it once and re-attaches the same embed on
+        # every edit; if it varied per call the dashboard would either flicker or
+        # edit on every tick.
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+        first, second = default_password_embed(), default_password_embed()
+        assert first is not None and second is not None
+        assert first.to_dict() == second.to_dict()
+
+
+class TestDefaultPasswordWarningReachesTheWire:
+    """The advisory on the actual dashboard, not in isolation.
+
+    TestDefaultPasswordEmbed covers default_password_embed() alone, which left the
+    whole surface deletable: replacing the dashboard's `warning =
+    default_password_embed()` with `None` passed the entire suite. These need a
+    pinned POSTGRES_URL — conftest scrubs it, and they set the default explicitly,
+    because otherwise the suite reads a developer shell carrying a real password."""
+
+    @pytest.fixture
+    def on_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+
+    async def test_the_skeleton_send_leads_with_the_warning(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, on_default: None
+    ) -> None:
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        # First, above the health card — an advisory below the fold is one the
+        # operator scrolls past.
+        assert "Default database password" in (embeds[0].title or "")
+
+    async def test_a_real_password_sends_only_the_health_card(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The other side: without this, "always two embeds" would pass the test
+        # above just as well as the correct behaviour.
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:9f3a1c@127.0.0.1:5432/musicbot"
+        )
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        assert len(mock_ctx.channel.send.await_args.kwargs["embeds"]) == 1
+
+    async def test_the_warning_survives_the_deadline_edit(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        on_default: None,
+    ) -> None:
+        """Every edit re-attaches it, or the advisory disappears the moment a
+        probe resolves late — i.e. on exactly the unhealthy deployments most
+        likely to be running unattended."""
+        message = _ping_message(mock_ctx)
+        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
+        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+
+        never = asyncio.Event()
+
+        async def _hang(*a: Any, **k: Any) -> ProbeResult:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.ping.probe_spotify", new=_hang):
+                await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        message.edit.assert_awaited()
+        embeds = message.edit.await_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        assert "Default database password" in (embeds[0].title or "")
+
+    async def test_the_warning_survives_a_mid_loop_tick_edit(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+        on_default: None,
+    ) -> None:
+        # The third write path. Send, tick-edit and deadline-edit are separate
+        # call sites in run_health_dashboard, and dropping the warning from any
+        # one of them survived the suite before these tests existed.
+        message = _ping_message(mock_ctx)
+        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.01)
+        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 5.0)
+        gate = asyncio.Event()
+
+        async def _gated(*a: Any, **k: Any) -> ProbeResult:
+            await gate.wait()
+            return ProbeResult("Spotify API", ProbeState.OK, latency_ms=42.0)
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.ping.probe_spotify", new=_gated):
+                task = asyncio.create_task(
+                    command_callback(MusicBot.ping)(music_bot, mock_ctx)
+                )
+                await _until(lambda: mock_ctx.channel.send.await_count == 1)
+                gate.set()
+                await _until(lambda: message.edit.await_count >= 1)
+                await task
+
+        embeds = message.edit.await_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        assert "Default database password" in (embeds[0].title or "")
+
+    async def test_the_advisory_rides_along_on_every_edit(self) -> None:
+        """The advisory is static and the health card moves, so the driver diffs the
+        whole embed LIST. Dropping the advisory from an edit would make it flicker;
+        diffing only the card would edit every tick for no change. Both live in
+        tests/test_dashboard.py now — this asserts the pairing survives the seam."""
+        warning = discord.Embed(title="⚠️ Default database password in use")
+        health = discord.Embed(title="Health")
+        assert not dashboard.embeds_changed([warning, health], [warning, health])
+        moved = discord.Embed(title="Health", description="redis 3 ms")
+        assert dashboard.embeds_changed([warning, moved], [warning, health])
+
+
+class TestTheAdvisoryIsForTheOperator:
+    """Who sees the default-password warning. -ping has no permission check and
+    answers to `-status`, `-health`, `-l`, so an ungated advisory confirms to every
+    member of every guild — permanently, in Discord's history — that this host runs
+    the public default. The leak is the confirmation, not the string."""
+
+    @pytest.fixture(autouse=True)
+    def on_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "POSTGRES_URL", "postgresql://musicbot:password@127.0.0.1:5432/musicbot"
+        )
+
+    async def test_the_owner_sees_it(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mock_ctx.bot.is_owner = AsyncMock(return_value=True)
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
+        assert len(embeds) == 2
+        assert "Default database password" in (embeds[0].title or "")
+
+    async def test_everyone_else_gets_the_health_card_alone(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        # Same deployment, same misconfiguration — only the audience differs.
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        _ping_message(mock_ctx)
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+        embeds = mock_ctx.channel.send.await_args.kwargs["embeds"]
+        assert len(embeds) == 1
+        assert "Default database password" not in (embeds[0].title or "")
+
+    async def test_a_non_owner_never_sees_it_on_an_edit_either(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The gate is evaluated once, before the send — so it has to hold for
+        # the edit paths too, or the advisory leaks on the first late probe.
+        mock_ctx.bot.is_owner = AsyncMock(return_value=False)
+        message = _ping_message(mock_ctx)
+        monkeypatch.setattr(ping, "PING_TICK_SECS", 0.0)
+        monkeypatch.setattr(ping, "PING_DEADLINE_SECS", 0.0)
+
+        never = asyncio.Event()
+
+        async def _hang(*a: Any, **k: Any) -> ProbeResult:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            with patch("src.ping.probe_spotify", new=_hang):
+                await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        message.edit.assert_awaited()
+        assert len(message.edit.await_args.kwargs["embeds"]) == 1
+
+    async def test_the_owner_check_is_never_paid_for_when_there_is_no_advisory(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_owner() must be reached only when the advisory exists — it is not a
+        local predicate: with no owner_id set, discord.py falls through to
+        application_info(), a REST GET that retries ~25s on a 5xx and then RAISES,
+        ahead of the skeleton send. is_owner answers True on purpose here, so a
+        regression cannot pass by answering False."""
+        # The ship default. Default_password_embed() returns None on its first
+        # line, so there is nothing to gate and nothing to ask about.
+        monkeypatch.setenv("HISTORY_ARCHIVE_ENABLED", "false")
+        mock_ctx.bot.is_owner = AsyncMock(
+            return_value=True, side_effect=RuntimeError("application_info() 500")
+        )
+        _ping_message(mock_ctx)
+
+        with _patch_probes(redis=_probe(ProbeState.OK, 1.0)):
+            await command_callback(MusicBot.ping)(music_bot, mock_ctx)
+
+        mock_ctx.bot.is_owner.assert_not_awaited()
+        assert len(mock_ctx.channel.send.await_args.kwargs["embeds"]) == 1
+
+
+class TestLatencyColor:
+    def test_excellent_latency_is_green(self) -> None:
+        assert latency_color(30).value == 0x44FF44
+
+    def test_boundary_50ms_is_green(self) -> None:
+        assert latency_color(50).value == 0x44FF44
+
+    def test_good_latency_is_yellow(self) -> None:
+        assert latency_color(75).value == 0xFFD000
+
+    def test_boundary_100ms_is_yellow(self) -> None:
+        assert latency_color(100).value == 0xFFD000
+
+    def test_acceptable_latency_is_orange(self) -> None:
+        assert latency_color(150).value == 0xFF6600
+
+    def test_boundary_200ms_is_orange(self) -> None:
+        assert latency_color(200).value == 0xFF6600
+
+    def test_poor_latency_is_red(self) -> None:
+        assert latency_color(300).value == 0x990000
