@@ -211,14 +211,10 @@ class Spotify:
             "client_secret": self.client_secret,
         }
         session = self._session_or_create()
-        resp = await session.post(self.auth_endpoint, data=data)
-        if strict and resp.status not in (200, 201):
-            # Drain first: the session outlives this call, so an unread body holds
-            # its pooled connection out of circulation until the response is
-            # collected. Same reason as the release in http_call.
-            await resp.release()
-            raise SpotifyAuthError(resp.status, "client-credentials grant failed")
-        resp_data = await resp.json(content_type=None)
+        async with session.post(self.auth_endpoint, data=data) as resp:
+            if strict and resp.status not in (200, 201):
+                raise SpotifyAuthError(resp.status, "client-credentials grant failed")
+            resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]
         expires_in: int = resp_data["expires_in"]
         self.token_expiry += expires_in
@@ -249,26 +245,29 @@ class Spotify:
         retry_after: Optional[float] = None
         session = self._session_or_create()
         for attempt in range(_MAX_429_RETRIES + 1):
-            resp = await session.request(
+            # `async with`, not a bare await: the session outlives this call, so an
+            # unread body holds its pooled connection until the response is
+            # collected. __aexit__ releases on every path, including the raises
+            # below — which a hand-rolled release has twice been written without.
+            async with session.request(
                 http_method,
                 endpoint_route,
                 headers=headers,
                 data=data,
                 params=params,
-            )
-            if resp.status in (200, 201):
-                return await resp.json(content_type=None)
-            # Drain before raising or sleeping: an unread body holds its pooled
-            # connection out of circulation until the response is collected.
-            await resp.release()
-            if resp.status in (401, 403):
-                # Credential/token rejection — distinct from other non-2xx
-                # codes so validate() can tell "bad credentials" from
-                # "request failed".
-                raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
-            if resp.status != 429:
-                raise SpotifyRequestError(resp.status, endpoint_route, params)
-            retry_after = _retry_after_secs(resp)
+            ) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json(content_type=None)
+                if resp.status in (401, 403):
+                    # Credential/token rejection — distinct from other non-2xx
+                    # codes so validate() can tell "bad credentials" from
+                    # "request failed".
+                    raise SpotifyAuthError(resp.status, f"endpoint: {endpoint_route}")
+                if resp.status != 429:
+                    raise SpotifyRequestError(resp.status, endpoint_route, params)
+                retry_after = _retry_after_secs(resp)
+            # Outside the block on purpose: the connection is back in the pool
+            # before the wait, rather than parked for the length of it.
             if attempt == _MAX_429_RETRIES:
                 break
             delay = min(
