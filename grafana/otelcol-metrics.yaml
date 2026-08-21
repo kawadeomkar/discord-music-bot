@@ -1,0 +1,60 @@
+# Metrics sidecar for the otel-lgtm stack (compose service: otelcol-metrics).
+#
+# The bot exports traces + logs only (src/telemetry.py configures no
+# MeterProvider), and otel-lgtm's embedded collector is a pure OTLP pass-through
+# — so before this sidecar, Prometheus held nothing but Tempo's span-derived
+# metrics and the collector's self-scrape. This sidecar adds the two missing
+# tiers the dashboard's "Containers" and "Redis" rows read:
+#
+#   docker_stats  per-container CPU / memory / network / block-IO for every
+#                 compose service (bot, redis, postgres, sidecars). Needs
+#                 /var/run/docker.sock mounted read-only.
+#   redis         INFO-derived server metrics from the compose `redis` service.
+#                 redis-server runs with maxmemory 256mb + volatile-lru and two
+#                 non-evictable keys (history:outbox, guild:*:history) — the
+#                 memory panels this feeds are the "memory alarm still owed" in
+#                 redis_client.py's push_history ISSUE marker.
+#
+# Everything is pushed as OTLP to the otel-lgtm collector (service-name DNS on
+# the compose default network), which routes metrics into its Prometheus.
+# Prometheus promotes container.name / service.name to labels
+# (promote_resource_attributes in the image's prometheus.yaml), which is what
+# the dashboard's `container_name` / `service_name` selectors rely on.
+#
+# Postgres deliberately NOT scraped here: the postgres service exists only under
+# the `archive` compose profile, and a permanently-failing receiver would spam
+# this collector's logs on every non-archive deployment. If archive-tier DB
+# metrics are wanted later, add a second sidecar behind the same `archive`
+# profile (see docs/GRAFANA_DASHBOARD_PLAN.md, phase 4).
+
+receivers:
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 15s
+    # Defaults already include cpu.utilization, memory.usage / percent,
+    # network io and blockio; container.name rides as a resource attribute.
+
+  redis:
+    endpoint: redis:6379
+    collection_interval: 15s
+    metrics:
+      # Off by default in the receiver; the dashboard's "Redis memory used %"
+      # stat divides used_memory by this, so it must be emitted.
+      redis.maxmemory:
+        enabled: true
+
+processors:
+  batch:
+
+exporters:
+  otlp:
+    endpoint: otel-lgtm:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [docker_stats, redis]
+      processors: [batch]
+      exporters: [otlp]
