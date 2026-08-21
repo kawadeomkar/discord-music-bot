@@ -37,7 +37,15 @@ from src.musicbot import (
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
 from src.util import EMBED_FIELD_LIMIT
-from src.sources import SpotifySource, SpotifyType, YTSource, YTType, parse_input
+from src.sources import (
+    SpotifySource,
+    SpotifyType,
+    YTSource,
+    YTType,
+    parse_input,
+    parse_url,
+    timestamp_warning,
+)
 from src.musicplayer import InterjectOutcome
 from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
@@ -4910,3 +4918,47 @@ class TestShuffleWaitsForTheRestore:
             await command_callback(MusicBot.shuffle)(music_bot, mock_ctx)
 
         mp.queue_shuffle.assert_awaited_once()
+
+
+class TestTimestampWarningReachesTheUser:
+    @staticmethod
+    def _bad_ts_source() -> Any:
+        return parse_url("https://youtu.be/a?t=bogus")
+
+    async def test_it_rides_the_queued_song_embed(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=3)  # something already queued
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        assert send.await_args is not None
+        description = send.await_args[0][2]
+        assert "bogus" in description
+        assert "Est. playing at" in description  # folded in, not replacing it
+
+    async def test_it_gets_its_own_message_when_no_embed_is_sent(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """An idle bot plays the first song immediately and sends no "Queued
+        song" embed at all. Riding that embed alone would drop the warning in
+        the most ordinary case there is."""
+        mp = _mock_mp()
+        mp.queue.qsize = MagicMock(return_value=0)
+        mock_ctx.voice_client = _connected_vc()
+        mock_ctx.voice_client.is_playing = MagicMock(return_value=False)
+        qobj = QueueObject("https://yt.com/v=1", "Test Song", mock_ctx.author)
+
+        with patch("src.musicbot.send_embed", new=AsyncMock()) as send:
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, mp, warning=timestamp_warning(self._bad_ts_source())
+            )
+
+        send.assert_not_awaited()
+        sent = [c.kwargs["embed"] for c in mock_ctx.send.await_args_list]
+        assert any("bogus" in (e.description or "") for e in sent)
