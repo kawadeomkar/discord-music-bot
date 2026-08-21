@@ -1504,7 +1504,7 @@ class MusicPlayer:
         only the ids survive and own_embeds cannot be reconstructed from them, so
         the by-id delete is gated to DEDICATED cards. Never a re-adopt: the live bar
         belongs at the channel bottom. See
-        docs/ARCHITECTURE.md#now-playing-host-model.
+        docs/ARCHITECTURE.md#now-playing-host-invariants.
         """
         ref = song.np_host_ref
         if ref is not None:

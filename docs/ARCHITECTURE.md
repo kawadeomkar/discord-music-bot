@@ -42,7 +42,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
     - [Queue invariant](#queue-invariant)
-    - [Now Playing host model](#now-playing-host-model)
+    - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
 16. [Design Decisions](#design-decisions)
 
@@ -1456,7 +1456,7 @@ eats the new head.
 Note that `-shuffle` requires **4** queued songs while `MusicPlayer.queue_shuffle()`
 and `-help` both say 3 (tracked by an in-code FIXME).
 
-### Now Playing host model
+### Now Playing host invariants
 
 The NP block lives in exactly one host message. `_adopt_np_host` is pointer-first: the
 pointer swap is synchronous, retirement is fire-and-forget under `_np_edit_lock`.
