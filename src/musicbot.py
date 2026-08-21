@@ -43,7 +43,7 @@ from src.redis_client import (
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
     QUERY_SOURCE_SEARCH,
-    TIMESTAMP_FORMATS,
+    timestamp_warning,
     unquote_argument,
     SoundcloudSource,
     SpotifySource,
@@ -193,26 +193,6 @@ _ECHO_MAX = 200
 
 # One row of a multi-row field — ten of these share the budget one needle gets.
 _ECHO_ROW_MAX = 70
-# The unparseable `t=` echoed back. Short: it is quoted inside a sentence, and a
-# pasted URL fragment can be arbitrarily long.
-_TIMESTAMP_ECHO_MAX = 40
-
-
-def timestamp_warning(
-    source: Union[SpotifySource, YTSource, SoundcloudSource],
-) -> Optional[str]:
-    """One line naming a `t=` value that did not parse, or None.
-
-    Stated rather than silent, for the reason the playlist branch reports its
-    skipped count: something the user wrote in their own URL changed where the
-    song starts, and nothing else in the response accounts for it."""
-    if not isinstance(source, YTSource) or source.bad_timestamp is None:
-        return None
-    shown = safe_label(source.bad_timestamp, _TIMESTAMP_ECHO_MAX)
-    return (
-        f"⚠️ Couldn't read the timestamp `{shown}` in that link — starting from "
-        f"the beginning. YouTube's `t=` takes {TIMESTAMP_FORMATS}."
-    )
 
 
 # The most dropped positions worth spelling out; past this the list says nothing

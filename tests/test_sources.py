@@ -6,6 +6,7 @@ from src.guild_state import Analytics
 from src.sources import (
     unquote_argument,
     QUERY_SOURCE_SEARCH,
+    TIMESTAMP_FORMATS,
     QUERY_SOURCE_SOUNDCLOUD,
     QUERY_SOURCE_SPOTIFY,
     QUERY_SOURCE_YOUTUBE,
@@ -21,6 +22,7 @@ from src.sources import (
     parse_url,
     query_source_of,
     spotify_playlist_to_ytsearch,
+    timestamp_warning,
 )
 
 
@@ -634,3 +636,38 @@ class TestQuotedArgumentsSurviveConsumeRest:
     def test_a_bare_quote_pair_is_not_stripped_to_nothing(self) -> None:
         assert unquote_argument('""') == '""'
         assert unquote_argument('"') == '"'
+
+
+class TestTimestampWarning:
+    """A `t=` that does not parse changes where the song starts, so the response
+    has to say so — the seek is otherwise dropped with nothing on screen."""
+
+    def test_none_when_the_timestamp_parsed(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=1m30s")) is None
+
+    def test_none_for_a_link_with_no_timestamp(self) -> None:
+        assert timestamp_warning(parse_url("https://youtu.be/a")) is None
+
+    def test_none_for_a_source_that_cannot_carry_one(self) -> None:
+        """Spotify and SoundCloud have no `t=`; the helper takes the union type,
+        so the isinstance narrowing is what keeps this from raising."""
+        assert timestamp_warning(parse_url("https://soundcloud.com/a/b")) is None
+
+    def test_names_the_value_and_the_accepted_forms(self) -> None:
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=1h30"))
+        assert warning is not None
+        assert "1h30" in warning
+        assert TIMESTAMP_FORMATS in warning
+
+    def test_a_good_second_timestamp_suppresses_it(self) -> None:
+        """`?t=bad&ts=90` does start where the user asked, so warning about it
+        would be wrong."""
+        assert timestamp_warning(parse_url("https://youtu.be/a?t=bad&ts=90")) is None
+
+    def test_the_echoed_value_cannot_break_out_of_its_code_span(self) -> None:
+        """The raw value is attacker-influenceable and is rendered inside
+        backticks, so safe_label's backtick neutralization is load-bearing."""
+        warning = timestamp_warning(parse_url("https://youtu.be/a?t=`x`[y](z)"))
+        assert warning is not None
+        assert "`x`" not in warning
+        assert "[y](z)" not in warning

@@ -5,7 +5,7 @@ from typing import Final, Optional, Union
 from urllib.parse import parse_qs, urlsplit
 
 from src.guild_state import ANALYTICS_ZERO, Analytics
-from src.util import get_logger
+from src.util import get_logger, safe_label
 
 log = get_logger(__name__)
 
@@ -42,6 +42,35 @@ def parse_timestamp(raw: str) -> Optional[int]:
         return None
     hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
     return hours * 3600 + minutes * 60 + seconds
+
+
+# The unparseable `t=` echoed back to the user. Short: it is quoted inside a
+# sentence, and a pasted URL fragment can be arbitrarily long.
+_TIMESTAMP_ECHO_MAX = 40
+
+
+def timestamp_warning(
+    source: Union["SpotifySource", "YTSource", "SoundcloudSource"],
+) -> Optional[str]:
+    """One line naming a `t=` value that did not parse, or None.
+
+    Lives beside the parser so the accepted shapes have one definition and the
+    sentence quoting them cannot drift from what parse_timestamp takes. Returns
+    text rather than an embed: this module stays free of discord, and the cog
+    owns how a notice is rendered.
+
+    Stated rather than silent, for the reason the playlist branch reports its
+    skipped count: something the user wrote in their own URL changed where the
+    song starts, and nothing else in the response accounts for it."""
+    if not isinstance(source, YTSource) or source.bad_timestamp is None:
+        return None
+    # safe_label, not the raw value: it is rendered inside a code span below and
+    # a backtick in it would close that span.
+    shown = safe_label(source.bad_timestamp, _TIMESTAMP_ECHO_MAX)
+    return (
+        f"⚠️ Couldn't read the timestamp `{shown}` in that link — starting from "
+        f"the beginning. YouTube's `t=` takes {TIMESTAMP_FORMATS}."
+    )
 
 
 class URLSource(Enum):
