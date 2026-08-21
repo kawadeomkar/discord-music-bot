@@ -41,19 +41,9 @@ T = TypeVar("T")
 
 _DEFAULT_WORKERS = int(os.environ.get("YTDLP_POOL_WORKERS", "4"))
 
-# Extractions a worker serves before the pool replaces it. yt-dlp accumulates
-# per-process state over days of uptime — player-JS caches, extractor objects — and
-# the BrokenProcessPool heal path below exists because a worker that grows enough
-# eventually gets OOM-killed. Bounded recycling turns that rare crash-and-heal into
-# routine turnover.
-#
-# The number is measured, not chosen: resident growth across repeated extractions
-# decelerates but does not flatten, holding ~+5MB/extraction from task 12 to task 24
-# (83 MB at import, 281 MB by 12, 347 MB by 24). A budget of 16 caps a worker near
-# 300 MB, so four of them stay well inside a container that would otherwise OOM-kill
-# one; 64 would have let a worker reach ~500 MB and the pool ~2 GB, which is the
-# scenario this recycling exists to prevent. Respawn cost is ~27ms on the platform
-# default context (see _pool_context), so a smaller budget is close to free.
+# Extractions a worker serves before the pool replaces it. A worker's resident set
+# grows with every extraction and never flattens, so 16 caps one near 300MB and keeps
+# four inside the container. See docs/ARCHITECTURE.md#yt-dlp-process-boundary.
 _MAX_TASKS_PER_CHILD = 16
 # How long shutdown waits before abandoning the join: yt-dlp's socket_timeout=30 with
 # retries=10 can outlive any shutdown. Mirrors loop.shutdown_default_executor()'s.
@@ -61,19 +51,13 @@ _SHUTDOWN_TIMEOUT_SECS = 10.0
 
 
 def _pool_context() -> BaseContext:
-    """The start method the pool spawns workers with.
+    """The start method the pool spawns workers with: the platform default, unless
+    that is `fork`, which a task budget rejects and which is unsafe to fork a
+    multi-threaded asyncio process from.
 
-    Passing max_tasks_per_child makes ProcessPoolExecutor FORCE the spawn context
-    whenever no mp_context is supplied. On Linux that silently replaces 3.14's
-    forkserver default, and it is not free: four cold workers ready plus their first
-    task measured 0.040s under forkserver against 0.933s under spawn, and per-task
-    latency across a respawn 27ms against 807ms. That cost lands on prewarm(), on
-    every recycle, and on the BrokenProcessPool heal — which is on the critical path
-    of the very extraction that tripped it.
-
-    So the context is passed explicitly: whatever the platform would have chosen on
-    its own, unless that is `fork`, which a task budget rejects outright (and which
-    is unsafe to fork a multi-threaded asyncio process from regardless).
+    Passed EXPLICITLY. Supplying max_tasks_per_child without an mp_context makes
+    ProcessPoolExecutor force spawn, replacing 3.14's forkserver default on Linux at
+    ~23x the worker startup cost. See docs/ARCHITECTURE.md#yt-dlp-process-boundary.
     """
     method = multiprocessing.get_start_method()
     if method == "fork":

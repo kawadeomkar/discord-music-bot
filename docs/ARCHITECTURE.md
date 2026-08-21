@@ -982,6 +982,8 @@ flowchart LR
 
 Measured: copy and libopus produce identical packet counts for YouTube's Opus (213.10 s of packets for a 213 s song, both), so the position math is unaffected on the passthrough path.
 
+Three differences are accepted, and ffmpeg warns about none of them, since no encoder is instantiated to ignore them: a mono source stays mono rather than being upmixed; the source's own bitrate is kept instead of being capped at 128k (~30% more egress on a 251); and discord.py's `-fec true -packet_loss 15` no longer embeds in-band forward error correction, so packet loss on the voice path produces dropouts libopus used to conceal. YouTube's files carry no FEC of their own, which makes that last one a real regression for lossy listeners and the reason to keep the gate narrow rather than widen it.
+
 **Position tracking**: the reader thread calls `YTDL.read()` once per 20 ms Opus frame; the subclass counts frames, giving `elapsed_secs` (frozen automatically during any pause or stall) and `position_secs = start_offset + elapsed_secs` — the single source of truth for the progress bar, presence timestamps, and pause confirmation.
 
 **Timestamp seek**: a `?t=N` URL parameter is carried on `QueueObject.ts` → FFmpeg `-ss N` → recorded as `YTDL.start_offset` so position surfaces and the backdated `play_start_epoch` agree.
