@@ -99,13 +99,13 @@ async def close_shared_http_sessions(
     # a process that exits after it and wrong for a suite that keeps going.
     monkeypatch.setattr(youtube_mod, "_probe_session_closed", False)
 
-    created: list[Any] = []
+    created: list[tuple[Any, Any]] = []
     original = spotify_mod.Spotify._session_or_create
 
     def tracked(self: Any) -> Any:
         session = original(self)
-        if session not in created:
-            created.append(session)
+        if not any(s is session for _, s in created):
+            created.append((self, session))
         return session
 
     monkeypatch.setattr(spotify_mod.Spotify, "_session_or_create", tracked)
@@ -113,12 +113,15 @@ async def close_shared_http_sessions(
     yield
 
     try:
-        for session in created:
+        for owner, session in created:
             # Only real sessions: a test-injected factory usually returns a mock,
-            # whose close() is not awaitable. Clear the attribute too, or the
-            # next call on a surviving instance gets a closed session.
+            # whose close() is not awaitable.
             if isinstance(session, aiohttp.ClientSession) and not session.closed:
                 await session.close()
+            # Clear the handle too. _session_or_create refuses to rebuild after
+            # aclose() and hands back whatever is stored otherwise, so an instance
+            # outliving its test would otherwise be holding a closed session.
+            owner._session = None
     finally:
         await close_probe_session()
 
@@ -436,9 +439,14 @@ def music_bot(mock_bot: MagicMock) -> MusicBot:
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
-    cog.spotify = MagicMock()
-    # cog_unload awaits it; a bare MagicMock returns a non-awaitable there.
-    cog.spotify.aclose = AsyncMock()
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = None
     # None, not a mock: this fixture builds the cog without __init__, so an unset
@@ -479,9 +487,14 @@ def music_bot_with_redis(mock_bot: MagicMock, fake_redis_bot: Redis) -> MusicBot
     cog = MusicBot.__new__(MusicBot)
     cog.bot = mock_bot
     cog.mps = {}
-    cog.spotify = MagicMock()
-    # cog_unload awaits it; a bare MagicMock returns a non-awaitable there.
-    cog.spotify.aclose = AsyncMock()
+    # spec'd, not bare: it supplies the async doubles cog_unload awaits and
+    # rejects an attribute Spotify does not have, which is how a renamed method
+    # gets caught here rather than passing against a mock that invents it. spec
+    # covers the class, so the credentials __init__ assigns are set by hand —
+    # -ping reads them to tell "unconfigured" from "configured and rejected".
+    cog.spotify = MagicMock(spec=Spotify)
+    cog.spotify.client_id = "cid"
+    cog.spotify.client_secret = "secret"
     cog._spotify_status = SpotifyStatus.ENABLED
     cog.redis = fake_redis_bot
     # None, not a mock, and set explicitly: this fixture builds the cog without

@@ -30,7 +30,8 @@ _ALBUM_TTL = 86400  # 24h
 
 # aiohttp's default is ClientTimeout(total=300) — a hung Spotify request held a
 # command for five minutes, with the user's only signal being a typing indicator
-# that eventually stopped.
+# that eventually stopped. Carried by the session, so it bounds the token grant
+# as well as every API call.
 _HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 _MAX_429_RETRIES = 3

@@ -2561,8 +2561,10 @@ class TestProbeSessionSharing:
         assert session.closed
 
     async def test_a_closed_session_is_replaced(self) -> None:
-        """Defensive: if something closes it out from under us, the next probe
-        must build a new one rather than raise on a dead session."""
+        """The tests' own cleanup closes this session without going through
+        close_probe_session(), so the next probe must rebuild rather than raise.
+        Scoped to an explicit close: a session whose event loop died still reports
+        `closed == False`, so this check cannot see that one."""
         import src.youtube as youtube
 
         first = youtube._get_probe_session()
@@ -2597,6 +2599,19 @@ class TestProbeSessionSharing:
 
         await youtube.close_probe_session()
         assert await _probe_stream_url("https://cdn/x") is StreamProbe.UNCONFIRMED
+
+    async def test_probe_session_carries_the_configured_timeout(self) -> None:
+        """STREAM_PROBE_TIMEOUT_SECS is baked into the session once, at first use,
+        rather than passed per call — so nothing else exercises the constructor and
+        a dropped timeout would leave every probe on aiohttp's 5-minute default,
+        stalling a song start behind a CDN that never answers."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            assert session.timeout.total == youtube._STREAM_PROBE_TIMEOUT
+        finally:
+            await youtube.close_probe_session()
 
     async def test_probe_connector_is_unbounded(self) -> None:
         """One connector serves every guild now. aiohttp's default limit of 100

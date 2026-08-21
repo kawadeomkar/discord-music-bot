@@ -499,6 +499,9 @@ class MusicBotApp(commands.AutoShardedBot):
             await close_probe_session()
         except Exception as e:
             log.warning(f"stream-probe session shutdown failed: {e}")
+        # Exception, not BaseException, in every guard above: a second Ctrl-C
+        # raises KeyboardInterrupt through them and abandons the rest of this
+        # sequence, which is what a second Ctrl-C is asking for.
         # shutdown_telemetry has no async form and blocks up to 30s flushing spans,
         # so it needs the executor hop.
         from src.telemetry import shutdown_telemetry

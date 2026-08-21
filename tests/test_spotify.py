@@ -534,7 +534,7 @@ class TestSpotifyHttpCall:
         ok.json = AsyncMock(return_value={"data": "ok"})
         responses = [limited, ok]
         # One session serves every attempt, so the retry is driven off .request().
-        session = _make_mock_session(limited)
+        session = _make_mock_session(ok)
         session.request = AsyncMock(side_effect=lambda *a, **kw: responses.pop(0))
         spotify._session_factory = lambda **kw: session
 
@@ -749,9 +749,22 @@ class TestSharedSession:
         assert session.request.await_count == 2
 
     async def test_session_is_created_lazily(self, spotify: Spotify) -> None:
-        """A ClientSession must be built on the running loop, and __init__ runs
-        before the bot connects — so construction must not create one."""
+        """A deployment with Spotify configured but never used must not open a
+        connector. Asserts the factory was never called: `_session is None` also
+        passes if __init__ built one and something cleared the handle after."""
+        calls = 0
+
+        def _factory(**kw: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return _make_mock_session(AsyncMock())
+
+        spotify._session_factory = _factory
+        assert calls == 0
         assert spotify._session is None
+
+        spotify._session_or_create()
+        assert calls == 1
 
     async def test_aclose_closes_and_clears(self, spotify: Spotify) -> None:
         session = _make_mock_session(AsyncMock())
@@ -782,6 +795,22 @@ class TestSharedSession:
         with pytest.raises(OSError):
             await spotify.aclose()
         assert spotify._session is None
+
+    async def test_a_session_closed_from_outside_is_replaced(
+        self, spotify: Spotify
+    ) -> None:
+        """Only aclose() latches the client shut. Anything else that closes the
+        session — the suite's own per-test cleanup is the live example — must get a
+        replacement, not a corpse that raises `Session is closed` on every call."""
+        first = _make_mock_session(AsyncMock())
+        second = _make_mock_session(AsyncMock())
+        sessions = [first, second]
+        spotify._session_factory = lambda **kw: sessions.pop(0)
+
+        assert spotify._session_or_create() is first
+        first.closed = True
+
+        assert spotify._session_or_create() is second
 
     async def test_a_call_after_aclose_is_refused(self, spotify: Spotify) -> None:
         """A command in flight when the cog unloads must not quietly build a
