@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from redis.asyncio import Redis
 
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import (
+    _HTTP_TIMEOUT,
+    _MAX_RETRY_AFTER_SECS,
+    Spotify,
+    SpotifyAuthError,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+)
 
 
 @pytest.fixture
@@ -174,9 +181,33 @@ class TestSpotifyRefreshToken:
         assert spotify.auth_token == "test_access_token_xyz"  # fresh, not cached
         mock_session.post.assert_awaited_once()
 
-    def test_str_returns_auth_token(self, spotify: Spotify) -> None:
-        spotify.auth_token = "my_token"
-        assert str(spotify) == "my_token"
+    def test_str_never_exposes_the_bearer_token(self, spotify: Spotify) -> None:
+        """Both dunders, since an exception repr reaches __repr__, not __str__."""
+        spotify.auth_token = "super_secret_bearer_token"
+        assert "super_secret_bearer_token" not in str(spotify)
+        assert "super_secret_bearer_token" not in repr(spotify)
+        assert "super_secret_bearer_token" not in f"{spotify}"
+        assert "super_secret_bearer_token" not in f"{spotify!r}"
+
+    def test_str_reports_token_presence_without_the_value(
+        self, spotify: Spotify
+    ) -> None:
+        spotify.auth_token = ""
+        assert "token=unset" in str(spotify)
+        spotify.auth_token = "anything"
+        assert "token=set" in str(spotify)
+
+    def test_str_identifies_the_client_without_the_secret(
+        self, spotify: Spotify
+    ) -> None:
+        """A truncated client_id tells two configs apart; the secret never renders."""
+        assert "test_i" in str(spotify)
+        assert spotify.client_secret is not None
+        assert spotify.client_secret not in str(spotify)
+
+    def test_str_handles_missing_client_id(self, spotify: Spotify) -> None:
+        spotify.client_id = None
+        assert "unset" in str(spotify)  # must not raise on None
 
 
 def _make_split_session(post_resp: AsyncMock, request_resp: AsyncMock) -> MagicMock:
@@ -255,7 +286,7 @@ class TestSpotifyValidate:
     async def test_validate_non_auth_http_error_is_not_auth_error(
         self, spotify: Spotify
     ) -> None:
-        """Grant succeeds but the track endpoint 404s: a plain Exception, NOT a
+        """Grant succeeds but the track endpoint 404s: a plain Exception, not a
         SpotifyAuthError — the caller treats this as inconclusive, not invalid."""
         session = _make_split_session(
             _resp(200, {"access_token": "tok", "expires_in": 3600}),
@@ -412,6 +443,99 @@ class TestSpotifyHttpCall:
         call_kwargs = mock_session.request.call_args[1]
         assert "Authorization" in call_kwargs["headers"]
         assert call_kwargs["headers"]["Authorization"] == "Bearer valid_token"
+
+    async def test_http_call_raises_typed_request_error(self, spotify: Spotify) -> None:
+        """A 404 is about the link, not the credentials — so it must not be the
+        exception that disables the Spotify source."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = AsyncMock()
+        mock_response.status = 404
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_response)
+
+        with pytest.raises(SpotifyRequestError) as excinfo:
+            await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
+        assert excinfo.value.status == 404
+        assert not isinstance(excinfo.value, SpotifyAuthError)
+        assert "may be private" in excinfo.value.user_message
+
+    async def test_http_call_bounds_the_request_timeout(self, spotify: Spotify) -> None:
+        """aiohttp's 300s default held a command for five minutes on a hung
+        request; the factory must receive an explicit ceiling."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value={})
+        seen: list[Any] = []
+
+        def factory(**kw: Any) -> MagicMock:
+            seen.append(kw.get("timeout"))
+            return _make_mock_session(mock_response)
+
+        spotify._session_factory = factory
+        await spotify.http_call("https://api.spotify.com/v1/tracks/xyz")
+
+        assert seen == [_HTTP_TIMEOUT]
+        assert _HTTP_TIMEOUT.total == 30
+
+    async def test_http_call_retries_429_then_succeeds(self, spotify: Spotify) -> None:
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "0"}
+        ok = AsyncMock()
+        ok.status = 200
+        ok.json = AsyncMock(return_value={"data": "ok"})
+        responses = [limited, ok]
+        # One session serves every attempt now, so the retry is driven off .request()
+        # rather than off a fresh session per pass.
+        session = _make_mock_session(limited)
+        session.request = AsyncMock(side_effect=lambda *a, **kw: responses.pop(0))
+        spotify._session_factory = lambda **kw: session
+
+        assert await spotify.http_call("https://api.spotify.com/v1/x") == {"data": "ok"}
+        assert responses == []
+
+    async def test_http_call_raises_rate_limit_after_retries(
+        self, spotify: Spotify
+    ) -> None:
+        """Its copy says "wait", not "try again": a re-run re-issues every request
+        that earned the 429."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "0"}
+        spotify._session_factory = lambda **kw: _make_mock_session(limited)
+
+        with pytest.raises(SpotifyRateLimitError) as excinfo:
+            await spotify.http_call("https://api.spotify.com/v1/x")
+        assert "rate-limiting" in excinfo.value.user_message
+        assert "try again in about 0s" not in excinfo.value.user_message.lower()
+
+    async def test_retry_after_caps_and_tolerates_garbage(
+        self, spotify: Spotify
+    ) -> None:
+        """A malformed header falls back to backoff rather than being read as
+        zero, and an hour-long one is capped rather than honoured."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        limited = AsyncMock()
+        limited.status = 429
+        limited.headers = {"Retry-After": "not-a-number"}
+        spotify._session_factory = lambda **kw: _make_mock_session(limited)
+
+        slept: list[float] = []
+        with (
+            patch("src.spotify.asyncio.sleep", new=AsyncMock(side_effect=slept.append)),
+            pytest.raises(SpotifyRateLimitError),
+        ):
+            await spotify.http_call("https://api.spotify.com/v1/x")
+
+        assert slept == [1.0, 2.0, 4.0]  # exponential, header ignored
+        assert all(s <= _MAX_RETRY_AFTER_SECS for s in slept)
 
     async def test_http_call_refreshes_expired_token(self, spotify: Spotify) -> None:
         spotify.token_expiry = time.time() - 1  # force expiry

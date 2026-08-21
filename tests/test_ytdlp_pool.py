@@ -1,10 +1,9 @@
 """Tests for src/ytdlp_pool.py — the extraction pool's lifecycle.
 
-Almost everything here drives a YtdlpPool built with an `executor_factory` seam, so no
-worker process is spawned: the class owns lifecycle, not extraction, and its logic is
-about *when* an executor is built, replaced and closed. The one exception is
-TestRealWorkerProcess, which spawns for real — see its docstring.
-"""
+Almost everything drives a YtdlpPool built with an `executor_factory` seam, spawning
+no worker process: the class owns lifecycle, not extraction, and its logic is about
+*when* an executor is built, replaced and closed. TestRealWorkerProcess is the one
+exception — it spawns for real; see its docstring."""
 
 import asyncio
 import os
@@ -46,7 +45,7 @@ def _double_in_worker(value: int) -> tuple[int, int]:
 
 class _UnpicklableError(Exception):
     """A *required* positional and no default — serialises but fails to *unpickle*, exactly
-    the trap that bricks the pool if it reaches the result queue (§12.1). Module-level so
+    the trap that bricks the pool if it reaches the result queue. Module-level so
     dumps() can resolve the class by reference and get far enough to fail on loads()."""
 
     def __init__(self, message: str, extra: object) -> None:
@@ -57,7 +56,7 @@ class _UnpicklableError(Exception):
 class _UnpicklableBroken(BrokenExecutor):
     """A BrokenExecutor that itself cannot cross the boundary. The real BrokenProcessPool
     is picklable, so only a synthetic one like this can prove the exclusion in
-    _picklable_call is load-bearing rather than incidental."""
+    _picklable_call is needed."""
 
     def __init__(self, message: str, extra: object) -> None:
         super().__init__(message)
@@ -140,10 +139,8 @@ class TestLazyCreation:
 
     def test_default_factory_builds_a_sized_process_pool(self) -> None:
         """The default factory is the only place a real ProcessPoolExecutor is named.
-
-        Patched rather than constructed: this asserts the wiring (worker count, the
-        hardened initializer), not that multiprocessing works.
-        """
+        Patched rather than constructed: this asserts the wiring (worker count,
+        hardened initializer), not that multiprocessing works."""
         pool = YtdlpPool(max_workers=3)
         sentinel = MagicMock(name="ProcessPoolExecutor-instance")
 
@@ -153,7 +150,7 @@ class TestLazyCreation:
         try:
             assert executor is sentinel
             # Wiring, not multiprocessing: the hardened initializer plus the worker-log
-            # queue handed to it via initargs (§12.2 Option B).
+            # queue handed to it via initargs (Option B).
             ctor.assert_called_once_with(
                 max_workers=3,
                 initializer=_worker_init,
@@ -180,13 +177,10 @@ class TestLazyCreation:
             pool.shutdown(wait=False)
 
     def test_concurrent_acquire_creates_exactly_one_executor(self) -> None:
-        """N threads racing into _acquire() must build one executor, not N.
-
-        The pool this class replaced justified skipping a lock by asserting all mutation
-        happened on the event-loop thread; that was untrue of its shutdown path
-        (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.4 D2). The lock is the fix, and a
-        barrier is how you prove it: every thread is released into _acquire() at once.
-        """
+        """N threads racing into _acquire() must build one executor, not N. The
+        predecessor skipped the lock on the claim that all mutation happened on the
+        event-loop thread, untrue of its shutdown path; a barrier is what proves the
+        fix, releasing every thread into _acquire() at once."""
         threads = 8
         barrier = threading.Barrier(threads)
         built: list[Executor] = []
@@ -260,14 +254,10 @@ class TestRun:
             pool.shutdown(wait=False)
 
     async def test_run_resolves_the_callable_at_call_time(self) -> None:
-        """The constraint the whole API shape exists to satisfy.
-
-        29 tests in test_youtube.py patch src.youtube._ytdlp_extract with a MagicMock.
-        That only works because run() takes the callable as a *parameter*, resolved from
-        the caller's module at call time — capturing it in __init__ would bind the real
-        function once at construction and every one of those patches would silently miss
-        (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §2.5).
-        """
+        """The constraint the whole API shape exists to satisfy: ~29 tests in
+        test_youtube.py patch src.youtube._ytdlp_extract, which works only because
+        run() takes the callable as a *parameter*, resolved from the caller's module
+        per call. Capturing it in __init__ makes every one of those patches miss."""
         import src.ytdlp_pool as module
 
         pool = YtdlpPool(executor_factory=_thread_pool_factory())
@@ -307,13 +297,10 @@ class TestRun:
             pool.shutdown(wait=False)
 
     async def test_run_after_shutdown_raises_instead_of_resurrecting(self) -> None:
-        """D1 — the defect this refactor closes.
-
-        The module global this replaced used None as "build one", so a late caller (an
-        in-flight prefetch_stream, exactly what is likely still running during close())
-        silently spawned a fresh 4-worker pool that nothing would ever join. Now it
-        raises, matching Executor.submit()'s own documented post-shutdown contract.
-        """
+        """The module global this replaced read None as "build one", so a late caller
+        (an in-flight prefetch_stream, likely still running during close()) silently
+        spawned a fresh 4-worker pool nothing would ever join. Now it raises, matching
+        Executor.submit()'s documented post-shutdown contract."""
         factory = MagicMock(side_effect=_thread_pool_factory())
         pool = YtdlpPool(executor_factory=factory)
         pool._acquire()
@@ -433,7 +420,7 @@ class TestAclose:
         """The shape borrowed from asyncio's loop.shutdown_default_executor(): the state
         change happens on the event-loop thread, and only the blocking join goes to a
         worker thread. That is what makes the cross-thread mutation the old module global
-        performed (§2.4 D2) structurally impossible rather than merely locked."""
+        performed structurally impossible rather than merely locked."""
         executor, started, release = self._blocking_executor()
         pool = YtdlpPool(executor_factory=lambda: executor)
         pool._acquire()
@@ -476,11 +463,10 @@ class TestAclose:
     async def test_aclose_terminates_workers_when_a_process_pool_join_times_out(
         self,
     ) -> None:
-        """A ProcessPoolExecutor must be actively terminated on timeout: shutdown(wait=False)
-        does NOT bound interpreter exit (the abandoned join is re-joined by _python_exit at
-        exit; measured 61s → 3.4s once workers are SIGTERMed, §12.3). The isinstance guard
-        picks terminate_workers() for a real pool and the shutdown(wait=False) fallback for
-        the thread-pool seam."""
+        """A ProcessPoolExecutor must be actively terminated on timeout: shutdown(
+        wait=False) does not bound interpreter exit — _python_exit re-joins the
+        abandoned pool (measured 61s → 3.4s once workers are SIGTERMed). The
+        isinstance guard picks terminate_workers() over the thread-pool fallback."""
         started = threading.Event()
         release = threading.Event()
 
@@ -502,13 +488,13 @@ class TestAclose:
 
             assert pool.is_closed
             executor.terminate_workers.assert_called_once_with()
-            # only the wait=True join ran; the wait=False fallback must NOT be taken
+            # Only the wait=True join ran; the wait=False fallback must not be taken
             executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
         finally:
             release.set()
 
     async def test_worker_termination_precedes_the_log_listener_stop(self) -> None:
-        """The §12.2 ordering rule: terminate_workers() THEN listener.stop(). Reversed,
+        """Ordering rule: terminate_workers() THEN listener.stop(). Reversed,
         stop() drains and closes the queue while the dying workers are still emitting, so
         their final records — the reason a shutdown-time extraction failed — are lost.
         """
@@ -545,10 +531,9 @@ class TestAclose:
         self,
     ) -> None:
         """A BrokenProcessPool heal (_replace) can null the executor out from under a
-        concurrent aclose(), so _close() returns None. The listener the original spawn
-        started is still draining the worker-log queue — aclose() must stop it anyway,
-        not early-return and leak the QueueListener thread (and its queue feeder) for the
-        life of the process."""
+        concurrent aclose(), so _close() returns None while the original spawn's
+        listener still drains the worker-log queue. aclose() must stop it anyway, not
+        early-return and leak the QueueListener thread for the life of the process."""
         listener = MagicMock(spec=QueueListener)
         pool = YtdlpPool(executor_factory=lambda: MagicMock(spec=ProcessPoolExecutor))
         # The state a break-heal leaves behind: _replace() already dropped the executor,
@@ -566,7 +551,7 @@ class TestAclose:
 
 class TestPicklableCall:
     """_picklable_call — the generic net that keeps an un-shippable worker exception from
-    breaking the pool (§12.1)."""
+    breaking the pool."""
 
     def test_a_picklable_exception_passes_through_unchanged(self) -> None:
         def boom() -> None:
@@ -591,7 +576,7 @@ class TestPicklableCall:
         assert pickle.loads(pickle.dumps(caught.value)).message == "cannot ship me"
 
     def test_a_picklable_broken_executor_is_re_raised_untouched(self) -> None:
-        """BrokenExecutor is run()'s healing signal — it must NOT be converted, or the
+        """BrokenExecutor is run()'s healing signal — it must not be converted, or the
         heal-once retry never fires."""
 
         def boom() -> None:
@@ -603,7 +588,7 @@ class TestPicklableCall:
     def test_even_an_unpicklable_broken_executor_is_re_raised_not_converted(
         self,
     ) -> None:
-        """Pins the exclusion as load-bearing: a picklable BrokenProcessPool round-trips
+        """Pins the exclusion: a picklable BrokenProcessPool round-trips
         and is re-raised either way, so removing `except BrokenExecutor: raise` is
         invisible unless the broken signal is itself unshippable. It must still reach the
         caller as a BrokenExecutor (so run() heals), never as a RemoteCallError."""
@@ -621,7 +606,7 @@ class TestPicklableCall:
 class TestRemoteCallError:
     def test_survives_pickle_round_trip_with_its_fields(self) -> None:
         """loads(dumps(...)): a multi-arg __init__ needs an explicit __reduce__ or it
-        unpickles into a TypeError on the parent side (§12.1)."""
+        unpickles into a TypeError on the parent side."""
         err = RemoteCallError("boom", "SomeWorkerError")
         back = pickle.loads(pickle.dumps(err))
 
@@ -643,13 +628,10 @@ class TestWorkerInit:
     def test_worker_init_swallows_a_failing_configure(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """An initializer that raises breaks the pool *and every rebuild of it* (the
-        stdlib contract, verified on 3.14.6), so heal-once cannot recover. Degrading to
-        unstructured worker logs beats bricking all extraction in the process.
-
-        Reported on stderr rather than through log.*, because what just failed is the
-        logging configuration.
-        """
+        """An initializer that raises breaks the pool *and every rebuild of it*
+        (stdlib contract, verified on 3.14.6), so heal-once cannot recover:
+        unstructured worker logs beat bricking all extraction. Reported on stderr
+        because what just failed is the logging configuration."""
         with patch(
             "src.ytdlp_pool.configure_worker_logging",
             side_effect=RuntimeError("structlog exploded"),
@@ -663,26 +645,16 @@ class TestWorkerInit:
 
 
 class TestRealWorkerProcess:
-    """The few tests that spawn real worker processes.
+    """The only tests that spawn real worker processes.
 
-    Everything else here uses a thread-pool seam, so nothing else asserts that the
-    production path — spawn, run the initializer, pickle the arguments and the result (or
-    the *exception*), ship them back, route the worker's logs to the parent, join —
-    actually works. These do, end to end.
-
-    Kept to the minimum, deliberately. Under `spawn` each worker re-imports the pytest
-    entry point, conftest and this module (discord, fakeredis, structlog, OTel), which
-    costs ~1 s per test here. Each of the three asserts something no cheap tier can, and
-    that Option B (§12.2) made worth the spawn:
-      * the callable runs across a real boundary and a late submit is refused (D1);
-      * a worker's ExtractionError survives pickling with its fields and cause (§12.1) —
-        the exact thing the autouse thread-pool seam can never exercise, because it never
-        pickles an exception;
-      * a worker's log record reaches a parent handler carrying worker_id and the
-        propagated trace_id (§12.2).
-    Picklability of *arguments* stays with TestProcessBoundaryContract; orphan reaping
-    stays a manual gate (docs/YTDLP_POOL_ENCAPSULATION_PLAN.md §7).
-    """
+    Everything else uses a thread-pool seam, so nothing else asserts the production
+    path end to end (spawn, initializer, pickle arguments and result, ship back,
+    route worker logs to the parent, join). Kept to three, ~1 s of re-imports each:
+    a callable crossing a real boundary with a late submit refused; an
+    ExtractionError surviving pickling with its fields and cause, which the seam can
+    never exercise since it never pickles an exception; a worker log record reaching
+    a parent handler with worker_id and trace_id. Argument picklability stays with
+    TestProcessBoundaryContract."""
 
     async def test_a_real_worker_process_runs_the_submitted_callable(self) -> None:
         pool = YtdlpPool(max_workers=1)
@@ -697,13 +669,13 @@ class TestRealWorkerProcess:
             await pool.aclose()
 
         assert pool.is_closed
-        # D1, against real processes: a late submit is refused rather than served by a
+        # Against real processes: a late submit is refused rather than served by a
         # freshly spawned pool that nothing would join.
         with pytest.raises(PoolClosedError):
             await pool.run(_double, 21)
 
     async def test_a_worker_extraction_error_survives_the_real_boundary(self) -> None:
-        """The defect the branch shipped (§12.1): a worker's yt-dlp error reaches the
+        """The defect the branch shipped: a worker's yt-dlp error reaches the
         parent as a flat ExtractionError with its fields, not an opaque pickling error,
         and the original is preserved as __cause__ (a _RemoteTraceback once it crosses).
         """
@@ -728,11 +700,10 @@ class TestRealWorkerProcess:
     async def test_the_returned_info_dict_survives_the_real_boundary_only_slimmed(
         self,
     ) -> None:
-        """The success-path return value (§ Finding 1): a raw process=True info dict
-        carries live/oversized values the pool cannot pickle back, so returning it fails
-        the call with a pickling error — while _slim_info's result crosses intact. Both on
-        one pool, which also proves a result-queue pickling failure does not brick it (the
-        stdlib re-delivers the error on the future; the result thread survives)."""
+        """A raw process=True info dict carries live/oversized values the pool cannot
+        pickle back, so returning it fails the call, while _slim_info's result crosses
+        intact. Both run on one pool, which also proves a result-queue pickling
+        failure does not brick it — the error is re-delivered on the future."""
         pool = YtdlpPool(max_workers=1)
         try:
             # Raw: the pool pickles the result synchronously; the unpicklable field comes
@@ -753,7 +724,7 @@ class TestRealWorkerProcess:
     async def test_worker_logs_reach_the_parent_with_worker_id_and_trace_id(
         self,
     ) -> None:
-        """Option B (§12.2): worker records travel the queue to a parent handler carrying
+        """Option B: worker records travel the queue to a parent handler carrying
         worker_id (bound in _worker_init) and the trace_id run() propagated from the active
         span — so a failed -play's worker diagnostics land in Loki, correlated."""
         import logging
@@ -772,7 +743,7 @@ class TestRealWorkerProcess:
         span_id = 0x00F067AA0BA902B7
         marker = "yt-dlp: SABR-only experiment detected [marker-6]"
 
-        # Present on root BEFORE the spawn: the listener captures root.handlers at start.
+        # Present on root before the spawn: the listener captures root.handlers at start.
         logging.root.addHandler(cap)
         pool = YtdlpPool(max_workers=1)
         try:

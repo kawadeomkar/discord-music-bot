@@ -1,12 +1,14 @@
 import asyncio
 import contextlib
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import (
     Any,
     Optional,
     Union,
     assert_never,
+    cast,
 )
 from collections.abc import AsyncGenerator, Coroutine
 
@@ -18,20 +20,46 @@ import redis.asyncio as aioredis
 from src.config import (
     SPOTIFY_TEST_TRACK_ID,
     SpotifyStatus,
+    debug_prometheus_url,
+    history_archive_enabled,
     spotify_enabled,
+    using_default_postgres_password,
+)
+from src import debug as debug_mode
+from src import leaderboard
+from src.guild_history import history_embeds
+from src.guild_state import Analytics
+from src.leaderboard import LeaderboardFlags
+from src.history_archive import (
+    ArchiveReader,
 )
 from src.musicplayer import MusicPlayer
-from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
+from src.redis_client import (
+    HISTORY_CACHE_LIMIT,
+    GuildRedisStore,
+    cache_get,
+    cache_set,
+)
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
 from src.sources import (
+    QUERY_SOURCE_SEARCH,
+    timestamp_warning,
+    unquote_argument,
     SoundcloudSource,
     SpotifySource,
     SpotifyType,
     YTSource,
     YTType,
     parse_input,
+    query_source_of,
     spotify_playlist_to_ytsearch,
 )
-from src.spotify import Spotify, SpotifyAuthError
+from src.spotify import (
+    Spotify,
+    SpotifyAuthError,
+    SpotifyRateLimitError,
+    SpotifyRequestError,
+)
 from src.youtube import YTDL, ExtractionError, QueueObject
 from contextvars import Token
 
@@ -41,18 +69,22 @@ from opentelemetry import trace
 from opentelemetry.trace import Span, StatusCode
 
 from src.ping import run_health_dashboard, send_latency_line
+from src.recovery import VoiceWatchdog, restore_guild
 from src.telemetry import get_tracer
 from src.util import (
+    EMBED_FIELD_LIMIT,
+    background_typing,
     cancel_task,
     fmt_duration,
-    history_embeds,
     notice_embed,
     pluralize,
     queue_message,
+    safe_label,
     record_span_error,
     send_embed,
     spawn_background,
     trace_footer,
+    truncate,
     get_logger,
 )
 
@@ -62,14 +94,9 @@ _tracer = get_tracer(__name__)
 
 class SpotifyDisabledError(Exception):
     """Raised when a Spotify link is played but Spotify support isn't usable.
-
-    Carries the SpotifyStatus so the message distinguishes the two failure modes:
-    no credentials were configured (DISABLED) vs. credentials were configured but
-    rejected by Spotify at startup (INVALID). The message is user-facing:
-    _command_error renders it (with the class name) into the error embed the
-    requester sees, so it explains the config gap and points at the sources that
-    still work.
-    """
+    Carries the SpotifyStatus so the message can separate no credentials configured
+    (disabled) from configured but rejected at startup (invalid). The message is
+    user-facing — _command_error renders it into the error embed."""
 
     def __init__(self, status: SpotifyStatus) -> None:
         self.status = status
@@ -80,7 +107,7 @@ class SpotifyDisabledError(Exception):
                 "(check SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
                 "Try a YouTube or SoundCloud link, or just search by name."
             )
-        else:  # DISABLED (and any unexpected value — safest generic message)
+        else:  # disabled (and any unexpected value — safest generic message)
             message = (
                 "Spotify links aren't available on this bot — it was started without "
                 "Spotify credentials (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). "
@@ -89,17 +116,142 @@ class SpotifyDisabledError(Exception):
         super().__init__(message)
 
 
+class PlaylistInputError(ValueError):
+    """A playlist link the user can fix by editing it, rather than a bot failure.
+
+    Subclasses ValueError so nothing that already catches one changes behaviour,
+    and carries user_message so _command_error renders actionable copy instead of
+    a "ValueError: …" line. One base class so _command_error's tuple names the
+    concept rather than growing an entry per case.
+    """
+
+    def __init__(self, log_message: str, user_message: str) -> None:
+        super().__init__(log_message)
+        self.user_message = user_message
+
+
+class PlaylistIndexError(PlaylistInputError):
+    """`index=` names a position past the end of the playlist. Both numbers are
+    in the message: the user cannot fix the link without knowing the real one."""
+
+    def __init__(self, index: int, total: int) -> None:
+        self.index = index
+        self.total = total
+        # A one-song playlist has no range to offer — "from 1 to 1" reads as a
+        # bug in the message rather than advice.
+        fix = (
+            "Drop the `&index=` from the link to queue it."
+            if total == 1
+            else (
+                f"Pick a position from 1 to {total}, or drop the `&index=` "
+                f"from the link to queue the whole playlist."
+            )
+        )
+        super().__init__(
+            f"playlist index {index} past end ({total} tracks)",
+            f"That link starts the playlist at **#{index}**, but the playlist "
+            f"only has **{total} {pluralize(total, 'song')}** — nothing was "
+            f"queued.\n\n{fix}",
+        )
+
+
+class EmptyPlaylistError(PlaylistInputError):
+    """A playlist that resolved to nothing queueable. Deliberately vague about
+    which cause: yt-dlp drops unavailable entries before this code sees them, so
+    "empty" and "every video is private" are indistinguishable here."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "playlist resolved to no tracks",
+            "That playlist has no songs I can queue — it may be empty, or every "
+            "video in it may be private or unavailable.",
+        )
+
+
 HISTORY_MIN_LIMIT = 1
-# The ceiling is the display cache depth — -history reads the in-memory cache,
-# or the Redis list when the cache is cold. See docs/HISTORY_OVERHAUL_PLAN.md §5.
+# Pinned to HISTORY_CACHE_LIMIT. recent() serves this command from the Redis list
+# alone, which holds exactly that many entries, so a larger ceiling here returns a
+# short page instead of failing. Raise both together or neither.
 HISTORY_MAX_LIMIT = HISTORY_CACHE_LIMIT
-# 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = 10,
-# Discord's per-message cap — so the block always fits and is never shed.
+# 8 song embeds + the ≤2-embed NP block MusicContext.send may prepend = Discord's
+# per-message cap of 10, so the block always fits and is never shed.
 HISTORY_EMBEDS_PER_MESSAGE = 8
+
+# How long a cold-start command (-play, -resume) waits for its restore. Generous for
+# one pipelined read; bounded because the pool sets no socket_timeout, so a server
+# that accepts the connection then stalls would hang the command outright.
+RESTORE_WAIT_SECS = 5.0
 
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+# Bound on one echoed needle, which owns a field to itself. Discord renders
+# markdown in field values, so what a user typed goes through safe_label first.
+_ECHO_MAX = 200
+
+# One row of a multi-row field — ten of these share the budget one needle gets.
+_ECHO_ROW_MAX = 70
+
+
+# The most dropped positions worth spelling out; past this the list says nothing
+# the count above it did not.
+_MAX_SHOWN_POSITIONS = 60
+
+
+def _echo(text: str, limit: int = _ECHO_MAX) -> str:
+    """A needle safe to put in an embed — see util.safe_label."""
+    return safe_label(text, limit)
+
+
+def _removed_label(item: QueueItem) -> str:
+    """A removed queue item's name for the reply, as MusicPlayer.queue_clear
+    renders it: `YTSource` has no title, so an unresolved Spotify-playlist track
+    would otherwise show as `?`."""
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
+
+
+def _field(value: str) -> str:
+    """An embed field value that cannot 400 the send. The callers below build from
+    lists whose length is the user's to choose, and the send happens AFTER the
+    queue has been mutated."""
+    return truncate(value, EMBED_FIELD_LIMIT)
+
+
+def _matched_label(outcome: RemoveOutcome, needle: str) -> str:
+    """How the removal matched, for the reply's "Matched" field. An origin match
+    names which of the user's own inputs did it, since one argument can take out a
+    whole playlist."""
+    # Not wrapped in a code span: inside one Discord renders safe_label's
+    # backslashes literally, so `-remove foo_bar` comes back as `foo\_bar`.
+    shown = _echo(needle)
+    if outcome.mode is not RemoveMode.ORIGIN:
+        return shown
+    kinds = {item.query_source for item in outcome.removed if item.query_source}
+    # Only when every removed item agrees — a mixed set has no one kind to name.
+    kind = kinds.pop() if len(kinds) == 1 else ""
+    them = "them" if len(outcome.removed) > 1 else "it"
+    if kind == QUERY_SOURCE_SEARCH:
+        return f"{shown} — the search you queued {them} with"
+    return f"{shown} — the {kind + ' ' if kind else ''}link you queued {them} with"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ActiveCommand:
+    """The bookkeeping cog_before_invoke opens and cog_after_invoke closes.
+
+    `token` is what otel_context.attach() returned and detach() requires back
+    (`object` does not satisfy it). `started` is monotonic and exists for the debug
+    footer, which reports elapsed time AT EACH SEND — so a command that sends twice
+    shows two increasing numbers, timing its phases.
+    """
+
+    span: Span
+    token: Token[Context]
+    started: float
 
 
 @dataclass
@@ -112,9 +264,87 @@ class ResolvedSpotifyPlaylist:
 
 @dataclass
 class ResolvedYoutubePlaylist:
-    """A YouTube playlist already resolved to playable QueueObjects."""
+    """A YouTube playlist already resolved to playable QueueObjects.
+
+    `skipped` is how many leading tracks the URL's `index=` dropped, carried for
+    the enqueue embed alone: tracks is already sliced, so nothing downstream has
+    to know the playlist started anywhere but its own first entry.
+    """
 
     tracks: list[QueueObject]
+    skipped: int = 0
+
+
+def _apply_playlist_index(
+    tracks: list[QueueObject],
+    index: Optional[int],
+    *,
+    keep_first_only: bool = False,
+) -> tuple[list[QueueObject], int]:
+    """Drop the tracks ahead of YouTube's 1-based `index=`, returning what is left
+    and how many went. A share link copied mid-playlist carries the position it was
+    copied at, so playing it starts there rather than back at track 1.
+
+    An index past the end raises PlaylistIndexError rather than queueing nothing:
+    the user named a position this playlist does not have, and an empty enqueue
+    reports success. The empty-playlist guard lives here too, so both callers
+    get it.
+
+    keep_first_only trims to the one track -playnow interjects, which also keeps
+    the rebase below off the tracks that caller discards (~1ms for a 1000-track
+    link).
+    """
+    if not tracks:
+        raise EmptyPlaylistError
+    if index is None or index <= 1:
+        return (tracks[:1] if keep_first_only else tracks), 0
+    if index > len(tracks):
+        raise PlaylistIndexError(index, len(tracks))
+    kept = tracks[index - 1 :]
+    dropped = index - 1
+    if keep_first_only:
+        kept = kept[:1]
+    # Positions were assigned at construction, before this slice. Rebase to
+    # kept-relative: the dropped tracks never enqueue, so an &index=N link would
+    # otherwise record every kept track N-1 too deep.
+    for track in kept:
+        track.analytics = replace(
+            track.analytics,
+            queue_position=track.analytics.queue_position - dropped,
+        )
+    return kept, dropped
+
+
+def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> None:
+    """Start the first queued track at the link's `t=` offset — but only when
+    that track is the video the link actually names.
+
+    A playlist link carries one offset and N tracks, so the offset belongs to the
+    `v=` video alone. Without a matching `index=` the queue starts at track 1,
+    which is usually a different song, and seeking that one would be wrong. The
+    offset was previously parsed and then dropped on this path.
+    """
+    if not source.ts or not source.video_id or not tracks:
+        return
+    # Substring, not equality: yt_playlist takes the entry's own `url` when it
+    # has one, so the shape it built is not guaranteed. An 11-char video id
+    # matching some other part of a YouTube URL is not a case that arises.
+    if source.video_id in tracks[0].webpage_url:
+        tracks[0].ts = source.ts
+
+
+def _join_succeeded(ctx: commands.Context) -> bool:
+    """Did the join a cold-start command just ran leave a USABLE voice client?
+
+    is_connected(), not just the type: discord.py registers the client on the guild
+    BEFORE the handshake completes, and vc.play() on a still-connecting one raises
+    once per restored song. join also swallows its own failures, so a failed one
+    arrives here as an absent client rather than an exception. Shared by -play and
+    -resume — the two checks must never diverge, since a type-only check is exactly
+    the bug this guards.
+    """
+    vc = ctx.voice_client
+    return isinstance(vc, discord.VoiceClient) and vc.is_connected()
 
 
 def _check_voice_permissions(
@@ -136,119 +366,90 @@ def _check_voice_permissions(
     return None
 
 
-async def _typing_keepalive(ctx: commands.Context) -> None:
-    try:
-        async with ctx.typing():
-            await asyncio.sleep(3600)  # held open until cancelled
-    # Catch Exception only — NOT CancelledError. This task is cancelled by
-    # background_typing() on the way out, and letting that CancelledError
-    # propagate is what marks the task genuinely cancelled (task.cancelled()
-    # True) instead of completing normally; swallowing it here would defeat
-    # cooperative cancellation and stop a shutdown/outer-timeout cancellation
-    # at this frame. Typing failures, on the other hand, are purely cosmetic
-    # and must never surface — hence the Exception catch.
-    except Exception:
-        pass  # cosmetic — never let typing failures surface
-
-
-@contextlib.asynccontextmanager
-async def background_typing(ctx: commands.Context) -> AsyncGenerator[None]:
-    """Non-blocking ctx.typing(): the first POST /typing runs in a background
-    task so the command body starts immediately; the keepalive is held open until the
-    body finishes, then cancelled. The whole CM lives inside the task — never enter/exit
-    Typing manually across tasks (see docs/PERFORMANCE_PLAN.md §2.2)."""
-    task = asyncio.create_task(_typing_keepalive(ctx))
-    try:
-        yield
-    finally:
-        task.cancel()
-
-
 class MusicBot(commands.Cog):
     """
     class for music bot
     """
 
-    __slots__ = (
-        "bot",
-        "mps",
-        "spotify",
-        "_spotify_status",
-        "redis",
-        "_active_spans",
-        "_alone_timers",
-        "_restore_tasks",
-    )
-
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         # HACK: getattr() hides MusicBot's real dependency on MusicBotApp.redis.
-        # `bot` is typed commands.Bot, but `redis` is a MusicBotApp attribute, so the
-        # access is spelled as getattr() to keep the type checker quiet. getattr()
-        # returns Any, which downgrades the Optional[aioredis.Redis] annotation from a
-        # checked type to an unchecked assertion: renaming MusicBotApp.redis silently
-        # degrades every guild to no-Redis — no persistence, no crash recovery — instead
-        # of failing at startup or at type-check time. Nothing here would go red.
-        # Fix: type `bot` as "MusicBotApp" under `if TYPE_CHECKING` (src/main.py already
-        # uses that idiom to break this exact import cycle), or declare a two-line
-        # Protocol carrying `redis: Optional[aioredis.Redis]`.
+        # `bot` is typed commands.Bot but `redis` is a MusicBotApp attribute, so the
+        # access is spelled getattr() to quiet the type checker. getattr() returns
+        # Any, downgrading Optional[aioredis.Redis] to an unchecked assertion:
+        # renaming MusicBotApp.redis silently degrades every guild to no-Redis — no
+        # persistence, no crash recovery — with nothing going red. Fix: type `bot` as
+        # "MusicBotApp" under `if TYPE_CHECKING` (src/main.py uses that idiom to break
+        # this cycle), or a Protocol carrying `redis: Optional[aioredis.Redis]`;
+        # history_archive below is the same HACK and the same fix covers both.
         self.redis: Optional[aioredis.Redis] = getattr(bot, "redis", None)
-        # Spotify is optional: only build the client when credentials are present.
-        # When None, playing a Spotify link raises SpotifyDisabledError; every other
-        # source (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
+        # The play-history archive's read surface. Present exactly when the archive
+        # is enabled: setup_hook builds it (requiring POSTGRES_URL) before
+        # load_extension constructs this cog, and leaves it None otherwise. Typed as
+        # ArchiveReader — -ping's Postgres row and -leaderboard's aggregate are all
+        # this class does with it.
+        self.history_archive: Optional[ArchiveReader] = getattr(
+            bot, "history_archive", None
+        )
+        # Spotify is optional: only build the client when credentials are present. When
+        # None, playing a Spotify link raises SpotifyDisabledError; every other source
+        # (YouTube, SoundCloud, search) is unaffected. See _require_spotify.
         self.spotify: Optional[Spotify] = (
             Spotify(redis=self.redis) if spotify_enabled() else None
         )
-        # Status starts ENABLED when credentials are present and DISABLED when
-        # they're absent. cog_load() then probes the live API and downgrades to
-        # INVALID if the credentials don't authenticate. The optimistic ENABLED
-        # start is safe because cog_load runs inside setup_hook, before the
-        # gateway connects — no command can arrive until the probe has resolved.
+        # Enabled when credentials are present, disabled when absent; cog_load()
+        # then probes the live API and downgrades to invalid if they don't
+        # authenticate. The optimistic start is safe because cog_load runs inside
+        # setup_hook, before the gateway connects — no command can arrive first.
         self._spotify_status: SpotifyStatus = (
             SpotifyStatus.ENABLED
             if self.spotify is not None
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
-        # id(ctx) → (span, the token otel_context.attach() returns, which detach()
-        # requires back — `object` does not satisfy it.
-        self._active_spans: dict[int, tuple[Span, Token[Context]]] = {}
-        self._alone_timers: dict[int, asyncio.Task] = {}
+        # id(ctx) → the in-flight command's span, otel token and start time.
+        self._active_spans: dict[int, ActiveCommand] = {}
+        self.voice_watchdog = VoiceWatchdog(self)
         self._restore_tasks: set[asyncio.Task] = set()
+        # Debug mode: the durable per-guild choice, its read cache and the runtime
+        # sampler, all owned by DebugSettings (src/debug.py). MusicContext.send and
+        # MusicPlayer read this attribute directly. Named debug_settings, not debug:
+        # MusicBot.debug is the -debug command and an attribute would shadow it.
+        self.debug_settings = debug_mode.DebugSettings()
 
     async def cog_load(self) -> None:
         """Kick off Spotify credential validation without blocking startup.
-
-        discord.py awaits this when the cog is added — inside setup_hook, before
-        the bot connects — so anything awaited here delays the connection. The
-        probe is a live network call, so it's spawned as a fire-and-forget
-        background task instead: startup proceeds immediately and _spotify_status
-        stays optimistically ENABLED until the probe resolves. With no credentials
-        there's nothing to check."""
+        discord.py awaits this inside setup_hook, before the bot connects, so
+        anything awaited here delays it. The probe is a live network call, spawned
+        fire-and-forget; _spotify_status stays optimistically enabled meanwhile."""
+        # At load, not only on toggles — RuntimeSampler.apply's docstring has the
+        # reason. The hydration re-syncs it once the stored choices land.
+        self.debug_settings.sync_sampler()
+        spawn_background(self._hydrate_debug(), self._restore_tasks)
         if self.spotify is None:
             return
         spawn_background(self._validate_spotify_credentials(), self._restore_tasks)
 
     async def cog_unload(self) -> None:
-        """Release the Spotify client's shared HTTP session.
+        """Stop the runtime sampler unconditionally. A reload that left it running
+        would drip /proc reads for the life of the process. The shared Prometheus
+        and Spotify sessions go with it, or a reload leaks a connector per load.
 
-        discord.py's BotBase.close() removes every cog before disconnecting, so
-        this runs on any orderly shutdown — an unclosed aiohttp session logs an
-        "Unclosed client session" warning at interpreter exit otherwise.
+        The background tasks go FIRST: the hydration ends in sync_sampler, so one
+        still in flight would restart the sampler straight after aclose() and leak
+        it, holding a dead cog alive.
         """
+        await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
+        await self.debug_settings.aclose()
+        await debug_mode.close_prometheus_session()
         if self.spotify is not None:
             await self.spotify.aclose()
 
     async def _validate_spotify_credentials(self) -> None:
-        """Background credential probe (spawned by cog_load, never awaited on the
-        startup path).
-
-        Only an authentication rejection — SpotifyAuthError — marks Spotify
-        INVALID. Network errors, timeouts, and non-auth HTTP failures are
-        inconclusive: they say nothing about whether the credentials are valid,
-        so the source is left ENABLED and a genuine problem simply surfaces on
-        the first Spotify link. The 10s cap keeps a hung probe from lingering;
-        a timeout is treated as inconclusive, not invalid."""
+        """Background credential probe (spawned by cog_load, never awaited). Only
+        SpotifyAuthError marks Spotify invalid; network errors, timeouts and non-auth
+        HTTP failures say nothing about validity, so the source stays enabled and a
+        genuine problem surfaces on the first Spotify link."""
         spotify = self.spotify
         if spotify is None:  # narrowing for the type checker; cog_load already checked
             return
@@ -272,11 +473,10 @@ class MusicBot(commands.Cog):
             )
 
     def _require_spotify(self) -> Spotify:
-        """Return the Spotify client, or raise SpotifyDisabledError if the feature
-        is off or its credentials failed startup validation. Call this at every
-        Spotify source dispatch: it both narrows the Optional away for the type
-        checker and produces the user-facing error, whose text depends on why
-        Spotify is unavailable (never configured vs. configured-but-rejected)."""
+        """The Spotify client, or SpotifyDisabledError when the feature is off or
+        its credentials failed startup validation. Call at every Spotify dispatch:
+        it narrows the Optional away AND produces the user-facing error, whose text
+        depends on why Spotify is unavailable."""
         if self.spotify is None or self._spotify_status is not SpotifyStatus.ENABLED:
             raise SpotifyDisabledError(self._spotify_status)
         return self.spotify
@@ -298,48 +498,55 @@ class MusicBot(commands.Cog):
         """Tear down the guild's MusicPlayer: cancel its background tasks,
         disconnect from voice, and clear persisted connection state. Safe to
         call concurrently — only the first caller for a given guild proceeds."""
-        # Cancel any pending alone-disconnect timer before the atomic gate so it
-        # cannot fire after cleanup completes and attempt a second cleanup.
-        existing = self._alone_timers.pop(guild.id, None)
-        if existing and not existing.done() and existing is not asyncio.current_task():
-            existing.cancel()
+        # Cancel any pending alone-disconnect timer before the atomic gate, so it
+        # cannot fire after cleanup completes and attempt a second one. Never
+        # cancels the caller — _countdown reaches here from inside its own task.
+        self.voice_watchdog.cancel(guild.id)
 
-        # Atomic pop: only the first caller proceeds; any concurrent call (e.g., from
-        # on_voice_state_update firing while stop's disconnect is in-flight) gets None
-        # and returns immediately, preventing the KeyError TOCTOU race.
+        # Atomic pop: only the first caller proceeds. A concurrent call (e.g.
+        # on_voice_state_update firing while stop's disconnect is in flight) gets
+        # None and returns, avoiding the KeyError TOCTOU race.
         mp = self.mps.pop(guild.id, None)
         trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
         if mp is None:
             return
         log.info("going to cleanup/disconnect")
+        # Claim the song being abandoned mid-play, before any await so the loop
+        # cannot slip its iteration end into the window. Nothing else records it: it
+        # left the queue at start, and clear_connection() drops the parked copy.
+        pending_history = mp.claim_current_song_for_history()
         try:
-            # Cancel tasks before disconnecting so the playback loop cannot
-            # wake up and start the next song between voice_client.stop() and
-            # the task cancellation. VoiceClient.disconnect() calls stop()
-            # internally, so audio is silenced when we disconnect below.
-            await asyncio.gather(
+            # Cancel tasks before disconnecting so the loop cannot wake and start
+            # the next song between voice_client.stop() and cancellation.
+            # disconnect() calls stop() internally, silencing audio below.
+            teardown = [
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
                 cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),
-            )
-            # Tasks are down — no tick can race this. Dispose of the NP host so
-            # no message keeps a mid-song bar frozen by the stop (dedicated NP
-            # message → deleted; command-response host → stripped back to its
-            # own embeds).
+            ]
+            await asyncio.gather(*teardown)
+            # Tasks are down, so no tick can race this. Dispose of the NP host so
+            # no message keeps a bar frozen mid-song by the stop.
             await mp.retire_np_host_on_stop()
             if guild.voice_client:
                 await guild.voice_client.disconnect(force=False)
-            # Belt-and-braces: the loop's own CancelledError handler already
-            # resets the presence, but only if it was parked inside the block
-            # that handles it. Repeat it here — after the disconnect, so this
-            # guild's client can no longer register as playing — so a stopped
-            # bot never advertises the song it stopped.
+            if pending_history is not None:
+                # After the disconnect, never inside the teardown gather: gather
+                # completes on its SLOWEST member, so Redis IO there delays the
+                # silence -stop asked for — measured at 20s against an unreachable
+                # host, and unbounded against one that accepts and then stalls,
+                # since the pool sets no socket_timeout.
+                await mp.history.add(pending_history)
+            # The loop's CancelledError handler already resets presence, but only
+            # if it was parked inside the block that handles it. Repeated here —
+            # after the disconnect, so this guild's client no longer registers as
+            # playing — so a stopped bot never advertises the song it stopped.
             await mp.update_activity(None)
             if mp.store is not None:
                 # Intentional stop — clear channel IDs and now-playing state so
-                # on_ready does not attempt to recover this guild after restart.
+                # on_ready doesn't try to recover this guild after a restart.
                 await mp.store.clear_connection()
                 await mp.store.refresh_ttl()
         except asyncio.CancelledError:
@@ -368,10 +575,23 @@ class MusicBot(commands.Cog):
             },
         )
         token = otel_context.attach(trace.set_span_in_context(span))
-        self._active_spans[id(ctx)] = (span, token)
+        self._active_spans[id(ctx)] = ActiveCommand(
+            span=span, token=token, started=time.monotonic()
+        )
 
         try:
             if ctx.guild is None:
+                return
+            # -debug is observation-only (see debug.py's module docstring), and
+            # get_mp() below CREATES a player. Letting it run would make the snapshot
+            # report a player it just manufactured — `player no` would be unreachable
+            # — and would spawn _restore_state() plus a 300s gate timeout that ends in
+            # cleanup() on a guild that was doing nothing.
+            #
+            # Read off the command rather than compared to a literal: a hardcoded
+            # "debug" here plus the same literal in its test means renaming the
+            # command leaves both green while the exemption silently stops applying.
+            if ctx.command is not None and ctx.command.extras.get("observation_only"):
                 return
             old_channel = (
                 self.mps[ctx.guild.id]._channel if ctx.guild.id in self.mps else None
@@ -401,26 +621,50 @@ class MusicBot(commands.Cog):
         from structlog.contextvars import clear_contextvars
 
         clear_contextvars()
-        pair = self._active_spans.pop(id(ctx), None)
-        if pair:
-            span, token = pair
-            span.end()
-            otel_context.detach(token)
+        active = self._active_spans.pop(id(ctx), None)
+        if active:
+            active.span.end()
+            otel_context.detach(active.token)
+
+    @contextlib.asynccontextmanager
+    async def traced_help(self, ctx: commands.Context) -> AsyncGenerator[None]:
+        """The span cog_before_invoke would have opened, for the help paths it does
+        not cover: discord.py owns the help command, and MusicBotApp.invoke's
+        `--help` short-circuit bypasses dispatch. Without it a help embed's debug
+        footer has no trace id and no elapsed time. Same key and bookkeeping as the
+        cog hooks, so MusicContext.send finds it.
+        """
+        span = _tracer.start_span(
+            "command.help",
+            attributes={
+                "discord.guild_id": str(ctx.guild.id) if ctx.guild else "",
+                "discord.user_id": str(ctx.author.id),
+            },
+        )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        self._active_spans[id(ctx)] = ActiveCommand(
+            span=span, token=token, started=time.monotonic()
+        )
+        try:
+            yield
+        finally:
+            active = self._active_spans.pop(id(ctx), None)
+            if active is not None:
+                active.span.end()
+                otel_context.detach(active.token)
 
     async def cog_command_error(self, ctx: commands.Context, error: Exception) -> None:
         """discord.py hook run when a command raises: records the error on the
         active span and, for errors with no other user-visible output, notifies the user.
         """
-        # Peek (don't pop) — cog_after_invoke runs in the finally block after this
-        # and is responsible for ending the span.
-        pair = self._active_spans.get(id(ctx))
-        if pair:
-            span, _ = pair
-            span.record_exception(error)
-            span.set_status(StatusCode.ERROR, str(error))
+        # Peek, don't pop: cog_after_invoke runs after this and ends the span.
+        active = self._active_spans.get(id(ctx))
+        if active:
+            active.span.record_exception(error)
+            active.span.set_status(StatusCode.ERROR, str(error))
 
-        # validate_commands already sends its own message before raising CommandError,
-        # so only handle errors that produce no user-visible output.
+        # validate_commands sends its own message before raising CommandError, so
+        # only handle errors that produce no user-visible output.
         if isinstance(error, commands.MissingRequiredArgument):
             cmd = ctx.command
             usage = f"`{ctx.prefix}{cmd.name} {cmd.signature}`" if cmd else ""
@@ -438,9 +682,9 @@ class MusicBot(commands.Cog):
                 embed=notice_embed(f"Invalid flags: {error}", discord.Color.red())
             )
         elif isinstance(error, commands.MaxConcurrencyReached):
-            # Raised in prepare(), before the command body — so the command's own
-            # try/except never sees it (e.g. a second -ping while one is live).
-            # Worded off the command name since any future guarded command lands here.
+            # Raised in prepare(), before the body, so the command's own try/except
+            # never sees it (e.g. a second -ping while one is live). Worded off the
+            # command name since any future guarded command lands here.
             cmd = ctx.command.name if ctx.command else "command"
             await ctx.send(
                 embed=notice_embed(
@@ -465,23 +709,37 @@ class MusicBot(commands.Cog):
         ctx: commands.Context,
         e: Exception,
         title: str = "Command failed",
+        detail: Optional[str] = None,
     ) -> None:
-        # The command's own failure log, folded in here so the 15 command
-        # bodies don't each repeat the identical `log.error(f"<cmd> failed:
-        # ...")` line before calling this. exc_info=True still captures the
-        # live traceback: this runs inside the command's `except` block, so
-        # sys.exc_info() is `e`. The command name comes from ctx (the canonical
-        # name, matching the literals it replaces) rather than being hand-typed.
+        # The failure log lives here so 15 command bodies don't each repeat it.
+        # exc_info=True still captures the live traceback — this runs inside the
+        # command's `except`, so sys.exc_info() is `e`. The name comes from ctx
+        # rather than being hand-typed.
         cmd = ctx.command.name if ctx.command else "command"
         log.error(f"{cmd} failed: {type(e).__name__}: {e}", exc_info=True)
         span = trace.get_current_span()
         record_span_error(span, e)  # full detail always goes to the span/logs
-        if isinstance(e, ExtractionError):
-            # A classified yt-dlp failure: show the user-safe line, not the raw message
-            # (which can carry yt-dlp's bug-report boilerplate). See ExtractionError.user_message.
-            detail = e.user_message
-        else:
-            detail = f"**{type(e).__name__}:** {e}"
+        # A caller-supplied detail wins: rendering the exception is safe for
+        # user-input failures, but a command whose exceptions come from
+        # infrastructure would publish what the operator sees — a DSN host and
+        # port, or a runbook naming a just recipe — to whoever ran it.
+        if detail is None:
+            if isinstance(
+                e,
+                (
+                    ExtractionError,
+                    PlaylistInputError,
+                    SpotifyRateLimitError,
+                    SpotifyRequestError,
+                ),
+            ):
+                # Show the user-safe line, not the raw message: yt-dlp's carries
+                # bug-report boilerplate, a bad playlist link needs to name the
+                # numbers, and a rate-limit needs to say "wait" rather than name
+                # an endpoint. See each class's user_message.
+                detail = e.user_message
+            else:
+                detail = f"**{type(e).__name__}:** {e}"
         await send_embed(
             ctx,
             title,
@@ -495,23 +753,37 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        analytics: Analytics,
+        origin: str,
     ) -> Union[QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist]:
-        """Resolve a parsed URL/search source into something enqueueable.
+        """Resolve a parsed URL/search source into something enqueueable: a
+        ResolvedSpotifyPlaylist (titles still needing per-title YouTube resolution),
+        a ResolvedYoutubePlaylist (already resolved), or a bare QueueObject.
 
-        Returns a ResolvedSpotifyPlaylist for a Spotify playlist (titles still
-        needing per-title YouTube resolution), a ResolvedYoutubePlaylist for a
-        YouTube playlist (already resolved), or a bare QueueObject otherwise.
-        """
+        `analytics` is the command's ask-time head value, minted at dispatch;
+        playlist tracks derive their per-track positions from it. `origin` is the
+        raw command argument, carried onto every resulting item — for a collection
+        the link, not the per-track search its expansion generated."""
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
+            # Titles, not QueueObjects — _enqueue_playlist mints the YTSources
+            # they become, carrying this command's analytics.
             return ResolvedSpotifyPlaylist(
                 await self._require_spotify().playlist(source.id)
             )
         elif isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             if source.list_id is None:
                 raise ValueError("YTSource with type=PLAYLIST must have list_id set")
-            return ResolvedYoutubePlaylist(
-                await YTDL.yt_playlist(source.playlist_url, ctx.author)
+            tracks = await YTDL.yt_playlist(
+                source.playlist_url,
+                ctx.author,
+                query_source=query_source_of(source),
+                analytics=analytics,
+                user_input=origin,
             )
+            tracks, skipped = _apply_playlist_index(tracks, source.index)
+            _apply_playlist_timestamp(tracks, source)
+            return ResolvedYoutubePlaylist(tracks, skipped=skipped)
         else:
             ts: Optional[int] = None
             search: str
@@ -524,7 +796,15 @@ class MusicBot(commands.Cog):
                 search = source.url
             else:
                 assert_never(source)
-            return await YTDL.yt_source(ctx.author, search, ts=ts, redis=self.redis)
+            return await YTDL.yt_source(
+                ctx.author,
+                search,
+                ts=ts,
+                redis=self.redis,
+                query_source=query_source_of(source),
+                analytics=analytics,
+                user_input=origin,
+            )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
     async def _enqueue_playlist(
@@ -534,25 +814,32 @@ class MusicBot(commands.Cog):
         qobj: Union[ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist],
         mp: MusicPlayer,
         *,
+        analytics: Analytics,
+        origin: str,
         front: bool = False,
     ) -> None:
         """Queue a resolved playlist and notify the channel — branches on the
         resolved shape since Spotify playlists arrive as titles needing YouTube
         search resolution while YouTube playlists arrive pre-resolved."""
-        # A playlist front-inserts in FULL, in order — unlike -playnow, which
-        # collapses a playlist to its first track. That restriction exists to
-        # bound how long an interrupted song waits to return; on this path
-        # nothing is playing to interrupt.
+        # A playlist front-inserts in full, in order — unlike -playnow, which
+        # collapses it to the first track to bound how long an interrupted song
+        # waits. Nothing is playing to interrupt on this path.
         enqueue = mp.queue_put_front if front else mp.queue_put
+        warning = timestamp_warning(source)
+        warning_line = f"\n\n{warning}" if warning else ""
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
-            qobjs_yt = spotify_playlist_to_ytsearch(titles)
+            qobjs_yt = spotify_playlist_to_ytsearch(
+                titles, analytics=analytics, origin=origin
+            )
             log.info(f"ytsearch qobjs: {qobjs_yt}")
+            shown_titles = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in titles])
             await asyncio.gather(
                 send_embed(
                     ctx,
                     "Queued playlist",
-                    f"Requested by: [{ctx.author.mention}]\n\n{queue_message(titles)}",
+                    f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
+                    f"{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
@@ -560,27 +847,35 @@ class MusicBot(commands.Cog):
             )
         else:
             # HACK: this assert stands in for a correlation the signature cannot
-            # express. _enqueue_playlist takes `source` and `qobj` as independent
-            # parameters, but they are not independent: a ResolvedYoutubePlaylist
-            # qobj always arrives with a YTSource source. Nothing in the types says
-            # so, hence the runtime assert — which `python -O` strips, leaving the
-            # attribute reads below unguarded.
-            # Fix: have the Resolved*Playlist dataclasses carry their own source, so
-            # the branch narrows both at once and this deletes itself. Deferred: it
-            # changes a dataclass's constructor and its test call sites, which is
-            # more than this typing branch should move.
+            # express — `source` and `qobj` are separate parameters, but a
+            # ResolvedYoutubePlaylist always arrives with a YTSource. `python -O`
+            # strips it, leaving the attribute reads below unguarded. Fix: have the
+            # Resolved*Playlist dataclasses carry their own source.
             assert isinstance(source, YTSource)
             playlist_url = source.playlist_url
-            # Mirror of the Spotify branch above: a YTSource playlist resolves
-            # via YTDL.yt_playlist() to fully-formed QueueObjects.
+            # Mirrors the Spotify branch: a YTSource playlist resolves via
+            # yt_playlist() to fully-formed QueueObjects.
             tracks = qobj.tracks
             count = len(tracks)
             log.info(f"yt playlist track count: {count}")
+            # Stated, not silent: the user pasted a link and got fewer songs than
+            # the playlist holds, and only the `index=` in their own URL explains
+            # it.
+            skipped_line = (
+                f"Starting at #{qobj.skipped + 1} — skipped {qobj.skipped} "
+                f"earlier {pluralize(qobj.skipped, 'song')}\n"
+                if qobj.skipped
+                else ""
+            )
+            shown_titles = queue_message(
+                [safe_label(q.title, _ECHO_ROW_MAX) for q in islice(tracks, 10)]
+            )
             await asyncio.gather(
                 send_embed(
                     ctx,
                     f"Queued playlist — {count} {pluralize(count, 'song')}",
-                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n\n{queue_message([q.title for q in islice(tracks, 10)])}",
+                    f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
+                    f"{skipped_line}\n{shown_titles}{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
@@ -595,17 +890,20 @@ class MusicBot(commands.Cog):
         mp: MusicPlayer,
         *,
         front: bool = False,
+        warning: Optional[str] = None,
     ) -> None:
+        """`warning` rides the confirmation embed when there is one. Every exit
+        below sends it either way: the embed is conditional (a song that starts
+        immediately gets none) and the warning is about what the user typed, so
+        losing it on the quietest path would hide it in the common case of
+        queueing the first song."""
         vc = ctx.voice_client
         if front:
-            # The song is about to play, so the "Queued song / Est. playing at"
-            # embed below would be wrong — the queue is non-empty here whenever
-            # a persisted queue was restored, but those entries are BEHIND this
-            # song, not ahead of it. The resume notice replaces it: it names the
-            # song starting now (nothing else in this response does — the
-            # playback gate is shut, so there is no Now Playing block to host)
-            # and adds what the restore knows. Built before the insert, while
-            # the queue still holds only the restored entries.
+            # The "Est. playing at" embed below would be wrong: a restored queue is
+            # non-empty but its entries sit BEHIND this song. The resume notice
+            # replaces it — it names the song starting now (nothing else does; the
+            # gate is shut, so there is no NP block to host). Built before the
+            # insert, while the queue holds only the restored entries.
             resume_notice = mp.build_resume_notice_embed(qobj)
             coros: list[Coroutine[Any, Any, Any]] = [
                 mp.queue_put_front(qobj),
@@ -613,6 +911,10 @@ class MusicBot(commands.Cog):
             ]
             if resume_notice is not None:
                 coros.append(ctx.send(embed=resume_notice))
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
             await asyncio.gather(*coros)
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
@@ -625,6 +927,7 @@ class MusicBot(commands.Cog):
             ctx.message.add_reaction("👍"),
         ]
         if should_show_queued:
+            warning_line = f"\n\n{warning}" if warning else ""
             coros.append(
                 send_embed(
                     ctx,
@@ -633,11 +936,16 @@ class MusicBot(commands.Cog):
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
                         f"Est. playing at {mp.estimated_playing_at()}"
+                        f"{warning_line}"
                     ),
                     discord.Color.blue(),
                     thumbnail=qobj.thumbnail,
                 )
             )
+        elif warning is not None:
+            # Nothing else is being sent on this path — the song starts now and
+            # the NP card speaks for it — so the warning needs its own message.
+            coros.append(ctx.send(embed=notice_embed(warning, discord.Color.orange())))
         await asyncio.gather(*coros)
         log.info(f"play qsize: {mp.queue.qsize()}")
 
@@ -653,13 +961,17 @@ class MusicBot(commands.Cog):
             "If the bot is not connected yet it joins your voice channel first. "
             "If something is already playing, the song is appended to the queue "
             "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset."
+            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
+            "A YouTube playlist link copied from partway through — one carrying "
+            "an `&index=` — queues from that position, skipping the songs "
+            "before it. Drop the `&index=` to queue the whole playlist."
         ),
         extras={
             "category": "Playback",
             "examples": [
                 "-play never gonna give you up",
                 "-play https://youtu.be/dQw4w9WgXcQ?t=43",
+                "-play https://www.youtube.com/playlist?list=PLabc&index=4",
                 "-play https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
                 "-p https://soundcloud.com/artist/track",
             ],
@@ -669,18 +981,25 @@ class MusicBot(commands.Cog):
             ),
         },
     )
+    # Serialized per guild, like -resume: two concurrent invocations both read a
+    # live current_song and both park a resume tail for it, so one play comes back
+    # twice. wait=False — the second caller is told to wait rather than queued
+    # behind a 1-4s extraction.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
-    async def play(self, ctx: commands.Context, url: str) -> None:
+    async def play(self, ctx: commands.Context, *, url: str) -> None:
+        # Consume-rest, so a multi-word search arrives whole: this value is what
+        # `origin` is stamped from, and -remove matches on that. read_rest hands
+        # the quotes through, hence the unquote — a quoted origin is one -remove
+        # would have to match literally.
+        url = unquote_argument(url.strip())
         async with background_typing(ctx):
             try:
-                # Paused → interject instead of appending. Appending would leave
-                # the bot silent with the request buried behind a paused song;
-                # -play means "play this". The interrupted song returns PLAYING
-                # (resume_paused=False), unlike -playnow which restores it
-                # paused. Checked before parse_input so the paused path parses
-                # exactly once, inside _interject_flow.
-                # docs/PLAY_WHILE_PAUSED_PLAN.md §3.
+                # Paused → interject, not append: appending leaves the bot silent
+                # with the request buried behind a paused song. The interrupted song
+                # returns PLAYING, unlike -playnow. Checked before parse_input so the
+                # paused path parses once, inside _interject_flow.
                 paused_vc = ctx.voice_client
                 if isinstance(paused_vc, discord.VoiceClient) and paused_vc.is_paused():
                     paused_mp = self.get_mp(ctx)
@@ -700,28 +1019,55 @@ class MusicBot(commands.Cog):
                     QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
                 ]
                 async with contextlib.AsyncExitStack() as stack:
-                    # front: the bot was not connected, so this song jumps ahead
-                    # of any queue restored from Redis (a -stop leaves its queue
-                    # persisted). -play on a disconnected bot means "play this",
-                    # not "play whatever was left over"; the persisted entries
-                    # resume behind it. docs/PLAYBACK_GATE_PLAN.md.
+                    # front: not connected, so this song jumps ahead of any queue
+                    # restored from Redis (a -stop leaves its queue persisted).
+                    # -play on a disconnected bot means "play this", not "play
+                    # the leftovers".
                     front = not ctx.voice_client
+                    # Bound before the join, not after: every failure path below
+                    # hands this exact player to _abandon_cold_start, and a get_mp()
+                    # issued after its cleanup() would build and start a fresh one.
+                    mp = self.get_mp(ctx)
+                    # Ask-time analytics, read ONCE at dispatch: the command
+                    # message's snowflake time, so the wait covers gateway
+                    # delivery and the resolve below. front ⇒ depth 0, the
+                    # cold-start song plays ahead of the restored queue.
                     if front:
-                        # Hold the playback gate across the join below — join
-                        # opens it the moment the handshake lands, which would
-                        # start the restored head while queue_source is still
-                        # extracting. The hold releases on exiting the stack,
-                        # after the front insertion.
-                        await stack.enter_async_context(
-                            self.get_mp(ctx).defer_playback()
-                        )
-                        # Launch join concurrently with queue_source — both are pure I/O
-                        # (Discord WebSocket handshake vs yt-dlp extraction) with no data
-                        # dependency between them. await join_task after queue_source
-                        # guarantees the voice client is ready before queue_put fires.
+                        position = 0
+                    else:
+                        # Wait out any in-flight restore: restore_entries() appends,
+                        # so a put() landing first leaves the deque holding this
+                        # song ahead of entries Redis lists behind it, and every
+                        # later commit-time LPOP then retires the wrong one.
+                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                            await ctx.send(
+                                embed=notice_embed(
+                                    "Still loading this server's saved queue — try "
+                                    "again in a moment.",
+                                    discord.Color.orange(),
+                                )
+                            )
+                            return
+                        position = mp.enqueue_depth()
+                    analytics = Analytics(
+                        queued_at=ctx.message.created_at.timestamp(),
+                        queue_position=position,
+                    )
+                    if front:
+                        # Hold the gate across the join below: join opens it the
+                        # moment the handshake lands, which would start the
+                        # restored head while queue_source is still extracting.
+                        # Released on exiting the stack, after the front insertion.
+                        await stack.enter_async_context(mp.defer_playback())
+                        # Concurrent with queue_source: both are pure I/O (voice
+                        # handshake vs yt-dlp extraction) with no data dependency.
+                        # Awaiting join_task after queue_source guarantees the voice
+                        # client is ready before queue_put fires.
                         join_task = asyncio.create_task(ctx.invoke(self.join))
                         try:
-                            qobj = await self.queue_source(ctx, source)
+                            qobj = await self.queue_source(
+                                ctx, source, analytics=analytics, origin=url
+                            )
                             await join_task
                         except BaseException:
                             if not join_task.done():
@@ -730,33 +1076,61 @@ class MusicBot(commands.Cog):
                                     asyncio.CancelledError, Exception
                                 ):
                                     await join_task
-                            # Full cleanup (not just disconnect) — cog_before_invoke already
-                            # created a MusicPlayer and started its loop() task. Without
-                            # cleanup() that task runs as a zombie for up to 300s waiting on
-                            # queue.get(), and store.clear_connection() is never called,
-                            # which would trigger spurious crash recovery on restart.
-                            if ctx.guild is not None:
-                                with contextlib.suppress(Exception):
-                                    await self.cleanup(ctx.guild)
+                            # Full cleanup, not just disconnect: cog_before_invoke
+                            # already started a MusicPlayer's loop(), which would
+                            # zombie for up to 300s on queue.get() with
+                            # clear_connection() never firing — spurious crash
+                            # recovery on restart.
+                            await self._abandon_cold_start(ctx, mp)
                             raise
+                        # Inserting onto a join that produced no usable client hands
+                        # the loop a song it can only raise on.
+                        if not _join_succeeded(ctx):
+                            await self._abandon_cold_start(ctx, mp)
+                            return
                     else:
-                        qobj = await self.queue_source(ctx, source)
+                        qobj = await self.queue_source(
+                            ctx, source, analytics=analytics, origin=url
+                        )
 
-                    mp = self.get_mp(ctx)
                     log.info(f"Voice client: {ctx.voice_client}")
 
                     if front:
-                        # Ordering is load-bearing: put_front LPUSHes the Redis
-                        # mirror, while restore_entries replays entries that are
-                        # already on that list in memory only. Inserting before
-                        # restore has read its snapshot double-queues this song.
-                        await mp.wait_for_restore()
+                        # Order matters: put_front LPUSHes the mirror while
+                        # restore_entries replays already-listed entries in memory
+                        # only, so inserting first double-queues this song. A restore
+                        # that never lands is therefore a reason NOT to insert — and
+                        # the wait is bounded, since the pool sets no socket_timeout.
+                        if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                            await self._abandon_cold_start(ctx, mp)
+                            await ctx.send(
+                                embed=notice_embed(
+                                    "Couldn't reach this server's saved queue, so "
+                                    "your song wasn't queued — try again in a "
+                                    "moment.",
+                                    discord.Color.red(),
+                                )
+                            )
+                            return
 
                     if isinstance(qobj, QueueObject):
-                        qobj.user_input = url
-                        await self._enqueue_single(ctx, qobj, mp, front=front)
+                        await self._enqueue_single(
+                            ctx,
+                            qobj,
+                            mp,
+                            front=front,
+                            warning=timestamp_warning(source),
+                        )
                     else:
-                        await self._enqueue_playlist(ctx, source, qobj, mp, front=front)
+                        await self._enqueue_playlist(
+                            ctx,
+                            source,
+                            qobj,
+                            mp,
+                            front=front,
+                            analytics=analytics,
+                            origin=url,
+                        )
 
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
@@ -765,31 +1139,72 @@ class MusicBot(commands.Cog):
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
+        *,
+        origin: str,
     ) -> QueueObject:
-        """Resolve -playnow input to exactly ONE QueueObject. Playlists
-        collapse to their first track (interjecting a whole playlist would
-        delay the interrupted song's return indefinitely — use -play)."""
+        """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
+        their first track — interjecting a whole one would delay the interrupted
+        song's return indefinitely (use -play).
+
+        `origin` is the raw command argument, passed down by every branch — for a
+        collapsed playlist it is the link, not the title the expansion generated."""
         playlist_notice = notice_embed(
             "Playlists can't be interjected — playing the **first track** now. "
             "Use `-play` for the full playlist.",
             discord.Color.orange(),
+        )
+        # Ask-time analytics: the message's snowflake time, and depth 0 — an
+        # interjection plays immediately. The caller re-mints the depth on the
+        # two paths where it ends up queueing instead.
+        analytics = Analytics(
+            queued_at=ctx.message.created_at.timestamp(), queue_position=0
         )
         if isinstance(source, SpotifySource) and source.type == SpotifyType.PLAYLIST:
             titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
             await ctx.send(embed=playlist_notice)
-            yts = spotify_playlist_to_ytsearch(titles[:1])[0]
+            yts = spotify_playlist_to_ytsearch(
+                titles[:1], analytics=analytics, origin=origin
+            )[0]
+            # Both playlist branches resolve directly rather than through
+            # queue_source, so each passes its own metadata.
             return await YTDL.yt_source(
-                ctx.author, yts.ytsearch or "", redis=self.redis
+                ctx.author,
+                yts.ytsearch or "",
+                redis=self.redis,
+                query_source=query_source_of(yts),
+                analytics=analytics,
+                user_input=origin,
             )
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
-            tracks = await YTDL.yt_playlist(source.playlist_url, ctx.author)
-            if not tracks:
-                raise ValueError("Playlist has no tracks")
-            await ctx.send(embed=playlist_notice)
+            tracks = await YTDL.yt_playlist(
+                source.playlist_url,
+                ctx.author,
+                query_source=query_source_of(source),
+                analytics=analytics,
+                user_input=origin,
+            )
+            # Indexed here too: -playnow on a link copied mid-playlist should
+            # interject the track the user was looking at, not the playlist's
+            # first. The slice makes tracks[0] that track.
+            tracks, skipped = _apply_playlist_index(
+                tracks, source.index, keep_first_only=True
+            )
+            _apply_playlist_timestamp(tracks, source)
+            if skipped:
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Playlists can't be interjected — playing **#"
+                        f"{skipped + 1}** now. Use `-play` for the full "
+                        f"playlist.",
+                        discord.Color.orange(),
+                    )
+                )
+            else:
+                await ctx.send(embed=playlist_notice)
             return tracks[0]
-        qobj = await self.queue_source(ctx, source)
+        qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
         return qobj
 
@@ -817,22 +1232,27 @@ class MusicBot(commands.Cog):
             "note": (
                 "`-play` adds to the back of the queue; `-playnow` cuts the line and "
                 "hands the current song back afterwards. A song that was nearly over "
-                "will not return, and interjecting on top of another `-playnow` song "
-                "replaces it rather than stacking."
+                "will not return. Otherwise they stack: run it again and the song "
+                "you just interrupted waits its turn too, each one resuming from "
+                "where it left off, most recent first."
             ),
         },
     )
+    # See -play: interject() re-checks current_song, but current_song outlives
+    # the check by a whole song, so the re-check cannot serialize two callers.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.playnow")
-    async def playnow(self, ctx: commands.Context, url: str) -> None:
+    async def playnow(self, ctx: commands.Context, *, url: str) -> None:
+        url = unquote_argument(url.strip())  # consume-rest, as -play — see there
         async with background_typing(ctx):
             try:
                 mp = self.get_mp(ctx)
                 vc = ctx.voice_client
-                # Nothing live to interrupt → equivalent to -play (also covers
-                # not-connected: play joins first). Playlists enqueue in full
-                # on this path — interjection semantics don't apply to an
-                # idle player (docs/PLAYNOW_PROPOSAL.md §3).
+                # Nothing live to interrupt → equivalent to -play (which also
+                # covers not-connected, since play joins first). Playlists enqueue
+                # in full here: interjection semantics don't apply to an idle
+                # player.
                 if (
                     mp.current_song is None
                     or not isinstance(vc, discord.VoiceClient)
@@ -857,59 +1277,58 @@ class MusicBot(commands.Cog):
     ) -> None:
         """Resolve `url` to one song, interrupt what is playing, and report.
 
-        Shared by `-playnow` and by `-play` when a song is paused. The two
-        differ only in resume_paused: `-playnow` restores exactly what it
-        interrupted (paused in → paused out), while `-play` on a paused song
-        brings it back playing. Everything else — playlist collapsing, the
-        stream warm-up, the ended-mid-resolve fallback, the outcome wording —
-        is identical, and duplicating it into `play` would guarantee drift
-        (docs/PLAY_WHILE_PAUSED_PLAN.md §4.2).
-
-        require_paused re-reads the pause state after resolution and before
-        committing. `-play` only interjects *because* the song is paused, so a
-        `-resume` landing during the 1–4s extraction removes the reason — the
-        resolved track is appended instead. Reading here rather than at the
-        command's entry also means a song that fails to resolve never stops
-        the paused song (§3.3).
+        Shared by `-playnow` and by `-play` on a paused song; they differ only in
+        resume_paused (`-playnow` restores paused-in → paused-out, `-play` brings it
+        back playing). require_paused re-reads the pause state after resolution,
+        before committing: `-play` interjects only *because* the song is paused, so a
+        `-resume` landing during the 1–4s extraction removes the reason and the track
+        is appended instead. Reading it here rather than at command entry also means
+        a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url, ctx.message.content)
-        qobj = await self._resolve_playnow_source(ctx, source)
-        qobj.user_input = url
+        qobj = await self._resolve_playnow_source(ctx, source, origin=url)
         qobj.interjected = True
 
-        # Warm the stream-URL cache BEFORE interrupting the current
-        # song — a cache miss at dequeue would otherwise put seconds
-        # of yt-dlp dead air between the interrupt and the interjected
-        # song starting. Awaited (not spawned like queue_put's
-        # warm-up): the current song keeps playing through the wait,
-        # which beats stopping it into silence. No-op without Redis;
+        # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
+        # seconds of yt-dlp dead air between the interrupt and the new song. Awaited,
+        # not spawned — the current song plays through the wait. No-op without Redis;
         # also back-fills duration/thumbnail for the embeds below.
         await YTDL.prefetch_stream(qobj, redis=self.redis)
 
         if require_paused and not vc.is_paused():
-            # Resumed while we were resolving — the reason to interject is
-            # gone, so append rather than interrupting a song the user just
-            # chose to keep playing. Clear the marker first: a normally queued
-            # song must not trigger replace semantics later.
+            # Resumed during the resolve — the reason to interject is gone, so
+            # append rather than interrupt a song the user just chose to keep
+            # playing. Clear the marker: a normally queued song must not trigger
+            # replace semantics later.
             qobj.interjected = False
-            await self._enqueue_single(ctx, qobj, mp)
+            # An ordinary append now, behind the whole queue, so replace the 0
+            # minted for the interjection. Read here: the queue moved during the
+            # resolve.
+            qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
+            await self._enqueue_single(ctx, qobj, mp, warning=timestamp_warning(source))
             return
 
         outcome = await mp.interject(qobj, vc, resume_paused=resume_paused)
         if outcome is None:
-            # The song ended while the input was resolving — nothing
-            # to interrupt anymore. The input is already parsed and
-            # resolved, so insert the qobj directly rather than
-            # re-invoking -play, which would re-parse and re-resolve —
-            # and, for a playlist, enqueue ALL tracks right after the
-            # first-track-only notice above. FRONT insert, not append:
-            # the user asked for "now", and this window can be seconds
-            # long (the loop mid-resolve on the next song) with more
-            # songs queued behind it. Reset the marker: a normally
-            # queued song must not trigger replace semantics when a
-            # later interjection interrupts it.
+            # The song ended during the resolve — nothing left to interrupt. Insert
+            # qobj directly rather than re-invoking -play, which would re-parse,
+            # re-resolve and (for a playlist) enqueue all tracks right after the
+            # first-track-only notice above. Front, not append: the user asked for
+            # "now", and this window can be seconds long with songs queued behind.
+            # It interrupted nothing, so keeping the marker would attribute an
+            # interjection that never happened.
             qobj.interjected = False
-            await mp.queue.put_front([qobj])
+            # interject() also returns None when the loop moved on to a
+            # DIFFERENT song, which this insert waits behind. One, never the
+            # queue depth: it goes to the front.
+            qobj.analytics = replace(
+                qobj.analytics,
+                queue_position=1 if mp.current_song is not None else 0,
+            )
+            # The player's wrapper, not queue.put_front directly — the same
+            # item-vs-list plumbing as every other user-facing insert.
+            # prefetch=False — the stream URL was warmed above.
+            await mp.queue_put_front(qobj, prefetch=False)
             await asyncio.gather(
                 send_embed(
                     ctx,
@@ -924,20 +1343,14 @@ class MusicBot(commands.Cog):
             )
             return
 
-        if outcome.replaced:
-            desc = (
-                f"Replaced **{outcome.interrupted_title}** (also played "
-                f"via `-playnow` — it will not return)."
-            )
-        elif outcome.resume_position is None:
+        if outcome.resume_position is None:
             desc = (
                 f"**{outcome.interrupted_title}** was nearly finished "
                 f"and will not resume."
             )
         elif outcome.returns_paused:
-            # returns_paused, NOT was_paused: with resume_paused=False the song
-            # was paused but comes back playing, and "will return paused"
-            # would be a lie.
+            # returns_paused, not was_paused: with resume_paused=False the song was
+            # paused but comes back playing, so "will return paused" would lie.
             desc = (
                 f"**{outcome.interrupted_title}** will return paused at "
                 f"`{outcome.resume_position_str}`."
@@ -983,35 +1396,40 @@ class MusicBot(commands.Cog):
             vc = ctx.voice_client
             if not isinstance(vc, discord.VoiceClient):
                 return
-            # is_playing() is False while paused, so gating on it alone made
-            # -skip a total no-op on a paused song — no stop, and not even the
-            # reaction (it lived inside the same branch).
+            # is_playing() is False while paused, so gating on it alone made -skip
+            # a total no-op on a paused song — not even the reaction.
             if not (vc.is_playing() or vc.is_paused()):
                 return
 
-            # Capture BEFORE stop(): the loop's song-end bookkeeping clears
-            # current_song, and the notice below has to name the song that was
-            # actually skipped. Primitives, not the object — discord.py's
-            # player thread calls source.cleanup() on the way out.
+            # Capture before stop(): the loop's song-end bookkeeping clears
+            # current_song, and the notice must name the song actually skipped.
+            # Primitives, not the object — the player thread calls cleanup() on it.
             skipped_title: Optional[str] = None
             skipped_position = ""
-            if vc.is_paused():
-                song = self.get_mp(ctx).current_song
+            assert ctx.guild is not None  # validate_commands rejects DMs before this
+            # mps, not get_mp(): this must not build a player, and one lookup keeps
+            # the mark and the paused read on the same object — cog_before_invoke can
+            # rebuild a player mid-command.
+            mp_for_stop = self.mps.get(ctx.guild.id)
+            if vc.is_paused() and mp_for_stop is not None:
+                song = mp_for_stop.current_song
                 if song is not None:
                     skipped_title = song.title
-                    # position_secs is frozen while paused, so this is the
-                    # exact point the song was left at.
+                    # position_secs is frozen while paused: the exact leave point.
                     skipped_position = fmt_duration(int(song.position_secs))
 
+            # Before vc.stop(): a skip inside ffmpeg's startup window otherwise looks
+            # exactly like a stream that never opened.
+            if mp_for_stop is not None:
+                mp_for_stop.note_deliberate_stop()
             vc.stop()
 
             coros: list[Coroutine[Any, Any, Any]] = []
             if not ctx.invoked_parents:
                 coros.append(ctx.message.add_reaction("⏭"))
             if skipped_title is not None:
-                # A paused song makes no sound, so stopping it produces no
-                # audible cue that the command did anything — unlike an
-                # ordinary skip, where the music changing is the feedback.
+                # A paused song makes no sound, so stopping it gives no audible
+                # cue — unlike an ordinary skip, where the music changing is it.
                 coros.append(
                     ctx.send(
                         embed=notice_embed(
@@ -1029,12 +1447,15 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="stop",
         aliases=["st"],
-        brief="stop playback, drop the queue and disconnect",
+        brief="stop playback and disconnect, keeping the queue",
         help=(
-            "Stops the current song, discards the queue, removes the Now Playing "
-            "card and disconnects the bot from the voice channel.\n\n"
+            "Stops the current song, removes the Now Playing card and "
+            "disconnects the bot from the voice channel.\n\n"
             "This is the full teardown — use `-pause` if you only want to take a "
-            "break, or `-clear` if you want to empty the queue but keep playing."
+            "break, or `-clear` if you want to empty the queue but keep playing.\n\n"
+            "The queue is **kept** on the server for 24 hours, so `-resume` (or "
+            "the next `-play`) picks it back up where it left off. The song that "
+            "was playing does not come back, but it is recorded in `-history`."
         ),
         extras={"category": "Playback", "examples": ["-stop", "-st"]},
     )
@@ -1042,11 +1463,10 @@ class MusicBot(commands.Cog):
     @_tracer.start_as_current_span("bot.stop")
     async def stop(self, ctx: commands.Context) -> None:
         try:
-            # Do not call skip before cleanup: skip fires voice_client.stop() which
-            # triggers the after callback (play_next.set), giving the playback loop a
-            # window to start the next song before the loop task is cancelled.
-            # cleanup() cancels _player first, then disconnects — disconnect()
-            # internally stops the audio subprocess, so no explicit skip is needed.
+            # Don't skip before cleanup: skip fires voice_client.stop(), whose
+            # after callback (play_next.set) gives the loop a window to start the
+            # next song before it is cancelled. cleanup() cancels _player first and
+            # disconnect() stops the audio subprocess, so no skip is needed.
             vc = discord.utils.get(self.bot.voice_clients, guild=ctx.guild)
             if vc is not None and ctx.guild is not None:
                 await ctx.message.add_reaction("👋")
@@ -1087,29 +1507,142 @@ class MusicBot(commands.Cog):
         help=(
             "Resumes a paused song from the position it stopped at, and re-pins "
             "the Now Playing card — with its live progress bar — to the bottom "
-            "of the channel."
+            "of the channel.\n\n"
+            "If the bot is not in a voice channel it joins yours first and picks "
+            "the previous session's queue back up, the same auto-join `-play` does."
         ),
-        extras={"category": "Playback", "examples": ["-resume", "-r"]},
+        extras={
+            "category": "Playback",
+            "examples": ["-resume", "-r"],
+            "note": (
+                "A `-stop` or a disconnect keeps the queue for 24 hours, so "
+                "`-resume` brings it back. The song that was playing comes back "
+                "too — but only after a crash; an intentional `-stop` drops it."
+            ),
+        },
     )
     @commands.before_invoke(validate_commands)
+    # Two racing -resumes both read `voice_client is None`, so validate_commands'
+    # "already being used in channel X" check fires for neither: both join and the
+    # second MOVES the bot to its own author's channel. One at a time per guild.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.resume")
     async def resume(self, ctx: commands.Context) -> None:
         try:
             vc = ctx.voice_client
-            if (
-                isinstance(vc, discord.VoiceClient)
-                and not vc.is_playing()
-                and vc.is_paused()
-            ):
-                mp = self.get_mp(ctx)
-                await mp.resume(vc)
-                await ctx.message.add_reaction("⏭️")
-                # If the -pause confirmation hosts the block, re-host it so
-                # "⏸️ Paused at…" becomes plain history instead of sitting
-                # beneath a live, advancing bar for the rest of the song.
-                await mp.rehost_np_after_resume()
+            if not isinstance(vc, discord.VoiceClient):
+                # Not in voice: the paused song went with the voice client, but the
+                # queue outlives it in Redis. Join and pick that up instead.
+                await self._resume_disconnected(ctx)
+                return
+            if vc.is_playing():
+                await ctx.send(
+                    embed=notice_embed(
+                        "Already playing — nothing is paused.", discord.Color.orange()
+                    )
+                )
+                return
+            if not vc.is_paused():
+                # No queue advice here: this branch also covers the seconds
+                # between two songs, where the queue is not empty at all.
+                await ctx.send(
+                    embed=notice_embed("Nothing is paused.", discord.Color.orange())
+                )
+                return
+            mp = self.get_mp(ctx)
+            await mp.resume(vc)
+            await ctx.message.add_reaction("⏭️")
+            # If the -pause confirmation hosts the block, re-host it so
+            # "⏸️ Paused at…" becomes history instead of sitting beneath a
+            # live, advancing bar for the rest of the song.
+            await mp.rehost_np_after_resume()
         except Exception as e:
             await self._command_error(ctx, e)
+
+    async def _resume_disconnected(self, ctx: commands.Context) -> None:
+        """`-resume` with the bot out of voice: join the author's channel and let the
+        persisted queue play again.
+
+        A `-stop`, an eject and a crash all leave `guild:{id}:queue` intact, so there
+        is something to come back to; only a crash also leaves the song that was
+        playing, which restore re-queues at its position (cleanup() scrubs those
+        state fields on the other two).
+        """
+        assert ctx.guild is not None  # validate_commands rejects DMs before this
+        async with background_typing(ctx):
+            mp = self.get_mp(ctx)
+            if not mp.can_rejoin_cold():
+                # An eject that never reached on_voice_state_update, so cleanup never
+                # ran. Rejoining around it announces a resume its wedged loop cannot
+                # deliver.
+                await self.cleanup(ctx.guild)
+                mp = self.get_mp(ctx)
+            # Restore first, unlike -play: there is no extraction to hide the join
+            # behind, and joining first parks the bot in a channel for an empty queue.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try `-resume` "
+                        "again in a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            # Built before the gate opens, while the queue head is still the
+            # restored one — the loop pops it out from under this.
+            embed = mp.build_rejoin_resume_embed()
+            if embed is None:
+                # A failed read lands here too, with a queue it never filled. Saying
+                # "nothing was left" would assert what it cannot know.
+                detail = (
+                    "Nothing to resume — no queue was left from a previous "
+                    "session. Use `-play` to start one."
+                    if mp.store is not None and not mp.restore_read_failed
+                    else "Can't reach the queue store, so there is nothing to "
+                    "resume from. Use `-play` to start a new queue."
+                )
+                await ctx.send(embed=notice_embed(detail, discord.Color.orange()))
+                return
+
+            # The hold -play takes across its join: without it the head starts playing,
+            # and posts its NP card, before the reply explaining the join lands.
+            async with mp.defer_playback():
+                try:
+                    await ctx.invoke(self.join)
+                    joined = _join_succeeded(ctx)
+                except BaseException:
+                    # join swallows Exceptions, so an escape means its error REPORTING
+                    # failed, or the command was cancelled. Same wreckage, same exit.
+                    await self._abandon_cold_start(ctx, mp)
+                    raise
+                if not joined:
+                    # join already told the user why; nothing to add here.
+                    await self._abandon_cold_start(ctx, mp)
+                    return
+                await ctx.send(embed=embed)
+
+    async def _abandon_cold_start(self, ctx: commands.Context, mp: MusicPlayer) -> None:
+        """Drop the player a cold-start command (`-play`, `-resume`) was about to
+        hand a voice connection to.
+
+        defer_playback opens the gate as it unwinds whether or not the join worked,
+        and a loop waking with no voice client fails its `vc` assertion once per
+        restored song — draining the in-memory queue while Redis keeps every entry.
+        Tearing down first makes that gate-open land on a cancelled loop, which is inert.
+
+        The re-park FOLLOWS cleanup(): dropping the player is what loses a
+        crash-recovered head, and clear_connection() HDELs the fields it writes.
+
+        Skipped entirely while another command holds the gate — it is mid-join on this
+        same player and owns the teardown call.
+        """
+        if mp.playback_holds > 1:  # this command's own hold, plus someone else's
+            return
+        if ctx.guild is not None:
+            with contextlib.suppress(Exception):
+                await self.cleanup(ctx.guild)
+        with contextlib.suppress(Exception):
+            await mp.repark_crashed_head()
 
     @commands.command(
         name="shuffle",
@@ -1126,6 +1659,18 @@ class MusicBot(commands.Cog):
     async def shuffle(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
+            # Like -clear and -remove: shuffle() REBUILDS the mirror from memory,
+            # so running it before restore_entries() has replayed the saved queue
+            # writes an unrestored deque over it and deletes the persisted entries.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
             async with background_typing(ctx):
                 await ctx.send(
                     embed=notice_embed("Please wait... shuffling", discord.Color.blue())
@@ -1142,7 +1687,7 @@ class MusicBot(commands.Cog):
         brief="connect the bot to your voice channel",
         help=(
             "Connects the bot to the voice channel you are in and reports its "
-            "latency. You rarely need this — `-play` joins for you.\n\n"
+            "latency. You rarely need this — `-play` and `-resume` join for you.\n\n"
             "If the bot is already playing in a different voice channel it stays "
             "there rather than abandoning that listener."
         ),
@@ -1172,16 +1717,16 @@ class MusicBot(commands.Cog):
             if mp.store is not None and isinstance(ctx.channel, discord.TextChannel):
                 await mp.store.set_connection(channel.id, ctx.channel.id)
 
-            # Voice is up — release the playback loop so a persisted queue
-            # resumes. No-op while -play holds the gate: it inserts its song at
-            # the front first, then opens (docs/PLAYBACK_GATE_PLAN.md §3.3).
+            # Voice is up — release the loop so a persisted queue resumes. No-op
+            # while -play holds the gate: it front-inserts its song first, then
+            # opens.
             mp.open_playback_gate()
 
             await asyncio.gather(
                 ctx.message.add_reaction("👋"),
-                # NOT ctx.invoke(self.ping): that would run the full ~3s health
-                # dashboard on every join/cold-play AND skip prepare() (so the
-                # ping max_concurrency guard). Cheap one-liner only — §2.3.
+                # Not ctx.invoke(self.ping): that runs the full ~3s dashboard on
+                # every join/cold-play AND skips prepare(), losing ping's
+                # max_concurrency guard. Cheap one-liner only.
                 send_latency_line(ctx, self.bot.latency),
             )
         except Exception as e:
@@ -1203,6 +1748,19 @@ class MusicBot(commands.Cog):
     async def clear(self, ctx: commands.Context) -> None:
         try:
             mp = self.get_mp(ctx)
+            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
+            # unrestored player deletes a saved queue it cannot see — including the
+            # -playnow tails _flush_played would have recorded. validate_commands
+            # only requires the AUTHOR in voice, so a cold player reaches here.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
             cleared = await mp.queue_clear()
             if not cleared:
                 await ctx.send(
@@ -1211,7 +1769,7 @@ class MusicBot(commands.Cog):
                     )
                 )
                 return
-            description = queue_message(cleared)
+            description = queue_message([safe_label(t, _ECHO_ROW_MAX) for t in cleared])
             await asyncio.gather(
                 ctx.message.add_reaction("🗑️"),
                 send_embed(
@@ -1227,54 +1785,114 @@ class MusicBot(commands.Cog):
     @commands.command(
         name="remove",
         aliases=["rm"],
-        brief="remove queued songs matching a URL",
-        usage="<url>",
+        brief="remove queued songs by link or by what you typed",
+        usage="<link or search text>",
         help=(
-            "Removes every queued song matching a YouTube URL and reports the "
+            "Removes every queued song matching what you give it and reports the "
             "queue positions that were dropped, followed by the updated queue.\n\n"
-            "The URL must match the YouTube link shown in the **Now Playing** "
-            "card — not the Spotify or search text you originally queued with. "
-            "Run it with no URL for a reminder of the format."
+            "Three things match: the YouTube link shown in the **Now Playing** "
+            "card, the search text you queued with, and the link you queued with "
+            "— so removing a playlist link takes back out every track it added. "
+            "Run it with no argument for a reminder.\n\n"
+            "Links are matched as typed, so a `youtu.be` short link will not "
+            "match a song queued from a full `youtube.com` one."
         ),
         extras={
             "category": "Queue",
-            "examples": ["-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+            "examples": [
+                "-remove https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "-remove never gonna give you up",
+                "-remove https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+            ],
+            "note": (
+                "A search term removes what that exact search queued, not "
+                "anything that only looks similar."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
-    async def remove(self, ctx: commands.Context, url: Optional[str] = None) -> None:
-        if url is None:
-            await ctx.send(
-                embed=notice_embed(
-                    "`-remove <url>` — removes all songs matching the given URL from the queue. "
-                    "The URL must match the YouTube link shown in the **Now Playing** embed.",
-                    discord.Color.blue(),
+    @_tracer.start_as_current_span("bot.remove")
+    async def remove(
+        self, ctx: commands.Context, *, needle: Optional[str] = None
+    ) -> None:
+        try:
+            if needle is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "`-remove <link or search text>` — removes every queued "
+                        "song that matches. Give it the YouTube link from the "
+                        "**Now Playing** card, or the search text or link you "
+                        "queued with; a collection link removes every track it "
+                        "added.",
+                        discord.Color.blue(),
+                    )
                 )
-            )
-            return
-        mp = self.get_mp(ctx)
-        positions = await mp.queue_remove(url)
-        if not positions:
+                return
+            mp = self.get_mp(ctx)
+            # Destroys the Redis mirror while reading the IN-MEMORY display, so an
+            # unrestored player deletes a saved queue it cannot see — including the
+            # -playnow tails _flush_played would have recorded. validate_commands
+            # only requires the AUTHOR in voice, so a cold player reaches here.
+            if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
+                await ctx.send(
+                    embed=notice_embed(
+                        "Still loading this server's saved queue — try again in "
+                        "a moment.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            outcome = await mp.queue_remove(needle)
+            positions = outcome.positions
+            if not positions:
+                await send_embed(
+                    ctx,
+                    "",
+                    f"No queued songs found matching: {_echo(needle)}",
+                    discord.Color.red(),
+                )
+                return
+            count = len(positions)
+            noun = pluralize(count, "song")
+            pos_label = pluralize(count, "Position")
+            # Capped by count: one -remove of a collection link drops as many
+            # positions as the collection had, and a raw join passes the 1024-char
+            # field limit at 227 of them — a 400 for a removal that already
+            # happened.
+            shown = positions[:_MAX_SHOWN_POSITIONS]
+            pos_str = ", ".join(str(p) for p in shown)
+            if len(positions) > len(shown):
+                pos_str += f", …and {len(positions) - len(shown)} more"
             await send_embed(
-                ctx, "", f"No queued songs found matching: <{url}>", discord.Color.red()
+                ctx,
+                f"Removed {count} {noun} from the queue",
+                "",
+                discord.Color.orange(),
+                fields=[
+                    ("Matched", _field(_matched_label(outcome, needle)), False),
+                    (f"{pos_label} removed", _field(pos_str), False),
+                    # Titles, like -clear reports: one argument can take out a whole
+                    # playlist, and there is no undo, so a bare count is not enough
+                    # to tell whether it took what the user meant.
+                    (
+                        "Songs",
+                        _field(
+                            queue_message(
+                                [
+                                    _echo(_removed_label(i), _ECHO_ROW_MAX)
+                                    # Sliced before the echo: queue_message keeps 10.
+                                    for i in outcome.removed[:10]
+                                ]
+                            )
+                        ),
+                        False,
+                    ),
+                ],
             )
-            return
-        count = len(positions)
-        noun = pluralize(count, "song")
-        pos_label = pluralize(count, "Position")
-        pos_str = ", ".join(str(p) for p in positions)
-        await send_embed(
-            ctx,
-            f"Removed {count} {noun} from the queue",
-            "",
-            discord.Color.orange(),
-            fields=[
-                ("URL", f"<{url}>", False),
-                (f"{pos_label} removed", pos_str, False),
-            ],
-        )
-        await ctx.send(embed=mp.queue_embed())
-        await ctx.message.add_reaction("🗑️")
+            await ctx.send(embed=mp.queue_embed())
+            await ctx.message.add_reaction("🗑️")
+        except Exception as e:
+            await self._command_error(ctx, e)
 
     @commands.command(
         name="now",
@@ -1303,22 +1921,20 @@ class MusicBot(commands.Cog):
                 and song is not None
             ):
                 if ctx.channel.id != mp._channel.id:
-                    # Invoked outside the player's home channel: the host never
-                    # leaves home, so answer HERE with a static snapshot (the
-                    # MusicContext channel guard keeps it unattached).
+                    # Outside the player's home channel: the host never leaves
+                    # home, so answer HERE with a static snapshot (MusicContext's
+                    # channel guard keeps it unattached).
                     await ctx.send(embed=mp._build_now_playing_embed(song))
                     return
-                # Re-host the live NP block at the bottom of the channel (the
-                # old host is retired) instead of sending a static snapshot
-                # that immediately goes stale.
+                # Re-host the live block at the bottom (retiring the old host)
+                # rather than sending a snapshot that immediately goes stale.
                 if await mp.repin_now_playing():
                     return
                 # Song ended between the liveness check and the repin — fall
                 # through to the static/none responses instead of silence.
             if mp.play_message is not None:
-                # Crash-recovery window: current_song isn't live yet, but a
-                # now-playing snapshot survived the restart. Best-effort static
-                # embed (no live progress bar) until loop() starts real playback.
+                # Crash-recovery window: current_song isn't live yet but a snapshot
+                # survived the restart. Static embed (no bar) until loop() starts.
                 await ctx.send(embed=mp.play_message)
             else:
                 await ctx.send(
@@ -1334,17 +1950,36 @@ class MusicBot(commands.Cog):
         aliases=["h"],
         brief="show recently played songs",
         usage="[--limit N]",
+        # Interpolated, not spelled out: this copy asserts the retention window,
+        # and HISTORY_MAX_LIMIT is that window (it is HISTORY_CACHE_LIMIT — see
+        # the constant above). A hand-typed number here is how the previous copy
+        # came to promise permanent retention months after the list was capped.
         help=(
             "Lists the songs already played in this server, most recent first.\n\n"
-            "`--limit N` controls how many are shown (1-50, default 10). History "
-            "is stored per server and survives a bot restart."
+            f"`--limit N` controls how many are shown ({HISTORY_MIN_LIMIT}-"
+            f"{HISTORY_MAX_LIMIT}, default 10). History is stored per server and "
+            f"survives a bot restart, but only the newest {HISTORY_MAX_LIMIT} plays "
+            f"are kept — so `--limit {HISTORY_MAX_LIMIT}` shows the whole record."
         ),
         extras={
             "category": "Queue",
             "examples": ["-history", "-h", "-history --limit 25"],
+            "note": (
+                f"The newest {HISTORY_MAX_LIMIT} plays are everything this command "
+                "can read. If this server's host has turned on the optional "
+                "long-term archive, plays are also recorded there permanently — "
+                f"but `-history` always serves the {HISTORY_MAX_LIMIT}-play window."
+            ),
         },
     )
     @commands.before_invoke(validate_commands)
+    # One in flight per guild, wait=False, so extra invocations are declined
+    # immediately rather than queueing (cog_command_error renders
+    # MaxConcurrencyReached as a notice). The reason is Discord-side: -history is the
+    # heaviest send in the bot — up to 8 song embeds plus the NP block — so unbounded
+    # concurrent renders are how a guild rate-limits itself out of its own channel.
+    # It never reaches Postgres, so it cannot contend with the drainer.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
     @_tracer.start_as_current_span("bot.history")
     async def history(self, ctx: commands.Context, *, flags: HistoryFlags) -> None:
         try:
@@ -1366,17 +2001,124 @@ class MusicBot(commands.Cog):
                 )
                 return
             embeds = history_embeds(entries)
-            # 8 per message: with the NP block (≤2 embeds) MusicContext.send
-            # prepends while a song is live, every chunk stays within Discord's
-            # 10-embed cap. Every chunk goes through ctx.send (key invariant #8
-            # — never bare channel.send in the player's channel), so the
-            # adopt/retire machinery walks the NP block down to the last chunk.
+            # 8 per message keeps every chunk within Discord's 10-embed cap once
+            # MusicContext.send prepends the ≤2-embed NP block. Each chunk goes
+            # through ctx.send — never bare channel.send in the player's channel —
+            # so the adopt/retire machinery walks the block down to the last chunk.
             for start in range(0, len(embeds), HISTORY_EMBEDS_PER_MESSAGE):
                 await ctx.send(
                     embeds=embeds[start : start + HISTORY_EMBEDS_PER_MESSAGE]
                 )
         except Exception as e:
             await self._command_error(ctx, e)
+
+    @commands.command(
+        name="leaderboard",
+        aliases=["lb", "top"],
+        brief="top listeners and songs (long-term archive)",
+        usage="[--days N]",
+        help=(
+            "Shows this server's top 10 listeners and top 10 songs, ranked by "
+            "total listening time (song and play counts included).\n\n"
+            "`--days N` limits both boards to the last N days; without it they "
+            "are all-time. The numbers come from this server's long-term play "
+            "archive, so they cover every song since the archive was enabled — "
+            "not just the recent plays `-history` shows. A song that just "
+            "finished can take a moment to appear."
+        ),
+        extras={
+            "category": "Queue",
+            "examples": ["-leaderboard", "-lb", "-leaderboard --days 30"],
+            "note": (
+                "Available only when this server's host has enabled the "
+                "optional long-term archive."
+            ),
+        },
+    )
+    # No validate_commands: reading a leaderboard needs no voice channel (-ping
+    # is the precedent). One in flight per guild, wait=False, so command spam is
+    # declined rather than queued — the 60s cache bounds the rate, this bounds
+    # concurrency against the pool the drainer also draws from.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @_tracer.start_as_current_span("bot.leaderboard")
+    async def leaderboard(
+        self, ctx: commands.Context, *, flags: LeaderboardFlags
+    ) -> None:
+        try:
+            # Locals: ctx.guild is a property and history_archive an attribute,
+            # so narrowing on either would not survive the awaits below.
+            guild = ctx.guild
+            archive = self.history_archive
+            if guild is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "Leaderboards are per server — use this in a server channel.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if archive is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        "This server's host has not enabled the long-term play "
+                        "archive, so there is no leaderboard data.",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            if not 0 <= flags.days <= leaderboard.MAX_DAYS:
+                await ctx.send(
+                    embed=notice_embed(
+                        f"--days must be between 1 and {leaderboard.MAX_DAYS}. "
+                        "Omit it, or pass 0, for all-time.",
+                        discord.Color.red(),
+                    )
+                )
+                return
+            key = leaderboard.cache_key(guild.id, flags.days, leaderboard.TOP_N)
+            board = leaderboard.from_cache(
+                await cache_get(self.redis, key), top_n=leaderboard.TOP_N
+            )
+            if board is None:
+                since = time.time() - flags.days * 86400 if flags.days else 0.0
+                async with background_typing(ctx):
+                    board = await archive.leaderboard(
+                        guild.id, leaderboard.TOP_N, since_epoch=since
+                    )
+                await cache_set(
+                    self.redis,
+                    key,
+                    leaderboard.to_cache(board),
+                    leaderboard.CACHE_TTL_SECS,
+                )
+            embed = leaderboard.build_embed(board, days=flags.days, guild=guild)
+            if embed is None:
+                window = (
+                    f"in the last {flags.days} {pluralize(flags.days, 'day')}"
+                    if flags.days
+                    else "yet"
+                )
+                await ctx.send(
+                    embed=notice_embed(
+                        f"Nothing has been archived {window} — play something first!",
+                        discord.Color.orange(),
+                    )
+                )
+                return
+            await ctx.send(embed=embed)
+        except Exception as e:
+            # Fixed copy rather than the exception text: this is the only command
+            # whose failures come from infrastructure, so the default detail would
+            # publish the archive's host and port, or SchemaVersionError's
+            # operator runbook, to the channel. -ping reduces the same class for
+            # the same reason (ping._error_detail). The trace footer still joins
+            # the report to the span, and the full exception is logged there.
+            await self._command_error(
+                ctx,
+                e,
+                title="Leaderboard unavailable",
+                detail="The long-term archive could not be reached. Try again in a moment.",
+            )
 
     @commands.command(
         name="jump",
@@ -1395,11 +2137,9 @@ class MusicBot(commands.Cog):
     async def jump(self, ctx: commands.Context) -> None:
         try:
             # TODO: Implement -jump or remove it from the command list.
-            # It has advertised itself in the help text since early history while doing
-            # nothing but replying "currently in development", so the bot promises a
-            # feature it does not have. Implementing it is a drain/rotate over
-            # GuildQueue, in the same shape as remove().
-            # See docs/ARCHITECTURE_PLAN.md §3.8.
+            # The help text advertises it while the body only replies "currently in
+            # development", so the bot promises a feature it does not have.
+            # Implementing it is a drain/rotate over GuildQueue, shaped like remove().
             await ctx.send(
                 embed=notice_embed("currently in development", discord.Color.blue())
             )
@@ -1462,11 +2202,22 @@ class MusicBot(commands.Cog):
                 return
             mp = self.get_mp(ctx)
             mp.volume = volume_pct / 100
+            persisted = False
             if mp.store is not None:
-                await mp.store.set_volume(mp.volume)
+                persisted = await mp.store.set_volume(mp.volume)
+            # Same rule as the debug toggle: the help promises this survives a
+            # restart, so a write that did not land is named rather than rounded
+            # up to success — a level that quietly reverts reads as being ignored.
+            durability = (
+                "It is saved for this server."
+                if persisted
+                else "⚠️ It could not be saved (Redis is unavailable), so it "
+                "applies until the bot restarts."
+            )
             await ctx.send(
                 embed=notice_embed(
-                    f"Set volume to {volume_pct}% (takes effect on next song)",
+                    f"Set volume to {volume_pct}% (takes effect on next song). "
+                    + durability,
                     discord.Color.blue(),
                 )
             )
@@ -1499,211 +2250,232 @@ class MusicBot(commands.Cog):
                 bot_latency=self.bot.latency,
                 redis=self.redis,
                 spotify=self.spotify,
-                # Startup validation outcome, not just "is a client configured":
-                # it lets the Spotify row say *why* the source is unusable
-                # without spending a doomed API call (see probe_spotify).
+                # The startup validation outcome, not just "is a client
+                # configured": lets the Spotify row say *why* the source is
+                # unusable without spending a doomed API call (see probe_spotify).
                 spotify_status=self._spotify_status,
-                pg_pool=getattr(self, "pg_pool", None),
+                archive=self.history_archive,
+                debug_suffix=self._debug_suffix(ctx),
             )
         except Exception as e:
             await self._command_error(ctx, e)
 
-    # ── Alone-channel disconnect ──────────────────────────────────────────────
+    # ── Debug mode ────────────────────────────────────────────────────────────
+    # The state machine is DebugSettings (src/debug.py); what stays here is the
+    # command surface and the permission policy around the toggle.
 
-    async def _alone_countdown(self, guild: discord.Guild) -> None:
-        """Warn the guild's text channel, wait 10s, then disconnect if the
-        bot is still alone in its voice channel. Cancelled if a human rejoins."""
+    def _debug_suffix(
+        self, ctx: commands.Context, *, host_metrics: bool = True
+    ) -> Optional[str]:
+        """The dashboards' debug footer, for a ctx rather than a guild."""
+        return self.debug_settings.footer(ctx.guild, host_metrics=host_metrics)
+
+    async def _hydrate_debug(self) -> None:
+        """Feed DebugSettings.hydrate this bot's redis handle and guild list. Both
+        cog_load and on_ready spawn it: bot.guilds is empty until READY, so
+        cog_load's pass covers an extension reload and on_ready's a cold start."""
+        await self.debug_settings.hydrate(self.redis, self.bot.guilds)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """Registration only — see DebugSettings.forget."""
+        await self.debug_settings.forget(self.redis, guild.id)
+
+    @commands.command(
+        name="debug",
+        aliases=["dbg"],
+        brief="diagnostic snapshot; toggle debug mode",
+        usage="[--enable | --disable]",
+        help=(
+            "Shows what this bot is running: versions, and Discord/voice state for "
+            "this server. For the bot owner it also fills in host details — build, "
+            "configuration, uptime, storage and health checks.\n\n"
+            "`--enable` turns debug mode on for this server, which adds a footer to "
+            "every embed the bot sends here — including the live Now Playing card, "
+            "which refreshes its numbers alongside the progress bar. A reply's "
+            "footer carries the trace id: paste it to the operator and they can find "
+            "the exact request in the logs. (The Now Playing card shows the runtime "
+            "numbers but no trace id — it is re-rendered under a different request "
+            "every few seconds, so any one id there would be misleading.) `--disable` "
+            "turns it back off. The choice is saved for this server and survives "
+            "restarts; a server that has never set it follows the host's default. "
+            "Toggling needs the **Manage Server** permission.\n\n"
+            'Where `-ping` answers "are my dependencies up, and how fast?", this '
+            'answers "what is running, and is it configured the way it should be?".'
+        ),
+        extras={
+            "category": "Utility",
+            # Read by cog_before_invoke to skip get_mp(): this command reports on a
+            # guild's player, so manufacturing one to look at would be the observer
+            # changing what it observes.
+            "observation_only": True,
+            "examples": ["-debug", "-debug --enable", "-debug --disable"],
+            "note": (
+                "Debug mode is per server and only changes what is DISPLAYED — "
+                "never how the bot plays, queues or stores anything. Credentials "
+                "are never shown, only whether they are set."
+            ),
+        },
+    )
+    # No validate_commands: diagnosing a bot needs no voice channel (-ping's
+    # precedent). One in flight per guild, wait=False, since the snapshot does real
+    # IO; cog_command_error renders the refusal.
+    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    @_tracer.start_as_current_span("bot.debug")
+    async def debug(self, ctx: commands.Context, *, arg: str = "") -> None:
         try:
-            mp = self.mps.get(guild.id)
-
-            if mp is not None:
-                try:
-                    # send_with_np (not a bare channel send): this can fire
-                    # mid-song, and a bare send would bury the NP host message.
-                    embed = discord.Embed(
-                        title="No users remaining in voice channel",
-                        description="All users have disconnected. The bot will disconnect in **10 seconds** unless someone rejoins.",
-                        color=discord.Color.orange(),
+            action = debug_mode.parse_debug_arg(arg)
+            if action is None:
+                await ctx.send(
+                    embed=notice_embed(
+                        debug_mode.unknown_arg_message(arg), discord.Color.red()
                     )
-                    await mp.send_with_np(embed=embed)
-                except Exception as e:
-                    log.warning(
-                        f"Failed to send alone-countdown notice in guild {guild.id}: {e}"
-                    )
-
-            await asyncio.sleep(10)
-
-            # Span covers only the post-sleep decision so it doesn't stay open for
-            # the full 10 seconds (which confuses OTLP exporters and leaks OTel context).
-            with _tracer.start_as_current_span(
-                "bot.alone_countdown",
-                attributes={"discord.guild_id": str(guild.id)},
-            ):
-                vc = guild.voice_client
-                if (
-                    isinstance(vc, discord.VoiceClient)
-                    and vc.channel is not None
-                    and not any(not m.bot for m in vc.channel.members)
-                ):
-                    log.info(
-                        f"Bot still alone in guild {guild.id} after 10s — disconnecting"
-                    )
-                    await self.cleanup(guild)
-        except asyncio.CancelledError:
-            pass  # user rejoined or explicit stop; timer was cancelled
+                )
+                return
+            if action is not debug_mode.DebugAction.STATUS:
+                await self._toggle_debug_mode(ctx, action)
+                return
+            inputs = await self._debug_inputs(ctx)
+            # No typing indicator and no ctx.send: the dashboard sends its own
+            # skeleton immediately and edits it as blocks land, so the reply IS the
+            # acknowledgement. It uses channel.send to stay off the Now Playing host,
+            # which an edit loop must not own (src/dashboard.py).
+            await debug_mode.run_debug_dashboard(ctx, inputs)
         except Exception as e:
-            log.error(f"_alone_countdown error in guild {guild.id}: {e}", exc_info=True)
-        finally:
-            self._alone_timers.pop(guild.id, None)
+            await self._command_error(ctx, e)
+
+    async def _debug_inputs(self, ctx: commands.Context) -> "debug_mode.DebugInputs":
+        """Everything the snapshot cannot reach on its own (src/debug.py importing
+        MusicBot would be a cycle)."""
+        guild_id = ctx.guild.id if ctx.guild else None
+        archive_enabled = history_archive_enabled()
+        operator = await self._is_owner(ctx)
+        # Asked symmetrically — not only when the password IS the default — because a
+        # row that renders for False and vanishes for True makes its own absence the
+        # answer. Moot while the whole Checks block is owner-only, and it stays right
+        # if that ever loosens.
+        default_password = (
+            (using_default_postgres_password() and archive_enabled)
+            if operator
+            else None
+        )
+        return debug_mode.DebugInputs(
+            debug_enabled=self.debug_settings.enabled(guild_id),
+            debug_overridden=self.debug_settings.has_override(guild_id),
+            debug_persisted=self.debug_settings.is_persisted(guild_id),
+            players=len(self.mps),
+            player=self.mps.get(guild_id) if guild_id is not None else None,
+            redis=self.redis,
+            store=GuildRedisStore(self.redis, guild_id)
+            if self.redis is not None and guild_id is not None
+            else None,
+            # Structural: PostgresHistoryArchive satisfies ArchiveStatsReader, and
+            # a cog built without an archive (tests, disabled tier) passes None.
+            archive=cast(
+                Optional["debug_mode.ArchiveStatsReader"], self.history_archive
+            ),
+            archive_enabled=archive_enabled,
+            prometheus_url=debug_prometheus_url(),
+            operator=operator,
+            default_password=default_password,
+            # Gated on `operator`: the card withholds its Runtime block from a
+            # non-owner and says so, so the footer must not print those figures.
+            debug_suffix=self._debug_suffix(ctx, host_metrics=operator),
+        )
+
+    async def _is_owner(self, ctx: commands.Context) -> bool:
+        """Is the caller the bot owner? Fails CLOSED.
+
+        `is_owner()` falls through to an `application_info()` REST call when neither
+        owner_id nor owner_ids is configured (MusicBotApp sets neither), and it RAISES
+        rather than returning False — a diagnostic must not disclose the host just
+        because Discord blinked. discord.py caches the answer onto the bot afterwards,
+        so this is one round trip per process, not per command.
+        """
+        try:
+            return await ctx.bot.is_owner(ctx.author)
+        except Exception as e:  # noqa: BLE001 — an unreachable owner is not an owner
+            log.warning(f"owner check failed, denying: {type(e).__name__}: {e}")
+            return False
+
+    async def _toggle_debug_mode(
+        self, ctx: commands.Context, action: "debug_mode.DebugAction"
+    ) -> None:
+        """Apply `--enable`/`--disable` to the invoking guild and confirm it."""
+        if ctx.guild is None:
+            await ctx.send(
+                embed=notice_embed(
+                    "Debug mode is set per server, so it can't be toggled from a "
+                    f"direct message. It is currently "
+                    f"**{'on' if self.debug_settings.default else 'off'}** here, following "
+                    "the host's `DEBUG_MODE` default.",
+                    discord.Color.orange(),
+                )
+            )
+            return
+        # A moderator action: the toggle is guild-wide and every member sees the
+        # result on every reply, so it is not the invoking user's to make alone.
+        # Reading `-debug` stays open to everyone; only writing is gated.
+        author = ctx.author
+        may_toggle = (
+            isinstance(author, discord.Member) and author.guild_permissions.manage_guild
+        ) or await self._is_owner(ctx)
+        if not may_toggle:
+            await ctx.send(
+                embed=notice_embed(
+                    "Debug mode changes what **every** embed in this server looks "
+                    "like, so switching it needs the Manage Server permission. Run "
+                    "`-debug` on its own to see the current state.",
+                    discord.Color.red(),
+                )
+            )
+            return
+        enabled = action is debug_mode.DebugAction.ENABLE
+        persisted = await self.debug_settings.toggle(self.redis, ctx.guild.id, enabled)
+        # Say which kind of change this was. A guild told "on" that quietly reverts
+        # on the next restart reads as the bot ignoring them, so a degraded write is
+        # named rather than rounded up to success.
+        durability = (
+            "The setting is saved for this server."
+            if persisted
+            else "⚠️ It could not be saved (Redis is unavailable), so it applies "
+            "until the bot restarts."
+        )
+        # Names what enabling publishes, at the moment the choice is made: the
+        # footer reports the whole process's load, and the Now Playing card carries
+        # it passively to everyone who can read the channel while music plays.
+        scope = (
+            " While it is on, every embed here — including the live Now Playing "
+            "card — shows the bot process's load to anyone who can read the channel."
+            if enabled
+            else ""
+        )
+        await ctx.send(
+            embed=notice_embed(
+                f"Debug mode is now **{'on' if enabled else 'off'}** for this "
+                "server. Embeds "
+                + ("carry" if enabled else "no longer carry")
+                + " a debug footer; nothing about playback changes either way."
+                + scope
+                + " "
+                + durability,
+                discord.Color.blue(),
+            )
+        )
 
     # ── Restart recovery listeners ────────────────────────────────────────────
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        """Fires on cold start or session loss (NOT on WebSocket resume).
+        """Fires on cold start or session loss (not on WebSocket resume).
         Spawns a recovery task per guild so we don't block the event loop."""
         if self.redis is None:
             return
+        # bot.guilds is empty until READY, so cog_load's pass covers an extension
+        # reload and this one covers a cold start. Both are needed.
+        spawn_background(self._hydrate_debug(), self._restore_tasks)
         for guild in self.bot.guilds:
-            spawn_background(self._restore_guild(guild), self._restore_tasks)
-
-    @_tracer.start_as_current_span("guild.restore")
-    async def _restore_guild(self, guild: discord.Guild) -> None:
-        """Attempt to rejoin voice and restore queue for one guild after restart."""
-        if self.redis is None:
-            return
-        if guild.id in self.mps:
-            return
-
-        store = GuildRedisStore(self.redis, guild.id)
-
-        trace.get_current_span().set_attribute("discord.guild_id", str(guild.id))
-        # Distributed lock prevents two bot instances from racing on the same guild.
-        # Acquired inside the span so the SET NX EX Redis call is a child span.
-        if not await store.acquire_recovery_lock():
-            trace.get_current_span().set_attribute("restore.skipped_lock", True)
-            log.info(
-                f"Recovery lock held by another instance for guild {guild.id}, skipping"
-            )
-            return
-        try:
-            # One pipelined read serves every gate below: the connection gate
-            # (state hash) and the anything-to-restore gate (queue length +
-            # crashed song). Only the queue *length* is read here — the actual
-            # queue/now-playing/history payload is re-read by _restore_state
-            # after a successful connect, so a stopped guild's leftover queue
-            # never rides the wire on the common "nothing to do" path.
-            gate = await store.get_recovery_gate()
-            if gate is None:
-                # Redis read failed — do NOT treat as "nothing to restore". Skip
-                # this attempt; the recovery lock expires in 60s and the next
-                # on_ready (session re-establishment) retries.
-                log.warning(f"Recovery skipped for guild {guild.id}: state read failed")
-                return
-            guild_state = gate.state
-            # Equivalent to `not guild_state.has_active_connection`, spelled as
-            # explicit None checks so the channel IDs narrow to int below.
-            vc_id = guild_state.voice_channel_id
-            tc_id = guild_state.text_channel_id
-            if vc_id is None or tc_id is None:
-                return
-
-            voice_channel = guild.get_channel(vc_id)
-            text_channel = guild.get_channel(tc_id)
-            voice_ok = isinstance(voice_channel, discord.VoiceChannel)
-            text_ok = isinstance(text_channel, discord.TextChannel)
-
-            if not voice_ok or not text_ok:
-                # Clear stale channel IDs so this guild is not re-attempted on every reconnect.
-                await store.clear_connection()
-                trace.get_current_span().set_attribute("restore.channel_missing", True)
-                log.warning(
-                    f"Recovery skipped for guild {guild.id}: "
-                    f"voice_channel_id={vc_id} (resolved={voice_ok}) "
-                    f"text_channel_id={tc_id} (resolved={text_ok})"
-                )
-
-                notify_channel: Optional[discord.TextChannel] = None
-                if text_ok:
-                    notify_channel = text_channel
-                elif guild.me is not None:
-                    if (
-                        guild.system_channel is not None
-                        and guild.system_channel.permissions_for(guild.me).send_messages
-                    ):
-                        notify_channel = guild.system_channel
-                    else:
-                        notify_channel = next(
-                            (
-                                ch
-                                for ch in guild.text_channels
-                                if ch.permissions_for(guild.me).send_messages
-                            ),
-                            None,
-                        )
-
-                if notify_channel is not None:
-                    deleted: list[str] = []
-                    if not voice_ok:
-                        deleted.append("voice channel")
-                    if not text_ok:
-                        deleted.append("text channel")
-                    what = " and ".join(deleted)
-                    verb = "was" if len(deleted) == 1 else "were"
-                    try:
-                        await notify_channel.send(
-                            embed=notice_embed(
-                                f"⚠️ I came back online but the {what} I was playing in "
-                                f"{verb} deleted. Use `-play` in a voice channel to start fresh.",
-                                discord.Color.orange(),
-                            )
-                        )
-                    except Exception as notify_err:
-                        log.warning(
-                            f"Failed to send channel-deleted notification for "
-                            f"guild {guild.id}: {notify_err}"
-                        )
-                return
-
-            # Check there is something to restore before connecting.
-            if not gate.has_restorable_playback:
-                return
-
-            trace.get_current_span().set_attribute(
-                "restore.queue_count", gate.pending_count
-            )
-            trace.get_current_span().set_attribute(
-                "restore.crashed_song", guild_state.has_crashed_song
-            )
-
-            try:
-                await voice_channel.connect(timeout=30.0, reconnect=True)
-                await guild.change_voice_state(
-                    channel=voice_channel, self_mute=False, self_deaf=True
-                )
-            except Exception as e:
-                trace.get_current_span().set_attribute(
-                    "restore.voice_connect_failed", True
-                )
-                trace.get_current_span().record_exception(e)
-                trace.get_current_span().set_status(
-                    StatusCode.ERROR, f"voice connect failed: {e}"
-                )
-                log.warning(f"Could not rejoin voice for guild {guild.id}: {e}")
-                return
-
-            mp = MusicPlayer(self.bot, guild, text_channel, self, redis=self.redis)
-            mp.start()
-            self.mps[guild.id] = mp
-
-            log.info(
-                f"Restored guild {guild.id} in #{text_channel.name} / {voice_channel.name}"
-            )
-        except Exception as e:
-            record_span_error(trace.get_current_span(), e)
-            log.error(f"_restore_guild failed for guild {guild.id}: {e}", exc_info=True)
-        finally:
-            await store.release_recovery_lock()
+            spawn_background(restore_guild(self, guild), self._restore_tasks)
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -1712,66 +2484,9 @@ class MusicBot(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Handles two cases: the bot itself being disconnected/moved (full
-        cleanup or stale-timer cancellation) and a human member's channel
-        change relative to the bot's current channel (starts/cancels the
-        10s alone-disconnect countdown)."""
-        guild = member.guild
-
-        # ── Case A: bot itself was disconnected or moved ──────────────────────
-        if self.bot.user is not None and member.id == self.bot.user.id:
-            if before.channel is not None and after.channel is None:
-                # Bot ejected — full cleanup.
-                if guild.id in self.mps:
-                    with _tracer.start_as_current_span(
-                        "bot.voice_state_update",
-                        attributes={"discord.guild_id": str(guild.id)},
-                    ):
-                        log.info(
-                            f"Bot disconnected from voice in guild {guild.id}, cleaning up"
-                        )
-                        await self.cleanup(guild)
-            elif before.channel is not None and after.channel is not None:
-                # Bot moved to a different channel — cancel any stale alone-timer
-                # that was counting down for the old channel.
-                existing = self._alone_timers.pop(guild.id, None)
-                if existing and not existing.done():
-                    existing.cancel()
-            return
-
-        # ── Case B: a human member's voice state changed ──────────────────────
-        if guild.id not in self.mps:
-            return  # bot isn't active in this guild
-
-        vc = guild.voice_client
-        if not isinstance(vc, discord.VoiceClient) or vc.channel is None:
-            return
-
-        # Skip mute/deafen/server-deafen events — channel is unchanged.
-        if before.channel == after.channel:
-            return
-
-        # Only care about events that affect the bot's current channel.
-        if before.channel != vc.channel and after.channel != vc.channel:
-            return
-
-        human_members = [m for m in vc.channel.members if not m.bot]
-
-        if len(human_members) == 0:
-            # Bot is now alone — start (or restart) the 10-second countdown.
-            existing = self._alone_timers.pop(guild.id, None)
-            if existing and not existing.done():
-                existing.cancel()
-            log.info(f"Bot is alone in guild {guild.id}, starting 10s disconnect timer")
-            self._alone_timers[guild.id] = asyncio.create_task(
-                self._alone_countdown(guild)
-            )
-        else:
-            # A human is present — cancel any running alone-timer.
-            existing = self._alone_timers.pop(guild.id, None)
-            if existing and not existing.done():
-                log.info(f"User rejoined guild {guild.id}, cancelling alone timer")
-                existing.cancel()
+        """Registration only — the alone-disconnect state machine is
+        VoiceWatchdog (src/recovery.py)."""
+        await self.voice_watchdog.on_voice_state_update(member, before, after)
 
 
 async def setup(bot: commands.Bot) -> None:
