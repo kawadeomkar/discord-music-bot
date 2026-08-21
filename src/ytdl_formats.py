@@ -27,10 +27,14 @@ from src.youtube import (
 
 
 def _row(fmt: dict[str, Any]) -> str:
+    # `ch` is here because it is a passthrough gate clause, not decoration: a >2
+    # channel serve must re-encode (see _passthrough_codec), and reconciling that
+    # allowlist by hand is the whole point of this report.
     return (
         f"  {str(fmt.get('format_id')):>8}  ext={str(fmt.get('ext')):<5} "
-        f"acodec={str(fmt.get('acodec')):<12} abr={str(fmt.get('abr')):<7} "
-        f"asr={str(fmt.get('asr')):<6} proto={str(fmt.get('protocol')):<7} "
+        f"acodec={str(fmt.get('acodec')):<12} ch={str(fmt.get('audio_channels')):<4} "
+        f"abr={str(fmt.get('abr')):<7} asr={str(fmt.get('asr')):<6} "
+        f"proto={str(fmt.get('protocol')):<7} "
         f"note={fmt.get('format_note')} lang={fmt.get('language')}"
     )
 
