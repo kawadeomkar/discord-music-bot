@@ -41,6 +41,7 @@ _Durable-tier update: 2026-08-02 — history, Redis eviction, deployment topolog
     - [Redis connection retry](#redis-connection-retry)
     - [yt-dlp client strategy](#yt-dlp-client-strategy)
     - [yt-dlp process boundary](#yt-dlp-process-boundary)
+    - [Stream probe session](#stream-probe-session)
     - [Queue invariant](#queue-invariant)
     - [Now Playing host invariants](#now-playing-host-invariants)
     - [Debug footer seams](#debug-footer-seams)
@@ -1419,6 +1420,41 @@ Four things cross into the worker processes, each with its own contract:
   cross). **Every field of the flattened error needs a default**: a required
   positional pickles fine and fails on *unpickling* in the parent's result thread,
   which bricks the pool permanently.
+
+### Stream probe session
+
+`_probe_stream_url` runs before every song and holds one process-wide
+`ClientSession`. What that buys is narrower than it looks, and the two properties
+below are the reason the shape is what it is.
+
+**It does not pool connections, and cannot.** The probe passes `read_bufsize=0` and
+calls `response.close()` on an unread body, because a revoked URL still answers 206
+to a ranged GET and googlevideo rejects HEAD — so only a plain GET's status line is
+trustworthy, and the body must not be read. `ClientResponse.close()` routes to
+`connector._release(should_close=True)`, which destroys the socket; `release()` would
+not help either, since an unread payload never reaches EOF and `should_close` is True
+regardless. Measured, 5 probes against one host: `read_bufsize=0` + `close()` opens 5
+connections, `read_bufsize=0` + `release()` opens 5, a full body read opens 1. Over
+300 sequential probes the pool holds `acquired=0, pooled=0`.
+
+So the saving is the connector and SSL-context construction — **0.062 ms against a
+~137 ms probe**, and an interleaved paired A/B over 40 real-HTTPS probes puts the
+shared session at 135.27 ms against a per-call session's 134.26 ms: a paired delta of
+−1.01 ms ± 14.34 ms, faster in 19 of 40 pairs. Treat this as an idiom fix, not a
+throughput one, and do not restore the handshake claim a comment here once carried.
+The residual real benefit is the connector's 10 s `ttl_dns_cache`, which helps inside
+one resolve and not across songs.
+
+**`DummyCookieJar` is load-bearing.** A default `CookieJar` would be process-wide and
+attacker-writable: `parse_url` hands any dotted domain to yt-dlp, whose generic
+extractor returns the input URL for the probe to fetch, so one `-play` reaches this
+session with a host the user chose. aiohttp applies no public-suffix check, so a
+`Domain=com` cookie set by that host is replayed to `googlevideo.com` — and enough
+cookie bytes turns every probe into an HTTP 400, which maps to `DEAD`, deletes the
+cache entry and burns the one re-extraction, for every guild, until restart. Nothing
+recovers from it: `probe_path_looks_broken()` watches `UNCONFIRMED` streaks, and a
+`DEAD` verdict resets that counter. A per-call session was immune only because its
+jar died with it.
 
 ### Queue invariant
 

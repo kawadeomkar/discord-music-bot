@@ -725,6 +725,21 @@ class TestClose:
             await app.close()
         assert youtube.ytdlp_pool.is_closed
 
+    async def test_closes_the_stream_probe_session(self, app: MusicBotApp) -> None:
+        """The probe session lives for the life of the process, so close() is the
+        only thing that releases it. Asserts the real module global rather than a
+        mock call: the conftest fixture closes sessions after every test, so a
+        close() that stopped calling it would otherwise leave the suite green."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        app._redis_pool = None
+        with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+            await app.close()
+
+        assert session.closed
+        assert youtube._probe_session is None
+
 
 class TestHelpFlag:
     """`--help` anywhere in a command message diverts to that command's help

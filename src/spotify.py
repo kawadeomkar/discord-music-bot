@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -143,10 +143,9 @@ class Spotify:
         self._auth_lock = asyncio.Lock()
         self._redis = redis
         self._session_factory = session_factory or aiohttp.ClientSession
-        # One session for the life of the client, created lazily on first use.
-        # A ClientSession must be constructed on the running loop, and __init__
-        # runs before the bot connects — so this cannot be built here.
-        self._session: Optional[Any] = None
+        # Built on first use, so a deployment with Spotify configured but never
+        # used never opens a connector.
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def __str__(self) -> str:
         # Never the bearer token: one f-string would put a live credential into
@@ -160,17 +159,18 @@ class Spotify:
 
     __repr__ = __str__
 
-    def _session_or_create(self) -> Any:
-        """The shared session, created on first use.
-
-        Every call used to construct and tear down its own ClientSession — the
-        documented aiohttp anti-pattern. It discards the connection pool and the
-        DNS cache, so each Spotify request paid a fresh TCP + TLS handshake to
-        the same host it had just finished talking to.
-        """
-        if self._session is None:
-            self._session = self._session_factory(
-                json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
+    def _session_or_create(self) -> aiohttp.ClientSession:
+        """The client's session, created on first use. One session keeps the
+        connection pool and DNS cache warm across every call to the API, which
+        the read-to-EOF response handling in http_call makes reachable. Rebuilt
+        when closed, so a caller after aclose() gets a usable session rather
+        than a corpse. Closed by aclose()."""
+        if self._session is None or self._session.closed:
+            self._session = cast(
+                aiohttp.ClientSession,
+                self._session_factory(
+                    json_serialize=ujson.dumps, timeout=_HTTP_TIMEOUT
+                ),
             )
         return self._session
 

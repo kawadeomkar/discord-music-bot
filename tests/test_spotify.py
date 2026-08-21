@@ -5,6 +5,7 @@ import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from redis.asyncio import Redis
 
@@ -30,6 +31,9 @@ def _make_mock_session(resp: AsyncMock) -> MagicMock:
     session.__aexit__ = AsyncMock(return_value=None)
     session.post = AsyncMock(return_value=resp)
     session.request = AsyncMock(return_value=resp)
+    # A bare MagicMock attribute is truthy, which reads as an already-closed
+    # session and makes _session_or_create rebuild on every call.
+    session.closed = False
     return session
 
 
@@ -459,6 +463,29 @@ class TestSpotifyHttpCall:
         assert not isinstance(excinfo.value, SpotifyAuthError)
         assert "may be private" in excinfo.value.user_message
 
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [(404, SpotifyRequestError), (401, SpotifyAuthError)],
+    )
+    async def test_http_call_releases_the_body_before_raising(
+        self, spotify: Spotify, status: int, expected: type[Exception]
+    ) -> None:
+        """The session outlives the call now, so an unread body holds its pooled
+        connection out of circulation until the response is collected. Both raise
+        arms must drain. Spec'd, because `release()` exists on a bare AsyncMock
+        whether or not it is ever called — which is what made this untestable."""
+        spotify.auth_token = "t"
+        spotify.token_expiry = time.time() + 3600
+        mock_response = MagicMock(spec=aiohttp.ClientResponse)
+        mock_response.status = status
+        mock_response.release = AsyncMock()
+        spotify._session_factory = lambda **kw: _make_mock_session(mock_response)
+
+        with pytest.raises(expected):
+            await spotify.http_call("https://api.spotify.com/v1/tracks/bad")
+
+        mock_response.release.assert_awaited_once()
+
     async def test_http_call_bounds_the_request_timeout(self, spotify: Spotify) -> None:
         """aiohttp's 300s default held a command for five minutes on a hung
         request; the factory must receive an explicit ceiling."""
@@ -489,8 +516,7 @@ class TestSpotifyHttpCall:
         ok.status = 200
         ok.json = AsyncMock(return_value={"data": "ok"})
         responses = [limited, ok]
-        # One session serves every attempt now, so the retry is driven off .request()
-        # rather than off a fresh session per pass.
+        # One session serves every attempt, so the retry is driven off .request().
         session = _make_mock_session(limited)
         session.request = AsyncMock(side_effect=lambda *a, **kw: responses.pop(0))
         spotify._session_factory = lambda **kw: session
@@ -682,9 +708,8 @@ class TestSpotifyAlbums:
 
 
 class TestSharedSession:
-    """One session per client instead of one per request — the documented
-    aiohttp anti-pattern discards the connection pool and DNS cache, so every
-    call paid a fresh TCP + TLS handshake to a host it had just talked to."""
+    """One session per client, kept for the life of the process. http_call
+    reads each response to EOF, so its connections return to the pool."""
 
     async def test_session_is_reused_across_calls(self, spotify: Spotify) -> None:
         factory_calls = 0

@@ -8,6 +8,7 @@ from typing import Any, Optional, cast
 from collections.abc import AsyncIterator, Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock
 
+import aiohttp
 import discord
 import fakeredis
 import pytest
@@ -15,12 +16,14 @@ import structlog
 from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
+import src.spotify as spotify_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.musicbot import MusicBot
 from src.recovery import VoiceWatchdog
 from src.musicplayer import MusicPlayer
 from src.spotify import Spotify
+from src.youtube import close_probe_session
 from tests.helpers import noop_ffmpeg_init, tier_enabled
 
 
@@ -84,25 +87,13 @@ def reset_probe_streak() -> Iterator[None]:
 async def close_shared_http_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[None]:
-    """Close the module-global stream-probe session after every test.
+    """Close the process-lifetime HTTP sessions after every test.
 
-    Both the stream-probe session (a src.youtube module global) and each
-    Spotify client's session now live for the life of the process, closed in
-    production by MusicBotApp.close() and the cog's unload. In tests nothing
-    calls those, so a leaked ClientSession raises a ResourceWarning from
-    aiohttp's __del__ — which pytest turns into a PytestUnraisableExceptionWarning
-    attributed to whatever test happens to be running when the collector fires,
-    failing tests that have nothing to do with the leak.
-
-    Spotify sessions are tracked by wrapping _session_or_create rather than by
-    collecting fixtures, so an instance built ad-hoc inside a test is covered
-    too. Same reasoning as the fresh-pool fixture below: a process-lifetime
-    resource needs per-test scoping in tests.
+    Production closes them in MusicBotApp.close() and the cog's unload; nothing
+    calls those here, and a surviving ClientSession fails an unrelated later test
+    through aiohttp's __del__ ResourceWarning. Wrapping _session_or_create covers
+    a Spotify instance built inside a test body.
     """
-    import aiohttp
-
-    import src.spotify as spotify_mod
-
     created: list[Any] = []
     original = spotify_mod.Spotify._session_or_create
 
@@ -116,15 +107,15 @@ async def close_shared_http_sessions(
 
     yield
 
-    for session in created:
-        # Only real sessions: a test-injected factory usually returns a mock,
-        # whose close() is not awaitable.
-        if isinstance(session, aiohttp.ClientSession) and not session.closed:
-            await session.close()
-
-    from src.youtube import close_probe_session
-
-    await close_probe_session()
+    try:
+        for session in created:
+            # Only real sessions: a test-injected factory usually returns a mock,
+            # whose close() is not awaitable. Clear the attribute too, or the
+            # next call on a surviving instance gets a closed session.
+            if isinstance(session, aiohttp.ClientSession) and not session.closed:
+                await session.close()
+    finally:
+        await close_probe_session()
 
 
 @pytest.fixture(autouse=True)

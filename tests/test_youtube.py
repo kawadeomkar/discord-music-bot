@@ -6,6 +6,7 @@ import pickle
 from dataclasses import FrozenInstanceError, replace
 import threading
 import time
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
@@ -15,6 +16,7 @@ import discord
 import orjson
 import pytest
 from redis.asyncio import Redis
+from yarl import URL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
@@ -2504,8 +2506,8 @@ class TestRunExtract:
 
 
 class TestProbeSessionSharing:
-    """The stream probe runs before EVERY song; a per-call session made each one
-    pay a fresh TCP + TLS handshake to googlevideo."""
+    """The probe holds one process-wide session. It pools nothing (the body goes
+    unread), so what these pin is the lifecycle: reuse, replacement and close."""
 
     async def test_probe_session_is_reused(self) -> None:
         import src.youtube as youtube
@@ -2539,3 +2541,29 @@ class TestProbeSessionSharing:
 
         await youtube.close_probe_session()
         await youtube.close_probe_session()  # must not raise
+
+    async def test_probe_session_keeps_no_cookies(self) -> None:
+        """One session serves every guild, and `-play <any url>` reaches it via the
+        generic extractor — so a default CookieJar would let one guild set a
+        `Domain=com` cookie (aiohttp applies no public-suffix check) that is then
+        replayed to googlevideo for everyone until restart. Enough cookie bytes
+        turns every probe into a 400, which maps to DEAD, drops the cache entry and
+        burns the re-extraction. Nothing self-heals: probe_path_looks_broken()
+        watches UNCONFIRMED streaks and a DEAD verdict resets that counter."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            hostile = SimpleCookie()
+            hostile["pwn"] = "AAAA"
+            hostile["pwn"]["domain"] = "com"
+            hostile["pwn"]["path"] = "/"
+            session.cookie_jar.update_cookies(hostile, URL("https://evil.com/x"))
+
+            assert len(session.cookie_jar) == 0
+            replayed = session.cookie_jar.filter_cookies(
+                URL("https://rr3---sn-4g5e6nez.googlevideo.com/videoplayback")
+            )
+            assert dict(replayed) == {}
+        finally:
+            await youtube.close_probe_session()

@@ -394,19 +394,23 @@ _UNCONFIRMED_STREAM_TTL = 120  # 2 minutes
 # cached-entry drop is deliberately NOT charged against this.
 _MAX_STREAM_EXTRACTIONS = 1
 
-# One session for every stream probe, created lazily on the running loop.
-# The probe runs before EVERY song, and a per-call ClientSession discards the
-# connection pool and DNS cache each time — so each probe paid a fresh TCP +
-# TLS handshake to googlevideo. Module-level rather than per-player: the hosts
-# are shared across guilds, so one pool serves all of them.
+# One session for every stream probe. The probe closes each connection rather
+# than pooling it, so this saves the connector and SSL-context construction a
+# per-call session paid — not a handshake. See docs/ARCHITECTURE.md#stream-probe-session
 _probe_session: Optional[aiohttp.ClientSession] = None
 
 
 def _get_probe_session() -> aiohttp.ClientSession:
+    """The process's probe session, created on first use so it binds to the
+    running loop. DummyCookieJar is load-bearing, not tidiness: a status-line
+    probe never needs a cookie, and `-play <any url>` reaches this session, so a
+    real jar lets one guild set a `Domain=com` cookie that is then replayed to
+    googlevideo for every guild until restart."""
     global _probe_session
     if _probe_session is None or _probe_session.closed:
         _probe_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
+            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
+            cookie_jar=aiohttp.DummyCookieJar(),
         )
     return _probe_session
 

@@ -2545,6 +2545,30 @@ def _running(cog: MusicBot, coro_name: str) -> bool:
     return any(coro_name in repr(t.get_coro()) for t in cog._restore_tasks)
 
 
+class TestCogUnloadReleasesSpotify:
+    """The Spotify client's session lives for the life of the process, so the
+    cog's unload is the only thing that releases it."""
+
+    async def test_cog_unload_closes_the_spotify_session(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing else asserts this: the conftest fixture closes stray sessions
+        after every test, so dropping the call from cog_unload leaves the whole
+        suite green."""
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_cog_unload_skips_a_disabled_spotify(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The shipping default: no credentials means `spotify` is None, and the
+        unload must not raise on the guard that exists for exactly that case."""
+        music_bot.spotify = None
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()  # must not raise
+
+
 class TestCogLoadSpotifyValidation:
     """cog_load spawns the credential probe as a background task so startup is
     never blocked, and the probe resolves _spotify_status without ever raising."""
