@@ -602,8 +602,8 @@ def _record_serving_format(data: YTDLVideoMetadata) -> None:
     audio_only = data.get("vcodec") in (None, "none")
     span.set_attribute("ytdl.audio_only", audio_only)
     # Whether this serve is eligible for the remux path — attributed here rather
-    # than only at construction, so a guild that stopped getting passthrough
-    # (android_vr degraded to muxed AAC) is visible in the same place as why.
+    # than only at construction, so a guild that stopped getting passthrough (a
+    # degraded client serving muxed AAC) is visible in the same place as why.
     span.set_attribute(
         "ytdl.opus_passthrough", _passthrough_codec(data, 1.0) is not None
     )
@@ -1232,16 +1232,14 @@ class YTDL(discord.FFmpegOpusAudio):
             # resolve is always a fresh extraction) makes the next play probe the
             # blacklisted rung first, throwing away what the retry learned and
             # warning about the wrong format for the rest of the TTL.
-            # Rotated, not truncated: the rungs ahead of the winner move to the
-            # BACK. Deleting them made two promotions leave a single ~50kbps rung
-            # pinned for the rest of the TTL with no fallback left — worse than no
-            # cache, which at least re-extracted and restored the top format. A
-            # rung also dies for reasons that pass (a transient 503 from one CDN
-            # host), and demotion lets it recover instead of being written off.
-            # The winner is now rung 0 (it was just promoted to the top level), so
-            # only what follows it is stored — rotated rather than truncated, since a
-            # rung can die for reasons that pass (one CDN host 503ing) and deserves a
-            # later try rather than being written off for the rest of the TTL.
+            # The winner was just promoted to the top level, so it is rung 0 now and
+            # only what follows it is stored — rotated, not truncated: the rungs
+            # ahead of it move to the BACK. Deleting them made two promotions leave a
+            # single ~50kbps rung pinned for the rest of the TTL with no fallback
+            # left, worse than no cache, which at least re-extracted and restored the
+            # top format. A rung also dies for reasons that pass (a transient 503
+            # from one CDN host), and demotion lets it recover rather than be
+            # written off.
             data["audio_candidates"] = ladder[index + 1 :] + ladder[:index]
             span.set_attribute("ytdl.candidate_index", index)
             return probe, index
