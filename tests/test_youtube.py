@@ -1,6 +1,7 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import logging
 import redis.asyncio as aioredis
 import pickle
 from dataclasses import FrozenInstanceError, replace
@@ -12,6 +13,7 @@ from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import orjson
 import pytest
@@ -1607,6 +1609,39 @@ class TestRevokedStreamUrl:
         with patch("src.youtube._get_probe_session", return_value=session):
             assert await _probe_stream_url("https://cdn/x") is expected
 
+    async def test_a_probe_bug_is_logged_at_error_not_swallowed_as_a_verdict(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A defect in this function is not evidence about the URL. It still answers
+        UNCONFIRMED — no probe bug may cost a song — but at ERROR, or a session left
+        dead reads as a flaky CDN for the life of the process. A real TypeError was
+        swallowed as UNCONFIRMED once; only the log level tells them apart."""
+        session = MagicMock()
+        session.get.side_effect = TypeError("unexpected keyword")
+        with patch("src.youtube._get_probe_session", return_value=session):
+            with caplog.at_level(logging.ERROR):
+                assert await _probe_stream_url("https://cdn/x") is (
+                    StreamProbe.UNCONFIRMED
+                )
+        assert any(
+            r.levelno == logging.ERROR and "failed unexpectedly" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_a_network_failure_stays_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ordinary case must not be promoted alongside it — a blocked probe is
+        routine and would drown the signal the ERROR arm exists to carry."""
+        session = MagicMock()
+        session.get.side_effect = aiohttp.ClientConnectionError("refused")
+        with patch("src.youtube._get_probe_session", return_value=session):
+            with caplog.at_level(logging.DEBUG):
+                assert await _probe_stream_url("https://cdn/x") is (
+                    StreamProbe.UNCONFIRMED
+                )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
     async def test_resolve_records_the_probe_verdict_on_the_span(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
     ) -> None:
@@ -2541,6 +2576,40 @@ class TestProbeSessionSharing:
 
         await youtube.close_probe_session()
         await youtube.close_probe_session()  # must not raise
+
+    async def test_a_probe_after_close_does_not_rebuild(self) -> None:
+        """close() is followed by a span flush that yields the loop for up to 30s,
+        and nothing tears the players down first — so the playback loop can reach a
+        probe after this ran. Rebuilding there strands a session nothing closes."""
+        import src.youtube as youtube
+
+        youtube._get_probe_session()
+        await youtube.close_probe_session()
+
+        with pytest.raises(youtube.ProbeSessionClosed):
+            youtube._get_probe_session()
+        assert youtube._probe_session is None
+
+    async def test_a_probe_after_close_is_unconfirmed_not_an_error(self) -> None:
+        """Shutdown is not a probe defect: it must not take the ERROR arm, and it
+        must not answer DEAD — that would drop a cache entry on the way out."""
+        import src.youtube as youtube
+
+        await youtube.close_probe_session()
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.UNCONFIRMED
+
+    async def test_probe_connector_is_unbounded(self) -> None:
+        """One connector serves every guild now. aiohttp's default limit of 100
+        would queue the 101st probe against its own 2s budget and report a healthy
+        URL as UNCONFIRMED — which _unconfirmed_streak then counts process-wide."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            assert session.connector is not None
+            assert session.connector.limit == 0
+        finally:
+            await youtube.close_probe_session()
 
     async def test_probe_session_keeps_no_cookies(self) -> None:
         """One session serves every guild, and `-play <any url>` reaches it via the

@@ -398,6 +398,14 @@ _MAX_STREAM_EXTRACTIONS = 1
 # than pooling it, so this saves the connector and SSL-context construction a
 # per-call session paid — not a handshake. See docs/ARCHITECTURE.md#stream-probe-session
 _probe_session: Optional[aiohttp.ClientSession] = None
+# One-shot, like MusicBotApp.close()'s own _teardown_started: the playback loop
+# outlives close_probe_session() by up to the 30s span flush, and rebuilding on
+# a call from there would strand a session nothing closes.
+_probe_session_closed = False
+
+
+class ProbeSessionClosed(RuntimeError):
+    """Raised when a probe is attempted after the session is closed for good."""
 
 
 def _get_probe_session() -> aiohttp.ClientSession:
@@ -405,10 +413,17 @@ def _get_probe_session() -> aiohttp.ClientSession:
     running loop. DummyCookieJar is load-bearing, not tidiness: a status-line
     probe never needs a cookie, and `-play <any url>` reaches this session, so a
     real jar lets one guild set a `Domain=com` cookie that is then replayed to
-    googlevideo for every guild until restart."""
+    googlevideo for every guild until restart. Rebuilt if closed from outside,
+    but never after close_probe_session(). Safe to call twice."""
     global _probe_session
+    if _probe_session_closed:
+        raise ProbeSessionClosed("stream-probe session is closed")
     if _probe_session is None or _probe_session.closed:
         _probe_session = aiohttp.ClientSession(
+            # limit=0: one connector now serves every guild, and the default 100
+            # would queue the 101st probe against its own 2s budget and report a
+            # healthy URL as UNCONFIRMED. Costs nothing — the probe never pools.
+            connector=aiohttp.TCPConnector(limit=0),
             timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
             cookie_jar=aiohttp.DummyCookieJar(),
         )
@@ -416,16 +431,14 @@ def _get_probe_session() -> aiohttp.ClientSession:
 
 
 async def close_probe_session() -> None:
-    """Close the shared probe session. Called from MusicBotApp.close()."""
-    global _probe_session
-    session = _probe_session
-    _probe_session = None
-    if session is None or session.closed:
-        return
-    try:
+    """Release the probe session for good. Called from MusicBotApp.close();
+    safe to call twice. Errors propagate — the call site guards this step, like
+    every other step in close()."""
+    global _probe_session, _probe_session_closed
+    _probe_session_closed = True
+    session, _probe_session = _probe_session, None
+    if session is not None and not session.closed:
         await session.close()
-    except Exception as e:
-        log.warning(f"Failed to close stream-probe session: {e}")
 
 
 # Fields to persist in the stream URL cache — strips ephemeral/large fields.
@@ -582,10 +595,23 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
                 )
                 return _record_probe_outcome(StreamProbe.UNCONFIRMED)
             return _record_probe_outcome(StreamProbe.DEAD)
-    except Exception as e:
+    except ProbeSessionClosed:
+        # Shutdown, not a defect: the loop can reach here while close() waits on
+        # the span flush. Nothing to judge and nothing to cache.
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
         # State the fact only — the three call sites have three different policies,
         # and each logs its own.
         log.warning(f"stream URL probe did not complete: {e}")
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+    except Exception as e:
+        # Anything outside the network set is a bug in this function, not evidence
+        # about the URL. Still UNCONFIRMED, because no probe defect may cost a song
+        # — but ERROR, or a dead session reads as a flaky CDN forever.
+        log.error(
+            f"stream URL probe failed unexpectedly: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
         return _record_probe_outcome(StreamProbe.UNCONFIRMED)
 
 

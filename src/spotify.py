@@ -146,6 +146,7 @@ class Spotify:
         # Built on first use, so a deployment with Spotify configured but never
         # used never opens a connector.
         self._session: Optional[aiohttp.ClientSession] = None
+        self._closed = False
 
     def __str__(self) -> str:
         # Never the bearer token: one f-string would put a live credential into
@@ -163,8 +164,10 @@ class Spotify:
         """The client's session, created on first use. One session keeps the
         connection pool and DNS cache warm across every call to the API, which
         the read-to-EOF response handling in http_call makes reachable. Rebuilt
-        when closed, so a caller after aclose() gets a usable session rather
-        than a corpse. Closed by aclose()."""
+        when closed from outside, but never after aclose(): a caller arriving
+        then would strand a session nothing closes."""
+        if self._closed:
+            raise RuntimeError("Spotify client is closed")
         if self._session is None or self._session.closed:
             self._session = cast(
                 aiohttp.ClientSession,
@@ -175,15 +178,12 @@ class Spotify:
         return self._session
 
     async def aclose(self) -> None:
-        """Close the shared session. Called from the cog's unload."""
-        session = self._session
-        self._session = None
-        if session is None:
-            return
-        try:
+        """Release the session for good. Called from the cog's unload; safe to
+        call twice. A reload builds a fresh Spotify, so nothing reuses this one."""
+        self._closed = True
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
             await session.close()
-        except Exception as e:
-            log.warning(f"Failed to close Spotify HTTP session: {e}")
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -212,6 +212,10 @@ class Spotify:
         session = self._session_or_create()
         resp = await session.post(self.auth_endpoint, data=data)
         if strict and resp.status not in (200, 201):
+            # Drain first: the session outlives this call, so an unread body holds
+            # its pooled connection out of circulation until the response is
+            # collected. Same reason as the release in http_call.
+            await resp.release()
             raise SpotifyAuthError(resp.status, "client-credentials grant failed")
         resp_data = await resp.json(content_type=None)
         self.auth_token = resp_data["access_token"]

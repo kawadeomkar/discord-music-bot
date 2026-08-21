@@ -794,7 +794,7 @@ sequenceDiagram
     MusicBot->>Redis: store.clear_connection() + refresh_ttl()
 ```
 
-`clear_connection()` distinguishes intentional stop from a crash (the Redis queue list is intentionally left intact — only the channel IDs and now-playing state are cleared). On process shutdown, `MusicBotApp.close()` tears down in order: drainer `stop()` (cancel, then one bounded final-drain attempt so a healthy Postgres receives whatever is buffered; never raises, even for an already-crashed task) → `PostgresHistoryArchive.close()` → Redis pool drain → `shutdown_telemetry()` (a blocking force-flush, run in an executor). Anything left in the outbox simply drains on next start.
+`clear_connection()` distinguishes intentional stop from a crash (the Redis queue list is intentionally left intact — only the channel IDs and now-playing state are cleared). On process shutdown, `MusicBotApp.close()` tears down in order: drainer `stop()` (cancel, then one bounded final-drain attempt so a healthy Postgres receives whatever is buffered; never raises, even for an already-crashed task) → `PostgresHistoryArchive.close()` → Redis pool drain → `super().close()` → `ytdlp_pool.aclose()` → `close_probe_session()` → `shutdown_telemetry()` (a blocking force-flush, run in an executor). Every step is guarded individually, so no failure can skip a later one. Anything left in the outbox simply drains on next start.
 
 ---
 

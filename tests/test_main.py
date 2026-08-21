@@ -740,6 +740,23 @@ class TestClose:
         assert session.closed
         assert youtube._probe_session is None
 
+    async def test_a_failing_probe_session_close_does_not_skip_telemetry(
+        self, app: MusicBotApp
+    ) -> None:
+        """close_probe_session() no longer swallows its own errors, so the call
+        site is the only guard — and if it were missing, a socket already gone
+        would cost the span flush, the record of the failed shutdown."""
+        app._redis_pool = None
+        with patch(
+            "src.youtube.close_probe_session",
+            new=AsyncMock(side_effect=OSError("already gone")),
+        ):
+            with patch("src.telemetry.shutdown_telemetry") as shutdown:
+                with patch.object(commands.AutoShardedBot, "close", new=AsyncMock()):
+                    await app.close()  # must not raise
+
+        shutdown.assert_called_once()
+
 
 class TestHelpFlag:
     """`--help` anywhere in a command message diverts to that command's help

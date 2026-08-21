@@ -17,6 +17,7 @@ from fakeredis.model import StreamEntryKey, XStream
 from redis.asyncio import Redis
 
 import src.spotify as spotify_mod
+import src.youtube as youtube_mod
 from src.config import SpotifyStatus
 from src.debug import DebugSettings
 from src.musicbot import MusicBot
@@ -94,6 +95,10 @@ async def close_shared_http_sessions(
     through aiohttp's __del__ ResourceWarning. Wrapping _session_or_create covers
     a Spotify instance built inside a test body.
     """
+    # close_probe_session() latches the module closed for good, which is right for
+    # a process that exits after it and wrong for a suite that keeps going.
+    monkeypatch.setattr(youtube_mod, "_probe_session_closed", False)
+
     created: list[Any] = []
     original = spotify_mod.Spotify._session_or_create
 

@@ -34,6 +34,7 @@ def _make_mock_session(resp: AsyncMock) -> MagicMock:
     # A bare MagicMock attribute is truthy, which reads as an already-closed
     # session and makes _session_or_create rebuild on every call.
     session.closed = False
+    session.close = AsyncMock()
     return session
 
 
@@ -271,6 +272,22 @@ class TestSpotifyValidate:
             await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
         assert exc.value.status == 400
         session.request.assert_not_awaited()  # never got to the track call
+
+    async def test_a_rejected_grant_releases_the_body(self, spotify: Spotify) -> None:
+        """The grant shares the client's session now, so raising on a non-2xx with
+        the body unread holds that pooled connection until the response is
+        collected. http_call drains before its raises; this path must too. Spec'd,
+        because release() exists on a bare AsyncMock whether or not it is called."""
+        resp = MagicMock(spec=aiohttp.ClientResponse)
+        resp.status = 400
+        resp.release = AsyncMock()
+        session = _make_mock_session(resp)
+        spotify._session_factory = lambda **kw: session
+
+        with pytest.raises(SpotifyAuthError):
+            await spotify.validate("4PTG3Z6ehGkBFwjybzWkR8")
+
+        resp.release.assert_awaited_once()
 
     async def test_validate_raises_auth_error_on_track_401(
         self, spotify: Spotify
@@ -750,12 +767,29 @@ class TestSharedSession:
     async def test_aclose_without_a_session_is_a_noop(self, spotify: Spotify) -> None:
         await spotify.aclose()  # must not raise
 
-    async def test_aclose_swallows_close_errors(self, spotify: Spotify) -> None:
-        """Shutdown must not be derailed by a socket that is already gone."""
+    async def test_aclose_clears_the_handle_before_a_failing_close(
+        self, spotify: Spotify
+    ) -> None:
+        """A socket already gone must not strand the reference. aclose() lets the
+        error out — cog_unload guards each step, so swallowing here would only
+        hide which one failed — but the handle is cleared first, so the failure
+        cannot leave a half-closed session reachable."""
         session = _make_mock_session(AsyncMock())
         session.close = AsyncMock(side_effect=OSError("already gone"))
         spotify._session_factory = lambda **kw: session
         spotify._session_or_create()
 
-        await spotify.aclose()  # must not raise
+        with pytest.raises(OSError):
+            await spotify.aclose()
         assert spotify._session is None
+
+    async def test_a_call_after_aclose_is_refused(self, spotify: Spotify) -> None:
+        """A command in flight when the cog unloads must not quietly build a
+        replacement session: nothing closes it, and the process is on its way out."""
+        session = _make_mock_session(AsyncMock())
+        spotify._session_factory = lambda **kw: session
+        spotify._session_or_create()
+        await spotify.aclose()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            spotify._session_or_create()
