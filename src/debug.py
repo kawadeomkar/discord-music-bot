@@ -1205,7 +1205,7 @@ _PROMETHEUS_MAX_BYTES = 1 << 20
 _prometheus_session_cache: Optional[aiohttp.ClientSession] = None
 
 
-async def _prometheus_session() -> aiohttp.ClientSession:
+def _prometheus_session() -> aiohttp.ClientSession:
     """The process's Prometheus session, created on first use.
 
     One per query cost an extra connect every time — 0.92 ms against 0.37 ms on
@@ -1251,7 +1251,7 @@ async def read_container_metrics(
         f'{{__name__=~"{"|".join(_CONTAINER_METRICS)}",container_name="{container}"}}'
     )
     try:
-        session = await _prometheus_session()
+        session = _prometheus_session()
         async with session.get(
             f"{base_url.rstrip('/')}/api/v1/query", params={"query": selector}
         ) as response:

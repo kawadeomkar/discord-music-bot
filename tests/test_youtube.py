@@ -1,20 +1,24 @@
 """Tests for src/youtube.py — QueueObject, YTDL config, yt_source, yt_stream, and stream cache."""
 
 import asyncio
+import logging
 import redis.asyncio as aioredis
 import pickle
 from dataclasses import FrozenInstanceError, replace
 import threading
 import time
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from typing import Any, Optional, cast
 from collections.abc import Callable, Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import discord
 import orjson
 import pytest
 from redis.asyncio import Redis
+from yarl import URL
 from yt_dlp.utils import DownloadError, UnsupportedError
 
 from src.telemetry import configure_worker_logging
@@ -1602,10 +1606,41 @@ class TestRevokedStreamUrl:
         session = MagicMock()
         session.get.return_value.__aenter__ = AsyncMock(return_value=response)
         session.get.return_value.__aexit__ = AsyncMock(return_value=False)
-        with patch("aiohttp.ClientSession") as mock_session_cls:
-            mock_session_cls.return_value.__aenter__ = AsyncMock(return_value=session)
-            mock_session_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        with patch("src.youtube._get_probe_session", return_value=session):
             assert await _probe_stream_url("https://cdn/x") is expected
+
+    async def test_a_probe_bug_is_logged_at_error_not_swallowed_as_a_verdict(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A defect in this function is not evidence about the URL. It still answers
+        UNCONFIRMED — no probe bug may cost a song — but at ERROR, or a session left
+        dead reads as a flaky CDN for the life of the process. A real TypeError was
+        swallowed as UNCONFIRMED once; only the log level tells them apart."""
+        session = MagicMock()
+        session.get.side_effect = TypeError("unexpected keyword")
+        with patch("src.youtube._get_probe_session", return_value=session):
+            with caplog.at_level(logging.ERROR):
+                assert await _probe_stream_url("https://cdn/x") is (
+                    StreamProbe.UNCONFIRMED
+                )
+        assert any(
+            r.levelno == logging.ERROR and "failed unexpectedly" in r.getMessage()
+            for r in caplog.records
+        )
+
+    async def test_a_network_failure_stays_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The ordinary case must not be promoted alongside it — a blocked probe is
+        routine and would drown the signal the ERROR arm exists to carry."""
+        session = MagicMock()
+        session.get.side_effect = aiohttp.ClientConnectionError("refused")
+        with patch("src.youtube._get_probe_session", return_value=session):
+            with caplog.at_level(logging.DEBUG):
+                assert await _probe_stream_url("https://cdn/x") is (
+                    StreamProbe.UNCONFIRMED
+                )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
     async def test_resolve_records_the_probe_verdict_on_the_span(
         self, mock_ctx: MagicMock, fake_redis: aioredis.Redis, playable_urls: AsyncMock
@@ -2503,3 +2538,116 @@ class TestRunExtract:
             mock_pool.run = AsyncMock(side_effect=DownloadError("boom"))
             with pytest.raises(DownloadError):
                 await _run_extract(ExtractRequest(url="https://yt.com/v=x", opts={}))
+
+
+class TestProbeSessionSharing:
+    """The probe holds one process-wide session. It pools nothing (the body goes
+    unread), so what these pin is the lifecycle: reuse, replacement and close."""
+
+    async def test_probe_session_is_reused(self) -> None:
+        import src.youtube as youtube
+
+        first = youtube._get_probe_session()
+        second = youtube._get_probe_session()
+        assert first is second
+        await youtube.close_probe_session()
+
+    async def test_close_clears_the_global(self) -> None:
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        await youtube.close_probe_session()
+        assert youtube._probe_session is None
+        assert session.closed
+
+    async def test_a_closed_session_is_replaced(self) -> None:
+        """The tests' own cleanup closes this session without going through
+        close_probe_session(), so the next probe must rebuild rather than raise.
+        Scoped to an explicit close: a session whose event loop died still reports
+        `closed == False`, so this check cannot see that one."""
+        import src.youtube as youtube
+
+        first = youtube._get_probe_session()
+        await first.close()
+        second = youtube._get_probe_session()
+        assert second is not first
+        await youtube.close_probe_session()
+
+    async def test_close_without_a_session_is_a_noop(self) -> None:
+        import src.youtube as youtube
+
+        await youtube.close_probe_session()
+        await youtube.close_probe_session()  # must not raise
+
+    async def test_a_probe_after_close_does_not_rebuild(self) -> None:
+        """close() is followed by a span flush that yields the loop for up to 30s,
+        and nothing tears the players down first — so the playback loop can reach a
+        probe after this ran. Rebuilding there strands a session nothing closes."""
+        import src.youtube as youtube
+
+        youtube._get_probe_session()
+        await youtube.close_probe_session()
+
+        with pytest.raises(youtube.ProbeSessionClosed):
+            youtube._get_probe_session()
+        assert youtube._probe_session is None
+
+    async def test_a_probe_after_close_is_unconfirmed_not_an_error(self) -> None:
+        """Shutdown is not a probe defect: it must not take the ERROR arm, and it
+        must not answer DEAD — that would drop a cache entry on the way out."""
+        import src.youtube as youtube
+
+        await youtube.close_probe_session()
+        assert await _probe_stream_url("https://cdn/x") is StreamProbe.UNCONFIRMED
+
+    async def test_probe_session_carries_the_configured_timeout(self) -> None:
+        """STREAM_PROBE_TIMEOUT_SECS is baked into the session once, at first use,
+        rather than passed per call — so nothing else exercises the constructor and
+        a dropped timeout would leave every probe on aiohttp's 5-minute default,
+        stalling a song start behind a CDN that never answers."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            assert session.timeout.total == youtube._STREAM_PROBE_TIMEOUT
+        finally:
+            await youtube.close_probe_session()
+
+    async def test_probe_connector_is_unbounded(self) -> None:
+        """One connector serves every guild now. aiohttp's default limit of 100
+        would queue the 101st probe against its own 2s budget and report a healthy
+        URL as UNCONFIRMED — which _unconfirmed_streak then counts process-wide."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            assert session.connector is not None
+            assert session.connector.limit == 0
+        finally:
+            await youtube.close_probe_session()
+
+    async def test_probe_session_keeps_no_cookies(self) -> None:
+        """One session serves every guild, and `-play <any url>` reaches it via the
+        generic extractor — so a default CookieJar would let one guild set a
+        `Domain=com` cookie (aiohttp applies no public-suffix check) that is then
+        replayed to googlevideo for everyone until restart. Enough cookie bytes
+        turns every probe into a 400, which maps to DEAD, drops the cache entry and
+        burns the re-extraction. Nothing self-heals: probe_path_looks_broken()
+        watches UNCONFIRMED streaks and a DEAD verdict resets that counter."""
+        import src.youtube as youtube
+
+        session = youtube._get_probe_session()
+        try:
+            hostile = SimpleCookie()
+            hostile["pwn"] = "AAAA"
+            hostile["pwn"]["domain"] = "com"
+            hostile["pwn"]["path"] = "/"
+            session.cookie_jar.update_cookies(hostile, URL("https://evil.com/x"))
+
+            assert len(session.cookie_jar) == 0
+            replayed = session.cookie_jar.filter_cookies(
+                URL("https://rr3---sn-4g5e6nez.googlevideo.com/videoplayback")
+            )
+            assert dict(replayed) == {}
+        finally:
+            await youtube.close_probe_session()

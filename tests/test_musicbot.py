@@ -16,6 +16,7 @@ import pytest
 from discord.ext import commands
 from redis.asyncio import Redis
 
+import src.debug as debug_mode
 from src.config import SpotifyStatus
 from src.guild_history import GuildHistory
 from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
@@ -2543,6 +2544,49 @@ def _running(cog: MusicBot, coro_name: str) -> bool:
     keeps the assertion about the thing under test.
     """
     return any(coro_name in repr(t.get_coro()) for t in cog._restore_tasks)
+
+
+class TestCogUnloadReleasesSpotify:
+    """The Spotify client's session lives for the life of the process, so the
+    cog's unload is the only thing that releases it."""
+
+    async def test_cog_unload_closes_the_spotify_session(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Nothing else asserts this: the conftest fixture closes stray sessions
+        after every test, so dropping the call from cog_unload leaves the whole
+        suite green."""
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_a_failing_step_does_not_skip_the_ones_after_it(
+        self, music_bot: MusicBot
+    ) -> None:
+        """Cog._eject only logs what this raises and BotBase.close swallows that,
+        so an unguarded early failure would silently skip every later step and
+        nothing would say so — the same shape that once made a hung Postgres
+        permanently skip the rest of MusicBotApp.close()."""
+        music_bot._restore_tasks = set()
+        music_bot.debug_settings = MagicMock()
+        music_bot.debug_settings.aclose = AsyncMock(side_effect=OSError("boom"))
+
+        with patch.object(
+            debug_mode, "close_prometheus_session", new=AsyncMock()
+        ) as prom:
+            await music_bot.cog_unload()  # must not raise
+
+        prom.assert_awaited_once()
+        cast(Any, music_bot.spotify).aclose.assert_awaited_once()
+
+    async def test_cog_unload_skips_a_disabled_spotify(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The shipping default: no credentials means `spotify` is None, and the
+        unload must not raise on the guard that exists for exactly that case."""
+        music_bot.spotify = None
+        music_bot._restore_tasks = set()
+        await music_bot.cog_unload()  # must not raise
 
 
 class TestCogLoadSpotifyValidation:
