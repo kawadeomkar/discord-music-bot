@@ -23,6 +23,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.sdk.trace.sampling import ALWAYS_OFF, ALWAYS_ON, Decision
 
 import src.telemetry as telemetry
+from src import config
 
 
 @pytest.fixture(autouse=True)
@@ -216,7 +217,7 @@ class TestSetupTraces:
         assert provider is not None
         attrs = provider.resource.attributes
         assert attrs["service.name"] == telemetry._SERVICE_NAME
-        assert attrs["deployment.environment"] == telemetry.ENVIRONMENT
+        assert attrs["deployment.environment"] == config.ENVIRONMENT
 
     def test_gateway_filter_is_installed_as_the_sampler(
         self, clean_setup: None
@@ -281,7 +282,7 @@ class TestShutdownTelemetry:
 class TestStructlogProcessors:
     def test_environment_is_stamped_on_every_event(self) -> None:
         event = telemetry._add_environment(None, "info", {"event": "hello"})
-        assert event["environment"] == telemetry.ENVIRONMENT
+        assert event["environment"] == config.ENVIRONMENT
 
     def test_trace_context_is_injected_inside_a_span(self) -> None:
         provider = TracerProvider()

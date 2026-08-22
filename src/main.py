@@ -12,7 +12,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from src import config
-from src.config import ENVIRONMENT, spotify_enabled
+from src.config import spotify_enabled
 
 # Reaches yt_dlp transitively (src.debug -> src.ping -> yt_dlp.version), and the
 # console script imports THIS module at module scope — so the yt-dlp pool's
@@ -415,7 +415,7 @@ class MusicBotApp(commands.AutoShardedBot):
         await self.change_presence(status=discord.Status.online, activity=activity)
         if self.user:
             log.info(f"Bot: {self.user.name} # {self.user.id}")
-        log.info(f"Environment: {ENVIRONMENT}")
+        log.info(f"Environment: {config.ENVIRONMENT}")
         log.info(f"Bot cogs: {list(self.cogs.keys())}")
         log.info(f"Bot guilds: {len(self.guilds)} | latency: {self.latency:.2f}s")
         # FIXME: this line is labelled "Bot commands:" but logs the `voice_states`
@@ -510,6 +510,14 @@ class MusicBotApp(commands.AutoShardedBot):
 
 
 def main() -> None:
+    # Dev convenience: with ENVIRONMENT unset, name it after the current git
+    # branch. An entrypoint is where running a subprocess belongs. Must precede
+    # setup_telemetry(), which stamps the value onto the OTel resource.
+    if not os.environ.get("ENVIRONMENT"):
+        inferred = config.infer_environment_from_git()
+        if inferred is not None:
+            config.ENVIRONMENT = inferred
+
     from src.telemetry import setup_telemetry
 
     setup_telemetry()  # must be first — configures structlog before any get_logger() call resolves

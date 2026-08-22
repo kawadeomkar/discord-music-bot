@@ -23,7 +23,7 @@ from opentelemetry.trace import Link, SpanKind
 from opentelemetry.trace.span import TraceState
 from opentelemetry.util.types import Attributes
 
-from src.config import ENVIRONMENT
+from src import config
 
 if TYPE_CHECKING:
     # The SDK providers are imported lazily in _setup_traces/_setup_logs so the
@@ -153,7 +153,7 @@ def _add_environment(
     logger: WrappedLogger, method: str, event_dict: EventDict
 ) -> EventDict:
     """Structlog processor: stamp every log event with the current environment."""
-    event_dict["environment"] = ENVIRONMENT
+    event_dict["environment"] = config.ENVIRONMENT
     return event_dict
 
 
@@ -204,7 +204,7 @@ def _setup_traces() -> None:
     resource = Resource.create(
         {
             SERVICE_NAME: _SERVICE_NAME,
-            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: config.ENVIRONMENT,
         }
     )
     exporter = OTLPSpanExporter(endpoint=_OTLP_ENDPOINT, insecure=True)
@@ -223,7 +223,7 @@ def _setup_logs() -> None:
     resource = Resource.create(
         {
             SERVICE_NAME: _SERVICE_NAME,
-            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: ENVIRONMENT,
+            ResourceAttributes.DEPLOYMENT_ENVIRONMENT: config.ENVIRONMENT,
         }
     )
     exporter = OTLPLogExporter(endpoint=_OTLP_ENDPOINT, insecure=True)

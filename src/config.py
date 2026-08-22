@@ -1,13 +1,24 @@
 import math
 import os
 import subprocess
-import warnings
 from enum import Enum
 from typing import Final, Optional
 from urllib.parse import unquote, urlsplit
 
+# The deploy environment, tagged onto every log line and OTel resource. Read
+# from the environment alone, so importing this module runs no subprocess and
+# needs no git repo. main() may replace it before setup_telemetry() — read it as
+# `config.ENVIRONMENT`, never `from src.config import ENVIRONMENT`, or the value
+# binds before that.
+ENVIRONMENT: str = os.environ.get("ENVIRONMENT") or "development"
 
-def _git_branch() -> str:
+
+def infer_environment_from_git() -> Optional[str]:
+    """Best-effort deploy-environment name from the current git branch.
+
+    None when the branch cannot be determined: no repo, no git binary, or a
+    detached HEAD, which `git rev-parse --abbrev-ref HEAD` reports as "HEAD" and
+    which is the normal state of a worktree. Never raises."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -15,36 +26,13 @@ def _git_branch() -> str:
             text=True,
             timeout=2,
         )
-        branch = result.stdout.strip()
-        if result.returncode == 0 and branch and branch != "HEAD":
-            return branch
     except Exception:
-        pass
-    # TODO: A detached HEAD turns this advisory warning into a hard test failure.
-    # `git rev-parse --abbrev-ref HEAD` prints "HEAD" when detached (including every
-    # `git worktree add --detach`), and pyproject's `filterwarnings = ["error", ...]`
-    # promotes this RuntimeWarning to an import-time exception, killing the suite at
-    # collection with an error about git branch detection rather than anything about
-    # the tests. CI escapes only because ci.yml sets ENVIRONMENT explicitly.
-    # Fix: skip the warning when the checkout is legitimately detached, or default
-    # ENVIRONMENT for the test session in tests/conftest.py.
-    warnings.warn(
-        "Could not detect git branch; defaulting ENVIRONMENT to 'development'",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    return "development"
-
-
-def _parse() -> str:
-    raw = os.environ.get("ENVIRONMENT")
-    if raw is not None:
-        return raw
-    branch = _git_branch()
+        return None
+    branch = result.stdout.strip()
+    if result.returncode != 0 or not branch or branch == "HEAD":
+        return None
     return "production" if branch == "main" else branch.replace("/", "-")[:50]
 
-
-ENVIRONMENT: str = _parse()
 
 # Touched by a loop-resident task so the container HEALTHCHECK can tell a wedged
 # event loop from a healthy one. Unset — the default outside Docker — skips the
