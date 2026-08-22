@@ -321,10 +321,18 @@ class _ConfigVar:
     # What the bot uses when the variable is unset, as text. Read from config's own
     # resolved constants where there is one, so this can't drift from the real default.
     fallback: Optional[str] = None
+    # For a default main() can still replace. src.main imports this module, so that
+    # assignment lands after this tuple is built and a stored string would freeze
+    # the pre-inference value.
+    fallback_factory: Optional[Callable[[], str]] = None
 
 
 _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
-    _ConfigVar(name="ENVIRONMENT", kind=_ConfigKind.VALUE, fallback=config.ENVIRONMENT),
+    _ConfigVar(
+        name="ENVIRONMENT",
+        kind=_ConfigKind.VALUE,
+        fallback_factory=lambda: config.ENVIRONMENT,
+    ),
     _ConfigVar(name="DEBUG_MODE", kind=_ConfigKind.VALUE, fallback="false"),
     _ConfigVar(
         name="HISTORY_ARCHIVE_ENABLED", kind=_ConfigKind.VALUE, fallback="false"
@@ -469,7 +477,8 @@ def render_config_value(var: _ConfigVar) -> str:
         # issue; a value here is one paste away from a leaked credential.
         return "set" if (raw or "").strip() else "unset"
     if raw is None or not raw.strip():
-        return "unset" if var.fallback is None else f"{var.fallback} (default)"
+        fallback = var.fallback_factory() if var.fallback_factory else var.fallback
+        return "unset" if fallback is None else f"{fallback} (default)"
     if var.kind is _ConfigKind.URL:
         return redact_url(raw.strip(), hide_host=True)
     return raw.strip()

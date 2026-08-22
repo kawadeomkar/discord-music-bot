@@ -279,6 +279,18 @@ class TestConfigAllowlist:
         var = next(v for v in _CONFIG_ALLOWLIST if v.name == "YTDLP_POOL_WORKERS")
         assert render_config_value(var) == "4 (default)"
 
+    def test_the_environment_default_is_read_at_render_time(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() infers ENVIRONMENT from the git branch when the var is unset, and
+        src.main imports this module — so a fallback stored at import freezes the
+        pre-inference value and this row contradicts the host block on the same card.
+        """
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.setattr(config, "ENVIRONMENT", "task/some-branch")
+        var = next(v for v in _CONFIG_ALLOWLIST if v.name == "ENVIRONMENT")
+        assert render_config_value(var) == "task/some-branch (default)"
+
     def test_unlisted_variable_never_renders(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
