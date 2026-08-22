@@ -954,9 +954,8 @@ class MusicPlayer:
                     # bot died after that transaction committed but before the song
                     # finished (at-most-once delivery).
                     if guild_state.has_crashed_song:
-                        # Approximate position at crash time — pure math on the
-                        # snapshot, no IO. crashed_position_at documents why it is
-                        # only approximate (downtime counts as playback).
+                        # The recorded position, read straight off the snapshot —
+                        # no clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
                         if position is not None:
                             # Cap at duration − 10s so FFmpeg can't seek past EOF.

@@ -448,14 +448,14 @@ concurrent callers no-op). Each player owns:
 
 - `queue: GuildQueue`, `history: GuildHistory`, `store: Optional[GuildRedisStore]`
 - tasks: `_player` (loop), `_prefetch_task`, `_restore_task`, `_progress_task`,
-  `_pause_debounce_task`, plus `_background_tasks` (fire-and-forget via
-  `spawn_background`)
+  `_heartbeat_task`, `_pause_debounce_task`, plus `_background_tasks`
+  (fire-and-forget via `spawn_background`)
 - events: `play_next`, `_restore_complete`, `_playback_gate` (+ `_playback_holds`
   refcount for `defer_playback()`)
 - NP host state: `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` /
   `_np_edit_lock`
 
-`cleanup(guild)` cancels all five tasks BEFORE disconnecting (so the loop can't start
+`cleanup(guild)` cancels all six tasks BEFORE disconnecting (so the loop can't start
 the next song mid-teardown), retires the NP host, disconnects voice, resets presence,
 and — for an intentional stop — `clear_connection()` so `on_ready` skips recovery.
 
@@ -611,8 +611,9 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
                 + newest-50 history (all-or-nothing on failure)
               • volume restored only if a value was stored (never clobber a concurrent
                 -volume with a fabricated default)
-              • crashed song: crashed_position_at(now) = elapsed − pauses, capped at
-                cached duration − 10s (EOF guard), rebuilt via
+              • crashed song: crashed_position_at() returns the RECORDED
+                last_position_secs (no clock read), capped at cached duration − 10s
+                (EOF guard), rebuilt via
                 SongQueueEntry.from_crashed_state (persisted=False, interjected flag
                 preserved) → queue.restore_crashed at the FRONT; state cleared
                 unconditionally so a failed re-queue can't loop every restart
@@ -660,13 +661,17 @@ could not be read"; only the first may be reported to a guild as an empty queue.
 
 Recovery reads a position the loop **recorded**, never one it infers from a clock:
 `_heartbeat_updater` writes `last_position_secs` every `HEARTBEAT_INTERVAL_SECS` while a
-song plays, the start transaction seeds it from the `-ss` offset, and `_pause_and_persist`
+song plays, the start transaction seeds it from the `-ss` offset, and `MusicPlayer.pause`
 writes one final exact value (the ticker skips paused songs). Downtime is therefore never
 credited and clock skew between restarts stops mattering; the worst case is replaying one
 interval, which is the deliberate bias — replaying 3s is imperceptible, skipping 3s is not.
 The legacy wall-clock fields are still written so a rollback still recovers, and
-`crashed_position_at` falls back to them for a hash written by the previous build; both go
-one release after this ships.
+`crashed_position_at` falls back to them for a hash written by the previous build — and for
+a recorded position whose `last_heartbeat_epoch` PREDATES the current song's start, which is
+what an older image leaves behind when it cannot clear fields it does not know about. Drop
+the legacy write, `_legacy_wall_clock_position_at`, `StateField.PLAY_START_EPOCH`,
+`TOTAL_PAUSE_SECONDS`, `PAUSE_START_EPOCH` and `on_pause`/`on_resume` together one release
+after this ships.
 
 ### `-playnow` interjection and resume entries
 
@@ -1022,7 +1027,7 @@ duplicated.
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `STREAM_PROBE_TIMEOUT_SECS` | `2.0` | Cap on the pre-playback stream-URL probe. Short because a single resolve can pay it twice and exceeding it now costs a **cache entry**, not just a verdict — an unconfirmed URL still plays, so firing early is cheap. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
-| `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability |
+| `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability. Floored at 0.5s and refused non-finite — each tick is a Redis write per PLAYING guild, so `0` would be an unbounded HSET loop and `inf` would silently disable recovery |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
 | `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (the Postgres probe brackets a 2s sampling window between two stats queries, plus a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried — keep the deadline comfortably above that ~2.2s floor. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
 | `OTEL_SDK_DISABLED` | `false` | `true` disables tracing/log export (stdout logs remain) |

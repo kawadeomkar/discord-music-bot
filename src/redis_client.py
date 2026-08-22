@@ -1405,8 +1405,6 @@ class GuildRedisStore:
         pipe.expire(self.state_key(), GUILD_TTL)
         await pipe.execute()
 
-    # Recovery lock (distributed, for rolling-restart safety)
-
     # Recovery lock — one restore_guild per guild at a time
 
     # Must outlast the guarded section: _restore_guild's voice connect is capped at

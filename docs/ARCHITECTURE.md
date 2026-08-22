@@ -610,7 +610,7 @@ flowchart TD
 Key details:
 
 - **Atomic start transaction**: for a real queue item, `pop_queue_and_start_song` LPOPs the Redis queue and writes all current-song state fields plus the `now_playing` display snapshot in one `MULTI/EXEC` — there is no window where the song is neither on the queue list nor in the state hash. A crash-recovered song (`persisted=False`) was never on the Redis list, so only the state fields are written (an LPOP would drop an unrelated queued song).
-- **Backdated epoch**: `play_start_epoch` is stored as `play_start − song.start_offset` so recovery position math (`now − play_start_epoch − pauses`) yields the true audio position for `?t=` songs and double-crash recoveries.
+- **Backdated epoch**: `play_start_epoch` is stored as `play_start − song.start_offset`. The same offset is passed again as `start_offset`, seeding `last_position_secs` so a crash inside the first heartbeat interval still resumes a `?t=` song at its offset. The backdated epoch now feeds only the legacy fallback.
 - **`_prefetch_next_song`** dequeues via `queue.get_nowait()`, resolves + streams the next item while the current song plays. If cancelled (clear/shuffle/remove), it returns the item to the front via `queue.requeue_front()` — the claim goes back with it. If resolve/stream fails, it settles the claim and mirrors it via `queue.finish_failed_dequeue()`.
 - **Every claim is settled exactly once** — by `try_commit_dequeue()` (the song starts), `finish_failed_dequeue()` (failure), or `requeue_front()` (cancellation, which returns the claim with the item). The loop's exception handler releases a claim no other path settled, tracked by `claim_outstanding`; a claim left standing would keep its item counted as in flight forever and the next release would settle a different song.
 - **Resume entries**: an `is_resume` `SongQueueEntry` (from `-playnow`) replays through the same FFmpeg `-ss ts` seek path as a `?t=` song and honours `start_paused`. The parked song's history add is deferred via `_skip_history_for` so it is recorded once, at its resume tail — see [-playnow Interjection](#-playnow-interjection).
@@ -711,7 +711,7 @@ pause(vc):  vc.pause()  → store.on_pause(now)        → mark_paused()
 resume(vc): vc.resume() → store.on_resume(now)       → mark_resumed()
 ```
 
-- **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position = `now − play_start_epoch − total_pause_seconds` (still-open pauses handled at read time).
+- **Redis epoch accounting** (crash-recovery correctness): `on_pause` writes `pause_start_epoch`; `on_resume` folds the pause interval into `total_pause_seconds` and clears `pause_start_epoch`. Recovery position is read from `last_position_secs`, recorded by the heartbeat while the song played — no clock is consulted, so downtime is never credited. The epoch accounting above feeds only `_legacy_wall_clock_position_at`, the fallback for a hash written before the heartbeat existed.
 - **`mark_paused`/`mark_resumed`** both fire `_fire_pause_state_updates()` — a debounced one-off NP-embed edit + presence refresh, so the bar and tooltip freeze/unfreeze promptly rather than waiting for the next 3 s tick.
 - `-pause` replies with a **confirmation embed** (`build_pause_confirmation_embed`) showing the frozen position; `-resume` calls `rehost_np_after_resume()` so a pause confirmation hosting the block becomes plain history rather than sitting beneath a live, advancing bar.
 
@@ -787,7 +787,7 @@ sequenceDiagram
     Trigger->>MusicBot: cleanup(guild)
     MusicBot->>MusicBot: cancel alone-timer; atomic mps.pop(guild.id)
     Note over MusicBot: pop-first gate — a concurrent cleanup call gets None and returns
-    MusicBot->>MP: gather-cancel: _prefetch_task, _progress_task,<br/>_pause_debounce_task, _player, _restore_task
+    MusicBot->>MP: gather-cancel: _prefetch_task, _progress_task,<br/>_heartbeat_task, _pause_debounce_task, _player, _restore_task
     MusicBot->>MP: retire_np_host_on_stop()
     Note over MP: no task can race this; dedicated NP msg deleted,<br/>command-response host strip-edited
     MusicBot->>VC: voice_client.disconnect(force=False)
@@ -817,6 +817,7 @@ sequenceDiagram
 | `_prefetch_task` | `Optional[asyncio.Task]` | Active `_prefetch_next_song()` task |
 | `_restore_task` / `_restore_complete` | `Optional[asyncio.Task]` / `asyncio.Event` | One-shot `_restore_state()`; the event gates `loop()`'s first dequeue |
 | `_progress_task` | `Optional[asyncio.Task]` | Per-song progress-bar updater |
+| `_heartbeat_task` | `Optional[asyncio.Task]` | Per-song position recorder for crash recovery |
 | `_pause_debounce_task` | `Optional[asyncio.Task]` | Debounced pause/resume embed+presence refresh |
 | `_skip_history_for` | `Optional[YTDL]` | Set by `interject()` to the parked song whose history add is deferred to its resume tail (holds identity, not a flag — the song can end during interject's awaits) |
 | `_np_host_message` / `_np_host_own_embeds` / `_np_host_dedicated` | host pointer + its own embeds + kind | The one message currently carrying the NP block |
@@ -831,7 +832,7 @@ All guild keys are prefixed `guild:{guild_id}:`. `GUILD_TTL = 86400` (24 h idle 
 
 | Key | Type | Schema | TTL |
 |---|---|---|---|
-| `guild:{id}:state` | Hash | 18 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
+| `guild:{id}:state` | Hash | 20 fields → `GuildStateData`: `volume`, `voice_channel_id`, `text_channel_id`, `current_song_url/_title/_duration/_uploader/_requester_id/_interjected/_is_resume/_start_paused/_queued_at/_queue_position/_query_source/_played_at` (a parked `SongQueueEntry`), `last_position_secs`, `last_heartbeat_epoch`, `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` | 24 h |
 | `guild:{id}:now_playing` | Hash | 12 display fields → `NowPlayingData`: `title`, `webpage_url`, `uploader`, `duration`, `thumbnail`, `view_count`, `like_count`, `abr`, `asr`, `acodec`, `requester_id`, `requester_mention` | 24 h |
 | `guild:{id}:queue` | List | JSON entries discriminated by `"type"`: `"qobj"` → `SongQueueEntry` (`webpage_url`, `title`, `requester_id`, `ts`, `user_input`, `duration`, `uploader`, `thumbnail`, `persisted`, `interjected`, `is_resume`, `start_paused`, `queued_at`, `queue_position`, `query_source`, `played_at`, `np_message_id`, `np_channel_id`, `np_dedicated`), `"ytsource"` → `SearchQueueEntry` (`ytsearch`, `url`, `ts`, `process`, `user_input`, `queued_at`, `queue_position`, `query_source`). RPUSH on enqueue (LPUSH to the front for `-playnow` resume entries); LPOP inside the atomic start transaction | 24 h |
 | `guild:{id}:history` | List | JSON `HistoryEntry` objects (most recently RECORDED first), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) and PERSISTed on every push. The **only** source `-history` reads, in both archive modes | **none, ever** |
@@ -889,6 +890,7 @@ flowchart TD
         RESTORE["_restore_task — _restore_state()"]
         PREF["_prefetch_task — _prefetch_next_song()"]
         PROG["_progress_task — _progress_updater()"]
+        HB["_heartbeat_task — _heartbeat_updater()"]
         DEB["_pause_debounce_task"]
         ALONE["alone-timer — _alone_countdown()"]
     end
