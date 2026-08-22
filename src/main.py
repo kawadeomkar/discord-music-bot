@@ -486,7 +486,7 @@ class MusicBotApp(commands.AutoShardedBot):
         loop = asyncio.get_running_loop()
         # Awaited directly rather than via the executor below — only aclose() knows
         # which half blocks; it owns its off-loop join and bounds the wait.
-        from src.youtube import ytdlp_pool
+        from src.youtube import close_probe_session, ytdlp_pool
 
         try:
             await ytdlp_pool.aclose()
@@ -495,6 +495,13 @@ class MusicBotApp(commands.AutoShardedBot):
             # timeout, so this arm is for the unexpected — which would otherwise cost
             # the span flush below, the record of the failed shutdown.
             log.warning(f"yt-dlp pool shutdown failed: {e}")
+        try:
+            await close_probe_session()
+        except Exception as e:
+            log.warning(f"stream-probe session shutdown failed: {e}")
+        # Exception, not BaseException, in every guard above: a second Ctrl-C
+        # raises KeyboardInterrupt through them and abandons the rest of this
+        # sequence, which is what a second Ctrl-C is asking for.
         # shutdown_telemetry has no async form and blocks up to 30s flushing spans,
         # so it needs the executor hop.
         from src.telemetry import shutdown_telemetry

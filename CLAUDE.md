@@ -337,6 +337,8 @@ embed, before voice checks or argument parsing.
 `history_archive.close()` — both skipped when the archive tier is off (the attrs are
 `None`) → close Redis pool → `super().close()` → `ytdlp_pool.aclose()`
 (10s join timeout, then `terminate_workers()` — an unbounded join measured 61s to exit)
+→ `close_probe_session()` (latches the module closed, so a player loop still running
+during the flush below cannot rebuild a session nothing will close)
 → `shutdown_telemetry()` via executor (blocking span flush, up to 30s). `close()` is
 one-shot (`_teardown_started`) and **every step is individually guarded**: a hung
 Postgres once made `archive.close()` raise, which skipped every later step permanently.

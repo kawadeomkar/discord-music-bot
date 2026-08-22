@@ -10,7 +10,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 
 import discord
 from discord.ext import commands
@@ -433,15 +433,36 @@ class MusicBot(commands.Cog):
     async def cog_unload(self) -> None:
         """Stop the runtime sampler unconditionally. A reload that left it running
         would drip /proc reads for the life of the process. The shared Prometheus
-        session goes with it, or a reload leaks a connector per load.
+        and Spotify sessions go with it, or a reload leaks a connector per load.
 
         The background tasks go FIRST: the hydration ends in sync_sampler, so one
         still in flight would restart the sampler straight after aclose() and leak
         it, holding a dead cog alive.
+
+        Every step is guarded individually, like MusicBotApp.close(): Cog._eject
+        only logs what this raises and BotBase.close swallows it, so an early
+        failure would silently skip the rest and nothing would say so.
         """
-        await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
-        await self.debug_settings.aclose()
-        await debug_mode.close_prometheus_session()
+        spotify = self.spotify
+
+        async def _cancel_background() -> None:
+            await asyncio.gather(*(cancel_task(t) for t in list(self._restore_tasks)))
+
+        # Callables, not coroutines: building them up front would schedule the
+        # gather before its turn and leave the rest un-awaited on any early exit,
+        # which pytest's filterwarnings=error turns into a failure.
+        steps: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
+            ("background tasks", _cancel_background),
+            ("runtime sampler", self.debug_settings.aclose),
+            ("prometheus session", debug_mode.close_prometheus_session),
+        ]
+        if spotify is not None:
+            steps.append(("spotify session", spotify.aclose))
+        for name, step in steps:
+            try:
+                await step()
+            except Exception as e:
+                log.warning(f"cog unload step failed ({name}): {e}")
 
     async def _validate_spotify_credentials(self) -> None:
         """Background credential probe (spawned by cog_load, never awaited). Only

@@ -514,6 +514,53 @@ def _record_probe_outcome(probe: StreamProbe) -> StreamProbe:
     return probe
 
 
+# One session for every stream probe. The probe closes each connection rather
+# than pooling it, so this saves the connector and SSL-context construction a
+# per-call session paid — not a handshake. See docs/ARCHITECTURE.md#stream-probe-session
+_probe_session: Optional[aiohttp.ClientSession] = None
+# One-shot, like MusicBotApp.close()'s own _teardown_started: the playback loop
+# outlives close_probe_session() by up to the 30s span flush, and rebuilding on
+# a call from there would strand a session nothing closes.
+_probe_session_closed = False
+
+
+class ProbeSessionClosed(RuntimeError):
+    """Raised when a probe is attempted after the session is closed for good."""
+
+
+def _get_probe_session() -> aiohttp.ClientSession:
+    """The process's probe session, created on first use so it binds to the
+    running loop. DummyCookieJar is load-bearing, not tidiness: a status-line
+    probe never needs a cookie, and `-play <any url>` reaches this session, so a
+    real jar lets one guild set a `Domain=com` cookie that is then replayed to
+    googlevideo for every guild until restart. Rebuilt if closed from outside,
+    but never after close_probe_session(). Safe to call twice."""
+    global _probe_session
+    if _probe_session_closed:
+        raise ProbeSessionClosed("stream-probe session is closed")
+    if _probe_session is None or _probe_session.closed:
+        _probe_session = aiohttp.ClientSession(
+            # limit=0: one connector now serves every guild, and the default 100
+            # would queue the 101st probe against its own 2s budget and report a
+            # healthy URL as UNCONFIRMED. Costs nothing — the probe never pools.
+            connector=aiohttp.TCPConnector(limit=0),
+            timeout=aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT),
+            cookie_jar=aiohttp.DummyCookieJar(),
+        )
+    return _probe_session
+
+
+async def close_probe_session() -> None:
+    """Release the probe session for good. Called from MusicBotApp.close();
+    safe to call twice. Errors propagate — the call site guards this step, like
+    every other step in close()."""
+    global _probe_session, _probe_session_closed
+    _probe_session_closed = True
+    session, _probe_session = _probe_session, None
+    if session is not None and not session.closed:
+        await session.close()
+
+
 async def _probe_stream_url(stream_url: str) -> StreamProbe:
     """What YouTube will do with this stream URL right now. A revoked URL makes ffmpeg
     403 and exit, which discord.py cannot tell from a song that simply ended — silence,
@@ -527,32 +574,44 @@ async def _probe_stream_url(stream_url: str) -> StreamProbe:
     if not stream_url:
         return StreamProbe.DEAD
     try:
-        timeout = aiohttp.ClientTimeout(total=_STREAM_PROBE_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # read_bufsize=0 + close(), not release(): only the status line matters,
-            # and aiohttp otherwise fills its StreamReader from the moment headers land
-            # until the transport is paused — audio we pay for and discard. Nothing is
-            # lost: an unread body means the connection could not be pooled anyway.
-            async with session.get(stream_url, read_bufsize=0) as response:
-                # Only a definite client-side refusal is DEAD. 429 and 5xx say "not
-                # right now" exactly as a timeout does, and routing them to DEAD would
-                # delete the cache entry and refuse a song ffmpeg's own -reconnect
-                # would very likely have played.
-                status = response.status
-                response.close()
-                if status < 400:
-                    return _record_probe_outcome(StreamProbe.PLAYABLE)
-                if status == 429 or status >= 500:
-                    log.warning(
-                        f"stream URL probe got HTTP {status}, treating as "
-                        "unconfirmed rather than revoked"
-                    )
-                    return _record_probe_outcome(StreamProbe.UNCONFIRMED)
-                return _record_probe_outcome(StreamProbe.DEAD)
-    except Exception as e:
+        session = _get_probe_session()
+        # read_bufsize=0 + close(), not release(): only the status line matters,
+        # and aiohttp otherwise fills its StreamReader from the moment headers land
+        # until the transport is paused — audio we pay for and discard. Nothing is
+        # lost: an unread body means the connection could not be pooled anyway.
+        async with session.get(stream_url, read_bufsize=0) as response:
+            # Only a definite client-side refusal is DEAD. 429 and 5xx say "not
+            # right now" exactly as a timeout does, and routing them to DEAD would
+            # delete the cache entry and refuse a song ffmpeg's own -reconnect
+            # would very likely have played.
+            status = response.status
+            response.close()
+            if status < 400:
+                return _record_probe_outcome(StreamProbe.PLAYABLE)
+            if status == 429 or status >= 500:
+                log.warning(
+                    f"stream URL probe got HTTP {status}, treating as "
+                    "unconfirmed rather than revoked"
+                )
+                return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+            return _record_probe_outcome(StreamProbe.DEAD)
+    except ProbeSessionClosed:
+        # Shutdown, not a defect: the loop can reach here while close() waits on
+        # the span flush. Nothing to judge and nothing to cache.
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as e:
         # State the fact only — the three call sites have three different policies,
         # and each logs its own.
         log.warning(f"stream URL probe did not complete: {e}")
+        return _record_probe_outcome(StreamProbe.UNCONFIRMED)
+    except Exception as e:
+        # Anything outside the network set is a bug in this function, not evidence
+        # about the URL. Still UNCONFIRMED, because no probe defect may cost a song
+        # — but ERROR, or a dead session reads as a flaky CDN forever.
+        log.error(
+            f"stream URL probe failed unexpectedly: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
         return _record_probe_outcome(StreamProbe.UNCONFIRMED)
 
 
