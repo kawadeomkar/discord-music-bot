@@ -2825,6 +2825,63 @@ class TestClearSongEndState:
         await broken_store.clear_song_end_state()  # must not raise
 
 
+class TestHeartbeat:
+    async def test_writes_both_position_fields(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.heartbeat(42.5, 1700000000.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert raw[b"last_position_secs"] == b"42.5"
+        assert raw[b"last_heartbeat_epoch"] == b"1700000000.0"
+
+    async def test_refreshes_the_state_ttl(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Otherwise a long song on an otherwise-idle guild could let the state
+        key expire mid-playback."""
+        await fake_redis.hset(store.state_key(), b"x", b"1")
+        await fake_redis.expire(store.state_key(), 5)
+        await store.heartbeat(1.0, 2.0)
+        assert await fake_redis.ttl(store.state_key()) > 5
+
+    async def test_negative_position_is_floored(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.heartbeat(-3.0, 1.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 0.0
+
+    async def test_swallows_redis_error(self, broken_store: GuildRedisStore) -> None:
+        await broken_store.heartbeat(1.0, 2.0)  # must not raise
+
+    async def test_start_transaction_seeds_the_heartbeat_from_start_offset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """Closes the window before the first tick — and makes a crash-recovered
+        song that crashes again immediately resume at its -ss offset, not 0:00."""
+        await store.pop_queue_and_start_song(_entry(1), 1000.0, start_offset=30.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 30.0
+
+    async def test_start_transaction_seeds_zero_without_an_offset(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        await store.pop_queue_and_start_song(_entry(1), 1000.0)
+        raw = await fake_redis.hgetall(store.state_key())
+        assert float(raw[b"last_position_secs"]) == 0.0
+
+    async def test_clear_song_end_state_wipes_the_heartbeat(
+        self, store: GuildRedisStore, fake_redis: aioredis.Redis
+    ) -> None:
+        """A stale position outliving its song would be read as the next
+        crash's resume point."""
+        await store.heartbeat(42.0, 1.0)
+        await store.clear_song_end_state()
+        raw = await fake_redis.hgetall(store.state_key())
+        assert b"last_position_secs" not in raw
+        assert b"last_heartbeat_epoch" not in raw
+
+
 class TestGuildConfigStore:
     """The durable half of the per-guild debug toggle."""
 

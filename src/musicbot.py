@@ -541,6 +541,7 @@ class MusicBot(commands.Cog):
             teardown = [
                 cancel_task(mp._prefetch_task),
                 cancel_task(mp._progress_task),
+                cancel_task(mp._heartbeat_task),
                 cancel_task(mp._pause_debounce_task),
                 cancel_task(mp._player),
                 cancel_task(mp._restore_task),

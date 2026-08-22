@@ -105,6 +105,14 @@ class StateField:
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
+    # The recorded playback position — the answer to "where was the audio?",
+    # read directly with no wall-clock arithmetic. The three fields above are
+    # its legacy predecessors and are still written for rollback safety; they
+    # go away one release after this ships.
+    LAST_POSITION_SECS: Final[str] = "last_position_secs"
+    # NOT used for position math — kept for observability (how stale is the
+    # snapshot?) and to allow crediting the sub-interval gap later if wanted.
+    LAST_HEARTBEAT_EPOCH: Final[str] = "last_heartbeat_epoch"
 
 
 # ── guild:{id}:now_playing hash — field name constants ───────────────────────
@@ -349,6 +357,8 @@ class GuildStateData:
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
+    last_position_secs: float | None = None
+    last_heartbeat_epoch: float | None = None
 
     # Convenience properties — derived from stored fields, not stored separately.
 
@@ -370,20 +380,43 @@ class GuildStateData:
         (vc.is_paused()): this is persisted crash-time state only."""
         return self.pause_start_epoch is not None
 
-    # FIXME: Crash recovery counts bot downtime as playback position.
-    # `now` is read at RESTART time while play_start_epoch dates from when the song
-    # started, so 10 minutes
-    # of downtime lands straight on the computed position: a song that crashed 30s in
-    # comes back near its end, on the caller's duration−10s EOF cap. Only a pause already
-    # active at crash time is subtracted; the crash gap is never tracked.
-    # Fix: a periodic playback heartbeat in Redis, so recovery reads the last known
-    # position instead of extrapolating.
     def crashed_position_at(self, now: float) -> int | None:
-        """Approximate playback position (seconds) at crash time, or None when no
-        play_start_epoch was recorded. Pure function of the snapshot plus a
-        caller-supplied clock. play_start_epoch is already backdated by the FFmpeg
-        -ss offset at write time; callers still cap the result at the song duration
-        to stop FFmpeg seeking past EOF.
+        """Playback position (seconds) at the last recorded heartbeat, or None
+        when nothing was recorded.
+
+        A pure snapshot read: downtime is never credited as playback, because
+        the position is *recorded* while playing rather than inferred from a
+        wall clock that kept running while the process was dead. No clock is
+        read on this path, so clock skew between restarts stops mattering too.
+
+        Resumes at last_position_secs exactly, crediting nothing for the gap
+        between the final heartbeat and the crash — we know the bot was alive
+        at that heartbeat and nothing after it. The worst case is a replay of
+        at most one heartbeat interval; replaying 3 seconds is imperceptible,
+        skipping 3 seconds is not, so the bias is deliberate.
+
+        `now` is used only by the legacy fallback below, which reads a state
+        hash written by a pre-heartbeat build. Both the parameter and the
+        fallback are removable one release after this ships — until then a
+        rollback to the old build must still recover.
+
+        Callers may still cap the result at the song's duration to prevent
+        FFmpeg seeking past EOF.
+        """
+        if self.last_position_secs is not None:
+            return max(0, int(self.last_position_secs))
+        return self._legacy_wall_clock_position_at(now)
+
+    def _legacy_wall_clock_position_at(self, now: float) -> int | None:
+        """Pre-heartbeat position math: extrapolate from the start epoch.
+
+        Kept ONLY to read state hashes written by a build that predates
+        last_position_secs. It is the bug the heartbeat replaces — `now` is
+        read at RESTART time while play_start_epoch was written when the song
+        started, so a bot down 10 minutes adds those 10 minutes straight onto
+        the position and a song that crashed 30s in comes back near its end.
+        A stale-by-one-deploy state hash resuming badly is strictly better
+        than failing to resume at all, which is why this still exists.
         """
         if self.play_start_epoch is None:
             return None
@@ -438,6 +471,8 @@ class GuildStateData:
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),
+            last_position_secs=_b_float(raw, StateField.LAST_POSITION_SECS),
+            last_heartbeat_epoch=_b_float(raw, StateField.LAST_HEARTBEAT_EPOCH),
         )
 
 

@@ -113,6 +113,8 @@ _PLAYBACK_POSITION_FIELDS = (
     StateField.PLAY_START_EPOCH,
     StateField.TOTAL_PAUSE_SECONDS,
     StateField.PAUSE_START_EPOCH,
+    StateField.LAST_POSITION_SECS,
+    StateField.LAST_HEARTBEAT_EPOCH,
 )
 
 
@@ -773,7 +775,10 @@ class GuildRedisStore:
         await self.redis.lpop(self.queue_key())
 
     def _now_playing_state_mapping(
-        self, current: SongQueueEntry, play_start_epoch: float
+        self,
+        current: SongQueueEntry,
+        play_start_epoch: float,
+        start_offset: float = 0.0,
     ) -> dict[str, str]:
         """The current_song_* state fields ARE a parked queue entry — one signature
         enforcing the identity SongQueueEntry.from_song()/from_crashed_state()
@@ -798,6 +803,14 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
+            # Seed the heartbeat with the song's start offset so a value always
+            # exists: without this, a crash inside the first heartbeat interval
+            # would find no position, and a crash-recovered song that crashes
+            # again immediately would resume at 0:00 instead of at its -ss
+            # offset. start_offset is already folded into play_start_epoch by
+            # the caller's backdating, so deriving it here keeps one source.
+            StateField.LAST_POSITION_SECS: str(max(0.0, start_offset)),
+            StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
 
     @_guild_op(default=None)
@@ -806,6 +819,7 @@ class GuildRedisStore:
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
     ) -> None:
         """Atomically LPOP the queue and park `current`'s fields in the state hash.
 
@@ -815,7 +829,9 @@ class GuildRedisStore:
         the same transaction, so a crash can never leave state pointing at song B
         while the snapshot still shows song A.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
         pipe = self.redis.pipeline(transaction=True)
         pipe.lpop(self.queue_key())
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
@@ -835,12 +851,15 @@ class GuildRedisStore:
         current: SongQueueEntry,
         play_start_epoch: float,
         now_playing: Optional[NowPlayingData] = None,
+        start_offset: float = 0.0,
     ) -> None:
         """pop_queue_and_start_song without the LPOP, in one transaction — for
         restarting a crash-recovered "current song" that was never RPUSHed to the
         queue list.
         """
-        mapping = self._now_playing_state_mapping(current, play_start_epoch)
+        mapping = self._now_playing_state_mapping(
+            current, play_start_epoch, start_offset
+        )
         pipe = self.redis.pipeline(transaction=True)
         pipe.hset(self.state_key(), mapping=_hset_mapping(mapping))
         pipe.hdel(self.state_key(), StateField.PAUSE_START_EPOCH)
@@ -1367,6 +1386,33 @@ class GuildRedisStore:
         )
         pipe.delete(self.now_playing_key())
         await pipe.execute()
+
+    @_guild_op(default=None)
+    async def heartbeat(self, position_secs: float, epoch: float) -> None:
+        """Record where the audio actually is, so recovery never has to infer it.
+
+        Two fields plus the state-key TTL refresh, pipelined into one round
+        trip — ~0.33 writes/s per *playing* guild at the default 3s cadence,
+        which is negligible beside the existing per-song transactions.
+
+        Deliberately writes the legacy wall-clock fields' successor WITHOUT
+        removing them (see StateField): this release must stay readable by the
+        previous build in case of rollback.
+        """
+        pipe = self.redis.pipeline()
+        pipe.hset(
+            self.state_key(),
+            mapping=_hset_mapping(
+                {
+                    StateField.LAST_POSITION_SECS: str(max(0.0, position_secs)),
+                    StateField.LAST_HEARTBEAT_EPOCH: str(epoch),
+                }
+            ),
+        )
+        pipe.expire(self.state_key(), GUILD_TTL)
+        await pipe.execute()
+
+    # Recovery lock (distributed, for rolling-restart safety)
 
     # Recovery lock — one restore_guild per guild at a time
 
