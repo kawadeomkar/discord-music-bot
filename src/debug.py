@@ -354,6 +354,11 @@ _CONFIG_ALLOWLIST: tuple[_ConfigVar, ...] = (
         fallback=str(config.NOW_PLAYING_UPDATE_INTERVAL_SECS),
     ),
     _ConfigVar(
+        name="HEARTBEAT_INTERVAL_SECS",
+        kind=_ConfigKind.VALUE,
+        fallback=str(config.HEARTBEAT_INTERVAL_SECS),
+    ),
+    _ConfigVar(
         name="PING_TICK_SECS",
         kind=_ConfigKind.VALUE,
         fallback=str(config.PING_TICK_SECS),

@@ -529,7 +529,7 @@ to `dict[bytes, bytes]` and decode in `from_redis()`; do not "simplify" this.
 
 | Key | Type | TTL | Contents |
 |---|---|---|---|
-| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch`. Still *parses* a legacy `volume` field — see `:config` |
+| `guild:{id}:state` | hash | 24h | voice/text channel IDs, `current_song_*` (a parked queue entry), `last_position_secs` + `last_heartbeat_epoch` (the recorded playback position — what recovery reads), and the legacy `play_start_epoch`, `total_pause_seconds`, `pause_start_epoch` it replaced, **dual-written for one release** so a rollback still recovers. Still *parses* a legacy `volume` field — see `:config` |
 | `guild:{id}:queue` | list | 24h | JSON entries, `type` discriminator: `"qobj"` (SongQueueEntry) / `"ytsource"` (SearchQueueEntry — e.g. unresolved Spotify-playlist tracks). Both carry `user_input`, what the user typed; on a search entry it is the ONLY surviving record of the collection link, since its `ytsearch` is a generated title. Mirror writes all go through `GuildQueue._write_mirror` — rebuild, DELETE, or LREM |
 | `guild:{id}:now_playing` | hash | 24h | display snapshot for `-now` / recovered embed (deleted wholesale on song end: empty == no song) |
 | `guild:{id}:history` | list | **none, ever (PERSISTed)** | HistoryEntry JSON, most recently RECORDED first (~625 B/entry), LTRIMmed to `HISTORY_CACHE_LIMIT` (50) on every write. The ONLY source `-history` reads — bounded by length so it can be retained forever. Postgres is the durable record behind it |
@@ -658,9 +658,15 @@ front-inserting against an unread snapshot double-queues the song — so both ab
 say so. `MusicPlayer.restore_read_failed` separates "nothing was saved" from "the store
 could not be read"; only the first may be reported to a guild as an empty queue.
 
-Known limitation (FIXME in guild_state.py): recovery counts **bot downtime** as playback
-position — a song 30s in that stays down 10min resumes near its end (duration−10s cap).
-The designed fix is a periodic position heartbeat, not yet implemented.
+Recovery reads a position the loop **recorded**, never one it infers from a clock:
+`_heartbeat_updater` writes `last_position_secs` every `HEARTBEAT_INTERVAL_SECS` while a
+song plays, the start transaction seeds it from the `-ss` offset, and `_pause_and_persist`
+writes one final exact value (the ticker skips paused songs). Downtime is therefore never
+credited and clock skew between restarts stops mattering; the worst case is replaying one
+interval, which is the deliberate bias — replaying 3s is imperceptible, skipping 3s is not.
+The legacy wall-clock fields are still written so a rollback still recovers, and
+`crashed_position_at` falls back to them for a hash written by the previous build; both go
+one release after this ships.
 
 ### `-playnow` interjection and resume entries
 
@@ -1016,6 +1022,7 @@ duplicated.
 | `YTDLP_POOL_WORKERS` | `4` | extraction worker processes (~80–120 MB RSS each) |
 | `STREAM_PROBE_TIMEOUT_SECS` | `2.0` | Cap on the pre-playback stream-URL probe. Short because a single resolve can pay it twice and exceeding it now costs a **cache entry**, not just a verdict — an unconfirmed URL still plays, so firing early is cheap. Raise it only if `stream URL probe did not complete` warnings correlate with songs that then play fine |
 | `NOW_PLAYING_UPDATE_INTERVAL_SECS` | `3.0` | NP progress-bar edit cadence |
+| `HEARTBEAT_INTERVAL_SECS` | `3.0` | How often a playing guild records its playback position for crash recovery. Bounds the worst-case recovery error — a crash resumes at the last heartbeat, so at most this many seconds replay. Same default as the progress bar because the same reasoning applies, but a separate knob: one is display cadence, the other durability |
 | `PING_TICK_SECS` / `PING_DEADLINE_SECS` | `1.0` / `3.0` | -ping live-edit loop |
 | `DEBUG_TICK_SECS` / `DEBUG_DEADLINE_SECS` | `1.0` / `8.0` | -debug live-edit loop. Longer deadline than -ping's: each block does more work (the Postgres probe brackets a 2s sampling window between two stats queries, plus a Prometheus round trip) and a straggler renders `⚠️ timed out` rather than being retried — keep the deadline comfortably above that ~2.2s floor. The tick is a CEILING, not a cadence — the loop wakes on the first probe to finish |
 | `OTEL_SDK_DISABLED` | `false` | `true` disables tracing/log export (stdout logs remain) |
@@ -1026,7 +1033,6 @@ duplicated.
 | Where | Marker | Summary |
 |---|---|---|
 | guild_queue.py (module header) | ISSUE | dequeue-commit ↔ Redis-LPOP race window; accepted, fix sketched |
-| guild_state.py `crashed_position_at` | FIXME | bot downtime counted as playback position; heartbeat fix designed |
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
 | guild_queue.py `shuffle` | FIXME | requires 4 songs but the user-facing message and help say 3 |
 | spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
