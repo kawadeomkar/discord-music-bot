@@ -388,9 +388,23 @@ class GuildStateData:
         3s is imperceptible and skipping 3s is not. `now` feeds only the legacy
         fallback. Callers still cap at the song's duration to stop an EOF seek.
         """
-        if self.last_position_secs is not None:
+        if self.last_position_secs is not None and not self._heartbeat_predates_song():
             return max(0, int(self.last_position_secs))
         return self._legacy_wall_clock_position_at(now)
+
+    def _heartbeat_predates_song(self) -> bool:
+        """True when the recorded position belongs to an EARLIER song.
+
+        A build without these fields cannot clear them, so `just up <older-sha>`
+        and back leaves one song's position parked on a later song's hash — which
+        would resume it minutes in. Every legitimate write puts the heartbeat at or
+        after the start it belongs to: the seed writes play_start_epoch +
+        start_offset, and ticks read a clock the backdated epoch precedes. Judged
+        only when both values are present, so a corrupt one costs nothing.
+        """
+        if self.last_heartbeat_epoch is None or self.play_start_epoch is None:
+            return False
+        return self.last_heartbeat_epoch < self.play_start_epoch
 
     def _legacy_wall_clock_position_at(self, now: float) -> int | None:
         """Pre-heartbeat position math: extrapolate from the start epoch.
