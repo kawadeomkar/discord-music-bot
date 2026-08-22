@@ -803,12 +803,9 @@ class GuildRedisStore:
             StateField.CURRENT_SONG_PLAYED_AT: str(current.played_at),
             StateField.PLAY_START_EPOCH: str(play_start_epoch),
             StateField.TOTAL_PAUSE_SECONDS: "0",
-            # Seed the heartbeat with the song's start offset so a value always
-            # exists: without this, a crash inside the first heartbeat interval
-            # would find no position, and a crash-recovered song that crashes
-            # again immediately would resume at 0:00 instead of at its -ss
-            # offset. start_offset is already folded into play_start_epoch by
-            # the caller's backdating, so deriving it here keeps one source.
+            # Seeded so a position always exists before the first tick: without
+            # it a crash inside that interval, or a re-crashed recovered song,
+            # resumes at 0:00 rather than at its -ss offset.
             StateField.LAST_POSITION_SECS: str(max(0.0, start_offset)),
             StateField.LAST_HEARTBEAT_EPOCH: str(play_start_epoch + start_offset),
         }
@@ -1389,15 +1386,11 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def heartbeat(self, position_secs: float, epoch: float) -> None:
-        """Record where the audio actually is, so recovery never has to infer it.
+        """Record where the audio is, so recovery never has to infer it.
 
-        Two fields plus the state-key TTL refresh, pipelined into one round
-        trip — ~0.33 writes/s per *playing* guild at the default 3s cadence,
-        which is negligible beside the existing per-song transactions.
-
-        Deliberately writes the legacy wall-clock fields' successor WITHOUT
-        removing them (see StateField): this release must stay readable by the
-        previous build in case of rollback.
+        Two fields plus the state-key TTL refresh in one pipelined round trip,
+        ~0.33 writes/s per *playing* guild. Writes the legacy fields' successor
+        without removing them (see StateField) — a rollback must still read this.
         """
         pipe = self.redis.pipeline()
         pipe.hset(

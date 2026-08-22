@@ -480,11 +480,6 @@ class MusicPlayer:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._progress_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
-        # Now-playing host state: the one message currently carrying the NP
-        # embed block, its own (cached, static) embeds that follow the block,
-        # and whether it's a dedicated NP message (deleted on retire) or a
-        # command response (strip-edited on retire). See
-        # docs/NOW_PLAYING_EMBED_ATTACH_PLAN.md.
         self._np_last_rendered: Optional[list[Any]] = None
         self._np_last_id: Optional[int] = None
         # NP host state: the message carrying the block, its own cached embeds that
@@ -1670,9 +1665,8 @@ class MusicPlayer:
         entry point, so a future call site can't forget either side effect."""
         vc.pause()
         if self.store is not None:
-            # One final heartbeat captures the exact pause point; the ticking
-            # task skips paused songs, so without this the recorded position
-            # would sit up to one interval behind for the whole pause.
+            # The exact pause point: the ticking task skips paused songs, so
+            # without this the position sits an interval behind for the whole pause.
             if self.current_song is not None:
                 await self.store.heartbeat(self.current_song.position_secs, time.time())
             # Still written this release: a rollback to the previous build
@@ -2251,13 +2245,9 @@ class MusicPlayer:
     async def _heartbeat_updater(self, song: YTDL) -> None:
         """Record the playback position to Redis on a fixed cadence.
 
-        Deliberately a separate task from _progress_updater rather than a
-        piggyback. That one is a *display* concern and carries display-shaped
-        conditions that are wrong for persistence: it only runs for songs long
-        enough to warrant a bar, and it goes dormant when the now-playing host
-        message is missing. A song with no visible bar must still be
-        recoverable — coupling them would make crash-recovery correctness
-        depend on whether a user happened to delete a message.
+        Separate from _progress_updater because that task is display-gated: it
+        skips songs too short for a bar and goes dormant when the host message is
+        gone. A song with no visible bar must still be recoverable.
         """
         while True:
             await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECS)
@@ -2530,11 +2520,10 @@ class MusicPlayer:
                     # window. A crash-recovered "current song" was never on the Redis
                     # list, so only state is written — an LPOP would drop a queued one.
                     if self.store is not None:
-                        # The -ss offset twice over: backdated into the epoch the
-                        # legacy fallback extrapolates from, and passed as the seed
-                        # position the heartbeat has not written yet. Without the
-                        # seed a crash inside the first interval resumes a ?t= song
-                        # at 0:00 instead of at its offset.
+                        # The -ss offset twice: backdated into the epoch the legacy
+                        # fallback extrapolates from, and passed as the seed the
+                        # heartbeat has not written yet. Without it a `?t=` song
+                        # crashing inside the first interval resumes at 0:00.
                         backdated_start = play_start - song.start_offset
                         current = SongQueueEntry.from_song(song)
                         now_playing = NowPlayingData.from_song(song)
@@ -2553,9 +2542,8 @@ class MusicPlayer:
                                 start_offset=song.start_offset,
                             )
 
-                    # Started here rather than beside the progress bar: the bar
-                    # lives in _send_now_playing, which is display-gated, and a
-                    # song with no visible bar must still be recoverable.
+                    # Not beside the progress bar: that lives in _send_now_playing,
+                    # which is display-gated, and a song with no bar must recover.
                     self._heartbeat_task = asyncio.create_task(
                         self._heartbeat_updater(song)
                     )

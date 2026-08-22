@@ -105,13 +105,11 @@ class StateField:
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
-    # The recorded playback position — the answer to "where was the audio?",
-    # read directly with no wall-clock arithmetic. The three fields above are
-    # its legacy predecessors and are still written for rollback safety; they
-    # go away one release after this ships.
+    # The recorded playback position, read with no wall-clock arithmetic. The
+    # three fields above are its predecessors, still written for rollback safety;
+    # they go one release after this ships.
     LAST_POSITION_SECS: Final[str] = "last_position_secs"
-    # NOT used for position math — kept for observability (how stale is the
-    # snapshot?) and to allow crediting the sub-interval gap later if wanted.
+    # Observability only — how stale the snapshot is. Never position math.
     LAST_HEARTBEAT_EPOCH: Final[str] = "last_heartbeat_epoch"
 
 
@@ -384,24 +382,11 @@ class GuildStateData:
         """Playback position (seconds) at the last recorded heartbeat, or None
         when nothing was recorded.
 
-        A pure snapshot read: downtime is never credited as playback, because
-        the position is *recorded* while playing rather than inferred from a
-        wall clock that kept running while the process was dead. No clock is
-        read on this path, so clock skew between restarts stops mattering too.
-
-        Resumes at last_position_secs exactly, crediting nothing for the gap
-        between the final heartbeat and the crash — we know the bot was alive
-        at that heartbeat and nothing after it. The worst case is a replay of
-        at most one heartbeat interval; replaying 3 seconds is imperceptible,
-        skipping 3 seconds is not, so the bias is deliberate.
-
-        `now` is used only by the legacy fallback below, which reads a state
-        hash written by a pre-heartbeat build. Both the parameter and the
-        fallback are removable one release after this ships — until then a
-        rollback to the old build must still recover.
-
-        Callers may still cap the result at the song's duration to prevent
-        FFmpeg seeking past EOF.
+        No clock is read, so neither downtime nor skew between restarts can be
+        credited as playback. Resumes at last_position_secs exactly, so the worst
+        case replays one heartbeat interval — the deliberate bias, since replaying
+        3s is imperceptible and skipping 3s is not. `now` feeds only the legacy
+        fallback. Callers still cap at the song's duration to stop an EOF seek.
         """
         if self.last_position_secs is not None:
             return max(0, int(self.last_position_secs))
@@ -410,13 +395,9 @@ class GuildStateData:
     def _legacy_wall_clock_position_at(self, now: float) -> int | None:
         """Pre-heartbeat position math: extrapolate from the start epoch.
 
-        Kept ONLY to read state hashes written by a build that predates
-        last_position_secs. It is the bug the heartbeat replaces — `now` is
-        read at RESTART time while play_start_epoch was written when the song
-        started, so a bot down 10 minutes adds those 10 minutes straight onto
-        the position and a song that crashed 30s in comes back near its end.
-        A stale-by-one-deploy state hash resuming badly is strictly better
-        than failing to resume at all, which is why this still exists.
+        Reads a state hash written before last_position_secs existed. `now` is read
+        at RESTART, so downtime lands straight on the position — the bug the
+        heartbeat replaces. Kept one release: resuming badly beats not resuming.
         """
         if self.play_start_epoch is None:
             return None

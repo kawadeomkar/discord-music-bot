@@ -44,11 +44,9 @@ NOW_PLAYING_UPDATE_INTERVAL_SECS: float = float(
     os.environ.get("NOW_PLAYING_UPDATE_INTERVAL_SECS", "3.0")
 )
 
-# How often a playing guild records its playback position for crash recovery.
-# Bounds the worst-case recovery error: a crash resumes at the last heartbeat,
-# so at most this many seconds are replayed. Same default as the progress bar
-# because the same reasoning applies (a few seconds is imperceptible), but a
-# separate knob — one is display cadence, the other is durability.
+# How often a playing guild records its playback position. Bounds the worst-case
+# recovery error: a crash resumes at the last heartbeat, so at most this many
+# seconds replay. Separate knob from the progress bar — that cadence is display.
 HEARTBEAT_INTERVAL_SECS: float = float(os.environ.get("HEARTBEAT_INTERVAL_SECS", "3.0"))
 
 
