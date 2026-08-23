@@ -6,7 +6,7 @@ detailed and are the authoritative record of design decisions and past incidents
 
 ## Project overview
 
-**discord-music-bot** (v2.11.0, GPL-3.0) is a self-hosted Discord music bot that streams
+**discord-music-bot** (v2.29.0, GPL-3.0) is a self-hosted Discord music bot that streams
 audio from YouTube, Spotify, SoundCloud, and any other yt-dlp-supported site into voice
 channels. It is a **single-process Python asyncio application** built on discord.py
 (`AutoShardedBot`), yt-dlp, and FFmpeg, with a **two-tier data layer**: Redis for all
@@ -35,7 +35,7 @@ Postgres backs the commands that need the permanent record (`-leaderboard`).
 | Runtime state | Redis 7 (redis-py asyncio), orjson as the project-wide wire codec |
 | Durable history | Postgres 18 + asyncpg (no ORM); migrations in `migrations/`, applied by `src/db_migrate.py` |
 | Observability | OpenTelemetry (OTLP gRPC) + structlog JSON; Grafana LGTM stack in compose |
-| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,830 tests plus two opt-in integration tiers (testcontainers): a 74-test `pg` tier and a 41-test `redis` tier; coverage gate `fail_under = 80` (actual ~94%) |
+| Tests | pytest + pytest-asyncio (`asyncio_mode = "auto"`) + fakeredis + pytest-timeout; ~2,970 passing tests (this figure is always the PASSING count, not the collected one) plus two opt-in integration tiers (testcontainers): an 81-test `pg` tier and a 49-test `redis` tier; coverage gate `fail_under = 80` (actual ~96%) |
 | Lint/types | ruff 0.15.21 (format + lint) and pyright 1.1.411 (exact pins) |
 
 Entry point: `just run` (loads `.env`) or `poetry run bot` → `src.main:main`.
@@ -44,11 +44,21 @@ start an enabled archive without it. Disabled (the default), no Postgres is need
 
 ## Golden rules — read before editing anything
 
-1. **The comments are load-bearing.** Docstrings and comments in this repo document
-   invariants, race windows, incident postmortems, and "do not simplify this" traps
-   (e.g. `decode_responses=False` casts, the in-flight-head branch in
-   `GuildQueue.put_front`). Never delete or contradict a comment without updating the
-   behavior it describes; when you change behavior, update the comment in the same edit.
+1. **The comments are load-bearing, and short.** Docstrings and comments here document
+   invariants, race windows, measurements, and "do not simplify this" traps (e.g.
+   `decode_responses=False` casts, the in-flight-head branch in `GuildQueue.put_front`).
+   Never delete or contradict a comment without updating the behavior it describes; when
+   you change behavior, update the comment in the same edit.
+   **Describe only what is implemented — never the road not taken.** No rejected
+   alternatives, no "this used to…", no comparison against deleted code or against
+   `main`: git carries that, and a reader forced to hold two models is worse off than
+   one told nothing. Scope a comment to the lines under it, target 3-4 lines, and state
+   the fact without editorializing about its importance. A comment that needs more is
+   the signal `docs/ARCHITECTURE.md` is missing a section — write it there and link the
+   anchor (rule 2). Where a rejected alternative must be recorded, it goes in the commit
+   message or ARCHITECTURE.md, never at the call site.
+   The test: delete every clause naming something the code does not do; if what is left
+   still serves the next few lines, the clauses were noise.
 2. **`docs/ARCHITECTURE.md` is tracked; the rest of `docs/` is not.** `.gitignore` is
    `docs/*` plus `!docs/ARCHITECTURE.md` (the negation needs `docs/*` — git cannot
    re-include a file whose parent directory is excluded). Comments carry the invariant
@@ -177,7 +187,7 @@ just fmt-check      # format check only                          ~0.05s
 just lint           # ruff check                                  ~0.05s
 just pins           # assert the eight duplicated version/name pins ~0.02s
 just types          # pyright over src/ AND tests/                ~6s
-just test           # pytest with coverage (fail_under=80)        ~27s
+just test           # full suite, coverage gated (fail_under=80)  ~27s
 just test-report    # `test` + the coverage/JUnit artifacts CI's PR comment consumes
 just check          # fmt-justfile + pins + fmt-check + lint + types + test  ~35s
 just test-pg        # opt-in real-Postgres tier (testcontainers, needs Docker) ~45s
@@ -185,7 +195,11 @@ just test-redis     # opt-in real-Redis tier (testcontainers, needs Docker)     
 just container-test # build test image, run suite inside it       ~1min
 just ci             # check + container-test + test-pg + test-redis — local mirror of CI
 
-# Test selection (args forward to pytest)
+# Test selection (args forward to pytest). ANY argument means a subset run, so
+# coverage is skipped — fail_under is a PROJECT floor and one file measures ~26%,
+# which used to fail a green run with exit 1. The gate rides the no-args form — what
+# `just check` and the pre-push hook invoke — and `test-report`, whose arguments are
+# reporting flags rather than a selection, keeps it with COVERAGE_GATE=1.
 just test tests/test_youtube.py
 just test -k spotify
 just test --maxfail=1
@@ -253,7 +267,7 @@ src/
 ├── debug.py          # -debug snapshot + debug-mode toggle parsing; OBSERVATION-ONLY by rule
 │                     # collectors are live-edit probes (dashboard.py); host blocks are owner-only
 ├── telemetry.py      # OTel traces+logs, structlog config, worker logging, gateway span filter
-├── config.py         # ENVIRONMENT detection (env var or git branch), SpotifyStatus, tunables
+├── config.py         # ENVIRONMENT (env var; main() may infer it from the git branch), SpotifyStatus, tunables
 └── util.py           # logger factory, embed helpers, fmt_duration, task helpers
 
 migrations/           # NNNN_*.sql, applied in numeric order; the ONLY source of schema
@@ -496,16 +510,28 @@ Rules encoded in the class (violating any of these corrupts the queue or Redis):
   the same two fields, so a swap compiles and type-checks; `display_size()` is the sole
   input to `play_history.queue_position`, so a swap writes a plausible wrong number to
   Postgres forever.
-- Callers with a prefetch task must `_cancel_prefetch()` BEFORE clear/shuffle/remove so
-  the prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
-- `clear()` sets a cleared-flag the loop consumes (`consume_cleared_flag`) to discard a
-  prefetched song it is holding.
+- Callers with a prefetch task must settle it BEFORE clear/shuffle/remove so the
+  prefetch's `CancelledError` handler `requeue_front()`s its item into the drain.
+  `-clear`/`-remove` use `_cancel_prefetch()`; **`-shuffle` uses
+  `_neutralize_prefetch()`**, because `cancel_task()` no-ops on a COMPLETED prefetch
+  and its surviving claim would pin that song to the front of the reorder and leave
+  the too-few guard counting one short of what `-queue` shows.
+- `clear()` invalidates in-flight work through the generation counter and the cursor
+  reset ALONE — a prefetched song the loop is holding is discarded because
+  `commit_dequeue` refuses (nothing is claimed once the cursor is 0). There was once
+  a cleared-flag beside them; it was read once per loop iteration, so a `clear()` landing
+  after that read survived an entire song and destroyed a song claimed long after it,
+  leaking the claim. Do not reintroduce a level flag here.
 - `restore_crashed` / `restore_entries` write the deque ONLY (entries are already on /
   never were on the Redis list, respectively).
 - Redis rebuilds (`rebuild_queue`) are MULTI DELETE+RPUSH so a concurrent LPOP never
   observes an empty-window queue.
-- Every mirror write goes through `_write_mirror(items, *, removed=())`, which owns the
-  rebuild / DELETE / LREM choice. Empty means DELETE, never skip. **Only a removal may
+- Every mirror write **from a bulk mutation** — `clear`, `shuffle`, `remove`,
+  `finish_failed_dequeue` — goes through `_write_mirror(items, *, removed=())`, which
+  owns the rebuild / DELETE / LREM choice. The APPEND paths deliberately do not:
+  `put`/`put_front` call `push_queue`/`push_queue_batch`/`push_queue_front` directly,
+  because routing an append through `_write_mirror` turns an O(1) RPUSH into a full
+  rebuild under the mutex on every `-play`. Empty means DELETE, never skip. **Only a removal may
   pass `removed`** — LREM asserts the survivors kept their order, which is false for a
   shuffle or an insert. Three clauses gate the shortcut: `_LREM_MAX_ENTRIES` (16),
   `_LREM_MAX_SHARE` (one in five), and `_claimed_blobs()`. **The count is the bound that
@@ -612,8 +638,8 @@ on_ready (cold start / session loss; NOT WebSocket resume; skipped when redis is
               • volume restored only if a value was stored (never clobber a concurrent
                 -volume with a fabricated default)
               • crashed song: crashed_position_at() returns the RECORDED
-                last_position_secs (no clock read), capped at cached duration − 10s
-                (EOF guard), rebuilt via
+                last_position_secs (no clock read), capped at the snapshot's own
+                current_song_duration − 10s (EOF guard, no IO), rebuilt via
                 SongQueueEntry.from_crashed_state (persisted=False, interjected flag
                 preserved) → queue.restore_crashed at the FRONT; state cleared
                 unconditionally so a failed re-queue can't loop every restart
@@ -651,13 +677,16 @@ the decision. Symmetrically, the 300s `_PLAYBACK_GATE_TIMEOUT` re-waits instead 
 tearing down while any hold is outstanding — every hold is released by an `async with`,
 raise or not, so it cannot park forever.
 
-Both cold-start commands wait on the restore before touching the queue, bounded by
-`RESTORE_WAIT_SECS` (musicbot.py): the pool sets `socket_connect_timeout` but no
-`socket_timeout`, so a Redis that accepts the connection and then stalls would hang the
-command outright. A restore that does not land is a reason **not** to insert — `-play`
-front-inserting against an unread snapshot double-queues the song — so both abandon and
-say so. `MusicPlayer.restore_read_failed` separates "nothing was saved" from "the store
-could not be read"; only the first may be reported to a guild as an empty queue.
+**Six** call sites wait on the restore before touching the queue, bounded by
+`RESTORE_WAIT_SECS` (musicbot.py): `-play` (warm and cold), `-resume`, `-shuffle`,
+`-clear` and `-remove`. The pool sets `socket_connect_timeout` but no `socket_timeout`,
+so a Redis that accepts the connection and then stalls would hang the command outright.
+The two cold-start sites must not **insert** against an unread snapshot — `-play`
+front-inserting there double-queues the song — and the other four must not **rebuild**
+the mirror from a deque the restore has not filled, which deletes the saved queue
+outright. All six abandon and say so. `MusicPlayer.restore_read_failed` separates
+"nothing was saved" from "the store could not be read"; only the first may be reported
+to a guild as an empty queue.
 
 Recovery reads a position the loop **recorded**, never one it infers from a clock:
 `_heartbeat_updater` writes `last_position_secs` every `HEARTBEAT_INTERVAL_SECS` while a
@@ -983,10 +1012,9 @@ touch Discord; a caller with no Redis write to make passes an empty body.
   output until it exits, so line count is hook count). CI invokes `lint`/`types`/`test`
   individually rather than calling `check`, so its jobs fail independently of this
   ordering.
-- Warnings are errors (see golden rule 11). Also note: running pytest from a **detached
-  worktree** without `ENVIRONMENT` set dies at collection (config.py's git-branch
-  RuntimeWarning is promoted to an error — documented TODO); `export
-  ENVIRONMENT=development` first.
+- Warnings are errors (see golden rule 11). `ENVIRONMENT` is read from the environment
+  alone at import (default `development`), so collection runs no git subprocess and a
+  detached worktree needs nothing set.
 
 ## CI/CD and deployment
 
@@ -1035,7 +1063,7 @@ duplicated.
 | `POSTGRES_MIGRATE_URL` | falls back to `POSTGRES_URL` | lets migrations run as a different (higher-privilege) role |
 | `POSTGRES_STATEMENT_CACHE` | `100` | asyncpg `statement_cache_size`; set `0` behind a statement-rewriting pooler |
 | `HISTORY_OUTBOX_MAX` | `0` (unbounded) | opt-in outbox ceiling, meaningful only while the archive is enabled. Dropping entries is real data loss; every drop logs ERROR |
-| `ENVIRONMENT` | git branch (`main`→`production`) | set explicitly in CI/Docker/worktrees |
+| `ENVIRONMENT` | `development` | `main()` infers `production`/the branch slug from git when unset and a repo is present; set explicitly in CI/Docker |
 | `DEBUG_MODE` | `false` | process-wide default for debug mode, which decorates every embed the bot sends with a trace/timing/runtime footer. Three seams apply it, because "every embed" is sent from three places: `MusicContext.send` (command responses), `MusicPlayer._decorate_for_debug` (the NP block at every render site — refreshed on each progress tick — plus the player's own notices), and a pre-rendered `debug_suffix` threaded into the two live dashboards. Same strict parse as `HISTORY_ARCHIVE_ENABLED`, read ONCE by `MusicBot.__init__` so garbage aborts startup inside `load_extension`. `-debug --enable`/`--disable` override it **per guild, persisted to `guild:{id}:config`**, and require **Manage Server** (or bot ownership). The stored choice survives restarts and WINS over this variable, so a guild that opted out stays out when the host default flips on; a guild that never chose follows this value and keeps following it. Redis unavailable → the toggle applies in memory only and says so. The per-guild scope is scoping, not a trust boundary — it exists so enabling debug in one guild does not enable it everywhere. Observation-only — it changes what is shown, never what the bot does |
 | `DEBUG_PROMETHEUS_URL` | — | Prometheus query API `-debug` reads the **postgres container's** CPU/memory from (the bot cannot see another container's cgroup, and Postgres reports no OS metrics over SQL). Compose sets `http://localhost:9090`; the series come from the `otelcol-metrics` `docker_stats` receiver, selected by `container_name="discord-postgres"`. **That collector is behind the `metrics` compose profile**, so on a default `up` it does not run and the cpu/mem rows render `n/a (no metrics source)` even though the URL is set and Prometheus answers — set `COMPOSE_PROFILES=metrics` (or `docker compose --profile metrics up -d`) as well. Unset URL → the same `n/a`. Only those two rows depend on it: the block's load/throughput/mem-signal rows are native SQL over the archive's own pool and render regardless. The container name is a hand-checked cross-file pin (see golden rule 6) |
 | `PROMETHEUS_HOST_PORT` | `9090` | host-side published port for the metrics stack's Prometheus, loopback-bound. Also the port `DEBUG_PROMETHEUS_URL` defaults to — the two are written separately in compose (golden rule 6c) |
@@ -1059,7 +1087,6 @@ duplicated.
 | redis_client.py `push_history` | ISSUE | non-evictable keys can OOM Redis and stall ALL writes. Only the OUTBOX can still get there — the history lists are capped per guild (~24 KB each), so their total scales with guild count, not runtime. `HISTORY_OUTBOX_MAX` is the opt-in bound on the outbox (and a disabled archive removes the outbox entirely); a memory alarm is still owed |
 | spotify.py `playlist` | FIXME | playlists >100 tracks silently truncated (first page only, `next` cursor never followed) |
 | sources.py `SoundcloudSource` | TODO | SoundCloud timestamp params ignored (YouTube-only `t`/`ts` parsing) |
-| config.py `_git_branch` | TODO | detached-worktree pytest runs die at collection (warning→error) |
 | youtube.py `yt_source` | TODOs | untyped `Exception("Could not find song")`; dead `download=True` param; no format validation on search results |
 | musicbot.py `__init__` | HACK | `getattr(bot, "redis")` hides the MusicBotApp dependency from the type checker |
 | musicbot.py `play` (playlist branch) | HACK | an `assert isinstance(source, YTSource)` stands in for a correlation the signature can't express — a `ResolvedYoutubePlaylist` always arrives with a `YTSource`, but they are separate parameters. `python -O` strips the assert and leaves the attribute reads unguarded; the fix is to have the `Resolved*Playlist` dataclasses carry their own source |

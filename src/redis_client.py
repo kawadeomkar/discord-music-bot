@@ -90,10 +90,11 @@ HISTORY_CACHE_LIMIT = 50
 # song end / disconnect. Shared so clear_song_end_state() and clear_connection()
 # can't drift by hand-editing one and forgetting the other.
 # ROLLBACK NOTE: an older image's copy of this tuple does not name the fields added
-# since, so `just up <older-sha>` leaves current_song_played_at / _is_resume /
-# _start_paused in the hash and from_crashed_state can later read a value belonging
-# to a song that finished under the old build. Bounded: this build rewrites all
-# three on every song start. Delete once no rollback target predates them.
+# since, so `just up <older-sha>` leaves them in the hash and from_crashed_state can
+# read a value belonging to a song that finished under the old build — a stale
+# _user_input makes `-remove <album link>` take out an unrelated recovered song.
+# Rewritten on every song start, so the exposure is one restore read. Name the
+# field's horizon in its commit when adding to this list.
 _TRANSIENT_SONG_FIELDS = (
     StateField.CURRENT_SONG_URL,
     StateField.CURRENT_SONG_TITLE,
