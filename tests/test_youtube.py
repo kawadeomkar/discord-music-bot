@@ -574,6 +574,77 @@ class TestYTSource:
                     user_input=None,
                 )
 
+    async def test_yt_source_refuses_a_search_that_matched_nothing(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """A search with no results returns the ytsearch WRAPPER, which answers
+        webpage_url and title — so an unguarded fall-through mints a QueueObject
+        whose URL is the search term. It enqueues, shows as a song, and only dies at
+        play time as a refused stream."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [],
+            "webpage_url": "ytsearch:no such song anywhere",
+            "title": "no such song anywhere",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "no such song anywhere",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+
+    async def test_yt_source_refuses_a_search_whose_entries_are_all_playlists(
+        self, mock_ctx: MagicMock
+    ) -> None:
+        """Same fall-through, reached with a non-empty entries list: the selection
+        loop skips every playlist entry and leaves the wrapper standing."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [{"_type": "playlist", "title": "A mix"}, None],
+            "webpage_url": "ytsearch:only mixes",
+            "title": "only mixes",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "only mixes",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                )
+
+    async def test_yt_source_nothing_is_cached_for_an_empty_search(
+        self, mock_ctx: MagicMock, fake_redis: aioredis.Redis
+    ) -> None:
+        """The raise lands before the cache write. Caching the wrapper would make one
+        empty search fail every later play of the same term for the whole hour."""
+        wrapper = {
+            "_type": "playlist",
+            "entries": [],
+            "webpage_url": "ytsearch:no such song anywhere",
+            "title": "no such song anywhere",
+        }
+        with patch("src.youtube.youtube_dl.YoutubeDL") as mock_cls:
+            mock_cls.return_value.extract_info.return_value = wrapper
+            with pytest.raises(Exception, match="No YouTube results for"):
+                await YTDL.yt_source(
+                    mock_ctx.author,
+                    "no such song anywhere",
+                    query_source="youtube.com",
+                    analytics=_ANALYTICS,
+                    user_input=None,
+                    redis=fake_redis,
+                )
+
+        assert await fake_redis.keys("ytdl:source:*") == []
+
     async def test_yt_source_unsupported_url_gives_friendly_error(
         self, mock_ctx: MagicMock
     ) -> None:

@@ -1183,7 +1183,7 @@ class YTDL(discord.FFmpegOpusAudio):
         # to the result type, and "raw result" vs "chosen entry" are two things.
         selected: YTDLEntry = data
         if "entries" in data:
-            # TODO: Validate search results have a usable audio format before accepting.
+            # TODO: Validate the selected entry has a usable audio format.
             # An entry wins purely by being the first non-playlist result — nothing
             # checks for an https audio URL at a usable bitrate, so a format-less or
             # low-quality entry is accepted here and only blows up at stream time,
@@ -1192,6 +1192,17 @@ class YTDL(discord.FFmpegOpusAudio):
                 if entry and entry.get("_type", None) != "playlist":
                     selected = entry
                     break
+            if selected is data:
+                # Nothing replaced the wrapper, and the wrapper answers webpage_url
+                # ("ytsearch:<query>") and title (the query) — so falling through
+                # caches a QueueObject whose URL is the search term, which enqueues,
+                # displays as a song, and dies at play time as a refused stream.
+                trace.get_current_span().set_attribute("ytdl.search_empty", True)
+                raise Exception(
+                    f"No YouTube results for: {search}. Some tracks — age-restricted "
+                    "ones especially — don't appear in search. Try pasting a direct "
+                    "YouTube link instead."
+                )
         if download:
             # TODO: Implement or remove yt_source's dead download=True parameter.
             # It is accepted but does nothing — the file is never named (prepare_filename)
