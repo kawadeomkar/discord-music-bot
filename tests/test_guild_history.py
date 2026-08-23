@@ -186,7 +186,7 @@ class TestRecent:
         the earliest played_at, and the sort in recent() is what stops -history
         rendering in end order under a "newest first" promise.
 
-        Shaped like a real -playnow stack: A starts, B and C cut in and finish
+        Shaped like a real interjection stack: A starts, B and C cut in and finish
         first, A resumes and finishes last."""
         a, b, c = (
             _entry(1, played_at=1000.0),

@@ -416,7 +416,7 @@ class TestSpotifyPlaylistToYTSearch:
 
 class TestYTSourcePlaylistUrl:
     """`YTSource.playlist_url` — the single spelling of the
-    `url or ".../playlist?list={list_id}"` fallback that the enqueue, playnow
+    `url or ".../playlist?list={list_id}"` fallback that the enqueue, interject
     and resolve paths all need."""
 
     def test_pasted_url_wins_over_rebuild(self) -> None:
@@ -635,7 +635,7 @@ class TestQuerySource:
 
 
 class TestQuotedArgumentsSurviveConsumeRest:
-    """`-play`/`-playnow` take consume-rest arguments, and discord.py's read_rest
+    """`-play` takes a consume-rest argument, and discord.py's read_rest
     does no quote handling where the positional parser's get_quoted_word did. So
     the quotes started arriving as part of the value."""
 

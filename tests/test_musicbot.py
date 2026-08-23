@@ -30,6 +30,7 @@ from src.musicbot import (
     HistoryFlags,
     MusicBot,
     PlayArgs,
+    Placement,
     PlayMode,
     PlaylistIndexError,
     ResolvedSpotifyPlaylist,
@@ -37,6 +38,7 @@ from src.musicbot import (
     SpotifyDisabledError,
     _check_voice_permissions,
     _join_succeeded,
+    _play_takes_the_queue,
     split_play_args,
 )
 from src.redis_client import HISTORY_CACHE_LIMIT, GuildRedisStore
@@ -55,6 +57,7 @@ from src.spotify import SpotifyAuthError
 from src.youtube import YTDL, QueueObject
 from tests.helpers import (
     command_callback,
+    described,
     make_mock_task,
     mocked,
     queue_object,
@@ -196,6 +199,138 @@ class TestCheckVoicePermissions:
         member.voice = MagicMock()
         member.voice.channel = MagicMock()
         assert _check_voice_permissions(member, None, "skip") is None
+
+    def test_rejects_an_interjecting_play_in_a_different_channel(self) -> None:
+        """-play's exemption is for QUEUEING into a session running elsewhere,
+        which costs its listeners nothing. An interjection STOPS what that channel
+        is hearing, so it is gated like every other command — otherwise a member
+        in channel B can cut the song for a room they are not in."""
+        member = MagicMock(spec=discord.Member)
+        member.voice = MagicMock()
+        member.voice.channel = MagicMock()
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = MagicMock()  # not the member's channel
+        assert (
+            _check_voice_permissions(member, vc, "play", queue_control=True) is not None
+        )
+
+    def test_an_interjecting_play_in_the_same_channel_is_fine(self) -> None:
+        member = MagicMock(spec=discord.Member)
+        channel = MagicMock()
+        member.voice = MagicMock()
+        member.voice.channel = channel
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = channel
+        assert _check_voice_permissions(member, vc, "play", queue_control=True) is None
+
+
+class TestPlayTakesTheQueue:
+    """What the voice gate reads to decide whether a -play is queue control.
+
+    It runs as a before_invoke hook, which discord.py calls AFTER parsing —
+    Command.prepare() runs _parse_arguments and then call_before_hooks — so the
+    parsed argument is available in ctx.kwargs by then."""
+
+    @staticmethod
+    def _ctx(url: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.kwargs = {"url": url}
+        return ctx
+
+    @staticmethod
+    def _vc(*, paused: bool) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_paused.return_value = paused
+        return vc
+
+    def test_no_voice_client_never_interjects(self) -> None:
+        assert _play_takes_the_queue(self._ctx("--now song"), None) is False
+
+    def test_the_flag_says_so(self) -> None:
+        assert (
+            _play_takes_the_queue(self._ctx("--now song"), self._vc(paused=False))
+            is True
+        )
+
+    def test_a_plain_play_appends(self) -> None:
+        assert _play_takes_the_queue(self._ctx("song"), self._vc(paused=False)) is False
+
+    def test_the_next_flag_says_so_too(self) -> None:
+        """`--next` interrupts nothing, but it decides what the channel hears when
+        the current song ends — which is queue control, the thing -skip, -shuffle,
+        -remove and -clear are all gated on. -play's exemption exists because
+        APPENDING costs the other channel's listeners nothing, and this does not
+        append."""
+        assert (
+            _play_takes_the_queue(self._ctx("--next song"), self._vc(paused=False))
+            is True
+        )
+
+    def test_a_paused_song_interjects_without_the_flag(self) -> None:
+        """-play on a paused song interrupts it to bring it back playing, so it
+        has always been an interjection — and has always carried -play's
+        exemption. Closing that is why this reads the pause state too."""
+        assert _play_takes_the_queue(self._ctx("song"), self._vc(paused=True)) is True
+
+    def test_a_trailing_flag_is_not_the_flag(self) -> None:
+        """Same leading-token rule as everywhere else: the gate must agree with
+        the body about what counts, or one refuses what the other would append."""
+        assert (
+            _play_takes_the_queue(self._ctx("song --now"), self._vc(paused=False))
+            is False
+        )
+
+    def test_a_command_with_no_url_argument_falls_out(self) -> None:
+        ctx = MagicMock()
+        ctx.kwargs = {}
+        assert _play_takes_the_queue(ctx, self._vc(paused=False)) is False
+
+
+class TestValidateCommandsGatesQueueControl:
+    """The hook wires the two halves together. Both are tested apart above, and
+    both stay green if the hook stops passing the flag — so this is what proves a
+    cross-channel `-p --now` / `-p --next` is actually refused end to end."""
+
+    @staticmethod
+    def _ctx(url: str, *, same_channel: bool) -> MagicMock:
+        ctx = MagicMock()
+        ctx.kwargs = {"url": url}
+        ctx.command.name = "play"
+        channel = MagicMock()
+        ctx.author = MagicMock(spec=discord.Member)
+        ctx.author.voice = MagicMock()
+        ctx.author.voice.channel = channel
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.channel = channel if same_channel else MagicMock()
+        vc.is_paused.return_value = False
+        ctx.voice_client = vc
+        ctx.send = AsyncMock()
+        return ctx
+
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_cross_channel_queue_control_is_refused(
+        self, music_bot: MusicBot, flag: str
+    ) -> None:
+        ctx = self._ctx(f"{flag} song", same_channel=False)
+        with pytest.raises(commands.CommandError):
+            await music_bot.validate_commands(ctx)
+        assert "already being used" in described(ctx.send.call_args.kwargs["embed"])
+
+    async def test_a_cross_channel_plain_play_is_still_allowed(
+        self, music_bot: MusicBot
+    ) -> None:
+        """The exemption survives for queueing, which is what it was for."""
+        ctx = self._ctx("song", same_channel=False)
+        await music_bot.validate_commands(ctx)
+        ctx.send.assert_not_awaited()
+
+    @pytest.mark.parametrize("flag", ["--now", "--next"])
+    async def test_a_same_channel_queue_control_is_allowed(
+        self, music_bot: MusicBot, flag: str
+    ) -> None:
+        ctx = self._ctx(f"{flag} song", same_channel=True)
+        await music_bot.validate_commands(ctx)
+        ctx.send.assert_not_awaited()
 
 
 class TestQueueSource:
@@ -356,7 +491,7 @@ class TestQuerySourceClassification:
             )
         assert isinstance(result, ResolvedYoutubePlaylist)
         assert [t.analytics.queue_position for t in result.tracks] == [0, 1, 2]
-        # keep_first_only is -playnow's; -play enqueues the whole tail.
+        # keep_first_only is the interjection's; -play enqueues the whole tail.
         assert len(result.tracks) == 3
         # The ask time is untouched by the slice — one instant for the command.
         assert all(t.analytics.queued_at == 1752530000.5 for t in result.tracks)
@@ -420,7 +555,7 @@ class TestQuerySourceClassification:
     async def test_empty_playlist_raises_instead_of_queueing_nothing(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """The same guard -playnow already had: a playlist that resolves to
+        """The same guard the interjection path already had: a playlist that resolves to
         nothing is an error, not a successful enqueue of zero songs."""
         url = "https://www.youtube.com/playlist?list=PLabc"
         source = parse_input(url)
@@ -502,10 +637,10 @@ class TestQuerySourceClassification:
         assert "ValueError" not in embed.description
         assert "EmptyPlaylistError" not in embed.description
 
-    async def test_playnow_honours_the_playlist_index(
+    async def test_interjection_honours_the_playlist_index(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow interjects the track the link was copied at, not track 1."""
+        """An interjection plays the track the link was copied at, not track 1."""
         url = "https://www.youtube.com/watch?v=v2&list=PLabc&index=3"
         source = parse_input(url)
         tracks = self._yt_tracks(mock_ctx.author, 5)
@@ -517,10 +652,10 @@ class TestQuerySourceClassification:
         notice = mock_ctx.send.await_args.kwargs["embed"].description
         assert "#3" in notice
 
-    async def test_playnow_index_past_the_end_reports_it(
+    async def test_interjection_index_past_the_end_reports_it(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """-playnow shares the guard, and its own error path renders the same
+        """The interjection path shares the guard, and its own error path renders the same
         embed under its own title."""
         url = "https://www.youtube.com/watch?v=v9&list=PLabc&index=9"
         source = parse_input(url)
@@ -541,7 +676,7 @@ class TestQuerySourceClassification:
         assert "**#9**" in embed.description
         assert "**3 songs**" in embed.description
 
-    async def test_playnow_spotify_playlist_bypasses_queue_source(
+    async def test_interjection_spotify_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         # _resolve_interjection_source resolves both playlist shapes directly, so a
@@ -557,7 +692,7 @@ class TestQuerySourceClassification:
             )
         assert self._passed_query_source(spy) == "spotify.com"
 
-    async def test_playnow_youtube_playlist_bypasses_queue_source(
+    async def test_interjection_youtube_playlist_bypasses_queue_source(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         url = "https://www.youtube.com/playlist?list=PLabc"
@@ -598,10 +733,10 @@ class TestQuerySourceClassification:
         # which is the whole point of trimming before the rebase.
         assert [t.analytics.queue_position for t in tracks[4:]] == [4, 5]
 
-    async def test_playnow_analytics_is_depth_zero(
+    async def test_interjection_analytics_is_depth_zero(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        # An interjection plays immediately by definition, so -playnow reads no
+        # An interjection plays immediately by definition, so it reads no
         # queue depth at all — and its queued_at is still the ask time.
         url = "https://www.youtube.com/watch?v=abc"
         source = parse_input(url)
@@ -2701,7 +2836,7 @@ class TestClearCommand:
     ) -> None:
         """clear() destroys the Redis mirror while reading the IN-MEMORY display,
         so against an unrestored player it deletes a saved queue it cannot see —
-        and a -playnow stack loses its rows too, because _flush_played records
+        and an interjection stack loses its rows too, because _flush_played records
         from that same empty display. validate_commands only requires the AUTHOR
         in voice, so a cold player is reachable."""
         mp = MagicMock()
@@ -2800,6 +2935,264 @@ def _mock_mp(qsize: int = 0) -> MagicMock:
         return_value=discord.Embed(title="❗ Resumed from queue") if qsize else None
     )
     return mp
+
+
+# ── -play --now routing ───────────────────────────────────────────────────────
+
+
+class TestNowFlagRouting:
+    """The six rows of the branch matrix, over one command body.
+
+    Two shallow commands became one branchy body, so this is what stops a later
+    edit quietly swapping a leg. Every row also asserts _command_error was not
+    awaited: the body wraps everything, so a row can otherwise pass on a
+    TypeError from an under-configured mock and prove nothing."""
+
+    @staticmethod
+    def _vc(*, playing: bool = False, paused: bool = False) -> MagicMock:
+        vc = MagicMock(spec=discord.VoiceClient)
+        vc.is_playing.return_value = playing
+        vc.is_paused.return_value = paused
+        vc.is_connected.return_value = True
+        return vc
+
+    def _wire(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, *, live: bool
+    ) -> MagicMock:
+        mp = _mock_mp()
+        mp.current_song = MagicMock() if live else None
+        music_bot.get_mp = MagicMock(return_value=mp)
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot._enqueue_single = AsyncMock()
+        music_bot._interject_flow = AsyncMock()
+        music_bot._abandon_cold_start = AsyncMock()
+        music_bot._command_error = AsyncMock()
+        mock_ctx.invoke = AsyncMock()
+        seams = MagicMock()
+        seams.mp = mp
+        seams.queue_source = music_bot.queue_source
+        seams.enqueue_single = music_bot._enqueue_single
+        seams.interject = music_bot._interject_flow
+        seams.command_error = music_bot._command_error
+        seams.abandon = music_bot._abandon_cold_start
+        return seams
+
+    @pytest.mark.parametrize(
+        "flag,connected,playing,paused,interjects,resume_paused,enqueued_as",
+        [
+            # flag      connected playing paused  interjects  resume_paused  placement
+            #
+            # `enqueued_as` is None wherever no enqueue is expected at all, which
+            # happens for two different reasons: an interjection never reaches
+            # _enqueue_single, and a disconnected row abandons at _join_succeeded
+            # because the mocked join leaves no voice client.
+            ("", False, False, False, False, None, None),
+            ("", True, True, False, False, None, Placement.TAIL),
+            ("", True, False, True, True, False, None),
+            ("", True, False, False, False, None, Placement.TAIL),
+            ("--now ", False, False, False, False, None, None),
+            ("--now ", True, True, False, True, True, None),
+            ("--now ", True, False, True, True, True, None),
+            # Connected with nothing live: no song to interrupt, so `--now` cannot
+            # interject, but it still jumps the queue. That state lasts every
+            # song-resolve and the whole of a restored queue's first song.
+            ("--now ", True, False, False, False, None, Placement.NEXT),
+            # `--next` never interjects, on any row. The paused one is the carve-out
+            # that matters: plain `-play` interjects there because the request would
+            # otherwise be buried behind a paused song, and with `--next` it is not
+            # buried — it IS next, so stopping the song the user chose to keep would
+            # be the opposite of what they typed.
+            ("--next ", False, False, False, False, None, None),
+            ("--next ", True, True, False, False, None, Placement.NEXT),
+            ("--next ", True, False, True, False, None, Placement.NEXT),
+            ("--next ", True, False, False, False, None, Placement.NEXT),
+        ],
+    )
+    async def test_the_branch_matrix(
+        self,
+        music_bot: MusicBot,
+        mock_ctx: MagicMock,
+        flag: str,
+        connected: bool,
+        playing: bool,
+        paused: bool,
+        interjects: bool,
+        resume_paused: Optional[bool],
+        enqueued_as: Optional[Placement],
+    ) -> None:
+        live = connected and (playing or paused)
+        seams = self._wire(music_bot, mock_ctx, live=live)
+        mock_ctx.voice_client = (
+            self._vc(playing=playing, paused=paused) if connected else None
+        )
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"{flag}never gonna give you up"
+            )
+
+        seams.command_error.assert_not_awaited()
+        if interjects:
+            seams.interject.assert_awaited_once()
+            assert (
+                seams.interject.await_args.kwargs.get("resume_paused", True)
+                is resume_paused
+            )
+        else:
+            seams.interject.assert_not_awaited()
+            seams.queue_source.assert_awaited_once()
+        if enqueued_as is None:
+            seams.enqueue_single.assert_not_awaited()
+        else:
+            assert seams.enqueue_single.await_args.kwargs["placement"] is enqueued_as
+
+    @pytest.mark.parametrize("flag", ["", "--now "])
+    async def test_a_connected_but_idle_player_does_not_interject(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, flag: str
+    ) -> None:
+        """A live current_song is necessary but not sufficient.
+
+        current_song outlives the song it names — the loop clears it after the
+        song ends — so a voice client that is neither playing nor paused has
+        nothing to interrupt. Without the playing-or-paused term, `--now` here
+        would build a resume entry for a song that already finished and replay
+        its final seconds. The matrix rows above all pair a live current_song
+        with a live client, so they cannot see this."""
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(playing=False, paused=False)
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"{flag}song"
+            )
+
+        seams.interject.assert_not_awaited()
+        seams.queue_source.assert_awaited_once()
+        seams.command_error.assert_not_awaited()
+
+    async def test_a_paused_song_returns_playing_without_the_flag(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """The ONE semantic difference between the two legs, and the only thing
+        the merge could silently lose. `-play` on a paused song brings it back
+        PLAYING — "-play means play" — where `--now` restores it paused."""
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(paused=True)
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="song")
+
+        kwargs = seams.interject.await_args.kwargs
+        assert kwargs["resume_paused"] is False
+        # require_paused is the second difference: a -resume landing during the
+        # 1-4s resolve removes the reason to interject, so that leg appends
+        # instead. The --now leg has no such reason to lose.
+        assert kwargs["require_paused"] is True
+
+    async def test_the_flag_leg_does_not_require_paused(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx, live=True)
+        mock_ctx.voice_client = self._vc(playing=True)
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now song")
+
+        kwargs = seams.interject.await_args.kwargs
+        assert kwargs.get("require_paused", False) is False
+
+    @pytest.mark.parametrize("live", [True, False])
+    async def test_the_origin_never_carries_the_flag(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, live: bool
+    ) -> None:
+        """What -remove matches on is the query without the flag, on BOTH the
+        interject row and the ordinary row — the ordinary path passes origin=url
+        at three separate call sites, and one is not a proxy for the others.
+
+        A leak here fails silently: the enqueue succeeds, the reply is normal,
+        and only `-remove never gonna give you up` later finds nothing."""
+        seams = self._wire(music_bot, mock_ctx, live=live)
+        mock_ctx.voice_client = self._vc(playing=True) if live else _connected_vc()
+        typed = "never gonna give you up"
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {typed}"
+            )
+
+        seams.command_error.assert_not_awaited()
+        if live:
+            # _interject_flow resolves its own source; it receives the query.
+            assert seams.interject.await_args.args[1] == typed
+        else:
+            assert seams.queue_source.await_args.kwargs["origin"] == typed
+
+    async def test_the_flag_leaves_a_link_parseable_as_a_link(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        """`-p --now <link>` must reach parse_url: with the flag stripped the link
+        is one token, so it parses as a URL and not as a two-word search."""
+        seams = self._wire(music_bot, mock_ctx, live=False)
+        mock_ctx.voice_client = _connected_vc()
+        url = "https://youtu.be/dQw4w9WgXcQ"
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
+
+        source = seams.queue_source.await_args.args[1]
+        assert isinstance(source, YTSource)
+        assert source.url == url
+        assert source.ytsearch is None
+
+    async def test_a_dash_typo_asks_instead_of_searching(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx, live=False)
+        mock_ctx.voice_client = _connected_vc()
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="-now song")
+
+        seams.queue_source.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert "--now" in mock_ctx.send.call_args.kwargs["embed"].description
+
+    async def test_the_flag_with_nothing_behind_it_asks(
+        self, music_bot: MusicBot, mock_ctx: MagicMock
+    ) -> None:
+        seams = self._wire(music_bot, mock_ctx, live=False)
+        mock_ctx.voice_client = _connected_vc()
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now")
+
+        seams.queue_source.assert_not_awaited()
+        seams.command_error.assert_not_awaited()
+        assert "url" in mock_ctx.send.call_args.kwargs["embed"].description
+
+    @pytest.mark.parametrize(
+        "live,title",
+        [(True, "Failed to play song now"), (False, "Failed to queue song")],
+    )
+    async def test_the_error_title_names_the_branch_not_the_flag(
+        self, music_bot: MusicBot, mock_ctx: MagicMock, live: bool, title: str
+    ) -> None:
+        """`-p --now x` on an idle bot queues like any other -play, so "failed to
+        play song now" would describe an interjection that never happened."""
+        seams = self._wire(music_bot, mock_ctx, live=live)
+        mock_ctx.voice_client = self._vc(playing=True) if live else _connected_vc()
+        boom = RuntimeError("nope")
+        seams.interject.side_effect = boom
+        seams.queue_source.side_effect = boom
+
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now song")
+
+        assert seams.command_error.await_args.kwargs["title"] == title
 
 
 class TestSplitPlayArgs:
@@ -3383,7 +3776,7 @@ class TestPlayFrontInsertion:
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
-        assert single_call.kwargs["front"] is True
+        assert single_call.kwargs["placement"] is Placement.COLD_FRONT
 
     async def test_cold_path_queues_nothing_when_the_join_never_connected(
         self, music_bot: MusicBot, mock_ctx: MagicMock
@@ -3495,11 +3888,10 @@ class TestPlayFrontInsertion:
 
         single_call = music_bot._enqueue_single.await_args
         assert single_call is not None
-        assert single_call.kwargs["front"] is False
-        # No playback hold on the warm path — the gate is already open. It DOES
-        # wait on the restore, on the SAME bound as every other queue-mutating
-        # command: enqueueing ahead of entries restore_entries has not replayed
-        # yet misaligns every later LPOP, so this is not just an analytics read.
+        assert single_call.kwargs["placement"] is Placement.TAIL
+        # No playback hold on the warm path — the gate is already open. (It DOES
+        # wait on the restore, but only to read a meaningful queue depth, and on
+        # the short bound; see test_warm_path_reads_the_depth_after_the_restore.)
         mp.defer_playback.assert_not_called()
         assert (
             mp.wait_for_restore.await_args is not None
@@ -3579,7 +3971,9 @@ class TestPlayFrontInsertion:
         mp = _mock_mp(qsize=3)
         mock_ctx.message.add_reaction = AsyncMock()
 
-        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+        await music_bot._enqueue_single(
+            mock_ctx, qobj, mp, placement=Placement.COLD_FRONT
+        )
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mp.queue_put.assert_not_awaited()
@@ -3599,7 +3993,9 @@ class TestPlayFrontInsertion:
         mp = _mock_mp(qsize=0)
         mock_ctx.message.add_reaction = AsyncMock()
 
-        await music_bot._enqueue_single(mock_ctx, qobj, mp, front=True)
+        await music_bot._enqueue_single(
+            mock_ctx, qobj, mp, placement=Placement.COLD_FRONT
+        )
 
         mp.queue_put_front.assert_awaited_once_with(qobj)
         mock_ctx.send.assert_not_awaited()
@@ -3607,7 +4003,7 @@ class TestPlayFrontInsertion:
     async def test_front_playlist_inserts_all_tracks_in_order(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        """Unlike -playnow (first track only), -play front-inserts a playlist in
+        """Unlike `--now` (first track only), plain -play front-inserts a playlist in
         full — nothing is playing here to delay the return of."""
         tracks = [
             QueueObject(f"https://yt.com/v={i}", f"Track {i}", mock_ctx.author)
@@ -3622,7 +4018,7 @@ class TestPlayFrontInsertion:
             source,
             ResolvedYoutubePlaylist(tracks),
             mp,
-            front=True,
+            placement=Placement.COLD_FRONT,
             analytics=_ANALYTICS,
             origin=_ORIGIN,
         )
@@ -3634,7 +4030,8 @@ class TestPlayFrontInsertion:
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
         """End-to-end wiring for the playlist half of the cold path: play()'s
-        list branch must carry front=True into _enqueue_playlist. Previously
+        list branch must carry the COLD_FRONT placement into _enqueue_playlist.
+        Previously
         only _enqueue_playlist was tested directly, leaving this dispatch —
         and the decision that a playlist front-inserts in full — unpinned."""
         mock_ctx.voice_client = None
@@ -3663,7 +4060,7 @@ class TestPlayFrontInsertion:
         music_bot._enqueue_single.assert_not_awaited()
         pl_call = music_bot._enqueue_playlist.await_args
         assert pl_call is not None
-        assert pl_call.kwargs["front"] is True
+        assert pl_call.kwargs["placement"] is Placement.COLD_FRONT
         assert pl_call.args[2] == ResolvedYoutubePlaylist(tracks)
 
     async def test_front_insert_after_restore_orders_both_legs(
@@ -3698,7 +4095,9 @@ class TestPlayFrontInsertion:
         qobj = QueueObject("https://yt.com/v=new", "New Song", mock_author)
         mock_ctx.message.add_reaction = AsyncMock()
         with patch("src.youtube.YTDL.prefetch_stream", new=AsyncMock()):
-            await music_bot._enqueue_single(mock_ctx, qobj, music_player, front=True)
+            await music_bot._enqueue_single(
+                mock_ctx, qobj, music_player, placement=Placement.COLD_FRONT
+            )
 
         titles = [
             queue_object(item).title for item in music_player.queue.display_items()
@@ -4183,14 +4582,18 @@ class TestRemoveReplyStaysInsideDiscordsCaps:
 
 
 class TestCommandArgumentBinding:
-    """`-play`, `-playnow` and `-remove` all consume the rest of the line, because
-    a positional binds ONE WORD: `-play` stores its argument as the origin
-    `-remove` matches on, so `-play never gonna give you up` would record
-    `"never"` and `-remove never` would become a wildcard over every song starting
-    with it. Asserted on the callback signature, since that is where the binding
-    lives."""
+    """`-play` and `-remove` both consume the rest of the line.
 
-    @pytest.mark.parametrize("name", ["play", "playnow", "remove"])
+    A positional binds ONE WORD. `-play` stores its argument as the origin
+    `-remove` matches on, so a positional there meant `-play never gonna give you
+    up` recorded `"never"` — the help's own example matched nothing, and
+    `-remove never` became a wildcard over every song starting with that word.
+
+    Asserted on the callback signature rather than through a parsed message,
+    because the binding is a property of the signature and the tests that missed
+    this were the ones that hand-built the value instead."""
+
+    @pytest.mark.parametrize("name", ["play", "remove"])
     def test_the_argument_consumes_the_rest_of_the_line(self, name: str) -> None:
         import inspect
 
@@ -4485,16 +4888,26 @@ class TestRemoveCommand:
         assert removal_embed.colour == discord.Color.orange()
 
 
-# ── -playnow ──────────────────────────────────────────────────────────────────
+# ── -play --now ──────────────────────────────────────────────────────────────
 
 
-class TestPlaynow:
+class TestNowFlag:
+    """`-p --now` end to end: resolve one song, interrupt, and report.
+
+    The assertions are unchanged from when a separate command drove this
+    path — what they pin is the interjection itself, and only its entry point
+    moved."""
+
     @pytest.fixture
     def live_mp(self) -> MagicMock:
-        """A MusicPlayer mock with a song currently playing."""
+        """A MusicPlayer mock with a song currently playing.
+
+        Built on _mock_mp() rather than a bare MagicMock: the not-live rows now
+        run play()'s real cold-start machinery, which needs defer_playback as an
+        async CM and an awaitable wait_for_restore."""
         from src.musicplayer import InterjectOutcome
 
-        mp = MagicMock()
+        mp = _mock_mp()
         mp.current_song = MagicMock()
         mp.interject = AsyncMock(
             return_value=InterjectOutcome(
@@ -4512,28 +4925,52 @@ class TestPlaynow:
         vc.is_paused.return_value = False
         return vc
 
-    async def test_idle_delegates_to_play(
+    async def test_idle_runs_the_ordinary_path(
         self, music_bot: MusicBot, mock_ctx: MagicMock
     ) -> None:
-        mp = MagicMock()
+        """Nothing live to interrupt, so this queues like any other -play — through
+        the same body, so the checks, the hooks and the bucket all apply."""
+        mp = _mock_mp()
         mp.current_song = None
         music_bot.get_mp = MagicMock(return_value=mp)
-        mock_ctx.invoke = AsyncMock()
+        mock_ctx.voice_client = _connected_vc()
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot._enqueue_single = AsyncMock()
+        music_bot._interject_flow = AsyncMock()
+        music_bot._command_error = AsyncMock()
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
+        music_bot._interject_flow.assert_not_awaited()
+        music_bot._enqueue_single.assert_awaited_once()
+        # Without this the test passes on a TypeError from an under-configured
+        # mock: the body swallows everything into _command_error.
+        music_bot._command_error.assert_not_awaited()
 
-    async def test_no_voice_client_delegates_to_play(
+    async def test_no_voice_client_runs_the_ordinary_path(
         self, music_bot: MusicBot, mock_ctx: MagicMock, live_mp: MagicMock
     ) -> None:
+        """A live current_song is not enough — with no voice client there is
+        nothing to interrupt, so this takes the cold-start path instead."""
         music_bot.get_mp = MagicMock(return_value=live_mp)
         mock_ctx.voice_client = None
         mock_ctx.invoke = AsyncMock()
+        music_bot.queue_source = AsyncMock(
+            return_value=QueueObject("https://yt.com/v=1", "Song", mock_ctx.author)
+        )
+        music_bot._interject_flow = AsyncMock()
+        music_bot._abandon_cold_start = AsyncMock()
+        music_bot._command_error = AsyncMock()
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        with _no_typing():
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        mock_ctx.invoke.assert_awaited_once_with(music_bot.play, url="test")
+        music_bot._interject_flow.assert_not_awaited()
+        music_bot.queue_source.assert_awaited_once()
+        music_bot._command_error.assert_not_awaited()
 
     async def test_live_song_interjects(
         self,
@@ -4547,7 +4984,7 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         assert qobj.interjected is True
         # The origin reaches the song through yt_source's required user_input, not
@@ -4571,7 +5008,7 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """-playnow restores exactly what it interrupted, so a paused song is
+        """`--now` restores exactly what it interrupted, so a paused song is
         announced as returning paused. returns_paused is what the wording keys
         off — was_paused alone is the observed state and is also True on the
         -play path, where the song comes back playing."""
@@ -4591,7 +5028,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "return paused" in embed.description
@@ -4621,7 +5058,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Almost Done" in embed.description
@@ -4635,7 +5072,7 @@ class TestPlaynow:
         live_mp: MagicMock,
         live_vc: MagicMock,
     ) -> None:
-        """Interjections stack, so a song that was itself queued via -playnow gets
+        """Interjections stack, so a song that was itself interjected gets
         the ordinary resume wording. This used to be its own branch announcing
         "it will not return" — the reply must never say that of a parked song."""
         from src.musicplayer import InterjectOutcome
@@ -4653,7 +5090,7 @@ class TestPlaynow:
             return_value=QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         )
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Old Interjection" in embed.description
@@ -4679,9 +5116,11 @@ class TestPlaynow:
         qobj = QueueObject("https://yt.com/v=x", "Urgent", mock_ctx.author)
         music_bot.queue_source = AsyncMock(return_value=qobj)
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
-        mock_ctx.invoke.assert_not_awaited()
+        # Resolved once: a second resolve would re-parse and, for a playlist,
+        # enqueue every track again.
+        music_bot.queue_source.assert_awaited_once()
         # The player's wrapper, not queue.put_front directly — same plumbing as
         # every other insert; the stream was warmed, so it must not prefetch again.
         live_mp.queue_put_front.assert_awaited_once_with(qobj, prefetch=False)
@@ -4690,7 +5129,7 @@ class TestPlaynow:
         # would have had, and not the queue depth — it goes to the front.
         assert qobj.analytics.queue_position == 1
         # The interjection marker must not leak onto a normally queued song —
-        # a later -playnow would otherwise "replace" it without a resume entry.
+        # a later interjection would otherwise "replace" it without a resume entry.
         assert qobj.interjected is False
         embed = mock_ctx.send.call_args.kwargs["embed"]
         assert "Playing next" in embed.title
@@ -4714,7 +5153,9 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_source", new=AsyncMock(return_value=qobj)
         ) as ys:
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
 
         music_bot.spotify.playlist.assert_awaited_once_with("37i9dQZF1DXcBWIGoYBM5M")
         ys.assert_awaited_once()
@@ -4745,7 +5186,9 @@ class TestPlaynow:
         with patch(
             "src.musicbot.YTDL.yt_playlist", new=AsyncMock(return_value=[first, second])
         ):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url=url)
+            await command_callback(MusicBot.play)(
+                music_bot, mock_ctx, url=f"--now {url}"
+            )
 
         live_mp.interject.assert_awaited_once()
         assert live_mp.interject.call_args.args[0] is first
@@ -4761,7 +5204,7 @@ class TestPlaynow:
         mock_ctx.voice_client = live_vc
         music_bot.queue_source = AsyncMock(side_effect=Exception("yt-dlp failed"))
 
-        await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+        await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         live_mp.interject.assert_not_awaited()
         mock_ctx.send.assert_awaited()  # error embed
@@ -4775,7 +5218,7 @@ class TestPlaynow:
     ) -> None:
         """The stream-URL cache is warmed before interject stops the current
         song — a cache miss at dequeue would otherwise put yt-dlp dead air
-        between the interrupt and the playnow song starting."""
+        between the interrupt and the interjected song starting."""
         from src.musicplayer import InterjectOutcome
 
         music_bot.get_mp = MagicMock(return_value=live_mp)
@@ -4798,7 +5241,7 @@ class TestPlaynow:
         live_mp.interject = AsyncMock(side_effect=_interject_effect)
 
         with patch("src.musicbot.YTDL.prefetch_stream", new=prefetch):
-            await command_callback(MusicBot.playnow)(music_bot, mock_ctx, url="test")
+            await command_callback(MusicBot.play)(music_bot, mock_ctx, url="--now test")
 
         prefetch.assert_awaited_once_with(qobj, redis=music_bot.redis)
         assert order == ["prefetch", "interject"]

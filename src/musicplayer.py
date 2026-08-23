@@ -154,7 +154,7 @@ _BAR_HEAD = "🔘"
 # instead of an API call pair per toggle.
 _PAUSE_DEBOUNCE_SECS = 0.5
 
-# ── -playnow interjection ──────────────────────────
+# ── interjection ───────────────────────────────────
 # Below this many seconds remaining, an interjected song gets no resume entry —
 # there is nothing meaningful to return to.
 _MIN_RESUME_REMAINING_SECS = 5
@@ -177,7 +177,7 @@ _PLAYBACK_GATE_TIMEOUT = 300
 
 @dataclass(frozen=True)
 class InterjectOutcome:
-    """What MusicPlayer.interject() did — everything -playnow needs for its
+    """What MusicPlayer.interject() did — everything `-play --now` needs for its
     confirmation wording."""
 
     interrupted_title: str
@@ -187,7 +187,7 @@ class InterjectOutcome:
     resume_position: Optional[int]
     was_paused: bool  # the OBSERVED state when it was interrupted
     # Whether the resume entry comes back PAUSED — distinct from was_paused, since
-    # -playnow restores what it interrupted while -play brings it back playing.
+    # `--now` restores what it interrupted while plain -play brings it back playing.
     # Wording must key off this, or a -play interjection announces "will return
     # paused" for a song that returns playing.
     returns_paused: bool = False
@@ -218,7 +218,7 @@ def _reached_end(song: YTDL) -> bool:
 
 def _remaining_secs(item: QueueObject) -> Optional[int]:
     """A queued item's expected playtime: full duration, minus the resume offset
-    for a -playnow resume entry — it plays only its tail, so counting the full
+    for a resume entry — it plays only its tail, so counting the full
     duration would overestimate everything behind it."""
     if item.duration is None:
         return None
@@ -1070,7 +1070,7 @@ class MusicPlayer:
           both current_song and still queued for the length of a probe
           (100ms-seconds).
         - UNDER by one when the live song has a parked tail from an EARLIER play
-          of the same URL (-play X, -playnow Y, -playnow X), which
+          of the same URL (-play X, -p --now Y, -p --now X), which
           has_resume_tail matches by URL."""
         depth = self.queue.display_size()
         current = self.current_song
@@ -1171,7 +1171,7 @@ class MusicPlayer:
         good — the -clear/-remove half of "a song is recorded exactly once, when
         its queue object exits the queue".
 
-        These are -playnow resume tails: songs a listener heard part of, whose
+        These are interjection resume tails: songs a listener heard part of, whose
         remaining tail is discarded, so nothing else records them (the loop's single
         write site only fires for a song it played to its end). `played_at > 0.0` is
         the whole test — the loop stamps it at vc.play() and the tail inherits it;
@@ -1325,7 +1325,7 @@ class MusicPlayer:
         requester_line = f"Requester: [{_requester_mention(song.requester)}]"
         if song.duration_secs > 0:
             # Remaining, not total: a song started mid-stream (?t=, crash
-            # recovery, -playnow resume) finishes sooner than its full length.
+            # recovery, an interjection's resume) finishes sooner than its full length.
             remaining = max(0, song.duration_secs - int(position))
             requester_line += (
                 f"  ·  Estimated finish: {_fmt_finish_time(remaining, self.timezone)}"
@@ -1520,7 +1520,7 @@ class MusicPlayer:
 
         Takes either form of the same tail — the YTDL the loop is about to play, or
         the QueueObject a bulk mutation is destroying — since both carry the np_*
-        fields and the card outlives whichever goes away. Without it a -playnow
+        fields and the card outlives whichever goes away. Without it an interjected
         stack accumulates one dead partial bar per interjection.
 
         With the live ref this is _retire_np_host verbatim, so a card hosted by a
@@ -1732,7 +1732,7 @@ class MusicPlayer:
             self._spawn_background(self._edit_now_playing_once())
         self._spawn_background(self.update_activity(self.current_song))
 
-    # ── -playnow interjection ─────────────────────────────────────────────────
+    # ── interjection ──────────────────────────────────────────────────────────
 
     @_tracer.start_as_current_span("player.interject")
     async def interject(
@@ -1755,7 +1755,7 @@ class MusicPlayer:
         actually reached rather than at its own fragment's start.
 
         resume_paused decides whether a song interrupted while PAUSED comes back
-        paused: True (-playnow) restores what it interrupted, False (-play) brings it
+        paused: True (`--now`) restores what it interrupted, False (plain) brings it
         back playing. No effect on a song that wasn't paused.
 
         None when there is no current song, or it ended during prefetch
@@ -1834,7 +1834,7 @@ class MusicPlayer:
             # song with no resume entry (nearly over) keeps its own entry, matching
             # -skip. One marker is enough at any depth: each interjection stops
             # exactly one song, and that song's iteration consumes the marker before
-            # the next -playnow can finish resolving.
+            # the next interjection can finish resolving.
             #
             # Taken BEFORE the put_front await and unconditionally: everything from
             # the guard above to here is synchronous, so there is no window in which
@@ -1854,7 +1854,7 @@ class MusicPlayer:
 
         # After the insert, so the tail just built is counted.
         span.set_attribute("interject.depth", self.queue.resume_tail_depth())
-        # Attribution only: did this cut in front of another -playnow song.
+        # Attribution only: did this cut in front of another interjected song.
         span.set_attribute("interject.over_interjection", current.interjected)
         span.set_attribute("interject.resume_position", position if resume else -1)
         return InterjectOutcome(
@@ -1898,7 +1898,7 @@ class MusicPlayer:
             song = None
         if song is None:
             return
-        # Carry the -ss offset, every -playnow flag and the analytics through the
+        # Carry the -ss offset, every interjection flag and the analytics through the
         # rebuild: dropping them restarts a neutralized resume entry from 0:00
         # (unpaused, unannounced), loses a prefetched song's ?t= offset, and zeroes
         # the ask this play was queued against, which nothing re-mints.
@@ -2583,7 +2583,7 @@ class MusicPlayer:
                         )
 
                     if song.start_paused:
-                        # Returns parked where -playnow interrupted it (the player
+                        # Returns parked where the interjection interrupted it (the player
                         # thread was already paused synchronously at vc.play). The
                         # full pause() runs here so the Redis pause epochs and the
                         # debounced embed/Activity refresh all engage.
@@ -2612,7 +2612,7 @@ class MusicPlayer:
                     # Zero frames AND an ffmpeg error means the stream never opened
                     # (typically a 403 on a revoked URL). Both conditions matter:
                     # zero frames alone also describes a song parked paused by
-                    # -playnow or stopped the instant it started (vc.stop() reports
+                    # an interjection or stopped the instant it started (vc.stop() reports
                     # no error), and an error alone also describes a mid-song death
                     # that delivered real audio and earns its history entry.
                     # A THIRD case joins these below: zero frames, no error, and no

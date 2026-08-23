@@ -177,7 +177,7 @@ class YTSource:
     @property
     def playlist_url(self) -> str:
         """Canonical playlist URL for a type=PLAYLIST source: the pasted URL, else
-        rebuilt from list_id. One spelling for the enqueue/playnow/resolve paths."""
+        rebuilt from list_id. One spelling for the enqueue/interject/resolve paths."""
         return self.url or f"https://www.youtube.com/playlist?list={self.list_id}"
 
 
@@ -343,10 +343,10 @@ def parse_url(url: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
 def unquote_argument(text: str) -> str:
     """Drop one matched pair of surrounding quotes.
 
-    `-play`/`-playnow` take consume-rest arguments, which discord.py's `read_rest()`
-    hands through with the quotes: parse_url then drags the trailing one into the
-    path and yt-dlp rejects it, and a quoted search stores `"some song"` as the
-    origin, which `-remove some song` cannot match.
+    `-play` takes a consume-rest argument, which discord.py's `read_rest()` hands
+    through with the quotes: parse_url then drags the trailing one into the path and
+    yt-dlp rejects it, and a quoted search stores `"some song"` as the origin, which
+    `-remove some song` cannot match.
 
     Only a whole argument wrapped at both ends, and never down to nothing — a lone
     quote or an empty pair is text the user typed. Runs here and at the command,
