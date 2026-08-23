@@ -656,10 +656,10 @@ class TestSearchQueueEntryWire:
         assert entry.to_redis() == _GOLDEN_YTSOURCE
 
     def test_origin_survives_the_wire(self) -> None:
-        """An unresolved Spotify-album track is the only place the album link still
+        """An unresolved Spotify-playlist track is the only place that link still
         exists: its ytsearch is a title the expansion generated, and the resolved
         YouTube URL it becomes names neither. Drop this field on the wire and
-        -remove <album link> stops matching the moment the bot restarts."""
+        -remove <playlist link> stops matching the moment the bot restarts."""
         album = "https://open.spotify.com/album/abc123"
         entry = SearchQueueEntry(ytsearch="ytsearch:Track One", user_input=album)
         parsed = parse_queue_entry(entry.to_redis())

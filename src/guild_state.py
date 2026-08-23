@@ -353,7 +353,8 @@ class GuildStateData:
     current_song_queue_position: int = 0
     current_song_query_source: str = ""
     # None, not "": absent means a pre-migration entry, not a song genuinely queued
-    # without an origin. parse_queue_entry draws the same line.
+    # without an origin, and an empty needle must never be what -remove matches on.
+    # parse_queue_entry draws the same line.
     current_song_user_input: str | None = None
     current_song_played_at: float = 0.0
     play_start_epoch: float | None = None

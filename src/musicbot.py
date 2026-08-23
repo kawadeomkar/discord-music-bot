@@ -1247,18 +1247,24 @@ class MusicBot(commands.Cog):
         name="play",
         aliases=["p", "sing"],
         brief="queue a song and start playing",
-        usage="<url|search>",
+        usage="[--now|--next] <url|search>",
         help=(
             "Queues a song and starts playback. Accepts a YouTube link, a YouTube "
-            "playlist, a Spotify track or playlist link, a SoundCloud link, or "
-            "plain words to search YouTube with.\n\n"
+            "playlist, a Spotify track or playlist link, a SoundCloud link, or plain "
+            "words to search YouTube with.\n\n"
             "If the bot is not connected yet it joins your voice channel first. "
-            "If something is already playing, the song is appended to the queue "
-            "and you get an estimated start time. A YouTube link carrying a "
-            "`?t=` / `?ts=` timestamp starts the song at that offset.\n\n"
-            "A YouTube playlist link copied from partway through — one carrying "
-            "an `&index=` — queues from that position, skipping the songs "
-            "before it. Drop the `&index=` to queue the whole playlist."
+            "Otherwise the song is appended to the queue with an estimated start time. "
+            "A `?t=` / `?ts=` timestamp starts it at that offset, and a playlist link's "
+            "`&index=` starts from that position instead of from the first track.\n\n"
+            "One option, as the first word:\n\n"
+            "`--now` plays it immediately. The interrupted song returns from the exact "
+            "position it left off at, paused if it was paused, unless it was nearly "
+            "over. Interrupt again and the parked songs unwind most recent first.\n\n"
+            "`--next` queues it at the front instead, without interrupting anything."
+            "\n\n"
+            "Both take a whole playlist in full. With `--now` that means the "
+            "interrupted song does not return until the last track — `-remove` with "
+            "the same link takes the whole thing back out."
         ),
         extras={
             "category": "Playback",
@@ -1272,8 +1278,11 @@ class MusicBot(commands.Cog):
                 "-p https://soundcloud.com/artist/track",
             ],
             "note": (
-                "Spotify links are matched to YouTube audio one title at a time, "
-                "so a long playlist takes a few seconds to finish queueing."
+                "Spotify links are matched to YouTube audio one title at a time, so a "
+                "long playlist takes a few seconds to finish queueing — and one plain "
+                "`-play` runs at a time per server, so a second one sent meanwhile is "
+                "declined rather than queued. `--now` and `--next` have their own "
+                "limit, so an urgent request still goes through."
             ),
         },
     )
@@ -1678,9 +1687,9 @@ class MusicBot(commands.Cog):
         if outcome is None:
             # The song ended during the resolve — nothing left to interrupt. Insert
             # qobj directly rather than re-invoking -play, which would re-parse,
-            # re-resolve and (for a playlist) enqueue all tracks right after the
-            # first-track-only notice above. Front, not append: the user asked for
-            # "now", and this window can be seconds long with songs queued behind.
+            # re-resolve and enqueue every track a second time. Front, not append:
+            # the user asked for "now", and this window can be seconds long with
+            # songs queued behind.
             # It interrupted nothing, so keeping the marker would attribute an
             # interjection that never happened.
             qobj.interjected = False

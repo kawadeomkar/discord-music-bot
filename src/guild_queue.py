@@ -18,7 +18,8 @@ remains — see the ISSUE below. The cleared-flag the playback loop consumes
 lives here too.
 
 Two counters, adjacent names, different sets: qsize() is PENDING (len - cursor),
-display_size() is pending PLUS in-flight (len).
+display_size() is pending PLUS in-flight (len). display_size() is the sole input to
+a Postgres column.
 
 Not known here:
 - stream prefetch — MusicPlayer cancels its prefetch task before
@@ -93,7 +94,8 @@ RemoveMatcher = Callable[[QueueItem], Optional[RemoveMode]]
 
 
 # A link, for folding purposes: a scheme, or a bare dotted host that parse_url
-# also accepts (`-play youtu.be/X` is an ordinary input).
+# also accepts (`-play youtu.be/X` is an ordinary input). Angle brackets are
+# stripped first because Discord adds them when suppressing an embed.
 _LOOKS_LIKE_A_LINK = re.compile(r"^(?:\w+://|[\w-]+(?:\.[\w-]+)+/)")
 
 
@@ -101,7 +103,9 @@ def _normalize(s: str) -> str:
     """Fold a needle for comparison: collapse whitespace, and casefold anything
     that is not a link. Links keep their case because IDs inside them are
     case-sensitive — a casefolded Spotify base62 id would let ".../playlist/AbC"
-    match a different playlist's ".../playlist/abc"."""
+    match a different playlist's ".../playlist/abc". Free text folds under
+    casefold(), so two searches differing only by a fold (strasse/straße) remove
+    each other."""
     s = " ".join(s.split()).strip("<>")
     return s if _LOOKS_LIKE_A_LINK.match(s) else s.casefold()
 
@@ -226,8 +230,8 @@ class GuildQueue:
 
         `while`, never `if`: Event.wait() wakes EVERY waiter and the prefetch's
         get_nowait() is a second consumer, so a woken getter can find the item
-        already taken. No await between the claim and the return, so a claim is
-        atomic on the event loop."""
+        already taken, as can one cancelled after being woken. No await between the
+        claim and the return, so a claim is atomic on the event loop."""
         while self._cursor >= len(self._items):
             await self._wake.wait()
         item = self._items[self._cursor]
@@ -421,6 +425,8 @@ class GuildQueue:
             self._items = deque(head + tail)
             self._sync_wake()
 
+            # DELETE when nothing persisted survives: it heals a mirror
+            # holding entries memory no longer has.
             if tail:
                 await self._write_mirror(self._items)
 
@@ -432,7 +438,9 @@ class GuildQueue:
         a removed entry can be the last record of a song that already played. An
         in-flight dequeue is never removed even on a match (it is committed to play;
         stopping it is -skip's job) but still occupies a display position — hence
-        the numbering offset. The matching policy is remove_matcher's."""
+        the numbering offset.
+
+        The matching policy is remove_matcher's."""
         removed_positions: list[int] = []
         removed_items: list[QueueItem] = []
         kept: list[QueueItem] = []

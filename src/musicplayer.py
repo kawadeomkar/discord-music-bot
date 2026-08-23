@@ -1236,7 +1236,7 @@ class MusicPlayer:
         """Retire a dequeue that will never play, and record it if a listener
         already heard part of it.
 
-        For an ordinary song the flush is a no-op — nobody heard it. For a -playnow
+        For an ordinary song the flush is a no-op — nobody heard it. For a
         resume TAIL it is the difference between one record and none: the
         interrupted fragment declined to record itself (_skip_history_for), so the
         tail is the only writer left for a play that may have run for minutes. A
@@ -1818,8 +1818,8 @@ class MusicPlayer:
                     # classification is not recoverable from webpage_url — a Spotify
                     # link, a search and a pasted link all archive as youtube.com.
                     query_source=current.query_source,
-                    # -remove matches on this: without it the parked tail is the
-                    # one track a playlist link cannot take back out.
+                    # Same reason -remove matches on it: without this the parked
+                    # tail is the one track a collection link cannot take back out.
                     user_input=current.user_input,
                 )
 
@@ -2341,7 +2341,7 @@ class MusicPlayer:
             return None
         if song is None:
             # _stream_source swallowed a failure — retire the dequeue as the raise
-            # path does, or the display/Redis heads sit one entry ahead forever.
+            # path does, or the deque and the mirror sit one entry ahead forever.
             await self._retire_failed_dequeue(source, context="prefetch failure")
             return None
         return song
@@ -2411,7 +2411,7 @@ class MusicPlayer:
                         prefetched_song = None
                     # Captured where each path takes its item, and handed back to
                     # try_commit_dequeue() below: a clear() in between voids this
-                    # dequeue even if a put() has since refilled the display.
+                    # dequeue even if a put() has since refilled the queue.
                     commit_generation = self.queue.generation
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
