@@ -1048,10 +1048,13 @@ class MusicPlayer:
         if is_persisted(head):
             # Already on the Redis list: parking it would re-queue a second copy.
             return False
-        # Backdated by the resume offset as the loop does at vc.play — the hash has no
-        # `ts`, and recovery reads position as now - play_start_epoch - pauses.
+        # Backdated by the resume offset as the loop does at vc.play, and seeded as
+        # the recorded position: the hash carries no `ts`, so the offset is the only
+        # record of how far this song had reached.
         await self.store.set_current_song_state(
-            SongQueueEntry.from_queue_object(head), time.time() - (head.ts or 0)
+            SongQueueEntry.from_queue_object(head),
+            time.time() - (head.ts or 0),
+            start_offset=head.ts or 0,
         )
         return True
 
@@ -2484,20 +2487,26 @@ class MusicPlayer:
                     # window. A crash-recovered "current song" was never on the Redis
                     # list, so only state is written — an LPOP would drop a queued one.
                     if self.store is not None:
-                        # Backdated by the FFmpeg -ss offset so recovery math (now -
-                        # play_start_epoch - pauses) yields true audio position, not
-                        # time-since-vc.play(). Without it, ?t= songs and
-                        # double-crash recoveries resume start_offset seconds early.
+                        # The -ss offset twice: backdated into the epoch the legacy
+                        # fallback extrapolates from, and passed as the seed the
+                        # heartbeat has not written yet. Without it a `?t=` song
+                        # crashing inside the first interval resumes at 0:00.
                         backdated_start = play_start - song.start_offset
                         current = SongQueueEntry.from_song(song)
                         now_playing = NowPlayingData.from_song(song)
                         if should_pop_queue:
                             await self.store.pop_queue_and_start_song(
-                                current, backdated_start, now_playing=now_playing
+                                current,
+                                backdated_start,
+                                now_playing=now_playing,
+                                start_offset=song.start_offset,
                             )
                         else:
                             await self.store.set_current_song_state(
-                                current, backdated_start, now_playing=now_playing
+                                current,
+                                backdated_start,
+                                now_playing=now_playing,
+                                start_offset=song.start_offset,
                             )
 
                     if song.start_paused:

@@ -7050,6 +7050,20 @@ class TestLoop:
         current, backdated_start = pop_spy.call_args.args[:2]
         assert current.played_at == pytest.approx(backdated_start + 60)
 
+    async def test_the_start_transaction_seeds_the_heartbeat_from_the_offset(
+        self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
+    ) -> None:
+        """No heartbeat has ticked yet, so a crash inside the first interval resumes
+        from whatever this wrote. The store defaults the argument to 0, which reads
+        as a `?t=60` song having reached 0:00."""
+        assert music_player.store is not None
+        mock_song.start_offset = 60
+        pop_spy = AsyncMock(wraps=music_player.store.pop_queue_and_start_song)
+
+        await self._run_one_song(music_player, queue_obj, mock_song, pop_spy)
+
+        assert pop_spy.call_args.kwargs["start_offset"] == 60
+
     async def test_inherited_played_at_is_not_restamped(
         self, music_player: MusicPlayer, queue_obj: QueueObject, mock_song: MagicMock
     ) -> None:
@@ -8338,6 +8352,25 @@ class TestPrefetchedHeadRespectsPersistence:
         # One LPOP for the first (persisted) song, none for the recovered head.
         assert pop_spy.await_count == 1
         set_spy.assert_awaited_once()
+
+    async def test_the_recovered_head_seeds_the_heartbeat_from_its_offset(
+        self,
+        music_player: MusicPlayer,
+        queue_obj: QueueObject,
+        mock_song: MagicMock,
+        live_song: MagicMock,
+    ) -> None:
+        """The double-crash path. This branch writes a song already recovered part
+        way through; seeding 0.0 there shadows the legacy fallback (0.0 is not None),
+        so a second crash restarts it at 0:00 — worse than not having the heartbeat.
+        """
+        live_song.persisted = False
+        live_song.start_offset = 180
+        _, set_spy = await self._run_with_prefetch(
+            music_player, queue_obj, mock_song, live_song
+        )
+        set_spy.assert_awaited_once()
+        assert set_spy.call_args.kwargs["start_offset"] == 180
 
     async def test_a_persisted_prefetched_head_still_lpops(
         self,

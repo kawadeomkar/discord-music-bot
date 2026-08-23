@@ -105,6 +105,13 @@ class StateField:
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
+    # The recorded playback position, read with no wall-clock arithmetic. The
+    # three fields above are its predecessors, still written for rollback safety;
+    # they go one release after this ships.
+    LAST_POSITION_SECS: Final[str] = "last_position_secs"
+    # When that position was recorded. Never an addend — it dates the field above,
+    # so _heartbeat_predates_song can refuse one belonging to an earlier song.
+    LAST_HEARTBEAT_EPOCH: Final[str] = "last_heartbeat_epoch"
 
 
 # ── guild:{id}:now_playing hash — field name constants ───────────────────────
@@ -349,6 +356,8 @@ class GuildStateData:
     play_start_epoch: float | None = None
     total_pause_seconds: float = 0.0
     pause_start_epoch: float | None = None
+    last_position_secs: float | None = None
+    last_heartbeat_epoch: float | None = None
 
     # Convenience properties — derived from stored fields, not stored separately.
 
@@ -438,6 +447,8 @@ class GuildStateData:
             play_start_epoch=_b_float(raw, StateField.PLAY_START_EPOCH),
             total_pause_seconds=total_pause if total_pause is not None else 0.0,
             pause_start_epoch=_b_float(raw, StateField.PAUSE_START_EPOCH),
+            last_position_secs=_b_float(raw, StateField.LAST_POSITION_SECS),
+            last_heartbeat_epoch=_b_float(raw, StateField.LAST_HEARTBEAT_EPOCH),
         )
 
 
