@@ -102,6 +102,9 @@ class StateField:
     # -ss offset, and not derivable from this run's clock at all — a resume tail
     # inherits its value from an earlier fragment.
     CURRENT_SONG_PLAYED_AT: Final[str] = "current_song_played_at"
+    # LEGACY, all three: superseded by LAST_POSITION_SECS below and read only by
+    # _legacy_wall_clock_position_at. Still written so a rollback recovers; drop them
+    # with that method and on_pause/on_resume one release after the heartbeat ships.
     PLAY_START_EPOCH: Final[str] = "play_start_epoch"
     TOTAL_PAUSE_SECONDS: Final[str] = "total_pause_seconds"
     PAUSE_START_EPOCH: Final[str] = "pause_start_epoch"
