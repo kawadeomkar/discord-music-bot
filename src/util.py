@@ -10,12 +10,36 @@ from discord.ext import commands
 from opentelemetry.trace import Span, StatusCode
 
 
+# Discord's embed field-value cap: it rejects the WHOLE send past this. The
+# -remove reply carrying one of these lands after the songs are already gone from
+# memory and Redis, so the user would read "Command failed" for a removal that
+# happened.
+_FIELD_VALUE_MAX = 1024
+_TRUNCATION_MARK = "..."
+
+
 def queue_message(songs: list[str]) -> str:
-    capped = songs[:10]
-    msg = "\n".join([f"{i + 1}: {capped[i]}" for i in range(len(capped))])
-    if len(songs) > 10:
-        msg += "\n..."
-    return msg
+    """Numbered song list for an embed field, bounded by count AND by length.
+
+    Ten entries is not a bound on its own: each line is a title or a link echo, so
+    ten 100-char titles compose to 1040. Overflow of either kind ends in the same
+    trailing mark; the count is in the embed's own title."""
+    lines: list[str] = []
+    used = 0
+    budget = _FIELD_VALUE_MAX - len(_TRUNCATION_MARK) - 1
+    for i, song in enumerate(songs[:10]):
+        line = f"{i + 1}: {song}"
+        if used + len(line) > budget:
+            # A single line over budget is truncated, not dropped: an empty
+            # field would say nothing about what was taken.
+            if not lines:
+                lines.append(line[:budget])
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if len(lines) < len(songs):
+        lines.append(_TRUNCATION_MARK)
+    return "\n".join(lines)
 
 
 def trace_id_of(span: Span) -> str:

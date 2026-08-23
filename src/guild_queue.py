@@ -42,8 +42,8 @@ import random
 import re
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from itertools import islice
+from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from typing import Optional, Union
 
@@ -237,14 +237,19 @@ class GuildQueue:
         again. The mirror never moved.
 
         `item` may be the RESOLVED form of what was claimed (YTSource →
-        QueueObject), so the slot is rewritten onto it: a later rebuild serializes
-        from the deque, and a stale YTSource there would persist a search over an
-        entry that had already resolved."""
+        QueueObject), so the returned entry replaces the claimed one: a later
+        rebuild serializes from the deque, and a stale YTSource there would persist
+        a search over an entry that had already resolved.
+
+        The item goes into the OLDEST claimed slot, index 0, and the cursor gives up
+        the NEWEST. Two claims can be live — the prefetch's, and loop()'s taken while
+        the prefetch's cancel awaited — and both settle by position, so each can take
+        the other's song while the deque stays in step with the mirror."""
         # Guarded like every other cursor decrement: unguarded, _cursor == 0 goes
         # negative and _items[-1] = item clobbers the TAIL.
         if self._cursor > 0:
             self._cursor -= 1
-            self._items[self._cursor] = item
+            self._items[0] = item
         self._sync_wake()
 
     def empty(self) -> bool:
@@ -452,19 +457,20 @@ class GuildQueue:
         *,
         requester_fallback: Union[discord.Member, discord.User, None],
     ) -> bool:
-        """Re-queue the crash-recovered "current song".
+        """Re-queue the crash-recovered "current song" at the front of the line.
 
-        APPENDS, and is the front only because its one caller (_restore_state)
-        runs it on an empty deque and calls restore_entries() after.
         In memory only: the entry is persisted=False — its LPOP already
         committed, so it is not on the Redis list and the loop must not LPOP for it
         (see redis_pop_for). requester_fallback (guild.me or guild.owner) covers a
         persisted requester ID that no longer resolves; False when nobody does, and
-        the caller still owns clearing the crashed-song state."""
+        the caller still owns clearing the crashed-song state.
+
+        Inserted at the cursor: with a claim outstanding that is the front of the
+        line, and the claimed items stay a prefix."""
         item = self._rehydrate(entry, requester_fallback=requester_fallback)
         if item is None:
             return False
-        self._items.append(item)
+        self._items.insert(self._cursor, item)
         self._sync_wake()
         return True
 

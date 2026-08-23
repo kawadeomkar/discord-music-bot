@@ -751,6 +751,8 @@ class SongQueueEntry:
             queued_at=state.current_song_queued_at,
             queue_position=state.current_song_queue_position,
             query_source=state.current_song_query_source,
+            # Origin, so -remove <what was typed> still matches the recovered song:
+            # this hash is the only place the link survives a restart.
             user_input=state.current_song_user_input,
             # The parked entry is the only at-rest copy of a playing song's start
             # (its queue entry was LPOPed when it started), so recovery reads it

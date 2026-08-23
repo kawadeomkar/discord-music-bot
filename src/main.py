@@ -410,6 +410,27 @@ class MusicBotApp(commands.AutoShardedBot):
             return
         await super().invoke(ctx)
 
+    async def on_command_error(
+        self, ctx: commands.Context, error: commands.CommandError, /
+    ) -> None:
+        """Drop unknown commands; hand every other error back to discord.py.
+
+        The prefix is a bare `-` and strip_after_prefix skips the whitespace behind
+        it, so an ordinary markdown bullet ("- milk") reaches the dispatcher as the
+        command `milk`, and discord.py's default handler logs each one at ERROR with
+        a traceback. A bare `-` escapes: an empty command word never dispatches.
+
+        The rest go to super(), whose default declines to log when the command or its
+        cog has a handler — which is what keeps cog_command_error's errors from being
+        reported twice.
+        """
+        if isinstance(error, commands.CommandNotFound):
+            # Bounded: invoked_with is one whitespace-free token, and nothing caps
+            # how long that token is.
+            log.debug(f"Unknown command: {str(ctx.invoked_with)[:32]!r}")
+            return
+        await super().on_command_error(ctx, error)
+
     async def on_ready(self) -> None:
         activity = discord.Game(name="music", type=3)
         await self.change_presence(status=discord.Status.online, activity=activity)

@@ -68,6 +68,29 @@ class TestQueueMessage:
         assert "song15" not in result
         assert "song20" not in result
 
+    def test_ten_long_titles_stay_inside_the_field_cap(self) -> None:
+        # Ten 100-char titles composed to 1040 — past Discord's 1024 field cap,
+        # which 400s the WHOLE send. For -remove that arrives after the songs are
+        # gone from memory and Redis, so the user is told a destructive command
+        # failed when it succeeded, with nothing to undo it.
+        result = queue_message(["t" * 100 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.endswith("...")
+
+    def test_a_length_overflow_still_names_what_it_can(self) -> None:
+        # Dropped for length, not for count: some entries still render, and the
+        # trailing mark says the list was cut.
+        result = queue_message(["x" * 200 for _ in range(10)])
+        assert len(result) <= 1024
+        assert result.startswith("1: ")
+        assert result.endswith("...")
+
+    def test_one_oversized_title_is_truncated_not_dropped(self) -> None:
+        # An empty field would say nothing at all about what was taken.
+        result = queue_message(["y" * 5000])
+        assert 0 < len(result) <= 1024
+        assert result.startswith("1: ")
+
 
 class TestGetLogger:
     def test_returns_structlog_logger(self) -> None:
