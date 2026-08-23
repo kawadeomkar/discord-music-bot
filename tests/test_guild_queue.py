@@ -1217,13 +1217,47 @@ class TestClear:
         assert gq.display_items() == []
         assert await fake_redis.exists(store.queue_key()) == 0
 
-    async def test_sets_cleared_flag_consumed_once(
+    async def test_bumps_the_generation_so_an_in_flight_dequeue_is_refused(
         self, gq: GuildQueue, mock_author: MagicMock
     ) -> None:
+        """A captured generation names the queue an item came from, so a claim
+        taken before a clear() is refused even when a refill has been claimed
+        since and the cursor alone would let the commit through.
+
+        The refill is claimed on purpose: with nothing claimed the cursor reset
+        refuses by itself, and this test would pass with the generation check
+        deleted. A read-and-reset flag beside it cannot do this job: a consumer
+        that reads it before the clear lands reads it a whole song late."""
         await gq.put([_qobj(1, mock_author)])
+        captured = gq.generation
+        await gq.get()
         await gq.clear()
-        assert gq.consume_cleared_flag() is True
-        assert gq.consume_cleared_flag() is False  # read-and-reset
+        assert gq.generation != captured
+        # -play refills and a prefetch claims the refill before the stale commit.
+        await gq.put([_qobj(2, mock_author)])
+        fresh = gq.generation
+        await gq.get()
+        assert gq._cursor == 1
+        assert await gq.try_commit_dequeue(captured) is False
+        assert gq._cursor == 1  # the refused commit released nothing
+        # The claim taken AFTER the clear carries the new value and commits.
+        assert await gq.try_commit_dequeue(fresh) is True
+        assert gq._cursor == 0
+
+    async def test_clear_leaves_nothing_pending_to_wake_on(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """I3 after a clear(): _wake is set iff something is pending, and nothing
+        is. Left set, get()'s wait loop returns without yielding, and the event
+        loop stops ticking — so the flag is asserted first, since a bounded get()
+        under that defect never reaches its deadline."""
+        await gq.put([_qobj(1, mock_author)])
+        assert gq._wake.is_set()
+        await gq.clear()
+        assert not gq._wake.is_set()
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.05):
+                await gq.get()
 
     async def test_clear_settles_an_outstanding_claim(
         self, gq: GuildQueue, mock_author: MagicMock
@@ -2365,3 +2399,16 @@ class TestPutClearMutualExclusion:
         assert gq.qsize() == 0
         assert gq.display_items() == []
         assert await fake_redis.lrange(store.queue_key(), 0, -1) == []
+
+
+class TestGenerationCounter:
+    async def test_starts_at_zero(self, gq: GuildQueue) -> None:
+        assert gq.generation == 0
+
+    async def test_clear_bumps_generation(
+        self, gq: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        await gq.put([_qobj(1, mock_author)])
+        gen = gq.generation
+        await gq.clear()
+        assert gq.generation == gen + 1

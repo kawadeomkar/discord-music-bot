@@ -14,8 +14,8 @@ by LPOP — so in-flight items are necessarily a PREFIX. Both legs are private:
 no caller can move one without the other, and every mirror-touching mutation
 (put, put_front, clear, shuffle, remove, finish_failed_dequeue) holds one
 bulk-mutation mutex across its memory AND mirror writes. One residual window
-remains — see the ISSUE below. The cleared-flag the playback loop consumes
-lives here too.
+remains — see the ISSUE below. Invalidation is carried by the generation
+counter and the cursor (see clear()).
 
 Two counters, adjacent names, different sets: qsize() is PENDING (len - cursor),
 display_size() is pending PLUS in-flight (len).
@@ -177,7 +177,6 @@ class GuildQueue:
         "_cursor",
         "_wake",
         "_mutex",
-        "_cleared",
         "_generation",
     )
 
@@ -191,7 +190,6 @@ class GuildQueue:
         self._cursor = 0
         self._wake = asyncio.Event()
         self._mutex = asyncio.Lock()
-        self._cleared = False
         self._generation = 0
 
     # ── Wake discipline ───────────────────────────────────────────────────────
@@ -262,14 +260,6 @@ class GuildQueue:
         a claimed item is still ahead of an arrival, so qsize() here would write a
         plausible wrong number to Postgres."""
         return len(self._items)
-
-    def consume_cleared_flag(self) -> bool:
-        """Read-and-reset the queue-was-cleared flag. clear() sets it under the
-        mutex; the loop consumes it once per iteration to learn that a prefetched
-        song it is holding was invalidated and must be discarded."""
-        was_cleared = self._cleared
-        self._cleared = False
-        return was_cleared
 
     @property
     def generation(self) -> int:
@@ -355,12 +345,14 @@ class GuildQueue:
         prefix included, because the caller records these
         (MusicPlayer._flush_played) and a parked -playnow tail is in it.
 
-        Sets the cleared-flag under the mutex before draining, so a loop iteration
-        holding a prefetched song discards it. The DEL is inside the mutex too:
-        released early, a concurrent put()'s mirror writes would land between the
-        drain and the DEL and be wiped."""
+        Bumps the generation under the mutex before draining, and resets the
+        cursor: a claim the loop took before this clear() captured the old value
+        and is refused by try_commit_dequeue(); a claim a prefetch took commits under
+        the current value and is refused because nothing is claimed at cursor 0.
+
+        The DEL is inside the mutex too: released early, a concurrent put()'s
+        mirror writes would land between the drain and the DEL and be wiped."""
         async with self._mutex:
-            self._cleared = True
             self._generation += 1
             cleared_items = list(self._items)
             self._items.clear()

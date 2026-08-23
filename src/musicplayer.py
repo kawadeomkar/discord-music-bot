@@ -442,7 +442,8 @@ class MusicPlayer:
             GuildRedisStore(redis, self._guild.id) if redis is not None else None
         )
         # All queue state (one deque + cursor, Redis mirror, bulk mutex, wake
-        # Event, cleared-flag) lives behind this one object — see guild_queue.py.
+        # Event, generation counter) lives behind this one object — see
+        # guild_queue.py.
         self.queue = GuildQueue(guild, self.store)
         # Played-song history (in-memory ring + Redis mirror) — guild_history.py.
         # Only the DRAINER is wired in: history writes nudge it, nothing here reads
@@ -2379,19 +2380,13 @@ class MusicPlayer:
                 attributes={"discord.guild_id": str(self._guild.id)},
             ) as span:
                 try:
-                    queue_was_cleared = self.queue.consume_cleared_flag()
                     prefetch_used = prefetched_song is not None
                     span.set_attribute("prefetch.used", prefetch_used)
-                    if prefetched_song is not None and queue_was_cleared:
-                        # Cleared while _prefetch_next_song ran: clear() reset the
-                        # cursor, so the prefetch's claim is already settled — only
-                        # the FFmpeg subprocess is left to reap, and discarding the
-                        # result without cleanup() would leak it.
-                        prefetched_song.cleanup()
-                        prefetched_song = None
-                    # Captured where each path takes its item, and handed back to
-                    # try_commit_dequeue() below: a clear() in between voids this
-                    # dequeue even if a put() has since refilled the display.
+                    # Captured where each path takes its item and handed back to
+                    # the commit below: a clear() in between voids this dequeue
+                    # even if a put() has since refilled the display. A prefetched
+                    # claim commits under the CURRENT value — a clear() during the
+                    # previous song reset the cursor, and try_release() refuses it.
                     commit_generation = self.queue.generation
                     if prefetched_song is not None:
                         self.current_song = prefetched_song
