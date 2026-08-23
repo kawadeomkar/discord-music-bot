@@ -37,7 +37,7 @@ from src.guild_state import (
     NowPlayingData,
     SongQueueEntry,
 )
-from src.redis_client import GuildRedisStore, cache_get
+from src.redis_client import GuildRedisStore
 from src.sources import YTSource
 from src.telemetry import get_tracer
 from src.util import (
@@ -954,29 +954,19 @@ class MusicPlayer:
                     # bot died after that transaction committed but before the song
                     # finished (at-most-once delivery).
                     if guild_state.has_crashed_song:
-                        # Approximate position at crash time — pure math on the
-                        # snapshot, no IO. crashed_position_at documents why it is
-                        # only approximate (downtime counts as playback).
+                        # The recorded position, read straight off the snapshot —
+                        # no clock, no IO, so downtime is never credited.
                         position = guild_state.crashed_position_at(time.time())
                         if position is not None:
-                            # Cap at duration − 10s so FFmpeg can't seek past EOF.
-                            # Narrow try/except: a malformed cached duration must
-                            # degrade to "no cap", not abort the whole restore.
-                            try:
-                                stream_data = await cache_get(
-                                    self.store.redis,
-                                    f"ytdl:stream:{guild_state.current_song_url}",
-                                )
-                                if stream_data is not None:
-                                    raw_duration = stream_data.get("duration")
-                                    if raw_duration is not None:
-                                        position = min(
-                                            position, max(0, int(raw_duration) - 10)
-                                        )
-                            except Exception as pos_err:
-                                log.warning(
-                                    f"Failed to cap recovery position: {pos_err}"
-                                )
+                            # Cap at duration − 10s so FFmpeg cannot seek past EOF,
+                            # read from the snapshot this restore already holds. The
+                            # stream cache expires in 30 minutes, so sourcing it there
+                            # capped or did not depending on how long the restart took.
+                            # Falsy covers both unknown and a livestream's 0, either of
+                            # which means no cap rather than a cap at 0.
+                            duration = guild_state.current_song_duration
+                            if duration:
+                                position = min(position, max(0, duration - 10))
                             log.info(
                                 f"Computed recovery position {position}s for "
                                 f"'{guild_state.current_song_title}'"

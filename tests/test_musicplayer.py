@@ -3793,32 +3793,57 @@ class TestRestoreCrashedSong:
         assert first.ts is not None
         assert 50 <= first.ts <= 70
 
-    async def test_crashed_song_position_capped_by_cached_stream_duration(
+    async def test_crashed_song_position_capped_by_the_parked_duration(
         self,
         music_player: MusicPlayer,
         fake_redis: aioredis.Redis,
         mock_author: MagicMock,
     ) -> None:
-        """The recovery position is capped at cached stream duration − 10s so
-        FFmpeg never seeks past EOF."""
+        """Capped at duration − 10s so FFmpeg never seeks past EOF, read from the
+        state hash rather than the stream cache: that key expires in 30 minutes, so
+        sourcing it there capped or did not depending on how long the restart took.
+        """
         assert music_player.store is not None
-        import time
-
-        start = time.time() - 90  # computed position ≈ 90s
         await fake_redis.hset(
             music_player.store.state_key(),
-            b"current_song_url",
-            b"https://yt.com/v=crash",
+            mapping={
+                b"current_song_url": b"https://yt.com/v=crash",
+                b"current_song_title": b"Crashed",
+                b"current_song_duration": b"60",
+                b"last_position_secs": b"90",
+                b"last_heartbeat_epoch": b"2000",
+                b"play_start_epoch": b"1000",
+            },
         )
+        # Deliberately absent: the cache this used to read is gone half an hour in,
+        # and the cap must not depend on it.
+        music_player._guild.get_member = MagicMock(return_value=mock_author)
+        music_player.bot.wait_until_ready = AsyncMock()
+
+        await music_player._restore_state()
+
+        first = await music_player.queue.get()
+        assert first.ts == 50  # min(90, 60 − 10)
+
+    async def test_a_livestream_duration_of_zero_does_not_cap_to_zero(
+        self,
+        music_player: MusicPlayer,
+        fake_redis: aioredis.Redis,
+        mock_author: MagicMock,
+    ) -> None:
+        """max(0, 0 - 10) is 0, so treating an unknown duration as a real one would
+        restart every livestream from the beginning."""
+        assert music_player.store is not None
         await fake_redis.hset(
-            music_player.store.state_key(), b"current_song_title", b"Crashed"
-        )
-        await fake_redis.hset(
-            music_player.store.state_key(), b"play_start_epoch", str(start).encode()
-        )
-        # Cached stream metadata says the song is only 60s long.
-        await fake_redis.set(
-            "ytdl:stream:https://yt.com/v=crash", orjson.dumps({"duration": 60})
+            music_player.store.state_key(),
+            mapping={
+                b"current_song_url": b"https://yt.com/v=live",
+                b"current_song_title": b"Live",
+                b"current_song_duration": b"0",
+                b"last_position_secs": b"140",
+                b"last_heartbeat_epoch": b"2000",
+                b"play_start_epoch": b"1000",
+            },
         )
         music_player._guild.get_member = MagicMock(return_value=mock_author)
         music_player.bot.wait_until_ready = AsyncMock()
@@ -3826,7 +3851,7 @@ class TestRestoreCrashedSong:
         await music_player._restore_state()
 
         first = await music_player.queue.get()
-        assert first.ts == 50  # min(≈90, 60 − 10)
+        assert first.ts == 140
 
     async def test_crashed_song_position_uncapped_when_cached_duration_malformed(
         self,
