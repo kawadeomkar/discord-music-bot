@@ -357,17 +357,20 @@ def unquote_argument(text: str) -> str:
     return text
 
 
-def parse_input(
-    user_input: str, message: str
-) -> Union[SpotifySource, YTSource, SoundcloudSource]:
+def parse_input(user_input: str) -> Union[SpotifySource, YTSource, SoundcloudSource]:
     """Top-level entry point for command input: tries parse_url, falls back to ytsearch.
     parse_url is attempted only for single-word input, since URLs never contain spaces; a
     single-word term with a slash ("98/99") still reaches it but raises ValueError on the
-    dotless host and falls back to search."""
-    args = message.split(" ")[1:]
+    dotless host and falls back to search.
+
+    Reads only what the caller passes, so a caller that strips a flag off the front
+    gets the answer for what remains."""
+    args = user_input.split()
     if len(args) == 1:
         try:
-            return parse_url(unquote_argument(user_input))
+            # args[0], not user_input: the token without whatever whitespace
+            # surrounded it, since parse_url hands this straight to YTSource.url.
+            return parse_url(unquote_argument(args[0]))
         except ValueError:
             pass
     ytsearch = unquote_argument(" ".join(args))

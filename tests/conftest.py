@@ -252,6 +252,9 @@ def mock_message(mock_author: MagicMock, mock_channel: MagicMock) -> MagicMock:
     message = MagicMock(spec=discord.Message)
     message.author = mock_author
     message.channel = mock_channel
+    # Present because Message carries one, not because the command path reads it:
+    # parse_input takes its search from the bound argument alone. A test that wants
+    # a specific input passes it as `url=`.
     message.content = "-play test song"
     message.add_reaction = AsyncMock()
     # A real tz-aware datetime, as discord.py derives from the message snowflake:

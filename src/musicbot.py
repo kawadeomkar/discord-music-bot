@@ -1,10 +1,13 @@
 import asyncio
 import contextlib
+import re
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from itertools import islice
 from typing import (
     Any,
+    Final,
     Optional,
     Union,
     assert_never,
@@ -190,6 +193,103 @@ DEPTH_RESTORE_WAIT_SECS = 1.0
 
 class HistoryFlags(commands.FlagConverter, prefix="--", delimiter=" "):
     limit: int = 10
+
+
+NOW_FLAG: Final[str] = "--now"
+NEXT_FLAG: Final[str] = "--next"
+
+
+class PlayMode(Enum):
+    """Where a `-play` invocation puts its song.
+
+    One field, so `now and next` is unrepresentable.
+    """
+
+    NORMAL = "normal"
+    NOW = "now"
+    NEXT = "next"
+
+
+_FLAG_MODES: Final[dict[str, PlayMode]] = {
+    NOW_FLAG: PlayMode.NOW,
+    NEXT_FLAG: PlayMode.NEXT,
+}
+
+
+class Placement(Enum):
+    """Where an enqueue puts its songs, and which confirmation says so.
+
+    Two decisions, not one: build_resume_notice_embed ("N songs from the previous
+    session resume after it") is true for a disconnected bot waking a persisted
+    queue and false for a warm front-insert, and it renders only when the queue is
+    non-empty — exactly the case that would be wrong.
+    """
+
+    TAIL = "tail"
+    COLD_FRONT = "cold_front"
+    NEXT = "next"
+
+
+# Every dash Unicode offers that a keyboard or a paste substitutes for ASCII `-`:
+# hyphen, non-breaking hyphen, figure dash, en dash, em dash, horizontal bar. iOS
+# turns a typed `--` into a single em dash.
+_DASHES: Final[str] = "-‐‑‒–—―"
+# Alternation built from _FLAG_MODES' own keys, so a renamed flag cannot leave this
+# branch offering one that no longer exists. The group is a flag minus its dashes;
+# split_play_args re-attaches them for the reply.
+_NEAR_FLAG_RE: Final[re.Pattern[str]] = re.compile(
+    f"[{_DASHES}]{{1,2}}({'|'.join(flag[2:] for flag in _FLAG_MODES)})"
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PlayArgs:
+    """`-play`'s argument, split into the placement flag and the query behind it.
+
+    kw_only because `query` and `dash_typo` are adjacent and both `str`-ish, and one
+    of them is echoed into an embed: transposed, the bot asks "did you mean `<the
+    user's whole search>`?".
+
+    `dash_typo` names the flag a misspelt leading token meant. It only ever
+    accompanies `PlayMode.NORMAL`, since which flag was intended is unknown.
+    """
+
+    mode: PlayMode
+    query: str
+    dash_typo: Optional[str] = None
+
+
+def split_play_args(argument: str) -> PlayArgs:
+    """Split a leading `--now`/`--next` off `-play`'s argument.
+
+    Only the FIRST token is considered, so a flag further along stays part of the
+    search text and the origin `-remove` matches on stays what the user typed. One
+    flag, never a run: `-p --now --next x` takes `--now` and searches for "--next x".
+
+    Hand-parsed: a FlagConverter's grammar is `--flag value`, which cannot express a
+    valueless switch, and it matches flags anywhere in the line.
+
+    A leading token one dash away from a flag gets `dash_typo` — `-now`, or an
+    autocorrected `—next`. The exact-match lookup runs first, since a real `--now`
+    also satisfies the near-miss pattern. A bare leading `now`/`next` does not
+    qualify: `-p next to me` is a real search.
+    """
+    stripped = argument.strip()
+    parts = stripped.split(maxsplit=1)
+    if not parts:
+        return PlayArgs(mode=PlayMode.NORMAL, query="")
+    head = parts[0].lower()
+    # No strip on the tail: `stripped` had none, and split() eats the separator run.
+    rest = parts[1] if len(parts) > 1 else ""
+    mode = _FLAG_MODES.get(head)
+    if mode is not None:
+        return PlayArgs(mode=mode, query=rest)
+    typo = _NEAR_FLAG_RE.fullmatch(head)
+    if typo is not None:
+        return PlayArgs(
+            mode=PlayMode.NORMAL, query=stripped, dash_typo=f"--{typo.group(1)}"
+        )
+    return PlayArgs(mode=PlayMode.NORMAL, query=stripped)
 
 
 # Bound on one echoed needle, which owns a field to itself. Discord renders
@@ -1014,11 +1114,21 @@ class MusicBot(commands.Cog):
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
-        # Consume-rest, so a multi-word search arrives whole: this value is what
-        # `origin` is stamped from, and -remove matches on that. read_rest hands
-        # the quotes through, hence the unquote — a quoted origin is one -remove
+        # Consume-rest, so a multi-word search arrives whole: it is what -remove
+        # matches on. parse_input reads the search off this argument, so what is
+        # passed here is the whole input as far as everything downstream knows. The
+        # strip covers direct callers that never went through discord.py's parser.
+        args = split_play_args(url.strip())
+        await self._play(ctx, args)
+
+    async def _play(self, ctx: commands.Context, args: PlayArgs) -> None:
+        """The body behind -play, taking the argument already split."""
+        trace.get_current_span().set_attribute("play.mode", args.mode.value)
+        # ONE rebind, so every `origin=url` below is the query with the flag off
+        # it: a leaked flag persists a user_input that -remove cannot match.
+        # read_rest hands the quotes through, and a quoted origin is one -remove
         # would have to match literally.
-        url = unquote_argument(url.strip())
+        url = unquote_argument(args.query)
         async with background_typing(ctx):
             try:
                 # Paused → interject, not append: appending leaves the bot silent
@@ -1038,7 +1148,7 @@ class MusicBot(commands.Cog):
                             require_paused=True,
                         )
 
-                source = parse_input(url, ctx.message.content)
+                source = parse_input(url)
 
                 qobj: Union[
                     QueueObject, ResolvedSpotifyPlaylist, ResolvedYoutubePlaylist
@@ -1055,7 +1165,7 @@ class MusicBot(commands.Cog):
                     mp = self.get_mp(ctx)
                     # Ask-time analytics, read ONCE at dispatch: the command
                     # message's snowflake time, so the wait covers gateway
-                    # delivery and the resolve below. front ⇒ depth 0, the
+                    # delivery and the resolve below. Cold ⇒ depth 0, the
                     # cold-start song plays ahead of the restored queue.
                     if front:
                         position = 0
@@ -1152,7 +1262,7 @@ class MusicBot(commands.Cog):
             except Exception as e:
                 await self._command_error(ctx, e, title="Failed to queue song")
 
-    async def _resolve_playnow_source(
+    async def _resolve_interjection_source(
         self,
         ctx: commands.Context,
         source: Union[SpotifySource, YTSource, SoundcloudSource],
@@ -1302,8 +1412,8 @@ class MusicBot(commands.Cog):
         is appended instead. Reading it here rather than at command entry also means
         a song that fails to resolve never stops the paused song.
         """
-        source = parse_input(url, ctx.message.content)
-        qobj = await self._resolve_playnow_source(ctx, source, origin=url)
+        source = parse_input(url)
+        qobj = await self._resolve_interjection_source(ctx, source, origin=url)
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts

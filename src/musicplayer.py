@@ -1126,6 +1126,34 @@ class MusicPlayer:
                         YTDL.prefetch_stream(item, redis=self.store.redis)
                     )
 
+    async def queue_put_next(
+        self,
+        obj: Union[QueueItem, Sequence[QueueItem]],
+        *,
+        prefetch: bool = True,
+    ) -> None:
+        """Insert so this plays NEXT, without interrupting what is playing.
+
+        loop() spawns _prefetch_next_song() on every iteration and its get_nowait()
+        holds a claim for the rest of the current song, so with anything queued at
+        all put_front lands the item at _cursor — behind that claimed head — and it
+        plays second. Nothing may go ahead of the claim: I6 makes the claimed items a
+        prefix because Redis retires them by LPOP. So the claim is given back first,
+        as interject() does.
+
+        The cost is one killed FFmpeg subprocess; the stream URL survives in
+        ytdl:stream:*, so the re-resolve is a cache hit plus a spawn.
+
+        The prefetch is not re-spawned. _prefetch_task is a single slot with a
+        claim-then-null protocol between interject() and loop(); if the current song
+        ends between the neutralize and a re-spawn, loop() reads None, dequeues, and
+        overwrites the slot with its own task — orphaning ours with a claim nothing
+        settles and drifting _cursor by one permanently. The `prefetch` flag below is
+        the unrelated stream-URL warm.
+        """
+        await self._neutralize_prefetch()
+        await self.queue_put_front(obj, prefetch=prefetch)
+
     async def queue_get(self) -> QueueItem:
         return await self.queue.get()
 
