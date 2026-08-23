@@ -1559,10 +1559,10 @@ class TestResumeTailDepth:
         )
         assert gq_no_redis.resume_tail_depth() == 3
 
-    async def test_stops_at_the_first_ordinary_song(
+    async def test_ordinary_songs_are_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
-        """Songs past the tails were queued normally and were never interrupted.
+        """Songs queued normally were never interrupted, so they park no play.
         Counting them would report depth as "queue length" on any guild that had
         ever interjected."""
         await gq_no_redis.put(
@@ -1570,10 +1570,28 @@ class TestResumeTailDepth:
                 _qobj(9, mock_author),
                 self._tail(1, mock_author),
                 _qobj(5, mock_author),
-                self._tail(2, mock_author),  # not contiguous — not part of the stack
+                _qobj(6, mock_author),
             ]
         )
         assert gq_no_redis.resume_tail_depth() == 1
+
+    async def test_a_tail_separated_from_the_others_still_counts(
+        self, gq_no_redis: GuildQueue, mock_author: MagicMock
+    ) -> None:
+        """Adjacency is not what makes a play parked. This counted the CONSECUTIVE
+        run, which was fine while an interjection queued exactly one song — but
+        `--now` takes a whole playlist now, so the layout is
+        [head, *playlist, tail] and the run behind the head is empty. Every playlist
+        interjection reported 0, and a stack of them reported 0 as well."""
+        await gq_no_redis.put(
+            [
+                _qobj(9, mock_author),
+                self._tail(1, mock_author),
+                _qobj(5, mock_author),
+                self._tail(2, mock_author),
+            ]
+        )
+        assert gq_no_redis.resume_tail_depth() == 2
 
     async def test_a_head_that_is_itself_a_tail_is_not_counted(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
@@ -1583,9 +1601,12 @@ class TestResumeTailDepth:
         await gq_no_redis.put([self._tail(1, mock_author), self._tail(2, mock_author)])
         assert gq_no_redis.resume_tail_depth() == 1
 
-    async def test_a_search_entry_breaks_the_run(
+    async def test_a_search_entry_is_not_a_parked_play(
         self, gq_no_redis: GuildQueue, mock_author: MagicMock
     ) -> None:
+        """An unresolved search has never played, so it parks nothing — but it no
+        longer hides the tails behind it either, which is exactly the shape a
+        Spotify playlist `--now` produces: [head, *lazy searches, tail]."""
         await gq_no_redis.put(
             [
                 _qobj(9, mock_author),
@@ -1594,7 +1615,7 @@ class TestResumeTailDepth:
                 self._tail(2, mock_author),
             ]
         )
-        assert gq_no_redis.resume_tail_depth() == 1
+        assert gq_no_redis.resume_tail_depth() == 2
 
 
 # ── crash recovery ────────────────────────────────────────────────────────────

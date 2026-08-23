@@ -29,6 +29,7 @@ from src.guild_queue import (
     RemoveOutcome,
     ShuffleOutcome,
     is_persisted,
+    item_label,
     remove_matcher,
 )
 from src.guild_state import (
@@ -1252,14 +1253,7 @@ class MusicPlayer:
         # rather than a "queue cleared" reply that silently dropped plays.
         await self._flush_played(cleared_items)
         await self._dispose_orphaned_cards(cleared_items)
-        return [
-            (
-                item.title
-                if isinstance(item, QueueObject)
-                else (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-            )
-            for item in cleared_items
-        ]
+        return [item_label(item) for item in cleared_items]
 
     async def queue_shuffle(self) -> str:
         # Cancel before shuffle()'s too-few guard: a prefetch holding a dequeued
@@ -1741,8 +1735,13 @@ class MusicPlayer:
         vc: discord.VoiceClient,
         *,
         resume_paused: bool = True,
+        follow_on: Sequence[QueueItem] = (),
     ) -> Optional[InterjectOutcome]:
         """Play `qobj` immediately; the interrupted song returns afterwards.
+
+        `follow_on` is the rest of a playlist `qobj` is the head of. It goes between
+        the head and the resume entry, so the playlist plays in order and the
+        interrupted song comes back after all of it.
 
         Capture the current song's exact position (frame-counted, frozen if paused),
         front-insert [qobj, resume-entry(ts=position)], stop the current song; the
@@ -1827,7 +1826,7 @@ class MusicPlayer:
         # The interjection arrives carrying depth 0 from its own command dispatch
         # — it plays immediately by definition — while the tail keeps the
         # interrupted song's analytics, unknown ones included.
-        items: list[QueueItem] = [qobj]
+        items: list[QueueItem] = [qobj, *follow_on]
         if resume is not None:
             items.append(resume)
             # The song returns, so it is recorded once — when its tail finishes. A
@@ -1857,6 +1856,8 @@ class MusicPlayer:
         # Attribution only: did this cut in front of another interjected song.
         span.set_attribute("interject.over_interjection", current.interjected)
         span.set_attribute("interject.resume_position", position if resume else -1)
+        # 1 for a single track, so the attribute is always present and comparable.
+        span.set_attribute("interject.playlist_size", len(follow_on) + 1)
         return InterjectOutcome(
             interrupted_title=current.title or "Unknown",
             resume_position=position if resume is not None else None,

@@ -13,7 +13,7 @@ from typing import (
     assert_never,
     cast,
 )
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 
 import discord
 from discord.ext import commands
@@ -43,7 +43,7 @@ from src.redis_client import (
     cache_get,
     cache_set,
 )
-from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome
+from src.guild_queue import QueueItem, RemoveMode, RemoveOutcome, item_label
 from src.sources import (
     QUERY_SOURCE_SEARCH,
     timestamp_warning,
@@ -88,6 +88,7 @@ from src.util import (
     spawn_background,
     trace_footer,
     truncate,
+    truncate_embed_title,
     get_logger,
 )
 
@@ -310,15 +311,6 @@ def _echo(text: str, limit: int = _ECHO_MAX) -> str:
     return safe_label(text, limit)
 
 
-def _removed_label(item: QueueItem) -> str:
-    """A removed queue item's name for the reply, as MusicPlayer.queue_clear
-    renders it: `YTSource` has no title, so an unresolved Spotify-playlist track
-    would otherwise show as `?`."""
-    if isinstance(item, QueueObject):
-        return item.title or "?"
-    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
-
-
 def _field(value: str) -> str:
     """An embed field value that cannot 400 the send. The callers below build from
     lists whose length is the user's to choose, and the send happens AFTER the
@@ -383,8 +375,6 @@ class ResolvedYoutubePlaylist:
 def _apply_playlist_index(
     tracks: list[QueueObject],
     index: Optional[int],
-    *,
-    keep_first_only: bool = False,
 ) -> tuple[list[QueueObject], int]:
     """Drop the tracks ahead of YouTube's 1-based `index=`, returning what is left
     and how many went. A share link copied mid-playlist carries the position it was
@@ -394,21 +384,15 @@ def _apply_playlist_index(
     the user named a position this playlist does not have, and an empty enqueue
     reports success. The empty-playlist guard lives here too, so both callers
     get it.
-
-    keep_first_only trims to the one track -playnow interjects, which also keeps
-    the rebase below off the tracks that caller discards (~1ms for a 1000-track
-    link).
     """
     if not tracks:
         raise EmptyPlaylistError
     if index is None or index <= 1:
-        return (tracks[:1] if keep_first_only else tracks), 0
+        return tracks, 0
     if index > len(tracks):
         raise PlaylistIndexError(index, len(tracks))
     kept = tracks[index - 1 :]
     dropped = index - 1
-    if keep_first_only:
-        kept = kept[:1]
     # Positions were assigned at construction, before this slice. Rebase to
     # kept-relative: the dropped tracks never enqueue, so an &index=N link would
     # otherwise record every kept track N-1 too deep.
@@ -436,6 +420,80 @@ def _apply_playlist_timestamp(tracks: list[QueueObject], source: YTSource) -> No
     # matching some other part of a YouTube URL is not a case that arises.
     if source.video_id in tracks[0].webpage_url:
         tracks[0].ts = source.ts
+
+
+def _plays_after_note(
+    mp: MusicPlayer, voice_client: Optional[discord.VoiceProtocol]
+) -> str:
+    """What a `--next` confirmation says about when the song will be heard.
+
+    Names the song it waits behind. The paused sentence is the only word the user
+    gets that playback is still stopped: `--next` does not interject a paused song.
+    """
+    current = mp.current_song
+    if current is None:
+        # A claim with no current_song is loop() between taking the prefetch
+        # result and starting it: a song is about to play, and the insert lands
+        # behind it.
+        if mp.queue.claim_outstanding():
+            return "Plays after the song starting now."
+        return "Nothing is playing, so it starts now."
+    note = f"Plays after **{current.title or 'the current song'}**."
+    if isinstance(voice_client, discord.VoiceClient) and voice_client.is_paused():
+        note += " Playback is paused — `-resume` to carry on."
+    return note
+
+
+def _with_queue_position(item: QueueItem, position: int) -> QueueItem:
+    """Re-mint one item's ask-time `queue_position`.
+
+    QueueObject is mutable and YTSource is frozen, so one is stamped in place and
+    the other returns a copy — the caller must use the return value either way.
+    """
+    analytics = replace(item.analytics, queue_position=position)
+    if isinstance(item, QueueObject):
+        item.analytics = analytics
+        return item
+    return replace(item, analytics=analytics)
+
+
+def _collection_note(
+    url: str, queued: int, *, returns: str = "", head_playing: bool
+) -> str:
+    """What a `-play` that queued a whole collection tells the user: how many tracks
+    landed, when the interrupted song comes back, and the one-command undo.
+
+    One builder for the three paths that queue a collection — the interjection, the
+    one whose song ended mid-resolve, and the one resumed mid-resolve — because they
+    make the same promise about the same tracks.
+
+    `head_playing` changes the undo: a playing song has no queue object (its entry
+    was LPOPed when it started), so `-remove` cannot reach it and only `-skip` will.
+    """
+    undo = (
+        "the queued ones back out; the one playing needs `-skip`."
+        if head_playing
+        else "the whole playlist back out."
+    )
+    return (
+        f"\n\nQueued **{queued}** {pluralize(queued, 'song')} from the playlist."
+        f"{returns}\nNot what you wanted? `-remove {_echo(url)}` takes {undo}"
+    )
+
+
+def _front_insert_depth(mp: MusicPlayer) -> int:
+    """Ask-time `queue_position` for a song going to the FRONT of the queue: it
+    waits behind the song playing and nothing else.
+
+    One definition for its two callers — `-play --next`, and the interjection whose
+    song ended before it could be interrupted — because they front-insert into the
+    same queue and this number reaches Postgres permanently.
+
+    Known ±1, the kind enqueue_depth() already documents: two `--next` in a row both
+    record 1. An outstanding claim counts as that one song even while current_song is
+    None, which is loop() between taking the prefetch result and starting it.
+    """
+    return 1 if mp.current_song is not None or mp.queue.claim_outstanding() else 0
 
 
 def _join_succeeded(ctx: commands.Context) -> bool:
@@ -543,6 +601,8 @@ class MusicBot(commands.Cog):
             else SpotifyStatus.DISABLED
         )
         self.mps: dict[int, MusicPlayer] = {}
+        # (guild id, placement) of every -play in flight. See _play_bucket.
+        self._play_inflight: set[tuple[int, PlayMode]] = set()
         # id(ctx) → the in-flight command's span, otel token and start time.
         self._active_spans: dict[int, ActiveCommand] = {}
         self.voice_watchdog = VoiceWatchdog(self)
@@ -968,6 +1028,25 @@ class MusicBot(commands.Cog):
             )
 
     @_tracer.start_as_current_span("bot.enqueue_playlist")
+    async def _warm_front_track(
+        self, tracks: Sequence[QueueItem], placement: Placement
+    ) -> None:
+        """Warm the stream URL of a playlist's first track when it is about to play.
+
+        Bulk enqueues pass prefetch=False: N concurrent extractions mint URLs that
+        expire before playback reaches them. Under `--next` the head is different —
+        queue_put_next killed the loop's one-ahead prefetch and the loop spawns
+        another only on its next iteration, so the head would reach the handoff with
+        nothing cached and pay a full in-band extraction.
+
+        A lazy Spotify entry has no URL to warm yet; it resolves at dequeue.
+        """
+        if placement is not Placement.NEXT or not tracks:
+            return
+        head = tracks[0]
+        if isinstance(head, QueueObject):
+            await YTDL.prefetch_stream(head, redis=self.redis)
+
     async def _enqueue_playlist(
         self,
         ctx: commands.Context,
@@ -993,6 +1072,8 @@ class MusicBot(commands.Cog):
         }[placement]
         warning = timestamp_warning(source)
         warning_line = f"\n\n{warning}" if warning else ""
+        # "Queued playlist" on its own reads as "at the back".
+        next_suffix = " — plays next" if placement is Placement.NEXT else ""
         if isinstance(qobj, ResolvedSpotifyPlaylist):
             titles = qobj.titles
             qobjs_yt = spotify_playlist_to_ytsearch(
@@ -1003,12 +1084,13 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    "Queued playlist",
+                    "Queued playlist" + next_suffix,
                     f"Requested by: [{ctx.author.mention}]\n\n{shown_titles}"
                     f"{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(qobjs_yt, prefetch=False),
+                self._warm_front_track(qobjs_yt, placement),
                 ctx.message.add_reaction("👍"),
             )
         else:
@@ -1039,14 +1121,39 @@ class MusicBot(commands.Cog):
             await asyncio.gather(
                 send_embed(
                     ctx,
-                    f"Queued playlist — {count} {pluralize(count, 'song')}",
+                    f"Queued playlist — {count} "
+                    f"{pluralize(count, 'song')}{next_suffix}",
                     f"Requested by: [{ctx.author.mention}]\n{playlist_url}\n"
                     f"{skipped_line}\n{shown_titles}{warning_line}",
                     discord.Color.blue(),
                 ),
                 enqueue(tracks, prefetch=False),
+                self._warm_front_track(tracks, placement),
                 ctx.message.add_reaction("👍"),
             )
+
+    async def _send_playing_next(
+        self,
+        ctx: commands.Context,
+        qobj: QueueObject,
+        *,
+        note: str,
+        reaction: str = "👍",
+    ) -> None:
+        """The "Playing next" confirmation, for the two paths that make that promise
+        — `-play --next`, and the interjection whose song ended before it could be
+        interrupted. `note` is the only difference: why this song is next.
+        """
+        await asyncio.gather(
+            send_embed(
+                ctx,
+                truncate_embed_title(f"▶️ Playing next: {qobj.title}"),
+                f"Requested by: [{ctx.author.mention}]\n{note}",
+                discord.Color.blue(),
+                thumbnail=qobj.thumbnail,
+            ),
+            ctx.message.add_reaction(reaction),
+        )
 
     @_tracer.start_as_current_span("bot.enqueue_single")
     async def _enqueue_single(
@@ -1086,8 +1193,28 @@ class MusicBot(commands.Cog):
             log.info(f"play (front) qsize: {mp.queue.qsize()}")
             return
 
-        should_show_queued = mp.queue.qsize() > 0 or (
-            isinstance(vc, discord.VoiceClient) and vc.is_playing()
+        if placement is Placement.NEXT:
+            # No "Est. playing at": estimated_playing_at() seeds from the current
+            # song's FULL duration as a proxy for what is left of it, which is badly
+            # wrong for the very next slot. It names the song it waits behind.
+            coros: list[Coroutine[Any, Any, Any]] = [
+                mp.queue_put_next(qobj),
+                self._send_playing_next(ctx, qobj, note=_plays_after_note(mp, vc)),
+            ]
+            if warning is not None:
+                coros.append(
+                    ctx.send(embed=notice_embed(warning, discord.Color.orange()))
+                )
+            await asyncio.gather(*coros)
+            log.info(f"play (next) qsize: {mp.queue.qsize()}")
+            return
+
+        # A note is the only word the user gets about tracks queued behind this
+        # one, so an empty queue does not suppress the field.
+        should_show_queued = (
+            bool(note)
+            or mp.queue.qsize() > 0
+            or (isinstance(vc, discord.VoiceClient) and vc.is_playing())
         )
         coros: list[Coroutine[Any, Any, Any]] = [
             mp.queue_put(qobj),
@@ -1102,7 +1229,7 @@ class MusicBot(commands.Cog):
                     (
                         f"Requested by: [{ctx.author.mention}]\n"
                         f"{qobj.title} - ({qobj.webpage_url})\n"
-                        f"Est. playing at {mp.estimated_playing_at()}"
+                        f"Est. playing at {mp.estimated_playing_at()}{note}"
                         f"{warning_line}"
                     ),
                     discord.Color.blue(),
@@ -1150,11 +1277,9 @@ class MusicBot(commands.Cog):
             ),
         },
     )
-    # Serialized per guild, like -resume: two concurrent invocations both read a
-    # live current_song and both park a resume tail for it, so one play comes back
-    # twice. wait=False — the second caller is told to wait rather than queued
-    # behind a 1-4s extraction.
-    @commands.max_concurrency(1, commands.BucketType.guild, wait=False)
+    # Serialized per guild PER PLACEMENT by _play_bucket, not by max_concurrency:
+    # the decorator acquires before the argument is parsed, so it cannot see which
+    # placement was asked for.
     @commands.before_invoke(validate_commands)
     @_tracer.start_as_current_span("bot.play")
     async def play(self, ctx: commands.Context, *, url: str) -> None:
@@ -1163,7 +1288,36 @@ class MusicBot(commands.Cog):
         # passed here is the whole input as far as everything downstream knows. The
         # strip covers direct callers that never went through discord.py's parser.
         args = split_play_args(url.strip())
-        await self._play(ctx, args)
+        async with self._play_bucket(ctx, args.mode):
+            await self._play(ctx, args)
+
+    @contextlib.asynccontextmanager
+    async def _play_bucket(
+        self, ctx: commands.Context, mode: PlayMode
+    ) -> AsyncGenerator[None, None]:
+        """One -play in flight per guild PER PLACEMENT, declining rather than
+        queueing — max_concurrency's contract, with a key it cannot express.
+
+        A bucket per placement: a -play resolving a large playlist holds its own for
+        the whole flat extraction (99.3s measured on a 5,547-track link), and an
+        urgent `-p --now` must not wait behind it. Within a placement one bucket is
+        what matters — two concurrent interjections both read a live current_song and
+        both park a resume tail for it, so one play comes back twice.
+
+        Not max_concurrency: prepare() acquires before _parse_arguments, so the flag
+        is not known yet. MaxConcurrencyReached is raised by hand so
+        cog_command_error renders it and the wording does not fork.
+        """
+        key = (ctx.guild.id if ctx.guild else 0, mode)
+        if key in self._play_inflight:
+            raise commands.MaxConcurrencyReached(1, commands.BucketType.guild)
+        # No await between the check and the claim, so the pair is atomic on one
+        # event loop and two invocations in the same tick cannot both pass.
+        self._play_inflight.add(key)
+        try:
+            yield
+        finally:
+            self._play_inflight.discard(key)
 
     async def _play(self, ctx: commands.Context, args: PlayArgs) -> None:
         """The body behind -play, taking the argument already split."""
@@ -1266,6 +1420,11 @@ class MusicBot(commands.Cog):
                     # cold-start song plays ahead of the restored queue.
                     if cold_start:
                         position = 0
+                    elif placement is Placement.NEXT:
+                        # No restore wait for the depth here — this number does not
+                        # come from the queue at all, so a queue still replaying
+                        # cannot make it wrong.
+                        position = _front_insert_depth(mp)
                     else:
                         # Wait out any in-flight restore: the queue stays empty
                         # until restore_entries() replays it, so a -play in the
@@ -1319,14 +1478,23 @@ class MusicBot(commands.Cog):
 
                     log.info(f"Voice client: {ctx.voice_client}")
 
-                    if cold_start:
+                    if placement is not Placement.TAIL:
                         # Order matters: put_front LPUSHes the mirror while
                         # restore_entries replays already-listed entries in memory
                         # only, so inserting first double-queues this song. A restore
                         # that never lands is therefore a reason NOT to insert — and
                         # the wait is bounded, since the pool sets no socket_timeout.
+                        #
+                        # Every front insert, not just the cold one:
+                        # connected-and-idle during crash recovery is the window
+                        # this guards, and the warm path's 1s wait ignores its
+                        # result because only an analytics integer rides on it.
                         if not await mp.wait_for_restore(timeout=RESTORE_WAIT_SECS):
-                            await self._abandon_cold_start(ctx, mp)
+                            # Cold start ONLY: _abandon_cold_start cancels the
+                            # player's tasks and disconnects it, which on a warm
+                            # player would stop the music over a Redis blink.
+                            if cold_start:
+                                await self._abandon_cold_start(ctx, mp)
                             await ctx.send(
                                 embed=notice_embed(
                                     "Couldn't reach this server's saved queue, so "
@@ -1371,20 +1539,25 @@ class MusicBot(commands.Cog):
         source: Union[SpotifySource, YTSource, SoundcloudSource],
         *,
         origin: str,
-    ) -> QueueObject:
-        """Resolve -playnow input to exactly one QueueObject. Playlists collapse to
-        their first track — interjecting a whole one would delay the interrupted
-        song's return indefinitely (use -play).
+    ) -> tuple[QueueObject, list[QueueItem]]:
+        """Resolve an interjection's input into (head, everything behind it).
+
+        Two values because the head is not interchangeable with the rest: it has to
+        be a resolved QueueObject to interrupt with, while the tail may hold lazy
+        YTSources.
+
+        The head interrupts and the rest queue behind it, so the interrupted song
+        comes back after the whole playlist. One `-remove <the link>` takes it all
+        back out.
+
+        Two callers: `-play --now`, and -play on a paused song.
 
         `origin` is the raw command argument, passed down by every branch — for a
-        collapsed playlist it is the link, not the title the expansion generated."""
-        playlist_notice = notice_embed(
-            "Playlists can't be interjected — playing the **first track** now. "
-            "Use `-play` for the full playlist.",
-            discord.Color.orange(),
-        )
-        # Ask-time analytics: the message's snowflake time, and depth 0 — an
-        # interjection plays immediately. The caller re-mints the depth on the
+        playlist it is the link, not the titles the expansion generated."""
+        # Ask-time analytics: the message's snowflake time, and depth 0 for the head
+        # — an interjection plays immediately. Tracks behind it derive their own
+        # positions from this base (yt_playlist and spotify_playlist_to_ytsearch
+        # both do), so they read 1, 2, … The caller re-mints the head's depth on the
         # two paths where it ends up queueing instead.
         analytics = Analytics(
             queued_at=ctx.message.created_at.timestamp(), queue_position=0
@@ -1393,20 +1566,23 @@ class MusicBot(commands.Cog):
             titles = await self._require_spotify().playlist(source.id)
             if not titles:
                 raise ValueError("Playlist has no tracks")
-            await ctx.send(embed=playlist_notice)
             yts = spotify_playlist_to_ytsearch(
-                titles[:1], analytics=analytics, origin=origin
-            )[0]
+                titles, analytics=analytics, origin=origin
+            )
+            # Only the head is resolved here — it has to be playable to interrupt
+            # with. The rest stay lazy YouTube searches resolved at dequeue, which
+            # is what keeps a 100-track album from paying 100 searches up front.
             # Both playlist branches resolve directly rather than through
             # queue_source, so each passes its own metadata.
-            return await YTDL.yt_source(
+            head = await YTDL.yt_source(
                 ctx.author,
-                yts.ytsearch or "",
+                yts[0].ytsearch or "",
                 redis=self.redis,
-                query_source=query_source_of(yts),
+                query_source=query_source_of(yts[0]),
                 analytics=analytics,
                 user_input=origin,
             )
+            return head, list(yts[1:])
         if isinstance(source, YTSource) and source.type == YTType.PLAYLIST:
             tracks = await YTDL.yt_playlist(
                 source.playlist_url,
@@ -1415,28 +1591,22 @@ class MusicBot(commands.Cog):
                 analytics=analytics,
                 user_input=origin,
             )
-            # Indexed here too: -playnow on a link copied mid-playlist should
-            # interject the track the user was looking at, not the playlist's
-            # first. The slice makes tracks[0] that track.
-            tracks, skipped = _apply_playlist_index(
-                tracks, source.index, keep_first_only=True
-            )
+            # Indexed here too: `--now` on a link copied mid-playlist starts at the
+            # track the user was looking at, not the playlist's first.
+            tracks, skipped = _apply_playlist_index(tracks, source.index)
             _apply_playlist_timestamp(tracks, source)
             if skipped:
                 await ctx.send(
                     embed=notice_embed(
-                        f"Playlists can't be interjected — playing **#"
-                        f"{skipped + 1}** now. Use `-play` for the full "
-                        f"playlist.",
+                        f"Starting at **#{skipped + 1}** — skipped {skipped} "
+                        f"earlier {pluralize(skipped, 'song')}.",
                         discord.Color.orange(),
                     )
                 )
-            else:
-                await ctx.send(embed=playlist_notice)
-            return tracks[0]
+            return tracks[0], list(tracks[1:])
         qobj = await self.queue_source(ctx, source, analytics=analytics, origin=origin)
         assert isinstance(qobj, QueueObject)
-        return qobj
+        return qobj, []
 
     @_tracer.start_as_current_span("bot.interject_flow")
     async def _interject_flow(
@@ -1460,13 +1630,19 @@ class MusicBot(commands.Cog):
         a song that fails to resolve never stops the paused song.
         """
         source = parse_input(url)
-        qobj = await self._resolve_interjection_source(ctx, source, origin=url)
+        qobj, follow_on = await self._resolve_interjection_source(
+            ctx, source, origin=url
+        )
+        # The head only: `interjected` is attribution, which song cut the line.
         qobj.interjected = True
 
         # Warm the stream-URL cache before interrupting: a cache miss at dequeue puts
         # seconds of yt-dlp dead air between the interrupt and the new song. Awaited,
         # not spawned — the current song plays through the wait. No-op without Redis;
         # also back-fills duration/thumbnail for the embeds below.
+        #
+        # The head only: warming N tracks would be N concurrent extractions
+        # minting URLs that expire before playback reaches them.
         await YTDL.prefetch_stream(qobj, redis=self.redis)
 
         if require_paused and not vc.is_paused():
@@ -1478,11 +1654,27 @@ class MusicBot(commands.Cog):
             # An ordinary append now, behind the whole queue, so replace the 0
             # minted for the interjection. Read here: the queue moved during the
             # resolve.
-            qobj.analytics = replace(qobj.analytics, queue_position=mp.enqueue_depth())
-            await self._enqueue_single(ctx, qobj, mp, warning=timestamp_warning(source))
+            depth = mp.enqueue_depth()
+            qobj.analytics = replace(qobj.analytics, queue_position=depth)
+            note = ""
+            if follow_on:
+                # The head went to the tail, so these follow it there. Their
+                # ask-time depths were minted for a front insert and are re-minted
+                # from the head's: play_history keeps whatever number is on them.
+                follow_on = [
+                    _with_queue_position(item, depth + offset)
+                    for offset, item in enumerate(follow_on, start=1)
+                ]
+                await mp.queue_put(follow_on, prefetch=False)
+                note = _collection_note(url, len(follow_on) + 1, head_playing=False)
+            await self._enqueue_single(
+                ctx, qobj, mp, note=note, warning=timestamp_warning(source)
+            )
             return
 
-        outcome = await mp.interject(qobj, vc, resume_paused=resume_paused)
+        outcome = await mp.interject(
+            qobj, vc, resume_paused=resume_paused, follow_on=follow_on
+        )
         if outcome is None:
             # The song ended during the resolve — nothing left to interrupt. Insert
             # qobj directly rather than re-invoking -play, which would re-parse,
@@ -1496,25 +1688,22 @@ class MusicBot(commands.Cog):
             # DIFFERENT song, which this insert waits behind. One, never the
             # queue depth: it goes to the front.
             qobj.analytics = replace(
-                qobj.analytics,
-                queue_position=1 if mp.current_song is not None else 0,
+                qobj.analytics, queue_position=_front_insert_depth(mp)
             )
-            # The player's wrapper, not queue.put_front directly — the same
-            # item-vs-list plumbing as every other user-facing insert.
+            # queue_put_next: the embed below promises "play next", and the
+            # loop's prefetch holds a claim a bare front-insert would land behind.
+            # interject() returned None without reaching its own neutralize.
             # prefetch=False — the stream URL was warmed above.
-            await mp.queue_put_front(qobj, prefetch=False)
-            await asyncio.gather(
-                send_embed(
-                    ctx,
-                    f"▶️ Playing next: {qobj.title}",
-                    f"Requested by: [{ctx.author.mention}]\n"
-                    "The song being interrupted already ended — "
-                    "queued to play next instead.",
-                    discord.Color.blue(),
-                    thumbnail=qobj.thumbnail,
-                ),
-                ctx.message.add_reaction("⏯️"),
+            await mp.queue_put_next([qobj, *follow_on], prefetch=False)
+            note = (
+                "The song being interrupted already ended — "
+                "queued to play next instead."
             )
+            if follow_on:
+                # Nothing was interrupted, so the head is QUEUED rather than
+                # playing: it counts, and -remove reaches it.
+                note += _collection_note(url, len(follow_on) + 1, head_playing=False)
+            await self._send_playing_next(ctx, qobj, note=note, reaction="⏯️")
             return
 
         if outcome.resume_position is None:
@@ -1539,10 +1728,27 @@ class MusicBot(commands.Cog):
                 f"**{outcome.interrupted_title}** will resume at "
                 f"`{outcome.resume_position_str}`."
             )
+        if follow_on:
+            # The interrupted song now waits behind the whole playlist, so the
+            # reply says so and names the undo: `-remove <the link>` matches on
+            # user_input, which every track carries.
+            #
+            # The tail only, and head_playing: this song is playing, so it has no
+            # queue object for -remove to match.
+            desc += _collection_note(
+                url,
+                len(follow_on),
+                returns=(
+                    f" **{outcome.interrupted_title}** returns after the last of them."
+                    if outcome.resume_position is not None
+                    else ""
+                ),
+                head_playing=True,
+            )
         await asyncio.gather(
             send_embed(
                 ctx,
-                f"▶️ Playing now: {qobj.title}",
+                truncate_embed_title(f"▶️ Playing now: {qobj.title}"),
                 f"Requested by: [{ctx.author.mention}]\n{desc}",
                 discord.Color.blue(),
                 thumbnail=qobj.thumbnail,
@@ -2053,7 +2259,7 @@ class MusicBot(commands.Cog):
                         _field(
                             queue_message(
                                 [
-                                    _echo(_removed_label(i), _ECHO_ROW_MAX)
+                                    _echo(item_label(i), _ECHO_ROW_MAX)
                                     # Sliced before the echo: queue_message keeps 10.
                                     for i in outcome.removed[:10]
                                 ]

@@ -32,10 +32,12 @@ See docs/ARCHITECTURE.md#queue-invariant.
 
 # ISSUE: Close the queue-desync race between dequeue commit and the Redis LPOP.
 # try_commit_dequeue() releases the bulk mutex before pop_queue_and_start_song()'s
-# atomic LPOP+HSET dispatches, so a -clear landing in that tick pops an entry the clear
-# already deleted: memory and Redis drift by one until the next rebuild, and a crash
-# inside the drift restores the queue one song out of alignment. Accepted. Cheapest fix:
-# hold the mutex across the store dispatch, costing one ~1ms round-trip.
+# atomic LPOP+HSET dispatches, so a mutation landing in that tick races it, in both
+# directions: a -clear pops an entry it already deleted, and an insert (put_front's
+# LPUSH branch) puts its entry at the head for the pending LPOP to eat. Either way
+# memory and Redis drift by one until the next rebuild, and a crash inside the drift
+# restores the wrong song. Accepted. The insert side has three callers — interject,
+# the cold-start -play, and -play --next.
 
 import asyncio
 import random
@@ -152,6 +154,17 @@ def _to_entry(item: QueueItem) -> QueueEntry:
     if isinstance(item, QueueObject):
         return SongQueueEntry.from_queue_object(item)
     return SearchQueueEntry.from_ytsource(item)
+
+
+def item_label(item: QueueItem) -> str:
+    """What to call a queued item in a reply, resolved or not.
+
+    A YTSource has no `title` — it is an unresolved search — so its search term
+    stands in, with the `ytsearch:` prefix off.
+    """
+    if isinstance(item, QueueObject):
+        return item.title or "?"
+    return (item.ytsearch or item.url or "?").removeprefix("ytsearch:")
 
 
 def is_persisted(item: Optional[QueueItem]) -> bool:
@@ -527,21 +540,23 @@ class GuildQueue:
         )
 
     def resume_tail_depth(self) -> int:
-        """How many parked plays are waiting behind the song that just cut the line
-        — the run of consecutive resume tails after it. 1 is a plain interjection, 2+ a
-        stack. Counts PLAYS, not fragments: the interrupted song's live fragment is
-        gone by the time this runs and only its tail is queued.
+        """How many parked plays are waiting behind the song that just cut the line.
+        1 is a plain interjection, 2+ a stack. Counts PLAYS, not fragments: the
+        interrupted song's live fragment is gone by the time this runs and only its
+        tail is queued.
 
-        The interjected song is not always at index 0 — put_front inserts behind a
-        dequeued-but-uncommitted item — so the run starts after the claimed prefix,
-        which _cursor names directly."""
-        # islice, not a slice copy: the run read here is almost always 1-3 long.
-        depth = 0
-        for item in islice(self._items, self._cursor + 1, None):
-            if not (isinstance(item, QueueObject) and item.is_resume):
-                break
-            depth += 1
-        return depth
+        Every pending tail, wherever it sits: `--now` takes a whole playlist, so
+        put_front lays out [head, *playlist, tail] and the tails are not adjacent.
+        The scan starts one past the claimed prefix, which holds the song that just
+        cut the line.
+
+        O(len(_items)), once per interjection, behind that command's own 1-4s
+        resolve."""
+        return sum(
+            1
+            for item in islice(self._items, self._cursor + 1, None)
+            if isinstance(item, QueueObject) and item.is_resume
+        )
 
     # ── Playback-loop dequeue bookkeeping ─────────────────────────────────────
 
@@ -637,8 +652,12 @@ class GuildQueue:
         """Bring the Redis mirror in line with `items` — the persisted subset, in
         order — by whichever of DELETE, LREM or rebuild is right.
 
-        The rebuild is DELETE + RPUSH in MULTI: a plain pipeline leaves a window
-        where a concurrent LPOP sees an empty queue. Callers hold the bulk-mutation
+        Cost on a big queue: 5,000 entries serialize in ~38ms (25ms building the
+        entries, 13ms of orjson) for a ~2.1MB RPUSH, and that span is synchronous —
+        it blocks every guild's gateway traffic. Bounded by playlist length.
+
+        Atomic rebuild (DELETE + RPUSH in MULTI; a plain pipeline leaves a window
+        where a concurrent LPOP sees an empty queue). Callers hold the bulk-mutation
         mutex, so a concurrent put()'s pushes can't be wiped by a rebuild that
         predates them. persisted=False items were never RPUSHed — never write them in.
 
