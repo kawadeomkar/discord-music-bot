@@ -1777,8 +1777,10 @@ class MusicPlayer:
 
         # Re-check after those awaits (cancellation can block up to yt-dlp's socket
         # timeout): if the song ended and the loop moved on, bail to the command's
-        # fallback rather than build a resume entry for a finished song.
-        if self.current_song is not current:
+        # fallback rather than build a resume entry for a finished song. A stopped
+        # song is still current_song until the loop's next vc.play(); measuring it
+        # would park a second resume tail for one play.
+        if self.current_song is not current or self._stopped_deliberately:
             return None
 
         was_paused = vc.is_paused()
