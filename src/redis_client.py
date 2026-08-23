@@ -1099,7 +1099,13 @@ class GuildRedisStore:
 
     @_guild_op(default=None)
     async def on_pause(self, epoch: float) -> None:
-        """Record the epoch when the voice client was paused."""
+        """Record the epoch when the voice client was paused.
+
+        LEGACY. Feeds only _legacy_wall_clock_position_at now — MusicPlayer.pause
+        records the exact position through heartbeat(). Drop this, on_resume, and
+        the three wall-clock StateFields together one release after the heartbeat
+        ships.
+        """
         pipe = self.redis.pipeline()
         pipe.hset(self.state_key(), StateField.PAUSE_START_EPOCH, str(epoch))
         await self._exec_with_state_ttl(pipe)
@@ -1108,6 +1114,10 @@ class GuildRedisStore:
     async def on_resume(self, resume_epoch: float) -> None:
         """Accumulate elapsed pause time into total_pause_seconds, clear
         pause_start_epoch.
+
+        LEGACY, like on_pause: the accumulated total feeds only
+        _legacy_wall_clock_position_at, and goes with it one release after the
+        heartbeat ships.
 
         Non-atomic read-modify-write, so it assumes one writer per guild (true
         today). Under multi-process sharding this must become a Lua script or a
@@ -1388,11 +1398,18 @@ class GuildRedisStore:
     async def heartbeat(self, position_secs: float, epoch: float) -> None:
         """Record where the audio is, so recovery never has to infer it.
 
-        Two fields plus the state-key TTL refresh in one pipelined round trip,
-        ~0.33 writes/s per *playing* guild. Writes the legacy fields' successor
-        without removing them (see StateField) — a rollback must still read this.
+        Two commands in one round trip, once per HEARTBEAT_INTERVAL_SECS per
+        PLAYING guild — 0.33/s at the default. Small in absolute terms but ~40x the
+        per-song transactions, and every one is an AOF append: ~230 B each, so a
+        thousand simultaneous listeners is ~0.3 GiB/day. Writes the legacy fields'
+        successor without removing them (see StateField) — a rollback must still
+        read this.
+
+        transaction=False unlike the other state writers: HSET then EXPIRE on one
+        key needs no atomicity, and at this frequency the MULTI/EXEC pair is a
+        measured 12% of the latency and 14% of the bytes for nothing.
         """
-        pipe = self.redis.pipeline()
+        pipe = self.redis.pipeline(transaction=False)
         pipe.hset(
             self.state_key(),
             mapping=_hset_mapping(
@@ -1402,8 +1419,7 @@ class GuildRedisStore:
                 }
             ),
         )
-        pipe.expire(self.state_key(), GUILD_TTL)
-        await pipe.execute()
+        await self._exec_with_state_ttl(pipe)
 
     # Recovery lock — one restore_guild per guild at a time
 
